@@ -1051,6 +1051,7 @@ mod clause_one_exit_proof {
     use super::recordless_provider::RecordlessProjectRecordsProvider;
 
     const PROJECT: &str = "p_clause_one";
+    const ATTACHED_PROJECT: &str = "p_clause_one_attached";
 
     /// A populated server and its recordless twin over the same durable
     /// bytes, so any difference is the blanked field and nothing else.
@@ -1062,6 +1063,15 @@ mod clause_one_exit_proof {
         (populated, recordless)
     }
 
+    /// A remote-only published project PLUS an attached one.
+    ///
+    /// The attached project is what gives this whole proof teeth. With only
+    /// a remote-only project, `records` is empty on the POPULATED twin too,
+    /// so every equality below compares two identical empty views and holds
+    /// no matter what the code does with the attached-row view. Mutation
+    /// testing caught exactly that: a corpus path made to bail when
+    /// `records` was empty still passed. The populated twin must genuinely
+    /// carry rows for the comparison to mean anything.
     fn fixture_with_content() -> CatalogFixture {
         let fixture = CatalogFixture::new();
         let scope = CatalogFixture::scope(".");
@@ -1072,6 +1082,20 @@ mod clause_one_exit_proof {
             COMMIT_ONE,
             &[knowledge_entry("knowledge-a", "published")],
             &[gap_note("gap-11111111", "published")],
+        );
+
+        let attached_scope = CatalogFixture::scope("attached");
+        fixture.add_published_project(ATTACHED_PROJECT, &attached_scope);
+        let checkout = fixture.root().join("clause-one-checkout");
+        std::fs::create_dir_all(checkout.join("attached")).unwrap();
+        fixture.attach_overlay_checkout_at(
+            ATTACHED_PROJECT,
+            &attached_scope,
+            &checkout,
+            &checkout.join("attached"),
+            "att_00000000000000000000000000000d01",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaad01",
+            true,
         );
         fixture
     }
@@ -1136,6 +1160,196 @@ mod clause_one_exit_proof {
             "published gaps must not vary with the attached-row view"
         );
         assert_eq!(actual.diagnostics, expected.diagnostics);
+    }
+
+    /// The plan section 14.1 operation inventory, pinned.
+    ///
+    /// The walk below asserts it executed exactly this list in exactly this
+    /// order. Deleting a row therefore fails rather than silently reducing
+    /// coverage, which is how this proof came to cover two operations while
+    /// claiming twelve.
+    const REQUIRED_OPERATIONS: [&str; 12] = [
+        "lexical search",
+        "hybrid search",
+        "graph inspect",
+        "graph path traversal",
+        "evidence bundle",
+        "entity-ref resolution",
+        "project-file provider",
+        "storage GC",
+        "collected activation and rebuild",
+        "published knowledge",
+        "published gaps",
+        "provenance export plan",
+    ];
+
+    fn rendered(result: &rmcp::model::CallToolResult) -> String {
+        format!("{:?}|{:?}", result.is_error, result.content)
+    }
+
+    /// Build tool params through their own deserializer. These structs
+    /// carry serde defaults but not `Default`, and hand-building seven of
+    /// them would bury the operation list this walk exists to make legible.
+    fn params<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).expect("params deserialize")
+    }
+
+    /// Clause 1 in full: EVERY section 14.1 operation, run against the
+    /// populated server and its recordless twin, compared byte for byte.
+    ///
+    /// Equality is the proof, not success. Several of these operations
+    /// legitimately refuse under `DenyCheckoutAccess` (the file provider
+    /// needs a checkout; the provenance plan needs an authoritative session
+    /// checkout). An identical refusal is exactly as strong a statement as
+    /// an identical success: neither varies with the attached-row view.
+    #[tokio::test]
+    async fn every_corpus_only_operation_is_identical_without_attached_rows() {
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let fixture = fixture_with_content();
+        let (populated, recordless) = twin(&fixture);
+        // Without this the whole comparison is between two empty views.
+        assert!(
+            !populated
+                .state
+                .records_provider
+                .records_snapshot()
+                .records
+                .is_empty(),
+            "the populated twin must genuinely carry attached rows, or every \
+             equality below holds vacuously"
+        );
+        assert!(
+            recordless
+                .state
+                .records_provider
+                .records_snapshot()
+                .records
+                .is_empty()
+        );
+        let mut executed: Vec<&str> = Vec::new();
+
+        macro_rules! compare {
+            ($name:expr, $server:ident => $call:expr) => {{
+                let left = {
+                    let $server = &populated;
+                    $call
+                };
+                let right = {
+                    let $server = &recordless;
+                    $call
+                };
+                assert_eq!(
+                    rendered(&right),
+                    rendered(&left),
+                    "{} varied with the attached-row view",
+                    $name
+                );
+                executed.push($name);
+            }};
+        }
+
+        compare!("lexical search", server => server
+            .bbox_search(Parameters(params(serde_json::json!({"query": "published"}))))
+            .await);
+        compare!("hybrid search", server => server
+            .bbox_hybrid_search(Parameters(params(serde_json::json!({"query": "published"}))))
+            .await);
+        compare!("graph inspect", server => server
+            .bbox_inspect_entity(Parameters(params(
+                serde_json::json!({"entity_ref": "knowledge:knowledge-a"})
+            )))
+            .await);
+        compare!("graph path traversal", server => server
+            .bbox_find_paths(Parameters(params(
+                serde_json::json!({"from": "knowledge:knowledge-a"})
+            )))
+            .await);
+        compare!("evidence bundle", server => server
+            .bbox_bundle_evidence(Parameters(params(serde_json::json!({
+                "question": "what is published?",
+                "entity_refs": ["knowledge:knowledge-a"],
+                "path_ids": [],
+            }))))
+            .await);
+        compare!("entity-ref resolution", server => server
+            .bbox_ref_size(Parameters(params(
+                serde_json::json!({"refs": ["knowledge:knowledge-a"]})
+            )))
+            .await);
+        compare!("project-file provider", server => server
+            .bbox_ref_size(Parameters(params(
+                serde_json::json!({"refs": ["file:src/lib.rs"]})
+            )))
+            .await);
+        compare!("storage GC", server => server
+            .bbox_storage_gc(Parameters(params(serde_json::json!({"dry_run": true}))))
+            .await);
+        compare!("provenance export plan", server => server
+            .bbox_provenance_export_plan(Parameters(params(serde_json::json!({}))))
+            .await);
+
+        // Collected activation and rebuild is not a tool call: it is the
+        // index-side pass that seeds corpus identity from
+        // `corpus_project_ids`, which is the field clause 1 keeps live.
+        let left = populated.rebuild_edge_index_from_stores();
+        let right = recordless.rebuild_edge_index_from_stores();
+        assert_eq!(
+            right.is_ok(),
+            left.is_ok(),
+            "collected activation and rebuild varied with the attached-row view"
+        );
+        executed.push("collected activation and rebuild");
+
+        // The two content-domain reads, compared as structured responses.
+        let expected = populated.session_knowledge_view(None, None).unwrap();
+        let actual = recordless.session_knowledge_view(None, None).unwrap();
+        let ids = expected
+            .knowledge
+            .all_entries()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            !ids.is_empty(),
+            "the fixture publishes knowledge to compare"
+        );
+        assert_eq!(
+            serde_json::to_string(&actual.structured_response(&ids)).unwrap(),
+            serde_json::to_string(&expected.structured_response(&ids)).unwrap(),
+        );
+        executed.push("published knowledge");
+
+        let expected = populated.session_gap_view(None, None).unwrap();
+        let actual = recordless.session_gap_view(None, None).unwrap();
+        assert_eq!(
+            serde_json::to_string(actual.gaps.all()).unwrap(),
+            serde_json::to_string(expected.gaps.all()).unwrap(),
+        );
+        executed.push("published gaps");
+
+        executed.sort();
+        let mut required = REQUIRED_OPERATIONS.to_vec();
+        required.sort();
+        assert_eq!(
+            executed, required,
+            "the section 14.1 inventory and the walk have diverged; a deleted \
+             row cannot silently reduce coverage"
+        );
+
+        // The checkout authority was never granted: clause 1 is a
+        // corpus-only claim and must not have leaned on a lease.
+        for server in [&populated, &recordless] {
+            let granted: u64 = server
+                .state
+                .checkout_access
+                .health()
+                .operations
+                .iter()
+                .map(|operation| operation.granted)
+                .sum();
+            assert_eq!(granted, 0, "clause 1 opened a checkout");
+        }
     }
 
     /// A remote-only project has no attached row in EITHER provider, so
