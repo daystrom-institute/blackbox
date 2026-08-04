@@ -706,7 +706,7 @@ impl SharedState {
         kb.configure_repo_io(
             repo_io.clone(),
             repo_io.clone(),
-            super::repo_io::RepoIoAuthority::knowledge_base_carriers(&repo_projects).unwrap(),
+            super::repo_io::RepoIoAuthority::knowledge_base_carriers(&repo_projects, None).unwrap(),
         )
         .unwrap();
         let kb_store = Arc::new(RwLock::new(kb));
@@ -718,7 +718,7 @@ impl SharedState {
         gaps.configure_repo_io(
             repo_io.clone(),
             repo_io,
-            super::repo_io::RepoIoAuthority::gap_base_carriers(&repo_projects).unwrap(),
+            super::repo_io::RepoIoAuthority::gap_base_carriers(&repo_projects, None).unwrap(),
         )
         .unwrap();
         crate::threads::register_thread_embed_hook(crate::embed_queue::enqueue_thread_hook);

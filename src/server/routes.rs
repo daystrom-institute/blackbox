@@ -2316,7 +2316,12 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
     let repo_io = std::sync::Arc::new(super::repo_io::RepoIoAuthority::new(
         state.checkout_access.clone(),
     ));
-    match super::repo_io::RepoIoAuthority::knowledge_base_carriers(&projects) {
+    let catalog_targets =
+        super::repo_io::CatalogBaseTargets::for_authority(&state.project_authority);
+    match super::repo_io::RepoIoAuthority::knowledge_base_carriers(
+        &projects,
+        catalog_targets.as_ref(),
+    ) {
         Ok(knowledge_carriers) => {
             if let Err(error) = state.kb.write().configure_repo_io(
                 repo_io.clone(),
@@ -2330,7 +2335,7 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
             tracing::warn!("knowledge repository-carrier sync failed: {error:#}");
         }
     }
-    match super::repo_io::RepoIoAuthority::gap_base_carriers(&projects) {
+    match super::repo_io::RepoIoAuthority::gap_base_carriers(&projects, catalog_targets.as_ref()) {
         Ok(gap_carriers) => {
             if let Err(error) =
                 state

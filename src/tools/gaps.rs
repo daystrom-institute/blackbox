@@ -361,7 +361,8 @@ mod tests {
             .configure_repo_io(
                 repo_io.clone(),
                 repo_io,
-                crate::server::repo_io::RepoIoAuthority::gap_base_carriers(&projects).unwrap(),
+                crate::server::repo_io::RepoIoAuthority::gap_base_carriers(&projects, None)
+                    .unwrap(),
             )
             .unwrap();
         let filed = server

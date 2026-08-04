@@ -449,10 +449,18 @@ pub(super) fn open_shared_state(
     // the tool-reference entry and triggers save()): a save with the repo's
     // entries not yet loaded would treat the in-memory set as authoritative and
     // purge the committed .bbox/knowledge files for a repo-owned project.
+    // Catalog-mode base carriers name their attachment natively; the
+    // bridge keeps `Selected`, whose encoding must stay byte-identical.
+    let catalog_base_targets = catalog_store
+        .as_deref()
+        .and_then(super::repo_io::CatalogBaseTargets::for_store);
     if let Err(e) = kb.configure_repo_io(
         repo_io.clone(),
         repo_io.clone(),
-        super::repo_io::RepoIoAuthority::knowledge_base_carriers(&registered_projects)?,
+        super::repo_io::RepoIoAuthority::knowledge_base_carriers(
+            &registered_projects,
+            catalog_base_targets.as_ref(),
+        )?,
     ) {
         tracing::warn!("kb repository-carrier load at startup: {e:#}");
     }
@@ -470,7 +478,10 @@ pub(super) fn open_shared_state(
     if let Err(e) = gaps_store.configure_repo_io(
         repo_io.clone(),
         repo_io,
-        super::repo_io::RepoIoAuthority::gap_base_carriers(&registered_projects)?,
+        super::repo_io::RepoIoAuthority::gap_base_carriers(
+            &registered_projects,
+            catalog_base_targets.as_ref(),
+        )?,
     ) {
         tracing::warn!("gaps repository-carrier load at startup: {e:#}");
     }

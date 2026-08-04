@@ -109,6 +109,10 @@ impl BlackboxServer {
                 );
                 let mut carriers = crate::server::repo_io::RepoIoAuthority::gap_base_carriers(
                     &projects,
+                    crate::server::repo_io::CatalogBaseTargets::for_authority(
+                        &server.state.project_authority,
+                    )
+                    .as_ref(),
                 )?
                 .into_iter()
                 .collect::<BTreeSet<_>>();

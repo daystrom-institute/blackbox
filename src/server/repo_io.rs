@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_corpus_core::project_catalog::{AttachmentKind, AttachmentStatus, ProjectScope};
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
 use bbox_gaps::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 use bbox_indexing::checkout_access::{
@@ -62,6 +63,92 @@ fn decode_target(carrier_id: &str) -> Result<RepoCarrierTarget> {
     serde_json::from_slice(&payload).context("parsing repository carrier id")
 }
 
+/// The native base-attachment target of every catalog project, keyed by
+/// project id.
+///
+/// Catalog-mode base carriers name their attachment outright instead of
+/// re-running the `Selected` ladder at every read (plan section 8, P5-F
+/// repo-I/O item 1). The lookup is total for the rows it serves: the
+/// compatibility projection emits a record only for a project with exactly
+/// one active `Base` attachment, so a record with no entry here means the
+/// catalog changed under the snapshot, not that the target is ambiguous.
+pub(crate) struct CatalogBaseTargets {
+    by_project: BTreeMap<String, (String, Option<PublishedScope>)>,
+}
+
+impl CatalogBaseTargets {
+    /// `None` in bridge mode. A version-1 record names no attachment, so
+    /// `Selected` remains its only resolvable target and its carrier
+    /// encoding stays byte-identical (plan section 8, repo-I/O item 2).
+    pub(crate) fn for_authority(authority: &super::state::ProjectAuthority) -> Option<Self> {
+        Self::for_store(authority.catalog_store()?)
+    }
+
+    /// The same projection from a store handle, for startup paths that open
+    /// the catalog before the runtime authority value exists.
+    pub(crate) fn for_store(
+        store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
+    ) -> Option<Self> {
+        let state = store
+            .snapshot()
+            .map_err(|error| {
+                tracing::warn!(
+                    code = %error.code(),
+                    "catalog base-attachment targets unavailable; carriers fall back to Selected"
+                );
+            })
+            .ok()?;
+        let mut by_project = BTreeMap::new();
+        for attachment in state.attachments().attachments.values() {
+            if attachment.status != AttachmentStatus::Attached
+                || attachment.kind != AttachmentKind::Base
+            {
+                continue;
+            }
+            let project_id = attachment.project_id.as_str().to_string();
+            let scope = state
+                .catalog()
+                .projects
+                .get(&attachment.project_id)
+                .and_then(|project| match &project.scope {
+                    ProjectScope::Published(scope) => Some(scope.clone()),
+                    ProjectScope::LegacyLocal => None,
+                });
+            // A second active base makes the target ambiguous, and the
+            // compatibility projection already omits such a project. Drop
+            // the entry so the carrier is not silently bound to whichever
+            // row iterated last.
+            if by_project
+                .insert(
+                    project_id.clone(),
+                    Some((attachment.attachment_id.as_str().to_string(), scope)),
+                )
+                .is_some()
+            {
+                by_project.insert(project_id, None);
+            }
+        }
+        Some(Self {
+            by_project: by_project
+                .into_iter()
+                .filter_map(|(project_id, target)| Some((project_id, target?)))
+                .collect(),
+        })
+    }
+
+    /// The unambiguous base attachment of one project, or `None` when the
+    /// caller must keep the `Selected` ladder: bridge mode, or a catalog
+    /// project whose base attachment is absent or duplicated. Falling back
+    /// to `Selected` there refuses through the normal ladder instead of
+    /// binding the carrier to a stale attachment id.
+    fn base_attachment(
+        catalog: Option<&Self>,
+        project_id: &str,
+    ) -> Option<(String, Option<PublishedScope>)> {
+        catalog?.by_project.get(project_id).cloned()
+    }
+}
+
 /// Broker-backed adapter shared by the knowledge and gap stores.
 pub(crate) struct RepoIoAuthority {
     broker: Arc<CheckoutAccessBroker>,
@@ -74,30 +161,50 @@ impl RepoIoAuthority {
 
     pub(crate) fn knowledge_base_carriers(
         projects: &[ProjectRecord],
+        catalog: Option<&CatalogBaseTargets>,
     ) -> Result<Vec<KnowledgeRepoCarrier>> {
         projects
             .iter()
             .map(|project| {
-                KnowledgeRepoCarrier::new(
-                    project.canonical_path.clone(),
-                    encode_target(&RepoCarrierTarget::Selected {
-                        project_id: project.project_id.clone(),
-                    })?,
-                )
+                match CatalogBaseTargets::base_attachment(catalog, &project.project_id) {
+                    Some((attachment_id, expected_scope)) => Self::knowledge_attachment_carrier(
+                        project.canonical_path.clone(),
+                        &project.project_id,
+                        &attachment_id,
+                        expected_scope,
+                    ),
+                    None => KnowledgeRepoCarrier::new(
+                        project.canonical_path.clone(),
+                        encode_target(&RepoCarrierTarget::Selected {
+                            project_id: project.project_id.clone(),
+                        })?,
+                    ),
+                }
             })
             .collect()
     }
 
-    pub(crate) fn gap_base_carriers(projects: &[ProjectRecord]) -> Result<Vec<GapRepoCarrier>> {
+    pub(crate) fn gap_base_carriers(
+        projects: &[ProjectRecord],
+        catalog: Option<&CatalogBaseTargets>,
+    ) -> Result<Vec<GapRepoCarrier>> {
         projects
             .iter()
             .map(|project| {
-                GapRepoCarrier::new(
-                    project.canonical_path.clone(),
-                    encode_target(&RepoCarrierTarget::Selected {
-                        project_id: project.project_id.clone(),
-                    })?,
-                )
+                match CatalogBaseTargets::base_attachment(catalog, &project.project_id) {
+                    Some((attachment_id, expected_scope)) => Self::gap_attachment_carrier(
+                        project.canonical_path.clone(),
+                        &project.project_id,
+                        &attachment_id,
+                        expected_scope,
+                    ),
+                    None => GapRepoCarrier::new(
+                        project.canonical_path.clone(),
+                        encode_target(&RepoCarrierTarget::Selected {
+                            project_id: project.project_id.clone(),
+                        })?,
+                    ),
+                }
             })
             .collect()
     }
@@ -139,9 +246,6 @@ impl RepoIoAuthority {
     /// Native catalog knowledge carrier. `display` is stamped onto loaded
     /// entries and is deliberately not authority: resolution uses the
     /// attachment id alone.
-    // Constructed by the catalog carrier call sites converted in P5-F; P5-E
-    // lands the target variant and its resolution path.
-    #[allow(dead_code)]
     pub(crate) fn knowledge_attachment_carrier(
         display: impl Into<String>,
         project_id: &str,
@@ -159,7 +263,6 @@ impl RepoIoAuthority {
     }
 
     /// Gap-side counterpart to [`Self::knowledge_attachment_carrier`].
-    #[allow(dead_code)]
     pub(crate) fn gap_attachment_carrier(
         display: impl Into<String>,
         project_id: &str,
@@ -246,7 +349,23 @@ impl RepoIoAuthority {
                 source_lane,
             })
             .map_err(anyhow::Error::new)?;
+        // Revalidate before publication (plan section 8, P5-F repo-I/O item
+        // 4). A Write-intent lease already pins the mutation lane for its
+        // lifetime, so the fence itself is not what this adds: the guard
+        // re-proves the lease immediately BEFORE the durable bytes land, so
+        // a checkout whose identity changed between acquisition and write is
+        // refused instead of written to. A read publishes nothing and needs
+        // only its closing revalidation.
+        let publication = match intent {
+            CheckoutAccessIntent::Write => Some(
+                self.broker
+                    .publication_guard(&lease)
+                    .map_err(anyhow::Error::new)?,
+            ),
+            CheckoutAccessIntent::Read => None,
+        };
         let outcome = operation(lease.project_root());
+        drop(publication);
         self.broker.revalidate(&lease).map_err(anyhow::Error::new)?;
         outcome
     }
@@ -709,5 +828,233 @@ mod tests {
             .to_string();
         assert!(error.contains("not confined"));
         assert!(!called);
+    }
+
+    fn record(project_id: &str, canonical_path: &str) -> ProjectRecord {
+        ProjectRecord {
+            project_id: project_id.into(),
+            repo_id: None,
+            canonical_path: canonical_path.into(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+            aliases: Default::default(),
+        }
+    }
+
+    /// Insert one published project with one active base attachment and
+    /// return the opened store. Built locally rather than through the
+    /// shared catalog fixture, which lives in the server-state test module
+    /// and owns a whole `SharedState`.
+    fn catalog_store_with_base_attachment(
+        root: &Path,
+        project_id: &str,
+        attachment_id: &str,
+        kind: AttachmentKind,
+    ) -> bbox_indexing::project_catalog_store::ProjectCatalogStore {
+        use bbox_corpus_core::project_catalog::{
+            AttachmentCapabilities, CheckoutAttachment, CorpusProject, ProjectId,
+        };
+
+        let checkout_dir = root.join("checkout");
+        std::fs::create_dir_all(&checkout_dir).unwrap();
+        let store = bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            &root.join("projects.json"),
+        )
+        .unwrap();
+        let scope = PublishedScope::try_new("repo_example", ".").unwrap();
+        let parsed_project = ProjectId::parse(project_id).unwrap();
+        let parsed_attachment =
+            bbox_corpus_core::project_catalog::AttachmentId::parse(attachment_id).unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |catalog, attachments| {
+                catalog.projects.insert(
+                    parsed_project.clone(),
+                    CorpusProject {
+                        project_id: parsed_project.clone(),
+                        scope: ProjectScope::Published(scope.clone()),
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: project_id.to_string(),
+                        created_at: "2026-07-25T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                attachments.attachments.insert(
+                    parsed_attachment.clone(),
+                    CheckoutAttachment {
+                        attachment_id: parsed_attachment.clone(),
+                        project_id: parsed_project.clone(),
+                        checkout_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01".into(),
+                        checkout_dir: checkout_dir.to_string_lossy().into_owned(),
+                        checkout_project_dir: checkout_dir.to_string_lossy().into_owned(),
+                        project_root_relpath: ".".into(),
+                        kind,
+                        validated_scope: Some(scope.clone()),
+                        computed_repo_hint: None,
+                        branch_ref: Some("refs/heads/main".into()),
+                        capabilities: AttachmentCapabilities {
+                            repo_knowledge: true,
+                            ..Default::default()
+                        },
+                        status: AttachmentStatus::Attached,
+                        attached_at: "2026-08-03T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+    }
+
+    /// In catalog mode a base carrier names its attachment outright, so the
+    /// read it drives takes one native lease and no scope-discovery lease.
+    #[test]
+    fn catalog_base_carriers_name_the_native_attachment() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store_with_base_attachment(
+            &root,
+            "project-1",
+            "att_00000000000000000000000000000a01",
+            AttachmentKind::Base,
+        );
+        let targets = CatalogBaseTargets::for_store(&store).expect("catalog mode");
+
+        let carriers = RepoIoAuthority::knowledge_base_carriers(
+            &[record("project-1", "/display/only")],
+            Some(&targets),
+        )
+        .unwrap();
+        assert_eq!(carriers.len(), 1);
+        assert_eq!(
+            decode_target(&carriers[0].carrier_id).unwrap(),
+            RepoCarrierTarget::Attachment {
+                project_id: "project-1".into(),
+                attachment_id: "att_00000000000000000000000000000a01".into(),
+                expected_scope: Some(PublishedScope::try_new("repo_example", ".").unwrap()),
+            }
+        );
+
+        let gap_carriers = RepoIoAuthority::gap_base_carriers(
+            &[record("project-1", "/display/only")],
+            Some(&targets),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_target(&gap_carriers[0].carrier_id).unwrap(),
+            decode_target(&carriers[0].carrier_id).unwrap(),
+            "both lanes name the same attachment"
+        );
+    }
+
+    /// A non-base attachment is not a base carrier target: the compatibility
+    /// projection omits such a project, and binding the carrier to a
+    /// worktree would make the base store follow the wrong checkout.
+    #[test]
+    fn a_worktree_only_project_keeps_the_selected_base_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store_with_base_attachment(
+            &root,
+            "project-1",
+            "att_00000000000000000000000000000a01",
+            AttachmentKind::Worktree,
+        );
+        let targets = CatalogBaseTargets::for_store(&store).expect("catalog mode");
+
+        let carriers = RepoIoAuthority::knowledge_base_carriers(
+            &[record("project-1", "/display/only")],
+            Some(&targets),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_target(&carriers[0].carrier_id).unwrap(),
+            RepoCarrierTarget::Selected {
+                project_id: "project-1".into(),
+            }
+        );
+    }
+
+    /// Bridge carrier encoding stays byte-identical: a version-1 record
+    /// names no attachment, so `Selected` is still its only target (plan
+    /// section 8, repo-I/O item 2).
+    #[test]
+    fn bridge_base_carriers_keep_the_selected_encoding_byte_for_byte() {
+        let records = [record("project-1", "/a"), record("project-2", "/b")];
+        let knowledge = RepoIoAuthority::knowledge_base_carriers(&records, None).unwrap();
+        let gaps = RepoIoAuthority::gap_base_carriers(&records, None).unwrap();
+        for (index, project) in records.iter().enumerate() {
+            let expected = encode_target(&RepoCarrierTarget::Selected {
+                project_id: project.project_id.clone(),
+            })
+            .unwrap();
+            assert_eq!(knowledge[index].carrier_id, expected);
+            assert_eq!(gaps[index].carrier_id, expected);
+            assert_eq!(knowledge[index].project, project.canonical_path);
+        }
+    }
+
+    /// A durable write re-proves its lease BEFORE the bytes land; a read
+    /// does not need to. The observable is the number of authority
+    /// resolutions completed by the time the callback runs: a write has
+    /// acquired AND revalidated (2), a read has only acquired (1).
+    ///
+    /// Note what is deliberately NOT the observable here: a Write-intent
+    /// lease already holds a mutation pin for its whole lifetime, so
+    /// `lifecycle_mutation_guard` reports LifecycleBusy during any write
+    /// with or without the publication guard, and would pass against a
+    /// build that never took the guard at all.
+    #[test]
+    fn durable_writes_revalidate_before_publication_and_reads_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (authority, requests) = recording_authority(&root);
+        let carrier = RepoIoAuthority::knowledge_attachment_carrier(
+            "display-only",
+            "project-1",
+            "att_00000000000000000000000000000a01",
+            Some(PublishedScope::try_new("repo-1", ".").unwrap()),
+        )
+        .unwrap();
+
+        let mut resolves_before_write = None;
+        let mut write = |_resolved: &Path| {
+            resolves_before_write = Some(requests.lock().unwrap().len());
+            Ok(())
+        };
+        KnowledgeRepoWrite::with_write(&authority, &carrier, &mut write).unwrap();
+        assert_eq!(
+            resolves_before_write,
+            Some(2),
+            "a durable write re-proves its lease before the bytes land"
+        );
+        let write_requests = requests.lock().unwrap().drain(..).collect::<Vec<_>>();
+        assert!(
+            write_requests.iter().all(|request| {
+                request.kind == CheckoutAccessKind::RepositoryMutation
+                    && request.intent == CheckoutAccessIntent::Write
+                    && request.source_lane == CheckoutAccessSourceLane::NativeAttachment
+            }),
+            "{write_requests:#?}"
+        );
+
+        let mut resolves_before_read = None;
+        let mut read = |_resolved: &Path| {
+            resolves_before_read = Some(requests.lock().unwrap().len());
+            Ok(())
+        };
+        KnowledgeRepoRead::with_read(&authority, &carrier, &mut read).unwrap();
+        assert_eq!(
+            resolves_before_read,
+            Some(1),
+            "a read publishes nothing and needs only its closing revalidation"
+        );
     }
 }
