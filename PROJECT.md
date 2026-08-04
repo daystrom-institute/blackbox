@@ -171,6 +171,16 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   `~/repos/bbox-cage/build/submit-bbox-verify.sh --ref <ref>`. Local
   full-suite runs are the fallback, not the default, and running someone
   else's ref locally is an anti-pattern.
+  - Reading results: the `--watch` submit exits 0 regardless of outcome;
+    the workflow phase in its printed step tree is the verdict. On any red,
+    triage with `~/repos/bbox-cage/build/verify-triage.sh <workflow-name>`
+    first - never hand-roll log pipelines per incident.
+  - A red at a sha whose lane gates are green is not presumptively code:
+    resubmit the same sha (red-green = flaky test; deterministic red-red =
+    environmental), and check whether a base regen landed between the last
+    green and first red - the cluster's warm-base rotation can mint bad
+    artifacts that every subsequent clone inherits. The remedy table in
+    `~/repos/bbox-cage/build/README.md` covers both cases.
 - **linux/amd64 images** build on the cluster:
   `~/repos/bbox-cage/build/submit-bbox-build.sh --ref <ref>` (native amd64
   in a warm ZFS clone; QEMU emulation and controller-host docker builds are
