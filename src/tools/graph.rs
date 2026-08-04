@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -689,6 +689,36 @@ fn acquire_provenance_projects(
     Ok((leases, inputs))
 }
 
+/// The projects a legacy provenance operation actually leased.
+fn leased_provenance_projects(
+    inputs: &[mcp_tools::provenance::ProvenanceProject],
+) -> BTreeSet<String> {
+    inputs
+        .iter()
+        .map(|input| input.project_id.clone())
+        .collect()
+}
+
+/// Authorize one legacy provenance anchor for re-identification.
+///
+/// Authority is the set of projects this operation already leased, not the
+/// compatibility projection. The projection carries only each project's
+/// unique active BASE attachment, so a catalog project attached solely
+/// through a worktree is absent from it; resolving through it refused that
+/// project's anchors even though its `ProvenanceNoteIo` lease had just
+/// succeeded, which is the P5-E residual this closes.
+fn authorize_legacy_provenance_target(
+    authorized: &BTreeSet<String>,
+    project_id: &str,
+) -> Result<()> {
+    if !authorized.contains(project_id) {
+        bail!(
+            "error.project_mismatch: provenance target names a project this import did not lease"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::graph_tools()
 }
@@ -1201,14 +1231,15 @@ impl BlackboxServer {
                 CheckoutAccessIntent::Read,
             )?;
             let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
+            let authorized_projects = leased_provenance_projects(&inputs);
             let resolve_legacy_target =
                 |project_id: &str,
                  root: &Path,
                  absolute_path: &Path,
                  byte_range: Option<(u64, u64)>| {
-                    let project = unique_project(&projects, project_id)?;
+                    authorize_legacy_provenance_target(&authorized_projects, project_id)?;
                     bbox_indexing::index::resolve_current_project_chunk_entity(
-                        &project.project_id,
+                        project_id,
                         root,
                         absolute_path,
                         byte_range,
@@ -2687,5 +2718,69 @@ mod catalog_adapter_tests {
         // A project with no pinned overlay has no commit evidence to require.
         require_snapshot_commit(&std::collections::BTreeMap::new(), PROJECT_ONE, &checkout)
             .unwrap();
+    }
+
+    /// The P5-E residual: a catalog project whose only active attachment is
+    /// a WORKTREE is absent from the compatibility projection (that carries
+    /// each project's unique active BASE attachment only), so legacy
+    /// provenance re-identification refused its anchors even though the
+    /// ProvenanceNoteIo lease for that very project had just succeeded.
+    ///
+    /// Authority is the leased set, so both halves are asserted here: the
+    /// projection still omits the project, and the anchor is still
+    /// authorized.
+    #[test]
+    fn legacy_provenance_authorizes_a_worktree_only_catalog_project() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        fixture.attach(AttachSpec {
+            project_id: PROJECT_ONE,
+            attachment_id: ATTACHMENT_ONE,
+            dir_name: "worktree-one",
+            kind: AttachmentKind::Worktree,
+            status: AttachmentStatus::Attached,
+            capabilities: capabilities(&[CheckoutAccessKind::ProvenanceNoteIo]),
+            scope: Some(CatalogAdapters::scope("repo-one")),
+            default_for_project: false,
+        });
+        let server = fixture.server();
+
+        let snapshot = server.state.records_provider.records_snapshot();
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .all(|record| record.project_id != PROJECT_ONE),
+            "the cause: the compatibility projection carries base attachments only"
+        );
+        assert!(
+            snapshot.corpus_project_ids.contains(PROJECT_ONE),
+            "the project is nonetheless a catalog project"
+        );
+
+        let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
+        let (leases, inputs) = acquire_provenance_projects(
+            &server,
+            &broker,
+            &ProvenanceParams {
+                project_id: Some(PROJECT_ONE.to_string()),
+            },
+            &snapshot.records,
+            CheckoutAccessIntent::Read,
+        )
+        .expect("the worktree attachment records provenance_note_io");
+        assert_eq!(leases.len(), 1);
+
+        let authorized = leased_provenance_projects(&inputs);
+        assert!(authorized.contains(PROJECT_ONE));
+        authorize_legacy_provenance_target(&authorized, PROJECT_ONE)
+            .expect("a leased project's anchors are re-identifiable");
+
+        // An unleased project is still refused: the lease set is authority,
+        // not a rubber stamp.
+        let error = authorize_legacy_provenance_target(&authorized, PROJECT_TWO)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("error.project_mismatch"), "{error}");
     }
 }
