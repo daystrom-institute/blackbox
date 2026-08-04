@@ -73,15 +73,51 @@ catalog_sources() {
     git ls-files "${globs[@]}"
 }
 
-# Test modules are exempt per the section 14.2 allowlist, so each file is
-# truncated at its first `#[cfg(test)]` or `#![cfg(test)]`. Both forms
-# matter: the inner attribute makes a WHOLE file test-only, so missing it
-# scans an entire test file as runtime code.
+# Test modules are exempt per the section 14.2 allowlist. The exemption
+# removes the test item's SPAN, not the rest of the file: truncating at the
+# first marker made every production item BELOW a test module invisible,
+# which in this tree hid thousands of lines across dozens of files, and the
+# hidden code was exempt while only the test module was ever inventoried.
+#
+# Span ends are found by indentation, not brace counting. rustfmt is a
+# repo gate, so an item's closing brace sits at the item's own indentation;
+# brace counting would instead be fooled by the braces inside raw string
+# literals, which this tree has (embedded JSON and source fixtures).
+#
+# `#![cfg(test)]` is the inner form: it makes the WHOLE file test-only, so
+# nothing after it is production.
 runtime_body() {
     awk '
-        /^#!?\[cfg\(test\)\]/ { exit }
+        /^#!\[cfg\(test\)\]/ { exit }
         /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
-        { print }
+        {
+            if (in_span) {
+                if ($0 == span_end) in_span = 0
+                next
+            }
+            if ($0 ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+                indent = $0
+                sub(/#.*$/, "", indent)
+                pending = 1
+                pending_indent = indent
+                next
+            }
+            if (pending) {
+                # Consume any further attributes, then the item header. A
+                # multi-line signature keeps the pending state until its
+                # opening brace or its terminating semicolon appears.
+                if ($0 ~ /^[[:space:]]*#\[/) next
+                if ($0 ~ /\{/) {
+                    in_span = 1
+                    span_end = pending_indent "}"
+                    pending = 0
+                    next
+                }
+                if ($0 ~ /;[[:space:]]*$/) { pending = 0; next }
+                next
+            }
+            print
+        }
     ' "$1"
 }
 
@@ -102,11 +138,14 @@ declare -a PATTERNS=(
     # Bridge repository carriers. Phase 6: delete the Selected/Checkout
     # variants and leave Attachment as the only target.
     "repo_io_selected_target|RepoCarrierTarget::(Selected|Checkout)"
-    # Plan 14.2: direct checkout-root filesystem access. A checkout root
-    # only legitimately enters runtime code through a lease accessor, so
-    # every site naming one is inventoried and must justify itself.
+    # Plan 14.2: direct checkout-root filesystem access. Every DURABLE path
+    # carrier is tracked, not just the ones a first pass noticed:
+    # `checkout_project_dir` is the catalog's primary carrier and reaches
+    # more runtime consumers than `checkout_dir` does, so omitting it left
+    # a filesystem open rooted there invisible here AND allowed by clippy
+    # in the modules where blocking I/O is deliberately sanctioned.
     # Phase 6: these collapse into the lease's confined readers.
-    "checkout_root_path|\\.checkout_dir|\\.checkout_root\\(\\)|\\.project_root\\(\\)"
+    "checkout_root_path|\\.checkout_dir|\\.checkout_project_dir|\\.checkout_root\\(\\)|\\.project_root\\(\\)"
     # Plan 14.2: direct Git process calls. The sanctioned path is the
     # verified-commit wrapper in bbox-corpus-core::git, which takes an
     # already-validated root. Phase 6: no direct spawns outside it.
