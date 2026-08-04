@@ -64,7 +64,14 @@ observable behavior change. Checklist:
    `reqwest-tls-no-provider`).
 2. Add `rust-version = "1.88"` to the root package.
 3. `with_stateful_mode(true)` -> `with_legacy_session_mode(true)`
-   (`src/server/mcp.rs`).
+   (`src/server/mcp.rs`). Session-manager guidance, corrected by the spike:
+   the dual-stack endpoint keeps `LocalSessionManager` (it serves
+   2026-07-28 requests statelessly regardless of the legacy-mode flag).
+   `NeverSessionManager` is NOT compatible with
+   `with_legacy_session_mode(true)`: its `create_session` always fails and
+   legacy `initialize` routes through that method. Reserve
+   `NeverSessionManager` for a pure-stateless deployment once legacy
+   clients are gone.
 4. `Meta` -> `RequestMetaObject` at the extractor and `RequestContext.meta`
    call sites (`dispatch.rs`, `workspace.rs`, `handler.rs`).
    `get_progress_token()` survives on `RequestMetaObject`.
@@ -182,6 +189,13 @@ into listen:
 - `resourcesListChanged` if Phase 4 has landed.
 - Harness children switch from bro_wait polling to listen + task handles;
   bro_wait remains the Tier 0 floor for all other clients.
+- SDK gap confirmed by the spike (rmcp 3.1): `SubscriptionFilter` has no
+  task category, `SubscriptionSink::send` rejects `notifications/tasks`,
+  and the client `Subscription` rejects them too. Options: (a) custom glue
+  sending task notifications on the active listen response stream, which
+  the spike demonstrates working, or (b) an upstream rmcp contribution
+  wiring the tasks category properly. Prefer (b) if the timeline allows;
+  (a) is the proven fallback but is not the final conformance shape.
 
 ## Phase 4: resource projection
 
@@ -266,6 +280,35 @@ Strings show what is bundled, not what is negotiated. Phase 0 should add a
 one-line trace log of client `protocolVersion` + capabilities at
 `initialize` so the tripwire measures negotiated reality, and so old-flavor
 tasks clients are visible in production telemetry.
+
+## Spike findings (rmcp 3.1, branch `spike/rmcp-3-exemplar`)
+
+A standalone exemplar crate (`spikes/rmcp-3-exemplar/`, detached workspace)
+exercises every mechanic in this plan: dual-stack stateless/legacy serving,
+per-request scope extraction, the strict tasks dual-shape gate, listen,
+MRTR with HMAC requestState, the resource plane with cursor pagination,
+cache hints, deterministic tools/list, and Tier-0 progress. Six integration
+tests green; `cargo run --bin demo_client` prints a narrated walkthrough of
+all nine mechanics. Verified independently lane-side 2026-08-04.
+
+Friction items the spike surfaced (full writeup in the spike README):
+
+1. `NeverSessionManager` and working legacy sessions are mutually exclusive,
+   even with `with_legacy_session_mode(true)` (corrected in Phase 0 item 3
+   above; the original draft of this plan had the pair wrong).
+2. `SubscriptionFilter` has no task IDs or task notification category.
+3. `SubscriptionSink::send` rejects `notifications/tasks`.
+4. The client `Subscription` also rejects task notifications on the listen
+   stream. (Items 2-4 shape Phase 3; see the options there.)
+5. The client peer overwrites a caller-supplied progress token with its
+   internal `ProgressTokenProvider` value before sending. Server-side echo
+   (our `progress.rs` pattern) is unaffected, but harness client code must
+   not assume it controls the token value.
+6. `ServerInfo`/`ClientInfo` are non-exhaustive aliases: constructors and
+   fluent setters, no struct literals (mechanical, Phase 0 tail).
+7. Modern lifecycle metadata validation is strict: a client advertising
+   2026-07-28 without the required request `_meta` gets `-32602`. Matters
+   for hand-rolled clients and for our harness client's modern path.
 
 ## References
 
