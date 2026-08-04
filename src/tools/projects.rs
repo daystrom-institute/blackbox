@@ -17,6 +17,7 @@ use crate::server::routes::{
     migrate_project_refs, project_ref_counts, trigger_project_bootstrap_arc,
 };
 use crate::server::state::BlackboxServer;
+use crate::tools::project_catalog::CatalogPathAuthority;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -674,18 +675,25 @@ impl BlackboxServer {
             // rule: once a selector resolves the path to a catalog project,
             // the same scaffolding writes are a catalog-targeted mutation and
             // take RepositoryMutation under the publication guard.
-            let attached_project =
-                server
-                    .state
-                    .project_authority
-                    .catalog_store()
-                    .and_then(|store| {
-                        let canonical = canonical_init_target(path)?;
-                        server
-                            .catalog_project_for_attached_path(store, &canonical.to_string_lossy())
-                    });
-            let result = match attached_project {
-                Some(project_id) => {
+            let authority = match server.state.project_authority.catalog_store() {
+                None => CatalogPathAuthority::Absent,
+                Some(store) => match canonical_init_target(path) {
+                    Some(canonical) => {
+                        server.catalog_path_authority(store, &canonical.to_string_lossy())
+                    }
+                    // The path exists but will not canonicalize, so it cannot
+                    // be compared against catalog authority at all. Unproved
+                    // is not unregistered.
+                    None => CatalogPathAuthority::Unreadable {
+                        code: "error.project_catalog_admin_path".into(),
+                        diagnostic: format!("{} could not be canonicalized", path.display()),
+                    },
+                },
+            };
+            let result = match authority {
+                // Bootstrap: no attachment row at any status knows this path.
+                CatalogPathAuthority::Absent => init_project_path(path, p.force)?,
+                CatalogPathAuthority::Attached(project_id) => {
                     let lease = crate::server::checkout_access::acquire_project_mutation_lease(
                         &server,
                         &project_id,
@@ -706,7 +714,14 @@ impl BlackboxServer {
                         .map_err(anyhow::Error::new)?;
                     result
                 }
-                None => init_project_path(path, p.force)?,
+                CatalogPathAuthority::Governed { diagnostic } => anyhow::bail!(
+                    "error.project_attachment_required: {diagnostic}; scaffolding a governed \
+                     checkout requires an active attachment recording repo_mutation"
+                ),
+                CatalogPathAuthority::Unreadable { code, diagnostic } => anyhow::bail!(
+                    "{code}: catalog authority is unreadable, so this path cannot be proved \
+                     unregistered ({diagnostic})"
+                ),
             };
             // Catalog arm (plan §9.1): init stays a filesystem initializer;
             // newly recorded authority inside a checkout attached to a
@@ -1878,6 +1893,122 @@ mod tests {
                 !checkout.join(".bbox/workflows").exists(),
                 "a refused catalog-targeted init must write nothing"
             );
+        }
+
+        /// F2: a DETACHED attachment still governs its checkout path. The
+        /// resolver only considers active attachments, so its refusal used
+        /// to read as "unregistered" and took the lease-free bootstrap into
+        /// a tree the catalog still governs.
+        #[tokio::test]
+        async fn init_into_a_detached_attachment_path_refuses_instead_of_bootstrapping() {
+            let fixture = CatalogFixture::new();
+            let scope = CatalogFixture::scope(".");
+            fixture.add_published_project(PROJECT, &scope);
+            let directory = tempdir().unwrap();
+            let checkout = directory.path().canonicalize().unwrap().join("checkout");
+            std::fs::create_dir_all(&checkout).unwrap();
+            fixture.attach_overlay_checkout(
+                PROJECT,
+                &scope,
+                &checkout,
+                "att_00000000000000000000000000000f01",
+                "ffffffffffffffffffffffffffffff01",
+                true,
+            );
+            let server = fixture.server_with_checkout_authority();
+            CatalogFixture::detach_in_server(&server, "att_00000000000000000000000000000f01");
+
+            let result = server
+                .bbox_project_init(Parameters(ProjectInitParams {
+                    path: checkout.to_string_lossy().into_owned(),
+                    force: false,
+                }))
+                .await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = text(&result);
+            assert!(text.contains("error.project_attachment_required"), "{text}");
+            assert!(
+                !checkout.join(".bbox/workflows").exists(),
+                "a governed checkout must not be scaffolded lease-free"
+            );
+        }
+
+        /// F2: a subdirectory of a governed checkout is governed too. No row
+        /// names it exactly, so an exact-match test would let it bootstrap.
+        #[tokio::test]
+        async fn init_inside_a_governed_checkout_refuses() {
+            let fixture = CatalogFixture::new();
+            let scope = CatalogFixture::scope(".");
+            fixture.add_published_project(PROJECT, &scope);
+            let directory = tempdir().unwrap();
+            let checkout = directory.path().canonicalize().unwrap().join("checkout");
+            let nested = checkout.join("crates").join("inner");
+            std::fs::create_dir_all(&nested).unwrap();
+            fixture.attach_overlay_checkout(
+                PROJECT,
+                &scope,
+                &checkout,
+                "att_00000000000000000000000000000f01",
+                "ffffffffffffffffffffffffffffff01",
+                true,
+            );
+            let server = fixture.server_with_checkout_authority();
+            CatalogFixture::detach_in_server(&server, "att_00000000000000000000000000000f01");
+
+            let result = server
+                .bbox_project_init(Parameters(ProjectInitParams {
+                    path: nested.to_string_lossy().into_owned(),
+                    force: false,
+                }))
+                .await;
+
+            assert_eq!(result.is_error, Some(true));
+            assert!(!nested.join(".bbox/workflows").exists());
+        }
+
+        /// F2: the authority projection itself, at each arm. Absent is the
+        /// only bootstrap-eligible verdict.
+        #[test]
+        fn catalog_path_authority_separates_absent_from_governed() {
+            let fixture = CatalogFixture::new();
+            let scope = CatalogFixture::scope(".");
+            fixture.add_published_project(PROJECT, &scope);
+            let directory = tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let checkout = root.join("checkout");
+            std::fs::create_dir_all(&checkout).unwrap();
+            let elsewhere = root.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            fixture.attach_overlay_checkout(
+                PROJECT,
+                &scope,
+                &checkout,
+                "att_00000000000000000000000000000f01",
+                "ffffffffffffffffffffffffffffff01",
+                true,
+            );
+            let server = fixture.server_with_checkout_authority();
+            let store = server
+                .state
+                .project_authority
+                .catalog_store()
+                .expect("catalog authority");
+
+            assert_eq!(
+                server.catalog_path_authority(store, &checkout.to_string_lossy()),
+                CatalogPathAuthority::Attached(PROJECT.to_string())
+            );
+            assert_eq!(
+                server.catalog_path_authority(store, &elsewhere.to_string_lossy()),
+                CatalogPathAuthority::Absent
+            );
+
+            CatalogFixture::detach_in_server(&server, "att_00000000000000000000000000000f01");
+            assert!(matches!(
+                server.catalog_path_authority(store, &checkout.to_string_lossy()),
+                CatalogPathAuthority::Governed { .. }
+            ));
         }
     }
 }

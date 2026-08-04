@@ -403,6 +403,52 @@ fn probe_attachment_scopes(
 
 // ── Tools ───────────────────────────────────────────────────────────────
 
+/// What catalog attachment authority knows about an absolute checkout path.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CatalogPathAuthority {
+    /// One active attachment resolves the path to this project.
+    Attached(String),
+    /// Catalog attachment rows govern this path, but no ACTIVE attachment
+    /// resolves it: detached, ambiguous, or otherwise unusable. Not a
+    /// bootstrap case, and not something a lease can be named for either.
+    Governed { diagnostic: String },
+    /// Catalog authority could not be read, so nothing about the path is
+    /// proved. Not a bootstrap case.
+    Unreadable { code: String, diagnostic: String },
+    /// No attachment row at any status names or contains this path. This is
+    /// the plan 4.19 bootstrap case and the ONLY one.
+    Absent,
+}
+
+/// Whether any attachment row, at ANY status, names or contains the path.
+///
+/// Containment counts deliberately: a subdirectory of an attached checkout
+/// is governed by that attachment even though no row names it exactly, and
+/// scaffolding it lease-free would write inside a governed tree.
+fn attachment_row_governing(
+    state: &bbox_indexing::project_catalog_store::ProjectCatalogState,
+    canonical_path: &str,
+) -> Option<String> {
+    let candidate = Path::new(canonical_path);
+    state
+        .attachments()
+        .attachments
+        .values()
+        .find(|attachment| {
+            [&attachment.checkout_dir, &attachment.checkout_project_dir]
+                .into_iter()
+                .any(|root| candidate.starts_with(Path::new(root)))
+        })
+        .map(|attachment| {
+            format!(
+                "path is governed by attachment {} of project {} (status {:?})",
+                attachment.attachment_id.as_str(),
+                attachment.project_id.as_str(),
+                attachment.status,
+            )
+        })
+}
+
 #[tool_router(router = project_catalog_tools)]
 impl BlackboxServer {
     fn catalog_store(&self) -> Option<Arc<ProjectCatalogStore>> {
@@ -1789,28 +1835,47 @@ impl BlackboxServer {
     /// `bbox_project_init` catalog follow-up: when init newly records repo
     /// authority inside a checkout attached to a `LegacyLocal` project,
     /// promotion is the required next action (plan §9.1).
-    /// The catalog project an absolute checkout path already resolves to.
+    /// What catalog authority says about an absolute checkout path.
     ///
-    /// `None` is the bootstrap case fixed by plan section 4.19: the path
-    /// carries no attachment yet, so `bbox_project_init` may scaffold it
-    /// without a lease. Attach needs the identity-bearing config this call
-    /// creates, so requiring an attachment first would be circular. Once a
-    /// selector does resolve, the same writes are a catalog-targeted
-    /// mutation and take `RepositoryMutation` like any other.
-    pub(crate) fn catalog_project_for_attached_path(
+    /// The distinction is load-bearing for the plan 4.19 bootstrap
+    /// exception: ONLY a path that catalog authority does not know at all
+    /// may be scaffolded without a `RepositoryMutation` lease. Collapsing
+    /// every failure into "unregistered" would let a detached attachment,
+    /// an ambiguous selector, or an unreadable catalog take the lease-free
+    /// path and write into a checkout the catalog still governs.
+    pub(crate) fn catalog_path_authority(
         &self,
         store: &Arc<ProjectCatalogStore>,
         canonical_path: &str,
-    ) -> Option<String> {
-        let state = store.snapshot().ok()?;
+    ) -> CatalogPathAuthority {
+        let state = match store.snapshot() {
+            Ok(state) => state,
+            Err(error) => {
+                return CatalogPathAuthority::Unreadable {
+                    code: error.code().to_string(),
+                    diagnostic: error.to_string(),
+                };
+            }
+        };
         let engine = ProjectResolverEngine::v2(state.catalog(), state.attachments());
-        let resolved = engine
-            .resolve_attached(&ProjectSelectorRequest::selection(
-                canonical_path.to_string(),
-                bbox_corpus_core::project_selector::ResolveIntent::Write,
-            ))
-            .ok()?;
-        Some(resolved.project.project_id().to_owned())
+        match engine.resolve_attached(&ProjectSelectorRequest::selection(
+            canonical_path.to_string(),
+            bbox_corpus_core::project_selector::ResolveIntent::Write,
+        )) {
+            Ok(resolved) => {
+                CatalogPathAuthority::Attached(resolved.project.project_id().to_owned())
+            }
+            // The resolver considers ACTIVE attachments only, so its refusal
+            // does not prove the catalog is ignorant of this path. Ask the
+            // attachment rows directly, at every status, before conceding
+            // that the path is unregistered.
+            Err(error) => match attachment_row_governing(&state, canonical_path) {
+                Some(governing) => CatalogPathAuthority::Governed {
+                    diagnostic: format!("{governing} ({})", error.code()),
+                },
+                None => CatalogPathAuthority::Absent,
+            },
+        }
     }
 
     pub(crate) fn init_catalog_next_action(
