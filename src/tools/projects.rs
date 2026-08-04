@@ -1071,10 +1071,12 @@ impl BlackboxServer {
             // resolver; the projection row supplies the record shape in
             // both modes.
             let resolved_id = server.validate_project_selection(&p.project)?;
-            let record = server
-                .state
-                .records_provider
-                .records_snapshot()
+            // Records and their exact base-attachment targets from ONE
+            // catalog epoch: the lease this operation takes must name the
+            // same attachment the record and its carriers were derived from.
+            let inputs =
+                crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(&server.state)?;
+            let record = inputs
                 .records
                 .iter()
                 .find(|record| record.project_id == resolved_id)
@@ -1093,7 +1095,6 @@ impl BlackboxServer {
                 }
                 None => anyhow::bail!("project not registered: {}", p.project),
             };
-            let dir = record.canonical_path.clone();
             let dry_run = p.dry_run.unwrap_or(false);
 
             // Ensure the project's repo is in kb roots so already-ejected files
@@ -1101,8 +1102,11 @@ impl BlackboxServer {
             crate::server::routes::sync_kb_project_roots(&server.state);
 
             if dry_run {
-                let entries = server.state.kb.read().count_project_entries(&dir);
-                return Ok::<_, anyhow::Error>((record, dir, true, entries, None, false));
+                // A preview writes nothing, so the record's display path is
+                // the right key to count against and no lease is needed.
+                let preview_dir = record.canonical_path.clone();
+                let entries = server.state.kb.read().count_project_entries(&preview_dir);
+                return Ok::<_, anyhow::Error>((record, preview_dir, true, entries, None, false));
             }
 
             // One RepositoryMutation lease covers every durable write this
@@ -1111,16 +1115,61 @@ impl BlackboxServer {
             // mutation items 2 and 3). Flushing here rather than awaiting the
             // persister after the blocking phase is what puts the central
             // store inside the same fence.
-            let lease = crate::server::checkout_access::acquire_project_mutation_lease(
-                &server,
-                &record.project_id,
-            )
-            .map_err(|refusal| mutation_refusal(&record.project_id, refusal))?;
+            //
+            // In catalog mode the lease names the EXACT base attachment the
+            // destination came from. Going through the ladder here was
+            // checkpoint 2 finding 3: on a base-plus-worktree project a
+            // session or operator default selects the worktree, so the guard
+            // pinned the worktree while the ejection wrote the base.
+            let lease = match inputs.targets.as_ref() {
+                Some(targets) => {
+                    let (attachment_id, expected_scope) = targets
+                        .base_attachment(&record.project_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "error.project_attachment_required: catalog project {} has no \
+                                 unambiguous active base attachment to eject into",
+                                record.project_id
+                            )
+                        })?;
+                    server
+                        .state
+                        .checkout_access
+                        .acquire(bbox_indexing::checkout_access::CheckoutAccessRequest {
+                            project_id: record.project_id.clone(),
+                            attachment:
+                                bbox_indexing::checkout_access::CheckoutAttachmentSelector::AttachmentId(
+                                    attachment_id,
+                                ),
+                            expected_scope,
+                            kind: CheckoutAccessKind::RepositoryMutation,
+                            intent: CheckoutAccessIntent::Write,
+                            source_lane:
+                                bbox_indexing::checkout_access::CheckoutAccessSourceLane::NativeAttachment,
+                        })
+                        .map_err(|error| {
+                            mutation_refusal(
+                                &record.project_id,
+                                crate::server::checkout_access::MutationLeaseRefusal::Lease(error),
+                            )
+                        })?
+                }
+                None => crate::server::checkout_access::acquire_project_mutation_lease(
+                    &server,
+                    &record.project_id,
+                )
+                .map_err(|refusal| mutation_refusal(&record.project_id, refusal))?,
+            };
             let publication = server
                 .state
                 .checkout_access
                 .publication_guard(&lease)
                 .map_err(anyhow::Error::new)?;
+            // Every repository destination is derived from the acquired
+            // lease, so the guard and the writes cannot name different
+            // checkouts. A destination that disagrees with the carrier the
+            // record was built from has no carrier and fails closed below.
+            let dir = lease.project_root().to_string_lossy().into_owned();
             let recorded_repo_id = record
                 .is_git_repo
                 .then(|| config::ensure_recorded_repo_id(lease.project_root()))
@@ -2008,6 +2057,197 @@ mod tests {
                 server.catalog_path_authority(store, &checkout.to_string_lossy()),
                 CatalogPathAuthority::Governed { .. }
             ));
+        }
+
+        /// Attach one row with full control over kind, capabilities, and
+        /// operator-default status. The shared fixture fixes kind to Base and
+        /// sets only repo_knowledge; F3 needs a base PLUS a worktree with
+        /// different capability bits and a default that points at the
+        /// worktree.
+        #[allow(clippy::too_many_arguments)] // one argument per durable attachment field
+        fn attach_row(
+            server: &BlackboxServer,
+            attachment_id: &str,
+            checkout_id: &str,
+            dir: &Path,
+            kind: bbox_corpus_core::project_catalog::AttachmentKind,
+            repo_mutation: bool,
+            default_for_project: bool,
+        ) {
+            use bbox_corpus_core::project_catalog::{
+                AttachmentCapabilities, AttachmentId, AttachmentStatus, CheckoutAttachment,
+                ProjectId,
+            };
+
+            std::fs::create_dir_all(dir.join(".bbox").join("local")).unwrap();
+            std::fs::write(
+                dir.join(".bbox").join("local").join("checkout-id"),
+                format!("{checkout_id}\n"),
+            )
+            .unwrap();
+            let store = server
+                .state
+                .project_authority
+                .catalog_store()
+                .expect("catalog authority");
+            let scope = CatalogFixture::scope(".");
+            let project_id = ProjectId::parse(PROJECT).unwrap();
+            let attachment_id = AttachmentId::parse(attachment_id).unwrap();
+            let dir = dir.to_string_lossy().into_owned();
+            let epoch = store.snapshot().unwrap().epoch();
+            store
+                .transact(epoch, |_catalog, attachments| {
+                    attachments.attachments.insert(
+                        attachment_id.clone(),
+                        CheckoutAttachment {
+                            attachment_id: attachment_id.clone(),
+                            project_id: project_id.clone(),
+                            checkout_id: checkout_id.to_string(),
+                            checkout_dir: dir.clone(),
+                            checkout_project_dir: dir.clone(),
+                            project_root_relpath: ".".into(),
+                            kind,
+                            validated_scope: Some(scope.clone()),
+                            computed_repo_hint: None,
+                            branch_ref: Some("refs/heads/main".into()),
+                            capabilities: AttachmentCapabilities {
+                                repo_knowledge: true,
+                                repo_mutation,
+                                ..Default::default()
+                            },
+                            status: AttachmentStatus::Attached,
+                            attached_at: "2026-08-03T00:00:00Z".into(),
+                            detached_at: None,
+                        },
+                    );
+                    if default_for_project {
+                        attachments
+                            .default_attachments
+                            .insert(project_id.clone(), attachment_id.clone());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        const BASE_ATT: &str = "att_00000000000000000000000000000b01";
+        const WORKTREE_ATT: &str = "att_00000000000000000000000000000b02";
+        const BASE_CO: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01";
+        const WORKTREE_CO: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
+
+        struct BaseAndWorktree {
+            server: BlackboxServer,
+            base: std::path::PathBuf,
+            worktree: std::path::PathBuf,
+            _directory: tempfile::TempDir,
+        }
+
+        /// A project with a base and a worktree, the operator default
+        /// pointing at the WORKTREE - the exact topology F3 names.
+        fn base_plus_worktree(
+            base_repo_mutation: bool,
+            worktree_repo_mutation: bool,
+        ) -> BaseAndWorktree {
+            let fixture = CatalogFixture::new();
+            fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+            let server = fixture.server_with_checkout_authority();
+            let directory = tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let base = root.join("base");
+            let worktree = root.join("worktree");
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::create_dir_all(&worktree).unwrap();
+            // The compatibility record reports is_git_repo, and eject records
+            // a repo_id for a Git project, so the destination has to be one.
+            for dir in [&base, &worktree] {
+                let status = std::process::Command::new("git")
+                    .args(["init", "--initial-branch", "main"])
+                    .current_dir(dir)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            attach_row(
+                &server,
+                BASE_ATT,
+                BASE_CO,
+                &base,
+                bbox_corpus_core::project_catalog::AttachmentKind::Base,
+                base_repo_mutation,
+                false,
+            );
+            attach_row(
+                &server,
+                WORKTREE_ATT,
+                WORKTREE_CO,
+                &worktree,
+                bbox_corpus_core::project_catalog::AttachmentKind::Worktree,
+                worktree_repo_mutation,
+                true,
+            );
+            BaseAndWorktree {
+                server,
+                base,
+                worktree,
+                _directory: directory,
+            }
+        }
+
+        /// F3: the guard must pin the attachment the ejection writes. With
+        /// the operator default on the worktree and repo_mutation absent from
+        /// the BASE, leasing through the ladder succeeded on the worktree
+        /// while the ejection wrote the base. Leasing the exact base
+        /// attachment turns that silent wrong-attachment write into the
+        /// correct capability refusal.
+        #[tokio::test]
+        async fn eject_leases_the_base_not_the_defaulted_worktree() {
+            let topology = base_plus_worktree(false, true);
+
+            let result = topology
+                .server
+                .bbox_project_eject(Parameters(ProjectEjectParams {
+                    project: PROJECT.into(),
+                    dry_run: None,
+                }))
+                .await;
+
+            assert_eq!(result.is_error, Some(true), "{}", text(&result));
+            let text = text(&result);
+            assert!(text.contains("error.project_capability_denied"), "{text}");
+            assert!(
+                !topology.base.join(".bbox/knowledge").exists(),
+                "the base must not be written while its own attachment lacks repo_mutation"
+            );
+            assert!(
+                !topology.worktree.join(".bbox/knowledge").exists(),
+                "the worktree is not the ejection destination either"
+            );
+        }
+
+        /// The complement: the BASE carries repo_mutation and the defaulted
+        /// worktree does not. The ladder would have refused on the worktree;
+        /// leasing the exact destination succeeds and writes the base.
+        #[tokio::test]
+        async fn eject_succeeds_when_the_base_is_capable_and_the_default_is_not() {
+            let topology = base_plus_worktree(true, false);
+
+            let result = topology
+                .server
+                .bbox_project_eject(Parameters(ProjectEjectParams {
+                    project: PROJECT.into(),
+                    dry_run: None,
+                }))
+                .await;
+
+            assert_ne!(result.is_error, Some(true), "{}", text(&result));
+            assert!(
+                topology.base.join(".bbox/knowledge").is_dir(),
+                "ejection writes the base checkout it leased"
+            );
+            assert!(
+                !topology.worktree.join(".bbox/knowledge").exists(),
+                "the defaulted worktree is never the ejection destination"
+            );
         }
     }
 }
