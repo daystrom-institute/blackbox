@@ -1930,7 +1930,7 @@ mod tests {
                 .unwrap();
         let access = Arc::new(TestWatchAccess::default());
         access.insert(carrier.clone(), project.clone());
-        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let catalog = Arc::new(ArtifactCatalog::open(root.join("catalog")).unwrap());
         let mut watcher = reconciling_watcher(access, catalog);
 
         let first = watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
@@ -1956,7 +1956,7 @@ mod tests {
                 .unwrap();
         let access = Arc::new(TestWatchAccess::default());
         access.insert(carrier.clone(), project);
-        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let catalog = Arc::new(ArtifactCatalog::open(root.join("catalog")).unwrap());
         let mut watcher = reconciling_watcher(access, catalog);
         watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
 
@@ -1982,7 +1982,7 @@ mod tests {
                 .unwrap();
         let access = Arc::new(TestWatchAccess::default());
         access.insert(carrier.clone(), original.clone());
-        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let catalog = Arc::new(ArtifactCatalog::open(root.join("catalog")).unwrap());
         let mut watcher = reconciling_watcher(access.clone(), catalog);
         watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
 
@@ -2017,7 +2017,7 @@ mod tests {
         // Not inserted into the fake authority: discovery refuses, exactly
         // as a capability-denied lease would.
         let access = Arc::new(TestWatchAccess::default());
-        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let catalog = Arc::new(ArtifactCatalog::open(root.join("catalog")).unwrap());
         let mut watcher = reconciling_watcher(access, catalog);
 
         let report = watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
@@ -2039,7 +2039,7 @@ mod tests {
         let access = Arc::new(TestWatchAccess::default());
         access.insert(selected.clone(), project.clone());
         access.insert(checkout.clone(), project);
-        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let catalog = Arc::new(ArtifactCatalog::open(root.join("catalog")).unwrap());
         let mut watcher = reconciling_watcher(access, catalog);
         watcher.watch_project(selected.clone()).unwrap();
         watcher.watch_repo_store(checkout.clone()).unwrap();
@@ -2066,7 +2066,7 @@ mod tests {
                 .unwrap();
         let access = Arc::new(TestWatchAccess::default());
         access.insert(carrier.clone(), project);
-        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let catalog = Arc::new(ArtifactCatalog::open(root.join("catalog")).unwrap());
         catalog
             .install_value_scoped(
                 ArtifactScope::Project {

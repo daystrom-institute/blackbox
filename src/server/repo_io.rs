@@ -859,7 +859,7 @@ mod tests {
         let checkout_dir = root.join("checkout");
         std::fs::create_dir_all(&checkout_dir).unwrap();
         let store = bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
-            &root.join("projects.json"),
+            root.join("projects.json"),
         )
         .unwrap();
         let scope = PublishedScope::try_new("repo_example", ".").unwrap();
