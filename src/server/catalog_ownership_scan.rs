@@ -269,8 +269,10 @@ impl<'ast> syn::visit::Visit<'ast> for TestSpans {
         let attrs: &[syn::Attribute] = match node {
             syn::Stmt::Local(local) => &local.attrs,
             syn::Stmt::Macro(mac) => &mac.attrs,
-            syn::Stmt::Expr(expr, _) => expr_attrs(expr),
-            syn::Stmt::Item(_) => &[],
+            // The expression arm is handled by `visit_expr` below, which
+            // sees it at any depth rather than only as the statement's
+            // outer expression.
+            syn::Stmt::Expr(_, _) | syn::Stmt::Item(_) => &[],
         };
         if is_cfg_test(attrs) {
             self.exclude(node.span());
@@ -278,6 +280,112 @@ impl<'ast> syn::visit::Visit<'ast> for TestSpans {
         }
         syn::visit::visit_stmt(self, node);
     }
+
+    /// Every expression, at every depth.
+    ///
+    /// Checking attributes only on a statement's OUTER expression missed a
+    /// gated block used as an array, tuple, call or tuple-struct operand.
+    /// Hooking the expression node itself is the by-construction form of
+    /// the same rule: enumerating operand contexts is the enumeration that
+    /// keeps coming up one short.
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        if is_cfg_test(expr_attrs(node)) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_expr(self, node);
+    }
+
+    /// Function and closure parameters, including `self`.
+    fn visit_fn_arg(&mut self, node: &'ast syn::FnArg) {
+        let attrs: &[syn::Attribute] = match node {
+            syn::FnArg::Receiver(receiver) => &receiver.attrs,
+            syn::FnArg::Typed(typed) => &typed.attrs,
+        };
+        if is_cfg_test(attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_fn_arg(self, node);
+    }
+
+    fn visit_receiver(&mut self, node: &'ast syn::Receiver) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_receiver(self, node);
+    }
+
+    /// Function-pointer parameters, e.g. `fn(#[cfg(test)] u8)`.
+    fn visit_bare_fn_arg(&mut self, node: &'ast syn::BareFnArg) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_bare_fn_arg(self, node);
+    }
+
+    /// Struct-expression fields. `FieldValue` is the initializer side and a
+    /// different node from the declaration-side `Field` above.
+    fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_field_value(self, node);
+    }
+
+    fn visit_pat(&mut self, node: &'ast syn::Pat) {
+        if is_cfg_test(pat_attrs(node)) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_pat(self, node);
+    }
+
+    fn visit_generic_param(&mut self, node: &'ast syn::GenericParam) {
+        let attrs: &[syn::Attribute] = match node {
+            syn::GenericParam::Lifetime(param) => &param.attrs,
+            syn::GenericParam::Type(param) => &param.attrs,
+            syn::GenericParam::Const(param) => &param.attrs,
+        };
+        if is_cfg_test(attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_generic_param(self, node);
+    }
+}
+
+/// Attributes carried by a pattern node.
+fn pat_attrs(pat: &syn::Pat) -> &[syn::Attribute] {
+    macro_rules! arms {
+        ($($variant:ident),* $(,)?) => {
+            match pat {
+                $(syn::Pat::$variant(inner) => &inner.attrs,)*
+                _ => &[],
+            }
+        };
+    }
+    arms!(
+        Const,
+        Ident,
+        Lit,
+        Macro,
+        Or,
+        Paren,
+        Path,
+        Range,
+        Reference,
+        Rest,
+        Slice,
+        Struct,
+        Tuple,
+        TupleStruct,
+        Type,
+        Wild,
+    )
 }
 
 fn item_attrs(item: &syn::Item) -> Option<&Vec<syn::Attribute>> {
