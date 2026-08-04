@@ -51,13 +51,15 @@ pub(crate) struct CatalogPublishedGapCacheEntry {
 pub(crate) struct SessionGapView {
     pub(crate) gaps: GapStore,
     pub(crate) built_from: BuiltFromTable,
-    /// Includes the bounded reason for every checkout `all` omitted.
-    ///
-    /// The knowledge lane also carries those reasons as typed rows in its
-    /// structured response; the gap response is assembled by its tool from
-    /// this channel alone, so one bounded line per omitted peer is the
-    /// whole report here.
     pub(crate) diagnostics: Vec<String>,
+    /// Checkouts `all` omitted because they could not position themselves
+    /// against accepted content, as typed rows.
+    ///
+    /// These are the report; the matching `diagnostics` lines are a
+    /// parallel human rendering of the same facts. Empty in every other
+    /// mode: `published` ignores overlay failure and `own` refuses instead
+    /// of omitting, and empty on the bridge, which never builds one.
+    pub(crate) degraded_overlays: Vec<OverlayDegradation>,
 }
 
 impl SessionGapView {
@@ -234,6 +236,7 @@ impl BlackboxServer {
         let mut metadata = BTreeMap::<String, GapViewMetadata>::new();
         let mut built_from = BuiltFromTable::default();
         let mut diagnostics = Vec::new();
+        let mut degraded_overlays = Vec::new();
         let mut has_legacy_compatibility_rows = false;
         let durable_gaps = self.state.gaps.read().all().to_vec();
         for gap in durable_gaps.iter().filter(|gap| {
@@ -263,6 +266,7 @@ impl BlackboxServer {
                 &mut metadata,
                 &mut built_from,
                 &mut diagnostics,
+                &mut degraded_overlays,
             )?;
         }
         let selected_projects = if catalog_published {
@@ -481,6 +485,7 @@ impl BlackboxServer {
             gaps: GapStore::detached_view(gaps, metadata),
             built_from,
             diagnostics,
+            degraded_overlays,
         })
     }
 
@@ -498,6 +503,7 @@ impl BlackboxServer {
         metadata: &mut BTreeMap<String, GapViewMetadata>,
         built_from: &mut BuiltFromTable,
         diagnostics: &mut Vec<String>,
+        degraded_overlays: &mut Vec<OverlayDegradation>,
     ) -> Result<()> {
         let Some(runtime) = self.state.accepted_publications.clone() else {
             diagnostics.push(
@@ -579,6 +585,7 @@ impl BlackboxServer {
                     metadata,
                     built_from,
                     diagnostics,
+                    degraded_overlays,
                 )?,
             }
             gaps.extend(project_gaps.into_values());
@@ -654,6 +661,7 @@ impl BlackboxServer {
 
     /// Add every peer checkout's provisional gaps, omitting only the peers
     /// that failed and reporting each one.
+    #[allow(clippy::too_many_arguments)] // one accumulator per view output
     fn append_catalog_all_gap_overlays(
         &self,
         project_id: &ProjectId,
@@ -662,6 +670,7 @@ impl BlackboxServer {
         metadata: &mut BTreeMap<String, GapViewMetadata>,
         built_from: &mut BuiltFromTable,
         diagnostics: &mut Vec<String>,
+        degraded_overlays: &mut Vec<OverlayDegradation>,
     ) -> Result<()> {
         for attachment in self.catalog_active_overlay_attachments(project_id)? {
             let degraded = match self.refresh_catalog_gap_overlay(verified, &attachment) {
@@ -686,9 +695,11 @@ impl BlackboxServer {
                 },
                 Err(degradation) => degradation,
             };
-            // The peer is omitted, never faked: its bounded reason is the
-            // report.
+            // The peer is omitted, never faked. The typed row is the
+            // report; the diagnostic line renders the same facts for the
+            // text surface.
             diagnostics.push(degraded.diagnostic_line());
+            degraded_overlays.push(degraded);
         }
         Ok(())
     }
@@ -2047,6 +2058,75 @@ mod catalog_gap_overlay_tests {
         assert!(
             !reason.contains(fixture.root.to_str().unwrap()),
             "a degradation must not carry an absolute path: {reason}"
+        );
+    }
+
+    /// Plan section 10.5: `all` retains accepted content and reports every
+    /// omitted peer through bounded `degraded.overlays`. The knowledge lane
+    /// already served typed rows; this proves the gap response does too,
+    /// through the tool that actually assembles it rather than through the
+    /// view struct alone.
+    #[test]
+    fn the_gap_response_serializes_every_omitted_peer_as_a_typed_row() {
+        use crate::gaps::GapListParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "accepted")]);
+        let peer = fixture.worktree("peer", PEER_ATTACHMENT, PEER_CHECKOUT);
+        write_gap(&peer, &edited("gap-11111111", "peer variant"));
+        const BROKEN_ATTACHMENT: &str = "att_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb04";
+        const BROKEN_CHECKOUT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb04";
+        fixture.unrelated("broken", BROKEN_ATTACHMENT, BROKEN_CHECKOUT);
+
+        let server = fixture.catalog.server_with_checkout_authority();
+        let response = server.bbox_gaps(Parameters(GapListParams {
+            provisional: Some("all".into()),
+            include_addressed: Some(true),
+            json: Some(true),
+            ..Default::default()
+        }));
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        let structured = response
+            .structured_content
+            .expect("bbox_gaps structured response");
+
+        let overlays = structured["degraded"]["overlays"]
+            .as_array()
+            .unwrap_or_else(|| panic!("degraded.overlays is present: {structured}"));
+        assert_eq!(overlays.len(), 1, "{structured}");
+        assert_eq!(overlays[0]["code"], ERROR_OVERLAY_BASELINE_UNAVAILABLE);
+        assert_eq!(overlays[0]["checkout_id"], BROKEN_CHECKOUT);
+        assert_eq!(overlays[0]["attachment_id"], BROKEN_ATTACHMENT);
+        assert_eq!(overlays[0]["project_id"], PROJECT);
+
+        // Accepted content still serves, which is what makes this a
+        // degradation rather than a failure.
+        assert!(
+            structured["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "gap-11111111"),
+            "{structured}"
+        );
+        // The human rendering is retained beside the typed rows, not
+        // replaced by them.
+        assert!(
+            structured["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line
+                    .as_str()
+                    .is_some_and(|line| line.contains(ERROR_OVERLAY_BASELINE_UNAVAILABLE))),
+            "{structured}"
+        );
+        // A degradation names identity and a stable code, never a path.
+        assert!(
+            !structured
+                .to_string()
+                .contains(fixture.root.to_str().unwrap()),
+            "a degradation must not carry an absolute path: {structured}"
         );
     }
 

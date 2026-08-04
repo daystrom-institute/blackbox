@@ -170,11 +170,19 @@ impl BlackboxServer {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let built_from = view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
-            let structured = serde_json::json!({
+            let mut structured = serde_json::json!({
                 "rows": rows,
                 "built_from": &built_from,
                 "diagnostics": &view.diagnostics,
             });
+            // Bounded structured degradation for `all` (plan §10.5): each
+            // checkout the survey omitted, as a typed row. Omitted entirely
+            // when nothing degraded, so bridge responses and healthy catalog
+            // responses keep their existing shape. `diagnostics` carries the
+            // same facts as human text.
+            if !view.degraded_overlays.is_empty() {
+                structured["degraded"] = serde_json::json!({ "overlays": &view.degraded_overlays });
+            }
             let mut rendered = if p.json.unwrap_or(false) {
                 serde_json::to_string_pretty(&structured)?
             } else {
