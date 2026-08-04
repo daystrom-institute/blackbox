@@ -796,4 +796,91 @@ mod catalog_watcher_startup_tests {
             .read()
             .store(true, Ordering::Release);
     }
+
+    /// Plan 5.2 fallback clause, end to end through the real observer loop:
+    /// a commit delivered while catalog authority is UNREADABLE must not
+    /// wedge the loop and must not tear down registrations; it schedules the
+    /// bounded rescan instead, and the loop converges once authority
+    /// returns.
+    ///
+    /// The store's own poison arm is what an unreadable pair looks like in
+    /// production, so this exercises the real degradation rather than a mock.
+    #[test]
+    fn unreadable_authority_schedules_a_rescan_and_converges_when_it_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let state = catalog_state(&fixture);
+        let capable = checkout(&root, "capable", CHECKOUT_ONE);
+        attach(&state, CAPABLE, CHECKOUT_ONE, &capable, true);
+
+        start_bbox_watcher(&state);
+        let registered_before = registered(&state);
+        assert_eq!(
+            registered_before.len(),
+            1,
+            "startup registered the capable attachment"
+        );
+
+        let store = state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority")
+            .clone();
+        let observer = store.commit_observer();
+        super::super::code_source::spawn_commit_observer(&state);
+
+        // Authority goes unreadable, then a commit arrives.
+        let restore = store
+            .poison_for_test("checkpoint test: catalog pair unreadable")
+            .expect("store was readable");
+        observer.push_for_test(CatalogCommittedEvent {
+            epoch: 1,
+            changed_project_ids: std::collections::BTreeSet::from([PROJECT.to_string()]),
+        });
+
+        // The registration survives: an unreadable snapshot is not evidence
+        // that nothing is capable, so nothing is torn down.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if observer.pending_rescan_generation().is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "observer never scheduled the bounded rescan"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            registered(&state),
+            registered_before,
+            "unreadable authority must not remove live registrations"
+        );
+
+        // Authority returns; the loop drains its own rescan and converges.
+        store.unpoison_for_test(restore);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if observer.pending_rescan_generation().is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "observer never drained the rescan after authority returned"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            registered(&state),
+            registered_before,
+            "convergence restores the same registration set"
+        );
+
+        state
+            .reconciler_shutdown
+            .read()
+            .store(true, Ordering::Release);
+    }
 }

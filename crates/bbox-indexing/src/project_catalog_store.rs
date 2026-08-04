@@ -513,6 +513,39 @@ impl ProjectCatalogStore {
         }
     }
 
+    /// Force snapshot reads to fail, returning the state that was current
+    /// so a caller can restore it.
+    ///
+    /// Test-only, and deliberately narrow: it changes snapshot readability
+    /// and nothing else. No durable byte moves, the transaction owner is
+    /// untouched, and the poisoned arm it installs is the same one a failed
+    /// recovery installs in production. That is what makes it worth having
+    /// rather than a mock: a consumer proved to degrade correctly here is
+    /// proved against the real unreadable-pair state.
+    ///
+    /// `None` when the store was already poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn poison_for_test(&self, detail: &str) -> Option<Arc<ProjectCatalogState>> {
+        let mut current = self.current.write();
+        let previous = match &*current {
+            PublishedStoreState::Ready(state) => Some(state.clone()),
+            PublishedStoreState::Poisoned(_) => None,
+        };
+        *current = PublishedStoreState::Poisoned(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_snapshot",
+            detail,
+        ));
+        previous
+    }
+
+    /// Restore a state captured by [`Self::poison_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn unpoison_for_test(&self, state: Arc<ProjectCatalogState>) {
+        *self.current.write() = PublishedStoreState::Ready(state);
+    }
+
     /// Returns a clone of the post-commit observer handle (section 9.4).
     ///
     /// The observer accumulates `CatalogCommittedEvent`s emitted after
