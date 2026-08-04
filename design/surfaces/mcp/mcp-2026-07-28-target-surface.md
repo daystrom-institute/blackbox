@@ -83,6 +83,31 @@ Consequences:
 proving ground for the tasks extension specifically, since no client we
 consume declares it yet.
 
+### Codex (OpenAI) as second data point (verified 2026-08-04)
+
+Source-level probe of the codex-rs workspace (local checkout, HEAD
+78306a32af):
+
+- Pins `rmcp = "=3.0.0"` exactly, with a dedicated `codex-rmcp-client`
+  crate and a full 2026 test suite (discovery, MRTR, message limits,
+  stdio, SSE).
+- Client protocol mode is `McpProtocolMode::{Legacy, V20260728}`; modern
+  mode uses `ClientLifecycleMode::Auto` (discover probe, legacy fallback),
+  gated behind `Feature::Mcp20260728`, default OFF (Legacy negotiates
+  V_2025_06_18 + initialize).
+- No tasks extension and no `subscriptions/listen` consumption anywhere in
+  the tree; their own MCP server shows no 2026-07-28 surface either.
+
+Takeaways: both major harness vendors shipped rmcp-3.0-based dual-stack
+clients within a week of the spec, and NEITHER consumes the tasks
+extension or listen yet. That validates the strict extension-key gate
+(Phase 2) and confirms the harness pair is the only near-term tasks/listen
+consumer. Codex's gating posture (modern off by default, Auto lifecycle
+with legacy fallback) mirrors our Q2 recommendation. Note Brodex rides OUR
+bro-harness MCP client, not codex CLI, so Codex support does not gate any
+blackbox dispatch path; it matters only if codex CLI itself is pointed at
+the daemon as an MCP client.
+
 ### Convergence with locality-first decomposition
 
 This design was cross-checked against

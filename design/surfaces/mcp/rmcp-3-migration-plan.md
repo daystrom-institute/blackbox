@@ -227,6 +227,11 @@ Probe history:
   keys). Tasks are the LEGACY experimental flavor: `tasks/result` and
   `tasks/list` (removed by SEP-2663) present, `tasks/update` and the
   `io.modelcontextprotocol/tasks` extension key absent.
+- 2026-08-04, codex-rs HEAD 78306a32af (source probe): pins
+  `rmcp = "=3.0.0"`; client modern mode (`McpProtocolMode::V20260728`,
+  Auto lifecycle) behind `Feature::Mcp20260728`, default OFF; no tasks
+  extension or listen consumption; their MCP server has no 2026-07-28
+  surface.
 
 Flip criteria, split by surface:
 
