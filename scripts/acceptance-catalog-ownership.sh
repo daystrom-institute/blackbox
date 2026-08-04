@@ -99,21 +99,40 @@ runtime_body() {
                 indent = $0
                 sub(/#.*$/, "", indent)
                 pending = 1
+                pending_depth = 0
                 pending_indent = indent
                 next
             }
             if (pending) {
-                # Consume any further attributes, then the item header. A
-                # multi-line signature keeps the pending state until its
-                # opening brace or its terminating semicolon appears.
+                # Consume any further attributes, then the item header.
+                #
+                # What the attribute governs is decided by BRACE DEPTH, not
+                # by spotting a brace anywhere on the line. A test-only
+                # struct field or enum variant terminates with a COMMA and
+                # opens nothing, and treating a bare `{` as proof of a
+                # braced item left such a member pending forever: the next
+                # production line containing a brace then opened a bogus
+                # span, so whole structs and impl blocks below a test-only
+                # field were dropped.
+                #
+                # depth > 0 after the line  -> a real braced item; the span
+                #                              ends at the closing brace on
+                #                              the matching outer indentation
+                # depth == 0 and , or ;     -> a member or a single-line
+                #                              item, complete on this line
+                # otherwise                 -> a signature still being read
                 if ($0 ~ /^[[:space:]]*#\[/) next
-                if ($0 ~ /\{/) {
+                opens = gsub(/\{/, "{")
+                closes = gsub(/\}/, "}")
+                pending_depth += opens - closes
+                if (pending_depth > 0) {
                     in_span = 1
                     span_end = pending_indent "}"
                     pending = 0
+                    pending_depth = 0
                     next
                 }
-                if ($0 ~ /;[[:space:]]*$/) { pending = 0; next }
+                if ($0 ~ /[,;][[:space:]]*$/) { pending = 0; pending_depth = 0; next }
                 next
             }
             print
