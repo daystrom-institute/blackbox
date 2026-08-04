@@ -1131,6 +1131,12 @@ until a later entry explicitly supersedes it.
   inventory and its order, the counter key-space of kind by outcome by
   source lane, `denied` on every kind, `active_compatibility_lanes`, and
   the exact `granted` and `count` of every OTHER kind.
+  The narrowing pins STRUCTURE even where it releases the value. Each
+  narrowed field must still be present, must still be a positive
+  integer, and the global `sequence` must still dominate every counter's
+  `last_sequence`. A bridge that stopped acquiring the kind altogether,
+  reset its sequence, or changed the field's type fails the harness
+  rather than being absorbed by the sentinel.
 - Evidence:
   - The cluster verify at 9bb62ab1 went red against a fixture captured
     in a lane at identical code. The entire divergence reduced to one
@@ -1138,6 +1144,12 @@ until a later entry explicitly supersedes it.
     on the cluster. Every other delta was derived from it (sequences
     shifted by the same two, and doctor's rendered counter line carried
     the same number).
+  - Three cluster runs over code-identical parity surfaces then read
+    green at cb9eb941 (45), red at 9bb62ab1 (47), and green again at
+    21d373e5 (45). The A/B/A settles the class on its own: the count is
+    INTERMITTENT under cluster conditions, not a deterministic property
+    of the environment, so no environment-conditional code path explains
+    it and none can be fixed to remove it.
   - That kind is the one acquired inside the publisher-authorization
     cache's 250 millisecond TTL window. How many of a replay's
     authorizations fall inside that window is a function of machine
@@ -1152,7 +1164,9 @@ until a later entry explicitly supersedes it.
     already buys determinism at the source wherever it can (pinned Git
     identity, pre-written checkout markers, a pinned system-memory
     catalog, a dropped authorization cache before every row); this is the
-    residue that no such lever reaches.
+    residue that no such lever reaches. The per-row cache drop moved the
+    floor from wherever it had been to 39 but did not remove the
+    variance, because authorizations WITHIN a row still race the timer.
   - The narrowing is verified environment-invariant across a range far
     wider than the observed one: the verifier passes unchanged with the
     TTL forced to zero and forced to an hour, which brackets the lane and

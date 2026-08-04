@@ -1037,7 +1037,35 @@ mod harness {
     const TIMING_DEPENDENT_KIND: &str = "publisher_config_tree_read";
 
     /// Blank exactly the D-041 fields, in place, and nothing else.
+    ///
+    /// Blanking alone would be a hole: a bridge that stopped acquiring
+    /// this kind entirely, or that reset its sequence, would produce a
+    /// zero and the sentinel would hide it. So each narrowed field is
+    /// STRUCTURALLY asserted before it is replaced. The value is not
+    /// compared; that it is a positive integer, and that the global
+    /// sequence dominates every counter's last sequence, still is.
     fn narrow_timing_dependent_counters(value: &mut Value) {
+        let mut sequences = Vec::new();
+        let mut top_level_sequence = None;
+        narrow_walk(value, &mut sequences, &mut top_level_sequence);
+        // Monotonicity across the snapshot: the global sequence is issued
+        // last, so it dominates every per-counter last sequence. A counter
+        // claiming a sequence beyond the global one is a corrupt snapshot
+        // whatever the exact numbers are.
+        if let Some(global) = top_level_sequence {
+            for observed in &sequences {
+                assert!(
+                    *observed <= global,
+                    "checkout observation snapshot is inconsistent: a counter \
+                     reports last_sequence {observed} beyond the global \
+                     sequence {global}. D-041 narrows these VALUES, not the \
+                     invariant between them."
+                );
+            }
+        }
+    }
+
+    fn narrow_walk(value: &mut Value, sequences: &mut Vec<u64>, top: &mut Option<u64>) {
         match value {
             Value::Object(map) => {
                 let is_varying_kind = map
@@ -1045,7 +1073,7 @@ mod harness {
                     .and_then(Value::as_str)
                     .is_some_and(|kind| kind == TIMING_DEPENDENT_KIND);
                 for (key, child) in map.iter_mut() {
-                    let blank = match key.as_str() {
+                    let narrowed = match key.as_str() {
                         // Derived from the global acquisition ordering, so
                         // they shift with the varying count wherever they
                         // appear.
@@ -1055,16 +1083,35 @@ mod harness {
                         "granted" | "count" => is_varying_kind,
                         _ => false,
                     };
-                    if blank {
-                        *child = Value::String(TIMING_DEPENDENT.to_string());
-                    } else {
-                        narrow_timing_dependent_counters(child);
+                    if !narrowed {
+                        narrow_walk(child, sequences, top);
+                        continue;
                     }
+                    let observed = child.as_u64().unwrap_or_else(|| {
+                        panic!(
+                            "D-041 narrows {key} as a COUNT; it is now {child}, \
+                             which means the observation schema changed and the \
+                             narrowing no longer describes the field it names."
+                        )
+                    });
+                    assert!(
+                        observed > 0,
+                        "D-041 narrows the VALUE of {key}, not whether the \
+                         surface is exercised at all. It is 0, so the bridge \
+                         stopped acquiring {TIMING_DEPENDENT_KIND} entirely, \
+                         which the sentinel must not hide."
+                    );
+                    match key.as_str() {
+                        "sequence" => *top = Some(observed),
+                        "last_sequence" => sequences.push(observed),
+                        _ => {}
+                    }
+                    *child = Value::String(TIMING_DEPENDENT.to_string());
                 }
             }
             Value::Array(items) => {
                 for item in items {
-                    narrow_timing_dependent_counters(item);
+                    narrow_walk(item, sequences, top);
                 }
             }
             _ => {}
