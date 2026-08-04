@@ -438,9 +438,6 @@ pub(super) fn open_shared_state(
     let repo_io = Arc::new(super::repo_io::RepoIoAuthority::new(
         checkout_access.clone(),
     ));
-    // Mode-independent record view: the bridge derives from the registry,
-    // catalog mode from the compatibility projection (attached rows only).
-    let registered_projects = records_provider.records_snapshot().records;
     let mut kb = Knowledge::open(&kb_path)?;
     kb.set_path_fallback_cut(path_fallback_cut);
     tracing::info!("Knowledge store: {}", kb_path.display());
@@ -454,6 +451,8 @@ pub(super) fn open_shared_state(
     // keeps `Selected`, whose encoding must stay byte-identical. Startup has
     // no last-good carrier set to preserve, so an unreadable catalog refuses
     // here rather than installing a moving-ladder carrier.
+    // Mode-independent record view: the bridge derives from the registry,
+    // catalog mode from the compatibility projection (attached rows only).
     let carrier_inputs = super::repo_io::CatalogBaseTargets::read_consistent(
         &records_provider,
         catalog_store.as_deref(),

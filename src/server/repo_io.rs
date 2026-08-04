@@ -308,42 +308,6 @@ impl RepoIoAuthority {
         )
     }
 
-    /// Native catalog knowledge carrier. `display` is stamped onto loaded
-    /// entries and is deliberately not authority: resolution uses the
-    /// attachment id alone.
-    pub(crate) fn knowledge_attachment_carrier(
-        display: impl Into<String>,
-        project_id: &str,
-        attachment_id: &str,
-        expected_scope: Option<PublishedScope>,
-    ) -> Result<KnowledgeRepoCarrier> {
-        KnowledgeRepoCarrier::new(
-            display,
-            encode_target(&RepoCarrierTarget::Attachment {
-                project_id: project_id.to_owned(),
-                attachment_id: attachment_id.to_owned(),
-                expected_scope,
-            })?,
-        )
-    }
-
-    /// Gap-side counterpart to [`Self::knowledge_attachment_carrier`].
-    pub(crate) fn gap_attachment_carrier(
-        display: impl Into<String>,
-        project_id: &str,
-        attachment_id: &str,
-        expected_scope: Option<PublishedScope>,
-    ) -> Result<GapRepoCarrier> {
-        GapRepoCarrier::new(
-            display,
-            encode_target(&RepoCarrierTarget::Attachment {
-                project_id: project_id.to_owned(),
-                attachment_id: attachment_id.to_owned(),
-                expected_scope,
-            })?,
-        )
-    }
-
     fn with_access(
         &self,
         carrier_id: &str,
@@ -764,13 +728,12 @@ mod tests {
         std::fs::write(project.join("entry.json"), b"{}").unwrap();
         let (authority, requests) = recording_authority(&root);
         let scope = PublishedScope::try_new("repo-1", ".").unwrap();
-        let carrier = RepoIoAuthority::knowledge_attachment_carrier(
+        let carrier = knowledge_attachment_carrier(
             "display-only",
             "project-1",
             "att_00000000000000000000000000000a01",
             Some(scope.clone()),
-        )
-        .unwrap();
+        );
 
         let mut observed = None;
         let mut read = |resolved: &Path| {
@@ -844,13 +807,12 @@ mod tests {
         let project = root.join("project");
         std::fs::create_dir(&project).unwrap();
         let (authority, _) = recording_authority(&root);
-        let carrier = RepoIoAuthority::gap_attachment_carrier(
+        let carrier = gap_attachment_carrier(
             "/nonexistent/stale/path",
             "project-1",
             "att_00000000000000000000000000000a01",
             Some(PublishedScope::try_new("repo-1", ".").unwrap()),
-        )
-        .unwrap();
+        );
         assert!(
             !carrier.carrier_id.contains("nonexistent"),
             "carrier ids stay path-free: {}",
@@ -893,6 +855,45 @@ mod tests {
             .to_string();
         assert!(error.contains("not confined"));
         assert!(!called);
+    }
+
+    /// Test-local native carriers. Production builds these through
+    /// `base_carrier_target`, so a named constructor per lane would be dead
+    /// code outside these tests.
+    fn knowledge_attachment_carrier(
+        display: &str,
+        project_id: &str,
+        attachment_id: &str,
+        expected_scope: Option<PublishedScope>,
+    ) -> KnowledgeRepoCarrier {
+        KnowledgeRepoCarrier::new(
+            display,
+            encode_target(&RepoCarrierTarget::Attachment {
+                project_id: project_id.to_owned(),
+                attachment_id: attachment_id.to_owned(),
+                expected_scope,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn gap_attachment_carrier(
+        display: &str,
+        project_id: &str,
+        attachment_id: &str,
+        expected_scope: Option<PublishedScope>,
+    ) -> GapRepoCarrier {
+        GapRepoCarrier::new(
+            display,
+            encode_target(&RepoCarrierTarget::Attachment {
+                project_id: project_id.to_owned(),
+                attachment_id: attachment_id.to_owned(),
+                expected_scope,
+            })
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     fn record(project_id: &str, canonical_path: &str) -> ProjectRecord {
@@ -1092,13 +1093,12 @@ mod tests {
         let project = root.join("project");
         std::fs::create_dir(&project).unwrap();
         let (authority, requests) = recording_authority(&root);
-        let carrier = RepoIoAuthority::knowledge_attachment_carrier(
+        let carrier = knowledge_attachment_carrier(
             "display-only",
             "project-1",
             "att_00000000000000000000000000000a01",
             Some(PublishedScope::try_new("repo-1", ".").unwrap()),
-        )
-        .unwrap();
+        );
 
         let mut resolves_before_write = None;
         let mut write = |_resolved: &Path| {
