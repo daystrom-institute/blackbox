@@ -9909,8 +9909,13 @@ mod tests {
         // is what reclamation is deciding about inside its window.
         write_snapshot_files(&edges_dir, "p_1", "snapshot-a", &[("project.jsonl", &[])]).unwrap();
         let snapshot = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
-        let metadata = fs::symlink_metadata(&snapshot).unwrap();
-        let identity = (metadata.dev() as u64, metadata.ino() as u64);
+        // The pre-window tree is identified by a marker rather than by its
+        // (dev, inode): a freed directory inode may be handed straight back
+        // to the directory that replaces it, so identity cannot distinguish
+        // "deleted and recreated" from "never deleted". Belonging to no
+        // staged member set, this marker can only vanish with the old tree.
+        let stale_marker = snapshot.join("stale-tree-marker");
+        fs::write(&stale_marker, b"stale").unwrap();
 
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -10001,15 +10006,10 @@ mod tests {
             .unwrap()
         );
         assert!(restaged.join("project.jsonl").is_file());
-        // The identity captured before the window is stale by construction;
-        // it is only referenced to keep the pre-window tree observation
-        // meaningful.
-        assert_ne!(
-            identity,
-            (
-                restaged_metadata.dev() as u64,
-                restaged_metadata.ino() as u64
-            )
+        // The pre-window tree did not survive the reclamation it raced.
+        assert!(
+            !stale_marker.exists(),
+            "the reclaimed tree must be gone, not merged into"
         );
     }
 
@@ -10155,6 +10155,14 @@ mod tests {
         let snapshot = snapshot_dir(&edges_dir, "p_1", "snapshot-a");
         let stale = fs::symlink_metadata(&snapshot).unwrap();
         let stale_identity = (stale.dev() as u64, stale.ino() as u64);
+        // Proof that the stale tree was REMOVED rather than written into.
+        // A directory's (dev, inode) cannot carry that proof: the kernel may
+        // hand a freshly created directory the inode it just freed, so an
+        // identical pair is equally consistent with a correct reclaim and
+        // with no reclaim at all. This marker is in no staged member set, so
+        // only an actual removal of the old tree can take it away.
+        let stale_marker = snapshot.join("stale-tree-marker");
+        fs::write(&stale_marker, b"stale").unwrap();
         let snapshots_parent = snapshot.parent().unwrap().to_path_buf();
 
         fs::set_permissions(&snapshots_parent, fs::Permissions::from_mode(0o500)).unwrap();
@@ -10181,9 +10189,9 @@ mod tests {
                 .is_empty()
         );
         let restaged = fs::symlink_metadata(&snapshot).unwrap();
-        assert_ne!(
-            (restaged.dev() as u64, restaged.ino() as u64),
-            stale_identity
+        assert!(
+            !stale_marker.exists(),
+            "the stale tree must be reclaimed, not merged into"
         );
         assert!(snapshot.join("project.jsonl").is_file());
         assert!(snapshot.join("symbols.jsonl").is_file());
