@@ -534,13 +534,15 @@ fn acquire_project_file(
         CheckoutAccessKind::Blame,
         CheckoutAccessIntent::Read,
     )?;
-    let (_, content) = lease
-        .read_relative_file(indexed_path_hint)
-        .map_err(checkout_access_error)?;
+    // Deliberately NO working-tree read. Catalog corpus-identity blame is
+    // answered from the snapshot commit, and a file the corpus indexed may
+    // legitimately be absent from the working tree now (deleted, or the
+    // checkout moved on). Reading it here would refuse those cases for a
+    // reason that has nothing to do with the question asked.
     Ok(AcquiredCheckoutFile {
         lease,
         relative_path: indexed_path_hint.to_string_lossy().into_owned(),
-        content,
+        content: Vec::new(),
     })
 }
 
@@ -594,33 +596,42 @@ fn acquire_bridge_project_file(
     })
 }
 
-/// Corpus-identity blame must run against a repository that carries the
-/// corpus snapshot's Git evidence.
+/// The exact commit corpus-identity blame must run against.
 ///
-/// The pinned Git overlay is that evidence: it names the attachment whose
-/// head produced the project's commit edges and the head it observed. When
-/// the request-pinned view holds one for this project, the selected checkout
-/// must contain that commit; otherwise blame would report an arbitrary
-/// attachment's HEAD history against a snapshot it never produced (plan
-/// section 8, P5-E blame items 4 and 5). A project with no overlay has no
-/// commit evidence to require, and the ladder selection stands on its own.
-fn require_snapshot_commit(
+/// The pinned Git overlay is the corpus snapshot's Git evidence: it names the
+/// attachment whose head produced the project's commit edges and the head it
+/// observed. Catalog corpus-identity blame is bound to that commit, not
+/// merely checked against it. Two failures are refusals rather than
+/// fallbacks, because either one would silently answer a question about the
+/// indexed snapshot using unrelated current history (plan section 8, P5-E
+/// blame items 4 and 5):
+///
+/// - no overlay: there is no evidence of WHICH snapshot the corpus indexed,
+///   so there is no commit to be faithful to;
+/// - overlay commit absent from the selected checkout: the attachment cannot
+///   answer for that snapshot even though it was selected for the project.
+///
+/// A checkout that CONTAINS the commit but has since advanced is fine and is
+/// the ordinary case: blame runs at the recorded commit regardless of where
+/// HEAD has moved.
+fn snapshot_commit_for_blame(
     git_overlays: &std::collections::BTreeMap<
         String,
         bbox_corpus_core::git_overlay::GitOverlaySelector,
     >,
     project_id: &str,
     checkout_root: &Path,
-) -> Result<()> {
+) -> Result<String> {
     let Some(overlay) = git_overlays.get(project_id) else {
-        return Ok(());
-    };
-    if bbox_corpus_core::git::resolve_commit(checkout_root, &overlay.repo_head).is_none() {
         bail!(
-            "error.blame_commit_mismatch: the selected attachment does not contain the commit the corpus snapshot was indexed at"
+            "error.blame_snapshot_unavailable: no Git snapshot evidence is recorded for this project, so blame cannot be bound to the indexed corpus snapshot"
         );
-    }
-    Ok(())
+    };
+    bbox_corpus_core::git::resolve_commit(checkout_root, &overlay.repo_head).ok_or_else(|| {
+        anyhow!(
+            "error.blame_commit_mismatch: the selected attachment does not contain the commit the corpus snapshot was indexed at"
+        )
+    })
 }
 
 /// The project ids one legacy Git-note operation covers.
@@ -1047,12 +1058,26 @@ impl BlackboxServer {
                         &indexed_path_hint,
                         &projects,
                     )?;
-                    require_snapshot_commit(
-                        &read_view.git_overlays,
-                        &project_id,
-                        acquired.lease.checkout_root(),
-                    )?;
-                    (acquired, line, Some(byte_offset))
+                    // Catalog corpus identity is answered AT the snapshot
+                    // commit. The bridge has no overlay lane at all
+                    // (`read_git_overlays_for_view` returns an empty map there
+                    // by contract), so requiring evidence on that arm would
+                    // change bridge output, which section 11 forbids; the
+                    // bridge keeps its current-checkout behavior verbatim.
+                    let source = if server.state.project_authority.is_bridge() {
+                        mcp_tools::blame::BlameSource::WorkingTree {
+                            content: acquired.content.clone(),
+                        }
+                    } else {
+                        mcp_tools::blame::BlameSource::Snapshot {
+                            commit: snapshot_commit_for_blame(
+                                &read_view.git_overlays,
+                                &project_id,
+                                acquired.lease.checkout_root(),
+                            )?,
+                        }
+                    };
+                    (acquired, line, Some(byte_offset), source)
                 }
                 mcp_tools::blame::BlameTargetIdentity::File { input_path, line } => {
                     let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
@@ -1072,10 +1097,16 @@ impl BlackboxServer {
                         CheckoutAccessKind::Blame,
                         CheckoutAccessIntent::Read,
                     )?;
-                    (acquired, Some(line), None)
+                    // A blame the caller addressed by PATH names no corpus
+                    // snapshot, so current history is the only history it
+                    // could mean. The fix condition preserves this arm.
+                    let source = mcp_tools::blame::BlameSource::WorkingTree {
+                        content: acquired.content.clone(),
+                    };
+                    (acquired, Some(line), None, source)
                 }
             };
-            let (mut acquired, line, byte_offset) = acquired;
+            let (acquired, line, byte_offset, source) = acquired;
             let project_rel = acquired
                 .lease
                 .project_root()
@@ -1088,10 +1119,10 @@ impl BlackboxServer {
                 mcp_tools::blame::ValidatedBlameTarget {
                     git_root: acquired.lease.checkout_root().to_path_buf(),
                     git_relative_path,
-                    content: std::mem::take(&mut acquired.content),
                     display_path: acquired.relative_path.clone(),
                     line,
                     byte_offset,
+                    source,
                 },
                 edge_index,
             )?;
@@ -2110,12 +2141,12 @@ mod catalog_adapter_tests {
                             checkout_dir: dir.clone(),
                             checkout_project_dir: dir.clone(),
                             project_root_relpath: ".".into(),
-                            kind: spec.kind.clone(),
+                            kind: spec.kind,
                             validated_scope: spec.scope.clone(),
                             computed_repo_hint: None,
                             branch_ref: Some("refs/heads/main".into()),
-                            capabilities: spec.capabilities.clone(),
-                            status: spec.status.clone(),
+                            capabilities: spec.capabilities,
+                            status: spec.status,
                             attached_at: "2026-08-03T00:00:00Z".into(),
                             detached_at: match spec.status {
                                 AttachmentStatus::Attached => None,
@@ -2690,11 +2721,15 @@ mod catalog_adapter_tests {
         )])
     }
 
-    /// The corpus snapshot's Git evidence must be present in the checkout the
-    /// ladder selected. Present passes; absent refuses rather than reporting
-    /// an unrelated attachment's HEAD history.
+    /// The commit-selection contract, in the three shapes that matter.
+    ///
+    /// The rejected earlier version of this check proved only that the
+    /// snapshot commit EXISTED and then blamed the working tree anyway, and
+    /// it treated a missing overlay as permission to proceed. Both are
+    /// refusals now: without evidence there is no snapshot to be faithful to,
+    /// and a checkout that cannot produce the commit cannot answer for it.
     #[test]
-    fn snapshot_commit_must_be_contained_in_the_selected_checkout() {
+    fn corpus_blame_commit_selection_requires_evidence_and_containment() {
         let fixture = CatalogAdapters::new();
         fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
         let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
@@ -2706,18 +2741,180 @@ mod catalog_adapter_tests {
         git(&checkout, &["commit", "-m", "seed"]);
         let head = bbox_corpus_core::git::current_head(&checkout).unwrap();
 
-        let present = overlay_map(PROJECT_ONE, &head);
-        require_snapshot_commit(&present, PROJECT_ONE, &checkout).unwrap();
+        // Evidence present and contained: blame is bound to that exact commit.
+        let selected =
+            snapshot_commit_for_blame(&overlay_map(PROJECT_ONE, &head), PROJECT_ONE, &checkout)
+                .unwrap();
+        assert_eq!(selected, head);
 
+        // Evidence present, commit absent from this checkout.
         let missing = overlay_map(PROJECT_ONE, "0123456789012345678901234567890123456789");
-        let error = require_snapshot_commit(&missing, PROJECT_ONE, &checkout)
+        let error = snapshot_commit_for_blame(&missing, PROJECT_ONE, &checkout)
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("error.blame_commit_mismatch"), "{error}");
 
-        // A project with no pinned overlay has no commit evidence to require.
-        require_snapshot_commit(&std::collections::BTreeMap::new(), PROJECT_ONE, &checkout)
-            .unwrap();
+        // No evidence at all: refuse, never fall through to current history.
+        let error =
+            snapshot_commit_for_blame(&std::collections::BTreeMap::new(), PROJECT_ONE, &checkout)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.starts_with("error.blame_snapshot_unavailable"),
+            "{error}"
+        );
+    }
+
+    /// Mutation-verify (a): the checkout has ADVANCED past the snapshot
+    /// commit, and the blamed line differs between the two. Corpus-identity
+    /// blame must report the snapshot commit's answer.
+    ///
+    /// This is the direct counterexample the checkpoint raised: proving the
+    /// commit exists says nothing, because the working tree can contain a
+    /// wholly different line at that number.
+    #[test]
+    fn advanced_checkout_blames_the_snapshot_commit_not_head() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        git(&checkout, &["init", "--initial-branch", "main"]);
+        git(&checkout, &["config", "user.email", "t@example.com"]);
+        git(&checkout, &["config", "user.name", "t"]);
+        std::fs::write(checkout.join("file.rs"), "pub fn indexed() {}\n").unwrap();
+        git(&checkout, &["add", "file.rs"]);
+        git(&checkout, &["commit", "-m", "the indexed snapshot"]);
+        let snapshot = bbox_corpus_core::git::current_head(&checkout).unwrap();
+
+        std::fs::write(checkout.join("file.rs"), "pub fn moved_on() {}\n").unwrap();
+        git(&checkout, &["add", "file.rs"]);
+        git(&checkout, &["commit", "-m", "the checkout moved on"]);
+        let head = bbox_corpus_core::git::current_head(&checkout).unwrap();
+        assert_ne!(snapshot, head);
+
+        let edges = bbox_edge_index::edge_index::EdgeIndex::default();
+        let snapshot_output = mcp_tools::blame::blame(
+            mcp_tools::blame::ValidatedBlameTarget {
+                git_root: checkout.clone(),
+                git_relative_path: PathBuf::from("file.rs"),
+                display_path: "file.rs".into(),
+                line: Some(1),
+                byte_offset: None,
+                source: mcp_tools::blame::BlameSource::Snapshot {
+                    commit: snapshot.clone(),
+                },
+            },
+            &edges,
+        )
+        .unwrap();
+
+        assert!(
+            snapshot_output.contains(&snapshot),
+            "snapshot blame must attribute the indexed commit: {snapshot_output}"
+        );
+        assert!(
+            !snapshot_output.contains(&head),
+            "snapshot blame must not attribute the advanced head: {snapshot_output}"
+        );
+
+        // The working-tree arm, which caller-supplied path blame keeps, does
+        // report current history. Asserting the contrast is what proves the
+        // snapshot arm is doing real work rather than agreeing by accident.
+        let working_tree_output = mcp_tools::blame::blame(
+            mcp_tools::blame::ValidatedBlameTarget {
+                git_root: checkout.clone(),
+                git_relative_path: PathBuf::from("file.rs"),
+                display_path: "file.rs".into(),
+                line: Some(1),
+                byte_offset: None,
+                source: mcp_tools::blame::BlameSource::WorkingTree {
+                    content: b"pub fn moved_on() {}\n".to_vec(),
+                },
+            },
+            &edges,
+        )
+        .unwrap();
+        assert!(working_tree_output.contains(&head), "{working_tree_output}");
+    }
+
+    /// A file the corpus indexed may be gone from the working tree. The
+    /// snapshot arm still answers, because it reads the committed blob rather
+    /// than the checkout.
+    #[test]
+    fn snapshot_blame_survives_a_file_deleted_from_the_working_tree() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        git(&checkout, &["init", "--initial-branch", "main"]);
+        git(&checkout, &["config", "user.email", "t@example.com"]);
+        git(&checkout, &["config", "user.name", "t"]);
+        std::fs::write(checkout.join("file.rs"), "pub fn indexed() {}\n").unwrap();
+        git(&checkout, &["add", "file.rs"]);
+        git(&checkout, &["commit", "-m", "the indexed snapshot"]);
+        let snapshot = bbox_corpus_core::git::current_head(&checkout).unwrap();
+        git(&checkout, &["rm", "-q", "file.rs"]);
+        git(&checkout, &["commit", "-m", "deleted"]);
+        assert!(!checkout.join("file.rs").exists());
+
+        let edges = bbox_edge_index::edge_index::EdgeIndex::default();
+        let output = mcp_tools::blame::blame(
+            mcp_tools::blame::ValidatedBlameTarget {
+                git_root: checkout.clone(),
+                git_relative_path: PathBuf::from("file.rs"),
+                display_path: "file.rs".into(),
+                line: Some(1),
+                byte_offset: None,
+                source: mcp_tools::blame::BlameSource::Snapshot {
+                    commit: snapshot.clone(),
+                },
+            },
+            &edges,
+        )
+        .unwrap();
+
+        assert!(output.contains(&snapshot), "{output}");
+    }
+
+    /// A byte offset resolves against the SNAPSHOT's bytes. Resolving it
+    /// against working-tree bytes would silently land on a different line
+    /// whenever the file changed length above the target.
+    #[test]
+    fn byte_offset_resolves_against_snapshot_content() {
+        let fixture = CatalogAdapters::new();
+        fixture.add_project(PROJECT_ONE, Some(CatalogAdapters::scope("repo-one")));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        git(&checkout, &["init", "--initial-branch", "main"]);
+        git(&checkout, &["config", "user.email", "t@example.com"]);
+        git(&checkout, &["config", "user.name", "t"]);
+        std::fs::write(checkout.join("file.rs"), "one\ntarget\n").unwrap();
+        git(&checkout, &["add", "file.rs"]);
+        git(&checkout, &["commit", "-m", "snapshot"]);
+        let snapshot = bbox_corpus_core::git::current_head(&checkout).unwrap();
+        // Prepend two lines: the same byte offset now points elsewhere.
+        std::fs::write(checkout.join("file.rs"), "pad\npad\none\ntarget\n").unwrap();
+        git(&checkout, &["add", "file.rs"]);
+        git(&checkout, &["commit", "-m", "prepended"]);
+
+        let edges = bbox_edge_index::edge_index::EdgeIndex::default();
+        let output = mcp_tools::blame::blame(
+            mcp_tools::blame::ValidatedBlameTarget {
+                git_root: checkout.clone(),
+                git_relative_path: PathBuf::from("file.rs"),
+                display_path: "file.rs".into(),
+                line: None,
+                // Offset of "target" in the SNAPSHOT content ("one\n" = 4).
+                byte_offset: Some(4),
+                source: mcp_tools::blame::BlameSource::Snapshot {
+                    commit: snapshot.clone(),
+                },
+            },
+            &edges,
+        )
+        .unwrap();
+
+        assert!(
+            output.contains("\"line\": 2"),
+            "byte offset must resolve against snapshot bytes: {output}"
+        );
     }
 
     /// The P5-E residual: a catalog project whose only active attachment is

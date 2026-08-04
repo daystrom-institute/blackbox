@@ -38,16 +38,39 @@ pub enum BlameTargetIdentity {
     },
 }
 
+/// Which history a blame attributes lines against.
+///
+/// This is an enum rather than an `Option<commit>` because the two cases are
+/// not a default and a refinement: a corpus-identity blame that silently ran
+/// against the working tree would attribute lines to whatever the checkout
+/// happens to be at now, which is the exact defect the split exists to make
+/// unrepresentable.
+#[derive(Debug, Clone)]
+pub enum BlameSource {
+    /// The checkout's current working tree, with bytes the caller already
+    /// read through its validated lease. Legitimate only for a blame the
+    /// caller addressed BY PATH: such a request names no corpus snapshot, so
+    /// current history is the only history it could mean.
+    WorkingTree { content: Vec<u8> },
+    /// One exact commit. Corpus-identity blame must use this: the lines it
+    /// attributes have to come from the snapshot the corpus indexed.
+    ///
+    /// The committed file is read here rather than supplied, so no caller can
+    /// pin the revision while passing working-tree bytes and get a line
+    /// number resolved against content the commit never had.
+    Snapshot { commit: String },
+}
+
 /// Caller-supplied file path produced by a validated checkout lease. The
 /// caller retains that lease for the complete blame operation.
 #[derive(Debug, Clone)]
 pub struct ValidatedBlameTarget {
     pub git_root: PathBuf,
     pub git_relative_path: PathBuf,
-    pub content: Vec<u8>,
     pub display_path: String,
     pub line: Option<u64>,
     pub byte_offset: Option<u64>,
+    pub source: BlameSource,
 }
 
 pub fn target_identity(p: &BlameParams, ctx: &ProviderContext<'_>) -> Result<BlameTargetIdentity> {
@@ -98,27 +121,111 @@ pub fn target_identity(p: &BlameParams, ctx: &ProviderContext<'_>) -> Result<Bla
     Ok(BlameTargetIdentity::File { input_path, line })
 }
 
-pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<String> {
-    let line = match target.line {
+/// A repository-relative path safe to hand to Git: non-empty, relative, and
+/// free of traversal or root components.
+fn git_safe_relative(path: &std::path::Path) -> Result<String> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("error.blame_path_invalid: blame path must be a safe relative path");
+    }
+    Ok(path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Blame one line at an exact commit, reading the file as that commit had it.
+///
+/// Both halves are pinned deliberately. Blaming at the commit without reading
+/// the committed file would resolve a byte offset against working-tree bytes
+/// and land on the wrong line; reading the committed file without pinning the
+/// blame would attribute that line to current history.
+fn blame_at_commit(
+    git_root: &std::path::Path,
+    git_relative_path: &std::path::Path,
+    commit: &str,
+    line: Option<u64>,
+    byte_offset: Option<u64>,
+) -> Result<(u64, Option<GitBlameLine>)> {
+    let rel_path = git_safe_relative(git_relative_path)?;
+    let content = bbox_corpus_core::git::read_committed_file_bytes(git_root, commit, &rel_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "error.blame_snapshot_unavailable: the corpus snapshot commit does not contain this file"
+            )
+        })?;
+    let line = match line {
         Some(line) => line,
-        None => line_for_byte_offset(&target.content, target.byte_offset.unwrap_or_default()),
+        None => line_for_byte_offset(&content, byte_offset.unwrap_or_default()),
+    };
+    if line == 0 {
+        anyhow::bail!("error.blame_path_invalid: line must be 1-based");
+    }
+    let line_spec = format!("{line},{line}");
+    let output = bbox_corpus_core::git::git_output(
+        git_root,
+        &[
+            "blame",
+            "--porcelain",
+            "-L",
+            &line_spec,
+            commit,
+            "--",
+            &rel_path,
+        ],
+        "running git blame at the corpus snapshot commit",
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "error.checkout_io_failed: git blame could not read the corpus snapshot commit"
+        )
+    })?;
+    if !output.status.success() {
+        return Ok((line, None));
+    }
+    let parsed = bbox_corpus_core::git::parse_blame_porcelain(
+        &output.stdout,
+        git_root.to_path_buf(),
+        rel_path,
+    )
+    .map_err(|_| {
+        anyhow::anyhow!("error.checkout_io_failed: git blame output could not be parsed")
+    })?;
+    Ok((line, parsed))
+}
+
+pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<String> {
+    let (line, blame) = match &target.source {
+        BlameSource::WorkingTree { content } => {
+            let line = match target.line {
+                Some(line) => line,
+                None => line_for_byte_offset(content, target.byte_offset.unwrap_or_default()),
+            };
+            let blame = bbox_corpus_core::git::blame_for_line_in_root(
+                &target.git_root,
+                &target.git_relative_path,
+                line,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "error.checkout_io_failed: git blame could not read the validated checkout file"
+                )
+            })?;
+            (line, blame)
+        }
+        BlameSource::Snapshot { commit } => blame_at_commit(
+            &target.git_root,
+            &target.git_relative_path,
+            commit,
+            target.line,
+            target.byte_offset,
+        )?,
     };
     let target = BlameTarget {
-        git_root: target.git_root,
-        git_relative_path: target.git_relative_path,
         display_path: target.display_path,
         line,
     };
-    let blame = bbox_corpus_core::git::blame_for_line_in_root(
-        &target.git_root,
-        &target.git_relative_path,
-        target.line,
-    )
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "error.checkout_io_failed: git blame could not read the validated checkout file"
-        )
-    })?;
     let Some(blame) = blame else {
         return Ok(serde_json::to_string_pretty(&json!({
             "status": "error.not_found",
@@ -176,9 +283,10 @@ pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<Str
     }))?)
 }
 
+/// What the response body reports. The revision-bearing inputs are consumed
+/// by the blame itself and deliberately do not survive into this struct, so
+/// nothing downstream can re-derive a path or root to read again.
 struct BlameTarget {
-    git_root: PathBuf,
-    git_relative_path: PathBuf,
     display_path: String,
     line: u64,
 }
