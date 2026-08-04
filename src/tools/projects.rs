@@ -827,13 +827,12 @@ impl BlackboxServer {
                 )?;
                 // Re-point logical carriers without reloading because the
                 // in-memory mutations from migrate_rename are still live.
-                let projects = server.state.records_provider.records_snapshot().records;
+                let inputs = crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(
+                    &server.state,
+                )?;
                 let carriers = crate::server::repo_io::RepoIoAuthority::knowledge_base_carriers(
-                    &projects,
-                    crate::server::repo_io::CatalogBaseTargets::for_authority(
-                        &server.state.project_authority,
-                    )
-                    .as_ref(),
+                    &inputs.records,
+                    inputs.targets.as_ref(),
                 )?;
                 server.state.kb.write().update_project_carriers(carriers);
                 if let Ok(mut guard) = server.state.bbox_watcher.lock()

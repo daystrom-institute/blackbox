@@ -449,11 +449,17 @@ pub(super) fn open_shared_state(
     // the tool-reference entry and triggers save()): a save with the repo's
     // entries not yet loaded would treat the in-memory set as authoritative and
     // purge the committed .bbox/knowledge files for a repo-owned project.
-    // Catalog-mode base carriers name their attachment natively; the
-    // bridge keeps `Selected`, whose encoding must stay byte-identical.
-    let catalog_base_targets = catalog_store
-        .as_deref()
-        .and_then(super::repo_io::CatalogBaseTargets::for_store);
+    // Catalog-mode base carriers name their attachment natively, read from
+    // the same catalog epoch as the records they describe (F4); the bridge
+    // keeps `Selected`, whose encoding must stay byte-identical. Startup has
+    // no last-good carrier set to preserve, so an unreadable catalog refuses
+    // here rather than installing a moving-ladder carrier.
+    let carrier_inputs = super::repo_io::CatalogBaseTargets::read_consistent(
+        &records_provider,
+        catalog_store.as_deref(),
+    )?;
+    let registered_projects = carrier_inputs.records.clone();
+    let catalog_base_targets = carrier_inputs.targets;
     if let Err(e) = kb.configure_repo_io(
         repo_io.clone(),
         repo_io.clone(),

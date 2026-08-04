@@ -2312,12 +2312,21 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
 /// Re-derive repository carriers from the live registry so committed
 /// knowledge and gaps are loaded only through checkout authority.
 pub(crate) fn sync_kb_project_roots(state: &SharedState) {
-    let projects = state.records_provider.records_snapshot().records;
     let repo_io = std::sync::Arc::new(super::repo_io::RepoIoAuthority::new(
         state.checkout_access.clone(),
     ));
-    let catalog_targets =
-        super::repo_io::CatalogBaseTargets::for_authority(&state.project_authority);
+    // Records and their exact attachment targets come from ONE catalog
+    // epoch (F4). On failure every arm below is skipped, which preserves the
+    // last-good carrier set rather than installing a moving-ladder one.
+    let inputs = match super::repo_io::CatalogBaseTargets::read_consistent_for_state(state) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            tracing::warn!("repository-carrier sync skipped, carriers unchanged: {error:#}");
+            return;
+        }
+    };
+    let projects = inputs.records;
+    let catalog_targets = inputs.targets;
     match super::repo_io::RepoIoAuthority::knowledge_base_carriers(
         &projects,
         catalog_targets.as_ref(),

@@ -64,40 +64,99 @@ fn decode_target(carrier_id: &str) -> Result<RepoCarrierTarget> {
 }
 
 /// The native base-attachment target of every catalog project, keyed by
-/// project id.
+/// project id, read from ONE catalog epoch.
 ///
 /// Catalog-mode base carriers name their attachment outright instead of
 /// re-running the `Selected` ladder at every read (plan section 8, P5-F
-/// repo-I/O item 1). The lookup is total for the rows it serves: the
-/// compatibility projection emits a record only for a project with exactly
-/// one active `Base` attachment, so a record with no entry here means the
-/// catalog changed under the snapshot, not that the target is ambiguous.
+/// repo-I/O item 1). `Selected` is a MOVING target: it re-resolves the
+/// session/default/single/base ladder at open time, so encoding it for a
+/// catalog project silently substitutes whatever the ladder later picks for
+/// the attachment the record was built from.
+#[derive(Debug)]
 pub(crate) struct CatalogBaseTargets {
     by_project: BTreeMap<String, (String, Option<PublishedScope>)>,
+    epoch: u64,
 }
 
+/// Compatibility records and their exact native targets, proved to come
+/// from the same catalog epoch.
+#[derive(Debug)]
+pub(crate) struct CatalogCarrierInputs {
+    pub(crate) records: Arc<Vec<ProjectRecord>>,
+    /// `None` in bridge mode only.
+    pub(crate) targets: Option<CatalogBaseTargets>,
+}
+
+/// How many times to re-read when the record projection and the catalog
+/// snapshot land on different epochs. A commit between the two reads is
+/// ordinary; a persistent disagreement is not, and must refuse rather than
+/// spin.
+const CARRIER_EPOCH_ATTEMPTS: usize = 4;
+
 impl CatalogBaseTargets {
-    /// `None` in bridge mode. A version-1 record names no attachment, so
-    /// `Selected` remains its only resolvable target and its carrier
-    /// encoding stays byte-identical (plan section 8, repo-I/O item 2).
-    pub(crate) fn for_authority(authority: &super::state::ProjectAuthority) -> Option<Self> {
-        Self::for_store(authority.catalog_store()?)
+    /// Read compatibility records and exact base-attachment targets from one
+    /// validated catalog epoch (checkpoint 2, finding 4).
+    ///
+    /// Reading the two separately is what let a catalog commit land between
+    /// them: the record set described one epoch while the target map
+    /// described another, and a record whose target had moved fell through
+    /// to `Selected`. Revalidation cannot repair that substitution, because
+    /// it faithfully proves the attachment the carrier now names.
+    pub(crate) fn read_consistent(
+        records_provider: &Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
+        catalog_store: Option<&bbox_indexing::project_catalog_store::ProjectCatalogStore>,
+    ) -> Result<CatalogCarrierInputs> {
+        let Some(store) = catalog_store else {
+            return Ok(CatalogCarrierInputs {
+                records: records_provider.records_snapshot().records,
+                targets: None,
+            });
+        };
+        let mut last_seen = None;
+        for _ in 0..CARRIER_EPOCH_ATTEMPTS {
+            let records = records_provider.records_snapshot();
+            let targets = Self::for_store(store)?;
+            if targets.epoch == records.authority_epoch {
+                return Ok(CatalogCarrierInputs {
+                    records: records.records,
+                    targets: Some(targets),
+                });
+            }
+            last_seen = Some((records.authority_epoch, targets.epoch));
+        }
+        let (record_epoch, target_epoch) = last_seen.unwrap_or_default();
+        bail!(
+            "error.project_catalog_epoch_unsettled: compatibility records at epoch {record_epoch} \
+             and attachment targets at epoch {target_epoch} did not agree after \
+             {CARRIER_EPOCH_ATTEMPTS} attempts; carriers left unchanged"
+        )
     }
 
-    /// The same projection from a store handle, for startup paths that open
-    /// the catalog before the runtime authority value exists.
+    /// The consistent read for callers holding `SharedState`.
+    pub(crate) fn read_consistent_for_state(
+        state: &super::SharedState,
+    ) -> Result<CatalogCarrierInputs> {
+        Self::read_consistent(
+            &state.records_provider,
+            state.project_authority.catalog_store().map(Arc::as_ref),
+        )
+    }
+
+    /// The base-attachment projection of one catalog snapshot.
+    ///
+    /// An unreadable snapshot is an ERROR, never an empty projection: the
+    /// carrier builders treat a missing target as a refusal, and silently
+    /// returning "no project has a native target" would send every catalog
+    /// carrier down the bridge path.
     pub(crate) fn for_store(
         store: &bbox_indexing::project_catalog_store::ProjectCatalogStore,
-    ) -> Option<Self> {
-        let state = store
-            .snapshot()
-            .map_err(|error| {
-                tracing::warn!(
-                    code = %error.code(),
-                    "catalog base-attachment targets unavailable; carriers fall back to Selected"
-                );
-            })
-            .ok()?;
+    ) -> Result<Self> {
+        let state = store.snapshot().map_err(|error| {
+            anyhow::anyhow!(
+                "{}: catalog base-attachment targets are unreadable ({error})",
+                error.code()
+            )
+        })?;
         let mut by_project = BTreeMap::new();
         for attachment in state.attachments().attachments.values() {
             if attachment.status != AttachmentStatus::Attached
@@ -128,25 +187,51 @@ impl CatalogBaseTargets {
                 by_project.insert(project_id, None);
             }
         }
-        Some(Self {
+        Ok(Self {
             by_project: by_project
                 .into_iter()
                 .filter_map(|(project_id, target)| Some((project_id, target?)))
                 .collect(),
+            epoch: state.epoch(),
         })
     }
 
-    /// The unambiguous base attachment of one project, or `None` when the
-    /// caller must keep the `Selected` ladder: bridge mode, or a catalog
-    /// project whose base attachment is absent or duplicated. Falling back
-    /// to `Selected` there refuses through the normal ladder instead of
-    /// binding the carrier to a stale attachment id.
-    fn base_attachment(
-        catalog: Option<&Self>,
+    /// The unambiguous base attachment of one catalog project.
+    pub(crate) fn base_attachment(
+        &self,
         project_id: &str,
     ) -> Option<(String, Option<PublishedScope>)> {
-        catalog?.by_project.get(project_id).cloned()
+        self.by_project.get(project_id).cloned()
     }
+}
+
+/// The carrier target for one project's base checkout.
+///
+/// In catalog mode a missing native target REFUSES. It cannot fall back to
+/// `Selected`: the compatibility projection emits a record only for a
+/// project with exactly one active base attachment read at this same epoch,
+/// so a record without a target is a torn read, and encoding a moving
+/// ladder for it substitutes authority rather than degrading.
+fn base_carrier_target(
+    project: &ProjectRecord,
+    catalog: Option<&CatalogBaseTargets>,
+) -> Result<RepoCarrierTarget> {
+    let Some(catalog) = catalog else {
+        return Ok(RepoCarrierTarget::Selected {
+            project_id: project.project_id.clone(),
+        });
+    };
+    let Some((attachment_id, expected_scope)) = catalog.base_attachment(&project.project_id) else {
+        bail!(
+            "error.project_attachment_required: catalog project {} has no unambiguous active base attachment for its repository carrier",
+            project.project_id
+        )
+    };
+    Ok(RepoCarrierTarget::Attachment {
+        project_id: project.project_id.clone(),
+        attachment_id,
+        expected_scope,
+    })
 }
 
 /// Broker-backed adapter shared by the knowledge and gap stores.
@@ -166,20 +251,10 @@ impl RepoIoAuthority {
         projects
             .iter()
             .map(|project| {
-                match CatalogBaseTargets::base_attachment(catalog, &project.project_id) {
-                    Some((attachment_id, expected_scope)) => Self::knowledge_attachment_carrier(
-                        project.canonical_path.clone(),
-                        &project.project_id,
-                        &attachment_id,
-                        expected_scope,
-                    ),
-                    None => KnowledgeRepoCarrier::new(
-                        project.canonical_path.clone(),
-                        encode_target(&RepoCarrierTarget::Selected {
-                            project_id: project.project_id.clone(),
-                        })?,
-                    ),
-                }
+                KnowledgeRepoCarrier::new(
+                    project.canonical_path.clone(),
+                    encode_target(&base_carrier_target(project, catalog)?)?,
+                )
             })
             .collect()
     }
@@ -191,20 +266,10 @@ impl RepoIoAuthority {
         projects
             .iter()
             .map(|project| {
-                match CatalogBaseTargets::base_attachment(catalog, &project.project_id) {
-                    Some((attachment_id, expected_scope)) => Self::gap_attachment_carrier(
-                        project.canonical_path.clone(),
-                        &project.project_id,
-                        &attachment_id,
-                        expected_scope,
-                    ),
-                    None => GapRepoCarrier::new(
-                        project.canonical_path.clone(),
-                        encode_target(&RepoCarrierTarget::Selected {
-                            project_id: project.project_id.clone(),
-                        })?,
-                    ),
-                }
+                GapRepoCarrier::new(
+                    project.canonical_path.clone(),
+                    encode_target(&base_carrier_target(project, catalog)?)?,
+                )
             })
             .collect()
     }
@@ -952,11 +1017,12 @@ mod tests {
         );
     }
 
-    /// A non-base attachment is not a base carrier target: the compatibility
-    /// projection omits such a project, and binding the carrier to a
-    /// worktree would make the base store follow the wrong checkout.
+    /// F4: a catalog record with no unambiguous active base attachment
+    /// REFUSES. It must never encode Selected, which re-resolves the
+    /// session/default/single/base ladder at open time and would silently
+    /// substitute whichever attachment the ladder later picks.
     #[test]
-    fn a_worktree_only_project_keeps_the_selected_base_target() {
+    fn a_worktree_only_catalog_project_refuses_rather_than_encoding_selected() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let store = catalog_store_with_base_attachment(
@@ -967,16 +1033,26 @@ mod tests {
         );
         let targets = CatalogBaseTargets::for_store(&store).expect("catalog mode");
 
-        let carriers = RepoIoAuthority::knowledge_base_carriers(
+        let error = RepoIoAuthority::knowledge_base_carriers(
             &[record("project-1", "/display/only")],
             Some(&targets),
         )
-        .unwrap();
-        assert_eq!(
-            decode_target(&carriers[0].carrier_id).unwrap(),
-            RepoCarrierTarget::Selected {
-                project_id: "project-1".into(),
-            }
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("error.project_attachment_required"),
+            "{error}"
+        );
+
+        let error = RepoIoAuthority::gap_base_carriers(
+            &[record("project-1", "/display/only")],
+            Some(&targets),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("error.project_attachment_required"),
+            "{error}"
         );
     }
 
@@ -1055,6 +1131,121 @@ mod tests {
             resolves_before_read,
             Some(1),
             "a read publishes nothing and needs only its closing revalidation"
+        );
+    }
+
+    /// F4: the epoch guard. Records and targets must come from one catalog
+    /// epoch, and a provider stuck at a stale epoch must REFUSE rather than
+    /// pair old records with new targets.
+    #[test]
+    fn carrier_inputs_refuse_when_records_and_targets_disagree_on_epoch() {
+        use bbox_corpus_core::project_record::{ProjectRecordsProvider, ProjectRecordsSnapshot};
+
+        struct StaleProvider {
+            snapshot: ProjectRecordsSnapshot,
+        }
+        impl ProjectRecordsProvider for StaleProvider {
+            fn records_snapshot(&self) -> ProjectRecordsSnapshot {
+                self.snapshot.clone()
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store_with_base_attachment(
+            &root,
+            "project-1",
+            "att_00000000000000000000000000000a01",
+            AttachmentKind::Base,
+        );
+        let live_epoch = store.snapshot().unwrap().epoch();
+
+        let provider: Arc<dyn ProjectRecordsProvider> = Arc::new(StaleProvider {
+            snapshot: ProjectRecordsSnapshot {
+                records: Arc::new(vec![record("project-1", "/display/only")]),
+                corpus_project_ids: Arc::new(Default::default()),
+                omitted_catalog_count: 0,
+                // Deliberately not the catalog's epoch: this is the torn read.
+                authority_epoch: live_epoch.wrapping_add(1),
+            },
+        });
+
+        let error = CatalogBaseTargets::read_consistent(&provider, Some(&store))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("error.project_catalog_epoch_unsettled"),
+            "{error}"
+        );
+    }
+
+    /// F4: agreement is the normal path, and it yields native targets.
+    #[test]
+    fn carrier_inputs_pair_records_with_targets_at_one_epoch() {
+        use bbox_corpus_core::project_record::{ProjectRecordsProvider, ProjectRecordsSnapshot};
+
+        struct FreshProvider {
+            snapshot: ProjectRecordsSnapshot,
+        }
+        impl ProjectRecordsProvider for FreshProvider {
+            fn records_snapshot(&self) -> ProjectRecordsSnapshot {
+                self.snapshot.clone()
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = catalog_store_with_base_attachment(
+            &root,
+            "project-1",
+            "att_00000000000000000000000000000a01",
+            AttachmentKind::Base,
+        );
+        let provider: Arc<dyn ProjectRecordsProvider> = Arc::new(FreshProvider {
+            snapshot: ProjectRecordsSnapshot {
+                records: Arc::new(vec![record("project-1", "/display/only")]),
+                corpus_project_ids: Arc::new(Default::default()),
+                omitted_catalog_count: 0,
+                authority_epoch: store.snapshot().unwrap().epoch(),
+            },
+        });
+
+        let inputs = CatalogBaseTargets::read_consistent(&provider, Some(&store)).unwrap();
+        let targets = inputs.targets.expect("catalog mode");
+        let carriers =
+            RepoIoAuthority::knowledge_base_carriers(&inputs.records, Some(&targets)).unwrap();
+        assert!(matches!(
+            decode_target(&carriers[0].carrier_id).unwrap(),
+            RepoCarrierTarget::Attachment { .. }
+        ));
+    }
+
+    /// F4: bridge mode still pairs records with no targets and keeps the
+    /// Selected encoding, without consulting a catalog at all.
+    #[test]
+    fn carrier_inputs_in_bridge_mode_carry_no_targets() {
+        use bbox_corpus_core::project_record::{ProjectRecordsProvider, ProjectRecordsSnapshot};
+
+        struct BridgeProvider;
+        impl ProjectRecordsProvider for BridgeProvider {
+            fn records_snapshot(&self) -> ProjectRecordsSnapshot {
+                ProjectRecordsSnapshot {
+                    records: Arc::new(vec![record("project-1", "/a")]),
+                    corpus_project_ids: Arc::new(Default::default()),
+                    omitted_catalog_count: 0,
+                    authority_epoch: 7,
+                }
+            }
+        }
+        let provider: Arc<dyn ProjectRecordsProvider> = Arc::new(BridgeProvider);
+        let inputs = CatalogBaseTargets::read_consistent(&provider, None).unwrap();
+        assert!(inputs.targets.is_none());
+        let carriers = RepoIoAuthority::knowledge_base_carriers(&inputs.records, None).unwrap();
+        assert_eq!(
+            decode_target(&carriers[0].carrier_id).unwrap(),
+            RepoCarrierTarget::Selected {
+                project_id: "project-1".into(),
+            }
         );
     }
 }

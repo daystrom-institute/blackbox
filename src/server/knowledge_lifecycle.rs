@@ -972,11 +972,10 @@ impl BlackboxServer {
         &self,
     ) -> Result<bbox_knowledge::inventory::PersistedInventoryReport> {
         let entries = self.state.kb.read().all_entries().to_vec();
-        let projects = self.state.records_provider.records_snapshot().records;
+        let inputs = super::repo_io::CatalogBaseTargets::read_consistent_for_state(&self.state)?;
         let carriers = super::repo_io::RepoIoAuthority::knowledge_base_carriers(
-            &projects,
-            super::repo_io::CatalogBaseTargets::for_authority(&self.state.project_authority)
-                .as_ref(),
+            &inputs.records,
+            inputs.targets.as_ref(),
         )?;
         let repo_io = super::repo_io::RepoIoAuthority::new(self.state.checkout_access.clone());
         bbox_knowledge::inventory::persist_schema_epoch_inventory_read_only(
@@ -997,10 +996,8 @@ impl BlackboxServer {
     ) -> Result<bbox_knowledge::inventory::PersistedInventoryReport> {
         let entries = self.state.kb.read().all_entries().to_vec();
         let canonical = project_root.to_string_lossy();
-        let projects = self
-            .state
-            .records_provider
-            .records_snapshot()
+        let inputs = super::repo_io::CatalogBaseTargets::read_consistent_for_state(&self.state)?;
+        let projects = inputs
             .records
             .iter()
             .cloned()
@@ -1011,8 +1008,7 @@ impl BlackboxServer {
         }
         let carriers = super::repo_io::RepoIoAuthority::knowledge_base_carriers(
             &projects,
-            super::repo_io::CatalogBaseTargets::for_authority(&self.state.project_authority)
-                .as_ref(),
+            inputs.targets.as_ref(),
         )?;
         let repo_io = super::repo_io::RepoIoAuthority::new(self.state.checkout_access.clone());
         bbox_knowledge::inventory::persist_schema_epoch_inventory(

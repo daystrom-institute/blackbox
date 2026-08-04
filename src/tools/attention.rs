@@ -103,16 +103,17 @@ impl BlackboxServer {
                 p.project = Some(base);
             }
             let import_report = if p.import_gap_spool.unwrap_or(false) {
-                let projects = server.state.records_provider.records_snapshot().records;
+                let inputs =
+                    crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(
+                        &server.state,
+                    )?;
+                let projects = inputs.records.clone();
                 let repo_write = crate::server::repo_io::RepoIoAuthority::new(
                     server.state.checkout_access.clone(),
                 );
                 let mut carriers = crate::server::repo_io::RepoIoAuthority::gap_base_carriers(
                     &projects,
-                    crate::server::repo_io::CatalogBaseTargets::for_authority(
-                        &server.state.project_authority,
-                    )
-                    .as_ref(),
+                    inputs.targets.as_ref(),
                 )?
                 .into_iter()
                 .collect::<BTreeSet<_>>();
