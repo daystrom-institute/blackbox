@@ -1972,7 +1972,7 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                 // project (plan 5.2). Unreadable authority degrades to the
                 // observer's own bounded rescan.
                 if delivered_a_commit {
-                    super::checkout_access::reconcile_catalog_watchers_for_commit(
+                    super::checkout_access::reconcile_catalog_runtime_for_commit(
                         &state, &observer,
                     );
                 }

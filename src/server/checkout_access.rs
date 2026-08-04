@@ -515,21 +515,53 @@ pub(crate) fn reconcile_catalog_watchers(state: &SharedState) -> WatcherReconcil
     WatcherReconcileOutcome::Reconciled(report)
 }
 
-/// The post-commit watcher step (plan 5.2: "reconcile watcher registrations").
+/// Whether one reconciliation outcome must schedule the observer's bounded
+/// rescan (plan 5.2 fallback clause).
 ///
-/// Called once per delivered batch rather than once per changed project:
-/// reconciliation is a whole-set comparison, so per-project calls would
-/// repeat identical work and report phantom churn. Unreadable authority
-/// degrades to the observer's existing bounded rescan instead of wedging the
-/// loop or tearing down registrations.
-pub(crate) fn reconcile_catalog_watchers_for_commit(
+/// Only unreadable authority does. `Inapplicable` is bridge mode or a
+/// process with no watcher, and rescanning for either would spin on a
+/// condition no rescan can change.
+pub(crate) fn requires_bounded_rescan(outcome: &WatcherReconcileOutcome) -> bool {
+    matches!(outcome, WatcherReconcileOutcome::AuthorityUnavailable)
+}
+
+/// The post-commit runtime step (plan 5.2: "reconcile watcher
+/// registrations", "refresh project capability status").
+///
+/// Watcher reconciliation runs once per delivered batch rather than once per
+/// changed project: it is a whole-set comparison, so per-project calls would
+/// repeat identical work and report phantom churn.
+///
+/// Unreadable authority degrades to the observer's existing bounded rescan
+/// instead of wedging the loop or tearing down registrations.
+///
+/// A catalog commit cannot stale the accepted-publication cache, which is
+/// why this function invalidates nothing.
+///
+/// The section 12 matrix requires attach, detach, and rebind to preserve
+/// accepted content and refresh binding status, and that already holds
+/// without an eviction:
+///   - content and binding stamps come from the POINTER store, which a
+///     `ProjectCatalogStore::transact` does not touch. Pointer mutations go
+///     through establish/bind/advance, which invalidate at their own call
+///     sites under the publication lock.
+///   - scope agreement is recomputed per read against the live catalog
+///     scope (`AcceptedPublicationStatus::with_scope`), so a scope migration
+///     is visible on the next read with no eviction.
+///   - binding status and per-attachment capability availability are read
+///     live from the catalog rows by `SharedState::project_runtime_status`,
+///     never cached.
+/// An `invalidate_binding` sweep here was written and then removed: two
+/// mutation probes could not distinguish its presence from its absence,
+/// because there is no stale state for it to clear.
+pub(crate) fn reconcile_catalog_runtime_for_commit(
     state: &SharedState,
     observer: &bbox_indexing::project_catalog_store::CatalogCommitObserver,
 ) -> WatcherReconcileOutcome {
     let outcome = reconcile_catalog_watchers(state);
-    if outcome == WatcherReconcileOutcome::AuthorityUnavailable {
+    if requires_bounded_rescan(&outcome) {
         tracing::warn!(
-            "watcher reconciliation could not read catalog authority; requesting a bounded rescan"
+            "catalog runtime reconciliation could not read authority; requesting a bounded rescan"
         );
         observer.request_rescan();
     }
@@ -798,5 +830,137 @@ mod tests {
             reconcile_catalog_watchers(&state),
             WatcherReconcileOutcome::Inapplicable
         );
+    }
+
+    /// P5-G mechanic 7 and the section 12 matrix: a catalog commit refreshes
+    /// the BINDING and leaves accepted CONTENT alone. Plan 5.2 names this as
+    /// a non-use explicitly - an attachment row moving is not a reason to
+    /// evict verified content.
+    #[test]
+    fn a_commit_refreshes_binding_and_preserves_accepted_content() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, knowledge_entry};
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().canonicalize().unwrap().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        fixture.attach_overlay_checkout(
+            PROJECT,
+            &scope,
+            &checkout,
+            CatalogFixture::attachment().as_str(),
+            "cccccccccccccccccccccccccccccc21",
+            true,
+        );
+        let installed = fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "published")],
+            &[],
+        );
+        let server = fixture.server();
+        let observer = server
+            .state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority")
+            .commit_observer();
+
+        let before = server.state.project_runtime_status(PROJECT).unwrap();
+        assert_eq!(before.binding.status, "attached");
+        assert_eq!(
+            before.accepted.generation_id.as_deref(),
+            Some(installed.generation_id.as_str())
+        );
+
+        CatalogFixture::detach_in_server(&server, CatalogFixture::attachment().as_str());
+        reconcile_catalog_runtime_for_commit(&server.state, &observer);
+
+        let after = server.state.project_runtime_status(PROJECT).unwrap();
+        assert_eq!(after.binding.status, "detached", "binding refreshed");
+        assert_eq!(
+            after.accepted.generation_id.as_deref(),
+            Some(installed.generation_id.as_str()),
+            "accepted content survives an attachment row change"
+        );
+        assert!(
+            after.accepted.serves_published_content,
+            "detach preserves published reads"
+        );
+    }
+
+    /// Duplicate delivery of the same commit is a no-op for content and for
+    /// registrations alike.
+    #[test]
+    fn duplicate_commit_delivery_evicts_no_accepted_content() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, knowledge_entry};
+
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let installed = fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "published")],
+            &[],
+        );
+        let server = fixture.server();
+        let observer = server
+            .state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority")
+            .commit_observer();
+        for _ in 0..3 {
+            reconcile_catalog_runtime_for_commit(&server.state, &observer);
+            let status = server.state.project_runtime_status(PROJECT).unwrap();
+            assert_eq!(
+                status.accepted.generation_id.as_deref(),
+                Some(installed.generation_id.as_str())
+            );
+            assert_eq!(status.accepted.state, "current");
+        }
+        assert!(
+            observer.pending_rescan_generation().is_none(),
+            "a healthy reconciliation never asks for a rescan"
+        );
+    }
+
+    /// Only unreadable authority schedules the bounded rescan. Bridge mode
+    /// and a watcherless process must not, or the observer would spin on a
+    /// condition no rescan can change.
+    #[test]
+    fn only_unreadable_authority_requires_a_bounded_rescan() {
+        assert!(requires_bounded_rescan(
+            &WatcherReconcileOutcome::AuthorityUnavailable
+        ));
+        assert!(!requires_bounded_rescan(
+            &WatcherReconcileOutcome::Inapplicable
+        ));
+        assert!(!requires_bounded_rescan(
+            &WatcherReconcileOutcome::Reconciled(Default::default())
+        ));
+    }
+
+    /// The fallback pathway itself: requesting a rescan leaves a pending
+    /// generation for the observer loop to drain, which is what makes
+    /// "degrade to a bounded rescan" a real behavior rather than a log line.
+    #[test]
+    fn requesting_a_rescan_leaves_a_pending_generation() {
+        let fixture = CatalogFixture::new();
+        let server = fixture.server();
+        let observer = server
+            .state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority")
+            .commit_observer();
+        assert!(observer.pending_rescan_generation().is_none());
+        observer.request_rescan();
+        assert!(observer.pending_rescan_generation().is_some());
     }
 }
