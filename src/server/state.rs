@@ -2149,6 +2149,12 @@ pub(crate) mod catalog_fixture {
                 .unwrap();
         }
 
+        /// The catalog store, for tests that need to drive its real
+        /// failure modes (`poison_for_test`) rather than mock an authority.
+        pub(crate) fn store(&self) -> &Arc<ProjectCatalogStore> {
+            &self.store
+        }
+
         /// The fixture's temp root, for tests that need to materialize a
         /// checkout directory before attaching it.
         pub(crate) fn root(&self) -> &Path {
@@ -2919,6 +2925,63 @@ mod clause_three_exit_proof {
             status.watcher.capable_but_unregistered.is_empty(),
             "a project with no attachment owes no registration: {:?}",
             status.watcher
+        );
+    }
+
+    /// An unreadable catalog pair is not a denial, and does not take
+    /// durable publication down with it.
+    ///
+    /// Plan 4.17 forbids synthesizing denied counts for operations nobody
+    /// attempted, and the tempting failure is to report an unreadable
+    /// catalog as "everything denied". Driven through the store's REAL
+    /// poisoned state rather than a mock, which is what makes the observed
+    /// answer worth recording: accepted publication is its own store and
+    /// keeps serving, so a catalog-pair read failure degrades attachment
+    /// knowledge without touching published content.
+    #[test]
+    fn a_poisoned_authority_reports_unavailable_without_inventing_denials() {
+        let (fixture, server) = remote_only();
+        let before = server.state.checkout_access.health().sequence;
+
+        let restore = fixture
+            .store()
+            .poison_for_test("clause three: catalog pair unreadable")
+            .expect("the fixture store is readable before poisoning");
+
+        let poisoned = server.state.project_runtime_status(PROJECT);
+        let poisoned = poisoned.expect("status is still answerable");
+        // The property worth pinning is not that everything collapses. It
+        // is that a catalog-pair read failure does NOT take durable
+        // published content down with it: accepted publication is its own
+        // store, and this is exactly the separation that lets a remote-only
+        // project keep serving.
+        assert!(
+            poisoned.accepted.serves_published_content,
+            "accepted publication survives an unreadable catalog pair: {:?}",
+            poisoned.accepted
+        );
+        // And the part plan 4.17 forbids: no attachment appears, and none
+        // is reported as denied, because nothing was attempted.
+        assert!(
+            poisoned.attachments.is_empty(),
+            "an unreadable catalog invents no attachments and no denials: {:?}",
+            poisoned.attachments
+        );
+        assert_eq!(
+            server.state.checkout_access.health().sequence,
+            before,
+            "a poisoned catalog must not manufacture checkout observations"
+        );
+
+        fixture.store().unpoison_for_test(restore);
+        let recovered = server
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("status returns once the pair is readable again");
+        assert!(
+            recovered.accepted.serves_published_content,
+            "unpoisoning restores the real answer, so the row above was not \
+             passing on a permanently broken fixture"
         );
     }
 
