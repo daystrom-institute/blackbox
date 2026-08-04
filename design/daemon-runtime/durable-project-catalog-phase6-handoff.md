@@ -1,7 +1,7 @@
 ---
 title: "Durable project catalog Phase 6 handoff inventory"
 kind: design
-lifecycle: partial
+lifecycle: complete
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -216,31 +216,41 @@ Reversing 4 and 5 breaks the cut: the projection is what keeps v1-shaped
 consumers alive while they are being converted.
 
 ## 6. Status of this document
-`lifecycle: partial`. Both P5-H deliverables this document was waiting on
-have landed and both run blocking:
+`lifecycle: complete`. Both P5-H deliverables this document was waiting on
+have landed, both run blocking, and the closing review has confirmed they
+prove what this document claims for them:
 
 - the checkout-open call-site audit, recorded in section 2.1 as a
   machine-checked input;
 - the bridge parity fixture, recorded in section 2.1 as a machine-checked
   input and in section 3.7 as its own deletion inventory.
 
-### 6.1 Why this is still partial
-This document was briefly marked `complete` on the strength of those two
-inputs existing and running blocking. The closing bookend review then found
-that existing and running is not the same as VALID, and its findings
-contradict assertions this document makes. A handoff inventory whose prose
-outruns its machine checks is the exact failure mode section 1 says the
-pairing exists to prevent, so the marker goes back until the checks are
-worth what the prose claims for them.
+### 6.1 How the marker was earned
+This document was briefly marked `complete` once before, on the strength of
+those two inputs existing and running blocking. The closing bookend review
+found that existing and running is not the same as VALID, and the marker
+went back. That is the record worth keeping: a handoff inventory whose prose
+outruns its machine checks is the failure mode section 1 says the pairing
+exists to prevent, and it caught this document rather than being caught by
+it.
 
-Open findings, all in the closing bookend round:
+The bookend ran nine rounds. Every finding is closed, and the round-9
+verdict is `PASS` with no findings. The static ownership proof took most of
+those rounds: it began as five aggregate counts over six crates and is now a
+per-site inventory over every crate the daemon links, with test spans
+excluded by parsing rather than by matching text, and with each covered
+syntax node mechanically bound to a case that fails if its hook is removed.
+Four successive versions of that proof were each disproved by reading the
+AST against them, which is why the binding is a machine check now rather
+than a claim in a comment.
 
-| Finding | Contradicted assertion |
-|---|---|
-| 4 (high, fix landed) | Section 2.1 says the parity fixture catches a bridge RESPONSE change. It did not catch one confined to a field the harness projected rather than compared: the system-memory body on the published views, the exact observation counters and sequences, and doctor finding messages. Section 3.7's claim that widening a projection converts the proof into a formality applied to the harness's own three projections first. FIX LANDED, awaiting re-review: all three are captured complete, with determinism bought at the source and only exact-value substitutions remaining. |
-| 2, 3 | Findings against the other P5-H proofs, held by their own workers. They bear on section 2.1's claim that the three machine-checked inputs together leave no unwatched gap. |
+One scanner limitation is accepted rather than fixed, and this is its
+record: attributes inside macro invocations are invisible to the parser,
+which reads a macro body as opaque tokens, so a `cfg(test)` occurrence
+inside one scans as production. The direction is what makes it acceptable.
+It over-reports test code as production, which fails loudly at the next
+baseline diff, and it cannot hide a production occurrence, which is the
+only direction that would weaken the ownership claim.
 
-Re-completion is a final-round act, not a same-round one: it happens after
-the re-review passes, not after the fixes are pushed. Until then, treat
-section 2.1's coverage claims as the INTENT of the inputs rather than a
-statement of what they currently prove.
+Section 2.1's coverage claims are now a statement of what the inputs prove,
+not merely their intent.
