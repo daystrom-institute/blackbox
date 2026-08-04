@@ -3146,20 +3146,50 @@ fn durable_mismatch_message_silent_when_predicate_says_no() {
 fn build_id_is_git_sha_not_timestamp() {
     let (_cv, cb) = own_id();
     assert!(!cb.is_empty(), "build_id must be non-empty");
-    // A git short SHA is all hex chars [0-9a-f]; a timestamp is all
-    // decimal digits. A build_id that starts with a hex letter
-    // (e.g. 'a'..'f') is definitively from git — timestamps never
-    // start with a-f. But we can't assume the SHA always leads
-    // with a letter (could be all decimal digits). Instead:
-    // timestamps are strictly decimal digits; git SHAs are hex.
     assert!(
-        cb.chars()
-            .any(|c| c.is_ascii_hexdigit() && c.is_ascii_alphabetic()),
-        "build_id '{}' must contain at least one hex letter; \
-             an all-decimal string suggests the timestamp fallback \
-             is incorrectly active",
-        cb,
+        looks_like_git_build_id(&cb),
+        "build_id '{cb}' is not a git-derived stamp; a value this short \
+         is the Unix-seconds timestamp fallback, which means build.rs \
+         could not reach git"
     );
+
+    // The discriminator asserted directly, so both the shape that used to
+    // break it and the shape it must still catch are pinned regardless of
+    // what HEAD happens to be today.
+    assert!(
+        looks_like_git_build_id("264068412209"),
+        "an all-decimal SHA prefix is still a SHA"
+    );
+    assert!(
+        !looks_like_git_build_id("1785799100"),
+        "a Unix-seconds timestamp must still be rejected"
+    );
+    assert!(
+        !looks_like_git_build_id("26406841"),
+        "a stamp shorter than build.rs asks git for is not a valid id"
+    );
+    assert!(
+        !looks_like_git_build_id("a8205a860abz"),
+        "a non-hex stamp is not a SHA"
+    );
+}
+
+/// A Unix-seconds timestamp is 10 digits, and stays under 12 until the
+/// year 33658, so LENGTH separates the two shapes and the alphabet does
+/// not. The assertion that used to stand here required at least one hex
+/// letter, which a git SHA prefix is under no obligation to contain: a
+/// 12-char prefix is all-decimal with probability (10/16)^12, about 1 in
+/// 281. The test's own comment conceded the premise and asserted the
+/// opposite anyway.
+///
+/// The length floor is what keeps the fallback detectable, which is the
+/// property this test actually exists for: `build.rs` asks git for
+/// `--short=12`, so anything at or below timestamp width means git was
+/// unreachable at build time.
+fn looks_like_git_build_id(build_id: &str) -> bool {
+    /// Unix seconds reach 11 digits in the year 2286.
+    const MAX_TIMESTAMP_DIGITS: usize = 11;
+    build_id.len() > MAX_TIMESTAMP_DIGITS && build_id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// N5: when both a status flash and a build-mismatch banner
