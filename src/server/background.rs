@@ -299,22 +299,40 @@ fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
 
 fn start_bbox_watcher(shared: &Arc<SharedState>) {
     let projects = shared.records_provider.records_snapshot().records;
-    let project_carriers = projects
-        .iter()
-        .filter_map(|project| {
-            watcher::ArtifactWatchCarrier::selected(project.project_id.clone())
-                .map_err(|error| {
-                    tracing::warn!(
-                        project = %project.project_id,
-                        error = %error,
-                        "artifact watcher skipped invalid project carrier"
-                    );
-                })
-                .ok()
-        })
-        .collect::<Vec<_>>();
+    // Catalog mode registers by native attachment id, gated on the
+    // `artifact_watching` capability (plan section 8, P5-F watcher items 1
+    // and 2). Bridge mode keeps the Selected carrier over compatibility
+    // records byte-identical.
+    let project_carriers = match super::checkout_access::catalog_watch_carriers(shared) {
+        super::checkout_access::CatalogWatchCarriers::Available(carriers) => carriers,
+        super::checkout_access::CatalogWatchCarriers::Unavailable => {
+            // Startup with unreadable catalog authority installs no native
+            // registration rather than guessing one. The post-commit
+            // reconciler converges the set once authority is readable.
+            tracing::warn!(
+                "catalog authority unavailable at watcher startup; native registrations deferred \
+                 to post-commit reconciliation"
+            );
+            Vec::new()
+        }
+        super::checkout_access::CatalogWatchCarriers::BridgeMode => projects
+            .iter()
+            .filter_map(|project| {
+                watcher::ArtifactWatchCarrier::selected(project.project_id.clone())
+                    .map_err(|error| {
+                        tracing::warn!(
+                            project = %project.project_id,
+                            error = %error,
+                            "artifact watcher skipped invalid project carrier"
+                        );
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>(),
+    };
     let watch_access = Arc::new(super::checkout_access::DaemonArtifactWatchAccess::new(
         shared.checkout_access.clone(),
+        shared.project_authority.catalog_store().cloned(),
     ));
     let catalog = Arc::new(shared.artifacts.read().clone());
 
@@ -549,5 +567,233 @@ fn spawn_packet_self_heal_scanner(shared: Arc<SharedState>) {
         });
     } else {
         tracing::debug!("packet self-heal scanner: disabled");
+    }
+}
+
+#[cfg(test)]
+mod catalog_watcher_startup_tests {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use bbox_artifacts::watcher::ArtifactWatchAttachment;
+    use bbox_corpus_core::project_catalog::{
+        AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus, CheckoutAttachment,
+        ProjectId,
+    };
+    use bbox_indexing::project_catalog_store::CatalogCommittedEvent;
+
+    use super::*;
+    use crate::server::state::catalog_fixture::CatalogFixture;
+
+    const PROJECT: &str = "proj_watch";
+    const CAPABLE: &str = "att_00000000000000000000000000000e01";
+    const INCAPABLE: &str = "att_00000000000000000000000000000e02";
+    const CHECKOUT_ONE: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeee01";
+    const CHECKOUT_TWO: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeee02";
+
+    /// A checkout the catalog authority will accept: real directory, real
+    /// `.bbox` tree, and the checkout-id marker it reads back on every lease.
+    fn checkout(root: &std::path::Path, name: &str, checkout_id: &str) -> std::path::PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join(".bbox").join("local")).unwrap();
+        std::fs::write(
+            dir.join(".bbox").join("local").join("checkout-id"),
+            format!("{checkout_id}\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn attach(
+        state: &Arc<SharedState>,
+        attachment_id: &str,
+        checkout_id: &str,
+        dir: &std::path::Path,
+        artifact_watching: bool,
+    ) {
+        let store = state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority");
+        let scope = CatalogFixture::scope(".");
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let attachment_id = AttachmentId::parse(attachment_id).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |_catalog, attachments| {
+                attachments.attachments.insert(
+                    attachment_id.clone(),
+                    CheckoutAttachment {
+                        attachment_id: attachment_id.clone(),
+                        project_id: project_id.clone(),
+                        checkout_id: checkout_id.to_string(),
+                        checkout_dir: dir.clone(),
+                        checkout_project_dir: dir.clone(),
+                        project_root_relpath: ".".into(),
+                        kind: AttachmentKind::Base,
+                        validated_scope: Some(scope.clone()),
+                        computed_repo_hint: None,
+                        branch_ref: Some("refs/heads/main".into()),
+                        capabilities: AttachmentCapabilities {
+                            artifact_watching,
+                            ..Default::default()
+                        },
+                        status: AttachmentStatus::Attached,
+                        attached_at: "2026-08-03T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn registered(state: &SharedState) -> Vec<bbox_artifacts::watcher::ArtifactWatchCarrier> {
+        let guard = state.bbox_watcher.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|watcher| watcher.registered_carriers())
+            .unwrap_or_default()
+    }
+
+    /// Poll until `predicate` holds or the deadline passes. The observer runs
+    /// on its own thread with a poll interval, so a fixed sleep would either
+    /// be flaky or slow; this is neither.
+    fn wait_until(
+        state: &SharedState,
+        predicate: impl Fn(&[bbox_artifacts::watcher::ArtifactWatchCarrier]) -> bool,
+    ) -> Vec<bbox_artifacts::watcher::ArtifactWatchCarrier> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let carriers = registered(state);
+            if predicate(&carriers) {
+                return carriers;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "observer did not converge; last registrations: {carriers:#?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn catalog_state(fixture: &CatalogFixture) -> Arc<SharedState> {
+        let server = fixture.server_with_checkout_authority();
+        server.state.clone()
+    }
+
+    /// Startup registers by attachment id, and only for an attachment that
+    /// records `artifact_watching`. The second attachment is the negative
+    /// half: it is attached and healthy and still installs no watcher.
+    #[test]
+    fn startup_registers_capable_attachments_by_attachment_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let state = catalog_state(&fixture);
+        attach(
+            &state,
+            CAPABLE,
+            CHECKOUT_ONE,
+            &checkout(&root, "capable", CHECKOUT_ONE),
+            true,
+        );
+        attach(
+            &state,
+            INCAPABLE,
+            CHECKOUT_TWO,
+            &checkout(&root, "incapable", CHECKOUT_TWO),
+            false,
+        );
+
+        start_bbox_watcher(&state);
+
+        let carriers = registered(&state);
+        assert_eq!(carriers.len(), 1, "{carriers:#?}");
+        assert_eq!(
+            carriers[0].attachment(),
+            &ArtifactWatchAttachment::AttachmentId(CAPABLE.to_string())
+        );
+    }
+
+    /// The post-commit observer path end to end: a real observer thread, a
+    /// real watcher, and a real catalog. A duplicate delivery of the same
+    /// committed event must leave the registration set exactly as it was.
+    #[test]
+    fn duplicate_observer_delivery_is_idempotent_and_detach_removes_the_watcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let state = catalog_state(&fixture);
+        let capable = checkout(&root, "capable", CHECKOUT_ONE);
+
+        // Start the watcher BEFORE the attachment exists, so every
+        // registration below arrives through the observer rather than
+        // through startup.
+        start_bbox_watcher(&state);
+        assert!(registered(&state).is_empty());
+
+        let observer = state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority")
+            .commit_observer();
+        super::super::code_source::spawn_commit_observer(&state);
+
+        attach(&state, CAPABLE, CHECKOUT_ONE, &capable, true);
+        let event = CatalogCommittedEvent {
+            epoch: state
+                .project_authority
+                .catalog_store()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .epoch(),
+            changed_project_ids: std::collections::BTreeSet::from([PROJECT.to_string()]),
+        };
+        observer.push_for_test(event.clone());
+
+        let after_first = wait_until(&state, |carriers| carriers.len() == 1);
+        assert_eq!(
+            after_first[0].attachment(),
+            &ArtifactWatchAttachment::AttachmentId(CAPABLE.to_string())
+        );
+
+        // Duplicate delivery of the same committed event: the catalog has
+        // not changed, so the registration set must be identical afterwards.
+        observer.push_for_test(event.clone());
+        observer.push_for_test(event);
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            registered(&state),
+            after_first,
+            "a duplicate committed event must not churn registrations"
+        );
+
+        // Detach through the same observer path: the registration goes, and
+        // nothing is left to publish events for that attachment.
+        CatalogFixture::detach_in_server(
+            &crate::server::BlackboxServer::new(state.clone()),
+            CAPABLE,
+        );
+        observer.push_for_test(CatalogCommittedEvent {
+            epoch: state
+                .project_authority
+                .catalog_store()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .epoch(),
+            changed_project_ids: std::collections::BTreeSet::from([PROJECT.to_string()]),
+        });
+        wait_until(&state, |carriers| carriers.is_empty());
+
+        state
+            .reconciler_shutdown
+            .read()
+            .store(true, Ordering::Release);
     }
 }

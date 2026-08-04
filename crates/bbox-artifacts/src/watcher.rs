@@ -458,6 +458,21 @@ impl BbxWatcher {
         report
     }
 
+    /// The logical carriers currently registered.
+    ///
+    /// Observational: the reconciler compares against the live table, not
+    /// this copy. Health reporting and tests use it to see watcher state
+    /// without reaching into the registration rows, which hold an OS watch
+    /// root that is not logical identity.
+    pub fn registered_carriers(&self) -> Vec<ArtifactWatchCarrier> {
+        self.registrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|registration| registration.carrier.clone())
+            .collect()
+    }
+
     fn unwatch_if_unreferenced(&mut self, root: &Path) -> anyhow::Result<()> {
         let still_watched = self
             .registrations

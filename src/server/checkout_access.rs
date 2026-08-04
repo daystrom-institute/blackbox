@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_artifacts::watcher::{
     ArtifactWatchAccess, ArtifactWatchAttachment, ArtifactWatchCarrier, ArtifactWatchRead,
+    ArtifactWatchReconcileReport,
 };
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{
@@ -390,19 +391,10 @@ pub(crate) struct DaemonArtifactWatchAccess {
 }
 
 impl DaemonArtifactWatchAccess {
-    pub(crate) fn new(broker: Arc<CheckoutAccessBroker>) -> Self {
-        Self {
-            broker,
-            catalog: None,
-        }
-    }
-
-    /// The catalog-mode adapter. Native attachment carriers resolve their
-    /// expected scope from the catalog row instead of a discovery lease.
-    // Adopted by the daemon watcher startup path; that integration is a
-    // separate ownership grant and lands with it.
-    #[allow(dead_code)]
-    pub(crate) fn with_catalog(
+    /// `catalog` is `None` in bridge mode, where every carrier resolves
+    /// through the legacy two-step and no catalog row exists to read a
+    /// scope from.
+    pub(crate) fn new(
         broker: Arc<CheckoutAccessBroker>,
         catalog: Option<Arc<ProjectCatalogStore>>,
     ) -> Self {
@@ -426,55 +418,89 @@ impl DaemonArtifactWatchAccess {
 /// degradation for this row is "no watcher plus bounded capability health",
 /// not a registration that fails on every event. Durable artifact metadata
 /// already in the catalog is unaffected either way.
-#[allow(dead_code)] // See `with_catalog`: startup/observer integration is a separate grant.
-pub(crate) fn catalog_watch_carriers(state: &SharedState) -> Vec<ArtifactWatchCarrier> {
+/// The result of projecting the catalog into watcher carriers.
+///
+/// `Unavailable` is deliberately NOT an empty carrier set. The reconciler
+/// removes every registration absent from its desired set, so collapsing an
+/// unreadable snapshot into "nothing is capable" would tear down every live
+/// watcher on a transient authority failure. It is a distinct state so the
+/// caller can leave registrations alone and fall back to a bounded rescan
+/// (plan 5.2 fallback clause).
+#[derive(Debug)]
+pub(crate) enum CatalogWatchCarriers {
+    Available(Vec<ArtifactWatchCarrier>),
+    Unavailable,
+    /// Bridge mode: the native lane does not apply and the legacy Selected
+    /// and CheckoutId registrations remain the whole watcher story.
+    BridgeMode,
+}
+
+pub(crate) fn catalog_watch_carriers(state: &SharedState) -> CatalogWatchCarriers {
     let Some(store) = state.project_authority.catalog_store() else {
-        return Vec::new();
+        return CatalogWatchCarriers::BridgeMode;
     };
-    let Ok(snapshot) = store.snapshot() else {
-        tracing::warn!("catalog snapshot unavailable; watcher reconciliation skipped this pass");
-        return Vec::new();
+    let snapshot = match store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                code = %error.code(),
+                "catalog snapshot unavailable; watcher registrations left as they are"
+            );
+            return CatalogWatchCarriers::Unavailable;
+        }
     };
-    snapshot
-        .attachments()
-        .attachments
-        .values()
-        .filter(|attachment| attachment.status == AttachmentStatus::Attached)
-        .filter(|attachment| attachment.capabilities.artifact_watching)
-        .filter_map(|attachment| {
-            ArtifactWatchCarrier::for_attachment(
-                attachment.project_id.as_str(),
-                attachment.attachment_id.as_str(),
-            )
-            .map_err(|error| {
-                tracing::warn!(
-                    project = %attachment.project_id.as_str(),
-                    error = %error,
-                    "artifact watcher rejected a catalog attachment carrier"
-                );
+    CatalogWatchCarriers::Available(
+        snapshot
+            .attachments()
+            .attachments
+            .values()
+            .filter(|attachment| attachment.status == AttachmentStatus::Attached)
+            .filter(|attachment| attachment.capabilities.artifact_watching)
+            .filter_map(|attachment| {
+                ArtifactWatchCarrier::for_attachment(
+                    attachment.project_id.as_str(),
+                    attachment.attachment_id.as_str(),
+                )
+                .map_err(|error| {
+                    tracing::warn!(
+                        project = %attachment.project_id.as_str(),
+                        error = %error,
+                        "artifact watcher rejected a catalog attachment carrier"
+                    );
+                })
+                .ok()
             })
-            .ok()
-        })
-        .collect()
+            .collect(),
+    )
+}
+
+/// What one reconciliation attempt did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WatcherReconcileOutcome {
+    Reconciled(ArtifactWatchReconcileReport),
+    /// Bridge mode, or this process runs no watcher. Neither is an error.
+    Inapplicable,
+    /// Catalog authority was unreadable. Registrations are untouched and the
+    /// caller should schedule a bounded rescan.
+    AuthorityUnavailable,
 }
 
 /// Reconcile the live watcher's native registrations against the catalog.
 ///
 /// Safe to call for every post-commit event including duplicates: the
 /// reconciler compares desired against installed, so an unchanged catalog
-/// produces no watch churn. A project with no watcher (no daemon watcher
-/// yet, or none of its attachments capable) is not an error here.
-#[allow(dead_code)] // See `with_catalog`: startup/observer integration is a separate grant.
-pub(crate) fn reconcile_catalog_watchers(state: &SharedState) {
-    if state.project_authority.catalog_store().is_none() {
-        return;
-    }
-    let desired = catalog_watch_carriers(state);
+/// produces no watch churn.
+pub(crate) fn reconcile_catalog_watchers(state: &SharedState) -> WatcherReconcileOutcome {
+    let desired = match catalog_watch_carriers(state) {
+        CatalogWatchCarriers::Available(desired) => desired,
+        CatalogWatchCarriers::Unavailable => return WatcherReconcileOutcome::AuthorityUnavailable,
+        CatalogWatchCarriers::BridgeMode => return WatcherReconcileOutcome::Inapplicable,
+    };
     let Ok(mut guard) = state.bbox_watcher.lock() else {
-        return;
+        return WatcherReconcileOutcome::Inapplicable;
     };
     let Some(watcher) = guard.as_mut() else {
-        return;
+        return WatcherReconcileOutcome::Inapplicable;
     };
     let report = watcher.reconcile_attachment_registrations(&desired);
     if !report.is_noop() || report.failed > 0 {
@@ -486,6 +512,28 @@ pub(crate) fn reconcile_catalog_watchers(state: &SharedState) {
             "artifact watcher reconciled catalog registrations"
         );
     }
+    WatcherReconcileOutcome::Reconciled(report)
+}
+
+/// The post-commit watcher step (plan 5.2: "reconcile watcher registrations").
+///
+/// Called once per delivered batch rather than once per changed project:
+/// reconciliation is a whole-set comparison, so per-project calls would
+/// repeat identical work and report phantom churn. Unreadable authority
+/// degrades to the observer's existing bounded rescan instead of wedging the
+/// loop or tearing down registrations.
+pub(crate) fn reconcile_catalog_watchers_for_commit(
+    state: &SharedState,
+    observer: &bbox_indexing::project_catalog_store::CatalogCommitObserver,
+) -> WatcherReconcileOutcome {
+    let outcome = reconcile_catalog_watchers(state);
+    if outcome == WatcherReconcileOutcome::AuthorityUnavailable {
+        tracing::warn!(
+            "watcher reconciliation could not read catalog authority; requesting a bounded rescan"
+        );
+        observer.request_rescan();
+    }
+    outcome
 }
 
 impl ArtifactWatchAccess for DaemonArtifactWatchAccess {
@@ -647,6 +695,13 @@ mod tests {
             .unwrap();
     }
 
+    fn available(state: &SharedState) -> Vec<ArtifactWatchCarrier> {
+        match catalog_watch_carriers(state) {
+            CatalogWatchCarriers::Available(carriers) => carriers,
+            other => panic!("expected an available catalog projection, got {other:?}"),
+        }
+    }
+
     fn watching() -> AttachmentCapabilities {
         AttachmentCapabilities {
             artifact_watching: true,
@@ -689,7 +744,7 @@ mod tests {
             AttachmentStatus::Attached,
         );
 
-        let carriers = catalog_watch_carriers(&server.state);
+        let carriers = available(&server.state);
         assert_eq!(carriers.len(), 1, "{carriers:#?}");
         assert_eq!(carriers[0].project_id(), PROJECT);
         assert_eq!(
@@ -718,11 +773,11 @@ mod tests {
             watching(),
             AttachmentStatus::Attached,
         );
-        assert_eq!(catalog_watch_carriers(&server.state).len(), 1);
+        assert_eq!(available(&server.state).len(), 1);
 
         CatalogFixture::detach_in_server(&server, CAPABLE);
 
-        assert!(catalog_watch_carriers(&server.state).is_empty());
+        assert!(available(&server.state).is_empty());
     }
 
     /// Bridge mode has no catalog to project, so the native lane is empty
@@ -733,9 +788,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let state = crate::server::state::SharedState::for_test(&root);
-        assert!(catalog_watch_carriers(&state).is_empty());
+        assert!(matches!(
+            catalog_watch_carriers(&state),
+            CatalogWatchCarriers::BridgeMode
+        ));
         // Inert, not a panic: a bridge daemon calls the reconciler from the
         // same post-commit path a catalog daemon does.
-        reconcile_catalog_watchers(&state);
+        assert_eq!(
+            reconcile_catalog_watchers(&state),
+            WatcherReconcileOutcome::Inapplicable
+        );
     }
 }

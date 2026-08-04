@@ -1912,6 +1912,7 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                         events.push(event);
                     }
                 }
+                let delivered_a_commit = !events.is_empty();
                 for event in events {
                     for project_id in &event.changed_project_ids {
                         // Map each affected id to one reconciler event
@@ -1964,6 +1965,15 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                         epoch = event.epoch,
                         changed_count = event.changed_project_ids.len(),
                         "commit observer: mapped catalog commit to reconciler events"
+                    );
+                }
+                // Watcher reconciliation is a whole-set comparison, so it
+                // runs once per delivered batch rather than once per changed
+                // project (plan 5.2). Unreadable authority degrades to the
+                // observer's own bounded rescan.
+                if delivered_a_commit {
+                    super::checkout_access::reconcile_catalog_watchers_for_commit(
+                        &state, &observer,
                     );
                 }
                 if let Some(progress) = rescan_progress.as_ref()
