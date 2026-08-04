@@ -1297,46 +1297,51 @@ mod clause_one_exit_proof {
         // consults `records`, emits different edges, and returns Ok on both
         // twins is exactly the failure this row exists to catch, and
         // is_ok()-equality cannot see it.
-        // The registered-project filter is the seam this row exists to
-        // test, and only ONE lane passes through it: the project-keyed
-        // sidecar files, gated by file stem in
-        // `project_sidecar_edges_in_dir`. Store-projected edges never reach
-        // it, which is why seeding knowledge alone could not make the
-        // records mutation red.
+        // ONE project-keyed sidecar file, named for the ATTACHED project so
+        // the loader's file-stem check admits it.
         //
-        // Both twins read the same durable bytes, so this is written once
-        // and loaded by both. Unmutated, `p_clause_one` is in
-        // `corpus_project_ids` on both and the edge loads on both.
-        // Mutated to derive the set from `records`, the recordless twin's
-        // set is EMPTY, the file is skipped, and its projection loses this
-        // edge, which is exactly the difference this row must catch.
+        // The attached project, not the remote-only one, is what makes the
+        // mutation red on the COMPARISON rather than on the guard: it is
+        // present in the populated twin's records and absent from the
+        // recordless twin's, so a rebuild rewired to consult records makes
+        // the two projections DIVERGE. Keyed to the remote-only project both
+        // twins lose the edge together, which still reds but proves only
+        // that the seam was touched, not that the twins differ. This is the only lane the
+        // rebuild's registered-project set actually gates
+        // (project_sidecar_edges_in_dir -> sidecar_project_is_registered),
+        // and it is what makes this row seam-relative rather than merely
+        // populated: store-projected knowledge edges never pass through
+        // that filter, so comparing them proved nothing about records.
+        //
+        // The Edge is CONSTRUCTED and serialized rather than hand-written,
+        // so the fixture cannot drift from the type. That is not
+        // hypothetical: writing this by hand once already produced a file
+        // that never loaded, and the row went green having compared
+        // nothing. A constructor makes such a drift a compile error.
         let sidecar_edge = bbox_edge_index::edge_index::Edge {
-            source: bbox_corpus_core::entity_ref::EntityRef::Knowledge {
-                id: "edge-seed-old".into(),
-            },
-            kind: "SEAM_PROBE".into(),
-            target: bbox_corpus_core::entity_ref::EntityRef::Knowledge {
-                id: "edge-seed-new".into(),
-            },
+            source: bbox_corpus_core::entity_ref::EntityRef::parse("knowledge:edge-seed-new")
+                .expect("edge source ref"),
+            kind: "DESCRIBES".to_string(),
+            target: bbox_corpus_core::entity_ref::EntityRef::parse("knowledge:edge-seed-old")
+                .expect("edge target ref"),
             provenance: bbox_chunker::EdgeProvenance::Explicit,
             confidence: bbox_chunker::EdgeConfidence::Exact,
             metadata: Default::default(),
         };
-        let seam_probe = format!(
+        let sidecar_key = format!(
             "{}|{}|{}",
             sidecar_edge.source, sidecar_edge.kind, sidecar_edge.target
         );
-        {
-            let edges_dir =
-                bbox_edge_index::edge_index::edges_dir_from_bro_store(&populated.state.store_dir);
-            std::fs::create_dir_all(&edges_dir).unwrap();
-            // The stem IS the project id the filter tests.
-            std::fs::write(
-                edges_dir.join(format!("{PROJECT}.jsonl")),
-                format!("{}\n", serde_json::to_string(&sidecar_edge).unwrap()),
-            )
-            .unwrap();
-        }
+        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&populated.state.store_dir);
+        std::fs::create_dir_all(&edges_dir).unwrap();
+        std::fs::write(
+            edges_dir.join(format!("{ATTACHED_PROJECT}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::to_string(&sidecar_edge).expect("edge serializes")
+            ),
+        )
+        .unwrap();
 
         for server in [&populated, &recordless] {
             let mut base = knowledge_entry("edge-seed-old", "superseded seed");
@@ -1366,29 +1371,17 @@ mod clause_one_exit_proof {
         };
         let left = edge_projection(&populated);
         let right = edge_projection(&recordless);
-        // Non-triviality, SEAM-RELATIVE. Asserting the view is merely
-        // populated proves nothing here: the earlier version of this row
-        // was populated by store-projected edges that never touch the
-        // filter under test, so it compared two views that were
-        // non-trivial in the wrong dimension. What has to hold is that the
-        // compared projection contains an edge which REACHED it through
-        // the registered-project filter.
+        // Seam-relative non-triviality. "Populated" is not enough: the
+        // compared projection must CONTAIN the edge that travels through
+        // the filter under test, or a rebuild rewired to consult `records`
+        // changes nothing this row can see.
         assert!(
-            left.contains(&seam_probe),
-            "the compared projection must contain the sidecar edge that \
-             traverses the registered-project filter; without it this row \
-             compares edges the record seam cannot affect"
+            left.contains(&sidecar_key),
+            "the compared projection must contain the project-keyed sidecar \
+             edge, which is the one the registered-project filter gates: \
+             {left:?}"
         );
-        // REMAINING STEP, stated rather than implied. The records mutation
-        // now reds, but on the guard above rather than on the comparison
-        // below, because PROJECT is a remote-only catalog project with no
-        // attachment: `records` is empty on BOTH twins, so the mutation
-        // drops the sidecar edge from both and the projections still match.
-        // Attaching a checkout to PROJECT in `fixture_with_content` makes
-        // the populated twin's `records` non-empty, at which point the
-        // mutation drops the edge from the recordless twin ONLY and the
-        // COMPARISON is what reds. The sidecar lane is reachable and the
-        // guard is seam-relative; that attachment is the last step.
+
         assert_eq!(
             right, left,
             "collected activation and rebuild produced different edges with \
