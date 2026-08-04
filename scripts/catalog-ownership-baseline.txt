@@ -1,12 +1,181 @@
-# Catalog ownership ratchet baseline (plan section 14.2 Proof B).
-# Counts of each replaced-surface pattern in catalog runtime paths,
-# excluding test modules. The lint fails on any INCREASE.
-# Every count here is Phase 6 deletion inventory; see
+# Catalog ownership inventory baseline (plan section 14.2 Proof B).
+# One row per SITE: pattern, file, enclosing item, count, Phase 6 reason.
+# A site absent from this file fails the check even when the total is
+# unchanged, which is what rejects substituting a prohibited occurrence
+# for an approved one. Every row is Phase 6 deletion inventory; see
 # design/daemon-runtime/durable-project-catalog-phase6-handoff.md.
+# Rows carrying NEEDS-REASON fail the check until an author states the
+# Phase 6 deletion or retention reason for that site.
 # Refresh after a legitimate removal:
 #   scripts/acceptance-catalog-ownership.sh --write-baseline
-project_record_import 12
-canonical_path_read 39
-legacy_publisher 10
-watcher_selected_carrier 4
-repo_io_selected_target 7
+canonical_path_read	crates/bbox-corpus-core/src/project_record.rs	fn from	2	delete with ProjectRecord
+canonical_path_read	crates/bbox-corpus-core/src/project_record.rs	fn resolve_base_project_for_scope	3	delete with ProjectRecord
+canonical_path_read	crates/bbox-corpus-core/src/project_selector.rs	fn display	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-edge-index/src/storage_health.rs	fn collect_project_storage_facts	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/catalog_records.rs	fn records_snapshot	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolution_roots	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolve_legacy_path	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolve_selected	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/checkout_access_v1.rs	fn select_scope_project	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/index/knowledge_docs.rs	fn reindex_knowledge_store_with_access	2	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn derive_legacy_project_probes_with_hook	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn observe_legacy_projects	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn validate_pairing	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory.rs	fn from_legacy	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_against_inventory	2	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_migration.rs	fn build_base_post_images	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_migration.rs	fn build_migration_report	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_migration.rs	fn missing_project_rows	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_resolver.rs	fn v1_resolve	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_resolver.rs	fn v1_scope_arm	3	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn base_context	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn fleet_worktree_scope_and_dir	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn register_path_locked	2	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn rename_project_locked	5	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn resolve_managed_fleet_worktree	5	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn resolve_project_context	3	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn resolve_project_index	2	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn resolve_scope_and_checkout_dir	2	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn select_checkout_project	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/projects.rs	fn sync_declared_aliases	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/publisher.rs	fn elect_publisher	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/publisher.rs	fn project_published_scope	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-providers/src/providers/file.rs	fn resolve_absolute	1	delete with ProjectRecord
+canonical_path_read	src/doctor.rs	fn projects_section	2	delete with ProjectRecord
+canonical_path_read	src/server/gap_view.rs	fn session_gap_view	7	delete with ProjectRecord
+canonical_path_read	src/server/knowledge_lifecycle.rs	fn publisher_project_inventory	1	delete with ProjectRecord
+canonical_path_read	src/server/knowledge_lifecycle.rs	fn reconcile_knowledge_scope_index	1	delete with ProjectRecord
+canonical_path_read	src/server/knowledge_lifecycle.rs	fn reconcile_path_fallback_cut	1	delete with ProjectRecord
+canonical_path_read	src/server/knowledge_lifecycle.rs	fn write_knowledge_schema_epoch_marker	1	delete with ProjectRecord
+canonical_path_read	src/server/knowledge_view.rs	fn session_knowledge_view	7	delete with ProjectRecord
+canonical_path_read	src/server/repo_io.rs	fn gap_base_carriers	1	delete with ProjectRecord
+canonical_path_read	src/server/repo_io.rs	fn knowledge_base_carriers	1	delete with ProjectRecord
+canonical_path_read	src/server/routes.rs	fn enqueue_project_knowledge_embeds	1	delete with ProjectRecord
+canonical_path_read	src/server/routes.rs	fn trigger_project_bootstrap_arc	2	delete with ProjectRecord
+canonical_path_read	src/server/store_helpers.rs	fn sync_knowledge_entry_to_index	1	delete with ProjectRecord
+canonical_path_read	src/tools/attention.rs	fn bbox_inbox	1	delete with ProjectRecord
+canonical_path_read	src/tools/graph.rs	fn acquire_bridge_project_file	1	delete with ProjectRecord
+canonical_path_read	src/tools/graph.rs	fn lexical_absolute_selection	1	delete with ProjectRecord
+canonical_path_read	src/tools/knowledge.rs	fn prepare_knowledge_write	1	delete with ProjectRecord
+canonical_path_read	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	delete with ProjectRecord
+canonical_path_read	src/tools/projects.rs	fn bbox_project_eject	1	delete with ProjectRecord
+canonical_path_read	src/tools/projects.rs	fn bbox_project_rename	2	delete with ProjectRecord
+canonical_path_read	src/tools/projects.rs	fn bbox_project_unregister	1	delete with ProjectRecord
+canonical_path_read	src/tools/projects.rs	fn run_post_register_pipeline	1	delete with ProjectRecord
+checkout_root_path	crates/bbox-artifacts/src/watcher.rs	fn handle_event_batch	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-artifacts/src/watcher.rs	fn register_inner	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-corpus-core/src/project_catalog.rs	fn projected_path_matches	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-corpus-core/src/project_catalog.rs	fn validate_attachments	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolution_roots	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolve_checkout	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolve_legacy_path	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn select_scope_project	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/checkout_access_v2.rs	fn resolve_candidate	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/checkout_access_v2.rs	fn verify_live_checkout	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/checkout_registry.rs	fn reconcile	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/project_catalog_admin.rs	fn attach_checkout	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/project_catalog_admin.rs	fn register_composite	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/project_catalog_admin.rs	fn relocate_attachment	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/project_resolver.rs	fn v1_resolve	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/project_resolver.rs	fn v2_attached_context	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-providers/src/providers/file.rs	fn read_with_lease	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-providers/src/providers/file.rs	fn resolve_absolute	1	collapse into the lease confined readers
+checkout_root_path	crates/bbox-providers/src/providers/file.rs	fn resolve_catalog_file	1	collapse into the lease confined readers
+checkout_root_path	src/doctor.rs	fn code_sources_section	1	collapse into the lease confined readers
+checkout_root_path	src/server/checkout_access.rs	fn project_root	1	collapse into the lease confined readers
+checkout_root_path	src/server/code_source.rs	fn stage_git_current_overlay_after_activation	2	collapse into the lease confined readers
+checkout_root_path	src/server/gap_view.rs	fn refresh_dark_gap_overlay	1	collapse into the lease confined readers
+checkout_root_path	src/server/gap_view.rs	fn stable_catalog_gap_overlay	2	collapse into the lease confined readers
+checkout_root_path	src/server/gap_view.rs	fn stable_gap_overlay	2	collapse into the lease confined readers
+checkout_root_path	src/server/knowledge_lifecycle.rs	fn acquire_authorized_publisher_lease	1	collapse into the lease confined readers
+checkout_root_path	src/server/knowledge_lifecycle.rs	fn reconcile_dark_knowledge_checkouts	3	collapse into the lease confined readers
+checkout_root_path	src/server/knowledge_lifecycle.rs	fn recover_dark_knowledge_transactions_with	2	collapse into the lease confined readers
+checkout_root_path	src/server/knowledge_lifecycle.rs	fn resolve_authorized_publisher	5	collapse into the lease confined readers
+checkout_root_path	src/server/knowledge_lifecycle.rs	fn resolve_registered_checkout	2	collapse into the lease confined readers
+checkout_root_path	src/server/knowledge_lifecycle.rs	fn with_authorized_publisher_root	2	collapse into the lease confined readers
+checkout_root_path	src/server/knowledge_view.rs	fn stable_catalog_knowledge_overlay	2	collapse into the lease confined readers
+checkout_root_path	src/server/open.rs	fn backfill_project_languages	1	collapse into the lease confined readers
+checkout_root_path	src/server/open.rs	fn open_shared_state	1	collapse into the lease confined readers
+checkout_root_path	src/server/repo_io.rs	fn with_access	1	collapse into the lease confined readers
+checkout_root_path	src/tools/graph.rs	fn acquire_file_selection	1	collapse into the lease confined readers
+checkout_root_path	src/tools/graph.rs	fn acquire_provenance_projects	1	collapse into the lease confined readers
+checkout_root_path	src/tools/graph.rs	fn bbox_blame	4	collapse into the lease confined readers
+checkout_root_path	src/tools/graph.rs	fn lexical_absolute_selection	1	collapse into the lease confined readers
+checkout_root_path	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	collapse into the lease confined readers
+checkout_root_path	src/tools/knowledge.rs	fn register_dark_knowledge_checkout	1	collapse into the lease confined readers
+checkout_root_path	src/tools/knowledge.rs	fn stable_knowledge_overlay	2	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn attachment_row_governing	1	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_attach	2	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn probe_migration_attachments	1	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn register_catalog_arm	2	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn rename_catalog_arm	2	collapse into the lease confined readers
+checkout_root_path	src/tools/projects.rs	fn bbox_project_eject	2	collapse into the lease confined readers
+checkout_root_path	src/tools/projects.rs	fn bbox_project_init	1	collapse into the lease confined readers
+checkout_root_path	src/tools/projects.rs	fn run_post_register_pipeline	7	collapse into the lease confined readers
+checkout_root_path	src/tools/scope.rs	fn resolve_project_write	3	collapse into the lease confined readers
+direct_git_process	crates/bbox-corpus-core/src/git.rs	fn read_stable_repository_object_format	1	route through the verified-commit git wrapper
+direct_git_process	crates/bbox-corpus-core/src/git.rs	fn resolve_stable_repository_commitish	1	route through the verified-commit git wrapper
+direct_git_process	crates/bbox-corpus-core/src/git.rs	fn resolve_stable_repository_ref	1	route through the verified-commit git wrapper
+direct_git_process	crates/bbox-corpus-core/src/git.rs	fn run_hardened_repository_path_query	1	route through the verified-commit git wrapper
+direct_git_process	crates/bbox-corpus-core/src/git.rs	fn run_stable_repository_stdout_bounded	1	route through the verified-commit git wrapper
+direct_git_process	crates/bbox-corpus-core/src/git.rs	fn spawn	1	route through the verified-commit git wrapper
+direct_git_process	crates/bbox-gaps/src/gap_closeout.rs	fn scan_git_trailers	1	route through the verified-commit git wrapper
+direct_git_process	src/server/knowledge_merge_gate.rs	fn target_contains_bbox	1	route through the verified-commit git wrapper
+direct_git_process	src/tools/workspace.rs	fn git_diff_untracked_file	1	route through the verified-commit git wrapper
+direct_git_process	src/tools/workspace.rs	fn git_run	1	route through the verified-commit git wrapper
+direct_git_process	src/workflow/ops/tests.rs	fn worktree_create_fails_when_branch_in_use	1	route through the verified-commit git wrapper
+direct_git_process	src/workflow/ops/tests.rs	fn worktree_create_reuses_existing_branch	2	route through the verified-commit git wrapper
+direct_git_process	src/workflow/ops/worktree.rs	fn branch_state	2	route through the verified-commit git wrapper
+direct_git_process	src/workflow/ops/worktree.rs	fn exec_worktree_create	1	route through the verified-commit git wrapper
+direct_git_process	src/workflow/ops/worktree.rs	fn exec_worktree_remove	1	route through the verified-commit git wrapper
+legacy_publisher	crates/bbox-indexing/src/index/knowledge_docs.rs	fn publish	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/index/knowledge_docs.rs	fn reindex_knowledge_store_with_access	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	<file scope>	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn capture_inventory_locked	2	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn capture_publisher_ref_source	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	struct AuthorizedProjectCatalogMigrationInventoryRequestV1	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	struct ProjectCatalogMigrationInventoryRequestV1	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	enum MutableInventorySourceKindV1	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	enum MutableInventorySourceLocatorV1	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate	2	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_mutable_source_locator	3	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_mutable_source_row_coverage	3	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_publisher_source_membership	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_migration.rs	<file scope>	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_migration.rs	fn prepare_closed_migration	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/publisher.rs	impl PublisherRefStore	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/publisher.rs	struct PublisherRefStore	1	delete the legacy publisher store outright
+legacy_publisher	src/server/knowledge_lifecycle.rs	fn authorize_publisher_classified	1	delete the legacy publisher store outright
+legacy_publisher	src/server/knowledge_lifecycle.rs	fn insert_if_generation	1	delete the legacy publisher store outright
+legacy_publisher	src/server/knowledge_lifecycle.rs	impl PublisherAuthorizationCache	1	delete the legacy publisher store outright
+legacy_publisher	src/server/knowledge_lifecycle.rs	struct PublisherAuthorizationCache	2	delete the legacy publisher store outright
+legacy_publisher	src/server/knowledge_lifecycle.rs	struct PublisherAuthorizationCacheEntry	1	delete the legacy publisher store outright
+legacy_publisher	src/server/open.rs	fn open_shared_state	1	delete the legacy publisher store outright
+legacy_publisher	src/system_events_runtime/integration_tests.rs	fn test_server	1	delete the legacy publisher store outright
+project_record_import	crates/bbox-corpus-core/src/code_project_identity.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-corpus-core/src/project_selector.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-corpus-index/src/index/git_history.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-corpus-index/src/index/mod.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-corpus-index/src/index/project_files.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/checkout_access_v1.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/index/knowledge_docs.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/index/schema_rebuild.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/index/writer_actor.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/project_catalog_migration.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/project_resolver.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/projects.rs	<file scope>	1	delete with the v1 record type
+project_record_import	crates/bbox-indexing/src/publisher.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/server/code_source.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/server/gap_view.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/server/knowledge_lifecycle.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/server/knowledge_view.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/server/repo_io.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/tools/graph.rs	<file scope>	1	delete with the v1 record type
+repo_io_selected_target	src/server/repo_io.rs	fn base_carrier_target	1	delete Selected/Checkout; Attachment remains
+repo_io_selected_target	src/server/repo_io.rs	fn gap_checkout_carrier_for_ids	1	delete Selected/Checkout; Attachment remains
+repo_io_selected_target	src/server/repo_io.rs	fn knowledge_checkout_carrier	1	delete Selected/Checkout; Attachment remains
+repo_io_selected_target	src/server/repo_io.rs	fn with_access	4	delete Selected/Checkout; Attachment remains
+watcher_selected_carrier	src/server/background.rs	fn start_bbox_watcher	1	delete; catalog watches by attachment id
+watcher_selected_carrier	src/tools/projects.rs	fn bbox_project_rename	1	delete; catalog watches by attachment id
+watcher_selected_carrier	src/tools/projects.rs	fn bbox_project_unregister	1	delete; catalog watches by attachment id
+watcher_selected_carrier	src/tools/projects.rs	fn run_post_register_pipeline	1	delete; catalog watches by attachment id
