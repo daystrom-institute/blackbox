@@ -1020,6 +1020,11 @@ mod blocking_acceptance_proofs {
     #[test]
     fn catalog_ownership_ratchet_holds() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // The scanner's completeness claim is only as good as the syn
+        // surface it was audited against, so the inventory check gates the
+        // proof rather than sitting beside it.
+        super::super::catalog_ownership_scan::assert_covered_node_inventory(root)
+            .expect("catalog ownership node inventory");
         let report =
             super::super::catalog_ownership_scan::run(root, false).expect("catalog ownership scan");
         assert!(report.ok, "{}", report.rendered);

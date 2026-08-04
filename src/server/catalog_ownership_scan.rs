@@ -182,8 +182,8 @@ fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
     arms!(
         Array, Assign, Async, Await, Binary, Block, Break, Call, Cast, Closure, Const, Continue,
         Field, ForLoop, Group, If, Index, Infer, Let, Lit, Loop, Macro, Match, MethodCall, Paren,
-        Path, Range, Reference, Repeat, Return, Struct, Try, TryBlock, Tuple, Unary, Unsafe, While,
-        Yield,
+        Path, Range, RawAddr, Reference, Repeat, Return, Struct, Try, TryBlock, Tuple, Unary,
+        Unsafe, While, Yield,
     )
 }
 
@@ -342,6 +342,33 @@ impl<'ast> syn::visit::Visit<'ast> for TestSpans {
             return;
         }
         syn::visit::visit_pat(self, node);
+    }
+
+    /// Variadic markers in `extern "C"` signatures, both the item and the
+    /// function-pointer form.
+    fn visit_variadic(&mut self, node: &'ast syn::Variadic) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_variadic(self, node);
+    }
+
+    fn visit_bare_variadic(&mut self, node: &'ast syn::BareVariadic) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_bare_variadic(self, node);
+    }
+
+    /// Struct-pattern fields, the destructuring counterpart to FieldValue.
+    fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_field_pat(self, node);
     }
 
     fn visit_generic_param(&mut self, node: &'ast syn::GenericParam) {
@@ -869,4 +896,91 @@ pub(crate) fn run(root: &Path, write_baseline: bool) -> anyhow::Result<Report> {
         )
     };
     Ok(Report { ok, rendered })
+}
+
+// ── Exhaustiveness of the attribute-bearing node set ─────────────────────
+//
+// The visitor claims to cover every node syn exposes attributes on. That
+// claim was wrong four times over on inspection, so it is a machine check
+// now rather than a comment.
+//
+// It is two-sided, and neither side alone is enough:
+//
+//   REMOVED or RENAMED nodes fail at COMPILE time. `expr_attrs` and
+//   `pat_attrs` name every variant explicitly and each visitor override
+//   names its node type, so a type syn drops or renames stops building.
+//
+//   ADDED nodes fail at TEST time, through the version pin below. syn's
+//   `Expr` and `Pat` are `#[non_exhaustive]`, so an exhaustive match is
+//   impossible and the wildcard arm cannot be removed; a new variant would
+//   otherwise fall silently into `_ => &[]`. There is no runtime reflection
+//   over a crate's type surface, so the tripwire is the version itself: the
+//   covered inventory was audited against syn 2.0.117, and any other
+//   version fails until someone re-audits and re-pins.
+//
+// The failure mode this replaces is the one that produced this round: a
+// reviewer diffing the visitor against the AST by hand and finding four
+// nodes short.
+
+/// syn version the covered inventory below was audited against.
+const AUDITED_SYN_VERSION: &str = "2.0.117";
+
+/// Every node type in the audited syn version that carries `attrs`, each
+/// with the hook that excludes it. Kept as data so the audit is reviewable
+/// as a list rather than by reading the visitor.
+const COVERED_ATTRIBUTE_NODES: &[(&str, &str)] = &[
+    ("syn::Item", "visit_item"),
+    ("syn::ImplItem", "visit_impl_item"),
+    ("syn::TraitItem", "visit_trait_item"),
+    ("syn::ForeignItem", "visit_foreign_item"),
+    ("syn::Field", "visit_field"),
+    ("syn::FieldValue", "visit_field_value"),
+    ("syn::FieldPat", "visit_field_pat"),
+    ("syn::Variant", "visit_variant"),
+    ("syn::Arm", "visit_arm"),
+    ("syn::Stmt", "visit_stmt"),
+    ("syn::Expr", "visit_expr"),
+    ("syn::Pat", "visit_pat"),
+    ("syn::FnArg", "visit_fn_arg"),
+    ("syn::Receiver", "visit_receiver"),
+    ("syn::BareFnArg", "visit_bare_fn_arg"),
+    ("syn::Variadic", "visit_variadic"),
+    ("syn::BareVariadic", "visit_bare_variadic"),
+    ("syn::GenericParam", "visit_generic_param"),
+    (
+        "syn::File",
+        "visit_file (inner attributes, whole-file gate)",
+    ),
+];
+
+/// Fail when the audited syn version is not the one actually resolved.
+///
+/// This is the only mechanism that can catch a NEWLY ADDED attribute node,
+/// because the non_exhaustive wildcard swallows unknown variants silently.
+pub(crate) fn assert_covered_node_inventory(root: &Path) -> anyhow::Result<()> {
+    let lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
+    let resolved = lock
+        .split("[[package]]")
+        .find(|block| block.contains("name = \"syn\""))
+        .and_then(|block| {
+            block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("version = "))
+        })
+        .map(|version| version.trim_matches('"').to_string())
+        .ok_or_else(|| anyhow::anyhow!("syn not found in Cargo.lock"))?;
+    anyhow::ensure!(
+        resolved == AUDITED_SYN_VERSION,
+        "the catalog ownership scanner covers the attribute-bearing nodes of syn \
+         {AUDITED_SYN_VERSION}, but {resolved} is resolved. A newer syn may expose \
+         attributes on nodes the visitor does not hook, and the non_exhaustive \
+         wildcard would swallow them silently. Re-audit syn's attribute-bearing \
+         node set against COVERED_ATTRIBUTE_NODES, add any missing visitor \
+         override, then re-pin AUDITED_SYN_VERSION."
+    );
+    anyhow::ensure!(
+        COVERED_ATTRIBUTE_NODES.len() == 19,
+        "the covered node inventory changed without its audit count"
+    );
+    Ok(())
 }
