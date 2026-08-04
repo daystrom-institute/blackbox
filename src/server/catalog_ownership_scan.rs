@@ -31,45 +31,116 @@ pub(crate) struct ProductionLine {
     pub(crate) text: String,
 }
 
-/// True when any attribute is a `cfg(test)` gate, including the inner
-/// (`#![cfg(test)]`) form and `cfg(all(test, ...))` / `cfg(any(test, ...))`
-/// nestings. Anything mentioning `test` inside a `cfg` is treated as a test
-/// gate: over-excluding shrinks the inventory, which fails the check
-/// loudly, whereas under-excluding is the silent direction.
+/// Three-valued evaluation of a `cfg` predicate under `test = false`.
+///
+/// A span is test-only exactly when its predicate CANNOT hold with `test`
+/// false. Anything else is reachable in a production build and must be
+/// scanned, so the question is not "does `test` appear" but "does the
+/// predicate require it". Treating any mention of `test` as a test gate
+/// reversed the answer for negated and mixed predicates: `#[cfg(not(test))]`
+/// is production-ONLY, and `#[cfg(any(not(unix), test))]` is production on
+/// every non-unix target, yet both were being excluded.
+///
+/// Unknown is the conservative value: every atom other than `test` is
+/// unknown here, and an unknown result scans as production. Over-scanning
+/// fails loudly at the next baseline diff; under-scanning is the silent
+/// direction an ownership gate must not take.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Truth {
+    False,
+    True,
+    Unknown,
+}
+
+impl Truth {
+    fn not(self) -> Self {
+        match self {
+            Self::False => Self::True,
+            Self::True => Self::False,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Evaluate one `cfg` predicate with `test` bound to false.
+fn eval_with_test_false(meta: &syn::Meta) -> Truth {
+    match meta {
+        syn::Meta::Path(path) => {
+            if path.is_ident("test") {
+                Truth::False
+            } else {
+                Truth::Unknown
+            }
+        }
+        syn::Meta::NameValue(_) => Truth::Unknown,
+        syn::Meta::List(list) => {
+            let nested: Vec<syn::Meta> = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .map(|items| items.into_iter().collect())
+                .unwrap_or_default();
+            if list.path.is_ident("not") {
+                return nested
+                    .first()
+                    .map(|inner| eval_with_test_false(inner).not())
+                    .unwrap_or(Truth::Unknown);
+            }
+            if list.path.is_ident("all") {
+                let mut result = Truth::True;
+                for inner in &nested {
+                    match eval_with_test_false(inner) {
+                        Truth::False => return Truth::False,
+                        Truth::Unknown => result = Truth::Unknown,
+                        Truth::True => {}
+                    }
+                }
+                return result;
+            }
+            if list.path.is_ident("any") {
+                let mut result = Truth::False;
+                for inner in &nested {
+                    match eval_with_test_false(inner) {
+                        Truth::True => return Truth::True,
+                        Truth::Unknown => result = Truth::Unknown,
+                        Truth::False => {}
+                    }
+                }
+                return result;
+            }
+            Truth::Unknown
+        }
+    }
+}
+
+/// True when the attribute set REQUIRES `test`, so the span cannot exist in
+/// a production build.
+///
+/// Multiple `cfg` attributes on one node conjoin, so any one of them
+/// forcing the predicate false under `test = false` is enough.
 fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
             return false;
         }
-        let mut found = false;
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("test") {
-                found = true;
-            }
-            // Recurse through all(..) / any(..) / not(..).
-            let _ = meta.parse_nested_meta(|inner| {
-                if inner.path.is_ident("test") {
-                    found = true;
-                }
-                let _ = inner.parse_nested_meta(|deep| {
-                    if deep.path.is_ident("test") {
-                        found = true;
-                    }
-                    Ok(())
-                });
-                Ok(())
-            });
-            Ok(())
-        });
-        found
+        let Ok(inner) = attr.parse_args::<syn::Meta>() else {
+            return false;
+        };
+        eval_with_test_false(&inner) == Truth::False
     })
 }
 
-/// Byte ranges of every `cfg(test)`-gated item and member in one file.
+/// Byte ranges of every span a production build cannot reach.
 ///
-/// Members matter as much as items: a test-only struct field or enum
-/// variant is a span too, and the forms that broke the previous filters
-/// were all members.
+/// This is a full `syn::visit::Visit` traversal rather than a hand-rolled
+/// walk over the item forms someone remembered. The manual version handled
+/// items, fields, variants and some impl members, and never descended into
+/// FUNCTION BODIES, so a `#[cfg(test)]` statement inside a function was
+/// scanned as production while its enclosing function was not. Both
+/// directions of that are wrong: test instrumentation gets rejected as a
+/// new production site, or a test-only row launders into the Phase 6
+/// inventory. Visiting every attribute-bearing node closes the form list
+/// by construction instead of by enumeration.
 struct TestSpans {
     ranges: Vec<std::ops::Range<usize>>,
 }
@@ -77,78 +148,16 @@ struct TestSpans {
 impl TestSpans {
     fn collect(file: &syn::File) -> Self {
         let mut spans = Self { ranges: Vec::new() };
-        spans.walk_items(&file.items);
+        syn::visit::Visit::visit_file(&mut spans, file);
         spans
     }
 
-    fn push(&mut self, span: proc_macro2::Span) {
+    /// Record the span and stop descending: everything inside an excluded
+    /// span is excluded with it.
+    fn exclude(&mut self, span: proc_macro2::Span) {
         let range = span.byte_range();
         if !range.is_empty() {
             self.ranges.push(range);
-        }
-    }
-
-    fn walk_items(&mut self, items: &[syn::Item]) {
-        for item in items {
-            if item_attrs(item).is_some_and(|attrs| is_cfg_test(attrs)) {
-                self.push(item.span());
-                continue;
-            }
-            match item {
-                syn::Item::Mod(module) => {
-                    if let Some((_, inner)) = &module.content {
-                        self.walk_items(inner);
-                    }
-                }
-                syn::Item::Struct(item) => self.walk_fields(&item.fields),
-                syn::Item::Union(item) => {
-                    self.walk_fields(&syn::Fields::Named(item.fields.clone()))
-                }
-                syn::Item::Enum(item) => {
-                    for variant in &item.variants {
-                        if is_cfg_test(&variant.attrs) {
-                            self.push(variant.span());
-                        } else {
-                            self.walk_fields(&variant.fields);
-                        }
-                    }
-                }
-                syn::Item::Impl(item) => {
-                    for sub in &item.items {
-                        let gated = match sub {
-                            syn::ImplItem::Fn(f) => is_cfg_test(&f.attrs),
-                            syn::ImplItem::Const(c) => is_cfg_test(&c.attrs),
-                            syn::ImplItem::Type(t) => is_cfg_test(&t.attrs),
-                            _ => false,
-                        };
-                        if gated {
-                            self.push(sub.span());
-                        }
-                    }
-                }
-                syn::Item::Trait(item) => {
-                    for sub in &item.items {
-                        let gated = match sub {
-                            syn::TraitItem::Fn(f) => is_cfg_test(&f.attrs),
-                            syn::TraitItem::Const(c) => is_cfg_test(&c.attrs),
-                            syn::TraitItem::Type(t) => is_cfg_test(&t.attrs),
-                            _ => false,
-                        };
-                        if gated {
-                            self.push(sub.span());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn walk_fields(&mut self, fields: &syn::Fields) {
-        for field in fields {
-            if is_cfg_test(&field.attrs) {
-                self.push(field.span());
-            }
         }
     }
 
@@ -156,6 +165,118 @@ impl TestSpans {
         self.ranges
             .iter()
             .any(|range| offset >= range.start && offset < range.end)
+    }
+}
+
+/// Attributes carried by an expression, for the statement positions where
+/// Rust accepts `cfg` on an expression.
+fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    macro_rules! arms {
+        ($($variant:ident),* $(,)?) => {
+            match expr {
+                $(syn::Expr::$variant(inner) => &inner.attrs,)*
+                _ => &[],
+            }
+        };
+    }
+    arms!(
+        Array, Assign, Async, Await, Binary, Block, Break, Call, Cast, Closure, Const, Continue,
+        Field, ForLoop, Group, If, Index, Infer, Let, Lit, Loop, Macro, Match, MethodCall, Paren,
+        Path, Range, Reference, Repeat, Return, Struct, Try, TryBlock, Tuple, Unary, Unsafe, While,
+        Yield,
+    )
+}
+
+impl<'ast> syn::visit::Visit<'ast> for TestSpans {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if item_attrs(node).is_some_and(|attrs| is_cfg_test(attrs)) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        let attrs: &[syn::Attribute] = match node {
+            syn::ImplItem::Const(inner) => &inner.attrs,
+            syn::ImplItem::Fn(inner) => &inner.attrs,
+            syn::ImplItem::Type(inner) => &inner.attrs,
+            syn::ImplItem::Macro(inner) => &inner.attrs,
+            _ => &[],
+        };
+        if is_cfg_test(attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        let attrs: &[syn::Attribute] = match node {
+            syn::TraitItem::Const(inner) => &inner.attrs,
+            syn::TraitItem::Fn(inner) => &inner.attrs,
+            syn::TraitItem::Type(inner) => &inner.attrs,
+            syn::TraitItem::Macro(inner) => &inner.attrs,
+            _ => &[],
+        };
+        if is_cfg_test(attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_trait_item(self, node);
+    }
+
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        let attrs: &[syn::Attribute] = match node {
+            syn::ForeignItem::Fn(inner) => &inner.attrs,
+            syn::ForeignItem::Static(inner) => &inner.attrs,
+            syn::ForeignItem::Type(inner) => &inner.attrs,
+            syn::ForeignItem::Macro(inner) => &inner.attrs,
+            _ => &[],
+        };
+        if is_cfg_test(attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_foreign_item(self, node);
+    }
+
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_field(self, node);
+    }
+
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_variant(self, node);
+    }
+
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        if is_cfg_test(&node.attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_arm(self, node);
+    }
+
+    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+        let attrs: &[syn::Attribute] = match node {
+            syn::Stmt::Local(local) => &local.attrs,
+            syn::Stmt::Macro(mac) => &mac.attrs,
+            syn::Stmt::Expr(expr, _) => expr_attrs(expr),
+            syn::Stmt::Item(_) => &[],
+        };
+        if is_cfg_test(attrs) {
+            self.exclude(node.span());
+            return;
+        }
+        syn::visit::visit_stmt(self, node);
     }
 }
 
