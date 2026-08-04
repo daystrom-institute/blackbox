@@ -28,7 +28,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 readonly BASELINE="scripts/catalog-ownership-baseline.txt"
 
 # Catalog runtime paths. Test modules are exempt per the section 14.2
-# allowlist, so each file is truncated at its first `#[cfg(test)]`.
+# allowlist, so each file is truncated at its first `#[cfg(test)]` or
+# `#![cfg(test)]`. Both forms matter: the inner attribute makes a WHOLE
+# file test-only, so missing it scans an entire test file as runtime code.
 catalog_sources() {
     git ls-files \
         'src/*.rs' 'src/**/*.rs' \
@@ -45,7 +47,7 @@ count_pattern() {
     local pattern="$1" total=0 file body hits
     while IFS= read -r file; do
         [[ -f "${file}" ]] || continue
-        body="$(awk '/^#\[cfg\(test\)\]/{exit} {print}' "${file}" | grep -Ev '^\s*(//|/\*|\*)' || true)"
+        body="$(awk '/^#!?\[cfg\(test\)\]/{exit} {print}' "${file}" | grep -Ev '^\s*(//|/\*|\*)' || true)"
         hits="$(grep -cE "${pattern}" <<<"${body}" || true)"
         total=$((total + hits))
     done < <(catalog_sources)
@@ -87,7 +89,7 @@ absolute_failures=0
 # a reintroduction. `grep -q` is deliberately avoided here because it closes
 # the pipe early, and under `pipefail` the resulting SIGPIPE on the upstream
 # awk makes the pipeline status depend on timing rather than on the match.
-tool_edge_code="$(awk '/^#\[cfg\(test\)\]/{exit} {print}' \
+tool_edge_code="$(awk '/^#!?\[cfg\(test\)\]/{exit} {print}' \
     crates/bbox-corpus-index/src/index/tool_edges.rs | grep -Ev '^\s*(//|/\*|\*)' || true)"
 if grep -E 'ProjectRecord' <<<"${tool_edge_code}" >/dev/null 2>&1; then
     echo "acceptance-catalog-ownership: lower tool-edge carrier reintroduced ProjectRecord" >&2

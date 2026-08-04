@@ -1046,9 +1046,9 @@ mod clause_one_exit_proof {
 
     use std::sync::Arc;
 
+    use super::BlackboxServer;
     use super::catalog_fixture::{COMMIT_ONE, CatalogFixture, gap_note, knowledge_entry};
     use super::recordless_provider::RecordlessProjectRecordsProvider;
-    use super::{BlackboxServer, SharedState};
 
     const PROJECT: &str = "p_clause_one";
 
