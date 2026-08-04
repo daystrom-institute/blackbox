@@ -264,20 +264,57 @@ fn accepted_publication_section(
     let mut considered = 0;
     let mut current = 0;
     for status in statuses {
-        // An unreadable catalog pair is reported FIRST and unconditionally.
-        // It is not a project-level content problem, and letting it fall
-        // through to the accepted-state arms below would describe the
-        // symptom (missing or unevaluated) instead of the cause.
+        // An unreadable catalog pair is reported FIRST, then the accepted
+        // state is reported BESIDE it. Both facts, not one: the catalog and
+        // the accepted pointer are separate durable stores that degrade
+        // separately, so "catalog unreadable" says nothing about whether
+        // published content is still serving, and an operator who sees only
+        // the first has no way to find out mid-poisoning
+        // (bbox_project_publisher_status needs a catalog snapshot itself).
         if status.catalog_authority == "unavailable" {
             considered += 1;
             if considered <= MAX_PROJECT_FINDINGS {
+                let project = &status.project_id;
                 findings.push(Finding::action(
                     format!(
-                        "project {} could not be read from the catalog pair; its                          catalog-derived status is unavailable, not denied, and its                          accepted publication is reported independently below",
-                        status.project_id
+                        "project {project} could not be read from the catalog pair; \
+                         its catalog-derived status is unavailable, not denied"
                     ),
                     "bbox_doctor",
                 ));
+                findings.push(match status.accepted.state {
+                    "current" if status.accepted.serves_published_content => {
+                        Finding::info(format!(
+                            "project {project} accepted publication is verified independently \
+                             of the catalog and is CURRENT; published knowledge and gaps keep \
+                             serving while the catalog pair is unreadable"
+                        ))
+                    }
+                    "prior" => Finding::action(
+                        format!(
+                            "project {project} accepted publication is verified independently \
+                             of the catalog and fell back to its PRIOR generation; reads \
+                             continue and every mutation refuses until repair"
+                        ),
+                        "bbox_project_publisher_status",
+                    ),
+                    "missing" => Finding::info(format!(
+                        "project {project} has no accepted publication pointer; that is \
+                         independent of the unreadable catalog pair"
+                    )),
+                    "corrupt" => Finding::action(
+                        format!(
+                            "project {project} accepted publication is CORRUPT independently \
+                             of the unreadable catalog pair; published reads are unavailable \
+                             for it"
+                        ),
+                        "bbox_project_publisher_status",
+                    ),
+                    other => Finding::warn(format!(
+                        "project {project} accepted publication state is {other} and could \
+                         not be evaluated further while the catalog pair is unreadable"
+                    )),
+                });
             }
             continue;
         }
