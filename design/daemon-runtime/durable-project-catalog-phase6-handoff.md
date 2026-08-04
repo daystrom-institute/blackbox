@@ -43,26 +43,41 @@ Baseline at the Phase 5 exit gate:
 
 | Pattern | Sites | Occurrences | Phase 6 disposition |
 |---|---|---|---|
-| `project_record_import` | 19 | 19 | Delete with the v1 record type. The sanctioned compatibility projection (`catalog_records.rs`) goes last, because it is what lets the catalog serve v1-shaped consumers during the cut. |
-| `canonical_path_read` | 54 | 89 | Delete with `ProjectRecord`. Every one is a bridge arm; the catalog arm beside it already resolves through attachment identity. |
-| `checkout_root_path` | 51 | 80 | Delete with the v1 path lane. A catalog-mode path reaches a checkout only through a capability lease. |
-| `direct_git_process` | 15 | 17 | Delete or route through lease-held authority. A direct Git process against a checkout root is an unleased open by definition. |
-| `legacy_publisher` | 24 | 31 | Delete outright. `PublisherRefStore`, `elect_publisher`, and `PublisherAuthorizationCache` have no catalog-mode caller. |
+| `project_record_import` | 20 | 21 | Delete with the v1 record type. The sanctioned compatibility projection (`catalog_records.rs`) goes last, because it is what lets the catalog serve v1-shaped consumers during the cut. |
+| `canonical_path_read` | 57 | 95 | Delete with `ProjectRecord`. Every one is a bridge arm; the catalog arm beside it already resolves through attachment identity. |
+| `checkout_root_path` | 80 | 140 | Delete with the v1 path lane. A catalog-mode path reaches a checkout only through a capability lease. |
+| `direct_git_process` | 19 | 21 | Delete or route through lease-held authority. A direct Git process against a checkout root is an unleased open by definition. |
+| `legacy_publisher` | 26 | 34 | Delete outright. `PublisherRefStore`, `elect_publisher`, and `PublisherAuthorizationCache` have no catalog-mode caller. |
 | `watcher_selected_carrier` | 4 | 4 | Delete. Catalog registrations are `ArtifactWatchAttachment::AttachmentId`; `Selected` is bridge-only. |
 | `repo_io_selected_target` | 4 | 7 | Delete the `Selected` and `Checkout` variants of `RepoCarrierTarget`, leaving `Attachment` as the only target. |
 
 A shrinking inventory is the Phase 6 progress metric. When every row is
 gone except the compatibility projection, the bridge is cut.
 
-**Baseline diffs are review artifacts.** Regeneration is a deliberate act,
-and any baseline diff in a change is read row by row, exactly like an
-allowlist change. `--write-baseline` preserves reasons by key, so a
-regeneration that nobody read can carry a NEW prohibited site into the
-baseline wearing an old row's reason, and the check cannot detect that by
-construction: it compares the tree against the baseline, and the
+**Baseline diffs are review artifacts, and this is the procedure.**
+Regeneration is a deliberate act. `--write-baseline` preserves reasons by
+key, so a regeneration nobody read can carry a NEW prohibited site into
+the inventory wearing an old row's reason, and the check cannot detect
+that by construction: it compares the tree against the baseline, and the
 regeneration just moved the baseline. The reviewer is the only thing
-standing between a laundered site and the inventory. Treat a diff touching
-rows the change did not intend to touch as a finding, not as noise.
+between a laundered site and the inventory. Any change carrying a
+baseline diff runs all three steps:
+
+1. **Diff the inventory KEYS**, old against new, not the file as a whole.
+   A key is the pattern, file, and enclosing item; comparing keys is what
+   separates a site moving from a site appearing.
+2. **Assert zero removals.** A site that vanished is the signature of a
+   span or scan defect in the checker rather than of work removing a
+   surface, because real removal work knows which surface it removed and
+   says so. An unexplained removal is a finding against the checker.
+3. **Inspect every addition individually against its actual span**,
+   starting with any whose name or location could plausibly be test code.
+   Test code is exempt, so "it looks like a test" is exactly the shape a
+   laundered production site would take.
+
+The procedure is not hypothetical: the round-2 ratchet repair ran it and
+it worked, which is why it is written down as steps rather than as a
+caution to be careful.
 
 ### 2.1 The other two machine-checked inputs
 The ratchet counts occurrences. Two further inputs check things a count
