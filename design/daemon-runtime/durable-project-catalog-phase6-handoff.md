@@ -27,26 +27,42 @@ paired with a machine-checked counterpart so it cannot rot into prose that
 disagrees with the tree.
 
 ## 2. The machine-checked half
-`scripts/catalog-ownership-baseline.txt` records the exact count of every
-replaced-surface pattern in catalog runtime paths.
-`scripts/acceptance-catalog-ownership.sh` fails when a count GROWS (a
-converted surface gained another unleased way to reach a checkout) and also
-when a count SHRINKS without the baseline being refreshed, so the file
-cannot drift from reality in either direction. It runs blocking from
+`scripts/catalog-ownership-baseline.txt` is a per-SITE evidence inventory:
+one row per pattern, file, and enclosing item, with its occurrence count
+and its Phase 6 deletion or retention reason.
+`scripts/acceptance-catalog-ownership.sh` fails when a site grows, when a
+site is absent without the baseline being refreshed, and when a site
+carries no stated reason. It runs blocking from
 `catalog_ownership_ratchet_holds`.
+
+Per-site is what a per-pattern TOTAL could not do: a total stays flat when
+a prohibited occurrence is substituted for an approved one, so counting
+alone accepted the exact move the proof exists to reject.
 
 Baseline at the Phase 5 exit gate:
 
-| Pattern | Count | Phase 6 disposition |
-|---|---|---|
-| `project_record_import` | 12 | Delete with the v1 record type. The sanctioned compatibility projection (`catalog_records.rs`) goes last, because it is what lets the catalog serve v1-shaped consumers during the cut. |
-| `canonical_path_read` | 39 | Delete with `ProjectRecord`. Every one of these is a bridge arm; the catalog arm beside it already resolves through attachment identity. |
-| `legacy_publisher` | 10 | Delete outright. `PublisherRefStore`, `elect_publisher`, and `PublisherAuthorizationCache` have no catalog-mode caller. |
-| `watcher_selected_carrier` | 4 | Delete. Catalog registrations are `ArtifactWatchAttachment::AttachmentId`; `Selected` is bridge-only. |
-| `repo_io_selected_target` | 7 | Delete the `Selected` and `Checkout` variants of `RepoCarrierTarget`, leaving `Attachment` as the only target. |
+| Pattern | Sites | Occurrences | Phase 6 disposition |
+|---|---|---|---|
+| `project_record_import` | 19 | 19 | Delete with the v1 record type. The sanctioned compatibility projection (`catalog_records.rs`) goes last, because it is what lets the catalog serve v1-shaped consumers during the cut. |
+| `canonical_path_read` | 54 | 89 | Delete with `ProjectRecord`. Every one is a bridge arm; the catalog arm beside it already resolves through attachment identity. |
+| `checkout_root_path` | 51 | 80 | Delete with the v1 path lane. A catalog-mode path reaches a checkout only through a capability lease. |
+| `direct_git_process` | 15 | 17 | Delete or route through lease-held authority. A direct Git process against a checkout root is an unleased open by definition. |
+| `legacy_publisher` | 24 | 31 | Delete outright. `PublisherRefStore`, `elect_publisher`, and `PublisherAuthorizationCache` have no catalog-mode caller. |
+| `watcher_selected_carrier` | 4 | 4 | Delete. Catalog registrations are `ArtifactWatchAttachment::AttachmentId`; `Selected` is bridge-only. |
+| `repo_io_selected_target` | 4 | 7 | Delete the `Selected` and `Checkout` variants of `RepoCarrierTarget`, leaving `Attachment` as the only target. |
 
-A shrinking baseline is the Phase 6 progress metric. When every row reaches
-zero except the compatibility projection, the bridge is cut.
+A shrinking inventory is the Phase 6 progress metric. When every row is
+gone except the compatibility projection, the bridge is cut.
+
+**Baseline diffs are review artifacts.** Regeneration is a deliberate act,
+and any baseline diff in a change is read row by row, exactly like an
+allowlist change. `--write-baseline` preserves reasons by key, so a
+regeneration that nobody read can carry a NEW prohibited site into the
+baseline wearing an old row's reason, and the check cannot detect that by
+construction: it compares the tree against the baseline, and the
+regeneration just moved the baseline. The reviewer is the only thing
+standing between a laundered site and the inventory. Treat a diff touching
+rows the change did not intend to touch as a finding, not as noise.
 
 ### 2.1 The other two machine-checked inputs
 The ratchet counts occurrences. Two further inputs check things a count
