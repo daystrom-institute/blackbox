@@ -22,6 +22,14 @@ pub type KnowledgeChangeCallback = Arc<dyn Fn(&ArtifactWatchCarrier) + Send + Sy
 pub enum ArtifactWatchAttachment {
     Selected,
     CheckoutId(String),
+    /// Native catalog attachment identity (plan section 4.16).
+    ///
+    /// `Selected` re-runs a ladder whose answer moves when attachments
+    /// change, and a checkout id names a working tree rather than the
+    /// catalog row that grants `artifact_watching`. An attachment id names
+    /// exactly one row, so a registration cannot silently follow a
+    /// different checkout after an attach, detach, or rebind.
+    AttachmentId(String),
 }
 
 /// Logical identity presented to the daemon-owned discovery authority.
@@ -43,6 +51,26 @@ impl ArtifactWatchCarrier {
         let checkout_id = checkout_id.into();
         validate_logical_id("checkout id", &checkout_id)?;
         Self::new(project_id, ArtifactWatchAttachment::CheckoutId(checkout_id))
+    }
+
+    /// Native catalog carrier naming one attachment row.
+    pub fn for_attachment(
+        project_id: impl Into<String>,
+        attachment_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let attachment_id = attachment_id.into();
+        validate_logical_id("attachment id", &attachment_id)?;
+        Self::new(
+            project_id,
+            ArtifactWatchAttachment::AttachmentId(attachment_id),
+        )
+    }
+
+    /// True for the native catalog carrier. Catalog reconciliation owns
+    /// exactly these registrations and must leave the bridge `Selected` and
+    /// provisional `CheckoutId` registrations alone.
+    pub fn is_attachment(&self) -> bool {
+        matches!(self.attachment, ArtifactWatchAttachment::AttachmentId(_))
     }
 
     fn new(
@@ -105,6 +133,39 @@ pub trait ArtifactWatchAccess: Send + Sync {
         prepare: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
         publish: &mut dyn FnMut(&dyn ArtifactWatchRead) -> anyhow::Result<()>,
     ) -> anyhow::Result<()>;
+}
+
+/// What installing one registration did. Reconciliation reports these so a
+/// duplicate event is visibly a no-op rather than an unmeasured re-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationChange {
+    Unchanged,
+    Installed,
+    Relocated,
+}
+
+/// Whether a registration may follow its carrier to a new root.
+#[derive(Debug, Clone, Copy)]
+enum RootChange {
+    Refuse,
+    Relocate,
+}
+
+/// Counts from one catalog reconciliation pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArtifactWatchReconcileReport {
+    pub added: usize,
+    pub removed: usize,
+    pub relocated: usize,
+    /// Carriers whose discovery lease refused. A no-capability or detached
+    /// attachment lands here, and no watcher is installed for it.
+    pub failed: usize,
+}
+
+impl ArtifactWatchReconcileReport {
+    pub fn is_noop(&self) -> bool {
+        self.added == 0 && self.removed == 0 && self.relocated == 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +279,25 @@ impl BbxWatcher {
         carrier: ArtifactWatchCarrier,
         artifact_routing: bool,
     ) -> anyhow::Result<bool> {
+        self.register_inner(carrier, artifact_routing, RootChange::Refuse)
+            .map(|change| change != RegistrationChange::Unchanged)
+    }
+
+    /// Install one registration, optionally accepting a moved root.
+    ///
+    /// `RootChange::Refuse` is the default and the safety property for the
+    /// bridge carriers: a `Selected` or `CheckoutId` carrier that suddenly
+    /// resolves elsewhere is drift, and silently following it would watch a
+    /// tree the caller never named. Catalog reconciliation passes
+    /// `RootChange::Relocate` because relocation is a legitimate, observed
+    /// catalog event there, and it must replace the registration exactly
+    /// once rather than accumulate a second one.
+    fn register_inner(
+        &mut self,
+        carrier: ArtifactWatchCarrier,
+        artifact_routing: bool,
+        on_root_change: RootChange,
+    ) -> anyhow::Result<RegistrationChange> {
         let existing = self
             .registrations
             .lock()
@@ -225,11 +305,13 @@ impl BbxWatcher {
             .iter()
             .find(|registration| registration.carrier == carrier)
             .cloned();
-        if existing
-            .as_ref()
-            .is_some_and(|registration| registration.artifact_routing || !artifact_routing)
+        let relocating = matches!(on_root_change, RootChange::Relocate);
+        if !relocating
+            && existing
+                .as_ref()
+                .is_some_and(|registration| registration.artifact_routing || !artifact_routing)
         {
-            return Ok(false);
+            return Ok(RegistrationChange::Unchanged);
         }
 
         let mut invoked = false;
@@ -246,9 +328,10 @@ impl BbxWatcher {
             let Some(bbox_root) = canonical_bbox_root(project_root) else {
                 return Ok(());
             };
-            if existing
-                .as_ref()
-                .is_some_and(|registration| registration.bbox_root != bbox_root)
+            if !relocating
+                && existing
+                    .as_ref()
+                    .is_some_and(|registration| registration.bbox_root != bbox_root)
             {
                 anyhow::bail!("artifact watch carrier changed roots without removal");
             }
@@ -279,26 +362,113 @@ impl BbxWatcher {
             anyhow::bail!("artifact watch authority did not invoke registration");
         }
         let Some(bbox_root) = discovered_root else {
-            return Ok(false);
+            return Ok(RegistrationChange::Unchanged);
         };
 
-        let mut registrations = self.registrations.lock().unwrap();
-        if let Some(existing) = registrations
-            .iter_mut()
-            .find(|registration| registration.carrier == carrier)
+        let mut change = RegistrationChange::Installed;
+        let mut vacated_root = None;
         {
-            if existing.bbox_root != bbox_root {
-                anyhow::bail!("artifact watch carrier changed roots without removal");
+            let mut registrations = self.registrations.lock().unwrap();
+            if let Some(existing) = registrations
+                .iter_mut()
+                .find(|registration| registration.carrier == carrier)
+            {
+                if existing.bbox_root != bbox_root {
+                    if !relocating {
+                        anyhow::bail!("artifact watch carrier changed roots without removal");
+                    }
+                    vacated_root = Some(std::mem::replace(&mut existing.bbox_root, bbox_root));
+                    change = RegistrationChange::Relocated;
+                } else if existing.artifact_routing || !artifact_routing {
+                    change = RegistrationChange::Unchanged;
+                }
+                existing.artifact_routing |= artifact_routing;
+            } else {
+                registrations.push(WatchRegistration {
+                    carrier,
+                    bbox_root,
+                    artifact_routing,
+                });
             }
-            existing.artifact_routing |= artifact_routing;
-        } else {
-            registrations.push(WatchRegistration {
-                carrier,
-                bbox_root,
-                artifact_routing,
-            });
         }
-        Ok(true)
+        if let Some(vacated) = vacated_root {
+            self.unwatch_if_unreferenced(&vacated)?;
+        }
+        Ok(change)
+    }
+
+    /// Reconcile the native catalog registrations to exactly `desired`.
+    ///
+    /// Bridge `Selected` and provisional `CheckoutId` registrations are left
+    /// untouched: this reconciler owns only the attachment-id lane. Removals
+    /// are idempotent, and re-running with an unchanged desired set installs
+    /// and removes nothing, so a duplicate post-commit event is a no-op.
+    pub fn reconcile_attachment_registrations(
+        &mut self,
+        desired: &[ArtifactWatchCarrier],
+    ) -> ArtifactWatchReconcileReport {
+        let mut report = ArtifactWatchReconcileReport::default();
+        let desired = desired
+            .iter()
+            .filter(|carrier| carrier.is_attachment())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let stale = self
+            .registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|registration| registration.carrier.is_attachment())
+            .filter(|registration| !desired.contains(&registration.carrier))
+            .map(|registration| registration.carrier.clone())
+            .collect::<Vec<_>>();
+        for carrier in stale {
+            match self.unwatch_carrier(&carrier) {
+                Ok(true) => report.removed += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        project = %carrier.project_id,
+                        attachment = ?carrier.attachment,
+                        error = %error,
+                        "artifact watcher could not remove a stale catalog registration"
+                    );
+                    report.failed += 1;
+                }
+            }
+        }
+
+        for carrier in desired {
+            match self.register_inner(carrier.clone(), true, RootChange::Relocate) {
+                Ok(RegistrationChange::Installed) => report.added += 1,
+                Ok(RegistrationChange::Relocated) => report.relocated += 1,
+                Ok(RegistrationChange::Unchanged) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        project = %carrier.project_id,
+                        attachment = ?carrier.attachment,
+                        error = %error,
+                        "artifact watcher skipped an unavailable catalog carrier"
+                    );
+                    report.failed += 1;
+                }
+            }
+        }
+        report
+    }
+
+    fn unwatch_if_unreferenced(&mut self, root: &Path) -> anyhow::Result<()> {
+        let still_watched = self
+            .registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|registration| registration.bbox_root == root);
+        if !still_watched {
+            self.debouncer.unwatch(root)?;
+        }
+        Ok(())
     }
 
     fn remove_registration(
@@ -1721,5 +1891,211 @@ mod tests {
                 .is_none()
         );
         assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn project_with_bbox(root: &Path, name: &str) -> PathBuf {
+        let project = root.join(name);
+        std::fs::create_dir_all(project.join(".bbox").join("workflows")).unwrap();
+        project
+    }
+
+    fn reconciling_watcher(
+        access: Arc<TestWatchAccess>,
+        catalog: Arc<ArtifactCatalog>,
+    ) -> BbxWatcher {
+        BbxWatcher::start(Vec::new(), access, catalog, None).unwrap()
+    }
+
+    fn registered_carriers(watcher: &BbxWatcher) -> Vec<ArtifactWatchCarrier> {
+        watcher
+            .registrations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|registration| registration.carrier.clone())
+            .collect()
+    }
+
+    /// The first reconciliation installs the capable attachment; a second
+    /// pass over the same catalog state changes nothing. A post-commit
+    /// observer may deliver the same event twice, so idempotence is the
+    /// property, not a happy accident of ordering.
+    #[test]
+    fn catalog_reconciliation_installs_once_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = project_with_bbox(&root, "checkout-a");
+        let carrier =
+            ArtifactWatchCarrier::for_attachment("proj-alpha", "att_0000000000000000000000000001")
+                .unwrap();
+        let access = Arc::new(TestWatchAccess::default());
+        access.insert(carrier.clone(), project.clone());
+        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let mut watcher = reconciling_watcher(access, catalog);
+
+        let first = watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+        assert_eq!(first.added, 1);
+        assert_eq!(first.removed, 0);
+        assert_eq!(first.relocated, 0);
+        assert_eq!(registered_carriers(&watcher), vec![carrier.clone()]);
+
+        let second = watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+        assert!(second.is_noop(), "{second:?}");
+        assert_eq!(registered_carriers(&watcher), vec![carrier]);
+    }
+
+    /// Detach drops the attachment from the desired set. The registration
+    /// goes with it, and removing it again is a no-op rather than an error.
+    #[test]
+    fn catalog_reconciliation_removes_a_detached_registration_idempotently() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = project_with_bbox(&root, "checkout-a");
+        let carrier =
+            ArtifactWatchCarrier::for_attachment("proj-alpha", "att_0000000000000000000000000001")
+                .unwrap();
+        let access = Arc::new(TestWatchAccess::default());
+        access.insert(carrier.clone(), project);
+        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let mut watcher = reconciling_watcher(access, catalog);
+        watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+
+        let detached = watcher.reconcile_attachment_registrations(&[]);
+        assert_eq!(detached.removed, 1);
+        assert!(registered_carriers(&watcher).is_empty());
+
+        let again = watcher.reconcile_attachment_registrations(&[]);
+        assert!(again.is_noop(), "{again:?}");
+    }
+
+    /// A relocated attachment keeps its identity and moves its root exactly
+    /// once. The failure this guards is two registrations for one
+    /// attachment, which would double every event it sees.
+    #[test]
+    fn catalog_reconciliation_relocates_a_moved_attachment_exactly_once() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let original = project_with_bbox(&root, "checkout-a");
+        let moved = project_with_bbox(&root, "checkout-b");
+        let carrier =
+            ArtifactWatchCarrier::for_attachment("proj-alpha", "att_0000000000000000000000000001")
+                .unwrap();
+        let access = Arc::new(TestWatchAccess::default());
+        access.insert(carrier.clone(), original.clone());
+        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let mut watcher = reconciling_watcher(access.clone(), catalog);
+        watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+
+        access.insert(carrier.clone(), moved.clone());
+        let relocation = watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+        assert_eq!(relocation.relocated, 1);
+        assert_eq!(relocation.added, 0);
+
+        let registrations = watcher.registrations.lock().unwrap().clone();
+        assert_eq!(registrations.len(), 1, "{registrations:#?}");
+        assert_eq!(
+            registrations[0].bbox_root,
+            moved.join(".bbox").canonicalize().unwrap()
+        );
+        drop(registrations);
+
+        let settled = watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+        assert!(settled.is_noop(), "{settled:?}");
+    }
+
+    /// An attachment without `artifact_watching` produces no carrier at all,
+    /// so reconciliation installs no watcher for it. The daemon-side carrier
+    /// projection owns that filter; here the equivalent is a carrier whose
+    /// discovery lease refuses.
+    #[test]
+    fn a_carrier_whose_discovery_refuses_installs_no_watcher() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let carrier =
+            ArtifactWatchCarrier::for_attachment("proj-alpha", "att_0000000000000000000000000001")
+                .unwrap();
+        // Not inserted into the fake authority: discovery refuses, exactly
+        // as a capability-denied lease would.
+        let access = Arc::new(TestWatchAccess::default());
+        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let mut watcher = reconciling_watcher(access, catalog);
+
+        let report = watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+        assert_eq!(report.added, 0);
+        assert_eq!(report.failed, 1);
+        assert!(registered_carriers(&watcher).is_empty());
+    }
+
+    /// Reconciliation owns the attachment lane only. A bridge `Selected`
+    /// registration and a provisional `CheckoutId` one survive a catalog
+    /// pass that names neither.
+    #[test]
+    fn catalog_reconciliation_leaves_bridge_registrations_alone() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = project_with_bbox(&root, "checkout-a");
+        let selected = ArtifactWatchCarrier::selected("proj-alpha").unwrap();
+        let checkout = ArtifactWatchCarrier::checkout("proj-alpha", "checkout-1").unwrap();
+        let access = Arc::new(TestWatchAccess::default());
+        access.insert(selected.clone(), project.clone());
+        access.insert(checkout.clone(), project);
+        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        let mut watcher = reconciling_watcher(access, catalog);
+        watcher.watch_project(selected.clone()).unwrap();
+        watcher.watch_repo_store(checkout.clone()).unwrap();
+
+        let report = watcher.reconcile_attachment_registrations(&[]);
+        assert!(report.is_noop(), "{report:?}");
+        let mut surviving = registered_carriers(&watcher);
+        surviving.sort();
+        let mut expected = vec![selected, checkout];
+        expected.sort();
+        assert_eq!(surviving, expected);
+    }
+
+    /// Durable artifact metadata is catalog state, not watcher state. A
+    /// project whose every registration is gone keeps the artifacts already
+    /// installed for it; only filesystem discovery stops.
+    #[test]
+    fn durable_artifact_metadata_survives_with_no_watcher() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = project_with_bbox(&root, "checkout-a");
+        let carrier =
+            ArtifactWatchCarrier::for_attachment("proj-alpha", "att_0000000000000000000000000001")
+                .unwrap();
+        let access = Arc::new(TestWatchAccess::default());
+        access.insert(carrier.clone(), project);
+        let catalog = Arc::new(ArtifactCatalog::open(&root.join("catalog")).unwrap());
+        catalog
+            .install_value_scoped(
+                ArtifactScope::Project {
+                    project_id: "proj-alpha",
+                    local: false,
+                },
+                crate::artifacts::ArtifactKind::Workflow,
+                ".bbox/workflows/durable.json".to_string(),
+                &make_workflow("durable"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut watcher = reconciling_watcher(access, catalog.clone());
+        watcher.reconcile_attachment_registrations(std::slice::from_ref(&carrier));
+
+        assert_eq!(watcher.reconcile_attachment_registrations(&[]).removed, 1);
+        assert!(registered_carriers(&watcher).is_empty());
+        assert!(
+            catalog
+                .load_artifact_value_scoped(
+                    Some("proj-alpha"),
+                    crate::artifacts::ArtifactKind::Workflow,
+                    "durable",
+                )
+                .unwrap()
+                .is_some(),
+            "durable artifact metadata must outlive its watcher registration"
+        );
     }
 }

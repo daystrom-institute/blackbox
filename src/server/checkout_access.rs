@@ -21,6 +21,7 @@ use bbox_indexing::checkout_access::{
     CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
     ValidatedCheckoutLease,
 };
+use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 
 use super::SharedState;
 use crate::server::BlackboxServer;
@@ -321,11 +322,108 @@ pub(crate) fn with_resolved_checkout_access<T>(
 /// `ArtifactWatchDiscovery` lease from their path-free logical carrier.
 pub(crate) struct DaemonArtifactWatchAccess {
     broker: Arc<CheckoutAccessBroker>,
+    /// Present in catalog mode only. Used solely to read a project's
+    /// recorded scope for the lease's `expected_scope`; the attachment id in
+    /// the carrier remains the authority for which checkout is opened.
+    catalog: Option<Arc<ProjectCatalogStore>>,
 }
 
 impl DaemonArtifactWatchAccess {
     pub(crate) fn new(broker: Arc<CheckoutAccessBroker>) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            catalog: None,
+        }
+    }
+
+    /// The catalog-mode adapter. Native attachment carriers resolve their
+    /// expected scope from the catalog row instead of a discovery lease.
+    // Adopted by the daemon watcher startup path; that integration is a
+    // separate ownership grant and lands with it.
+    #[allow(dead_code)]
+    pub(crate) fn with_catalog(
+        broker: Arc<CheckoutAccessBroker>,
+        catalog: Option<Arc<ProjectCatalogStore>>,
+    ) -> Self {
+        Self { broker, catalog }
+    }
+
+    fn catalog_scope(&self, project_id: &str) -> Option<PublishedScope> {
+        let state = self.catalog.as_ref()?.snapshot().ok()?;
+        let parsed = ProjectId::parse(project_id).ok()?;
+        match &state.catalog().projects.get(&parsed)?.scope {
+            ProjectScope::Published(scope) => Some(scope.clone()),
+            ProjectScope::LegacyLocal => None,
+        }
+    }
+}
+
+/// The active attachments that carry `artifact_watching`, as native watcher
+/// carriers (plan section 8, P5-F watcher item 2).
+///
+/// An attachment without the capability yields no carrier at all: the plan's
+/// degradation for this row is "no watcher plus bounded capability health",
+/// not a registration that fails on every event. Durable artifact metadata
+/// already in the catalog is unaffected either way.
+#[allow(dead_code)] // See `with_catalog`: startup/observer integration is a separate grant.
+pub(crate) fn catalog_watch_carriers(state: &SharedState) -> Vec<ArtifactWatchCarrier> {
+    let Some(store) = state.project_authority.catalog_store() else {
+        return Vec::new();
+    };
+    let Ok(snapshot) = store.snapshot() else {
+        tracing::warn!("catalog snapshot unavailable; watcher reconciliation skipped this pass");
+        return Vec::new();
+    };
+    snapshot
+        .attachments()
+        .attachments
+        .values()
+        .filter(|attachment| attachment.status == AttachmentStatus::Attached)
+        .filter(|attachment| attachment.capabilities.artifact_watching)
+        .filter_map(|attachment| {
+            ArtifactWatchCarrier::for_attachment(
+                attachment.project_id.as_str(),
+                attachment.attachment_id.as_str(),
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    project = %attachment.project_id.as_str(),
+                    error = %error,
+                    "artifact watcher rejected a catalog attachment carrier"
+                );
+            })
+            .ok()
+        })
+        .collect()
+}
+
+/// Reconcile the live watcher's native registrations against the catalog.
+///
+/// Safe to call for every post-commit event including duplicates: the
+/// reconciler compares desired against installed, so an unchanged catalog
+/// produces no watch churn. A project with no watcher (no daemon watcher
+/// yet, or none of its attachments capable) is not an error here.
+#[allow(dead_code)] // See `with_catalog`: startup/observer integration is a separate grant.
+pub(crate) fn reconcile_catalog_watchers(state: &SharedState) {
+    if state.project_authority.catalog_store().is_none() {
+        return;
+    }
+    let desired = catalog_watch_carriers(state);
+    let Ok(mut guard) = state.bbox_watcher.lock() else {
+        return;
+    };
+    let Some(watcher) = guard.as_mut() else {
+        return;
+    };
+    let report = watcher.reconcile_attachment_registrations(&desired);
+    if !report.is_noop() || report.failed > 0 {
+        tracing::debug!(
+            added = report.added,
+            removed = report.removed,
+            relocated = report.relocated,
+            failed = report.failed,
+            "artifact watcher reconciled catalog registrations"
+        );
     }
 }
 
@@ -336,28 +434,46 @@ impl ArtifactWatchAccess for DaemonArtifactWatchAccess {
         prepare: &mut dyn FnMut(&dyn ArtifactWatchRead) -> Result<()>,
         publish: &mut dyn FnMut(&dyn ArtifactWatchRead) -> Result<()>,
     ) -> Result<()> {
-        let scope_lease = self
-            .broker
-            .acquire(CheckoutAccessRequest {
-                project_id: carrier.project_id().to_owned(),
-                attachment: CheckoutAttachmentSelector::Selected,
-                expected_scope: None,
-                kind: CheckoutAccessKind::PublisherConfigTreeRead,
-                intent: CheckoutAccessIntent::Read,
-                source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-            })
-            .map_err(anyhow::Error::new)?;
-        let expected_scope = scope_lease.published_scope().cloned();
-        drop(scope_lease);
-        let (attachment, source_lane) = match carrier.attachment() {
-            ArtifactWatchAttachment::Selected => (
-                CheckoutAttachmentSelector::Selected,
-                CheckoutAccessSourceLane::LegacyProjectRecord,
+        // A native attachment carries the catalog's scope on its own row, so
+        // it needs no scope-discovery lease. Taking one anyway would gate
+        // artifact watching on `repo_knowledge` (D-032), which the section 9
+        // table assigns to the publisher and overlay lanes, not to this one.
+        // The bridge carriers keep the two-step verbatim: a version-1 record
+        // carries no scope at all.
+        let (attachment, expected_scope, source_lane) = match carrier.attachment() {
+            ArtifactWatchAttachment::AttachmentId(attachment_id) => (
+                CheckoutAttachmentSelector::AttachmentId(attachment_id.clone()),
+                self.catalog_scope(carrier.project_id()),
+                CheckoutAccessSourceLane::NativeAttachment,
             ),
-            ArtifactWatchAttachment::CheckoutId(checkout_id) => (
-                CheckoutAttachmentSelector::CheckoutId(checkout_id.clone()),
-                CheckoutAccessSourceLane::LegacyCheckoutRegistry,
-            ),
+            legacy => {
+                let scope_lease = self
+                    .broker
+                    .acquire(CheckoutAccessRequest {
+                        project_id: carrier.project_id().to_owned(),
+                        attachment: CheckoutAttachmentSelector::Selected,
+                        expected_scope: None,
+                        kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                        intent: CheckoutAccessIntent::Read,
+                        source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+                    })
+                    .map_err(anyhow::Error::new)?;
+                let expected_scope = scope_lease.published_scope().cloned();
+                drop(scope_lease);
+                match legacy {
+                    ArtifactWatchAttachment::Selected => (
+                        CheckoutAttachmentSelector::Selected,
+                        expected_scope,
+                        CheckoutAccessSourceLane::LegacyProjectRecord,
+                    ),
+                    ArtifactWatchAttachment::CheckoutId(checkout_id) => (
+                        CheckoutAttachmentSelector::CheckoutId(checkout_id.clone()),
+                        expected_scope,
+                        CheckoutAccessSourceLane::LegacyCheckoutRegistry,
+                    ),
+                    ArtifactWatchAttachment::AttachmentId(_) => unreachable!("handled above"),
+                }
+            }
         };
         let lease = self
             .broker
@@ -397,5 +513,168 @@ impl ArtifactWatchRead for LeaseArtifactWatchRead<'_> {
 
     fn check_relative_absence(&self, relative: &Path) -> Result<bool> {
         Ok(!self.lease.relative_regular_file_exists(relative)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bbox_corpus_core::project_catalog::{
+        AttachmentCapabilities, AttachmentId, CheckoutAttachment,
+    };
+
+    use super::*;
+    use crate::server::state::catalog_fixture::CatalogFixture;
+
+    const PROJECT: &str = "proj_watch";
+    const CAPABLE: &str = "att_00000000000000000000000000000c01";
+    const INCAPABLE: &str = "att_00000000000000000000000000000c02";
+    const CHECKOUT_ONE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01";
+    const CHECKOUT_TWO: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
+
+    /// Insert one attachment with exactly the capability bits under test.
+    ///
+    /// Built here rather than in the shared fixture: the fixture's attach
+    /// helpers fix `repo_knowledge` and this lane turns on
+    /// `artifact_watching` instead.
+    fn attach(
+        server: &BlackboxServer,
+        attachment_id: &str,
+        checkout_id: &str,
+        checkout_dir: &std::path::Path,
+        capabilities: AttachmentCapabilities,
+        status: AttachmentStatus,
+    ) {
+        std::fs::create_dir_all(checkout_dir.join(".bbox/local")).unwrap();
+        std::fs::write(
+            checkout_dir.join(".bbox/local/checkout-id"),
+            format!("{checkout_id}\n"),
+        )
+        .unwrap();
+        let store = server
+            .state
+            .project_authority
+            .catalog_store()
+            .expect("catalog authority");
+        let scope = CatalogFixture::scope(".");
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let attachment_id = AttachmentId::parse(attachment_id).unwrap();
+        let checkout_dir = checkout_dir.to_string_lossy().into_owned();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |_catalog, attachments| {
+                attachments.attachments.insert(
+                    attachment_id.clone(),
+                    CheckoutAttachment {
+                        attachment_id: attachment_id.clone(),
+                        project_id: project_id.clone(),
+                        checkout_id: checkout_id.to_string(),
+                        checkout_dir: checkout_dir.clone(),
+                        checkout_project_dir: checkout_dir.clone(),
+                        project_root_relpath: ".".into(),
+                        kind: AttachmentKind::Base,
+                        validated_scope: Some(scope.clone()),
+                        computed_repo_hint: None,
+                        branch_ref: Some("refs/heads/main".into()),
+                        capabilities,
+                        status,
+                        attached_at: "2026-08-03T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn watching() -> AttachmentCapabilities {
+        AttachmentCapabilities {
+            artifact_watching: true,
+            ..Default::default()
+        }
+    }
+
+    /// Only an active attachment recording `artifact_watching` becomes a
+    /// carrier, and the carrier names the attachment id, not a checkout id
+    /// or the Selected ladder.
+    #[test]
+    fn catalog_carriers_are_attachment_ids_gated_on_the_capability() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+
+        attach(
+            &server,
+            CAPABLE,
+            CHECKOUT_ONE,
+            &root.join("capable"),
+            watching(),
+            AttachmentStatus::Attached,
+        );
+        attach(
+            &server,
+            INCAPABLE,
+            CHECKOUT_TWO,
+            &root.join("incapable"),
+            // Every other bit set: the filter must key on the one this lane
+            // owns, not on "has some capability".
+            AttachmentCapabilities {
+                artifact_watching: false,
+                repo_knowledge: true,
+                local_code_source: true,
+                ..Default::default()
+            },
+            AttachmentStatus::Attached,
+        );
+
+        let carriers = catalog_watch_carriers(&server.state);
+        assert_eq!(carriers.len(), 1, "{carriers:#?}");
+        assert_eq!(carriers[0].project_id(), PROJECT);
+        assert_eq!(
+            carriers[0].attachment(),
+            &ArtifactWatchAttachment::AttachmentId(CAPABLE.to_string())
+        );
+        assert!(carriers[0].is_attachment());
+    }
+
+    /// Detach removes the carrier. The store additionally refuses to hold a
+    /// detached row that still claims capabilities, so "detached but still
+    /// watching" is unrepresentable rather than merely filtered; this drives
+    /// the real detach path and asserts the carrier is gone with it.
+    #[test]
+    fn detach_removes_the_native_carrier() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        attach(
+            &server,
+            CAPABLE,
+            CHECKOUT_ONE,
+            &root.join("capable"),
+            watching(),
+            AttachmentStatus::Attached,
+        );
+        assert_eq!(catalog_watch_carriers(&server.state).len(), 1);
+
+        CatalogFixture::detach_in_server(&server, CAPABLE);
+
+        assert!(catalog_watch_carriers(&server.state).is_empty());
+    }
+
+    /// Bridge mode has no catalog to project, so the native lane is empty
+    /// and its reconciler is inert. The legacy Selected and CheckoutId
+    /// registrations remain the bridge's whole watcher story.
+    #[test]
+    fn bridge_mode_projects_no_native_carriers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state = crate::server::state::SharedState::for_test(&root);
+        assert!(catalog_watch_carriers(&state).is_empty());
+        // Inert, not a panic: a bridge daemon calls the reconciler from the
+        // same post-commit path a catalog daemon does.
+        reconcile_catalog_watchers(&state);
     }
 }
