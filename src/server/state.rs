@@ -1292,12 +1292,61 @@ mod clause_one_exit_proof {
         // Collected activation and rebuild is not a tool call: it is the
         // index-side pass that seeds corpus identity from
         // `corpus_project_ids`, which is the field clause 1 keeps live.
-        let left = populated.rebuild_edge_index_from_stores();
-        let right = recordless.rebuild_edge_index_from_stores();
+        //
+        // Compared by rebuilt CONTENT, not by return status. A rebuild that
+        // consults `records`, emits different edges, and returns Ok on both
+        // twins is exactly the failure this row exists to catch, and
+        // is_ok()-equality cannot see it.
+        for server in [&populated, &recordless] {
+            let mut base = knowledge_entry("edge-seed-old", "superseded seed");
+            let mut newer = knowledge_entry("edge-seed-new", "superseding seed");
+            // A SUPERSEDES link is what actually projects an edge; an
+            // isolated entry projects none, which the non-triviality guard
+            // below caught on the first attempt.
+            newer.supersedes = Some(base.id.clone());
+            base.status = bbox_knowledge::knowledge::Status::Superseded;
+            let mut kb = server.state.kb.write();
+            kb.upsert_generated(base).expect("seed entry");
+            kb.upsert_generated(newer).expect("seed entry");
+            drop(kb);
+            server
+                .rebuild_edge_index_from_stores()
+                .expect("rebuild succeeds on both twins");
+        }
+        let edge_projection = |server: &BlackboxServer| {
+            let view = server.state.code_read_view.read().clone();
+            let mut edges = view
+                .edge_index
+                .all_edges()
+                .map(|edge| format!("{}|{}|{}", edge.source, edge.kind, edge.target))
+                .collect::<Vec<_>>();
+            edges.sort();
+            edges
+        };
+        let left = edge_projection(&populated);
+        let right = edge_projection(&recordless);
+        // Non-triviality first, per the rule this proof already learned
+        // once: comparing two empty edge views proves nothing.
+        //
+        // KNOWN GAP, recorded rather than papered over. This guard proves
+        // the rebuilt view is populated, NOT that it is populated with
+        // edges the record seam can affect. The rebuild's registered-project
+        // filter gates project-keyed sidecar edges, and a sidecar file
+        // seeded here does not reach the rebuilt index through this path, so
+        // a rebuild rewired to consult `records` still produces identical
+        // projections and this row cannot yet catch it. The comparison is a
+        // real improvement over the previous is_ok() check and the guard is
+        // honest about what it covers, but R2-2's mutation requirement is
+        // NOT met until the sidecar lane is reachable from this fixture.
+        assert!(
+            !left.is_empty(),
+            "the rebuilt edge view must be non-trivially populated before it \
+             is compared"
+        );
         assert_eq!(
-            right.is_ok(),
-            left.is_ok(),
-            "collected activation and rebuild varied with the attached-row view"
+            right, left,
+            "collected activation and rebuild produced different edges with \
+             and without the attached-row view"
         );
         executed.push("collected activation and rebuild");
 
@@ -3306,6 +3355,19 @@ mod clause_three_exit_proof {
         assert!(
             joined.contains("could not be read from the catalog pair"),
             "and must name the cause rather than a downstream symptom: {joined}"
+        );
+        // BOTH facts. The catalog and the accepted pointer are separate
+        // durable stores that degrade separately, so an operator seeing
+        // only the unreadable-catalog line cannot tell whether published
+        // content is still serving, and cannot find out mid-poisoning:
+        // bbox_project_publisher_status needs a catalog snapshot itself.
+        assert!(
+            joined.contains("verified independently") && joined.contains("CURRENT"),
+            "the independently verified accepted state must stay visible: {joined}"
+        );
+        assert!(
+            joined.contains("keep serving"),
+            "and must say published reads continue: {joined}"
         );
     }
 
