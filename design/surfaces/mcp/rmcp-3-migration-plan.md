@@ -217,9 +217,30 @@ for s in 2026-07-28 io.modelcontextprotocol/tasks subscriptions/listen server/di
 done
 ```
 
-Baseline 2026-08-03 (v2.1.220): all zero; `2025-11-25` and `Mcp-Session-Id`
-present; elicitation present. When the strings appear, Claude Code has
-shipped the revision.
+Probe history:
+
+- 2026-08-03, v2.1.220: all modern strings zero; `2025-11-25` and
+  `Mcp-Session-Id` present; elicitation present.
+- 2026-08-04, v2.1.221: modern CORE present (`2026-07-28`,
+  `server/discover`, `subscriptions/listen`, MRTR `input_required` /
+  `resultType`, `ttlMs`/`cacheScope`, `Mcp-Method`, SEP-2575 `_meta`
+  keys). Tasks are the LEGACY experimental flavor: `tasks/result` and
+  `tasks/list` (removed by SEP-2663) present, `tasks/update` and the
+  `io.modelcontextprotocol/tasks` extension key absent.
+
+Flip criteria, split by surface:
+
+- **Core modern path (stateless lifecycle, discover, listen, MRTR, cache
+  hints)**: the client side is ready as of 2.1.221. The Q2 gate can flip
+  as soon as Phase 1 lands and a live round-trip validates.
+- **Tasks extension**: flip only when a probe (or better, a daemon
+  capability log) shows `io.modelcontextprotocol/tasks` negotiated. Until
+  then all clients get plain JSON from `bro_exec`/`bro_resume`.
+
+Strings show what is bundled, not what is negotiated. Phase 0 should add a
+one-line trace log of client `protocolVersion` + capabilities at
+`initialize` so the tripwire measures negotiated reality, and so old-flavor
+tasks clients are visible in production telemetry.
 
 ## References
 

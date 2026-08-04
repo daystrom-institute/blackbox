@@ -42,23 +42,46 @@ is the largest protocol break since Streamable HTTP:
   Logging deprecated. `structuredContent` relaxed to any JSON value;
   schemas loosened to full JSON Schema 2020-12 (SEP-2106).
 
-### Client landscape (verified 2026-08-03)
+### Client landscape (verified 2026-08-04, Claude Code 2.1.221)
 
-Anthropic authored the spec revision, so Claude Code support is a when, not
-an if. Today's installed binary does not have it. Probe against
-`~/.local/share/claude/versions/2.1.220` (built 2026-07-24, four days before
-the spec cut):
+Anthropic authored the spec revision, and Claude Code support has now
+shipped in part. Strings probe against
+`~/.local/share/claude/versions/2.1.221`:
 
-- `2025-11-25` present (3 hits); `2026-07-28` absent (0 hits).
-- `io.modelcontextprotocol/tasks`, `subscriptions/listen`,
-  `server/discover`: 0 hits each.
-- `Mcp-Session-Id` handling present; elicitation present (2025-11-25 form).
+- **Modern core present**: `2026-07-28` (25 hits), `server/discover` (28),
+  `subscriptions/listen` (27), `input_required`/`resultType` (43/23, MRTR),
+  `ttlMs`/`cacheScope` (7/11), `Mcp-Method` (2), and the SEP-2575 `_meta`
+  keys (`protocolVersion`, `clientCapabilities`, `clientInfo`,
+  `serverInfo`, `subscriptionId`, `logLevel`).
+- **Legacy retained** (dual-stack client, as expected): `Mcp-Session-Id`,
+  `Last-Event-ID`, `resources/subscribe`.
+- **Tasks are the OLD flavor, not the extension**: `tasks/get`,
+  `tasks/cancel` present, but so are `tasks/result` and `tasks/list`
+  (methods SEP-2663 removed), while `tasks/update` and the
+  `io.modelcontextprotocol/tasks` extension key are absent. Until a live
+  capture shows the extension key negotiated, treat Claude Code's tasks
+  support as legacy experimental and serve it plain JSON, never
+  `CreateTaskResult`.
 
-**Tripwire**: re-run this strings probe on each Claude Code update. When
-`2026-07-28` and the extension method strings appear, the prod config gate
-(migration plan, version advertisement) flips. The bro-harness child pair is
-the only client we own end to end and is the proving ground for every modern
-surface before that flip.
+Baseline 2026-08-03 (v2.1.220, four days older): all modern strings absent,
+`2025-11-25` max. The core protocol landed in 2.1.221.
+
+Consequences:
+
+- The dual-shape gate on `bro_exec`/`bro_resume` keys STRICTLY on the
+  `io.modelcontextprotocol/tasks` extension declaration in per-request
+  capabilities, not on any looser "client mentions tasks" signal.
+- The modern core (stateless lifecycle, discover, listen, MRTR, cache
+  hints) has a real dominant client today; the Q2 version gate becomes
+  testable as soon as Phase 1 lands.
+- Strings probes show what is bundled, not what is negotiated. The daemon
+  should trace-log client `protocolVersion` + capabilities at initialize
+  (one line) so the tripwire measures reality.
+
+**Tripwire**: re-run the strings probe on each Claude Code update
+(migration plan has the command). The bro-harness child pair remains the
+proving ground for the tasks extension specifically, since no client we
+consume declares it yet.
 
 ### Convergence with locality-first decomposition
 
@@ -368,12 +391,15 @@ MRTR rounds.
 
 ## Decisions recorded (operator, 2026-08-03 discussion)
 
-1. Dual-stack work is not speculative: Anthropic authored the spec revision,
-   so Claude Code support is a when, not an if. Phases 1-3 are "be ready
-   before the client lands", not experiments.
-2. Legacy session mode is a bridge measured in Claude Code release cycles,
-   not a permanent path. Keep until the installed base moves; design treats
-   legacy as temporary.
+1. Dual-stack work is not speculative: Anthropic authored the spec revision
+   and shipped modern-core client support in Claude Code 2.1.221
+   (2026-08-04). Phases 1-3 are "be ready for the client that is already
+   here", not experiments. (Recorded lesson: when the protocol author is
+   also the client vendor, "support hasn't shipped" has a shelf life of
+   hours.)
+2. Legacy session mode is a bridge, not a permanent path: the dominant
+   client is already dual-stack as of 2.1.221. Keep legacy until the
+   installed base moves; design treats legacy as temporary.
 3. The bro-harness child pair is the proving ground for tasks + listen
    end-to-end before any prod capability flip.
 4. Scope channel: URL query params remain canonical; resource endpoints
