@@ -1789,6 +1789,30 @@ impl BlackboxServer {
     /// `bbox_project_init` catalog follow-up: when init newly records repo
     /// authority inside a checkout attached to a `LegacyLocal` project,
     /// promotion is the required next action (plan §9.1).
+    /// The catalog project an absolute checkout path already resolves to.
+    ///
+    /// `None` is the bootstrap case fixed by plan section 4.19: the path
+    /// carries no attachment yet, so `bbox_project_init` may scaffold it
+    /// without a lease. Attach needs the identity-bearing config this call
+    /// creates, so requiring an attachment first would be circular. Once a
+    /// selector does resolve, the same writes are a catalog-targeted
+    /// mutation and take `RepositoryMutation` like any other.
+    pub(crate) fn catalog_project_for_attached_path(
+        &self,
+        store: &Arc<ProjectCatalogStore>,
+        canonical_path: &str,
+    ) -> Option<String> {
+        let state = store.snapshot().ok()?;
+        let engine = ProjectResolverEngine::v2(state.catalog(), state.attachments());
+        let resolved = engine
+            .resolve_attached(&ProjectSelectorRequest::selection(
+                canonical_path.to_string(),
+                bbox_corpus_core::project_selector::ResolveIntent::Write,
+            ))
+            .ok()?;
+        Some(resolved.project.project_id().to_owned())
+    }
+
     pub(crate) fn init_catalog_next_action(
         &self,
         store: &Arc<ProjectCatalogStore>,

@@ -292,6 +292,67 @@ pub(crate) fn acquire_catalog_project_lease(
         .map_err(checkout_access_error)
 }
 
+/// Why a `RepositoryMutation` lease could not be taken.
+///
+/// Typed rather than pre-rendered so the tool boundary can pick the section 9
+/// mutation-row code without parsing its own error text back out of a string.
+pub(crate) enum MutationLeaseRefusal {
+    /// No usable attachment resolved. Already code-prefixed by the shared
+    /// resolver, which distinguishes required from ambiguous.
+    Selection(anyhow::Error),
+    /// An attachment was named and its lease refused.
+    Lease(CheckoutAccessError),
+}
+
+/// Acquire the single `RepositoryMutation` lease covering one catalog-targeted
+/// mutation (plan section 8, P5-F mutation item 2).
+///
+/// The catalog arm names its attachment natively; the bridge arm keeps the
+/// legacy two-step, because a version-1 record carries no scope to gate on.
+pub(crate) fn acquire_project_mutation_lease(
+    server: &BlackboxServer,
+    project_id: &str,
+) -> std::result::Result<ValidatedCheckoutLease, MutationLeaseRefusal> {
+    let broker = &server.state.checkout_access;
+    let (attachment, expected_scope, source_lane) = if server.state.project_authority.is_bridge() {
+        let scope_lease = broker
+            .acquire(CheckoutAccessRequest {
+                project_id: project_id.to_owned(),
+                attachment: CheckoutAttachmentSelector::Selected,
+                expected_scope: None,
+                kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                intent: CheckoutAccessIntent::Read,
+                source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+            })
+            .map_err(MutationLeaseRefusal::Lease)?;
+        let expected_scope = scope_lease.published_scope().cloned();
+        drop(scope_lease);
+        (
+            CheckoutAttachmentSelector::Selected,
+            expected_scope,
+            CheckoutAccessSourceLane::LegacyProjectRecord,
+        )
+    } else {
+        let target = catalog_attachment_target(server, project_id)
+            .map_err(MutationLeaseRefusal::Selection)?;
+        (
+            CheckoutAttachmentSelector::AttachmentId(target.attachment_id),
+            target.expected_scope,
+            CheckoutAccessSourceLane::NativeAttachment,
+        )
+    };
+    broker
+        .acquire(CheckoutAccessRequest {
+            project_id: project_id.to_owned(),
+            attachment,
+            expected_scope,
+            kind: CheckoutAccessKind::RepositoryMutation,
+            intent: CheckoutAccessIntent::Write,
+            source_lane,
+        })
+        .map_err(MutationLeaseRefusal::Lease)
+}
+
 /// Run an exact checkout operation from the registry snapshot already held by
 /// `parent`. The resulting lease shares the same lifecycle guard.
 /// Run one exact registered checkout operation without consulting either raw

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::artifacts;
 use crate::config;
@@ -55,6 +55,41 @@ fn capability_denied(error: &anyhow::Error) -> bool {
         .is_some_and(|error| {
             error.code == bbox_indexing::checkout_access::CheckoutAccessErrorCode::CapabilityDenied
         })
+}
+
+/// Render one mutation-lease refusal in the section 9 vocabulary for the
+/// init/eject/mutation row: `error.project_attachment_required` when no
+/// attachment can receive the write, `error.project_capability_denied` when
+/// one resolved but does not record `repo_mutation`.
+///
+/// Every other lease code passes through with its own stable prefix rather
+/// than being flattened into one of those two, which would report a
+/// lifecycle conflict or an unsafe root as a missing capability.
+fn mutation_refusal(
+    project_id: &str,
+    refusal: crate::server::checkout_access::MutationLeaseRefusal,
+) -> anyhow::Error {
+    use crate::server::checkout_access::MutationLeaseRefusal;
+    use bbox_indexing::checkout_access::CheckoutAccessErrorCode as Code;
+
+    match refusal {
+        MutationLeaseRefusal::Selection(error) => error,
+        MutationLeaseRefusal::Lease(error) => match error.code {
+            Code::AttachmentNotFound | Code::AttachmentInactive => anyhow::anyhow!(
+                "error.project_attachment_required: project {project_id} has no active \
+                 attachment able to receive repository writes"
+            ),
+            Code::CapabilityDenied => anyhow::anyhow!(
+                "error.project_capability_denied: project {project_id} resolves an attachment \
+                 that does not record repo_mutation"
+            ),
+            code => anyhow::anyhow!(
+                "error.checkout_access.{}: {}",
+                code.as_str(),
+                error.diagnostic
+            ),
+        },
+    }
 }
 
 // The registration path invokes this helper only from its surrounding
@@ -172,6 +207,16 @@ fn write_or_skip_mcp(
     orchestration::mcp::McpStore::new().save(path)?;
     created.push(path_display);
     Ok(())
+}
+
+/// Canonicalize the init target so it can be matched against catalog
+/// attachments before any scaffolding is written.
+// The init handler body runs entirely inside `run_blocking`, so this read is
+// already on the blocking pool, the same sanction the scaffolding writes below
+// carry.
+#[allow(clippy::disallowed_methods)]
+fn canonical_init_target(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
 }
 
 // migration debt: project-init scaffolding writes inline; run_blocking conversion tracked in thread-935b467d.
@@ -622,7 +667,47 @@ impl BlackboxServer {
             if !path.exists() {
                 anyhow::bail!("project path does not exist: {}", p.path);
             }
-            let result = init_project_path(path, p.force)?;
+            // Bootstrap exception, plan section 4.19: an UNREGISTERED absolute
+            // path is initialized with no lease, because attach needs the
+            // identity-bearing config this very call creates and requiring an
+            // attachment first would be circular. It is an exception, not the
+            // rule: once a selector resolves the path to a catalog project,
+            // the same scaffolding writes are a catalog-targeted mutation and
+            // take RepositoryMutation under the publication guard.
+            let attached_project =
+                server
+                    .state
+                    .project_authority
+                    .catalog_store()
+                    .and_then(|store| {
+                        let canonical = canonical_init_target(path)?;
+                        server
+                            .catalog_project_for_attached_path(store, &canonical.to_string_lossy())
+                    });
+            let result = match attached_project {
+                Some(project_id) => {
+                    let lease = crate::server::checkout_access::acquire_project_mutation_lease(
+                        &server,
+                        &project_id,
+                    )
+                    .map_err(|refusal| mutation_refusal(&project_id, refusal))?;
+                    let publication = server
+                        .state
+                        .checkout_access
+                        .publication_guard(&lease)
+                        .map_err(anyhow::Error::new)?;
+                    let result = init_project_path(lease.project_root(), p.force);
+                    drop(publication);
+                    let result = result?;
+                    server
+                        .state
+                        .checkout_access
+                        .revalidate(&lease)
+                        .map_err(anyhow::Error::new)?;
+                    result
+                }
+                None => init_project_path(path, p.force)?,
+            };
             // Catalog arm (plan §9.1): init stays a filesystem initializer;
             // newly recorded authority inside a checkout attached to a
             // legacy-local project reports promotion as the next action.
@@ -979,40 +1064,62 @@ impl BlackboxServer {
                 .records
                 .iter()
                 .find(|record| record.project_id == resolved_id)
-                .cloned()
-                .with_context(|| format!("project not registered: {}", p.project))?;
+                .cloned();
+            // A remote-only catalog project resolves but has no attachment to
+            // write into. Eject writes repository files, so the honest refusal
+            // is attachment-required, not "not registered": the project exists
+            // and its published knowledge still serves.
+            let record = match record {
+                Some(record) => record,
+                None if server.state.project_authority.catalog_store().is_some() => {
+                    anyhow::bail!(
+                        "error.project_attachment_required: eject writes repository files and \
+                         project {resolved_id} has no active attachment"
+                    )
+                }
+                None => anyhow::bail!("project not registered: {}", p.project),
+            };
             let dir = record.canonical_path.clone();
             let dry_run = p.dry_run.unwrap_or(false);
-            let recorded_repo_id = if !dry_run && record.is_git_repo {
-                let lease = crate::server::checkout_access::acquire_selected_project_access(
-                    &server.state.checkout_access,
-                    &record.project_id,
-                    CheckoutAccessKind::RepositoryMutation,
-                    CheckoutAccessIntent::Write,
-                )?;
-                let publication = server
-                    .state
-                    .checkout_access
-                    .publication_guard(&lease)
-                    .map_err(anyhow::Error::new)?;
-                let repo_id = config::ensure_recorded_repo_id(lease.project_root())?;
-                drop(publication);
-                Some(repo_id)
-            } else {
-                None
-            };
 
             // Ensure the project's repo is in kb roots so already-ejected files
             // are accounted for and the post-eject reload loads from the repo.
             crate::server::routes::sync_kb_project_roots(&server.state);
 
-            let (entries, schema_epoch_marker_written) = if dry_run {
-                (server.state.kb.read().count_project_entries(&dir), false)
-            } else {
-                let entries = server.state.kb.write().eject_project_to_repo(&dir)?;
-                let report = server.write_knowledge_schema_epoch_marker(Path::new(&dir))?;
-                (entries, !report.marked_scopes.is_empty())
-            };
+            if dry_run {
+                let entries = server.state.kb.read().count_project_entries(&dir);
+                return Ok::<_, anyhow::Error>((record, dir, true, entries, None, false));
+            }
+
+            // One RepositoryMutation lease covers every durable write this
+            // eject performs, and one publication guard fences those writes
+            // together with the central-store flush (plan section 8, P5-F
+            // mutation items 2 and 3). Flushing here rather than awaiting the
+            // persister after the blocking phase is what puts the central
+            // store inside the same fence.
+            let lease = crate::server::checkout_access::acquire_project_mutation_lease(
+                &server,
+                &record.project_id,
+            )
+            .map_err(|refusal| mutation_refusal(&record.project_id, refusal))?;
+            let publication = server
+                .state
+                .checkout_access
+                .publication_guard(&lease)
+                .map_err(anyhow::Error::new)?;
+            let recorded_repo_id = record
+                .is_git_repo
+                .then(|| config::ensure_recorded_repo_id(lease.project_root()))
+                .transpose()?;
+            let entries = server.state.kb.write().eject_project_to_repo(&dir)?;
+            let report = server.write_knowledge_schema_epoch_marker(Path::new(&dir))?;
+            server.state.kb_persister.flush_blocking()?;
+            drop(publication);
+            server
+                .state
+                .checkout_access
+                .revalidate(&lease)
+                .map_err(anyhow::Error::new)?;
 
             Ok::<_, anyhow::Error>((
                 record,
@@ -1020,7 +1127,7 @@ impl BlackboxServer {
                 dry_run,
                 entries,
                 recorded_repo_id,
-                schema_epoch_marker_written,
+                !report.marked_scopes.is_empty(),
             ))
         })
         .await
@@ -1029,12 +1136,8 @@ impl BlackboxServer {
 
         match fs_result {
             Ok((record, dir, dry_run, entries, recorded_repo_id, schema_epoch_marker_written)) => {
-                // Phase 2: await the kb persister durable ack on the runtime.
-                if !dry_run && let Err(e) = self.state.kb_persister.request_durable().await {
-                    let ms = start.elapsed().as_secs_f64() * 1000.0;
-                    tracing::warn!(target: "blackbox::tool", tool = "bbox_project_eject", elapsed_ms = ms, error = %e, "err");
-                    return Self::err_text(&format!("Error: {e:#}"));
-                }
+                // The central store was already flushed under the publication
+                // guard above, so there is no durability ack left to await.
                 match serde_json::to_string_pretty(&json!({
                     "status": if dry_run { "dry_run" } else { "ok" },
                     "project_id": record.project_id,
@@ -1639,5 +1742,142 @@ mod tests {
             Some(new_project.as_str()),
             "roadmap items follow the rename instead of orphaning"
         );
+    }
+
+    mod catalog_mutation {
+        use super::*;
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
+        const PROJECT: &str = "proj_mutate";
+
+        fn text(result: &rmcp::model::CallToolResult) -> String {
+            result
+                .content
+                .iter()
+                .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// A remote-only catalog project resolves but has no attachment to
+        /// write into. Eject writes repository files, so the refusal names
+        /// the missing attachment rather than claiming the project is
+        /// unregistered: its published knowledge still serves.
+        #[tokio::test]
+        async fn catalog_eject_of_a_remote_only_project_requires_an_attachment() {
+            let fixture = CatalogFixture::new();
+            fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+            let server = fixture.server();
+
+            let result = server
+                .bbox_project_eject(Parameters(ProjectEjectParams {
+                    project: PROJECT.into(),
+                    dry_run: None,
+                }))
+                .await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = text(&result);
+            assert!(text.contains("error.project_attachment_required"), "{text}");
+            assert!(
+                !text.contains("not registered"),
+                "a published remote-only project is registered: {text}"
+            );
+        }
+
+        /// An attachment that records `repo_knowledge` but not
+        /// `repo_mutation` is a capability refusal, not a missing
+        /// attachment. Reporting it as attachment-required would send the
+        /// operator to attach a checkout that is already attached.
+        #[tokio::test]
+        async fn catalog_eject_without_repo_mutation_is_capability_denied() {
+            let fixture = CatalogFixture::new();
+            let scope = CatalogFixture::scope(".");
+            fixture.add_published_project(PROJECT, &scope);
+            let directory = tempdir().unwrap();
+            let checkout = directory.path().canonicalize().unwrap().join("checkout");
+            std::fs::create_dir_all(&checkout).unwrap();
+            fixture.attach_overlay_checkout(
+                PROJECT,
+                &scope,
+                &checkout,
+                "att_00000000000000000000000000000d01",
+                "dddddddddddddddddddddddddddddd01",
+                // repo_knowledge only: repo_mutation stays unset.
+                true,
+            );
+            let server = fixture.server_with_checkout_authority();
+
+            let result = server
+                .bbox_project_eject(Parameters(ProjectEjectParams {
+                    project: PROJECT.into(),
+                    dry_run: None,
+                }))
+                .await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = text(&result);
+            assert!(text.contains("error.project_capability_denied"), "{text}");
+        }
+
+        /// The bootstrap exception (plan 4.19) survives catalog mode: a path
+        /// with no attachment is scaffolded with no lease, because attach
+        /// needs the identity-bearing config this call writes.
+        #[tokio::test]
+        async fn unregistered_init_bootstraps_under_catalog_authority() {
+            let fixture = CatalogFixture::new();
+            let server = fixture.server_with_checkout_authority();
+            let directory = tempdir().unwrap();
+            let project = directory.path().canonicalize().unwrap().join("fresh");
+            std::fs::create_dir_all(&project).unwrap();
+
+            let result = server
+                .bbox_project_init(Parameters(ProjectInitParams {
+                    path: project.to_string_lossy().into_owned(),
+                    force: false,
+                }))
+                .await;
+
+            assert_ne!(result.is_error, Some(true), "{}", text(&result));
+            assert!(project.join(".bbox/config.toml").exists());
+            assert!(project.join(".bbox/knowledge").is_dir());
+        }
+
+        /// The same call against an ATTACHED catalog path is no longer
+        /// bootstrap: it is a catalog-targeted mutation, so an attachment
+        /// without `repo_mutation` refuses instead of scaffolding.
+        #[tokio::test]
+        async fn init_against_an_attached_path_requires_repo_mutation() {
+            let fixture = CatalogFixture::new();
+            let scope = CatalogFixture::scope(".");
+            fixture.add_published_project(PROJECT, &scope);
+            let directory = tempdir().unwrap();
+            let checkout = directory.path().canonicalize().unwrap().join("checkout");
+            std::fs::create_dir_all(&checkout).unwrap();
+            fixture.attach_overlay_checkout(
+                PROJECT,
+                &scope,
+                &checkout,
+                "att_00000000000000000000000000000d01",
+                "dddddddddddddddddddddddddddddd01",
+                true,
+            );
+            let server = fixture.server_with_checkout_authority();
+
+            let result = server
+                .bbox_project_init(Parameters(ProjectInitParams {
+                    path: checkout.to_string_lossy().into_owned(),
+                    force: false,
+                }))
+                .await;
+
+            assert_eq!(result.is_error, Some(true));
+            let text = text(&result);
+            assert!(text.contains("error.project_capability_denied"), "{text}");
+            assert!(
+                !checkout.join(".bbox/workflows").exists(),
+                "a refused catalog-targeted init must write nothing"
+            );
+        }
     }
 }
