@@ -220,6 +220,14 @@ bbox-mcp-tools = { path = "crates/bbox-mcp-tools" }
 bbox-visual-store = { path = "crates/bbox-visual-store" }
 
 [dev-dependencies]
+# Syntax-aware Rust source scanning for the blocking exit-gate proofs
+# (scripts/acceptance-catalog-ownership.sh). Test scope only: nothing the
+# daemon links parses Rust. `span-locations` is what lets the scanner slice
+# the ORIGINAL source text for an item rather than reprinting it from
+# tokens, which would not preserve what the patterns match on.
+syn = { version = "2", features = ["full", "parsing", "extra-traits", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
 filetime = "0.2"
 # Enable bbox-vectors' test-global-store helpers for the daemon's own tests.
 # cfg(test) doesn't cross crate boundaries, so this dev-dep turns on the

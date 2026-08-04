@@ -1,11 +1,11 @@
 # Catalog ownership inventory baseline (plan section 14.2 Proof B).
 # One row per SITE: pattern, file, enclosing item, count, Phase 6 reason.
-# A site absent from this file fails the check even when the total is
-# unchanged, which is what rejects substituting a prohibited occurrence
-# for an approved one. Every row is Phase 6 deletion inventory; see
+# Spans are computed by parsing each file, so test items and members are
+# excluded structurally rather than by matching text. A site absent here
+# fails the check even when the total is unchanged, which is what rejects
+# substituting a prohibited occurrence for an approved one. Every row is
+# Phase 6 deletion inventory; see
 # design/daemon-runtime/durable-project-catalog-phase6-handoff.md.
-# Rows carrying NEEDS-REASON fail the check until an author states the
-# Phase 6 deletion or retention reason for that site.
 # Refresh after a legitimate removal:
 #   scripts/acceptance-catalog-ownership.sh --write-baseline
 canonical_path_read	crates/bbox-corpus-core/src/project_record.rs	fn from	2	delete with ProjectRecord
@@ -20,11 +20,11 @@ canonical_path_read	crates/bbox-indexing/src/checkout_access_v1.rs	fn select_sco
 canonical_path_read	crates/bbox-indexing/src/index/knowledge_docs.rs	fn reindex_knowledge_store_with_access	2	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/index/reindex.rs	fn execute_reindex_pass	4	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/index/thread_docs.rs	fn reindex_project_records_with_access	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory.rs	fn from_legacy	1	delete with ProjectRecord
+canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_against_inventory	2	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn derive_legacy_project_probes_with_hook	1	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn observe_legacy_projects	1	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn validate_pairing	1	delete with ProjectRecord
-canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory.rs	fn from_legacy	1	delete with ProjectRecord
-canonical_path_read	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_against_inventory	2	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/project_catalog_migration.rs	fn build_base_post_images	1	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/project_catalog_migration.rs	fn build_compatibility_projection	1	delete with ProjectRecord
 canonical_path_read	crates/bbox-indexing/src/project_catalog_migration.rs	fn build_migration_report	1	delete with ProjectRecord
@@ -166,17 +166,17 @@ direct_git_process	src/workflow/ops/worktree.rs	fn exec_worktree_create	1	route 
 direct_git_process	src/workflow/ops/worktree.rs	fn exec_worktree_remove	1	route through the verified-commit git wrapper
 legacy_publisher	crates/bbox-indexing/src/index/knowledge_docs.rs	fn publish	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/index/knowledge_docs.rs	fn reindex_knowledge_store_with_access	1	delete the legacy publisher store outright
-legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	<file scope>	1	delete the legacy publisher store outright
-legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn capture_inventory_locked	2	delete the legacy publisher store outright
-legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn capture_publisher_ref_source	1	delete the legacy publisher store outright
-legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	struct AuthorizedProjectCatalogMigrationInventoryRequestV1	1	delete the legacy publisher store outright
-legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	struct ProjectCatalogMigrationInventoryRequestV1	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	enum MutableInventorySourceKindV1	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	enum MutableInventorySourceLocatorV1	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate	2	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_mutable_source_locator	3	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_mutable_source_row_coverage	3	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	fn validate_publisher_source_membership	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	<file scope>	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn capture_inventory_locked	2	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn capture_publisher_ref_source	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	struct AuthorizedProjectCatalogMigrationInventoryRequestV1	1	delete the legacy publisher store outright
+legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	struct ProjectCatalogMigrationInventoryRequestV1	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_migration.rs	<file scope>	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_migration.rs	fn prepare_closed_migration	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_migration.rs	fn prepare_source_drafts	1	delete the legacy publisher store outright
@@ -189,7 +189,6 @@ legacy_publisher	src/server/knowledge_lifecycle.rs	struct PublisherAuthorization
 legacy_publisher	src/server/knowledge_lifecycle.rs	struct PublisherAuthorizationCacheEntry	1	delete the legacy publisher store outright
 legacy_publisher	src/server/open.rs	fn open_shared_state	1	delete the legacy publisher store outright
 legacy_publisher	src/server/state.rs	struct SharedState	2	delete the legacy publisher store outright
-legacy_publisher	src/system_events_runtime/integration_tests.rs	fn test_server	1	delete the legacy publisher store outright
 project_record_import	crates/bbox-corpus-core/src/code_project_identity.rs	<file scope>	1	delete with the v1 record type
 project_record_import	crates/bbox-corpus-core/src/project_selector.rs	<file scope>	1	delete with the v1 record type
 project_record_import	crates/bbox-corpus-index/src/index/git_history.rs	<file scope>	1	delete with the v1 record type

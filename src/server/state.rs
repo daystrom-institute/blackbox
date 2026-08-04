@@ -1010,12 +1010,36 @@ mod blocking_acceptance_proofs {
         (output.status.success(), rendered)
     }
 
-    /// Clause 2 Proof B. A grown count means a converted surface gained
-    /// another unleased way to reach a checkout.
+    /// Clause 2 Proof B. A NEW or grown site means a converted surface
+    /// gained another unleased way to reach a checkout.
+    ///
+    /// The scan runs in-process rather than shelling to the script: the
+    /// exclusion is a Rust parse now, and a nested cargo invocation from
+    /// inside a test would contend for the build lock this test already
+    /// holds. The script is the operator entry point and calls back here.
     #[test]
     fn catalog_ownership_ratchet_holds() {
-        let (ok, rendered) = run_acceptance("acceptance-catalog-ownership.sh");
-        assert!(ok, "static ownership ratchet failed:\n{rendered}");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report =
+            super::super::catalog_ownership_scan::run(root, false).expect("catalog ownership scan");
+        assert!(report.ok, "{}", report.rendered);
+        println!("{}", report.rendered);
+    }
+
+    /// Operator entry point for refreshing the inventory after a legitimate
+    /// removal. Ignored by default so a normal run never rewrites evidence.
+    ///
+    /// Selection is by test NAME rather than an environment variable: the
+    /// build routes into a container on this estate, and `kubectl exec`
+    /// does not forward arbitrary environment, so an env-driven switch is
+    /// silently inert exactly where the suite actually runs. Argv survives.
+    #[test]
+    #[ignore = "rewrites the ownership baseline; run explicitly"]
+    fn catalog_ownership_baseline_write() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let report = super::super::catalog_ownership_scan::run(root, true)
+            .expect("catalog ownership baseline write");
+        println!("{}", report.rendered);
     }
 
     /// Clause 2 Proof C: every checkout-open call site is classified.
