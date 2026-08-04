@@ -1131,6 +1131,399 @@ pub(crate) struct ArcSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Project runtime status (plan section 6.8)
+// ---------------------------------------------------------------------------
+
+/// Per-project runtime status: a bounded, OBSERVATIONAL projection.
+///
+/// It is never authority. The catalog, the attachment store, and the
+/// accepted pointer remain authority; this is assembled on demand from
+/// those sources plus the runtime's own published observations, and a
+/// consumer that acts on it must still take the corresponding lease.
+///
+/// It is deliberately separate from `CheckoutAccessHealth`, whose durable
+/// observation counters keep a closed, low-cardinality key space as Phase 6
+/// cut evidence (plan 4.17). Nothing here is written back into those
+/// counters, and no operation that was never attempted is reported as
+/// denied.
+///
+/// Path-free by construction: every field is a logical id, a published
+/// scope, a content stamp, or an enum. No checkout path appears, which
+/// plan 13.6 pins.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ProjectRuntimeStatus {
+    pub(crate) project_id: String,
+    /// Absent for a `LegacyLocal` project, which publishes under no scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) catalog_scope: Option<PublishedScopeView>,
+    pub(crate) accepted: AcceptedRuntimeView,
+    pub(crate) binding: BindingRuntimeView,
+    pub(crate) attachments: Vec<AttachmentCapabilityView>,
+    pub(crate) overlays: Vec<CheckoutOverlayView>,
+    pub(crate) watcher: WatcherRuntimeView,
+}
+
+/// A published scope rendered as its two logical components, never a path.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct PublishedScopeView {
+    pub(crate) repo_id: String,
+    pub(crate) bbox_root_relpath: String,
+}
+
+impl PublishedScopeView {
+    fn from_scope(scope: &bbox_corpus_core::identity::PublishedScope) -> Self {
+        Self {
+            repo_id: scope.repo_id().to_string(),
+            bbox_root_relpath: scope.bbox_root_relpath().to_string(),
+        }
+    }
+}
+
+/// Accepted-publication state and content identity.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AcceptedRuntimeView {
+    /// `current`, `prior`, `missing`, `corrupt`, or `unavailable` when the
+    /// runtime itself could not be consulted.
+    pub(crate) state: &'static str,
+    pub(crate) serves_published_content: bool,
+    pub(crate) advance_available: bool,
+    /// `agreed`, `refresh_required`, or `unevaluated`. `refresh_required`
+    /// is the scope-migration bridge of plan 4.9.
+    pub(crate) scope_agreement: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) accepted_scope: Option<PublishedScopeView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) full_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) accepted_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) generation_sha256: Option<String>,
+    /// Seconds since the unix epoch at the last pointer verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_verified_unix_secs: Option<u64>,
+    /// The stable code of whatever refused, when the state is not Current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<String>,
+}
+
+/// Which attachment the pointer names, and whether it is still usable.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct BindingRuntimeView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attachment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pointer_sha256: Option<String>,
+    /// `attached`, `detached`, `unknown_attachment`, or `unbound`.
+    ///
+    /// `detached` is the D-033 item 1 residual made observable: catalog
+    /// detach does not take the publication lock, so a pointer can name a
+    /// freshly detached attachment. That is a misleading binding, not
+    /// corruption, and an explicit bind repairs it.
+    pub(crate) status: &'static str,
+}
+
+/// One attachment's recorded capability bits.
+///
+/// Read straight from the catalog row. A capability that is not recorded
+/// is reported as unavailable; it is NOT reported as a denial, because no
+/// operation was attempted (plan 4.17).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AttachmentCapabilityView {
+    pub(crate) attachment_id: String,
+    pub(crate) checkout_id: String,
+    pub(crate) kind: String,
+    pub(crate) status: String,
+    /// The capability bits this attachment records, by name, sorted.
+    pub(crate) available: Vec<&'static str>,
+}
+
+/// The last published overlay outcome for one checkout.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct CheckoutOverlayView {
+    pub(crate) checkout_id: String,
+    pub(crate) lane: &'static str,
+    pub(crate) published_scope: PublishedScopeView,
+    /// `fresh` or `unavailable`.
+    pub(crate) outcome: &'static str,
+    /// The accepted generation this overlay was computed against, when the
+    /// stamp carries one. A mismatch against the accepted content stamp is
+    /// what makes staleness explicit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) accepted_generation: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) diagnostics: Vec<String>,
+}
+
+/// Whether this process runs a watcher for the project's attachments.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WatcherRuntimeView {
+    /// False when this process runs no watcher at all, which is not a
+    /// project-level fault.
+    pub(crate) watcher_running: bool,
+    /// Attachment ids with a live native registration.
+    pub(crate) registered_attachments: Vec<String>,
+    /// Attachments that record `artifact_watching` but carry no
+    /// registration. Non-empty here is the actionable state.
+    pub(crate) capable_but_unregistered: Vec<String>,
+}
+
+/// Capability bit names, in the order the section 9 adapter table lists
+/// them. Kept as a function rather than a derive so the projection never
+/// depends on field order in the durable struct.
+fn recorded_capabilities(
+    capabilities: &bbox_corpus_core::project_catalog::AttachmentCapabilities,
+) -> Vec<&'static str> {
+    let mut available = Vec::new();
+    for (recorded, name) in [
+        (capabilities.local_code_source, "local_code_source"),
+        (capabilities.git_history, "git_history"),
+        (capabilities.blame, "blame"),
+        (capabilities.repo_knowledge, "repo_knowledge"),
+        (capabilities.repo_mutation, "repo_mutation"),
+        (capabilities.render_output, "render_output"),
+        (capabilities.provenance_note_io, "provenance_note_io"),
+        (capabilities.artifact_watching, "artifact_watching"),
+    ] {
+        if recorded {
+            available.push(name);
+        }
+    }
+    available
+}
+
+impl SharedState {
+    /// Project one catalog project's runtime status (plan 6.8).
+    ///
+    /// `None` in bridge mode: there is no catalog project to project, and
+    /// the bridge's health story stays the existing sections unchanged.
+    pub(crate) fn project_runtime_status(&self, project_id: &str) -> Option<ProjectRuntimeStatus> {
+        use bbox_corpus_core::project_catalog::{AttachmentStatus, ProjectId, ProjectScope};
+
+        let store = self.project_authority.catalog_store()?;
+        let snapshot = store.snapshot().ok()?;
+        let parsed = ProjectId::parse(project_id).ok()?;
+        let project = snapshot.catalog().projects.get(&parsed)?;
+        let catalog_scope = match &project.scope {
+            ProjectScope::Published(scope) => Some(scope.clone()),
+            ProjectScope::LegacyLocal => None,
+        };
+
+        let accepted_status = self
+            .accepted_publications
+            .as_ref()
+            .and_then(|runtime| runtime.status(&parsed, catalog_scope.as_ref()).ok());
+        let accepted = AcceptedRuntimeView::project(accepted_status.as_ref());
+
+        let rows = snapshot
+            .attachments()
+            .attachments
+            .values()
+            .filter(|attachment| attachment.project_id == parsed)
+            .collect::<Vec<_>>();
+
+        let bound_attachment = accepted_status
+            .as_ref()
+            .and_then(|status| status.binding_stamp())
+            .map(|stamp| stamp.attachment_id().as_str().to_string());
+        let binding = BindingRuntimeView {
+            status: match bound_attachment.as_deref() {
+                None => "unbound",
+                Some(attachment_id) => match rows
+                    .iter()
+                    .find(|row| row.attachment_id.as_str() == attachment_id)
+                {
+                    None => "unknown_attachment",
+                    Some(row) if row.status == AttachmentStatus::Attached => "attached",
+                    Some(_) => "detached",
+                },
+            },
+            pointer_sha256: accepted_status
+                .as_ref()
+                .and_then(|status| status.binding_stamp())
+                .map(|stamp| stamp.pointer_sha256().to_string()),
+            attachment_id: bound_attachment,
+        };
+
+        let attachments = rows
+            .iter()
+            .map(|row| AttachmentCapabilityView {
+                attachment_id: row.attachment_id.as_str().to_string(),
+                checkout_id: row.checkout_id.clone(),
+                kind: format!("{:?}", row.kind).to_lowercase(),
+                status: format!("{:?}", row.status).to_lowercase(),
+                available: recorded_capabilities(&row.capabilities),
+            })
+            .collect::<Vec<_>>();
+
+        let checkout_ids = rows
+            .iter()
+            .map(|row| row.checkout_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut overlays = Vec::new();
+        for snapshot in self.knowledge_overlays.read().snapshots() {
+            if !checkout_ids.contains(snapshot.key.checkout_id.as_str()) {
+                continue;
+            }
+            overlays.push(CheckoutOverlayView {
+                checkout_id: snapshot.key.checkout_id.clone(),
+                lane: "knowledge",
+                published_scope: PublishedScopeView::from_scope(&snapshot.key.published_scope),
+                outcome: match snapshot.status {
+                    bbox_knowledge::overlay::OverlayStatus::Valid => "fresh",
+                    bbox_knowledge::overlay::OverlayStatus::Invalid => "unavailable",
+                },
+                accepted_generation: snapshot
+                    .stamp
+                    .as_ref()
+                    .and_then(|stamp| stamp.accepted_generation.clone()),
+                diagnostics: snapshot.diagnostics.clone(),
+            });
+        }
+        for snapshot in self.gap_overlays.read().snapshots() {
+            if !checkout_ids.contains(snapshot.key.checkout_id.as_str()) {
+                continue;
+            }
+            overlays.push(CheckoutOverlayView {
+                checkout_id: snapshot.key.checkout_id.clone(),
+                lane: "gaps",
+                published_scope: PublishedScopeView::from_scope(&snapshot.key.published_scope),
+                outcome: match snapshot.status {
+                    bbox_gaps::overlay::GapOverlayStatus::Valid => "fresh",
+                    bbox_gaps::overlay::GapOverlayStatus::Invalid => "unavailable",
+                },
+                accepted_generation: snapshot
+                    .stamp
+                    .as_ref()
+                    .and_then(|stamp| stamp.accepted_generation.clone()),
+                diagnostics: snapshot.diagnostics.clone(),
+            });
+        }
+        overlays.sort_by(|left, right| {
+            (left.checkout_id.as_str(), left.lane).cmp(&(right.checkout_id.as_str(), right.lane))
+        });
+
+        let watcher = self.watcher_runtime_view(&rows);
+
+        Some(ProjectRuntimeStatus {
+            project_id: project_id.to_string(),
+            catalog_scope: catalog_scope.as_ref().map(PublishedScopeView::from_scope),
+            accepted,
+            binding,
+            attachments,
+            overlays,
+            watcher,
+        })
+    }
+
+    fn watcher_runtime_view(
+        &self,
+        rows: &[&bbox_corpus_core::project_catalog::CheckoutAttachment],
+    ) -> WatcherRuntimeView {
+        use bbox_artifacts::watcher::ArtifactWatchAttachment;
+        use bbox_corpus_core::project_catalog::AttachmentStatus;
+
+        let guard = self.bbox_watcher.lock().ok();
+        let Some(registered) = guard
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .map(|watcher| watcher.registered_carriers())
+        else {
+            // No watcher in this process: not a project fault, and not an
+            // "unregistered" verdict about any attachment.
+            return WatcherRuntimeView {
+                watcher_running: false,
+                registered_attachments: Vec::new(),
+                capable_but_unregistered: Vec::new(),
+            };
+        };
+        let registered_attachments = registered
+            .iter()
+            .filter_map(|carrier| match carrier.attachment() {
+                ArtifactWatchAttachment::AttachmentId(attachment_id) => Some(attachment_id.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let capable_but_unregistered = rows
+            .iter()
+            .filter(|row| row.status == AttachmentStatus::Attached)
+            .filter(|row| row.capabilities.artifact_watching)
+            .map(|row| row.attachment_id.as_str().to_string())
+            .filter(|attachment_id| !registered_attachments.contains(attachment_id))
+            .collect::<Vec<_>>();
+        WatcherRuntimeView {
+            watcher_running: true,
+            registered_attachments: registered_attachments
+                .iter()
+                .filter(|attachment_id| {
+                    rows.iter()
+                        .any(|row| row.attachment_id.as_str() == attachment_id.as_str())
+                })
+                .cloned()
+                .collect(),
+            capable_but_unregistered,
+        }
+    }
+}
+
+impl AcceptedRuntimeView {
+    fn project(
+        status: Option<&bbox_indexing::accepted_publication_runtime::AcceptedPublicationStatus>,
+    ) -> Self {
+        use bbox_indexing::accepted_publication_runtime::{
+            AcceptedPublicationScopeAgreement as Agreement, AcceptedPublicationState as State,
+        };
+
+        let Some(status) = status else {
+            // The runtime itself is absent or refused. Distinct from
+            // Missing, which is a proved absence of a pointer.
+            return Self {
+                state: "unavailable",
+                serves_published_content: false,
+                advance_available: false,
+                scope_agreement: "unevaluated",
+                accepted_scope: None,
+                full_ref: None,
+                accepted_commit: None,
+                generation_id: None,
+                generation_sha256: None,
+                last_verified_unix_secs: None,
+                diagnostic: None,
+            };
+        };
+        let stamp = status.content_stamp();
+        Self {
+            state: match status.state() {
+                State::Current => "current",
+                State::Prior => "prior",
+                State::Missing => "missing",
+                State::Corrupt => "corrupt",
+            },
+            serves_published_content: status.state().serves_published_content(),
+            advance_available: status.advance_available(),
+            scope_agreement: match status.scope_agreement() {
+                Agreement::Agreed => "agreed",
+                Agreement::RefreshRequired => "refresh_required",
+                Agreement::Unevaluated => "unevaluated",
+            },
+            accepted_scope: stamp
+                .map(|stamp| PublishedScopeView::from_scope(stamp.accepted_scope())),
+            full_ref: stamp.map(|stamp| stamp.full_ref().to_string()),
+            accepted_commit: stamp.map(|stamp| stamp.accepted_commit().to_string()),
+            generation_id: stamp.map(|stamp| stamp.generation_id().to_string()),
+            generation_sha256: stamp.map(|stamp| stamp.generation_hash().to_string()),
+            last_verified_unix_secs: status
+                .last_verified_at()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_secs()),
+            diagnostic: status.failure().map(|failure| failure.code().to_string()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server Handler
 // ---------------------------------------------------------------------------
 

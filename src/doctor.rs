@@ -201,12 +201,329 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     let checkout_access = state.checkout_access_observations.health();
     sections.push(checkout_access_section(&checkout_access));
     sections.push(resolver_compat_section(state));
+    // Catalog-only project health (plan section 8, P5-G). Each section is
+    // observational: it reports what the catalog, the accepted pointer, and
+    // the runtime's published observations already say, and never counts an
+    // operation nobody attempted.
+    let project_statuses = catalog_project_statuses(state);
+    if let Some(statuses) = project_statuses.as_ref() {
+        sections.extend([
+            accepted_publication_section(statuses),
+            publisher_binding_section(statuses),
+            overlay_baseline_section(statuses),
+            attachment_capability_section(statuses),
+            artifact_watcher_section(statuses),
+        ]);
+    }
     sections.extend([
         memories_section(state),
         knowledge_section(state),
         attention_section(state),
     ]);
     Ok(DoctorReport::from_sections(sections).with_checkout_access(checkout_access))
+}
+
+/// How many per-project findings one catalog section emits before it
+/// summarizes the rest. Doctor output is an operator surface, not a
+/// dump; the projection itself stays complete for programmatic consumers.
+const MAX_PROJECT_FINDINGS: usize = 20;
+
+/// Project every catalog project's runtime status once, for the sections
+/// below to read. `None` in bridge mode, where these sections do not apply
+/// and are omitted from the report entirely rather than rendered empty.
+fn catalog_project_statuses(
+    state: &crate::server::state::SharedState,
+) -> Option<Vec<crate::server::state::ProjectRuntimeStatus>> {
+    state.project_authority.catalog_store()?;
+    let snapshot = state.records_provider.records_snapshot();
+    Some(
+        snapshot
+            .corpus_project_ids
+            .iter()
+            .filter_map(|project_id| state.project_runtime_status(project_id))
+            .collect(),
+    )
+}
+
+/// Append a bounded tail line when a section had more to say than it showed.
+fn bound_findings(findings: &mut Vec<Finding>, considered: usize, section: &str) {
+    if considered > MAX_PROJECT_FINDINGS {
+        findings.push(Finding::info(format!(
+            "{} more {section} findings not shown",
+            considered - MAX_PROJECT_FINDINGS
+        )));
+    }
+}
+
+/// Accepted-publication state per project, plus the two states that read
+/// fine but refuse mutation: Prior fallback and the scope-migration bridge.
+fn accepted_publication_section(
+    statuses: &[crate::server::state::ProjectRuntimeStatus],
+) -> SectionReport {
+    let mut findings = Vec::new();
+    let mut considered = 0;
+    let mut current = 0;
+    for status in statuses {
+        let notable = match status.accepted.state {
+            "current" => status.accepted.scope_agreement == "refresh_required",
+            _ => true,
+        };
+        if !notable {
+            current += 1;
+            continue;
+        }
+        considered += 1;
+        if considered > MAX_PROJECT_FINDINGS {
+            continue;
+        }
+        let project = &status.project_id;
+        findings.push(match status.accepted.state {
+            // Serving old accepted truth under its old scope until a
+            // new-scope advance clears the bridge (plan 4.9).
+            _ if status.accepted.scope_agreement == "refresh_required" => Finding::action(
+                format!(
+                    "project {project} serves accepted content at a scope the catalog has since \
+                     migrated; publishing at the current scope clears the bridge"
+                ),
+                "bbox_project_publisher_advance",
+            ),
+            // Reads continue off the prior arm; every mutation refuses.
+            "prior" => Finding::action(
+                format!(
+                    "project {project} fell back to its PRIOR accepted generation; reads continue \
+                     and establish, bind, and advance all refuse until repair"
+                ),
+                "bbox_project_publisher_status",
+            ),
+            "missing" => Finding::info(format!(
+                "project {project} has no accepted publication pointer; an explicit establish \
+                 creates the first one"
+            )),
+            "corrupt" => Finding::blocked(format!(
+                "project {project} has an accepted pointer whose current and prior arms both \
+                 failed verification{}",
+                status
+                    .accepted
+                    .diagnostic
+                    .as_deref()
+                    .map(|code| format!(" ({code})"))
+                    .unwrap_or_default()
+            )),
+            "unavailable" => Finding::warn(format!(
+                "project {project} accepted status could not be read from the runtime"
+            )),
+            other => Finding::info(format!("project {project} accepted state {other}")),
+        });
+    }
+    bound_findings(&mut findings, considered, "accepted-publication");
+    if findings.is_empty() && current > 0 {
+        findings.push(Finding::ok(format!(
+            "{current} catalog project(s) serve their current accepted generation"
+        )));
+    }
+    SectionReport {
+        section: "accepted_publication",
+        findings,
+    }
+}
+
+/// Which attachment each pointer names and whether an advance can run.
+fn publisher_binding_section(
+    statuses: &[crate::server::state::ProjectRuntimeStatus],
+) -> SectionReport {
+    let mut findings = Vec::new();
+    let mut considered = 0;
+    let mut healthy = 0;
+    for status in statuses {
+        let project = &status.project_id;
+        let finding = match status.binding.status {
+            // D-033 item 1 made observable: detach does not take the
+            // publication lock, so a pointer can outlive its attachment.
+            "detached" => Some(Finding::action(
+                format!(
+                    "project {project} pointer names a DETACHED attachment; published reads \
+                     continue and advance is unavailable until an explicit bind repairs it"
+                ),
+                "bbox_project_publisher_bind",
+            )),
+            "unknown_attachment" => Some(Finding::warn(format!(
+                "project {project} pointer names an attachment the catalog no longer carries"
+            ))),
+            "unbound" => None,
+            _ if !status.accepted.advance_available
+                && status.accepted.state != "missing"
+                && status.accepted.state != "unavailable" =>
+            {
+                Some(Finding::info(format!(
+                    "project {project} advance is unavailable from accepted state \
+                     ({})",
+                    status.accepted.state
+                )))
+            }
+            _ => {
+                healthy += 1;
+                None
+            }
+        };
+        if let Some(finding) = finding {
+            considered += 1;
+            if considered <= MAX_PROJECT_FINDINGS {
+                findings.push(finding);
+            }
+        }
+    }
+    bound_findings(&mut findings, considered, "publisher-binding");
+    if findings.is_empty() && healthy > 0 {
+        findings.push(Finding::ok(format!(
+            "{healthy} catalog pointer binding(s) name an attached attachment"
+        )));
+    }
+    SectionReport {
+        section: "publisher_binding",
+        findings,
+    }
+}
+
+/// Last published overlay outcome per checkout, per lane.
+fn overlay_baseline_section(
+    statuses: &[crate::server::state::ProjectRuntimeStatus],
+) -> SectionReport {
+    let mut findings = Vec::new();
+    let mut considered = 0;
+    let mut fresh = 0;
+    for status in statuses {
+        for overlay in &status.overlays {
+            if overlay.outcome == "fresh" {
+                fresh += 1;
+                continue;
+            }
+            considered += 1;
+            if considered > MAX_PROJECT_FINDINGS {
+                continue;
+            }
+            findings.push(Finding::warn(format!(
+                "project {} checkout {} {} overlay unavailable{}",
+                status.project_id,
+                overlay.checkout_id,
+                overlay.lane,
+                overlay
+                    .diagnostics
+                    .first()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default(),
+            )));
+        }
+    }
+    bound_findings(&mut findings, considered, "overlay-baseline");
+    if findings.is_empty() && fresh > 0 {
+        findings.push(Finding::ok(format!("{fresh} checkout overlay(s) fresh")));
+    }
+    SectionReport {
+        section: "overlay_baseline",
+        findings,
+    }
+}
+
+/// Capability availability by attachment, straight from the catalog bits.
+///
+/// An attachment with no recorded capability is the actionable case: it is
+/// attached but every lane degrades. Nothing here is a denial count; no
+/// operation was attempted (plan 4.17).
+fn attachment_capability_section(
+    statuses: &[crate::server::state::ProjectRuntimeStatus],
+) -> SectionReport {
+    let mut findings = Vec::new();
+    let mut considered = 0;
+    let mut attached = 0;
+    let mut remote_only = 0;
+    for status in statuses {
+        let active = status
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.status == "attached")
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            remote_only += 1;
+            continue;
+        }
+        for attachment in active {
+            attached += 1;
+            if !attachment.available.is_empty() {
+                continue;
+            }
+            considered += 1;
+            if considered > MAX_PROJECT_FINDINGS {
+                continue;
+            }
+            findings.push(Finding::warn(format!(
+                "project {} attachment {} records no capabilities; every checkout-backed lane \
+                 degrades for it",
+                status.project_id, attachment.attachment_id
+            )));
+        }
+    }
+    bound_findings(&mut findings, considered, "attachment-capability");
+    if remote_only > 0 {
+        findings.push(Finding::info(format!(
+            "{remote_only} catalog project(s) are remote-only; published reads serve and every \
+             checkout-backed lane reports unavailable"
+        )));
+    }
+    if findings.is_empty() && attached > 0 {
+        findings.push(Finding::ok(format!(
+            "{attached} active attachment(s) record at least one capability"
+        )));
+    }
+    SectionReport {
+        section: "attachment_capability",
+        findings,
+    }
+}
+
+/// Watcher registration state per project.
+fn artifact_watcher_section(
+    statuses: &[crate::server::state::ProjectRuntimeStatus],
+) -> SectionReport {
+    let mut findings = Vec::new();
+    let mut considered = 0;
+    let mut registered = 0;
+    if statuses
+        .iter()
+        .all(|status| !status.watcher.watcher_running)
+    {
+        return SectionReport {
+            section: "artifact_watcher",
+            findings: vec![Finding::info(
+                "no artifact watcher runs in this process; durable artifact metadata is                  unaffected and filesystem discovery is off",
+            )],
+        };
+    }
+    for status in statuses {
+        registered += status.watcher.registered_attachments.len();
+        if status.watcher.capable_but_unregistered.is_empty() {
+            continue;
+        }
+        considered += 1;
+        if considered > MAX_PROJECT_FINDINGS {
+            continue;
+        }
+        findings.push(Finding::warn(format!(
+            "project {} has {} attachment(s) recording artifact_watching with no live watcher \
+             registration",
+            status.project_id,
+            status.watcher.capable_but_unregistered.len()
+        )));
+    }
+    bound_findings(&mut findings, considered, "artifact-watcher");
+    if findings.is_empty() {
+        findings.push(Finding::ok(format!(
+            "{registered} attachment watcher registration(s) active"
+        )));
+    }
+    SectionReport {
+        section: "artifact_watcher",
+        findings,
+    }
 }
 
 fn checkout_access_section(
@@ -263,6 +580,16 @@ fn resolver_compat_section(state: &crate::server::state::SharedState) -> Section
     if let Some(degradation) = state.records_provider.last_degradation() {
         findings.push(Finding::info(format!(
             "records provider degradation: {degradation}"
+        )));
+    }
+    // The paired read that repository carriers depend on. A persistent
+    // epoch disagreement leaves carriers at their last-good set rather than
+    // encoding a moving Selected target, so it is a real degradation an
+    // operator must see rather than a transient the runtime absorbs.
+    if let Err(error) = crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(state)
+    {
+        findings.push(Finding::warn(format!(
+            "catalog carrier paired read unavailable: {error:#}"
         )));
     }
     if snapshot.sequence == 0 {
@@ -1250,5 +1577,359 @@ mod tests {
         assert!(action_pos < info_pos, "worst-first grouping: {summary}");
         assert!(summary.contains("next: bbox_reembed"), "{summary}");
         assert!(summary.contains("ok: daemon"), "{summary}");
+    }
+}
+
+#[cfg(test)]
+mod catalog_health_tests {
+    use super::*;
+    use crate::server::state::ProjectRuntimeStatus;
+    use crate::server::state::catalog_fixture::{
+        COMMIT_ONE, COMMIT_TWO, CatalogFixture, knowledge_entry,
+    };
+
+    const PROJECT: &str = "p_health";
+
+    fn status(server: &crate::server::BlackboxServer) -> ProjectRuntimeStatus {
+        server
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("catalog mode projects a status")
+    }
+
+    fn section<'a>(report: &'a DoctorReport, name: &str) -> &'a SectionReport {
+        report
+            .sections
+            .iter()
+            .find(|section| section.section == name)
+            .unwrap_or_else(|| panic!("section {name} is present"))
+    }
+
+    fn messages(report: &DoctorReport, name: &str) -> String {
+        section(report, name)
+            .findings
+            .iter()
+            .map(|finding| finding.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Accepted Current, and the section says so without inventing findings.
+    #[test]
+    fn accepted_current_is_healthy_and_advance_is_available() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        let server = fixture.server();
+
+        let status = status(&server);
+        assert_eq!(status.accepted.state, "current");
+        assert!(status.accepted.serves_published_content);
+        assert!(status.accepted.advance_available);
+        assert_eq!(status.accepted.scope_agreement, "agreed");
+        assert!(status.accepted.generation_id.is_some());
+        assert!(status.accepted.last_verified_unix_secs.is_some());
+
+        let report = run(&server).unwrap();
+        assert!(
+            section(&report, "accepted_publication").worst() == FindingLevel::Ok,
+            "{}",
+            messages(&report, "accepted_publication")
+        );
+    }
+
+    /// Accepted Prior: reads continue, mutation refuses, and the finding
+    /// says both.
+    #[test]
+    fn accepted_prior_reports_repair_required() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        let second = fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_TWO,
+            &[knowledge_entry("k1", "b")],
+            &[],
+        );
+        fixture.corrupt_generation(PROJECT, &second.generation_id);
+        let server = fixture.server();
+
+        let status = status(&server);
+        assert_eq!(status.accepted.state, "prior");
+        assert!(status.accepted.serves_published_content);
+        assert!(!status.accepted.advance_available);
+
+        let report = run(&server).unwrap();
+        let text = messages(&report, "accepted_publication");
+        assert!(text.contains("PRIOR"), "{text}");
+    }
+
+    /// A project with no pointer at all is Missing, not Corrupt.
+    #[test]
+    fn accepted_missing_is_distinct_from_corrupt() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let status = status(&server);
+        assert_eq!(status.accepted.state, "missing");
+        assert!(!status.accepted.serves_published_content);
+        assert_eq!(status.binding.status, "unbound");
+    }
+
+    /// Both arms damaged is Corrupt and blocks.
+    #[test]
+    fn accepted_corrupt_blocks() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let first = fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        let second = fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_TWO,
+            &[knowledge_entry("k1", "b")],
+            &[],
+        );
+        fixture.corrupt_generation(PROJECT, &first.generation_id);
+        fixture.corrupt_generation(PROJECT, &second.generation_id);
+        let server = fixture.server();
+
+        let status = status(&server);
+        assert_eq!(status.accepted.state, "corrupt");
+        assert!(!status.accepted.serves_published_content);
+
+        let report = run(&server).unwrap();
+        assert_eq!(
+            section(&report, "accepted_publication").worst(),
+            FindingLevel::Blocked,
+            "{}",
+            messages(&report, "accepted_publication")
+        );
+    }
+
+    /// Scope migration leaves accepted content readable at its old scope and
+    /// reports the bridge as an action (plan 4.9).
+    #[test]
+    fn scope_migration_reports_refresh_required() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        fixture.migrate_project_scope(PROJECT, &CatalogFixture::scope("nested"));
+        let server = fixture.server();
+
+        let status = status(&server);
+        assert_eq!(status.accepted.scope_agreement, "refresh_required");
+        assert_eq!(
+            status
+                .accepted
+                .accepted_scope
+                .as_ref()
+                .unwrap()
+                .bbox_root_relpath,
+            ".",
+            "response provenance keeps the OLD accepted scope"
+        );
+        assert_eq!(
+            status.catalog_scope.as_ref().unwrap().bbox_root_relpath,
+            "nested"
+        );
+
+        let report = run(&server).unwrap();
+        let text = messages(&report, "accepted_publication");
+        assert!(text.contains("migrated"), "{text}");
+    }
+
+    /// Binding Attached vs Detached. Detached is D-033 item 1 made
+    /// observable: the pointer outlives its attachment and an explicit bind
+    /// repairs it.
+    #[test]
+    fn binding_reports_attached_then_detached_after_detach() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().canonicalize().unwrap().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        fixture.attach_overlay_checkout(
+            PROJECT,
+            &scope,
+            &checkout,
+            CatalogFixture::attachment().as_str(),
+            "cccccccccccccccccccccccccccccc01",
+            true,
+        );
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        let server = fixture.server();
+        assert_eq!(status(&server).binding.status, "attached");
+
+        CatalogFixture::detach_in_server(&server, CatalogFixture::attachment().as_str());
+        let detached = status(&server);
+        assert_eq!(detached.binding.status, "detached");
+        assert!(
+            detached.accepted.serves_published_content,
+            "detach preserves accepted content"
+        );
+
+        let report = run(&server).unwrap();
+        let text = messages(&report, "publisher_binding");
+        assert!(text.contains("DETACHED"), "{text}");
+    }
+
+    /// Capability availability comes from the catalog bits, and a
+    /// remote-only project reports no attachment rather than a denial.
+    #[test]
+    fn capability_availability_reads_catalog_bits_without_synthesizing_denials() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let server = fixture.server();
+        assert!(status(&server).attachments.is_empty());
+
+        let report = run(&server).unwrap();
+        let text = messages(&report, "attachment_capability");
+        assert!(text.contains("remote-only"), "{text}");
+        assert!(
+            !text.contains("denied"),
+            "no operation was attempted, so nothing is a denial: {text}"
+        );
+    }
+
+    /// No watcher in this process is an informational state about the
+    /// process, never an "unregistered" verdict about an attachment.
+    #[test]
+    fn watcher_absent_is_informational_not_a_project_fault() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let server = fixture.server();
+
+        let status = status(&server);
+        assert!(!status.watcher.watcher_running);
+        assert!(status.watcher.capable_but_unregistered.is_empty());
+
+        let report = run(&server).unwrap();
+        assert_eq!(
+            section(&report, "artifact_watcher").worst(),
+            FindingLevel::Info
+        );
+    }
+
+    /// Plan 13.6: no absolute path appears anywhere in the serialized
+    /// report. The fixture deliberately holds a real checkout so a leak
+    /// would have something to leak.
+    #[test]
+    fn catalog_health_serialization_is_path_free() {
+        crate::init_system_memory_for_tests();
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().canonicalize().unwrap().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        fixture.attach_overlay_checkout(
+            PROJECT,
+            &scope,
+            &checkout,
+            CatalogFixture::attachment().as_str(),
+            "cccccccccccccccccccccccccccccc01",
+            true,
+        );
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("k1", "a")],
+            &[],
+        );
+        let server = fixture.server();
+
+        let status = serde_json::to_string(&status(&server)).unwrap();
+        let needle = checkout.to_string_lossy().into_owned();
+        assert!(
+            !status.contains(&needle),
+            "project runtime status leaked a checkout path: {status}"
+        );
+
+        let report = run(&server).unwrap();
+        let rendered = serde_json::to_string(&report).unwrap();
+        assert!(
+            !rendered.contains(&needle),
+            "doctor report leaked a checkout path"
+        );
+        assert!(
+            !report.render_summary().contains(&needle),
+            "doctor summary leaked a checkout path"
+        );
+    }
+
+    /// Bridge mode omits the catalog sections entirely rather than
+    /// rendering them empty.
+    #[test]
+    fn bridge_mode_omits_the_catalog_health_sections() {
+        crate::init_system_memory_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let state = std::sync::Arc::new(crate::server::state::SharedState::for_test(&root));
+        let server = crate::server::BlackboxServer::new(state);
+
+        let report = run(&server).unwrap();
+        for name in [
+            "accepted_publication",
+            "publisher_binding",
+            "overlay_baseline",
+            "attachment_capability",
+            "artifact_watcher",
+        ] {
+            assert!(
+                report
+                    .sections
+                    .iter()
+                    .all(|section| section.section != name),
+                "bridge mode must not render {name}"
+            );
+        }
     }
 }
