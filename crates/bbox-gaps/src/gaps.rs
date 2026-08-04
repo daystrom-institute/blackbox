@@ -593,6 +593,20 @@ fn repo_gaps_dir(project_dir: &Path) -> PathBuf {
 
 const MAX_LIVE_GAP_FILE_BYTES: usize = 2 * 1024 * 1024;
 
+/// The exact bytes a committed `.bbox/gaps/<id>.json` file carries.
+///
+/// Gap-side twin of `committed_knowledge_entry_bytes`, and one owner for
+/// the same reason: accepted publication hashes these bytes exactly
+/// (D-014), so a fixture that encodes them differently produces generation
+/// hashes over bytes no writer would commit.
+pub fn committed_gap_note_bytes(entry: &GapNote) -> Result<Vec<u8>> {
+    let mut on_disk = entry.clone();
+    on_disk.project = None;
+    on_disk.write_dir = None;
+    on_disk.provisional_checkout_id = None;
+    bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)
+}
+
 fn validate_repo_gap_id(id: &str) -> Result<()> {
     let mut components = Path::new(id).components();
     let Some(std::path::Component::Normal(name)) = components.next() else {
@@ -821,12 +835,8 @@ fn persist_repo_gap_entries(
 
         for entry in entries {
             validate_repo_gap_id(&entry.id)?;
-            let mut on_disk = (*entry).clone();
-            on_disk.project = None;
-            on_disk.write_dir = None;
-            on_disk.provisional_checkout_id = None;
             let path = dir.join(format!("{}.json", entry.id));
-            let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+            let new_bytes = committed_gap_note_bytes(entry)?;
             let unchanged = match fs::symlink_metadata(&path) {
                 Ok(metadata)
                     if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>

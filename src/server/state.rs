@@ -927,6 +927,96 @@ impl SharedState {
 }
 
 #[cfg(test)]
+mod committed_bytes_parity_tests {
+    //! The fixture must hash exactly what a writer commits.
+    //!
+    //! This is the guard against the vacuously-green class: when the
+    //! fixture and the test writers shared one PRIVATE encoding, they
+    //! agreed with each other, every published digest matched, and the
+    //! byte-equality suppression rule looked exercised while nothing
+    //! production writes was ever compared. Binding both to the writer's
+    //! own encoder is the fix; these tests keep it bound.
+
+    use bbox_gaps::gaps::committed_gap_note_bytes;
+    use bbox_knowledge::knowledge::committed_knowledge_entry_bytes;
+
+    use super::catalog_fixture::{gap_note, knowledge_entry};
+
+    /// The knowledge encoder drops host-local and telemetry fields. A
+    /// fixture entry deliberately carries both, so an encoder that skipped
+    /// normalization would show up here rather than as a silent digest
+    /// miss three layers away.
+    #[test]
+    fn committed_knowledge_bytes_are_normalized_and_newline_terminated() {
+        let mut entry = knowledge_entry("k1", "content");
+        entry.project = Some("/host/local/path".into());
+        entry.recall_count = 9;
+        entry.last_recalled = Some("2026-01-03T00:00:00Z".into());
+
+        let bytes = committed_knowledge_entry_bytes(&entry).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.ends_with('\n'), "committed JSON is newline-terminated");
+        assert!(
+            !text.contains("/host/local/path"),
+            "a committed entry carries no host path: {text}"
+        );
+
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(decoded["project"].is_null());
+        assert_eq!(decoded["recall_count"], 0);
+        assert!(decoded["last_recalled"].is_null());
+
+        // Byte-stable across the normalized/unnormalized pair: two entries
+        // differing only in dropped fields commit identically.
+        let mut twin = knowledge_entry("k1", "content");
+        twin.project = None;
+        twin.recall_count = 0;
+        twin.last_recalled = None;
+        assert_eq!(committed_knowledge_entry_bytes(&twin).unwrap(), bytes);
+    }
+
+    /// Gap-side twin of the same contract.
+    #[test]
+    fn committed_gap_bytes_are_normalized_and_newline_terminated() {
+        let mut gap = gap_note("gap-11111111", "title");
+        gap.project = Some("/host/local/path".into());
+        gap.write_dir = Some("/host/local/write".into());
+        gap.provisional_checkout_id = Some("checkout-1".into());
+
+        let bytes = committed_gap_note_bytes(&gap).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(!text.contains("/host/local"), "{text}");
+
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(decoded["project"].is_null());
+        assert!(decoded["write_dir"].is_null());
+        assert!(decoded["provisional_checkout_id"].is_null());
+    }
+
+    /// The asymmetry itself: the fixture's published source bytes must be
+    /// the writer's bytes. A private fixture encoding is what this catches.
+    #[test]
+    fn fixture_publishes_the_bytes_a_writer_commits() {
+        let entry = knowledge_entry("k1", "content");
+        let gap = gap_note("gap-11111111", "title");
+
+        // The old fixture encoding, kept here ONLY as the negative: if it
+        // ever matches again, the encoders have converged by accident and
+        // the parity above proves nothing.
+        assert_ne!(
+            serde_json::to_vec(&entry).unwrap(),
+            committed_knowledge_entry_bytes(&entry).unwrap(),
+            "the ad hoc encoding must remain visibly different from the committed one"
+        );
+        assert_ne!(
+            serde_json::to_vec(&gap).unwrap(),
+            committed_gap_note_bytes(&gap).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
 mod code_read_view_tests {
     use super::*;
 
@@ -1841,17 +1931,27 @@ pub(crate) mod catalog_fixture {
                 scope,
                 "refs/heads/main",
                 accepted_commit,
+                // The fixture must hash exactly what a WRITER commits.
+                // Encoding these independently is how a suite goes
+                // vacuously green: accepted publication hashes source bytes
+                // exactly (D-014), so a fixture with its own encoding
+                // produces generations describing bytes no writer would
+                // ever produce, and every byte comparison against them
+                // passes without proving anything.
                 knowledge
                     .iter()
                     .map(|entry| AcceptedPublicationSourceFileForTest {
                         repository_relative_filename: relative("knowledge", &entry.id),
-                        source_bytes: serde_json::to_vec(entry).unwrap(),
+                        source_bytes: bbox_knowledge::knowledge::committed_knowledge_entry_bytes(
+                            entry,
+                        )
+                        .unwrap(),
                     })
                     .collect(),
                 gaps.iter()
                     .map(|gap| AcceptedPublicationSourceFileForTest {
                         repository_relative_filename: relative("gaps", &gap.id),
-                        source_bytes: serde_json::to_vec(gap).unwrap(),
+                        source_bytes: bbox_gaps::gaps::committed_gap_note_bytes(gap).unwrap(),
                     })
                     .collect(),
             )

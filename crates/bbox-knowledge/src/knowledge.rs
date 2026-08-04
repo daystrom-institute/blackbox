@@ -800,6 +800,25 @@ fn validate_repo_knowledge_filename(path: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The exact bytes a committed `.bbox/knowledge/<id>.json` file carries.
+///
+/// ONE owner for the normalization plus the encoding, because accepted
+/// publication hashes these bytes exactly (D-014). Two writers and every
+/// fixture must agree byte for byte or a generation's hash describes bytes
+/// no writer would ever commit, and a test comparing them passes
+/// vacuously.
+///
+/// Normalization drops host-local and telemetry fields: `project` is a
+/// host path, and recall counters live in the repo-local stats sidecar,
+/// not in the traveling entry.
+pub fn committed_knowledge_entry_bytes(entry: &KnowledgeEntry) -> Result<Vec<u8>> {
+    let mut on_disk = entry.clone();
+    on_disk.project = None;
+    on_disk.recall_count = 0;
+    on_disk.last_recalled = None;
+    bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)
+}
+
 fn read_live_knowledge_file(path: &Path) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspecting repo-owned knowledge file {}", path.display()))?;
@@ -1181,13 +1200,8 @@ fn persist_repo_kb_entries(
 
         for entry in entries {
             validate_repo_knowledge_id(&entry.id)?;
-            let mut on_disk = (*entry).clone();
-            on_disk.project = None;
-            // Durable content only — recall telemetry lives in the sidecar.
-            on_disk.recall_count = 0;
-            on_disk.last_recalled = None;
             let path = dir.join(format!("{}.json", entry.id));
-            let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+            let new_bytes = committed_knowledge_entry_bytes(entry)?;
             let unchanged = match fs::symlink_metadata(&path) {
                 Ok(metadata)
                     if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
@@ -1775,12 +1789,8 @@ impl Knowledge {
                         },
                     );
                 }
-                let mut on_disk = entry.clone();
-                on_disk.project = None;
-                on_disk.recall_count = 0;
-                on_disk.last_recalled = None;
                 let path = repo_kb_dir(project_dir).join(format!("{}.json", entry.id));
-                let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(&on_disk)?;
+                let new_bytes = committed_knowledge_entry_bytes(entry)?;
                 match fs::symlink_metadata(&path) {
                     Ok(metadata)
                         if metadata.file_type().is_file()

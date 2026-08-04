@@ -1685,9 +1685,14 @@ mod catalog_gap_overlay_tests {
     fn write_gap(root: &Path, gap: &GapNote) {
         let dir = root.join(".bbox/gaps");
         std::fs::create_dir_all(&dir).unwrap();
+        // Write exactly what a writer commits. Encoding these
+        // independently was how this suite went vacuously green: the
+        // fixture and the test shared one private encoding, so a
+        // suppression assertion compared fixture bytes to fixture bytes
+        // and never touched the bytes production writes.
         std::fs::write(
             dir.join(format!("{}.json", gap.id)),
-            serde_json::to_vec(gap).unwrap(),
+            bbox_gaps::gaps::committed_gap_note_bytes(gap).unwrap(),
         )
         .unwrap();
     }

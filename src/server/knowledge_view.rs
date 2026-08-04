@@ -2992,21 +2992,26 @@ mod catalog_overlay_tests {
         );
     }
 
-    /// Write one entry with the exact bytes the fixture's accepted
-    /// publication hashes.
+    /// Write one entry with the exact bytes a WRITER commits.
     ///
     /// An accepted generation records the SHA-256 of the committed blob,
     /// so in production the repository content and the accepted source
-    /// bytes ARE the same bytes. A fixture that commits one serialization
-    /// and publishes another makes every published digest miss, which
+    /// bytes ARE the same bytes. Committing one serialization and
+    /// publishing another makes every published digest miss, which
     /// silently disables the byte-equality suppression rule instead of
     /// failing.
+    ///
+    /// The reference has to be the writer, not the fixture. This helper
+    /// and `install_publication` previously shared one PRIVATE encoding:
+    /// they agreed with each other and both disagreed with production, so
+    /// the digests matched and the rule looked exercised while nothing
+    /// production writes was ever compared.
     fn write_entry(root: &Path, entry: &KnowledgeEntry) {
         let dir = root.join(".bbox/knowledge");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{}.json", entry.id)),
-            serde_json::to_vec(entry).unwrap(),
+            bbox_knowledge::knowledge::committed_knowledge_entry_bytes(entry).unwrap(),
         )
         .unwrap();
     }
