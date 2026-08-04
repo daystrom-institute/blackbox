@@ -940,13 +940,18 @@ const COVERED_ATTRIBUTE_NODES: &[(&str, &str)] = &[
     ("syn::Arm", "visit_arm"),
     ("syn::Stmt", "visit_stmt"),
     ("syn::Expr", "visit_expr"),
-    ("syn::Pat", "visit_pat"),
     ("syn::FnArg", "visit_fn_arg"),
     ("syn::Receiver", "visit_receiver"),
     ("syn::BareFnArg", "visit_bare_fn_arg"),
     ("syn::Variadic", "visit_variadic"),
     ("syn::BareVariadic", "visit_bare_variadic"),
     ("syn::GenericParam", "visit_generic_param"),
+    // syn::Pat is deliberately NOT listed. `visit_pat` exists as defensive
+    // depth, but no source syn parses puts an attribute on a standalone
+    // pattern: the reachable pattern attributes arrive through PatType
+    // inside FnArg, which is its own row. An unexercisable row would be a
+    // coverage claim no test could bind, which is the shape of claim this
+    // inventory exists to retire.
     (
         "syn::File",
         "visit_file (inner attributes, whole-file gate)",
@@ -979,8 +984,226 @@ pub(crate) fn assert_covered_node_inventory(root: &Path) -> anyhow::Result<()> {
          override, then re-pin AUDITED_SYN_VERSION."
     );
     anyhow::ensure!(
-        COVERED_ATTRIBUTE_NODES.len() == 19,
+        COVERED_ATTRIBUTE_NODES.len() == 18,
         "the covered node inventory changed without its audit count"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// One synthetic source exercising one hook.
+    ///
+    /// `CANARY` marks an occurrence inside the `cfg(test)` span and must
+    /// never survive; `PRODUCTION` marks one outside it and must, except
+    /// for the whole-file gate where nothing survives.
+    struct Case {
+        node: &'static str,
+        source: &'static str,
+        production_survives: bool,
+        /// Text that must not survive the scan. Usually the CANARY token,
+        /// but a variadic has no name to carry one, so for those the
+        /// excluded SPAN itself is the assertion.
+        canary: &'static str,
+    }
+
+    const CASES: &[Case] = &[
+        Case {
+            node: "syn::Item",
+            source: "#[cfg(test)]\nfn g() { CANARY; }\nfn p() { PRODUCTION; }\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::ImplItem",
+            source: "struct S;\nimpl S {\n#[cfg(test)]\nfn g() { CANARY; }\nfn p() { PRODUCTION; }\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::TraitItem",
+            source: "trait T {\n#[cfg(test)]\nfn g() { CANARY; }\nfn p() { PRODUCTION; }\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::ForeignItem",
+            source: "extern \"C\" {\n#[cfg(test)]\nfn CANARY();\nfn PRODUCTION();\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::Field",
+            source: "struct S {\n#[cfg(test)]\na: CANARY,\nb: PRODUCTION,\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::FieldValue",
+            source: "fn f() -> S {\nS {\n#[cfg(test)]\na: CANARY,\nb: PRODUCTION,\n}\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::FieldPat",
+            source: "fn f(s: S) {\nlet S {\n#[cfg(test)]\na: CANARY,\nb: PRODUCTION,\n} = s;\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::Variant",
+            source: "enum E {\n#[cfg(test)]\nA(CANARY),\nB(PRODUCTION),\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::Arm",
+            source: "fn f(x: u8) {\nmatch x {\n#[cfg(test)]\n0 => CANARY,\n_ => PRODUCTION,\n}\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::Stmt",
+            source: "fn f() {\n#[cfg(test)]\nlet _ = CANARY;\nlet _ = PRODUCTION;\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        // The raw-address expression from the round-7 finding, in the
+        // statement position where an expression attribute is stable.
+        Case {
+            node: "syn::Expr",
+            source: "fn f() {\n#[cfg(test)]\n&raw const CANARY;\nPRODUCTION;\n}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::FnArg",
+            source: "fn f(\n#[cfg(test)]\na: CANARY,\nb: PRODUCTION,\n) {}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::Receiver",
+            source: "impl S {\nfn f(\n#[cfg(test)]\n&self,\n) {}\n}\nfn p() { PRODUCTION; }\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::BareFnArg",
+            source: "type F = fn(\n#[cfg(test)]\nCANARY,\nPRODUCTION,\n);\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::Variadic",
+            source: "extern \"C\" {\nfn f(\na: PRODUCTION,\n#[cfg(test)]\n...\n);\n}\n",
+            production_survives: true,
+            canary: "...",
+        },
+        Case {
+            node: "syn::BareVariadic",
+            source: "type F = unsafe extern \"C\" fn(\na: PRODUCTION,\n#[cfg(test)]\n...\n);\n",
+            production_survives: true,
+            canary: "...",
+        },
+        Case {
+            node: "syn::GenericParam",
+            source: "fn f<\n#[cfg(test)]\nCANARY,\nPRODUCTION,\n>() {}\n",
+            production_survives: true,
+            canary: "CANARY",
+        },
+        Case {
+            node: "syn::File",
+            source: "#![cfg(test)]\nfn p() { PRODUCTION; }\n",
+            production_survives: false,
+            canary: "CANARY",
+        },
+    ];
+
+    fn scan_source(source: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("case.rs");
+        std::fs::write(&path, source).unwrap();
+        production_lines(&path)
+            .unwrap_or_else(|error| panic!("parsing case source: {error}\n{source}"))
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// Every inventory row is exercised by a case, and every case is an
+    /// inventory row.
+    ///
+    /// This is what binds the inventory to the hooks. Row count alone
+    /// proved nothing: deleting a hook left the count intact and every
+    /// gate green, which is the silent regression the inventory exists to
+    /// prevent.
+    #[test]
+    fn every_covered_node_is_exercised_by_a_case() {
+        let covered: std::collections::BTreeSet<&str> = COVERED_ATTRIBUTE_NODES
+            .iter()
+            .map(|(node, _)| *node)
+            .collect();
+        let exercised: std::collections::BTreeSet<&str> =
+            CASES.iter().map(|case| case.node).collect();
+        assert_eq!(
+            covered, exercised,
+            "every attribute-bearing node the scanner claims to cover must have a \
+             case that fails when its hook is removed"
+        );
+    }
+
+    /// Deleting any hook makes its case leak, which reds this.
+    #[test]
+    fn gated_spans_are_excluded_and_production_survives() {
+        for case in CASES {
+            let lines = scan_source(case.source);
+            let joined = lines.join("\n");
+            assert!(
+                !joined.contains(case.canary),
+                "{}: a cfg(test) span survived the scan\n{joined}",
+                case.node
+            );
+            assert_eq!(
+                joined.contains("PRODUCTION"),
+                case.production_survives,
+                "{}: production reachability is wrong\n{joined}",
+                case.node
+            );
+        }
+    }
+
+    /// The round-7 finding end to end, through `scan` rather than through
+    /// `production_lines`: the gated raw-address occurrence contributes no
+    /// site, and the production occurrence after it is the only one.
+    #[test]
+    fn a_gated_raw_address_statement_reports_only_the_production_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw_addr.rs");
+        std::fs::write(
+            &path,
+            "fn f(p: &P) -> usize {\n\
+             #[cfg(test)]\n\
+             (&raw const p.canonical_path);\n\
+             p.checkout_project_dir.len()\n\
+             }\n",
+        )
+        .unwrap();
+        let patterns = vec![
+            (
+                "canonical_path_read".to_string(),
+                regex::Regex::new(r"\.canonical_path").unwrap(),
+            ),
+            (
+                "checkout_root_path".to_string(),
+                regex::Regex::new(r"\.checkout_project_dir").unwrap(),
+            ),
+        ];
+        let files = vec![path.to_string_lossy().into_owned()];
+        let sites = scan(&files, &patterns).unwrap();
+        let names: Vec<&str> = sites.keys().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["checkout_root_path"], "sites: {sites:?}");
+    }
 }
