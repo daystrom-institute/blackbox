@@ -1106,7 +1106,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read-only accepted-publication status for one catalog project. Reports whether the project serves its current generation, has fallen back to its prior generation, has no pointer at all, or is corrupt; the accepted scope, ref, commit, and generation identity; the bound attachment and the pointer SHA-256; whether the accepted scope still agrees with the catalog's current scope; and whether an advance is available. The generation id and pointer SHA-256 it returns are the compare-and-swap tokens bbox_project_publisher_advance requires. Opens no checkout and takes no lease. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports whether the project serves its current generation, has fallen back to its prior generation, has no pointer at all, or is corrupt; the accepted scope, ref, commit, and generation identity; the bound attachment and the pointer SHA-256; whether the accepted scope still agrees with the catalog's current scope; and whether an advance is available. A `health` object adds the bounded per-project runtime projection: binding status (attached, detached, unknown, or unbound), recorded capability bits per attachment, the last overlay outcome per checkout and lane, and watcher registration state. The generation id and pointer SHA-256 it returns are the compare-and-swap tokens bbox_project_publisher_advance requires. Everything it reports is observational: it opens no checkout, takes no lease, and never counts an operation nobody attempted. Health is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -1118,6 +1118,7 @@ impl BlackboxServer {
         let Some(runtime) = self.state.accepted_publications.clone() else {
             return Self::err_text(&catalog_inactive());
         };
+        let server = self.clone();
         Self::run_blocking("bbox_project_publisher_status", move || {
             let project_id = parse_project_id(&p.project_id)?;
             let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -1133,6 +1134,12 @@ impl BlackboxServer {
             let status = runtime
                 .status(&project_id, catalog_scope)
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
+            // The accepted fields stay exactly where they were: the
+            // generation id and pointer SHA-256 here are the advance
+            // compare-and-swap tokens, and moving them would break every
+            // caller that reads them. P5-G ADDS the runtime health view
+            // beside them (plan section 8, P5-G mechanic 4).
+            let runtime_health = server.state.project_runtime_status(project_id.as_str());
             Ok(serde_json::to_string_pretty(&json!({
                 "project_id": project_id.as_str(),
                 "accepted_state": accepted_state_label(status.state()),
@@ -1151,6 +1158,7 @@ impl BlackboxServer {
                 "pointer_sha256": status.binding_stamp().map(|stamp| stamp.pointer_sha256()),
                 "diagnostic": status.failure().map(|failure| failure.code()),
                 "epoch": state.epoch(),
+                "health": runtime_health,
             }))?)
         })
         .await
@@ -2494,5 +2502,89 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("absent");
         assert!(probe_checkout(missing.to_str().unwrap()).is_err());
+    }
+
+    /// P5-G mechanic 4: the status tool keeps every accepted field where it
+    /// was (the generation id and pointer SHA-256 are advance CAS tokens)
+    /// and ADDS the bounded runtime health view beside them.
+    #[tokio::test]
+    async fn publisher_status_carries_the_runtime_health_view() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().canonicalize().unwrap().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let scope = PublishedScope::try_new("repo_example", ".").unwrap();
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project("p_status", &scope);
+        fixture.attach_overlay_checkout(
+            "p_status",
+            &scope,
+            &checkout,
+            CatalogFixture::attachment().as_str(),
+            "cccccccccccccccccccccccccccccc0f",
+            true,
+        );
+        fixture.install_publication(
+            "p_status",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "published")],
+            &[],
+        );
+        let server = fixture.server();
+
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status".into(),
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+
+        // The compare-and-swap tokens stay exactly where callers read them.
+        assert_eq!(body["accepted_state"], "current");
+        assert!(body["generation_id"].is_string());
+        assert!(body["pointer_sha256"].is_string());
+
+        let health = &body["health"];
+        assert_eq!(health["binding"]["status"], "attached");
+        assert_eq!(health["accepted"]["state"], "current");
+        let capabilities = health["attachments"][0]["available"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(capabilities.contains(&"repo_knowledge"), "{capabilities:?}");
+        assert!(
+            !capabilities.contains(&"repo_mutation"),
+            "an unrecorded bit is absent, not denied: {capabilities:?}"
+        );
+
+        // Path-free (plan 13.6), asserted against a real checkout path.
+        let needle = checkout.to_string_lossy().into_owned();
+        assert!(
+            !error_text(&result).contains(&needle),
+            "publisher status leaked a checkout path"
+        );
+    }
+
+    /// Bridge mode refusal is unchanged by the widening.
+    #[tokio::test]
+    async fn publisher_status_still_refuses_on_bridge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = bridge_server(&tmp);
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_00000000000000000000000000000000".into(),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            error_text(&result).contains("error.project_catalog_inactive"),
+            "{}",
+            error_text(&result)
+        );
     }
 }
