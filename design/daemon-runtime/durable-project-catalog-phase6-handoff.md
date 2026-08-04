@@ -152,8 +152,10 @@ Two properties Phase 6 must not quietly relax:
   as a mid-token landing. A Phase 6 change that reaches for a regex
   normalization to make a row pass has converted the proof into a
   formality.
-- **Every row compares the COMPLETE serialized response.** Nothing is
-  dropped or summarized. Three surfaces were briefly projected instead
+- **Every row compares the COMPLETE serialized response**, with the single
+  exception [D-041](../../DECISION_LEDGER.md#d-041) names: one
+  timing-dependent acquisition count and the sequence numbers derived from
+  it. Nothing else is dropped or summarized. Three surfaces were briefly projected instead
   (the system-memory trailer, exact observation counters, doctor finding
   messages) and the closing bookend review was right to reject that:
   changes confined to an omitted field left the comparison green.
@@ -167,7 +169,9 @@ Two properties Phase 6 must not quietly relax:
   from the same sources doctor renders them from.
 
 Re-projecting any of those three to make a Phase 6 diff go away would
-re-open the finding, not resolve it.
+re-open the finding, not resolve it. D-041 is the only sanctioned
+narrowing and it is deliberately one count wide; widening it to the rest
+of the snapshot gives up the cut evidence section 3.5 depends on.
 
 The section 13.8 fixture set
 (`crates/bbox-indexing/tests/project_catalog_migration_facade.rs`) is NOT
@@ -214,7 +218,7 @@ Open findings, all in the closing bookend round:
 
 | Finding | Contradicted assertion |
 |---|---|
-| 4 (high) | Section 2.1 says the parity fixture catches a bridge RESPONSE change. It did not catch one confined to a field the harness projected rather than compared: the system-memory body on the published views, the exact observation counters and sequences, and doctor finding messages. Section 3.7's claim that widening a projection converts the proof into a formality applied to the harness's own three projections first. FIX LANDED, awaiting re-review: all three are captured complete, with determinism bought at the source and only exact-value substitutions remaining. |
+| 4 (high, fix landed) | Section 2.1 says the parity fixture catches a bridge RESPONSE change. It did not catch one confined to a field the harness projected rather than compared: the system-memory body on the published views, the exact observation counters and sequences, and doctor finding messages. Section 3.7's claim that widening a projection converts the proof into a formality applied to the harness's own three projections first. FIX LANDED, awaiting re-review: all three are captured complete, with determinism bought at the source and only exact-value substitutions remaining. |
 | 2, 3 | Findings against the other P5-H proofs, held by their own workers. They bear on section 2.1's claim that the three machine-checked inputs together leave no unwatched gap. |
 
 Re-completion is a final-round act, not a same-round one: it happens after

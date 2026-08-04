@@ -1111,3 +1111,67 @@ until a later entry explicitly supersedes it.
   "project publishes nothing" that is itself a pointer (which would
   make absence ambiguous), or Establish is ever asked to succeed
   without a live named attachment.
+
+## D-041: Bridge parity narrows for one timing-dependent acquisition count
+
+- Date: 2026-08-04
+- Phase: durable project catalog, Phase 5 (P5-H, drafted during the
+  closing bookend re-review)
+- Status: drafted for reviewer ratification; narrows the Phase 5 plan
+  section 11 parity contract for the named fields only
+- Decision: the bridge parity harness compares every captured response
+  byte for byte, with one narrowing. These fields, and no others, are
+  replaced by a sentinel instead of compared:
+  - `granted` and `count` for checkout-access kind
+    `publisher_config_tree_read`;
+  - every `last_sequence` and the top-level `sequence` in the checkout
+    observation snapshot;
+  - the same acquisition count where doctor renders it into prose.
+  Everything else in that snapshot stays exact: the operation kind
+  inventory and its order, the counter key-space of kind by outcome by
+  source lane, `denied` on every kind, `active_compatibility_lanes`, and
+  the exact `granted` and `count` of every OTHER kind.
+- Evidence:
+  - The cluster verify at 9bb62ab1 went red against a fixture captured
+    in a lane at identical code. The entire divergence reduced to one
+    quantity: `publisher_config_tree_read` granted 45 in the lane and 47
+    on the cluster. Every other delta was derived from it (sequences
+    shifted by the same two, and doctor's rendered counter line carried
+    the same number).
+  - That kind is the one acquired inside the publisher-authorization
+    cache's 250 millisecond TTL window. How many of a replay's
+    authorizations fall inside that window is a function of machine
+    speed, not of bridge behavior.
+  - Measured rather than argued. Forcing the TTL to zero makes every
+    authorization a miss and the count reaches 61. Forcing it to one hour
+    leaves only the harness's own explicit per-row invalidations and it
+    settles at 39. The lane's 45 and the cluster's 47 both sit strictly
+    inside that envelope.
+  - Neither bound is reachable from a test without changing production
+    behavior, so no fixture discipline pins the value. The harness
+    already buys determinism at the source wherever it can (pinned Git
+    identity, pre-written checkout markers, a pinned system-memory
+    catalog, a dropped authorization cache before every row); this is the
+    residue that no such lever reaches.
+  - The narrowing is verified environment-invariant across a range far
+    wider than the observed one: the verifier passes unchanged with the
+    TTL forced to zero and forced to an hour, which brackets the lane and
+    cluster values with room to spare.
+- Alternatives rejected:
+  - Re-projecting the whole observation row, which is what the closing
+    bookend review rejected as finding 4. The varying quantity is one
+    count, not the snapshot.
+  - Substituting the count by its exact captured value. The substitution
+    would match whatever the run produced and would satisfy the harness's
+    own anti-vacuity guards while proving nothing, which is worse than an
+    honest sentinel because it looks exact.
+  - Widening to all counter values. Every other kind's count is stable
+    and was measured stable; narrowing them would give up real coverage
+    to no purpose.
+- Consequences: a regression that changes ONLY how many times the bridge
+  resolves publisher authorization is not caught by parity. That is
+  accepted: the acquisition count is a caching artifact, the surface that
+  matters (which kinds are acquired, under which lane, granted or denied)
+  stays exact, and the Phase 6 cut evidence in
+  `design/daemon-runtime/durable-project-catalog-phase6-handoff.md`
+  section 3.5 depends on `active_compatibility_lanes`, which is unnarrowed.

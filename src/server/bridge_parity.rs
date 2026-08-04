@@ -1013,6 +1013,86 @@ mod harness {
         )
     }
 
+    /// The one acquisition count that is timing-dependent in principle,
+    /// and the global sequence numbers derived from it (D-041).
+    ///
+    /// Every OTHER counter in the snapshot is exact and stays exact. Only
+    /// `publisher_config_tree_read` varies, because it is the one kind
+    /// acquired inside the publisher-authorization cache's 250 millisecond
+    /// TTL window: how many of the replay's authorizations fall inside that
+    /// window is a function of machine speed, not of bridge behavior.
+    ///
+    /// Measured rather than assumed. Forcing the TTL to zero makes every
+    /// authorization a miss and the count reaches 61; forcing it to an hour
+    /// leaves only the harness's own explicit invalidations and it settles
+    /// at 39. The lane observes 45 and the cluster 47, both strictly inside
+    /// that envelope. Neither bound is reachable from a test without
+    /// changing production behavior, so no fixture discipline can pin the
+    /// value.
+    ///
+    /// The sequence numbers go with it because they are derived: a counter
+    /// that moves two extra times shifts every `last_sequence` after it and
+    /// the top-level `sequence` by the same amount.
+    const TIMING_DEPENDENT: &str = "<TIMING_DEPENDENT_D041>";
+    const TIMING_DEPENDENT_KIND: &str = "publisher_config_tree_read";
+
+    /// Blank exactly the D-041 fields, in place, and nothing else.
+    fn narrow_timing_dependent_counters(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                let is_varying_kind = map
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == TIMING_DEPENDENT_KIND);
+                for (key, child) in map.iter_mut() {
+                    let blank = match key.as_str() {
+                        // Derived from the global acquisition ordering, so
+                        // they shift with the varying count wherever they
+                        // appear.
+                        "sequence" | "last_sequence" => true,
+                        // The acquisition count itself, on the one varying
+                        // kind only. Every other kind keeps its exact count.
+                        "granted" | "count" => is_varying_kind,
+                        _ => false,
+                    };
+                    if blank {
+                        *child = Value::String(TIMING_DEPENDENT.to_string());
+                    } else {
+                        narrow_timing_dependent_counters(child);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    narrow_timing_dependent_counters(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Doctor renders the same count into prose, so the same field has to
+    /// be narrowed in both places or the narrowing leaks back in as text.
+    fn narrow_timing_dependent_prose(text: &str) -> String {
+        text.split('\n')
+            .map(|line| {
+                let Some(at) = line.find(TIMING_DEPENDENT_KIND) else {
+                    return line.to_string();
+                };
+                let Some(granted) = line[at..].find(" granted") else {
+                    return line.to_string();
+                };
+                let count_start = at + line[at..at + granted].rfind(' ').map_or(0, |i| i + 1);
+                format!(
+                    "{}{TIMING_DEPENDENT}{}",
+                    &line[..count_start],
+                    &line[at + granted..]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The checkout observation snapshot after the whole replay, COMPLETE.
     ///
     /// Previously projected to kinds, denials, booleans, and the counter
@@ -1028,9 +1108,11 @@ mod harness {
     /// all exact again; only the wall-clock reading is substituted.
     fn checkout_observation_row(fixture: &BridgeFixture) -> Row {
         let health = fixture.server.state.checkout_access_observations.health();
+        let mut value = serde_json::to_value(&health).unwrap();
+        narrow_timing_dependent_counters(&mut value);
         row(
             "checkout_observations",
-            serde_json::to_value(&health).unwrap(),
+            value,
             &[Normalization::ObservationWallClock],
         )
     }
@@ -1048,9 +1130,25 @@ mod harness {
                 format: Some("json".into()),
             }))
             .await;
+        // Doctor carries the observation snapshot twice: as a `checkout_access`
+        // object and as rendered findings. Both get the same D-041 narrowing,
+        // applied to the SAME fields, so the narrowing cannot leak back in
+        // through the prose copy.
+        let mut value = tool_row(&result);
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            let narrowed_prose = narrow_timing_dependent_prose(text);
+            let narrowed = match serde_json::from_str::<Value>(&narrowed_prose) {
+                Ok(mut body) => {
+                    narrow_timing_dependent_counters(&mut body);
+                    serde_json::to_string_pretty(&body).unwrap()
+                }
+                Err(_) => narrowed_prose,
+            };
+            value["text"] = Value::String(narrowed);
+        }
         row(
             "doctor_report",
-            tool_row(&result),
+            value,
             &[
                 Normalization::FixtureRoot,
                 Normalization::ObservationWallClock,
