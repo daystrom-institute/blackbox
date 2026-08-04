@@ -1,4 +1,7 @@
 mod background;
+/// Phase 5 plan section 14.4: the bridge parity proof. Test-only.
+#[cfg(test)]
+mod bridge_parity;
 mod built_from;
 pub(crate) mod checkout_access;
 pub(crate) mod code_source;

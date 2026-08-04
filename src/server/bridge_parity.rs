@@ -1,0 +1,1206 @@
+//! Bridge parity harness (Phase 5 plan sections 11 and 14.4).
+//!
+//! Section 11 is a freeze, not a guideline: while the version-1 registry is
+//! the runtime authority, every legacy surface it lists keeps its EXACT
+//! response. The only sanctioned bridge-visible additions are dormant code,
+//! the catalog-inactive refusal from the two new catalog-only tools, and
+//! empty catalog runtime state that is not serialized into an existing
+//! response. Anything else needs a new explicit decision.
+//!
+//! So the proof is a replay, not a set of hand-written expectations: one
+//! canonical bridge fixture is driven through every listed surface, each
+//! full response is captured, and the whole capture is compared byte for
+//! byte against committed bytes. A hand-written assertion proves only what
+//! its author thought to assert; a committed capture fails on ANY field,
+//! ordering, or wording change, including one arriving through a shared
+//! type (Risk 18).
+//!
+//! # Determinism, and why the normalization list is short
+//!
+//! A parity harness goes vacuous the moment it normalizes generously: sweep
+//! a timestamp regex over the capture and a real timestamp change stops
+//! failing too. The rule here is that determinism is bought at the SOURCE
+//! wherever it can be, and what is left over is substituted by EXACT VALUE,
+//! never by pattern.
+//!
+//! Bought at the source:
+//! - Git identity and both dates are pinned, so every commit SHA in the
+//!   capture is a fixed constant. That also pins `repo_id`, which is the
+//!   hash of the repository's first commit.
+//! - The checkout identity marker is pre-written rather than minted, so the
+//!   random `checkout_id` becomes a constant, and with it every overlay key
+//!   and provisional entity ref derived from it.
+//!
+//! Left over, and substituted by exact value:
+//! - the fixture root, because it is a per-run temporary directory;
+//! - the version-1 registry `project_id`, because it is the hash of that
+//!   per-run path;
+//! - `registered_at`, because the registry stamps wall-clock time;
+//! - the overlay working fingerprint, because it is derived from filesystem
+//!   metadata that no fixture controls.
+//!
+//! Each row DECLARES which of those four it expects. Substitution is
+//! self-policing in both directions: a declared substitution that never
+//! fires fails as vacuous, and an undeclared one that does fire fails as an
+//! unaudited normalization. That is what keeps the list from quietly
+//! growing into a regex sweep.
+//!
+//! # Doctor is a structural row, and says so
+//!
+//! One surface is captured structurally rather than verbatim: doctor
+//! findings embed host-global state (daemon version, index byte counts,
+//! store paths outside the fixture) that neither the bridge nor the catalog
+//! controls, so a verbatim capture would be host-dependent - flaky, not
+//! loud, which is worse than no row at all. The doctor row therefore
+//! captures the section inventory in order, each section's finding COUNT,
+//! and each finding's level and suggested-next command. A new, dropped, or
+//! reclassified finding still fails; only the free-text body is out.
+
+//! The whole harness lives inside one `#[cfg(test)]` module rather than
+//! behind a file-level `#![cfg(test)]`. The clause 2 Proof B ownership
+//! ratchet exempts test modules by truncating each file at its first
+//! `#[cfg(test)]` line, and the inner-attribute form does not match that
+//! pattern - a file-level gate would have this harness's deliberate
+//! capture of the frozen bridge watcher carrier counted as a new runtime
+//! occurrence.
+
+#[cfg(test)]
+mod harness {
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Arc;
+
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_corpus_core::project_record::ResolvedCheckoutScope;
+    use bbox_gaps::gaps::{
+        BlockingLevel, GapImpact, GapKind, GapListParams, GapNote, GapResolution,
+        committed_gap_note_bytes,
+    };
+    use bbox_knowledge::knowledge::{
+        Approval, Category, KnowledgeEntry, KnowledgeListParams, Priority, RenderParams, Scope,
+        Status, committed_knowledge_entry_bytes,
+    };
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::CallToolResult;
+    use serde_json::{Value, json};
+
+    use crate::server::{BlackboxServer, SharedState};
+
+    /// Committed canonical bytes, relative to the repository root.
+    const FIXTURE_RELPATH: &str = "tests/fixtures/bridge-parity/bridge-parity.json";
+
+    // ---------------------------------------------------------------------------
+    // Pinned fixture identity
+    // ---------------------------------------------------------------------------
+
+    /// Fixed Git identity and dates. Every commit SHA in the capture is a
+    /// consequence of these plus the committed tree, so pinning them removes
+    /// the single largest source of run-to-run drift instead of normalizing it
+    /// away afterwards.
+    const GIT_NAME: &str = "Bridge Parity";
+    const GIT_EMAIL: &str = "bridge-parity@example.invalid";
+    const GIT_DATE: &str = "2026-01-01T00:00:00+0000";
+
+    /// Pre-written so the checkout identity is a constant rather than
+    /// `random_hex()`. Overlay keys, provisional entity refs, and every
+    /// snapshot id are derived from it.
+    const OWN_CHECKOUT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01";
+    const PEER_CHECKOUT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb02";
+
+    // ---------------------------------------------------------------------------
+    // Declared normalizations
+    // ---------------------------------------------------------------------------
+
+    /// The four values that cannot be pinned at the source.
+    ///
+    /// Every one is substituted by its EXACT captured value, never by pattern,
+    /// so a value the fixture does not know about cannot be swallowed: it
+    /// survives into the capture and fails the byte comparison.
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    enum Normalization {
+        /// The per-run temporary directory holding the fixture.
+        FixtureRoot,
+        /// The version-1 registry project id: the 8-hex hash of the canonical
+        /// fixture path, so nondeterministic for the same reason the root is.
+        RegistryProjectId,
+        /// `registered_at`, stamped from wall-clock time at registration.
+        RegisteredAt,
+        /// The overlay working fingerprint, derived from filesystem metadata.
+        WorkingFingerprint,
+        /// The provenance export plan's `generation`: a SHA-256 over the
+        /// project id, the notes ref, and the document set. The document set
+        /// and the notes ref are pinned, so what varies is the project id -
+        /// the same per-run path hash, one indirection further on.
+        PlanGeneration,
+    }
+
+    impl Normalization {
+        fn placeholder(self) -> &'static str {
+            match self {
+                Self::FixtureRoot => "<FIXTURE_ROOT>",
+                Self::RegistryProjectId => "<REGISTRY_PROJECT_ID>",
+                Self::RegisteredAt => "<REGISTERED_AT>",
+                Self::WorkingFingerprint => "<WORKING_FINGERPRINT>",
+                Self::PlanGeneration => "<PLAN_GENERATION>",
+            }
+        }
+
+        /// The justification, carried in the capture itself so a reader of the
+        /// committed bytes sees why a placeholder is there without reading this
+        /// file.
+        fn justification(self) -> &'static str {
+            match self {
+                Self::FixtureRoot => "per-run temporary directory",
+                Self::RegistryProjectId => "hash of the per-run canonical fixture path",
+                Self::RegisteredAt => "registry stamps wall-clock time",
+                Self::WorkingFingerprint => "derived from filesystem metadata",
+                Self::PlanGeneration => "digest over the per-run registry project id",
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // The canonical bridge fixture
+    // ---------------------------------------------------------------------------
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", GIT_NAME)
+            .env("GIT_AUTHOR_EMAIL", GIT_EMAIL)
+            .env("GIT_AUTHOR_DATE", GIT_DATE)
+            .env("GIT_COMMITTER_NAME", GIT_NAME)
+            .env("GIT_COMMITTER_EMAIL", GIT_EMAIL)
+            .env("GIT_COMMITTER_DATE", GIT_DATE)
+            // A host `~/.gitconfig` must not reach the fixture: a template
+            // directory, a commit hook, or `commit.gpgsign` would change the
+            // committed tree or the commit object and move every SHA.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_knowledge(root: &Path, entry: &KnowledgeEntry) {
+        let dir = root.join(".bbox/knowledge");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Single owner (`committed_knowledge_entry_bytes`). A second encoder
+        // here is the incident class that made an earlier suite vacuously
+        // green: the fixture and the writers agreed with each other and both
+        // disagreed with production.
+        std::fs::write(
+            dir.join(format!("{}.json", entry.id)),
+            committed_knowledge_entry_bytes(entry).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_gap(root: &Path, gap: &GapNote) {
+        let dir = root.join(".bbox/gaps");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", gap.id)),
+            committed_gap_note_bytes(gap).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn knowledge_entry(id: &str, content: &str) -> KnowledgeEntry {
+        KnowledgeEntry {
+            id: id.to_string(),
+            title: format!("entry {id}"),
+            content: content.to_string(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            project_id: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    fn gap_note(id: &str, title: &str) -> GapNote {
+        GapNote {
+            id: id.to_string(),
+            title: title.to_string(),
+            gap_kind: GapKind::Tooling,
+            domain: "bridge-parity".to_string(),
+            wanted_capability: "serve published gaps on the version-1 bridge".to_string(),
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: Vec::new(),
+            impact: GapImpact::Medium,
+            blocking_level: BlockingLevel::WorkaroundAvailable,
+            dedupe_key: "tooling/bridge-parity/published".to_string(),
+            suggested_owner: None,
+            notes: None,
+            supersedes: None,
+            superseded_by: None,
+            resolution: GapResolution::Unresolved,
+            project: None,
+            project_id: None,
+            write_dir: None,
+            provisional_checkout_id: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            resolved_at: None,
+            resolution_note: None,
+        }
+    }
+
+    /// One published repository, one peer worktree, one registered version-1
+    /// project, and a bridge-mode server over them.
+    struct BridgeFixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        base: PathBuf,
+        peer: PathBuf,
+        scope: PublishedScope,
+        registry_project_id: String,
+        registered_at: String,
+        server: BlackboxServer,
+    }
+
+    impl BridgeFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let base = root.join("base");
+            std::fs::create_dir_all(&base).unwrap();
+
+            git(&base, &["init", "-q", "-b", "main"]);
+            std::fs::write(base.join("README.md"), "bridge parity fixture\n").unwrap();
+            git(&base, &["add", "README.md"]);
+            git(&base, &["commit", "-q", "-m", "seed"]);
+
+            // `repo_id` is the hash of the first commit, so it is pinned by the
+            // pinned Git identity above and needs no substitution.
+            let repo_id = bbox_config::config::ensure_recorded_repo_id(&base)
+                .unwrap()
+                .repo_id;
+
+            write_knowledge(&base, &knowledge_entry("bp-shared", "PUBLISHED_CONTENT"));
+            write_knowledge(&base, &knowledge_entry("bp-deleted", "PUBLISHED_DELETED"));
+            write_gap(&base, &gap_note("gap-bb000001", "published gap"));
+            git(&base, &["add", ".bbox"]);
+            git(&base, &["commit", "-q", "-m", "published lanes"]);
+
+            let peer = root.join("peer");
+            git(
+                &base,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "peer",
+                    peer.to_str().unwrap(),
+                ],
+            );
+
+            // Pre-write both checkout identity markers so no `random_hex()`
+            // reaches the capture.
+            pin_checkout_id(&base, OWN_CHECKOUT_ID);
+            pin_checkout_id(&peer, PEER_CHECKOUT_ID);
+
+            let state_dir = root.join("state");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            let state = Arc::new(SharedState::for_test(&state_dir));
+            assert!(
+                state.project_authority.is_bridge(),
+                "the parity fixture must run against the version-1 bridge"
+            );
+            let record = state
+                .project_authority
+                .bridge_registry()
+                .unwrap()
+                .write()
+                .register_path(&base)
+                .unwrap();
+            let server = BlackboxServer::new(state);
+            let scope = PublishedScope::try_new(repo_id, ".").unwrap();
+
+            Self {
+                _temp: temp,
+                root,
+                base,
+                peer,
+                scope,
+                registry_project_id: record.project_id.clone(),
+                registered_at: record.registered_at.clone(),
+                server,
+            }
+        }
+
+        /// Dirty both checkouts and drive the bridge overlay recompute for each,
+        /// so Own and All have real provisional content rather than a
+        /// hand-published snapshot.
+        fn recompute_overlays(&self) {
+            write_knowledge(&self.base, &knowledge_entry("bp-shared", "OWN_CONTENT"));
+            std::fs::remove_file(self.base.join(".bbox/knowledge/bp-deleted.json")).unwrap();
+            write_gap(&self.base, &gap_note("gap-bb000001", "own gap title"));
+            write_knowledge(&self.peer, &knowledge_entry("bp-shared", "PEER_CONTENT"));
+
+            let own = self.checkout(&self.base, OWN_CHECKOUT_ID);
+            let peer = self.checkout(&self.peer, PEER_CHECKOUT_ID);
+            for checkout in [&own, &peer] {
+                self.server
+                    .register_dark_knowledge_checkout(checkout)
+                    .unwrap();
+                self.server.refresh_dark_knowledge_overlay(checkout);
+                self.server.refresh_dark_gap_overlay(checkout);
+            }
+            self.server.set_session_checkout_for_test(
+                self.registry_project_id.clone(),
+                self.scope.clone(),
+                OWN_CHECKOUT_ID.to_string(),
+                self.base.clone(),
+            );
+        }
+
+        fn checkout(&self, dir: &Path, checkout_id: &str) -> ResolvedCheckoutScope {
+            ResolvedCheckoutScope {
+                project_id: self.registry_project_id.clone(),
+                published_scope: self.scope.clone(),
+                checkout_id: checkout_id.to_string(),
+                checkout_dir: dir.to_string_lossy().into_owned(),
+                checkout_project_dir: dir.to_string_lossy().into_owned(),
+                branch_ref: bbox_corpus_core::git::current_branch(dir)
+                    .map(|branch| format!("refs/heads/{branch}")),
+            }
+        }
+
+        /// The exact values behind each declared normalization.
+        ///
+        /// Working fingerprints are read back from the overlay stores rather
+        /// than guessed, so the substitution is exactly what the recompute
+        /// produced and cannot silently cover a different value.
+        fn substitutions(&self) -> Vec<Substitution> {
+            let mut substitutions = vec![
+                substitution(
+                    Normalization::FixtureRoot,
+                    self.root.to_string_lossy().into_owned(),
+                    None,
+                ),
+                substitution(
+                    Normalization::RegistryProjectId,
+                    self.registry_project_id.clone(),
+                    None,
+                ),
+                substitution(
+                    Normalization::RegisteredAt,
+                    self.registered_at.clone(),
+                    None,
+                ),
+            ];
+            let mut fingerprints = BTreeMap::new();
+            for snapshot in self.server.state.knowledge_overlays.read().snapshots() {
+                if let Some(stamp) = &snapshot.stamp {
+                    fingerprints
+                        .insert(stamp.checkout_id.clone(), stamp.working_fingerprint.clone());
+                }
+            }
+            for snapshot in self.server.state.gap_overlays.read().snapshots() {
+                if let Some(stamp) = &snapshot.stamp {
+                    fingerprints
+                        .insert(stamp.checkout_id.clone(), stamp.working_fingerprint.clone());
+                }
+            }
+            assert!(
+                !fingerprints.is_empty(),
+                "the overlay recompute produced no stamp, so the Own and All rows would be empty"
+            );
+            for (checkout_id, fingerprint) in fingerprints {
+                substitutions.push(substitution(
+                    Normalization::WorkingFingerprint,
+                    fingerprint,
+                    Some(&checkout_id),
+                ));
+            }
+            substitutions
+        }
+    }
+
+    fn pin_checkout_id(checkout_dir: &Path, checkout_id: &str) {
+        let local = checkout_dir.join(".bbox/local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join(".gitignore"), "*\n!.gitignore\n").unwrap();
+        std::fs::write(local.join("checkout-id"), format!("{checkout_id}\n")).unwrap();
+        assert_eq!(
+            bbox_corpus_core::identity::ensure_checkout_id(checkout_dir).unwrap(),
+            checkout_id,
+            "the pinned marker must be what the identity reader returns"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Capture
+    // ---------------------------------------------------------------------------
+
+    fn tool_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A tool response captured whole: the refusal flag and the exact text, so
+    /// a success that becomes a refusal (or the reverse) fails even when the
+    /// body happens to match.
+    fn tool_row(result: &CallToolResult) -> Value {
+        json!({
+            "is_error": result.is_error.unwrap_or(false),
+            "text": tool_text(result),
+        })
+    }
+
+    /// The rendered knowledge and gap views append the process-wide
+    /// system-memory catalog.
+    ///
+    /// That trailer is the SECOND structural exclusion in this harness, and for
+    /// the same reason as the doctor one: it is neither bridge nor catalog
+    /// content, it is identical in both modes, and capturing it verbatim would
+    /// break bridge parity on every unrelated `system-defaults/memories` edit -
+    /// noise that trains a reader to regenerate the fixture, which is precisely
+    /// how a parity harness dies. The exclusion is narrow and still fails loud
+    /// if the trailer disappears: `system_memories_present` is captured beside
+    /// the truncated body.
+    const SYSTEM_MEMORY_SECTION: &str = "\u{2500}\u{2500} System memories";
+
+    fn tool_row_without_system_memories(result: &CallToolResult) -> Value {
+        let text = tool_text(result);
+        let (bridge_text, present) = match text.find(SYSTEM_MEMORY_SECTION) {
+            Some(at) => (text[..at].trim_end().to_string(), true),
+            None => (text.clone(), false),
+        };
+        json!({
+            "is_error": result.is_error.unwrap_or(false),
+            "system_memories_present": present,
+            "text": bridge_text,
+        })
+    }
+
+    /// One captured surface plus the normalizations it declares.
+    struct Row {
+        name: &'static str,
+        value: Value,
+        declares: BTreeSet<Normalization>,
+    }
+
+    fn row(name: &'static str, value: Value, declares: &[Normalization]) -> Row {
+        Row {
+            name,
+            value,
+            declares: declares.iter().copied().collect(),
+        }
+    }
+
+    /// One nondeterministic value and the placeholder that replaces it.
+    ///
+    /// A normalization can have more than one instance (two checkouts produce
+    /// two working fingerprints), so the placeholder is per-instance while the
+    /// declaration a row makes stays at the normalization level.
+    struct Substitution {
+        normalization: Normalization,
+        actual: String,
+        placeholder: String,
+    }
+
+    fn substitution(
+        normalization: Normalization,
+        actual: impl Into<String>,
+        suffix: Option<&str>,
+    ) -> Substitution {
+        let base = normalization.placeholder();
+        let placeholder = match suffix {
+            Some(suffix) => format!("{}_{suffix}>", base.trim_end_matches('>')),
+            None => base.to_string(),
+        };
+        Substitution {
+            normalization,
+            actual: actual.into(),
+            placeholder,
+        }
+    }
+
+    /// Substitute by exact value, and refuse both failure modes.
+    ///
+    /// A declared substitution that never fires means the row stopped carrying
+    /// the value it was written to tolerate, and its declaration is now a
+    /// standing license to normalize something else. An undeclared one that
+    /// fires means a nondeterministic value reached a row nobody audited. Both
+    /// are how a parity harness stops proving anything, so both fail here.
+    fn normalize(
+        row: &Row,
+        substitutions: &[Substitution],
+        audit: bool,
+    ) -> (Value, BTreeSet<Normalization>) {
+        let mut rendered = serde_json::to_string(&row.value).unwrap();
+        let mut fired = BTreeSet::new();
+        for substitution in substitutions {
+            assert!(
+                !substitution.actual.is_empty(),
+                "row {}: substitution {:?} has no captured value",
+                row.name,
+                substitution.normalization
+            );
+            if !rendered.contains(substitution.actual.as_str()) {
+                continue;
+            }
+            assert!(
+                audit || row.declares.contains(&substitution.normalization),
+                "row {}: UNAUDITED normalization {:?} fired on value {:?}. A nondeterministic \
+             value reached a row that did not declare it; declare it or make the value \
+             deterministic at the source.",
+                row.name,
+                substitution.normalization,
+                substitution.actual
+            );
+            rendered = rendered.replace(substitution.actual.as_str(), &substitution.placeholder);
+            fired.insert(substitution.normalization);
+        }
+        for declared in &row.declares {
+            assert!(
+                audit || fired.contains(declared),
+                "row {}: VACUOUS normalization {declared:?} was declared but never fired. The \
+             declaration is now a standing license to normalize something else; drop it.",
+                row.name
+            );
+        }
+        (serde_json::from_str(&rendered).unwrap(), fired)
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn rendered_capture(capture: &Value) -> String {
+        format!("{}\n", serde_json::to_string_pretty(capture).unwrap())
+    }
+
+    /// Compare the capture against the committed bytes.
+    fn settle(capture: Value) {
+        let rendered = rendered_capture(&capture);
+        let path = repo_root().join(FIXTURE_RELPATH);
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "reading canonical bridge parity bytes {}: {error}. \
+             Regenerate with the ignored producer: \
+             cargo nextest run --workspace --run-ignored all \
+             -E 'test(produce_bridge_parity_fixture)'",
+                path.display()
+            )
+        });
+        if committed == rendered {
+            return;
+        }
+        // A whole-capture diff is unreadable; name the rows that moved.
+        let committed_value: Value = serde_json::from_str(&committed).unwrap();
+        let mut moved = Vec::new();
+        let empty = serde_json::Map::new();
+        let old = committed_value
+            .get("rows")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let new = capture
+            .get("rows")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        for name in old.keys().chain(new.keys()).collect::<BTreeSet<_>>() {
+            if old.get(name) != new.get(name) {
+                moved.push(name.clone());
+            }
+        }
+        panic!(
+            "BRIDGE PARITY BROKEN (plan section 11): {} row(s) changed: {}.\n\
+         Section 11 freezes every listed legacy surface byte-identical while the \
+         version-1 registry is the runtime authority. A change here needs a new \
+         explicit decision, not a regenerated fixture.\n\
+         Committed bytes: {}\n\
+         Live capture:\n{rendered}",
+            moved.len(),
+            moved.join(", "),
+            path.display(),
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // The captured surfaces (plan section 14.4)
+    // ---------------------------------------------------------------------------
+
+    /// Publisher authorization: `AuthorizedPublisher` with its existing four
+    /// fields, and the scope-keyed cache returning the same decision on the
+    /// second call. Section 11 freezes the field set, so the row carries all
+    /// four by name.
+    fn publisher_authorization_row(fixture: &BridgeFixture) -> Row {
+        let projects = fixture
+            .server
+            .state
+            .records_provider
+            .records_snapshot()
+            .records;
+        let first = fixture
+            .server
+            .authorize_publisher(&projects, &fixture.scope)
+            .expect("the bridge fixture has exactly one publisher for its scope");
+        let cached = fixture
+            .server
+            .authorize_publisher(&projects, &fixture.scope)
+            .expect("the scope-keyed cache must answer the repeat call");
+        assert_eq!(
+            (
+                &first.project_id,
+                &first.published_scope,
+                &first.branch_ref,
+                &first.commit
+            ),
+            (
+                &cached.project_id,
+                &cached.published_scope,
+                &cached.branch_ref,
+                &cached.commit
+            ),
+            "a scope-keyed cache hit must be the same decision"
+        );
+        // The frozen election entry point, driven with the same committed
+        // authority the fixture recorded, so the row captures what the bridge
+        // itself would classify rather than a synthetic input.
+        let election =
+            bbox_indexing::publisher::elect_publisher(&projects, &fixture.scope, |path| {
+                crate::config::read_repo_id_inputs(path)
+            });
+        row(
+            "publisher_authorization",
+            json!({
+                "authorized_publisher": {
+                    "project_id": first.project_id,
+                    "published_scope": {
+                        "repo_id": first.published_scope.repo_id(),
+                        "bbox_root_relpath": first.published_scope.bbox_root_relpath(),
+                    },
+                    "branch_ref": first.branch_ref,
+                    "commit": first.commit,
+                },
+                "elect_publisher": format!("{election:?}"),
+            }),
+            &[Normalization::RegistryProjectId, Normalization::FixtureRoot],
+        )
+    }
+
+    /// Published, Own, and All for both lanes, captured through the tools an
+    /// external consumer actually calls.
+    async fn view_rows(fixture: &BridgeFixture) -> Vec<Row> {
+        let project = fixture.base.to_string_lossy().into_owned();
+        let mut rows = Vec::new();
+        for (name, mode) in [
+            ("published_knowledge", "published"),
+            ("own_knowledge", "own"),
+            ("all_knowledge", "all"),
+        ] {
+            let result = fixture
+                .server
+                .bbox_knowledge(Parameters(KnowledgeListParams {
+                    project: Some(project.clone()),
+                    provisional: Some(mode.to_string()),
+                    ..Default::default()
+                }))
+                .await;
+            rows.push(row(name, tool_row_without_system_memories(&result), &[]));
+        }
+        for (name, mode) in [
+            ("published_gaps", "published"),
+            ("own_gaps", "own"),
+            ("all_gaps", "all"),
+        ] {
+            let result = fixture.server.bbox_gaps(Parameters(GapListParams {
+                project: Some(project.clone()),
+                provisional: Some(mode.to_string()),
+                json: Some(true),
+                ..Default::default()
+            }));
+            rows.push(row(
+                name,
+                tool_row(&result),
+                if mode == "published" {
+                    &[Normalization::FixtureRoot]
+                } else {
+                    &[
+                        Normalization::FixtureRoot,
+                        Normalization::WorkingFingerprint,
+                    ]
+                },
+            ));
+        }
+        rows
+    }
+
+    /// File provider: a relative `file:` ref resolved through the checkout
+    /// authority that section 9 assigns `RenderFileProvider`.
+    async fn file_provider_row(fixture: &BridgeFixture) -> Row {
+        let result = fixture
+            .server
+            .bbox_ref_size(Parameters(
+                bbox_mcp_tools::mcp_tools::ref_size::RefSizeParams {
+                    refs: vec!["file:README.md".into(), "file:missing.md".into()],
+                    project_dir: Some(fixture.base.to_string_lossy().into_owned()),
+                },
+            ))
+            .await;
+        row("file_provider", tool_row(&result), &[])
+    }
+
+    async fn blame_row(fixture: &BridgeFixture) -> Row {
+        let result = fixture
+            .server
+            .bbox_blame(Parameters(bbox_mcp_tools::mcp_tools::blame::BlameParams {
+                file: Some(
+                    fixture
+                        .base
+                        .join("README.md")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                line: Some(1),
+                entity_ref: None,
+            }))
+            .await;
+        row("blame", tool_row(&result), &[])
+    }
+
+    async fn render_row(fixture: &BridgeFixture) -> Row {
+        let result = fixture
+            .server
+            .bbox_render(Parameters(RenderParams {
+                project: Some(fixture.base.to_string_lossy().into_owned()),
+                scope: Some("project".into()),
+                dry_run: Some(true),
+                ..Default::default()
+            }))
+            .await;
+        row("render", tool_row(&result), &[Normalization::FixtureRoot])
+    }
+
+    async fn provenance_rows(fixture: &BridgeFixture) -> Vec<Row> {
+        let plan = fixture
+            .server
+            .bbox_provenance_export_plan(Parameters(
+                bbox_mcp_tools::mcp_tools::provenance_plan::ProvenanceExportPlanParams::default(),
+            ))
+            .await;
+        let export = fixture
+            .server
+            .bbox_provenance_export(Parameters(
+                bbox_mcp_tools::mcp_tools::provenance::ProvenanceParams {
+                    project_id: Some(fixture.registry_project_id.clone()),
+                },
+            ))
+            .await;
+        let import = fixture
+            .server
+            .bbox_provenance_import(Parameters(
+                bbox_mcp_tools::mcp_tools::provenance::ProvenanceParams {
+                    project_id: Some(fixture.registry_project_id.clone()),
+                },
+            ))
+            .await;
+        vec![
+            row(
+                "provenance_export_plan",
+                tool_row(&plan),
+                &[
+                    Normalization::RegistryProjectId,
+                    Normalization::PlanGeneration,
+                ],
+            ),
+            row("provenance_note_export", tool_row(&export), &[]),
+            row("provenance_note_import", tool_row(&import), &[]),
+        ]
+    }
+
+    /// Project administration on the bridge: the version-1 registry listing,
+    /// which is the only project administration surface the bridge serves.
+    fn project_administration_row(fixture: &BridgeFixture) -> Row {
+        row(
+            "project_administration",
+            tool_row(&fixture.server.bbox_project_list()),
+            &[
+                Normalization::FixtureRoot,
+                Normalization::RegistryProjectId,
+                Normalization::RegisteredAt,
+            ],
+        )
+    }
+
+    /// Watcher behavior: section 11 keeps the legacy `Selected` and
+    /// `CheckoutId` carriers, so the row captures both carrier shapes and the
+    /// registration the bridge installs for the fixture's checkouts.
+    fn watcher_row(fixture: &BridgeFixture) -> Row {
+        use bbox_artifacts::watcher::ArtifactWatchCarrier;
+        let selected = ArtifactWatchCarrier::selected(&fixture.registry_project_id).unwrap();
+        let checkout =
+            ArtifactWatchCarrier::checkout(&fixture.registry_project_id, OWN_CHECKOUT_ID).unwrap();
+        let describe = |carrier: &ArtifactWatchCarrier| {
+            json!({
+                "project_id": carrier.project_id(),
+                "attachment": format!("{:?}", carrier.attachment()),
+                "is_attachment": carrier.is_attachment(),
+            })
+        };
+        row(
+            "watcher_carriers",
+            json!({
+                "selected": describe(&selected),
+                "checkout": describe(&checkout),
+            }),
+            &[Normalization::RegistryProjectId],
+        )
+    }
+
+    /// The checkout observation snapshot after the whole replay.
+    ///
+    /// THIRD structural projection, and the narrowest of the three. Exact
+    /// counts and sequence numbers are a function of the 250 millisecond
+    /// publisher-authorization cache TTL: under parallel load the same replay
+    /// takes more cache misses and therefore more
+    /// `publisher_config_tree_read` leases, with no bridge behavior having
+    /// changed at all. Freezing those numbers would make the harness fail on
+    /// machine load, which trains a reader to regenerate the fixture - the one
+    /// habit that kills a parity harness.
+    ///
+    /// What plan item 16 actually freezes is that observations stay
+    /// low-cardinality and schema-compatible, so that is what the row carries:
+    /// the operation kind inventory IN ORDER, `denied` EXACTLY (a denial is
+    /// never load-dependent, and a new one must fail), whether each kind was
+    /// granted at all, and the complete counter key-space of
+    /// kind x outcome x source lane. A new kind, a dropped kind, a reordering,
+    /// a new denial, a kind that stops being exercised, or a new counter
+    /// dimension all still fail.
+    fn checkout_observation_row(fixture: &BridgeFixture) -> Row {
+        let health = fixture.server.state.checkout_access_observations.health();
+        let operations = health
+            .operations
+            .iter()
+            .map(|operation| {
+                json!({
+                    "kind": format!("{:?}", operation.kind),
+                    "denied": operation.denied,
+                    "granted_any": operation.granted > 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let counter_key_space = health
+            .counters
+            .iter()
+            .map(|counter| {
+                json!({
+                    "kind": format!("{:?}", counter.kind),
+                    "outcome": format!("{:?}", counter.outcome),
+                    "source_lane": format!("{:?}", counter.source_lane),
+                })
+            })
+            .collect::<Vec<_>>();
+        row(
+            "checkout_observations",
+            json!({
+                "operations": operations,
+                "counter_key_space": counter_key_space,
+                "active_compatibility_lanes": health
+                    .active_compatibility_lanes
+                    .iter()
+                    .map(|lane| format!("{lane:?}"))
+                    .collect::<Vec<_>>(),
+            }),
+            &[],
+        )
+    }
+
+    /// Doctor, structurally. See the module header: findings embed host-global
+    /// state, so the row carries the section inventory in order, each section's
+    /// finding count, and each finding's level and suggested-next command.
+    async fn doctor_row(fixture: &BridgeFixture) -> Row {
+        let result = fixture
+            .server
+            .bbox_doctor(Parameters(crate::tools::doctor::DoctorParams {
+                format: Some("json".into()),
+            }))
+            .await;
+        let report: Value = serde_json::from_str(&tool_text(&result)).expect("doctor json");
+        let sections = report["sections"]
+            .as_array()
+            .expect("doctor sections")
+            .iter()
+            .map(|section| {
+                json!({
+                    "section": section["section"],
+                    "finding_count": section["findings"].as_array().map(Vec::len),
+                    "findings": section["findings"]
+                        .as_array()
+                        .unwrap_or(&Vec::new())
+                        .iter()
+                        .map(|finding| json!({
+                            "level": finding["level"],
+                            "next": finding.get("next"),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        row(
+            "doctor_sections",
+            json!({
+                "sections": sections,
+                "checkout_access_present": !report["checkout_access"].is_null(),
+            }),
+            &[],
+        )
+    }
+
+    /// The two catalog-only tools, which section 11 requires to refuse with
+    /// `error.project_catalog_inactive` on the bridge. Capturing the refusal
+    /// bytes here freezes the wording alongside every other bridge response.
+    async fn catalog_only_refusal_row(fixture: &BridgeFixture) -> Row {
+        let advance = fixture
+            .server
+            .bbox_project_publisher_advance(Parameters(
+                crate::tools::project_catalog::ProjectPublisherAdvanceParams {
+                    project_id: "p_00000000000000000000000000000000".into(),
+                    attachment_id: "att_00000000000000000000000000000000".into(),
+                    mode: "establish".into(),
+                    full_ref: "refs/heads/main".into(),
+                    expected_generation_id: None,
+                    expected_pointer_sha256: None,
+                    dry_run: false,
+                    expected_catalog_epoch: 1,
+                    audit_reason: "bridge parity".into(),
+                },
+            ))
+            .await;
+        let status = fixture
+            .server
+            .bbox_project_publisher_status(Parameters(
+                crate::tools::project_catalog::ProjectPublisherStatusParams {
+                    project_id: "p_00000000000000000000000000000000".into(),
+                },
+            ))
+            .await;
+        for result in [&advance, &status] {
+            assert!(
+                tool_text(result).contains("error.project_catalog_inactive"),
+                "a catalog-only tool must refuse on the bridge"
+            );
+        }
+        row(
+            "catalog_only_tools_refuse",
+            json!({
+                "bbox_project_publisher_advance": tool_row(&advance),
+                "bbox_project_publisher_status": tool_row(&status),
+            }),
+            &[],
+        )
+    }
+
+    /// The plan generation digest, read out of the captured plan row itself.
+    fn plan_generation_substitutions(rows: &[Row]) -> Vec<Substitution> {
+        let Some(plan) = rows.iter().find(|row| row.name == "provenance_export_plan") else {
+            return Vec::new();
+        };
+        let Some(text) = plan.value.get("text").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Ok(body) = serde_json::from_str::<Value>(text) else {
+            return Vec::new();
+        };
+        body.get("generation")
+            .and_then(Value::as_str)
+            .map(|generation| {
+                vec![substitution(
+                    Normalization::PlanGeneration,
+                    generation,
+                    None,
+                )]
+            })
+            .unwrap_or_default()
+    }
+
+    // ---------------------------------------------------------------------------
+    // The blocking proof
+    // ---------------------------------------------------------------------------
+
+    /// Plan section 14.4. Replay the canonical bridge fixture across every
+    /// surface section 11 freezes and compare the whole capture to committed
+    /// bytes.
+    ///
+    /// Blocking by construction: this is an ordinary `#[test]`, so a bridge
+    /// output change fails the workspace gate rather than being noticed later.
+    /// Build the fixture, replay every frozen surface, and return the
+    /// normalized capture.
+    ///
+    /// The producer and the verifier below share this function by
+    /// construction, so the committed bytes cannot be produced by a code path
+    /// that differs from the one that checks them - the failure mode that makes
+    /// a golden-file test agree with itself and with nothing else.
+    async fn capture(audit: bool) -> Value {
+        // Several captured tools consult the process-wide system-memory
+        // catalog. Without it they refuse with a panic-shaped error, which
+        // would freeze a broken response as the parity baseline.
+        crate::init_system_memory_for_tests();
+        let fixture = BridgeFixture::new();
+        fixture.recompute_overlays();
+
+        let mut rows = vec![publisher_authorization_row(&fixture)];
+        rows.extend(view_rows(&fixture).await);
+        rows.push(file_provider_row(&fixture).await);
+        rows.push(blame_row(&fixture).await);
+        rows.push(render_row(&fixture).await);
+        rows.extend(provenance_rows(&fixture).await);
+        rows.push(project_administration_row(&fixture));
+        rows.push(watcher_row(&fixture));
+        rows.push(catalog_only_refusal_row(&fixture).await);
+        rows.push(doctor_row(&fixture).await);
+        // Last: the observation snapshot must reflect every lease the replay
+        // above actually took.
+        rows.push(checkout_observation_row(&fixture));
+
+        // Section 14.4 names eleven surfaces. Asserting the inventory here is
+        // what stops a future edit from deleting a row and leaving a green
+        // harness that covers less than the plan requires.
+        let expected: BTreeSet<&str> = [
+            "publisher_authorization",
+            "published_knowledge",
+            "own_knowledge",
+            "all_knowledge",
+            "published_gaps",
+            "own_gaps",
+            "all_gaps",
+            "file_provider",
+            "blame",
+            "render",
+            "provenance_export_plan",
+            "provenance_note_export",
+            "provenance_note_import",
+            "project_administration",
+            "watcher_carriers",
+            "catalog_only_tools_refuse",
+            "doctor_sections",
+            "checkout_observations",
+        ]
+        .into_iter()
+        .collect();
+        let captured: BTreeSet<&str> = rows.iter().map(|row| row.name).collect();
+        assert_eq!(
+            captured, expected,
+            "the parity harness must cover exactly the section 14.4 surface list"
+        );
+
+        let mut substitutions = fixture.substitutions();
+        // Wall-clock readings come from the captured observation row itself,
+        // not from a second health read, so the substituted value is exactly
+        // the one in the capture.
+        substitutions.extend(plan_generation_substitutions(&rows));
+        let mut normalized = serde_json::Map::new();
+        let mut observed = BTreeMap::new();
+        for row in &rows {
+            let (value, fired) = normalize(row, &substitutions, audit);
+            normalized.insert(row.name.to_string(), value);
+            observed.insert(row.name, fired);
+        }
+        if audit {
+            let report = observed
+                .iter()
+                .map(|(name, fired)| format!("  {name}: {fired:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            eprintln!("observed normalizations per row:\n{report}");
+        }
+
+        let mut legend = serde_json::Map::new();
+        for substitution in &substitutions {
+            legend.insert(
+                substitution.placeholder.clone(),
+                Value::String(substitution.normalization.justification().to_string()),
+            );
+        }
+
+        json!({
+            "contract": "Phase 5 plan section 11 bridge parity. Every row is a full \
+                         response from a bridge-mode server over one canonical fixture. \
+                         A diff here is a bridge output change and needs a new explicit \
+                         decision, not a regenerated fixture.",
+            "normalizations": legend,
+            "rows": normalized,
+        })
+    }
+
+    /// Plan section 14.4. Replay the canonical bridge fixture across every
+    /// surface section 11 freezes and compare the whole capture to committed
+    /// bytes.
+    ///
+    /// Blocking by construction: an ordinary `#[test]`, so a bridge output
+    /// change fails the workspace gate rather than being noticed later.
+    #[tokio::test]
+    async fn bridge_parity_holds_against_canonical_fixtures() {
+        settle(capture(false).await);
+    }
+
+    /// Not a test: the canonical-bytes producer, following the same ignored
+    /// producer convention as the D-030 migrated-root fixture.
+    ///
+    /// It is a test rather than an env switch on the verifier because the lane
+    /// build shim forwards only a fixed env allowlist into the builder pod, so
+    /// an env-gated mode is unreachable exactly where the gates run.
+    #[tokio::test]
+    #[ignore = "canonical-bytes producer; run explicitly to regenerate the parity fixture"]
+    async fn produce_bridge_parity_fixture() {
+        let path = repo_root().join(FIXTURE_RELPATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, rendered_capture(&capture(false).await)).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+
+    /// Not a test: reports, per row, which substitutions ACTUALLY fire, and
+    /// asserts neither direction.
+    ///
+    /// It exists so a maintainer adding a row sets its declaration from
+    /// evidence instead of guessing and then loosening the declaration until
+    /// the verifier passes - that loosening path is exactly how the
+    /// self-policing check would rot into a regex sweep. The declaration still
+    /// has to be written by hand in this file; the audit only reports.
+    #[tokio::test]
+    #[ignore = "normalization audit; run explicitly when adding or moving a row"]
+    async fn audit_bridge_parity_normalizations() {
+        capture(true).await;
+    }
+}
