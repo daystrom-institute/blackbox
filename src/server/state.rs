@@ -1018,6 +1018,16 @@ mod blocking_acceptance_proofs {
         assert!(ok, "static ownership ratchet failed:\n{rendered}");
     }
 
+    /// Clause 2 Proof C: every checkout-open call site is classified.
+    ///
+    /// Blocking here rather than only in CI: a new acquisition must arrive
+    /// with its section 14.2C attributes or the suite goes red.
+    #[test]
+    fn checkout_callsite_audit_is_complete() {
+        let (ok, rendered) = run_acceptance("acceptance-checkout-callsites.sh");
+        assert!(ok, "checkout call-site audit failed:\n{rendered}");
+    }
+
     /// The lower corpus crate must never gain the upward dependency that
     /// would let it acquire leases for itself (plan 4.15, Risk 10).
     #[test]
