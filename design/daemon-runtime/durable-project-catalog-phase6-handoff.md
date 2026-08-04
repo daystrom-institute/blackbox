@@ -39,17 +39,21 @@ Per-site is what a per-pattern TOTAL could not do: a total stays flat when
 a prohibited occurrence is substituted for an approved one, so counting
 alone accepted the exact move the proof exists to reject.
 
-Baseline at the Phase 5 exit gate:
+Per-pattern counts are deliberately NOT reproduced here: read the
+baseline artifact, or run the script, which reports them. The artifact is
+the authority and this document points at it rather than mirroring it; a
+mirrored inventory rots by construction, and this one did, twice, behind
+two ratchet changes.
 
-| Pattern | Sites | Occurrences | Phase 6 disposition |
-|---|---|---|---|
-| `project_record_import` | 20 | 21 | Delete with the v1 record type. The sanctioned compatibility projection (`catalog_records.rs`) goes last, because it is what lets the catalog serve v1-shaped consumers during the cut. |
-| `canonical_path_read` | 57 | 95 | Delete with `ProjectRecord`. Every one is a bridge arm; the catalog arm beside it already resolves through attachment identity. |
-| `checkout_root_path` | 80 | 140 | Delete with the v1 path lane. A catalog-mode path reaches a checkout only through a capability lease. |
-| `direct_git_process` | 19 | 21 | Delete or route through lease-held authority. A direct Git process against a checkout root is an unleased open by definition. |
-| `legacy_publisher` | 26 | 34 | Delete outright. `PublisherRefStore`, `elect_publisher`, and `PublisherAuthorizationCache` have no catalog-mode caller. |
-| `watcher_selected_carrier` | 4 | 4 | Delete. Catalog registrations are `ArtifactWatchAttachment::AttachmentId`; `Selected` is bridge-only. |
-| `repo_io_selected_target` | 4 | 7 | Delete the `Selected` and `Checkout` variants of `RepoCarrierTarget`, leaving `Attachment` as the only target. |
+| Pattern | Phase 6 disposition |
+|---|---|
+| `project_record_import` | Delete with the v1 record type. The sanctioned compatibility projection (`catalog_records.rs`) goes last, because it is what lets the catalog serve v1-shaped consumers during the cut. |
+| `canonical_path_read` | Delete with `ProjectRecord`. Every one is a bridge arm; the catalog arm beside it already resolves through attachment identity. |
+| `checkout_root_path` | Delete with the v1 path lane. A catalog-mode path reaches a checkout only through a capability lease. |
+| `direct_git_process` | Delete or route through lease-held authority. A direct Git process against a checkout root is an unleased open by definition. |
+| `legacy_publisher` | Delete outright. `PublisherRefStore`, `elect_publisher`, and `PublisherAuthorizationCache` have no catalog-mode caller. |
+| `watcher_selected_carrier` | Delete. Catalog registrations are `ArtifactWatchAttachment::AttachmentId`; `Selected` is bridge-only. |
+| `repo_io_selected_target` | Delete the `Selected` and `Checkout` variants of `RepoCarrierTarget`, leaving `Attachment` as the only target. |
 
 A shrinking inventory is the Phase 6 progress metric. When every row is
 gone except the compatibility projection, the bridge is cut.
