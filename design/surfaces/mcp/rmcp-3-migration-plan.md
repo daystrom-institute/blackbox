@@ -153,6 +153,26 @@ doc. Implementation notes:
 - `bro_wait`/`bro_status`/`bro_cancel` tools remain for legacy clients; SM
   runbooks updated to describe tasks as the accelerator for capable clients.
 
+### First-mover vertical slice (endorsed 2026-08-04, decision 6)
+
+Sequenced poll-first because rmcp 3.0 does not wire task notifications
+into listen:
+
+1. Harness child MCP layer declares `io.modelcontextprotocol/tasks` in
+   per-request capabilities, behind a harness-side flag.
+2. Daemon returns pure `CreateTaskResult` from `bro_exec`/`bro_resume`
+   when the extension is declared; unchanged JSON otherwise.
+3. Child drives the `tasks/get` poll loop to terminal status;
+   `tasks/cancel` wired to the existing SIGTERM path.
+4. One provider lane (GLM, cheapest iteration) validated on a real
+   dispatch, side-by-side against the bro_wait path.
+5. The lens/prompt change so the model inside the child learns
+   handle-then-poll instead of bro_wait long-poll. This is agent-behavior
+   work, not transport work; budget for it.
+6. Follow-up: emit `notifications/tasks` over `subscriptions/listen`
+   ourselves (SDK glue; the riskiest single piece) and switch the child's
+   wait to wake-on-done.
+
 ## Phase 3: subscriptions/listen
 
 - `ServerHandler::listen` + `SubscriptionSink`; emit

@@ -434,6 +434,16 @@ MRTR rounds.
    spill-as-resource, stateless as deployment prerequisite for the corpus
    move, corpus-plane-only checkout authority, reconcile-on-reconnect
    listen semantics, fleetd location-independent task handles.
+6. Tasks/listen early adoption endorsed (2026-08-04): the Brodex harness
+   pair goes first mover on the tasks extension rather than waiting for
+   Claude Code / Codex. Their inertia is structural (Claude Code shipped
+   the legacy experimental tasks API and must migrate its own usage;
+   Codex gates everything modern behind flags for a third-party server
+   ecosystem); the extension negotiates per-connection, and for the
+   harness pair we own both ends. Vertical slice: one provider lane,
+   poll-first (`tasks/get` loop), `notifications/tasks` over listen as the
+   follow-up since rmcp 3.0 does not wire those yet. Harness-side flag;
+   a bad experiment is a revert, not an incident.
 
 ## Open questions
 
