@@ -1117,8 +1117,12 @@ until a later entry explicitly supersedes it.
 - Date: 2026-08-04
 - Phase: durable project catalog, Phase 5 (P5-H, drafted during the
   closing bookend re-review)
-- Status: drafted for reviewer ratification; narrows the Phase 5 plan
-  section 11 parity contract for the named fields only
+- Status: RATIFIED by the closing bookend review, round 2. The reviewer's
+  ruling: "sufficiently specific, leaves the Phase 6 cut evidence intact;
+  any widening beyond the named fields requires a new decision." Narrows
+  the Phase 5 plan section 11 parity contract for the named fields only;
+  the ratification is explicitly scoped to those fields, so a later
+  widening is a new decision and not an amendment to this one.
 - Decision: the bridge parity harness compares every captured response
   byte for byte, with one narrowing. These fields, and no others, are
   replaced by a sentinel instead of compared:

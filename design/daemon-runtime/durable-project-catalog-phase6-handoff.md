@@ -140,7 +140,7 @@ Each row names the bridge surface it pins and what happens to that row:
 | `watcher_carriers` | `ArtifactWatchAttachment::{Selected, CheckoutId}` | Dies with 3.4. |
 | `checkout_observations` | Compatibility lane key-space and the granted/denied split | Dies with 3.5. Its `active_compatibility_lanes` going empty IS the cut signal. |
 | `file_provider`, `blame`, `render`, `provenance_export_plan`, `provenance_note_export`, `provenance_note_import` | Bridge-lane ROUTING into surfaces that survive | Row dies; the surface does not. A red row here during Phase 6 means a converted adapter changed output, which is a defect, not progress. |
-| `doctor_sections` | Section inventory, per-section finding counts, levels, next commands | Row dies. Doctor survives; its bridge-shaped findings do not. |
+| `doctor_report` | The COMPLETE serialized doctor response, findings and messages included, less only [D-041](../../DECISION_LEDGER.md#d-041) and the declared exact-value substitutions (daemon version, host state directory, fixture root, observation wall clock) | Row dies. Doctor survives; its bridge-shaped findings do not. |
 | `catalog_only_tools_refuse` | `bbox_project_publisher_advance` and `_status` refusing `error.project_catalog_inactive` | INVERTS. This is the only row that must be DELETED rather than carried: after the cut the refusal is wrong, so a row asserting it would be actively false. |
 
 Two properties Phase 6 must not quietly relax:
