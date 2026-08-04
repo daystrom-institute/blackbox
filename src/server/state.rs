@@ -2658,3 +2658,327 @@ mod clause_two_proof_a {
         );
     }
 }
+
+#[cfg(test)]
+mod clause_three_exit_proof {
+    //! Plan section 14.3: remote-only projects degrade PER CAPABILITY.
+    //!
+    //! One project, valid accepted content, zero attachments, walked across
+    //! the section 9 table. The claim under proof is not "everything
+    //! refuses": it is that the content-domain surfaces keep serving from
+    //! accepted bytes while exactly the checkout-backed surfaces refuse, and
+    //! that the refusals name the missing ATTACHMENT rather than a missing
+    //! project.
+    //!
+    //! Every row asserts the positive half too where the table promises one.
+    //! A walk that only checked refusals would stay green if accepted
+    //! publication broke entirely, which is the opposite of what clause 3
+    //! claims.
+
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use super::BlackboxServer;
+    use super::catalog_fixture::{COMMIT_ONE, CatalogFixture, gap_note, knowledge_entry};
+
+    const PROJECT: &str = "p_clause_three";
+
+    /// Published, with accepted content, and deliberately never attached.
+    fn remote_only() -> (CatalogFixture, BlackboxServer) {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "accepted")],
+            &[gap_note("gap-11111111", "accepted")],
+        );
+        let server = fixture.server();
+        (fixture, server)
+    }
+
+    fn text_of(result: &rmcp::model::CallToolResult) -> String {
+        format!("{:?}", result.content)
+    }
+
+    /// A refusal must name the missing attachment, never a missing project.
+    /// Plan 10.5 fixes this: file, blame, render, and mutation do not
+    /// translate a missing attachment into project-not-found, because an
+    /// operator who sees "not registered" goes looking for a registration
+    /// that already exists.
+    fn assert_attachment_required(row: &str, refusal: &str) {
+        assert!(
+            refusal.contains("attachment"),
+            "{row}: remote-only must degrade on the ATTACHMENT: {refusal}"
+        );
+        assert!(
+            !refusal.contains("not_registered") && !refusal.contains("selector_unknown"),
+            "{row}: a remote-only project is registered; the refusal must not deny its identity: {refusal}"
+        );
+    }
+
+    /// The content-domain half of the table: published knowledge and gaps
+    /// serve accepted bytes with zero attachments, and the provenance PLAN
+    /// succeeds because it is corpus computation that opens no Git notes.
+    #[test]
+    fn accepted_content_serves_with_zero_attachments() {
+        let (_fixture, server) = remote_only();
+
+        let knowledge = server
+            .session_knowledge_view(None, None)
+            .expect("published knowledge serves without any checkout");
+        assert!(
+            knowledge
+                .knowledge
+                .all_entries()
+                .iter()
+                .any(|entry| entry.id == "knowledge-a"),
+            "accepted knowledge must actually serve, not merely not-fail"
+        );
+
+        let gaps = server
+            .session_gap_view(None, None)
+            .expect("published gaps serve without any checkout");
+        assert!(
+            gaps.gaps.all().iter().any(|gap| gap.id == "gap-11111111"),
+            "accepted gaps must actually serve"
+        );
+    }
+
+    /// Blame, render, the file provider, and Git-note I/O all refuse, and
+    /// all refuse on the attachment.
+    #[tokio::test]
+    async fn checkout_backed_surfaces_return_attachment_required() {
+        let (_fixture, server) = remote_only();
+
+        let blame = server
+            .bbox_blame(Parameters(crate::mcp_tools::blame::BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(1),
+                entity_ref: None,
+            }))
+            .await;
+        assert_eq!(blame.is_error, Some(true));
+        assert_attachment_required("blame", &text_of(&blame));
+
+        let render = server
+            .bbox_render(Parameters(crate::knowledge::RenderParams {
+                project: Some(PROJECT.into()),
+                scope: Some("project".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(render.is_error, Some(true));
+        assert_attachment_required("render", &text_of(&render));
+
+        let file =
+            bbox_providers::providers::file::resolve_file(&server.provider_context(), "src/lib.rs")
+                .expect_err("a file ref needs a checkout");
+        assert_attachment_required("file provider", &file.to_string());
+
+        let export = server
+            .bbox_provenance_export(Parameters(crate::mcp_tools::provenance::ProvenanceParams {
+                project_id: Some(PROJECT.into()),
+            }))
+            .await;
+        assert_eq!(export.is_error, Some(true));
+        assert_attachment_required("provenance note io", &text_of(&export));
+
+        let eject = server
+            .bbox_project_eject(Parameters(bbox_indexing::projects::ProjectEjectParams {
+                project: PROJECT.into(),
+                dry_run: None,
+            }))
+            .await;
+        assert_eq!(eject.is_error, Some(true));
+        assert_attachment_required("catalog mutation", &text_of(&eject));
+    }
+
+    /// `own` has no honest answer without a checkout of one's own, and says
+    /// so with the typed overlay code rather than serving published content
+    /// relabelled as provisional.
+    #[test]
+    fn own_returns_provisional_overlay_unavailable() {
+        let (_fixture, server) = remote_only();
+
+        let error = server
+            .session_knowledge_view(None, Some("own"))
+            .err()
+            .expect("own cannot answer for a project with no checkout");
+
+        assert!(
+            format!("{error:#}").contains("checkout"),
+            "own degrades on the absent checkout: {error:#}"
+        );
+    }
+
+    /// Capability status reports AVAILABILITY and invents no denial counts.
+    ///
+    /// Plan 4.17 is explicit that a capability which was never attempted is
+    /// not a denial. A remote-only project has no attachment to carry bits
+    /// at all, so the honest report is an empty attachment list beside a
+    /// healthy accepted state, and the durable observation counters must not
+    /// have moved for operations nobody ran.
+    #[test]
+    fn capability_status_reports_availability_without_inventing_denials() {
+        let (_fixture, server) = remote_only();
+        let before = server.state.checkout_access.health().sequence;
+
+        let status = server
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("a remote-only project still has runtime status");
+
+        assert!(
+            status.attachments.is_empty(),
+            "no attachment means no capability bits, not denied ones: {:?}",
+            status.attachments
+        );
+        assert!(
+            status.accepted.serves_published_content,
+            "accepted content is healthy and says so: {:?}",
+            status.accepted
+        );
+        // `advance_available` is deliberately NOT asserted here. Its
+        // contract is accepted-side availability only: it answers "is the
+        // pointer in a state that permits a future advance", and the
+        // publisher surface adds the attachment, capability, and CAS gates
+        // on top. The attachment requirement is a property of the
+        // OPERATION, so the row below exercises the operation instead of
+        // reading a field that never promised to carry it.
+        assert_eq!(
+            server.state.checkout_access.health().sequence,
+            before,
+            "reading status must not synthesize checkout observations"
+        );
+    }
+
+    /// Plan 14.3, publisher advance: the OPERATION returns
+    /// attachment-required for a project with nothing attached.
+    ///
+    /// This is the row that carries the attachment gate. The accepted-side
+    /// `advance_available` flag reports pointer health and says nothing
+    /// about attachments by design, so asserting it here would have proved
+    /// the wrong thing in the reassuring direction.
+    #[tokio::test]
+    async fn publisher_advance_returns_attachment_required() {
+        let (fixture, server) = remote_only();
+        // Real CAS tokens, so the refusal below is the ATTACHMENT gate and
+        // not the earlier missing-token gate. Getting this wrong produces a
+        // green row that never reached the property under proof.
+        let status = server
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("status carries the tokens an advance must present");
+
+        let advance = server
+            .bbox_project_publisher_advance(Parameters(
+                crate::tools::project_catalog::ProjectPublisherAdvanceParams {
+                    project_id: PROJECT.into(),
+                    attachment_id: CatalogFixture::attachment().as_str().to_string(),
+                    mode: "advance".into(),
+                    full_ref: "refs/heads/main".into(),
+                    expected_generation_id: status.accepted.generation_id.clone(),
+                    expected_pointer_sha256: status.binding.pointer_sha256.clone(),
+                    dry_run: false,
+                    expected_catalog_epoch: fixture.epoch(),
+                    audit_reason: "clause three walk".into(),
+                },
+            ))
+            .await;
+
+        assert_eq!(advance.is_error, Some(true), "{advance:?}");
+        assert_attachment_required("publisher advance", &text_of(&advance));
+    }
+
+    /// No watcher is installed, and that is reported as an absence rather
+    /// than a fault: `capable_but_unregistered` is the actionable state, and
+    /// a project with no attachment cannot populate it.
+    #[test]
+    fn no_watcher_is_installed_and_none_is_owed() {
+        let (_fixture, server) = remote_only();
+
+        let status = server
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("status");
+
+        assert!(status.watcher.registered_attachments.is_empty());
+        assert!(
+            status.watcher.capable_but_unregistered.is_empty(),
+            "a project with no attachment owes no registration: {:?}",
+            status.watcher
+        );
+    }
+
+    /// The vacuity guard for the whole walk: attach a capable checkout to
+    /// the SAME fixture and the refusing rows start succeeding. Without
+    /// this, every assertion above would still hold if accepted publication
+    /// were broken and the project simply did not exist.
+    #[test]
+    fn the_walk_is_not_vacuous_once_an_attachment_exists() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "accepted")],
+            &[gap_note("gap-11111111", "accepted")],
+        );
+        let remote_status = fixture
+            .server()
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("status");
+        assert!(remote_status.attachments.is_empty());
+
+        let checkout = fixture.root().join("late-checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("probe.txt"), b"real").unwrap();
+        fixture.attach_overlay_checkout(
+            PROJECT,
+            &scope,
+            &checkout,
+            "att_00000000000000000000000000000c31",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaac31",
+            true,
+        );
+        fixture.grant_capabilities(
+            "att_00000000000000000000000000000c31",
+            bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                render_output: true,
+                ..Default::default()
+            },
+        );
+        let attached = fixture.server_with_checkout_authority();
+
+        let file = bbox_providers::providers::file::resolve_file(
+            &attached.provider_context(),
+            "probe.txt",
+        )
+        .expect("the same read succeeds once an attachment exists");
+        assert_eq!(file.content, b"real");
+
+        let status = attached
+            .state
+            .project_runtime_status(PROJECT)
+            .expect("status");
+        assert_eq!(
+            status.attachments.len(),
+            1,
+            "the capability view now reports one attachment: {:?}",
+            status.attachments
+        );
+        assert!(
+            status
+                .attachments
+                .iter()
+                .any(|attachment| attachment.available.contains(&"render_output")),
+            "and reports the bit it actually records: {:?}",
+            status.attachments
+        );
+    }
+}
