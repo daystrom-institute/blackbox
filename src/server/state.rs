@@ -989,6 +989,45 @@ pub(crate) mod recordless_provider {
 }
 
 #[cfg(test)]
+mod blocking_acceptance_proofs {
+    //! The exit-gate proofs must be BLOCKING (plan section 14): their
+    //! failure has to fail the suite, not sit in a CI log a reader may
+    //! skim. Running the scripts from a test is what makes that true for
+    //! `cargo nextest run` and therefore for every gate that wraps it.
+
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    }
+
+    fn run_acceptance(script: &str) -> (bool, String) {
+        let output = std::process::Command::new("bash")
+            .arg(repo_root().join("scripts").join(script))
+            .current_dir(repo_root())
+            .output()
+            .unwrap_or_else(|error| panic!("running {script}: {error}"));
+        let mut rendered = String::from_utf8_lossy(&output.stdout).into_owned();
+        rendered.push_str(&String::from_utf8_lossy(&output.stderr));
+        (output.status.success(), rendered)
+    }
+
+    /// Clause 2 Proof B. A grown count means a converted surface gained
+    /// another unleased way to reach a checkout.
+    #[test]
+    fn catalog_ownership_ratchet_holds() {
+        let (ok, rendered) = run_acceptance("acceptance-catalog-ownership.sh");
+        assert!(ok, "static ownership ratchet failed:\n{rendered}");
+    }
+
+    /// The lower corpus crate must never gain the upward dependency that
+    /// would let it acquire leases for itself (plan 4.15, Risk 10).
+    #[test]
+    fn corpus_index_dependency_ceiling_holds() {
+        let (ok, rendered) = run_acceptance("acceptance-corpus-index-deps.sh");
+        assert!(ok, "dependency ceiling failed:\n{rendered}");
+    }
+}
+
+#[cfg(test)]
 mod clause_one_exit_proof {
     //! Plan section 14.1. Every corpus-only operation must behave
     //! IDENTICALLY against a provider whose attached-row view is empty.

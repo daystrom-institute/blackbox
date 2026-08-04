@@ -1,0 +1,12 @@
+# Catalog ownership ratchet baseline (plan section 14.2 Proof B).
+# Counts of each replaced-surface pattern in catalog runtime paths,
+# excluding test modules. The lint fails on any INCREASE.
+# Every count here is Phase 6 deletion inventory; see
+# design/daemon-runtime/durable-project-catalog-phase6-handoff.md.
+# Refresh after a legitimate removal:
+#   scripts/acceptance-catalog-ownership.sh --write-baseline
+project_record_import 12
+canonical_path_read 39
+legacy_publisher 10
+watcher_selected_carrier 4
+repo_io_selected_target 7
