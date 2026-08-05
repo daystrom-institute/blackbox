@@ -225,6 +225,16 @@ pub struct ProjectCatalogMigrationResolvedLayoutV1 {
 }
 
 impl ProjectCatalogMigrationResolvedLayoutV1 {
+    /// The resolved `projects.json` path this layout administers.
+    ///
+    /// Exposed for the offline CLI, which needs the CONFIGURED path to take
+    /// the lifetime lock (`--configured` apply, and the
+    /// `--require-exclusive-availability` bridge-down proof on verify) before
+    /// any store is opened. Read-only: the layout stays the single resolver.
+    pub fn projects_path(&self) -> &Path {
+        &self.projects_path
+    }
+
     /// Resolve configured paths without reading environment or opening stores.
     pub fn from_config(
         config: &Config,

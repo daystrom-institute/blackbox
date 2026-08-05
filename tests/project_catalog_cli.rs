@@ -1622,3 +1622,47 @@ fn retire_refuses_on_a_slack_channel_binding() {
             .unwrap();
     assert!(bindings["bindings"].as_object().unwrap().is_empty());
 }
+
+/// Plan section 3.2: `verify --require-exclusive-availability` is the
+/// bridge-down proof. A live daemon holds the configured lifetime lock
+/// SHARED, so the exclusive probe finds no guard and the command refuses.
+///
+/// Both halves are asserted. Without them the test would pass against an
+/// implementation that always refused (or never did): the first half pins
+/// that the refusal is caused by the held lock rather than by the rest of
+/// the invocation, and the second pins the refusal itself.
+#[test]
+fn verify_require_exclusive_availability_refuses_while_the_bridge_holds_the_lock() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, _index) = isolated_state_root(&root);
+
+    let invocation = |config: &str| {
+        run(&[
+            "project-catalog",
+            "verify",
+            "--root",
+            state.to_str().unwrap(),
+            "--config",
+            config,
+            "--require-exclusive-availability",
+        ])
+    };
+
+    // Premise: with the lock FREE the availability probe passes, so whatever
+    // this invocation goes on to report is not the lock refusal.
+    let available = invocation(config_path.to_str().unwrap());
+    let available: Value = serde_json::from_slice(&available.stdout).unwrap();
+    assert_ne!(
+        available["error"]["code"], "error.project_catalog_cli_lock",
+        "an unheld lifetime lock must not produce the bridge-live refusal: {available}"
+    );
+
+    // The proof: a shared holder is exactly what a live bridge looks like.
+    let held = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
+    let refused = invocation(config_path.to_str().unwrap());
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
+    drop(held);
+}

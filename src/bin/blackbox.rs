@@ -299,6 +299,13 @@ struct VerifyArgs {
     /// Load the same configuration file used by blackboxd.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Prove the bridge is DOWN before verifying: take the configured
+    /// lifetime lock exclusively and release it. A live daemon holds a
+    /// shared guard, so the attempt yields no guard and the command
+    /// refuses with `error.project_catalog_cli_lock`.
+    #[arg(long)]
+    require_exclusive_availability: bool,
 }
 
 #[derive(Debug)]
@@ -505,12 +512,49 @@ fn execute_migrate(args: MigrateArgs) -> Result<serde_json::Value, CommandFailur
 
 fn execute_verify(args: VerifyArgs) -> Result<serde_json::Value, CommandFailure> {
     let config = load_config(args.config)?;
+    if args.require_exclusive_availability {
+        require_exclusive_availability(&config)?;
+    }
     let rehearsal_layout =
         ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(args.root, &config)?;
     let result = ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
         rehearsal_layout,
     })?;
     serialize_result(result.receipt())
+}
+
+/// The bridge-down proof behind `verify --require-exclusive-availability`
+/// (plan section 3.2).
+///
+/// Exclusivity here is a PROBE, not a held guard: the point is to observe
+/// that no daemon holds the configured lifetime lock, so the guard is
+/// dropped immediately and verification proceeds against durable state.
+/// `try_acquire_exclusive` returns `Ok(None)` when a live bridge holds its
+/// shared handle, which is the refusal this flag exists to produce.
+fn require_exclusive_availability(config: &config::Config) -> Result<(), CommandFailure> {
+    let configured_layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: None,
+            state_dir: None,
+        },
+    )?;
+    let acquired =
+        ProjectCatalogMigrationLock::try_acquire_exclusive(configured_layout.projects_path())
+            .map_err(|error| {
+                CommandFailure::new("error.project_catalog_cli_lock", format!("{error:#}"))
+            })?;
+    match acquired {
+        Some(guard) => {
+            drop(guard);
+            Ok(())
+        }
+        None => Err(CommandFailure::new(
+            "error.project_catalog_cli_lock",
+            "the lifetime migration lock is shared; the bridge is live and \
+             --require-exclusive-availability demands it be stopped",
+        )),
+    }
 }
 
 /// Load the shared configuration for one offline command.
@@ -629,6 +673,29 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(command_name(&verify), "project_catalog_verify");
+    }
+
+    /// The bridge-down proof rides the shipped `Verify` variant rather than a
+    /// new verb (plan section 3.2).
+    #[test]
+    fn verify_accepts_the_exclusive_availability_proof_flag() {
+        let verify = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "verify",
+            "--root",
+            "/tmp/rehearsal",
+            "--require-exclusive-availability",
+        ])
+        .expect("verify accepts the availability proof flag");
+        assert_eq!(command_name(&verify), "project_catalog_verify");
+        let TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::Verify(args),
+        }) = &verify.command
+        else {
+            panic!("expected the verify variant");
+        };
+        assert!(args.require_exclusive_availability);
     }
 
     #[test]
