@@ -200,6 +200,28 @@ pub fn project_catalog_migration_store_limits(config: &Config) -> StoreLimits {
     }
 }
 
+/// The eleven durable owner locations a Phase 6 backfill stamper writes.
+///
+/// A read-only projection of the resolved layout, handed to the root crate so
+/// it can construct the one production `LegacyRowStamperV1`. It carries no
+/// authority of its own: the stamper re-validates every path immediately
+/// before each write, and the owner crates open their sources nofollow under
+/// an exclusive lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCatalogStamperOwnerPathsV1 {
+    pub knowledge_store_path: PathBuf,
+    pub gap_store_path: PathBuf,
+    pub thread_store_path: PathBuf,
+    pub note_store_path: PathBuf,
+    pub pin_store_path: PathBuf,
+    pub roadmap_store_path: PathBuf,
+    pub packet_root: PathBuf,
+    pub proposal_root: PathBuf,
+    pub slack_store_root: PathBuf,
+    pub whiteboard_root: PathBuf,
+    pub artifact_root: PathBuf,
+}
+
 /// Opaque, validated, non-serializable owner and transaction layout.
 ///
 /// Paths intentionally have no public getters. Callers choose one constructor
@@ -276,9 +298,50 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
         self.accepted_publication_generations.clone()
     }
 
+    /// The durable owner store locations the Phase 6 backfill STAMPS.
+    ///
+    /// Public because the one production `LegacyRowStamperV1` lives in the
+    /// root crate (the write side needs the owner crates' real schemas), so it
+    /// cannot reach these paths any other way. This is a narrow, read-only
+    /// projection, not a general path getter: it exposes exactly the owners a
+    /// stamper writes and nothing else.
+    ///
+    /// It is derived through `owner_inventory_paths`, the SAME function the
+    /// read-side capture uses, rather than by re-joining the paths here. The
+    /// read and write halves are already separated by the crate boundary; if
+    /// they also derived owner locations independently they could disagree
+    /// about where an owner lives, and the backfill would then stamp a store
+    /// the inventory never looked at.
+    pub fn stamper_owner_paths(&self) -> ProjectCatalogStamperOwnerPathsV1 {
+        let inventory = owner_inventory_paths(self);
+        ProjectCatalogStamperOwnerPathsV1 {
+            knowledge_store_path: inventory.knowledge_store_path,
+            gap_store_path: inventory.gap_store_path,
+            thread_store_path: inventory.thread_store_path,
+            note_store_path: inventory.note_store_path,
+            pin_store_path: inventory.pin_store_path,
+            roadmap_store_path: inventory.roadmap_store_path,
+            packet_root: inventory.packet_root,
+            proposal_root: inventory.proposal_root,
+            slack_store_root: inventory.slack_store_root,
+            whiteboard_root: inventory.whiteboard_root,
+            artifact_root: inventory.artifact_root,
+        }
+    }
+
     /// The index root the Phase 6 path-free rebuild scans and replaces.
     pub(crate) fn index_root_for_rebuild(&self) -> &Path {
         &self.index_root
+    }
+
+    /// The git-cursor root the Equality fingerprint folds.
+    ///
+    /// The materializer derives this as `projects_path.parent()/git_meta`;
+    /// the layout resolves the same directory once, so the preflight
+    /// prediction and the apply-time proof read one root rather than two
+    /// independently-derived ones.
+    pub(crate) fn git_meta_root_for_rebuild(&self) -> &Path {
+        &self.git_meta_root
     }
 
     /// The RESOLVED vector-store root. The materializer's equality proof
