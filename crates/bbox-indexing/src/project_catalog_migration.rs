@@ -220,6 +220,9 @@ pub struct ProjectCatalogStamperOwnerPathsV1 {
     pub slack_store_root: PathBuf,
     pub whiteboard_root: PathBuf,
     pub artifact_root: PathBuf,
+    /// The JSONL edge lane TREE, not a single file: the transcript-edge owner
+    /// is a directory of lanes (Q-E1).
+    pub transcript_edge_root: PathBuf,
 }
 
 /// Opaque, validated, non-serializable owner and transaction layout.
@@ -326,6 +329,11 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             slack_store_root: inventory.slack_store_root,
             whiteboard_root: inventory.whiteboard_root,
             artifact_root: inventory.artifact_root,
+            // The same root the transcript-edge CAPTURE reads, for exactly the
+            // reason above: the stamper must rewrite lanes in the tree the
+            // inventory looked at, or the row ids it was handed name rows in a
+            // different tree.
+            transcript_edge_root: inventory.edge_root,
         }
     }
 
