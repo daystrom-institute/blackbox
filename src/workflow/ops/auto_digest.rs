@@ -336,6 +336,7 @@ pub(super) async fn exec_write_semantic_edge(
                 provenance: EdgeProvenance::Explicit,
                 confidence: EdgeConfidence::Heuristic,
                 metadata,
+                project_id: None,
             };
             let edges_dir = args
                 .get("edges_dir")

@@ -310,6 +310,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
             metadata: Default::default(),
+            project_id: None,
         };
         let index = EdgeIndex::from_edges_for_tests(vec![edge]);
         let paths = bfs(&index, a, Some(&b), None, None, 3, 5);

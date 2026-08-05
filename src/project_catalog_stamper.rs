@@ -49,6 +49,10 @@ pub struct ProjectCatalogStamperPathsV1 {
     pub slack_store_root: PathBuf,
     pub whiteboard_root: PathBuf,
     pub artifact_root: PathBuf,
+    /// Root of the JSONL edge lane tree, not a single file: the transcript-edge
+    /// owner is a directory of lanes and the stamper locates a row across all
+    /// of them.
+    pub transcript_edge_root: PathBuf,
 }
 
 /// Reject a path that is not absolute or that contains a traversal or prefix
@@ -92,6 +96,7 @@ impl ProjectCatalogOwnerRowStamperV1 {
             &paths.slack_store_root,
             &paths.whiteboard_root,
             &paths.artifact_root,
+            &paths.transcript_edge_root,
         ] {
             validate_owner_path(path)?;
         }
@@ -205,23 +210,16 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
             | LegacyPathStoreKindV1::Proposal
             | LegacyPathStoreKindV1::SlackBinding
             | LegacyPathStoreKindV1::Whiteboard
-            | LegacyPathStoreKindV1::Artifact => LegacyRowStampCoverageV1::Covered,
-            // The three owners whose rows are not JSON store rows. Each needs a
-            // schema or mechanism decision that this phase does not get to make
-            // unilaterally, so each is NAMED as uncovered and refuses the
-            // report before any mutation rather than silently stamping nothing:
-            //
-            // - Task: the persisted task record has no project id field at all,
-            //   only an orchestration cwd, and it is owned by the root crate
-            //   that depends on THIS one.
-            // - Provenance: rows are git notes documents, so writing means
-            //   writing git notes - a different transaction model entirely.
-            // - TranscriptEdge: rows are lines in append-only JSONL, and the
-            //   edge record carries no project id field, only a free-form
-            //   metadata map.
-            LegacyPathStoreKindV1::Task
-            | LegacyPathStoreKindV1::Provenance
-            | LegacyPathStoreKindV1::TranscriptEdge => LegacyRowStampCoverageV1::NotImplemented,
+            | LegacyPathStoreKindV1::Artifact
+            // Q-E1: a typed top-level project_id on the edge record plus an
+            // atomic whole-file lane replacement.
+            | LegacyPathStoreKindV1::TranscriptEdge => LegacyRowStampCoverageV1::Covered,
+            // Task: the persisted record has no project id field at all, only
+            // an orchestration cwd, and it is owned by the root crate. Its
+            // schema change is a separate dedicated commit (Q-E2).
+            LegacyPathStoreKindV1::Task | LegacyPathStoreKindV1::Provenance => {
+                LegacyRowStampCoverageV1::NotImplemented
+            }
         }
     }
 
@@ -387,14 +385,27 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     )
                 },
             ),
+            LegacyPathStoreKindV1::TranscriptEdge => self.stamp_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.transcript_edge_root,
+                |path| {
+                    bbox_edge_sidecar::edge_sidecar::stamp_project_catalog_owner_row(
+                        path,
+                        source_row_id,
+                        project_id,
+                        limits,
+                    )
+                },
+            ),
             // Reached only if preflight's coverage refusal were bypassed. A
             // typed refusal, never a silent success.
-            LegacyPathStoreKindV1::Task
-            | LegacyPathStoreKindV1::Provenance
-            | LegacyPathStoreKindV1::TranscriptEdge => Err(stamp_refusal(format!(
-                "{} has no durable write-back",
-                legacy_store_token(store_kind)
-            ))),
+            LegacyPathStoreKindV1::Task | LegacyPathStoreKindV1::Provenance => {
+                Err(stamp_refusal(format!(
+                    "{} has no durable write-back",
+                    legacy_store_token(store_kind)
+                )))
+            }
         }
     }
 }
@@ -407,7 +418,14 @@ mod owner_row_stamper_dispatch {
     /// that reaches the wrong owner writes somewhere observable instead of
     /// silently hitting real host state.
     fn stamper(root: &Path) -> ProjectCatalogOwnerRowStamperV1 {
-        for directory in ["packets", "proposals", "slack", "whiteboards", "artifacts"] {
+        for directory in [
+            "packets",
+            "proposals",
+            "slack",
+            "whiteboards",
+            "artifacts",
+            "edges",
+        ] {
             std::fs::create_dir_all(root.join(directory)).unwrap();
         }
         ProjectCatalogOwnerRowStamperV1::new(
@@ -423,6 +441,7 @@ mod owner_row_stamper_dispatch {
                 slack_store_root: root.join("slack"),
                 whiteboard_root: root.join("whiteboards"),
                 artifact_root: root.join("artifacts"),
+                transcript_edge_root: root.join("edges"),
             },
             OwnerSnapshotLimitsV1::default(),
         )
@@ -485,6 +504,47 @@ mod owner_row_stamper_dispatch {
         assert_eq!(
             row_project_id(&root.join("threads.json"), "threads").as_deref(),
             Some("a1b2c3d4")
+        );
+    }
+
+    /// The transcript-edge owner reaches its lane tree through the dispatch,
+    /// and its row survives a re-stamp as `AlreadyStamped` with the same id.
+    #[test]
+    fn the_dispatch_stamps_a_transcript_edge_lane_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let stamper = stamper(&root);
+        std::fs::write(
+            root.join("edges").join("tool.jsonl"),
+            concat!(
+                r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","#,
+                r#""target":{"type":"task","task_id":"two"},"provenance":"explicit","#,
+                r#""confidence":"exact","metadata":{"cwd":"/repo/one"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let row_id = bbox_edge_sidecar::edge_sidecar::capture_project_catalog_owner_snapshot(
+            &root.join("edges"),
+            OwnerSnapshotLimitsV1::default(),
+        )
+        .unwrap()
+        .rows[0]
+            .stable_row_id
+            .clone();
+
+        assert_eq!(
+            stamper
+                .stamp(LegacyPathStoreKindV1::TranscriptEdge, &row_id, &project())
+                .unwrap(),
+            LegacyRowStampOutcomeV1::Stamped
+        );
+        assert_eq!(
+            stamper
+                .stamp(LegacyPathStoreKindV1::TranscriptEdge, &row_id, &project())
+                .unwrap(),
+            LegacyRowStampOutcomeV1::AlreadyStamped
         );
     }
 
@@ -629,7 +689,6 @@ mod owner_row_stamper_dispatch {
         let uncovered = [
             LegacyPathStoreKindV1::Task,
             LegacyPathStoreKindV1::Provenance,
-            LegacyPathStoreKindV1::TranscriptEdge,
         ];
         for kind in [
             LegacyPathStoreKindV1::Knowledge,
@@ -672,7 +731,6 @@ mod owner_row_stamper_dispatch {
         for kind in [
             LegacyPathStoreKindV1::Task,
             LegacyPathStoreKindV1::Provenance,
-            LegacyPathStoreKindV1::TranscriptEdge,
         ] {
             assert!(stamper.stamp(kind, "any-row", &project()).is_err());
         }

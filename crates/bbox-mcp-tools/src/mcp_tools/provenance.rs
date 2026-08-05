@@ -241,6 +241,7 @@ fn edges_from_note(
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata,
+            project_id: None,
         });
     }
     Ok(edges)
@@ -359,6 +360,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
+            project_id: None,
         };
         let mut prepared = PreparedProvenanceImport::default();
         prepared
@@ -394,6 +396,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
+            project_id: None,
         };
         let edge_b = Edge {
             source: EntityRef::Transcript {
@@ -407,6 +410,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
+            project_id: None,
         };
         let edge_index = EdgeIndex::from_edges_for_tests(vec![edge_a.clone(), edge_b.clone()]);
 

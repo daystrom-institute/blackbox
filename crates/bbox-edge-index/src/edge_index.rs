@@ -439,6 +439,7 @@ impl EdgeIndex {
                         provenance: EdgeProvenance::Explicit,
                         confidence: link.confidence,
                         metadata,
+                        project_id: None,
                     },
                     seen,
                 );
@@ -502,6 +503,7 @@ impl EdgeIndex {
                         provenance: EdgeProvenance::Explicit,
                         confidence: EdgeConfidence::Exact,
                         metadata,
+                        project_id: None,
                     },
                     seen,
                 );
@@ -1450,6 +1452,7 @@ mod tests {
                 provenance: EdgeProvenance::Derived,
                 confidence: EdgeConfidence::Exact,
                 metadata: BTreeMap::new(),
+                project_id: None,
             },
             &mut seen,
         );
@@ -1461,6 +1464,7 @@ mod tests {
                 provenance: EdgeProvenance::Derived,
                 confidence: EdgeConfidence::Exact,
                 metadata: BTreeMap::new(),
+                project_id: None,
             },
             &mut seen,
         );
@@ -1553,6 +1557,7 @@ mod tests {
                 provenance: EdgeProvenance::Explicit,
                 confidence: EdgeConfidence::Exact,
                 metadata: BTreeMap::new(),
+                project_id: None,
             }],
         )
         .unwrap();
@@ -1776,6 +1781,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: Default::default(),
+            project_id: None,
         };
         let legacy_derived = bbox_chunker::Edge {
             source: EntityRef::ProjectFile {
@@ -1975,6 +1981,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: Default::default(),
+            project_id: None,
         };
         append_project_edges(dir.path(), "proj9999", &[legacy_derived]).unwrap();
         append_edges(dir.path(), "proj9999", &[legacy_explicit]).unwrap();
@@ -2045,6 +2052,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
+            project_id: None,
         };
         append_edges(dir.path(), "proj1234", &[explicit]).unwrap();
 
@@ -2086,6 +2094,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
+            project_id: None,
         };
         append_edges(dir.path(), "proj1234", &[edge]).unwrap();
 
@@ -2126,6 +2135,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::from([("anchor.commit_sha_at_edit".into(), "abc123".into())]),
+            project_id: None,
         };
 
         assert_eq!(
@@ -2172,6 +2182,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 
@@ -2193,6 +2204,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 
@@ -2232,6 +2244,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         };
         let _ = append_explicit_edges(dir.path(), "p1", &[e]);
     }
@@ -2247,6 +2260,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         };
         let _ = append_observed_edges(dir.path(), "p1", &[e]);
     }
@@ -2613,6 +2627,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         })
         .unwrap()
     }
@@ -2625,6 +2640,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         })
         .unwrap()
     }
@@ -2807,6 +2823,7 @@ mod tests {
                 provenance: EdgeProvenance::Derived,
                 confidence: EdgeConfidence::Exact,
                 metadata: BTreeMap::new(),
+                project_id: None,
             }
         }
 
@@ -3279,6 +3296,7 @@ mod tests {
                     provenance: EdgeProvenance::Derived,
                     confidence: EdgeConfidence::Exact,
                     metadata: BTreeMap::new(),
+                    project_id: None,
                 }],
             );
 
@@ -3380,6 +3398,7 @@ mod tests {
             provenance,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 
@@ -3401,6 +3420,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 
@@ -3428,6 +3448,7 @@ mod tests {
                 provenance: EdgeProvenance::Explicit,
                 confidence: EdgeConfidence::Exact,
                 metadata: BTreeMap::new(),
+                project_id: None,
             },
             &mut seen,
         );
@@ -3587,6 +3608,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         })
         .unwrap();
         fs::write(explicit_dir.join("p1.jsonl"), format!("{explicit_edge}\n")).unwrap();

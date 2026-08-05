@@ -665,6 +665,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Heuristic,
             metadata,
+            project_id: None,
         }
     }
 }

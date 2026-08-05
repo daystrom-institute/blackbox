@@ -1356,6 +1356,7 @@ mod clause_one_exit_proof {
             provenance: bbox_chunker::EdgeProvenance::Explicit,
             confidence: bbox_chunker::EdgeConfidence::Exact,
             metadata: Default::default(),
+            project_id: None,
         };
         let sidecar_key = format!(
             "{}|{}|{}",

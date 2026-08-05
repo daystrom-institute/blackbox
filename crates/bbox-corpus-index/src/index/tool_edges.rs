@@ -307,6 +307,10 @@ impl ToolEdgeContext {
                 byte_range,
                 &bytes,
             ),
+            // Left None deliberately: `access.project_id` is the indexing
+            // lane's id, not durable catalog authority. Only the Phase 6
+            // backfill stamps a catalog project onto an edge row (Q-E1).
+            project_id: None,
         }))
     }
 
@@ -342,6 +346,10 @@ impl ToolEdgeContext {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: bash_metadata(event, tool_call, &access.project_id, line_offset),
+            // Left None deliberately: `access.project_id` is the indexing
+            // lane's id, not durable catalog authority. Only the Phase 6
+            // backfill stamps a catalog project onto an edge row (Q-E1).
+            project_id: None,
         }))
     }
 
@@ -404,6 +412,10 @@ impl ToolEdgeContext {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: bash_metadata(event, tool_call, &access.project_id, line_offset),
+            // Left None deliberately: `access.project_id` is the indexing
+            // lane's id, not durable catalog authority. Only the Phase 6
+            // backfill stamps a catalog project onto an edge row (Q-E1).
+            project_id: None,
         };
         let project_id = access.project_id.clone();
         self.pending_edges

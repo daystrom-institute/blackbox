@@ -261,6 +261,7 @@ impl ProjectIndexPublicationBundle {
                             provenance: edge.provenance,
                             confidence: edge.confidence,
                             metadata: Default::default(),
+                            project_id: None,
                         })
                         .collect::<Vec<_>>()
                     } else {
@@ -1669,6 +1670,7 @@ where
                 provenance: edge.provenance,
                 confidence: edge.confidence,
                 metadata: Default::default(),
+                project_id: None,
             })
             .collect::<Vec<_>>();
         edge_writer.append(&sidecar_edges)?;
@@ -3370,6 +3372,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
             metadata: Default::default(),
+            project_id: None,
         }
     }
 

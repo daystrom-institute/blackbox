@@ -6480,6 +6480,7 @@ mod tests {
             provenance: prov,
             confidence: bbox_chunker::EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 

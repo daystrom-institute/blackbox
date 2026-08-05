@@ -1870,6 +1870,7 @@ pub(crate) fn agent_derived_from_edge(
         provenance: chunker::EdgeProvenance::Explicit,
         confidence: chunker::EdgeConfidence::Exact,
         metadata: Default::default(),
+        project_id: None,
     }
 }
 

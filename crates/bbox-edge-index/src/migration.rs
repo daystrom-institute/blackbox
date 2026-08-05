@@ -536,6 +536,7 @@ mod tests {
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 
@@ -547,6 +548,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 
@@ -558,6 +560,7 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata: BTreeMap::new(),
+            project_id: None,
         }
     }
 

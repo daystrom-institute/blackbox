@@ -1685,6 +1685,7 @@ mod tests {
                 provenance: EdgeProvenance::Derived,
                 confidence: EdgeConfidence::Exact,
                 metadata: Default::default(),
+                project_id: None,
             }])),
             catalog_epoch: 0,
             git_overlays: std::collections::BTreeMap::new(),
