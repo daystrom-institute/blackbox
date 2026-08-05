@@ -57,7 +57,7 @@ the authority and this document points at it rather than mirroring it; a
 mirrored inventory rots by construction, and this one did, twice, behind
 two ratchet changes.
 
-| Pattern | Phase 6 disposition |
+| Pattern | Retirement disposition |
 |---|---|
 | `project_record_import` | Delete with the v1 record type. The sanctioned compatibility projection (`catalog_records.rs`) goes last, because it is what lets the catalog serve v1-shaped consumers during the cut. |
 | `canonical_path_read` | Delete with `ProjectRecord`. Every one is a bridge arm; the catalog arm beside it already resolves through attachment identity. |
@@ -107,16 +107,20 @@ cannot see, and both are blocking from `src/server/state.rs`:
 | `tests/fixtures/bridge-parity/bridge-parity.json` | `bridge_parity_holds_against_canonical_fixtures`, an ordinary blocking test | A bridge RESPONSE change. Every count can stay flat while a deletion silently alters what the bridge returns, including through a type the bridge and the catalog share (Risk 18). |
 
 The parity fixture is the input Phase 6 leans on most heavily, because
-Phase 6 is a deletion campaign and the failure mode of a deletion campaign
-is removing something that was load-bearing for output nobody was watching.
-Each deletion step in section 5 should be run with the parity verifier
-green BEFORE and after; a red parity row is the signal that a "dead" bridge
-arm was not dead.
+the deletion campaign's failure mode is removing something that was
+load-bearing for output nobody was watching. Each deletion step in
+section 5 should be run with the parity verifier green BEFORE and after; a
+red parity row is the signal that a "dead" bridge arm was not dead.
 
 Regenerating the fixture is a decision, not a chore. `settle()` says so in
 its own failure text: a diff there means a bridge output changed and needs
-a new explicit decision. During Phase 6 the ONLY legitimate regeneration is
-the cut itself (see 3.7).
+a new explicit decision. NO regeneration, row deletion, or row inversion
+is legitimate anywhere in Phase 6, the P6-F migration included: the
+fixture pins a bridge-mode daemon's responses, the bridge lane still ships
+after the operator cut, and the harness is the evidence that Phase 6
+changed nothing the bridge serves. Regeneration first becomes a decision
+at the retirement-phase deletion steps (section 5 steps 2 through 5),
+where each step retires the rows that pinned the surface it deletes.
 
 ## 3. Deletion inventory by subsystem
 
@@ -176,7 +180,7 @@ Each row names the bridge surface it pins and what happens to that row:
 | `checkout_observations` | Compatibility lane key-space and the granted/denied split | Dies with 3.5. Its `active_compatibility_lanes` going empty IS the cut signal. |
 | `file_provider`, `blame`, `render`, `provenance_export_plan`, `provenance_note_export`, `provenance_note_import` | Bridge-lane ROUTING into surfaces that survive | Row dies; the surface does not. A red row here during Phase 6 means a converted adapter changed output, which is a defect, not progress. |
 | `doctor_report` | The COMPLETE serialized doctor response, findings and messages included, less only [D-041](../../DECISION_LEDGER.md#d-041) and the declared exact-value substitutions (daemon version, host state directory, fixture root, observation wall clock) | Row dies. Doctor survives; its bridge-shaped findings do not. |
-| `catalog_only_tools_refuse` | `bbox_project_publisher_advance` and `_status` refusing `error.project_catalog_inactive` | INVERTS. This is the only row that must be DELETED rather than carried: after the cut the refusal is wrong, so a row asserting it would be actively false. |
+| `catalog_only_tools_refuse` | `bbox_project_publisher_advance` and `_status` refusing `error.project_catalog_inactive` | INVERTS at retirement. The fixture daemon runs bridge mode, where this refusal stays correct through and after the P6-F operator cut, so the row is carried UNCHANGED through Phase 6 (live catalog-mode success is proved separately by the catalog lane's own tests). At the retirement-phase bridge deletion this is the one row that must be DELETED rather than carried: a bridge-modeless tree cannot refuse this way, so a row asserting it would be actively false. |
 
 Two properties Phase 6 must not quietly relax:
 
@@ -197,9 +201,12 @@ Two properties Phase 6 must not quietly relax:
   Determinism for each was bought at the source instead. The system-memory
   catalog is pinned to a fixture-owned pair, so the trailer is captured
   whole and moves only when the harness moves. Observation counters are
-  exact because the harness drops the publisher-authorization cache before
-  every row, which removes the 250 millisecond TTL from the measurement
-  rather than tolerating its variance. Doctor is captured whole, with the
+  exact, with the single [D-041](../../DECISION_LEDGER.md#d-041) exception
+  (the `publisher_config_tree_read` acquisition count and its derived
+  sequences, sentinel-substituted), because the harness drops the
+  publisher-authorization cache before every row, which removes the 250
+  millisecond TTL from the measurement rather than tolerating its variance
+  everywhere the cache drop reaches. Doctor is captured whole, with the
   daemon version and the host state directory substituted by exact value
   from the same sources doctor renders them from.
 
