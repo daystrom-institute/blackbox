@@ -26,10 +26,11 @@ use bbox_indexing::project_catalog_inventory::{
     decode_migration_report_v1, decode_migration_resolution_v1, encode_migration_resolution_v1,
 };
 use bbox_indexing::project_catalog_migration::{
-    ProjectCatalogMigrationApplyOutcomeV1, ProjectCatalogMigrationApplyRequestV1,
-    ProjectCatalogMigrationFacadeV1, ProjectCatalogMigrationLayoutOverridesV1,
-    ProjectCatalogMigrationMutationDispositionV1, ProjectCatalogMigrationPreflightRequestV1,
-    ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogMigrationVerifyRequestV1,
+    ProjectCatalogMigrationApplyConfiguredRequestV1, ProjectCatalogMigrationApplyOutcomeV1,
+    ProjectCatalogMigrationApplyRequestV1, ProjectCatalogMigrationFacadeV1,
+    ProjectCatalogMigrationLayoutOverridesV1, ProjectCatalogMigrationMutationDispositionV1,
+    ProjectCatalogMigrationPreflightRequestV1, ProjectCatalogMigrationResolvedLayoutV1,
+    ProjectCatalogMigrationVerifyConfiguredRequestV1, ProjectCatalogMigrationVerifyRequestV1,
     project_catalog_migration_store_limits,
 };
 use bbox_indexing::project_catalog_store::ProjectCatalogStore;
@@ -1415,6 +1416,232 @@ fn absent_legacy_catalog_is_fresh_for_first_apply_but_public_verify_fails_closed
         })
         .unwrap();
     assert_eq!(reverified.receipt(), &reapplied.receipt.verification);
+}
+
+/// The P6-F configured apply and configured verify (plan section 3.2,
+/// adjudication Q-B): reviewed artifacts applied to the REAL configured
+/// layout, where target and protected layout are the same layout.
+///
+/// This test is the mutation evidence for the "separation-check-omitted-ONLY"
+/// claim. Re-adding `validate_rehearsal_separation` to the configured path
+/// reds it, because the configured target legitimately carries no rehearsal
+/// root and the separation check refuses exactly that shape. Every other
+/// check the rehearsal path runs is still exercised here through the shared
+/// apply-to-target core: the artifact set is confined, the four-hash identity
+/// is rechecked against the artifacts (proven by the tampered-report arm),
+/// and the post-commit verification receipt must agree with the preflight
+/// prediction.
+#[test]
+fn configured_apply_installs_the_reviewed_post_image_on_the_configured_layout() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config = config(&root);
+
+    // The CONFIGURED layout: config-resolved, carrying no rehearsal root.
+    let configured_base = root.join("configured");
+    fs::create_dir_all(&configured_base).unwrap();
+    initialize_empty_owner_state(&configured_base);
+    let configured_state = configured_base.join("state");
+    CodeSourceStore::open(
+        configured_state.join("code-sources"),
+        project_catalog_migration_store_limits(&config),
+    )
+    .unwrap();
+    let configured = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: Some(configured_state.join("projects.json")),
+            state_dir: Some(configured_state.clone()),
+        },
+    )
+    .unwrap();
+
+    // Verification fails closed before anything is installed, exactly as the
+    // rehearsal entry does.
+    let unverifiable = ProjectCatalogMigrationFacadeV1::verify_configured(
+        ProjectCatalogMigrationVerifyConfiguredRequestV1 {
+            target_layout: configured.clone(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(unverifiable.code, "error.project_catalog_invalid_snapshot");
+    assert_eq!(
+        unverifiable.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+    );
+
+    let review = root.join("review");
+    let report_path = review.join("report.json");
+    let resolution_path = review.join("resolution.json");
+    let preflight =
+        ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
+            layout: configured.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
+            sensitive_report_path: None,
+        })
+        .unwrap();
+    assert_eq!(
+        preflight.receipt.status,
+        ProjectCatalogMigrationStatusV1::Clean
+    );
+
+    // The four-hash identity recheck survives the omission of the separation
+    // check: a tampered report is refused with no durable mutation.
+    let reviewed_report_bytes = fs::read(&report_path).unwrap();
+    let mut tampered: serde_json::Value = serde_json::from_slice(&reviewed_report_bytes).unwrap();
+    tampered["inventory_hash"] = serde_json::Value::String("0".repeat(64));
+    fs::write(&report_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+    let tampered_error = ProjectCatalogMigrationFacadeV1::apply_configured(
+        ProjectCatalogMigrationApplyConfiguredRequestV1 {
+            target_layout: configured.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        tampered_error.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+    );
+    assert!(
+        !configured_state
+            .join("project-catalog-migration.json")
+            .exists()
+    );
+    fs::write(&report_path, &reviewed_report_bytes).unwrap();
+
+    let applied = ProjectCatalogMigrationFacadeV1::apply_configured(
+        ProjectCatalogMigrationApplyConfiguredRequestV1 {
+            target_layout: configured.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        applied.receipt.outcome,
+        ProjectCatalogMigrationApplyOutcomeV1::Applied
+    );
+    assert_eq!(
+        applied.receipt.verification.expected_catalog_hash,
+        preflight.receipt.predicted_catalog_hash
+    );
+
+    let verified = ProjectCatalogMigrationFacadeV1::verify_configured(
+        ProjectCatalogMigrationVerifyConfiguredRequestV1 {
+            target_layout: configured.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(verified.receipt(), &applied.receipt.verification);
+
+    // Re-apply is idempotent through the same shared core.
+    let reapplied = ProjectCatalogMigrationFacadeV1::apply_configured(
+        ProjectCatalogMigrationApplyConfiguredRequestV1 {
+            target_layout: configured,
+            report_path,
+            resolution_path,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reapplied.receipt.outcome,
+        ProjectCatalogMigrationApplyOutcomeV1::AlreadyApplied
+    );
+}
+
+/// The REHEARSAL apply keeps `validate_rehearsal_separation` (D-006).
+///
+/// This is the other half of the "separation-check-omitted-only" evidence:
+/// removing the check from the rehearsal path reds this test. It had no
+/// coverage before the shared apply-to-target core existed, which is exactly
+/// the coverage a refactor that moves a safety check must not rely on.
+#[test]
+fn rehearsal_apply_refuses_a_target_that_is_not_isolated_from_the_protected_layout() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config = config(&root);
+    let rehearsal_root = root.join("rehearsal");
+    fs::create_dir_all(&rehearsal_root).unwrap();
+    initialize_empty_owner_state(&rehearsal_root);
+    let rehearsal =
+        ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal_root, &config)
+            .unwrap();
+
+    // The protected layout is the rehearsal root's OWN state: a rehearsal
+    // apply here would mutate the very authority it claims to be isolated
+    // from, which is the destructive-discretion shape D-006 exists to refuse.
+    let protected = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: Some(rehearsal_root.join("state/projects.json")),
+            state_dir: Some(rehearsal_root.join("state")),
+        },
+    )
+    .unwrap();
+
+    let refused =
+        ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
+            rehearsal_layout: rehearsal,
+            protected_layout: protected,
+            report_path: root.join("review/report.json"),
+            resolution_path: root.join("review/resolution.json"),
+        })
+        .unwrap_err();
+    assert_eq!(
+        refused.code, "error.project_catalog_migration_unsafe_layout",
+        "rehearsal apply must refuse a target that overlaps the protected layout"
+    );
+    assert_eq!(
+        refused.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+    );
+}
+
+/// The configured entries refuse a rehearsal-root layout, which is the Q-C
+/// binding condition that a configured-selected layout is config-resolved.
+/// Without it, omitting the separation check would let a rehearsal layout
+/// through the configured path unchallenged.
+#[test]
+fn configured_entries_refuse_a_rehearsal_root_layout() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config = config(&root);
+    let rehearsal_root = root.join("rehearsal");
+    fs::create_dir_all(&rehearsal_root).unwrap();
+    initialize_empty_owner_state(&rehearsal_root);
+    let rehearsal =
+        ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal_root, &config)
+            .unwrap();
+
+    let apply_error = ProjectCatalogMigrationFacadeV1::apply_configured(
+        ProjectCatalogMigrationApplyConfiguredRequestV1 {
+            target_layout: rehearsal.clone(),
+            report_path: root.join("review/report.json"),
+            resolution_path: root.join("review/resolution.json"),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        apply_error.code,
+        "error.project_catalog_migration_unsafe_layout"
+    );
+    assert_eq!(
+        apply_error.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+    );
+
+    let verify_error = ProjectCatalogMigrationFacadeV1::verify_configured(
+        ProjectCatalogMigrationVerifyConfiguredRequestV1 {
+            target_layout: rehearsal,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        verify_error.code,
+        "error.project_catalog_migration_unsafe_layout"
+    );
 }
 
 /// Not a test: the smoke-fixture producer for the phase-2 live bootsmokes

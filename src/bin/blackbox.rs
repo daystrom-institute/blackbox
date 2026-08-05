@@ -9,9 +9,10 @@ use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope, ScopeMigrationK
 use bbox_corpus_index::index::migration_inventory as corpus_inventory;
 use bbox_indexing::project_catalog_admin;
 use bbox_indexing::project_catalog_migration::{
-    ProjectCatalogMigrationApplyRequestV1, ProjectCatalogMigrationError,
-    ProjectCatalogMigrationFacadeV1, ProjectCatalogMigrationLayoutOverridesV1,
-    ProjectCatalogMigrationPreflightRequestV1, ProjectCatalogMigrationResolvedLayoutV1,
+    ProjectCatalogMigrationApplyConfiguredRequestV1, ProjectCatalogMigrationApplyRequestV1,
+    ProjectCatalogMigrationError, ProjectCatalogMigrationFacadeV1,
+    ProjectCatalogMigrationLayoutOverridesV1, ProjectCatalogMigrationPreflightRequestV1,
+    ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogMigrationVerifyConfiguredRequestV1,
     ProjectCatalogMigrationVerifyRequestV1,
 };
 use bbox_indexing::project_catalog_migration_lock::ProjectCatalogMigrationLock;
@@ -244,12 +245,31 @@ struct ConfigArgs {
     projects_path: Option<PathBuf>,
 }
 
+/// Target selection on `migrate` uses the ratified two-layer mechanism
+/// (plan section 3.1, adjudication Q-A).
+///
+/// Layer one is this at-most-one `ArgGroup("target")`: naming BOTH targets is
+/// a parse-time refusal, because no handler rule could give that combination
+/// a meaning. Layer two is the per-mode `exactly one` check in
+/// `enforce_migrate_target_rules`, which runs before configuration loading or
+/// any artifact access.
+///
+/// A dual `required_if_eq("apply", "true")` on the pair would be mechanically
+/// wrong: clap evaluates the two conditional requirements independently of
+/// their conflict, so `--apply` would demand BOTH flags and no documented
+/// apply invocation would parse.
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("mode")
         .required(true)
         .multiple(false)
         .args(["preflight", "apply"])
+))]
+#[command(group(
+    ArgGroup::new("target")
+        .required(false)
+        .multiple(false)
+        .args(["rehearsal_root", "configured"])
 ))]
 struct MigrateArgs {
     /// Capture the source inventory and write reviewed artifacts.
@@ -268,14 +288,15 @@ struct MigrateArgs {
     #[arg(long, value_name = "PATH")]
     resolution: PathBuf,
 
-    /// Isolated rehearsal root. Required with --apply.
-    #[arg(
-        long,
-        value_name = "PATH",
-        required_if_eq("apply", "true"),
-        conflicts_with = "preflight"
-    )]
+    /// Isolated rehearsal root. One target is required with --apply.
+    #[arg(long, value_name = "PATH", conflicts_with = "preflight")]
     rehearsal_root: Option<PathBuf>,
+
+    /// Apply to the REAL configured state resolved through `ConfigArgs`
+    /// (the P6-F live cut). One target is required with --apply; preflight
+    /// captures configured state by default and does not accept this flag.
+    #[arg(long)]
+    configured: bool,
 
     /// Explicit owner-only local-path review artifact. Preflight only.
     #[arg(
@@ -290,20 +311,33 @@ struct MigrateArgs {
     config: ConfigArgs,
 }
 
+/// Verification selects exactly one target (plan section 3.2).
+///
+/// `--root` keeps rehearsal verification exactly as shipped.
+/// `--require-exclusive-availability` selects the CONFIGURED layout instead:
+/// it is the P6-F bridge-down proof followed by configured verification, so
+/// it conflicts with `--root` rather than decorating it. The group is
+/// required so no invocation can leave the verified target implicit.
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("verify_target")
+        .required(true)
+        .multiple(false)
+        .args(["root", "require_exclusive_availability"])
+))]
 struct VerifyArgs {
     /// Isolated rehearsal state root, not a projects.json path.
     #[arg(long, value_name = "PATH")]
-    root: PathBuf,
+    root: Option<PathBuf>,
 
     /// Load the same configuration file used by blackboxd.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Prove the bridge is DOWN before verifying: take the configured
-    /// lifetime lock exclusively and release it. A live daemon holds a
-    /// shared guard, so the attempt yields no guard and the command
-    /// refuses with `error.project_catalog_cli_lock`.
+    /// Verify the CONFIGURED layout, proving first that the bridge is DOWN:
+    /// take the configured lifetime lock exclusively and release it. A live
+    /// daemon holds a shared guard, so the attempt yields no guard and the
+    /// command refuses with `error.project_catalog_cli_lock`.
     #[arg(long)]
     require_exclusive_availability: bool,
 }
@@ -470,7 +504,61 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
     }
 }
 
+/// The target one `migrate` invocation operates on, after layer two of the
+/// Q-A mechanism has run.
+#[derive(Debug, PartialEq, Eq)]
+enum MigrateTargetSelectionV1 {
+    /// Preflight with no target flag: capture the real configured state
+    /// through `ConfigArgs` resolution (D-021), which is the P6-F live-cut
+    /// preflight.
+    PreflightConfiguredCapture,
+    /// Apply into the isolated rehearsal root.
+    RehearsalRoot(PathBuf),
+    /// Apply to the real configured state (the P6-F cut).
+    Configured,
+}
+
+/// Layer two of the Q-A target mechanism (plan section 3.1).
+///
+/// Runs BEFORE configuration loading, artifact access, or any other
+/// observable work, so a mode-incompatible or missing target never reaches
+/// the point where it could read or touch real state. Naming BOTH targets is
+/// already impossible here: layer one, the at-most-one `ArgGroup("target")`,
+/// refuses that combination at parse time.
+fn enforce_migrate_target_rules(
+    args: &MigrateArgs,
+) -> Result<MigrateTargetSelectionV1, CommandFailure> {
+    if args.preflight {
+        if args.configured {
+            return Err(CommandFailure::new(
+                "error.project_catalog_cli_arguments",
+                "--preflight does not accept --configured: preflight already \
+                 captures the configured state through the configuration \
+                 resolution, so naming it would imply a choice that does not exist",
+            ));
+        }
+        return Ok(MigrateTargetSelectionV1::PreflightConfiguredCapture);
+    }
+
+    debug_assert!(args.apply, "clap requires exactly one migration mode");
+    match (args.rehearsal_root.as_ref(), args.configured) {
+        (Some(root), false) => Ok(MigrateTargetSelectionV1::RehearsalRoot(root.clone())),
+        (None, true) => Ok(MigrateTargetSelectionV1::Configured),
+        (None, false) => Err(CommandFailure::new(
+            "error.project_catalog_cli_arguments",
+            "--apply requires exactly one target: --rehearsal-root <path> or --configured",
+        )),
+        // Layer one rejects this pair at parse time; the arm exists so the
+        // handler rule is total rather than relying on the parser alone.
+        (Some(_), true) => Err(CommandFailure::new(
+            "error.project_catalog_cli_arguments",
+            "--apply accepts exactly one target: --rehearsal-root and --configured are exclusive",
+        )),
+    }
+}
+
 fn execute_migrate(args: MigrateArgs) -> Result<serde_json::Value, CommandFailure> {
+    let target = enforce_migrate_target_rules(&args)?;
     let config = load_config(args.config.config)?;
     let source_layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
         &config,
@@ -491,13 +579,29 @@ fn execute_migrate(args: MigrateArgs) -> Result<serde_json::Value, CommandFailur
         return serialize_result(&result.receipt);
     }
 
-    debug_assert!(args.apply, "clap requires exactly one migration mode");
-    let rehearsal_root = args.rehearsal_root.ok_or_else(|| {
-        CommandFailure::new(
-            "error.project_catalog_cli_arguments",
-            "--apply requires --rehearsal-root",
-        )
-    })?;
+    let rehearsal_root = match target {
+        MigrateTargetSelectionV1::Configured => {
+            // The configured apply is the P6-F cut. The lifetime claim is
+            // taken BEFORE any target read or mutation and held across the
+            // complete facade call including its post-commit verification
+            // (plan sections 3.2 and 4.2). It is the factored claim, not
+            // `open_admin_store`: the configured store is still version 1 at
+            // this instant, so a strict open would refuse it.
+            let _claim = acquire_admin_lifetime_claim(source_layout.projects_path())?;
+            let result = ProjectCatalogMigrationFacadeV1::apply_configured(
+                ProjectCatalogMigrationApplyConfiguredRequestV1 {
+                    target_layout: source_layout,
+                    report_path: args.report,
+                    resolution_path: args.resolution,
+                },
+            )?;
+            return serialize_result(&result.receipt);
+        }
+        MigrateTargetSelectionV1::RehearsalRoot(root) => root,
+        MigrateTargetSelectionV1::PreflightConfiguredCapture => {
+            unreachable!("preflight returned above")
+        }
+    };
     let rehearsal_layout =
         ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(rehearsal_root, &config)?;
     let result =
@@ -513,10 +617,25 @@ fn execute_migrate(args: MigrateArgs) -> Result<serde_json::Value, CommandFailur
 fn execute_verify(args: VerifyArgs) -> Result<serde_json::Value, CommandFailure> {
     let config = load_config(args.config)?;
     if args.require_exclusive_availability {
-        require_exclusive_availability(&config)?;
+        // The configured verification target (plan section 3.2): prove the
+        // bridge is down, then verify the configured layout itself. The
+        // shipped rehearsal entry refuses a layout with no rehearsal root,
+        // which is why the configured store needs its own entry rather than
+        // a flag over the rehearsal one.
+        let target_layout = require_exclusive_availability(&config)?;
+        let result = ProjectCatalogMigrationFacadeV1::verify_configured(
+            ProjectCatalogMigrationVerifyConfiguredRequestV1 { target_layout },
+        )?;
+        return serialize_result(result.receipt());
     }
+    let root = args.root.ok_or_else(|| {
+        CommandFailure::new(
+            "error.project_catalog_cli_arguments",
+            "verify requires exactly one target: --root <path> or --require-exclusive-availability",
+        )
+    })?;
     let rehearsal_layout =
-        ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(args.root, &config)?;
+        ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(root, &config)?;
     let result = ProjectCatalogMigrationFacadeV1::verify(ProjectCatalogMigrationVerifyRequestV1 {
         rehearsal_layout,
     })?;
@@ -531,7 +650,13 @@ fn execute_verify(args: VerifyArgs) -> Result<serde_json::Value, CommandFailure>
 /// dropped immediately and verification proceeds against durable state.
 /// `try_acquire_exclusive` returns `Ok(None)` when a live bridge holds its
 /// shared handle, which is the refusal this flag exists to produce.
-fn require_exclusive_availability(config: &config::Config) -> Result<(), CommandFailure> {
+///
+/// Returns the configured layout it proved availability against, so the
+/// caller verifies exactly the target the probe covered rather than
+/// re-resolving it and risking a different one.
+fn require_exclusive_availability(
+    config: &config::Config,
+) -> Result<ProjectCatalogMigrationResolvedLayoutV1, CommandFailure> {
     let configured_layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
         config,
         ProjectCatalogMigrationLayoutOverridesV1 {
@@ -547,7 +672,7 @@ fn require_exclusive_availability(config: &config::Config) -> Result<(), Command
     match acquired {
         Some(guard) => {
             drop(guard);
-            Ok(())
+            Ok(configured_layout)
         }
         None => Err(CommandFailure::new(
             "error.project_catalog_cli_lock",
@@ -664,6 +789,23 @@ mod tests {
         .unwrap();
         assert_eq!(command_name(&apply), "project_catalog_migrate_apply");
 
+        let apply_configured = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "migrate",
+            "--apply",
+            "--configured",
+            "--report",
+            "/tmp/report.json",
+            "--resolution",
+            "/tmp/resolution.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_name(&apply_configured),
+            "project_catalog_migrate_apply"
+        );
+
         let verify = Cli::try_parse_from([
             "blackbox",
             "project-catalog",
@@ -673,18 +815,28 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(command_name(&verify), "project_catalog_verify");
+
+        let verify_configured = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "verify",
+            "--require-exclusive-availability",
+            "--config",
+            "/tmp/blackbox.toml",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&verify_configured), "project_catalog_verify");
     }
 
     /// The bridge-down proof rides the shipped `Verify` variant rather than a
-    /// new verb (plan section 3.2).
+    /// new verb, and it SELECTS the configured target rather than decorating
+    /// the rehearsal one (plan section 3.2).
     #[test]
     fn verify_accepts_the_exclusive_availability_proof_flag() {
         let verify = Cli::try_parse_from([
             "blackbox",
             "project-catalog",
             "verify",
-            "--root",
-            "/tmp/rehearsal",
             "--require-exclusive-availability",
         ])
         .expect("verify accepts the availability proof flag");
@@ -696,6 +848,29 @@ mod tests {
             panic!("expected the verify variant");
         };
         assert!(args.require_exclusive_availability);
+        assert!(
+            args.root.is_none(),
+            "the configured verification target carries no rehearsal root"
+        );
+    }
+
+    /// `--require-exclusive-availability` selects the CONFIGURED layout, so
+    /// pairing it with a rehearsal `--root` names two targets for one
+    /// verification and is refused at parse time (plan section 3.2).
+    #[test]
+    fn verify_refuses_both_targets_at_parse_time() {
+        assert!(
+            Cli::try_parse_from([
+                "blackbox",
+                "project-catalog",
+                "verify",
+                "--root",
+                "/tmp/rehearsal",
+                "--require-exclusive-availability",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["blackbox", "project-catalog", "verify"]).is_err());
     }
 
     #[test]
@@ -721,19 +896,6 @@ mod tests {
                 "blackbox",
                 "project-catalog",
                 "migrate",
-                "--apply",
-                "--report",
-                "/tmp/report.json",
-                "--resolution",
-                "/tmp/resolution.json",
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "blackbox",
-                "project-catalog",
-                "migrate",
                 "--preflight",
                 "--report",
                 "/tmp/report.json",
@@ -744,6 +906,145 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    /// Layer ONE of the Q-A mechanism: naming both targets has no possible
+    /// meaning, so the PARSER refuses it (plan section 3.1).
+    #[test]
+    fn parser_refuses_both_migrate_targets() {
+        assert!(
+            Cli::try_parse_from([
+                "blackbox",
+                "project-catalog",
+                "migrate",
+                "--apply",
+                "--report",
+                "/tmp/report.json",
+                "--resolution",
+                "/tmp/resolution.json",
+                "--rehearsal-root",
+                "/tmp/rehearsal",
+                "--configured",
+            ])
+            .is_err()
+        );
+    }
+
+    /// Layer ONE must not over-reach: `--apply` with no target still PARSES,
+    /// because a dual `required_if_eq` would demand both flags and break
+    /// every documented apply invocation (plan section 3.1, Q-A).
+    #[test]
+    fn parser_admits_apply_without_a_target_for_the_handler_to_refuse() {
+        let parsed = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "migrate",
+            "--apply",
+            "--report",
+            "/tmp/report.json",
+            "--resolution",
+            "/tmp/resolution.json",
+        ])
+        .expect("a missing target is a handler refusal, not a parse refusal");
+        assert_eq!(command_name(&parsed), "project_catalog_migrate_apply");
+    }
+
+    /// Layer TWO: a missing or mode-incompatible target is a TYPED handler
+    /// refusal carrying `error.project_catalog_cli_arguments`, produced
+    /// before configuration loading or any artifact access.
+    #[test]
+    fn handler_refuses_missing_or_mode_incompatible_migrate_targets() {
+        let missing = migrate_args_from([
+            "blackbox",
+            "project-catalog",
+            "migrate",
+            "--apply",
+            "--report",
+            "/tmp/report.json",
+            "--resolution",
+            "/tmp/resolution.json",
+        ]);
+        let failure = enforce_migrate_target_rules(&missing)
+            .expect_err("apply without a target must be refused");
+        assert_eq!(failure.code, "error.project_catalog_cli_arguments");
+
+        let incompatible = migrate_args_from([
+            "blackbox",
+            "project-catalog",
+            "migrate",
+            "--preflight",
+            "--report",
+            "/tmp/report.json",
+            "--resolution",
+            "/tmp/resolution.json",
+            "--configured",
+        ]);
+        let failure = enforce_migrate_target_rules(&incompatible)
+            .expect_err("preflight must refuse an explicit --configured target");
+        assert_eq!(failure.code, "error.project_catalog_cli_arguments");
+    }
+
+    /// Layer TWO admits exactly the three documented target selections.
+    #[test]
+    fn handler_selects_each_documented_migrate_target() {
+        let preflight = migrate_args_from([
+            "blackbox",
+            "project-catalog",
+            "migrate",
+            "--preflight",
+            "--report",
+            "/tmp/report.json",
+            "--resolution",
+            "/tmp/resolution.json",
+        ]);
+        assert_eq!(
+            enforce_migrate_target_rules(&preflight).unwrap(),
+            MigrateTargetSelectionV1::PreflightConfiguredCapture
+        );
+
+        let rehearsal = migrate_args_from([
+            "blackbox",
+            "project-catalog",
+            "migrate",
+            "--apply",
+            "--report",
+            "/tmp/report.json",
+            "--resolution",
+            "/tmp/resolution.json",
+            "--rehearsal-root",
+            "/tmp/rehearsal",
+        ]);
+        assert_eq!(
+            enforce_migrate_target_rules(&rehearsal).unwrap(),
+            MigrateTargetSelectionV1::RehearsalRoot(PathBuf::from("/tmp/rehearsal"))
+        );
+
+        let configured = migrate_args_from([
+            "blackbox",
+            "project-catalog",
+            "migrate",
+            "--apply",
+            "--report",
+            "/tmp/report.json",
+            "--resolution",
+            "/tmp/resolution.json",
+            "--configured",
+        ]);
+        assert_eq!(
+            enforce_migrate_target_rules(&configured).unwrap(),
+            MigrateTargetSelectionV1::Configured
+        );
+    }
+
+    fn migrate_args_from<const N: usize>(argv: [&str; N]) -> MigrateArgs {
+        let parsed = Cli::try_parse_from(argv).expect("documented migrate invocation must parse");
+        let TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::Migrate(args),
+        }) = parsed.command
+        else {
+            panic!("expected the migrate variant");
+        };
+        args
     }
 
     #[test]
@@ -916,20 +1217,25 @@ mod tests {
     }
 }
 
-/// Open a strict v2 store for offline administration: the exclusive
-/// lifetime lock proves no daemon shares the store (mutations are
-/// CLI-only while stopped, plan §7.9), and `open_existing` fails closed on
-/// v1 bytes, which is the constructive D-002 boundary: these subcommands
-/// cannot create or mutate v2 state at a configured v1 path.
-fn open_admin_store(
-    projects_path: &PathBuf,
-) -> Result<(ProjectCatalogMigrationLock, ProjectCatalogStore), CommandFailure> {
-    // Prove no daemon shares this store, then atomically downgrade so the
-    // strict open can take its own shared handle on the same lock file
-    // (holding exclusive across the open would deadlock against it). The
-    // downgraded guard keeps continuous lock coverage for the CLI's
-    // lifetime; mutation correctness itself is owned by the pair
-    // transaction's locks.
+/// Take the offline-administration lifetime claim on one projects path
+/// (plan section 4.2, adjudication Q-B).
+///
+/// Exclusive-then-downgrade: the exclusive acquisition proves no daemon
+/// shares the store at that instant, then the guard atomically downgrades so
+/// a subsequent store open can take its own shared handle on the same lock
+/// file (holding exclusive across the open would deadlock against it). The
+/// returned shared guard keeps continuous lock coverage for as long as the
+/// caller holds it; mutation correctness itself is owned by the pair
+/// transaction's locks, and the stopped-service window is the real exclusion
+/// for the transaction's duration.
+///
+/// Factored out of `open_admin_store` because the configured migration apply
+/// needs exactly this claim BEFORE the store is version 2: the strict open
+/// `open_admin_store` performs would correctly refuse the still-version-1
+/// configured store that exists at that moment.
+fn acquire_admin_lifetime_claim(
+    projects_path: &Path,
+) -> Result<ProjectCatalogMigrationLock, CommandFailure> {
     let exclusive = ProjectCatalogMigrationLock::try_acquire_exclusive(projects_path)
         .map_err(|error| {
             CommandFailure::new("error.project_catalog_cli_lock", format!("{error:#}"))
@@ -941,9 +1247,20 @@ fn open_admin_store(
                  offline administration",
             )
         })?;
-    let shared = exclusive.downgrade_to_shared().map_err(|error| {
+    exclusive.downgrade_to_shared().map_err(|error| {
         CommandFailure::new("error.project_catalog_cli_lock", format!("{error:#}"))
-    })?;
+    })
+}
+
+/// Open a strict v2 store for offline administration: the exclusive
+/// lifetime lock proves no daemon shares the store (mutations are
+/// CLI-only while stopped, plan §7.9), and `open_existing` fails closed on
+/// v1 bytes, which is the constructive D-002 boundary: these subcommands
+/// cannot create or mutate v2 state at a configured v1 path.
+fn open_admin_store(
+    projects_path: &PathBuf,
+) -> Result<(ProjectCatalogMigrationLock, ProjectCatalogStore), CommandFailure> {
+    let shared = acquire_admin_lifetime_claim(projects_path)?;
     let store = ProjectCatalogStore::open_existing(projects_path)?;
     Ok((shared, store))
 }

@@ -1623,26 +1623,124 @@ fn retire_refuses_on_a_slack_channel_binding() {
     assert!(bindings["bindings"].as_object().unwrap().is_empty());
 }
 
-/// Plan section 3.2: `verify --require-exclusive-availability` is the
-/// bridge-down proof. A live daemon holds the configured lifetime lock
-/// SHARED, so the exclusive probe finds no guard and the command refuses.
+/// Plan sections 3.2 and 4.2: configured apply holds the FACTORED lifetime
+/// claim, acquired before any target read or mutation. It cannot use
+/// `open_admin_store`, whose strict open would refuse the still-version-1
+/// configured store that exists at exactly this moment.
 ///
 /// Both halves are asserted. Without them the test would pass against an
 /// implementation that always refused (or never did): the first half pins
 /// that the refusal is caused by the held lock rather than by the rest of
 /// the invocation, and the second pins the refusal itself.
 #[test]
+fn migrate_apply_configured_takes_the_lifetime_claim_before_touching_the_target() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (_state, projects_path, config_path, _index) = isolated_state_root(&root);
+
+    // Artifacts that do not exist: if the claim were taken AFTER the target
+    // read, the refusal would name the missing artifacts instead of the lock.
+    let invocation = || {
+        run(&[
+            "project-catalog",
+            "migrate",
+            "--apply",
+            "--configured",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--report",
+            root.join("review/report.json").to_str().unwrap(),
+            "--resolution",
+            root.join("review/resolution.json").to_str().unwrap(),
+        ])
+    };
+
+    // Premise: with the lock FREE the claim succeeds, so whatever this
+    // invocation goes on to report is not the lock refusal.
+    let available: Value = serde_json::from_slice(&invocation().stdout).unwrap();
+    assert_ne!(
+        available["error"]["code"], "error.project_catalog_cli_lock",
+        "an unheld lifetime lock must not produce the claim refusal: {available}"
+    );
+
+    // A shared holder is exactly what a live daemon looks like.
+    let held = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
+    let refused = invocation();
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
+    drop(held);
+}
+
+/// A missing or mode-incompatible `migrate` target is a TYPED handler
+/// refusal, produced before configuration loading (plan section 3.1, Q-A).
+/// The named config path does not exist, so a refusal that reached the
+/// config loader would carry `error.project_catalog_cli_config` instead.
+#[test]
+fn migrate_target_rules_refuse_before_configuration_is_loaded() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let absent_config = root.join("no-such-config.toml");
+
+    let missing_target = run(&[
+        "project-catalog",
+        "migrate",
+        "--apply",
+        "--config",
+        absent_config.to_str().unwrap(),
+        "--report",
+        root.join("review/report.json").to_str().unwrap(),
+        "--resolution",
+        root.join("review/resolution.json").to_str().unwrap(),
+    ]);
+    assert!(!missing_target.status.success());
+    let missing_target: Value = serde_json::from_slice(&missing_target.stdout).unwrap();
+    assert_eq!(
+        missing_target["error"]["code"],
+        "error.project_catalog_cli_arguments"
+    );
+
+    let incompatible_target = run(&[
+        "project-catalog",
+        "migrate",
+        "--preflight",
+        "--configured",
+        "--config",
+        absent_config.to_str().unwrap(),
+        "--report",
+        root.join("review/report.json").to_str().unwrap(),
+        "--resolution",
+        root.join("review/resolution.json").to_str().unwrap(),
+    ]);
+    assert!(!incompatible_target.status.success());
+    let incompatible_target: Value = serde_json::from_slice(&incompatible_target.stdout).unwrap();
+    assert_eq!(
+        incompatible_target["error"]["code"],
+        "error.project_catalog_cli_arguments"
+    );
+}
+
+/// Plan section 3.2: `verify --require-exclusive-availability` is the
+/// bridge-down proof, and it selects the CONFIGURED target. A live daemon
+/// holds the configured lifetime lock SHARED, so the exclusive probe finds
+/// no guard and the command refuses.
+///
+/// Both halves are asserted: the first pins that the refusal is caused by
+/// the held lock rather than by the rest of the invocation, and the second
+/// pins the refusal itself.
+#[test]
 fn verify_require_exclusive_availability_refuses_while_the_bridge_holds_the_lock() {
     let directory = tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let (state, projects_path, config_path, _index) = isolated_state_root(&root);
+    let (_state, projects_path, config_path, _index) = isolated_state_root(&root);
 
+    // `--require-exclusive-availability` SELECTS the configured target (plan
+    // section 3.2), so it carries no `--root`: the layout it probes and then
+    // verifies is the one this `--config` resolves.
     let invocation = |config: &str| {
         run(&[
             "project-catalog",
             "verify",
-            "--root",
-            state.to_str().unwrap(),
             "--config",
             config,
             "--require-exclusive-availability",

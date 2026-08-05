@@ -797,8 +797,33 @@ pub struct ProjectCatalogMigrationApplyRequestV1 {
     pub resolution_path: PathBuf,
 }
 
+/// The P6-F configured apply request (plan section 3.2, adjudication Q-B).
+///
+/// ONE target layout, not the rehearsal/protected pair. Configured apply is
+/// defined by target equality, so a dual-layout request would either be
+/// self-contradictory (the same layout in both slots, which
+/// `validate_rehearsal_separation` is built to refuse) or would silently
+/// overload the rehearsal request's meaning. The dual-layout
+/// `ProjectCatalogMigrationApplyRequestV1` keeps its rehearsal meaning
+/// unchanged.
+pub struct ProjectCatalogMigrationApplyConfiguredRequestV1 {
+    pub target_layout: ProjectCatalogMigrationResolvedLayoutV1,
+    pub report_path: PathBuf,
+    pub resolution_path: PathBuf,
+}
+
 pub struct ProjectCatalogMigrationVerifyRequestV1 {
     pub rehearsal_layout: ProjectCatalogMigrationResolvedLayoutV1,
+}
+
+/// The P6-F configured verification request (plan section 3.2).
+///
+/// The shipped `verify` entry refuses a layout without a rehearsal root, so
+/// the configured store cannot be verified through it. This entry verifies
+/// exactly one config-resolved target; the availability probe that precedes
+/// it is a CLI concern, not a facade one.
+pub struct ProjectCatalogMigrationVerifyConfiguredRequestV1 {
+    pub target_layout: ProjectCatalogMigrationResolvedLayoutV1,
 }
 
 /// The only public executable migration authority.
@@ -817,10 +842,31 @@ impl ProjectCatalogMigrationFacadeV1 {
         FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).apply_rehearsal(request)
     }
 
+    /// Apply reviewed artifacts to the CONFIGURED target (plan section 3.2).
+    ///
+    /// Retains every four-hash, report-status, resolution, recapture,
+    /// transaction, mutation-disposition, and post-commit verification check
+    /// that rehearsal apply runs, through the shared
+    /// [`FacadeCoreV1::apply_to_target`] core. It omits exactly one check,
+    /// `validate_rehearsal_separation`, because configured target equality is
+    /// this operation's definition rather than a defect.
+    pub fn apply_configured(
+        request: ProjectCatalogMigrationApplyConfiguredRequestV1,
+    ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError> {
+        FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).apply_configured(request)
+    }
+
     pub fn verify(
         request: ProjectCatalogMigrationVerifyRequestV1,
     ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
         FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).verify(request)
+    }
+
+    /// Fresh verification against the CONFIGURED target (plan section 3.2).
+    pub fn verify_configured(
+        request: ProjectCatalogMigrationVerifyConfiguredRequestV1,
+    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
+        FacadeCoreV1::new(CurrentClosedMigrationIntegrationV1).verify_configured(request)
     }
 }
 
@@ -925,21 +971,65 @@ where
         request.rehearsal_layout.validate()?;
         request.protected_layout.validate()?;
         validate_rehearsal_separation(&request.rehearsal_layout, &request.protected_layout)?;
-        validate_artifact_set(
+        self.apply_to_target(
             &request.rehearsal_layout,
+            Some(&request.protected_layout),
             &request.report_path,
             &request.resolution_path,
+        )
+    }
+
+    /// Apply to the configured target (plan section 3.2, adjudication Q-B).
+    ///
+    /// The ONLY check omitted relative to rehearsal apply is
+    /// `validate_rehearsal_separation`: under `--configured` the target and
+    /// the protected layout are the same layout by definition, so a
+    /// separation check could only ever refuse the operation it is meant to
+    /// authorize. In its place the target must carry the CONFIGURED shape
+    /// (no rehearsal root), which is the Q-C binding condition that a
+    /// configured-selected layout is config-resolved.
+    fn apply_configured(
+        &self,
+        request: ProjectCatalogMigrationApplyConfiguredRequestV1,
+    ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError> {
+        request.target_layout.validate()?;
+        if request.target_layout.rehearsal_root.is_some() {
+            return Err(unsafe_layout(
+                "configured apply requires a config-resolved layout, not a rehearsal-root layout",
+            ));
+        }
+        self.apply_to_target(
+            &request.target_layout,
             None,
-        )?;
-        validate_artifact_target(&request.protected_layout, &request.report_path)?;
-        validate_artifact_target(&request.protected_layout, &request.resolution_path)?;
-        let report_bytes = read_artifact_required(
             &request.report_path,
-            MAX_PROJECT_CATALOG_REPORT_BYTES,
-            "report",
-        )?;
-        let resolution_bytes = read_artifact_required(
             &request.resolution_path,
+        )
+    }
+
+    /// The shared apply-to-target core (plan section 3.2).
+    ///
+    /// Both apply entries route through this one body so they cannot drift
+    /// transactionally. `artifact_confinement` is the SECOND layout reviewed
+    /// artifacts must also stay clear of; rehearsal apply passes the
+    /// protected configured layout there, and configured apply passes `None`
+    /// because the target already IS that layout and
+    /// `validate_artifact_set` has confined the artifacts against it.
+    fn apply_to_target(
+        &self,
+        target_layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        artifact_confinement: Option<&ProjectCatalogMigrationResolvedLayoutV1>,
+        report_path: &Path,
+        resolution_path: &Path,
+    ) -> Result<ProjectCatalogMigrationApplyResultV1, ProjectCatalogMigrationError> {
+        validate_artifact_set(target_layout, report_path, resolution_path, None)?;
+        if let Some(confinement) = artifact_confinement {
+            validate_artifact_target(confinement, report_path)?;
+            validate_artifact_target(confinement, resolution_path)?;
+        }
+        let report_bytes =
+            read_artifact_required(report_path, MAX_PROJECT_CATALOG_REPORT_BYTES, "report")?;
+        let resolution_bytes = read_artifact_required(
+            resolution_path,
             MAX_PROJECT_CATALOG_RESOLUTION_BYTES,
             "resolution",
         )?;
@@ -960,7 +1050,7 @@ where
         {
             return Err(ProjectCatalogMigrationError::no_mutation(
                 "error.project_catalog_migration_report_not_clean",
-                "rehearsal apply requires a clean executable report",
+                "migration apply requires a clean executable report",
             ));
         }
         if report.resolution_artifact_hash != Sha256ValueV1::digest(&resolution_bytes) {
@@ -975,8 +1065,8 @@ where
                 "report and resolution are bound to different inventories",
             ));
         }
-        let result = self.integration.apply_rehearsal(
-            &request.rehearsal_layout,
+        let result = self.integration.apply_to_target(
+            target_layout,
             &report_bytes,
             &report,
             &resolution_bytes,
@@ -996,7 +1086,32 @@ where
                 "migration verify requires a rehearsal-root layout",
             ));
         }
-        let result = self.integration.verify(&request.rehearsal_layout)?;
+        self.verify_target(&request.rehearsal_layout)
+    }
+
+    /// Verify the configured target (plan section 3.2).
+    ///
+    /// Same durable-state verification as the rehearsal entry, with the
+    /// rehearsal-root requirement replaced by its configured counterpart:
+    /// the target must be config-resolved.
+    fn verify_configured(
+        &self,
+        request: ProjectCatalogMigrationVerifyConfiguredRequestV1,
+    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
+        request.target_layout.validate()?;
+        if request.target_layout.rehearsal_root.is_some() {
+            return Err(unsafe_layout(
+                "configured verify requires a config-resolved layout, not a rehearsal-root layout",
+            ));
+        }
+        self.verify_target(&request.target_layout)
+    }
+
+    fn verify_target(
+        &self,
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    ) -> Result<ProjectCatalogMigrationVerifyResultV1, ProjectCatalogMigrationError> {
+        let result = self.integration.verify(layout)?;
         validate_verify_result(&result)?;
         Ok(result)
     }
@@ -1022,7 +1137,12 @@ pub(crate) trait ClosedMigrationIntegrationV1 {
         include_sensitive_paths: bool,
     ) -> Result<PreparedPreflightV1, ProjectCatalogMigrationError>;
 
-    fn apply_rehearsal(
+    /// Apply reviewed artifacts to ONE explicit layout.
+    ///
+    /// Target-generic by construction: the integration never asked whether
+    /// its layout was a rehearsal root, so both the rehearsal and the
+    /// configured apply entries drive exactly this body.
+    fn apply_to_target(
         &self,
         layout: &ProjectCatalogMigrationResolvedLayoutV1,
         report_bytes: &[u8],
@@ -3816,7 +3936,7 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
         .preflight)
     }
 
-    fn apply_rehearsal(
+    fn apply_to_target(
         &self,
         layout: &ProjectCatalogMigrationResolvedLayoutV1,
         report_bytes: &[u8],
