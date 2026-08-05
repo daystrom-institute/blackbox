@@ -57,7 +57,14 @@ const MAX_BACKFILL_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// The plan's NEW resolution refusal code (section 7.3). A resolution naming a
 /// disposition inconsistent with the predecessor inventory refuses with it.
-const ERROR_RESOLUTION_INVALID: &str = "error.project_catalog_durable_backfill_resolution_invalid";
+///
+/// Public, with [`ERROR_STALE_POST_IMAGE`], because the production row stamper
+/// lives in the root crate (it needs the real owner schemas) and must choose
+/// between these two codes per adjudication Q-E4. Exporting the constants keeps
+/// ONE code vocabulary; a root-side string literal would be a second one that
+/// drifts silently, which section 7 forbids.
+pub const ERROR_RESOLUTION_INVALID: &str =
+    "error.project_catalog_durable_backfill_resolution_invalid";
 /// The shipped four-hash identity refusal (section 7.1). Reused verbatim
 /// rather than minting a backfill-specific twin: section 7.3 admits new codes
 /// only for the four the plan names.
@@ -65,7 +72,10 @@ const ERROR_ARTIFACT_IDENTITY: &str = "error.project_catalog_migration_artifact_
 /// The shipped staleness suffix family (section 7.2).
 const ERROR_STALE_REPORT: &str = "error.project_catalog_inventory_stale_report";
 const ERROR_STALE_RESOLUTION: &str = "error.project_catalog_inventory_stale_resolution";
-const ERROR_STALE_POST_IMAGE: &str = "error.project_catalog_inventory_stale_post_image";
+/// Apply-time divergence between the preflight post-image and what the owner
+/// actually holds (adjudication Q-E4). Public for the root-crate stamper; see
+/// [`ERROR_RESOLUTION_INVALID`].
+pub const ERROR_STALE_POST_IMAGE: &str = "error.project_catalog_inventory_stale_post_image";
 
 type BackfillResult<T> = Result<T, ProjectCatalogMigrationError>;
 
