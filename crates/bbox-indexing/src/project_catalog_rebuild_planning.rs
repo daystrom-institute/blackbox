@@ -23,6 +23,8 @@ use bbox_corpus_core::project_catalog::{CatalogOriginV2, ProjectCatalogTransacti
 use bbox_corpus_index::index::history_generations::{
     HistoryProofModeV1, HistoryScanLimitsV1, scan_commit_documents,
 };
+
+use crate::index::history_materializer::{HistoryMaterializerRequestV1, prove_source_index};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -30,7 +32,6 @@ use crate::project_catalog_inventory::{OperatorResolutionNoteV1, Sha256ValueV1};
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationError, ProjectCatalogMigrationResolvedLayoutV1,
     load_legacy_commit_namespace_inventory_asset,
-    recompute_legacy_commit_namespace_source_fingerprint,
 };
 use crate::project_catalog_rebuild::ERROR_REBUILD_PROOF_MODE;
 use crate::project_catalog_store::ProjectCatalogStore;
@@ -377,50 +378,64 @@ pub fn read_predecessor_binding(
 
 /// Compute the Finding-2 source binding, READ-ONLY.
 ///
-/// The proof-mode derivation deliberately mirrors
-/// `history_materializer::select_proof_mode` step for step, including its
-/// `state_dir/git_meta` cursor root and its use of the request's RESOLVED
-/// vector root rather than a derived one (R33F1). A preflight that proved
-/// Equality against a different vector store than the runtime writes could
-/// never be honoured at apply.
+/// The proof mode is NOT recomputed here. It comes from
+/// `history_materializer::prove_source_index`, the same function apply's
+/// materializer uses, called with the same request shape. This is the whole
+/// point: preflight exists to predict what apply will decide, so a second
+/// implementation of the derivation could report Equality and authorize a cut
+/// whose apply then lands in Drift. One function makes that disagreement
+/// impossible rather than merely unlikely, and it carries the cursor-root and
+/// RESOLVED-vector-root reasoning (R33F1) with it instead of leaving a copy
+/// here to drift.
 pub fn plan_source_binding(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
     origin: &CatalogOriginV2,
     scan_limits: HistoryScanLimitsV1,
 ) -> PlanningResult<RebuildSourceBindingV1> {
     let index_path = layout.index_root_for_rebuild();
-    let recorded = match origin {
+    let asset = match origin {
         CatalogOriginV2::FreshV2 {} => None,
-        CatalogOriginV2::MigratedV1 { transaction_id } => {
-            let asset = load_legacy_commit_namespace_inventory_asset(
-                layout.projects_path(),
-                transaction_id,
-            )?
-            .ok_or_else(|| {
+        CatalogOriginV2::MigratedV1 { transaction_id } => Some(
+            load_legacy_commit_namespace_inventory_asset(layout.projects_path(), transaction_id)?
+                .ok_or_else(|| {
                 refuse(
                     ERROR_REBUILD_PROOF_MODE,
                     format!(
                         "migrated catalog {transaction_id} has no persisted legacy \
-                         commit-namespace inventory asset, so Equality cannot be proved \
-                         and legacy history cannot be rematerialized unproved"
+                             commit-namespace inventory asset, so Equality cannot be proved \
+                             and legacy history cannot be rematerialized unproved"
                     ),
                 )
-            })?;
-            Some(asset.source_index_fingerprint)
-        }
+            })?,
+        ),
     };
-    // Same three roots `select_proof_mode` uses at apply: the outgoing index,
-    // the `state_dir/git_meta` cursor root, and the layout's RESOLVED vector
-    // root rather than one derived here (R33F1).
-    let observed = recompute_legacy_commit_namespace_source_fingerprint(
-        index_path,
-        layout.git_meta_root_for_rebuild(),
-        layout.vector_root_for_rebuild(),
+    // THE shared derivation. The request is built from the layout's own
+    // resolved roots so the preflight proves against exactly the index,
+    // cursor root, and vector store apply will consume.
+    let proof = prove_source_index(
+        asset.as_ref(),
+        &HistoryMaterializerRequestV1 {
+            index_path: index_path.to_path_buf(),
+            projects_path: layout.projects_path().to_path_buf(),
+            vector_root: layout.vector_root_for_rebuild().to_path_buf(),
+            scan_limits,
+        },
     );
-    let proof_mode = match (recorded.as_ref(), observed.as_ref()) {
-        (Some(recorded), Some(observed)) if recorded == observed => HistoryProofModeV1::Equality,
-        _ => HistoryProofModeV1::Drift,
+    let parse_fingerprint = |value: Option<String>| -> PlanningResult<Option<Sha256ValueV1>> {
+        value
+            .map(|value| {
+                Sha256ValueV1::parse(value).map_err(|error| {
+                    refuse(
+                        ERROR_REBUILD_PROOF_MODE,
+                        format!("source index fingerprint is not a sha256 value: {error}"),
+                    )
+                })
+            })
+            .transpose()
     };
+    let recorded = parse_fingerprint(proof.recorded_source_index_fingerprint)?;
+    let observed = parse_fingerprint(proof.observed_source_index_fingerprint)?;
+    let proof_mode = proof.proof_mode;
 
     let scan = scan_commit_documents(index_path, scan_limits)
         .map_err(|error| refuse(ERROR_REBUILD_PROOF_MODE, error.to_string()))?;
@@ -830,5 +845,37 @@ mod tests {
         let decoded: PathFreeRebuildResolutionV1 =
             serde_json::from_str(&rendered_resolution).unwrap();
         assert_eq!(decoded, resolution);
+    }
+
+    /// The proof-mode derivation must stay a CALL, never a copy.
+    ///
+    /// This module's whole reason for sharing `prove_source_index` is that a
+    /// second derivation could report Equality at preflight and land in Drift
+    /// at apply. That risk returns the moment someone reintroduces a local
+    /// fingerprint comparison here, and it would return silently: the
+    /// existing tests would all still pass, because a mirrored derivation
+    /// agrees with the shared one right up until one of them changes.
+    #[test]
+    fn the_proof_mode_derivation_is_shared_not_mirrored() {
+        let source = include_str!("project_catalog_rebuild_planning.rs");
+        assert!(
+            source.contains("prove_source_index("),
+            "planning must call the shared proof-mode export"
+        );
+        // The body must not recompute a fingerprint or re-decide the mode.
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module body precedes its tests");
+        for copied in [
+            "recompute_legacy_commit_namespace_source_fingerprint",
+            "HistoryProofModeV1::Equality,",
+        ] {
+            assert!(
+                !body.contains(copied),
+                "planning must not restate `{copied}`: the proof-mode derivation \
+                 belongs to history_materializer, never to a second copy"
+            );
+        }
     }
 }

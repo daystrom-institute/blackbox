@@ -425,13 +425,44 @@ pub fn create_history_generation(
     Ok(store.create_or_open(input)?)
 }
 
-/// Decide which asset proof this pass can run.
+/// The proof this pass can run over its source index, with the evidence it
+/// was decided from.
+///
+/// Exported so the Phase 6 rebuild PREFLIGHT can predict what apply will
+/// decide by calling the same function rather than restating its steps
+/// (P6-B task 5). A preflight that reported `Equality` from a second
+/// implementation could hand the operator a report authorizing a cut whose
+/// apply then lands in `Drift`, which D-036 forbids; sharing the derivation
+/// makes that disagreement impossible rather than merely unlikely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySourceIndexProofV1 {
+    pub proof_mode: HistoryProofModeV1,
+    pub recorded_source_index_fingerprint: Option<String>,
+    pub observed_source_index_fingerprint: Option<String>,
+}
+
+/// Decide which asset proof this pass can run. READ-ONLY.
 ///
 /// `Equality` requires BOTH a recorded fingerprint and a recomputed one that
 /// are equal. Anything else is `Drift`: a missing asset (no proof to gate),
 /// an owner state the Phase 1 recipe refuses to fold, or any difference at
 /// all. Drift is the weaker but always-sound direction, so every uncertain
 /// case lands there rather than claiming an equality it cannot support.
+///
+/// This scans and hashes; it writes nothing, which is what makes it safe for
+/// the read-only preflight to call.
+pub fn prove_source_index(
+    asset: Option<&LegacyCommitNamespaceInventoryAssetV1>,
+    request: &HistoryMaterializerRequestV1,
+) -> HistorySourceIndexProofV1 {
+    let (proof_mode, recorded, observed) = select_proof_mode(asset, request);
+    HistorySourceIndexProofV1 {
+        proof_mode,
+        recorded_source_index_fingerprint: recorded,
+        observed_source_index_fingerprint: observed,
+    }
+}
+
 fn select_proof_mode(
     asset: Option<&LegacyCommitNamespaceInventoryAssetV1>,
     request: &HistoryMaterializerRequestV1,

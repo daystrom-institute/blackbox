@@ -334,16 +334,6 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
         &self.index_root
     }
 
-    /// The git-cursor root the Equality fingerprint folds.
-    ///
-    /// The materializer derives this as `projects_path.parent()/git_meta`;
-    /// the layout resolves the same directory once, so the preflight
-    /// prediction and the apply-time proof read one root rather than two
-    /// independently-derived ones.
-    pub(crate) fn git_meta_root_for_rebuild(&self) -> &Path {
-        &self.git_meta_root
-    }
-
     /// The RESOLVED vector-store root. The materializer's equality proof
     /// recomputes a fingerprint over exactly this store, so deriving it
     /// anywhere else would compare against a different store and could never
