@@ -872,7 +872,9 @@ but is absent, or bound to a DIFFERENT project, when apply reaches the
 owner is current-state divergence and maps to
 `error.project_catalog_inventory_stale_post_image`, carrying the owner
 token, row id, and underlying diagnostic (`owner_row_absent`,
-`owner_row_project_id_conflict`) in the bounded message, with the
+`owner_row_project_id_conflict`, or `owner_source_moved` when a
+descriptor-confined pre-replacement recheck finds the owner source
+changed between read and rename) in the bounded message, with the
 stamping mutation disposition preserved so a refusal after earlier
 stamps truthfully reports partial mutation and remains retryable.
 `error.project_catalog_durable_backfill_resolution_invalid` remains
