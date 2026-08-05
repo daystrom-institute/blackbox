@@ -513,6 +513,52 @@ impl ProjectCatalogStore {
         }
     }
 
+    /// The publisher-disposition evidence the migration retained in its marker.
+    ///
+    /// The durable-backfill preflight needs the migration's reviewed publisher
+    /// dispositions, and the marker is their only durable source: the CLI
+    /// cannot supply them (the migration resolution artifact is not on the
+    /// backfill surface per FD-3, and receipts carry only a count).
+    ///
+    /// Deliberately narrow. It returns the evidence and nothing else of the
+    /// marker, so this does not become a general marker getter.
+    ///
+    /// An ABSENT or unreadable marker is a typed refusal, never an empty set.
+    /// An empty set verifies vacuously and would report a clean publisher check
+    /// on a store whose marker is missing or corrupt, which is the exact silent
+    /// pass the backfill's publisher verification exists to prevent.
+    ///
+    /// The journal binding is verified on this read like every other, so a
+    /// marker disagreeing with its transaction journal refuses rather than
+    /// being trusted. The mutation lock is acquired HERE rather than assumed:
+    /// the store released it at the end of `open_existing`, and the
+    /// `_locked` journal reads below require it.
+    pub(crate) fn migration_publisher_dispositions(
+        &self,
+    ) -> ProjectCatalogStoreResult<Vec<PublisherDispositionEvidenceV1>> {
+        let _mutation_lock = self
+            .owner
+            .io
+            .acquire_mutation_lock(&self.owner.paths.catalog)?;
+        let marker_bytes = self
+            .owner
+            .io
+            .read_regular_nofollow(&self.owner.paths.migration_marker, MAX_MARKER_BYTES)?
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "migrated catalog lacks its retained migration marker",
+                )
+            })?;
+        let marker: ProjectCatalogMigrationMarkerV1 =
+            decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")?;
+        let journal = self
+            .owner
+            .committed_migration_journal_for_marker_locked(&marker)?;
+        verify_migration_marker_journal_binding(&marker, &marker_bytes, &journal)?;
+        Ok(marker.publisher_dispositions)
+    }
+
     /// Force snapshot reads to fail, returning the state that was current
     /// so a caller can restore it.
     ///

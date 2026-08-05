@@ -321,9 +321,9 @@ pub fn stamp_project_catalog_owner_row(
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
 > {
     use bbox_corpus_core::project_catalog_snapshot::{
-        OWNER_PROJECT_ID_INVALID, OWNER_ROW_ABSENT, OWNER_SOURCE_UNREADABLE,
-        OWNER_SOURCE_UNWRITABLE, OwnerRowStampError, OwnerRowStampOutcomeV1, RowStampDecisionV1,
-        capture_stable_regular_tree_nofollow, stable_subsource_id, stamp_row_object,
+        OWNER_PROJECT_ID_INVALID, OWNER_ROW_ABSENT, OWNER_SOURCE_UNWRITABLE, OwnerRowStampError,
+        OwnerRowStampOutcomeV1, RowStampDecisionV1, capture_stable_regular_tree_nofollow,
+        stable_subsource_id, stamp_row_object,
     };
 
     if project_id.trim().is_empty() {

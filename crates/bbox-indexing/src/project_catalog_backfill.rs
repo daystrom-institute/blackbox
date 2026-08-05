@@ -35,15 +35,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::project_catalog_inventory::{
-    LegacyPathStoreKindV1, OperatorResolutionNoteV1, PublisherBindingDispositionV1, Sha256ValueV1,
-    digest_path, digest_published_scope, digest_publisher_full_ref,
+    LegacyPathStoreKindV1, OperatorResolutionNoteV1, Sha256ValueV1, digest_path,
+    digest_published_scope, digest_publisher_full_ref,
 };
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationError, ProjectCatalogMigrationMutationDispositionV1,
     ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogTargetSelectionV1,
     validate_artifact_set, validate_target_selection,
 };
-use crate::project_catalog_store::ProjectCatalogStore;
+use crate::project_catalog_store::{ProjectCatalogStore, PublisherDispositionEvidenceV1};
+use bbox_corpus_core::identity::PublishedScope;
 
 pub const DURABLE_BACKFILL_REPORT_VERSION_V1: u32 = 1;
 pub const DURABLE_BACKFILL_RESOLUTION_VERSION_V1: u32 = 1;
@@ -1051,8 +1052,105 @@ fn plan_backfill(
 /// is the only place a project's publisher branch is chosen. This function
 /// reads what the migration transaction installed and reports agreement or
 /// defect; it writes nothing.
+/// Exactly the five fields the publisher verification below reads, plus the
+/// disposition split it branches on.
+///
+/// Purpose-built rather than reusing `PublisherBindingDispositionV1`, and that
+/// is a correctness point rather than a style one: that type's `SeedG1` variant
+/// demands `payload_hashes` and `accepted_commit`, which the migration marker
+/// does not carry and this verification never reads. Routing marker evidence
+/// through it would mean inventing hash values to satisfy a constructor, i.e.
+/// fabricating data into a durable-evidence path. This type demands only what
+/// the marker actually has and the verification actually uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackfillPublisherDispositionV1 {
+    SeedG1 {
+        project_id: ProjectId,
+        expected_scope: PublishedScope,
+        full_ref: String,
+        generation_id: String,
+        pointer_sha256: Sha256ValueV1,
+    },
+    NoPublishedContentAcknowledged {
+        project_id: ProjectId,
+        expected_scope: PublishedScope,
+        full_ref: String,
+    },
+}
+
+impl BackfillPublisherDispositionV1 {
+    fn from_evidence(evidence: PublisherDispositionEvidenceV1) -> Self {
+        match evidence {
+            PublisherDispositionEvidenceV1::SeedG1 {
+                project_id,
+                expected_scope,
+                full_ref,
+                generation_id,
+                pointer_sha256,
+                ..
+            } => Self::SeedG1 {
+                project_id,
+                expected_scope,
+                full_ref: full_ref.to_string(),
+                generation_id: generation_id.to_string(),
+                pointer_sha256: Sha256ValueV1::parse(pointer_sha256.to_string())
+                    .expect("marker evidence carries a validated sha256"),
+            },
+            PublisherDispositionEvidenceV1::NoPublishedContentAcknowledged {
+                project_id,
+                expected_scope,
+                full_ref,
+                ..
+            } => Self::NoPublishedContentAcknowledged {
+                project_id,
+                expected_scope,
+                full_ref: full_ref.to_string(),
+            },
+        }
+    }
+
+    fn project_id(&self) -> &ProjectId {
+        match self {
+            Self::SeedG1 { project_id, .. }
+            | Self::NoPublishedContentAcknowledged { project_id, .. } => project_id,
+        }
+    }
+
+    fn expected_scope(&self) -> &PublishedScope {
+        match self {
+            Self::SeedG1 { expected_scope, .. }
+            | Self::NoPublishedContentAcknowledged { expected_scope, .. } => expected_scope,
+        }
+    }
+
+    fn full_ref(&self) -> &str {
+        match self {
+            Self::SeedG1 { full_ref, .. }
+            | Self::NoPublishedContentAcknowledged { full_ref, .. } => full_ref,
+        }
+    }
+}
+
+/// Project the migration marker's retained evidence onto the five fields the
+/// publisher verification reads.
+///
+/// A refusal here is the marker's own `error.project_catalog_migration_incomplete`,
+/// surfaced rather than swallowed: a MigratedV1 target whose marker is missing
+/// or disagrees with its transaction journal must REFUSE, never verify an empty
+/// set and report a clean publisher check.
+fn backfill_publisher_dispositions(
+    store: &ProjectCatalogStore,
+) -> BackfillResult<Vec<BackfillPublisherDispositionV1>> {
+    Ok(store
+        .migration_publisher_dispositions()
+        .map_err(|error| refuse(error.code(), error.to_string()))?
+        .into_iter()
+        .map(BackfillPublisherDispositionV1::from_evidence)
+        .collect())
+}
+
 pub fn verify_publisher_dispositions(
-    dispositions: &[PublisherBindingDispositionV1],
+    dispositions: &[BackfillPublisherDispositionV1],
     pointers_root: &Path,
     generations_root: &Path,
 ) -> BackfillResult<Vec<PublisherDispositionVerificationV1>> {
@@ -1066,9 +1164,9 @@ pub fn verify_publisher_dispositions(
         let full_ref_digest = digest_publisher_full_ref(disposition.full_ref())
             .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
         let (kind, outcome) = match disposition {
-            PublisherBindingDispositionV1::SeedG1 {
+            BackfillPublisherDispositionV1::SeedG1 {
                 generation_id,
-                pointer_hash,
+                pointer_sha256,
                 ..
             } => {
                 let outcome = if !pointer_present {
@@ -1077,7 +1175,7 @@ pub fn verify_publisher_dispositions(
                     PublisherVerificationOutcomeV1::GenerationMissing
                 } else {
                     match std::fs::read(&pointer_path) {
-                        Ok(bytes) if &Sha256ValueV1::digest(&bytes) == pointer_hash => {
+                        Ok(bytes) if &Sha256ValueV1::digest(&bytes) == pointer_sha256 => {
                             PublisherVerificationOutcomeV1::PointerPresentAndConsistent
                         }
                         Ok(_) => PublisherVerificationOutcomeV1::PointerHashMismatch,
@@ -1086,7 +1184,7 @@ pub fn verify_publisher_dispositions(
                 };
                 (PublisherDispositionKindV1::SeedG1, outcome)
             }
-            PublisherBindingDispositionV1::NoPublishedContentAcknowledged { .. } => {
+            BackfillPublisherDispositionV1::NoPublishedContentAcknowledged { .. } => {
                 // D-040: such a project must have NO accepted-publication
                 // pointer until an explicit Establish. A pointer found here is
                 // a defect, not a gap this command may fill.
@@ -1135,8 +1233,6 @@ pub struct DurableBackfillPreflightRequestV1 {
     /// OUTPUT path. A first preflight may create the canonical empty
     /// resolution here; an existing reviewed resolution is read and honoured.
     pub resolution_path: PathBuf,
-    /// The migration's reviewed publisher dispositions, verified per branch.
-    pub publisher_dispositions: Vec<PublisherBindingDispositionV1>,
     /// Probed for per-store coverage, never invoked to write. Preflight writes
     /// no project state.
     pub stamper: Arc<dyn LegacyRowStamperV1>,
@@ -1283,8 +1379,17 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             &attachment_hash,
             &resolution,
         )?;
+        // Dispositions come from the migration MARKER, not the request. The CLI
+        // has no lawful source for them: the migration resolution artifact is
+        // not on the backfill surface (FD-3) and receipts carry only a count.
+        // The marker is their durable home, written at apply as a transaction
+        // participant, journal-bound on every read, and scoped to exactly the
+        // MigratedV1 population the backfill runs against. Deriving here also
+        // means the facade reads them for the SAME target layout it already
+        // validated, so no new path input enters the surface.
+        let publisher_dispositions = backfill_publisher_dispositions(&store)?;
         let publisher_verification = verify_publisher_dispositions(
-            &request.publisher_dispositions,
+            &publisher_dispositions,
             &pointers_root,
             &generations_root,
         )?;
@@ -1827,7 +1932,6 @@ mod tests {
                     target_selection: ProjectCatalogTargetSelectionV1::Configured,
                     report_path,
                     resolution_path,
-                    publisher_dispositions: Vec::new(),
                     stamper: Arc::new(PartialStamper),
                     generated_at: "2026-08-05T00:00:00Z".to_string(),
                 },
@@ -1840,13 +1944,57 @@ mod tests {
             );
         });
 
-        receiver
+        let outcome = receiver
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect(
                 "durable-backfill preflight deadlocked: its capture must not run inside a helper \
                  that already holds the store mutation lock, because open_existing re-acquires \
                  that lock on a second descriptor",
             );
+        // It refuses, because this store has no migration marker to source
+        // publisher dispositions from. See the dedicated test below for why
+        // that refusal is the required behaviour rather than an empty set.
+        assert_eq!(outcome, Err("error.project_catalog_migration_incomplete"));
+    }
+
+    /// A target with no readable migration marker REFUSES, and never verifies
+    /// an empty disposition set.
+    ///
+    /// This is the silent pass the publisher check exists to prevent: an empty
+    /// set verifies vacuously, so a store whose marker is missing or corrupt
+    /// would report a clean publisher verification and a Clean backfill report.
+    /// The refusal reuses the marker's own code rather than minting a new one.
+    #[test]
+    fn a_target_without_a_migration_marker_refuses_rather_than_verifying_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let projects_path = root.join("live").join("projects.json");
+        std::fs::create_dir_all(projects_path.parent().unwrap()).unwrap();
+        drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+        assert!(
+            !root
+                .join("live")
+                .join("project-catalog-migration.json")
+                .exists(),
+            "the fixture must genuinely lack a marker"
+        );
+
+        let refused =
+            ProjectCatalogDurableBackfillFacadeV1::preflight(DurableBackfillPreflightRequestV1 {
+                layout: test_layout(&root),
+                target_selection: ProjectCatalogTargetSelectionV1::Configured,
+                report_path: root.join("review").join("report.json"),
+                resolution_path: root.join("review").join("resolution.json"),
+                stamper: Arc::new(PartialStamper),
+                generated_at: "2026-08-05T00:00:00Z".to_string(),
+            })
+            .expect_err("a target with no marker has no lawful disposition source");
+
+        assert_eq!(refused.code, "error.project_catalog_migration_incomplete");
+        assert!(
+            !root.join("review").join("report.json").exists(),
+            "a refused preflight must not publish a report"
+        );
     }
 
     /// Mirrors `project_catalog_rebuild_planning.rs`'s helper of the same name.
@@ -2329,37 +2477,31 @@ mod tests {
         assert_eq!(error.code, ERROR_RESOLUTION_INVALID);
     }
 
+    // Note how much SMALLER these are than the PublisherBindingDispositionV1
+    // versions they replace: no attachment_id, no accepted_commit, no
+    // payload_hashes. Those three had to be fabricated to satisfy that type's
+    // constructor even though the verification never reads them and the
+    // migration marker does not carry them - which is exactly why the
+    // marker-sourced path uses a purpose-built projection instead.
     fn seed_g1(
         project_id: ProjectId,
         generation_id: &str,
-        pointer_hash: Sha256ValueV1,
-    ) -> PublisherBindingDispositionV1 {
-        PublisherBindingDispositionV1::SeedG1 {
+        pointer_sha256: Sha256ValueV1,
+    ) -> BackfillPublisherDispositionV1 {
+        BackfillPublisherDispositionV1::SeedG1 {
             project_id,
-            attachment_id: bbox_corpus_core::project_catalog::AttachmentId::parse(
-                "att_11111111111111111111111111111111",
-            )
-            .unwrap(),
             expected_scope: PublishedScope::try_new("repo-alpha", "alpha").unwrap(),
             full_ref: "refs/heads/main".to_string(),
-            accepted_commit: "a".repeat(40),
             generation_id: generation_id.to_string(),
-            payload_hashes: crate::project_catalog_inventory::PublicationPayloadHashesV1 {
-                knowledge_manifest_hash: hash(1),
-                gap_manifest_hash: hash(2),
-                knowledge_payload_hash: hash(3),
-                gap_payload_hash: hash(4),
-            },
-            pointer_hash,
+            pointer_sha256,
         }
     }
 
-    fn acknowledged(project_id: ProjectId) -> PublisherBindingDispositionV1 {
-        PublisherBindingDispositionV1::NoPublishedContentAcknowledged {
+    fn acknowledged(project_id: ProjectId) -> BackfillPublisherDispositionV1 {
+        BackfillPublisherDispositionV1::NoPublishedContentAcknowledged {
             project_id,
             expected_scope: PublishedScope::try_new("repo-beta", "beta").unwrap(),
             full_ref: "refs/heads/main".to_string(),
-            bounded_reason: "no published content at migration".to_string(),
         }
     }
 
