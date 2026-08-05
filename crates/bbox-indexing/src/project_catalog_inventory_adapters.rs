@@ -3066,6 +3066,29 @@ fn edge_source_state(snapshot: &EdgeMigrationSnapshotV1) -> InventorySourceState
     }
 }
 
+const PROJECT_REF_COMMITMENT_DOMAIN: &[u8] = b"bbox.project-catalog.project-ref-commitment.v1";
+
+/// Domain-separated hasher for one store's per-project ref commitment.
+fn project_ref_commitment_hasher(store_token: &[u8]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update((PROJECT_REF_COMMITMENT_DOMAIN.len() as u64).to_be_bytes());
+    hasher.update(PROJECT_REF_COMMITMENT_DOMAIN);
+    hasher.update((store_token.len() as u64).to_be_bytes());
+    hasher.update(store_token);
+    hasher
+}
+
+fn hash_project_ref_pair(hasher: &mut Sha256, entity_ref: &str, document_count: u64) {
+    hasher.update((entity_ref.len() as u64).to_be_bytes());
+    hasher.update(entity_ref.as_bytes());
+    hasher.update(document_count.to_be_bytes());
+}
+
+fn finish_project_ref_commitment(hasher: Sha256) -> AdapterResult<Sha256ValueV1> {
+    Sha256ValueV1::parse(hex::encode(hasher.finalize()))
+        .map_err(|_| invalid_source("project_ref_commitment_invalid"))
+}
+
 fn capture_project_scoped_refs_lane(
     corpus: &CorpusOwnerMigrationSnapshotV1,
     vectors: &VectorMigrationSnapshotV1,
@@ -3076,50 +3099,73 @@ fn capture_project_scoped_refs_lane(
         corpus.index.source_fingerprint_sha256.as_deref(),
     );
     let vector_state = vector_source_state(vectors);
+    // One aggregate row per (store, project): a complete count plus a
+    // canonical ordered commitment, the same idiom the design fixed for
+    // commit namespaces (section 6.3). The per-document expansion this
+    // replaces exceeded MAX_PROJECT_CATALOG_ENTRIES on every real corpus.
     let mut rows = Vec::new();
     let mut tantivy_row_ids = BTreeSet::new();
     let mut vector_row_ids = BTreeSet::new();
     if matches!(corpus_state, InventorySourceStateV1::Present { .. }) {
+        // The corpus snapshot's rows come out of a BTreeMap keyed
+        // (project, entity), so the per-project fold observes each
+        // project's entities in one contiguous, canonically ordered run.
+        let mut aggregates: BTreeMap<String, (Sha256, u64, u64)> = BTreeMap::new();
         for row in &corpus.index.project_scoped_refs {
-            let project_id = ProjectId::parse(row.project_id.clone())
+            let entry = aggregates
+                .entry(row.project_id.clone())
+                .or_insert_with(|| (project_ref_commitment_hasher(b"tantivy"), 0, 0));
+            hash_project_ref_pair(&mut entry.0, &row.entity_ref, row.document_count);
+            entry.1 += 1;
+            entry.2 = entry.2.saturating_add(row.document_count);
+        }
+        for (project, (hasher, distinct_entity_count, document_count)) in aggregates {
+            let project_id = ProjectId::parse(project.clone())
                 .map_err(|_| invalid_source("tantivy_project_id_invalid"))?;
-            for occurrence in 0..row.document_count {
-                let stable_row_id = stable_observation_id_v1(
-                    "tantivy-row",
-                    &[
-                        row.project_id.as_bytes(),
-                        row.entity_ref.as_bytes(),
-                        &occurrence.to_be_bytes(),
-                    ],
-                )?;
-                let observation_id = stable_observation_id_v1(
-                    "project-ref",
-                    &[b"tantivy", stable_row_id.as_bytes()],
-                )?;
-                tantivy_row_ids.insert(observation_id.clone());
-                rows.push(ProjectScopedRefObservationV1 {
-                    observation_id,
-                    store_kind: ProjectScopedRefStoreKindV1::Tantivy,
-                    project_id: project_id.clone(),
-                    stable_row_id,
-                    entity_ref_hash: Sha256ValueV1::digest(row.entity_ref.as_bytes()),
-                });
-            }
+            let stable_row_id =
+                stable_observation_id_v1("tantivy-project-refs", &[project.as_bytes()])?;
+            let observation_id =
+                stable_observation_id_v1("project-ref", &[b"tantivy", stable_row_id.as_bytes()])?;
+            tantivy_row_ids.insert(observation_id.clone());
+            rows.push(ProjectScopedRefObservationV1 {
+                observation_id,
+                store_kind: ProjectScopedRefStoreKindV1::Tantivy,
+                project_id,
+                stable_row_id,
+                ref_commitment_sha256: finish_project_ref_commitment(hasher)?,
+                distinct_entity_count,
+                document_count,
+            });
         }
     }
     if matches!(vector_state, InventorySourceStateV1::Present { .. }) {
+        // Vector rows are keyed (route, project, entity, content); order
+        // them canonically per project before committing so the commitment
+        // is independent of the snapshot's emission order.
+        let mut per_project: BTreeMap<String, BTreeSet<(&str, &str, &str)>> = BTreeMap::new();
         for row in &vectors.project_scoped_refs {
-            let project_id = ProjectId::parse(row.project_id.clone())
+            per_project.entry(row.project_id.clone()).or_default().insert((
+                row.route.as_str(),
+                row.entity_ref.as_str(),
+                row.content_hash.as_str(),
+            ));
+        }
+        for (project, entries) in per_project {
+            let project_id = ProjectId::parse(project.clone())
                 .map_err(|_| invalid_source("vector_project_id_invalid"))?;
-            let stable_row_id = stable_observation_id_v1(
-                "vector-row",
-                &[
-                    row.route.as_bytes(),
-                    row.project_id.as_bytes(),
-                    row.entity_ref.as_bytes(),
-                    row.content_hash.as_bytes(),
-                ],
-            )?;
+            let mut hasher = project_ref_commitment_hasher(b"vector");
+            let mut distinct = BTreeSet::new();
+            let mut document_count = 0u64;
+            for (route, entity_ref, content_hash) in entries {
+                for value in [route, entity_ref, content_hash] {
+                    hasher.update((value.len() as u64).to_be_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                distinct.insert(entity_ref);
+                document_count = document_count.saturating_add(1);
+            }
+            let stable_row_id =
+                stable_observation_id_v1("vector-project-refs", &[project.as_bytes()])?;
             let observation_id =
                 stable_observation_id_v1("project-ref", &[b"vector", stable_row_id.as_bytes()])?;
             vector_row_ids.insert(observation_id.clone());
@@ -3128,7 +3174,9 @@ fn capture_project_scoped_refs_lane(
                 store_kind: ProjectScopedRefStoreKindV1::VectorMetadata,
                 project_id,
                 stable_row_id,
-                entity_ref_hash: Sha256ValueV1::digest(row.entity_ref.as_bytes()),
+                ref_commitment_sha256: finish_project_ref_commitment(hasher)?,
+                distinct_entity_count: distinct.len() as u64,
+                document_count,
             });
         }
     }
@@ -5248,6 +5296,70 @@ mod tests {
         // Strictness stays intact for owners provisioned by the daemon
         // itself: the ProjectScopedRefs Missing arm in the test above still
         // pins a Missing tantivy owner to a Missing lane.
+    }
+
+    /// Real corpora hold millions of project-scoped documents; the lane must
+    /// aggregate one row per (store, project) with counts and a canonical
+    /// ordered commitment (section 6.3 idiom). The per-document expansion
+    /// this pins against exceeded MAX_PROJECT_CATALOG_ENTRIES on the first
+    /// production host, aborting every configured preflight.
+    #[test]
+    fn project_scoped_refs_aggregate_per_project_with_counts_and_commitment() {
+        use bbox_corpus_index::index::migration_inventory::CorpusProjectScopedRefV1;
+
+        let mut corpus = namespace_corpus_snapshot();
+        corpus.index.project_scoped_refs = vec![
+            CorpusProjectScopedRefV1 {
+                project_id: "project-a".to_string(),
+                entity_ref: "project_file:project-a:x:y:0".to_string(),
+                document_count: 100_001,
+            },
+            CorpusProjectScopedRefV1 {
+                project_id: "project-a".to_string(),
+                entity_ref: "project_file:project-a:x:y:1".to_string(),
+                document_count: 2,
+            },
+            CorpusProjectScopedRefV1 {
+                project_id: "project-b".to_string(),
+                entity_ref: "project_file:project-b:z:w:0".to_string(),
+                document_count: 1,
+            },
+        ];
+        let vectors = namespace_vector_snapshot();
+
+        let lane = capture_project_scoped_refs_lane(&corpus, &vectors).unwrap();
+        let tantivy_rows: Vec<_> = lane
+            .rows
+            .iter()
+            .filter(|row| row.store_kind == ProjectScopedRefStoreKindV1::Tantivy)
+            .collect();
+        assert_eq!(tantivy_rows.len(), 2);
+        let alpha = tantivy_rows
+            .iter()
+            .find(|row| row.project_id.as_str() == "project-a")
+            .unwrap();
+        assert_eq!(alpha.distinct_entity_count, 2);
+        assert_eq!(alpha.document_count, 100_003);
+
+        // The commitment is deterministic over identical content and moves
+        // with multiplicity, so a dropped or duplicated document cannot
+        // hide behind an unchanged row.
+        let replay = capture_project_scoped_refs_lane(&corpus, &vectors).unwrap();
+        assert_eq!(lane.rows, replay.rows);
+        corpus.index.project_scoped_refs[0].document_count = 100_002;
+        let moved = capture_project_scoped_refs_lane(&corpus, &vectors).unwrap();
+        let moved_alpha = moved
+            .rows
+            .iter()
+            .find(|row| {
+                row.store_kind == ProjectScopedRefStoreKindV1::Tantivy
+                    && row.project_id.as_str() == "project-a"
+            })
+            .unwrap();
+        assert_ne!(
+            moved_alpha.ref_commitment_sha256,
+            alpha.ref_commitment_sha256
+        );
     }
 
     fn namespace_legacy_capture() -> LegacyProjectsCaptureV1 {

@@ -554,6 +554,15 @@ pub enum ProjectScopedRefStoreKindV1 {
     VectorMetadata,
 }
 
+/// One AGGREGATE row per (store, project), not one row per document.
+///
+/// Real corpora hold millions of project-scoped documents, so a per-row
+/// ledger cannot fit `MAX_PROJECT_CATALOG_ENTRIES` or the canonical
+/// inventory byte bound. The evidence follows the same idiom section 6.3
+/// fixed for commit namespaces: a complete count plus a canonical ordered
+/// commitment over the store's (entity ref, multiplicity) pairs, without
+/// embedding the refs themselves. Nothing downstream consumed per-document
+/// rows; discharge proofs recompute against the live store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectScopedRefObservationV1 {
@@ -561,7 +570,11 @@ pub struct ProjectScopedRefObservationV1 {
     pub store_kind: ProjectScopedRefStoreKindV1,
     pub project_id: ProjectId,
     pub stable_row_id: String,
-    pub entity_ref_hash: Sha256ValueV1,
+    /// Domain-separated hash over the store's canonically ordered
+    /// (entity_ref, document_count) pairs for this project.
+    pub ref_commitment_sha256: Sha256ValueV1,
+    pub distinct_entity_count: u64,
+    pub document_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6274,14 +6287,18 @@ pub(crate) mod tests {
                     store_kind: ProjectScopedRefStoreKindV1::Tantivy,
                     project_id: alpha.clone(),
                     stable_row_id: "doc_alpha".to_string(),
-                    entity_ref_hash: hash("entity"),
+                    ref_commitment_sha256: hash("entity"),
+                    distinct_entity_count: 1,
+                    document_count: 1,
                 },
                 ProjectScopedRefObservationV1 {
                     observation_id: "vector_beta".to_string(),
                     store_kind: ProjectScopedRefStoreKindV1::VectorMetadata,
                     project_id: beta.clone(),
                     stable_row_id: "vector_beta".to_string(),
-                    entity_ref_hash: hash("vector"),
+                    ref_commitment_sha256: hash("vector"),
+                    distinct_entity_count: 1,
+                    document_count: 1,
                 },
             ],
             edge_workspaces: vec![EdgeWorkspaceObservationV1 {
