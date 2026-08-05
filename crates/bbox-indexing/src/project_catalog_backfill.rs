@@ -1324,11 +1324,19 @@ pub struct ProjectCatalogDurableBackfillFacadeV1;
 impl ProjectCatalogDurableBackfillFacadeV1 {
     /// Capture the predecessor under the SHARED lifetime lock and plan.
     ///
-    /// Preflight writes no project state. It acquires the shared lifetime lock
-    /// and the store mutation lock through `capture_migration_preflight_with`
-    /// (section 4.1); a shared lifetime lock does not exclude the daemon's own
-    /// shared handle, so this runs against live configured state and still sees
-    /// a consistent capture.
+    /// Preflight writes no project state. It holds the shared lifetime lock
+    /// DIRECTLY, for the store's whole lifetime, and deliberately does NOT run
+    /// inside `capture_migration_preflight_with`. That helper's two-lock pattern
+    /// (shared lifetime plus exclusive store mutation) belongs to the
+    /// MIGRATION's raw-file capture, which opens no version-2 store and so has
+    /// no other source of pair-read coherence. A new-verb preflight whose
+    /// capture OPENS the store cannot use it: `open_existing` re-acquires that
+    /// same mutation lock on a second descriptor and self-deadlocks. Section
+    /// 4.1's requirement is met by the open itself, and the pair read is
+    /// coherent because it runs under the mutation lock the open takes; a shared
+    /// lifetime lock does not exclude the daemon's own shared handle, so this
+    /// runs against live configured state and still sees a consistent capture.
+    /// The store-open comment below records the failure that settled this.
     pub fn preflight(
         request: DurableBackfillPreflightRequestV1,
     ) -> BackfillResult<DurableBackfillPreflightReceiptV1> {
