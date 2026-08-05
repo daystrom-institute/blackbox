@@ -112,7 +112,10 @@ pub struct ProjectCatalogMigrationError {
 }
 
 impl ProjectCatalogMigrationError {
-    fn new(
+    /// Visible crate-wide so the Phase 6 durable-backfill and path-free-rebuild
+    /// facades share this ONE error boundary. A second boundary would mint a
+    /// parallel code vocabulary, which section 7 forbids.
+    pub(crate) fn new(
         code: &'static str,
         message: impl Into<String>,
         mutation_disposition: ProjectCatalogMigrationMutationDispositionV1,
@@ -133,11 +136,26 @@ impl ProjectCatalogMigrationError {
         }
     }
 
-    fn no_mutation(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn no_mutation(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(
             code,
             message,
             ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation,
+        )
+    }
+
+    /// Reclassify a refusal raised while stamping durable-store rows.
+    ///
+    /// A stamping failure is never `NoDurableMutation`: by the time the stamper
+    /// runs, any appended supersession has already committed to the pair and an
+    /// unknown prefix of the stamp set has landed. The recovery section 3.3
+    /// specifies is a fresh preflight and re-apply against the new predecessor,
+    /// which is exactly what `RetryExactPlanRequired` tells the operator, and
+    /// mislabelling it as no-mutation would invite a retry of the same stale
+    /// plan.
+    pub(crate) fn with_backfill_stamping_disposition(self) -> Self {
+        self.with_mutation_disposition(
+            ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired,
         )
     }
 
@@ -233,6 +251,40 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
     /// any store is opened. Read-only: the layout stays the single resolver.
     pub fn projects_path(&self) -> &Path {
         &self.projects_path
+    }
+
+    /// The state directory the Phase 6 backfill places its completion journal
+    /// beside (section 3.3). Crate-visible rather than public: the journal path
+    /// is code-owned, and a caller that could choose it could place the
+    /// rebuild's predecessor binding somewhere the rebuild never looks.
+    pub(crate) fn state_dir_for_backfill(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// The accepted-publication pointer root the D-040 per-disposition proof
+    /// reads. Read-only: this facade verifies publisher evidence and never
+    /// seeds it.
+    pub(crate) fn accepted_publication_pointers_for_backfill(&self) -> PathBuf {
+        self.accepted_publication_pointers.clone()
+    }
+
+    /// The accepted-publication generation root a `SeedG1` disposition's G1
+    /// evidence must be present in.
+    pub(crate) fn accepted_publication_generations_for_backfill(&self) -> PathBuf {
+        self.accepted_publication_generations.clone()
+    }
+
+    /// The index root the Phase 6 path-free rebuild scans and replaces.
+    pub(crate) fn index_root_for_rebuild(&self) -> &Path {
+        &self.index_root
+    }
+
+    /// The RESOLVED vector-store root. The materializer's equality proof
+    /// recomputes a fingerprint over exactly this store, so deriving it
+    /// anywhere else would compare against a different store and could never
+    /// reach `Equality` (R33F1).
+    pub(crate) fn vector_root_for_rebuild(&self) -> &Path {
+        &self.vector_root
     }
 
     /// Resolve configured paths without reading environment or opening stores.
