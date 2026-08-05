@@ -1073,6 +1073,128 @@ fn a_torn_stamping_pass_refuses_a_stale_reapply_then_completes_after_fresh_prefl
     }
 }
 
+/// D-026: an existing reviewed resolution is HONOURED, never rewritten, and the
+/// hash the report carries is taken over the bytes the operator actually
+/// reviewed.
+///
+/// The previous revision read the resolution, decoded it, and wrote a
+/// RE-ENCODING of it back over the operator's file at the end of every
+/// preflight. Two things were wrong with that. The reviewed artifact is the
+/// operator's evidence and preflight has no business editing it; and the
+/// recorded `resolution_artifact_hash` was a digest of bytes that had never
+/// existed on disk until preflight put them there, so any resolution whose
+/// formatting differed from serde's would have failed apply's identity check
+/// had preflight not silently normalised it first.
+#[test]
+fn a_reviewed_resolution_is_preserved_byte_for_byte_and_hashed_as_reviewed() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+
+    // The operator reviews the canonical empty resolution and saves it with
+    // their own formatting: same meaning, different bytes.
+    let canonical = fs::read(fixture.resolution_path()).unwrap();
+    let reviewed = serde_json::to_vec_pretty(
+        &serde_json::from_slice::<serde_json::Value>(&canonical).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(reviewed, canonical, "the fixture must actually differ");
+    fs::write(fixture.resolution_path(), &reviewed).unwrap();
+
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fs::read(fixture.resolution_path()).unwrap(),
+        reviewed,
+        "preflight rewrote the operator's reviewed resolution"
+    );
+    // The apply identity check is over the REVIEWED bytes, so it passes without
+    // preflight having normalised the file first.
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+}
+
+/// The report is replaced through the CONFINED helper, so a symlink planted at
+/// the report path refuses instead of being written through.
+///
+/// `std::fs::write` follows the link: it would have published the reviewed
+/// report to wherever the link pointed, leaving the explicit report path
+/// holding a link to an artifact outside the review directory.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_report_path_refuses_instead_of_being_written_through() {
+    let fixture = Fixture::new();
+    let target = fixture.artifacts.join("not-the-report.json");
+    fs::write(&target, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&target, fixture.report_path()).unwrap();
+
+    let error =
+        ProjectCatalogDurableBackfillFacadeV1::preflight(DurableBackfillPreflightRequestV1 {
+            layout: fixture.layout.clone(),
+            target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+            report_path: fixture.report_path(),
+            resolution_path: fixture.resolution_path(),
+            stamper: fixture.production_stamper(),
+            generated_at: "2026-08-05T00:00:00Z".to_string(),
+        })
+        .expect_err("a symlinked report path is not a publication target");
+
+    assert_eq!(error.code, "error.project_catalog_migration_artifact_io");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"untouched",
+        "the report must never be written through a link"
+    );
+}
+
+/// An `AlreadyApplied` answer requires the COMPLETE artifact identity, not the
+/// report's byte hash alone.
+///
+/// The journal names all four hashes and the predecessor it was applied
+/// against. Matching only the report meant a second apply carrying the same
+/// report but a DIFFERENT resolution was blessed as already-applied: the
+/// operator was told their reviewed pair had run when the pair that ran named a
+/// different resolution.
+#[test]
+fn already_applied_requires_the_complete_artifact_identity() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    // The exact same invocation is genuinely already applied.
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::AlreadyApplied
+    );
+
+    // Same report, resolution bytes the applied journal never saw.
+    let applied = fs::read(fixture.resolution_path()).unwrap();
+    let other =
+        serde_json::to_vec_pretty(&serde_json::from_slice::<serde_json::Value>(&applied).unwrap())
+            .unwrap();
+    assert_ne!(other, applied);
+    fs::write(fixture.resolution_path(), &other).unwrap();
+
+    let error = fixture
+        .apply(fixture.production_stamper())
+        .expect_err("a report whose resolution is not the applied one is not already applied");
+    assert_eq!(
+        error.code,
+        "error.project_catalog_migration_artifact_identity"
+    );
+}
+
 /// The torn stamper's `coverage` delegates, which is what keeps the fault a
 /// STAMPING fault rather than silently converting this into a coverage test.
 #[test]

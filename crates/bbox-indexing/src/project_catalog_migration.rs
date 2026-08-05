@@ -6025,7 +6025,9 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
-fn read_artifact_required(
+/// `pub(crate)` for the Phase 6 backfill facade, which binds these same confined
+/// helpers to its own byte bound and artifact labels (D-026).
+pub(crate) fn read_artifact_required(
     path: &Path,
     max_bytes: usize,
     label: &'static str,

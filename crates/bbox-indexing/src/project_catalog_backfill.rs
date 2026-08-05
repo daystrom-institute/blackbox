@@ -1451,17 +1451,27 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             (**state.attachments()).clone(),
         );
 
-        // A first preflight may create the canonical empty resolution at the
-        // explicit path (D-026); a reviewed one already there is honoured.
-        let resolution = match read_artifact_optional(&request.resolution_path)? {
-            Some(bytes) => decode_resolution(&bytes)?,
-            None => DurableBackfillResolutionV1::empty(backfill_inventory_hash(
-                epoch,
-                &catalog_hash,
-                &attachment_hash,
-                &effective_legacy_bindings(&attachments.legacy_path_bindings)?,
-            )),
-        };
+        // A first preflight may CREATE the canonical empty resolution at the
+        // explicit path (D-026); a reviewed one already there is honoured and
+        // never rewritten. Its EXACT bytes are carried forward rather than a
+        // re-encoding of the decoded value: those bytes are what the operator
+        // reviewed and what apply will hash, so re-encoding would both destroy
+        // the reviewed artifact and record a digest of bytes that never existed
+        // on disk.
+        let (resolution, resolution_bytes) =
+            match read_backfill_artifact_optional(&request.resolution_path, RESOLUTION_LABEL)? {
+                Some(bytes) => (decode_resolution(&bytes)?, bytes),
+                None => {
+                    let empty = DurableBackfillResolutionV1::empty(backfill_inventory_hash(
+                        epoch,
+                        &catalog_hash,
+                        &attachment_hash,
+                        &effective_legacy_bindings(&attachments.legacy_path_bindings)?,
+                    ));
+                    let bytes = encode_resolution(&empty)?;
+                    (empty, bytes)
+                }
+            };
         let plan = plan_backfill(
             &attachments,
             epoch,
@@ -1488,7 +1498,6 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             .filter(|row| row.outcome.is_defect())
             .count() as u64;
 
-        let resolution_bytes = encode_resolution(&resolution)?;
         let resolution_artifact_hash = Sha256ValueV1::digest(&resolution_bytes);
         // The pair moves ONLY on an appended supersession. Mappable stamping
         // writes durable stores and leaves the catalog epoch alone, so a
@@ -1547,8 +1556,19 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             completion_journal_relative_path: BACKFILL_COMPLETION_JOURNAL_FILE.to_string(),
         };
         let report_bytes = encode_report(&report)?;
-        write_artifact(&request.report_path, &report_bytes)?;
-        write_artifact(&request.resolution_path, &resolution_bytes)?;
+        // The resolution lands FIRST, and only if absent. Ordered that way so a
+        // published report always names a resolution that is on disk with
+        // exactly the bytes the report's hash was taken over; the create-only
+        // write doubles as the proof that nothing rewrote the reviewed
+        // resolution between this preflight's read and its report.
+        write_backfill_artifact_if_absent(
+            &request.resolution_path,
+            &resolution_bytes,
+            RESOLUTION_LABEL,
+        )?;
+        // The report is preflight's OWN output: rerunning against fresh state
+        // must replace it, and the replacement is atomic and confined.
+        write_backfill_artifact_replacing(&request.report_path, &report_bytes, REPORT_LABEL)?;
 
         Ok(DurableBackfillPreflightReceiptV1 {
             version: DURABLE_BACKFILL_REPORT_VERSION_V1,
@@ -1616,8 +1636,9 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         let projects_path = request.layout.projects_path().to_path_buf();
         let state_dir = request.layout.state_dir_for_backfill().to_path_buf();
 
-        let report_bytes = read_artifact(&request.report_path)?;
-        let resolution_bytes = read_artifact(&request.resolution_path)?;
+        let report_bytes = read_backfill_artifact_required(&request.report_path, REPORT_LABEL)?;
+        let resolution_bytes =
+            read_backfill_artifact_required(&request.resolution_path, RESOLUTION_LABEL)?;
         let report = decode_report(&report_bytes)?;
         let resolution = decode_resolution(&resolution_bytes)?;
         if report.status == DurableBackfillStatusV1::Refused {
@@ -1638,12 +1659,34 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         let attachment_hash = Sha256ValueV1::parse(state.attachments_sha256().to_string())
             .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
 
+        let report_artifact_hash = Sha256ValueV1::digest(&report_bytes);
+        let resolution_artifact_hash = Sha256ValueV1::digest(&resolution_bytes);
         // An already-applied backfill is recognised by its journal rather than
         // by re-deriving state, so a re-invocation is a cheap no-op instead of
-        // a second stamping pass.
+        // a second stamping pass. The recognition is the COMPLETE identity, not
+        // the report's byte hash alone: the journal names all four hashes and
+        // the predecessor it was applied against, and the report names three of
+        // them, so a match on the report alone would report AlreadyApplied for
+        // an invocation whose RESOLUTION bytes are unrelated to the one that
+        // actually ran, silently blessing an artifact pair that was never
+        // applied together.
         if let Some(existing) = read_backfill_completion_journal(&state_dir)?
-            && existing.identity.report_artifact_hash == Sha256ValueV1::digest(&report_bytes)
+            && existing.identity.report_artifact_hash == report_artifact_hash
         {
+            if existing.identity.resolution_artifact_hash != resolution_artifact_hash
+                || report.resolution_artifact_hash != resolution_artifact_hash
+                || existing.identity.inventory_hash != report.inventory_hash
+                || existing.identity.plan_hash != report.plan_hash
+                || existing.predecessor_catalog_epoch != report.predecessor_catalog_epoch
+                || existing.predecessor_catalog_hash != report.predecessor_catalog_hash
+                || existing.predecessor_attachment_hash != report.predecessor_attachment_hash
+            {
+                return Err(refuse(
+                    ERROR_ARTIFACT_IDENTITY,
+                    "the completion journal names this report but a different \
+                     artifact identity, so this invocation was never applied",
+                ));
+            }
             return Ok(DurableBackfillApplyReceiptV1 {
                 version: DURABLE_BACKFILL_REPORT_VERSION_V1,
                 outcome: DurableBackfillApplyOutcomeV1::AlreadyApplied,
@@ -1669,7 +1712,7 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         // reproduce this inventory hash against any other.
         if plan.inventory_hash != report.inventory_hash
             || plan.plan_hash != report.plan_hash
-            || Sha256ValueV1::digest(&resolution_bytes) != report.resolution_artifact_hash
+            || resolution_artifact_hash != report.resolution_artifact_hash
             || catalog_hash != report.predecessor_catalog_hash
             || attachment_hash != report.predecessor_attachment_hash
         {
@@ -1773,8 +1816,8 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             identity: BackfillArtifactIdentityV1 {
                 inventory_hash: plan.inventory_hash,
                 plan_hash: plan.plan_hash,
-                report_artifact_hash: Sha256ValueV1::digest(&report_bytes),
-                resolution_artifact_hash: Sha256ValueV1::digest(&resolution_bytes),
+                report_artifact_hash,
+                resolution_artifact_hash,
             },
         };
         write_backfill_completion_journal(&state_dir, &journal)?;
@@ -1939,37 +1982,65 @@ fn decode_resolution(bytes: &[u8]) -> BackfillResult<DurableBackfillResolutionV1
     Ok(resolution)
 }
 
-fn read_artifact(path: &Path) -> BackfillResult<Vec<u8>> {
-    read_artifact_optional(path)?.ok_or_else(|| {
-        refuse(
-            ERROR_STALE_REPORT,
-            "a required backfill artifact is not present at its explicit path",
-        )
-    })
+/// D-026 artifact discipline, borrowed rather than restated.
+///
+/// These four wrappers exist only to bind the backfill's byte bound and its
+/// artifact labels to the migration's confined artifact helpers. Those helpers
+/// are the ones D-026 describes: they resolve the parent through a NOFOLLOW
+/// directory handle, refuse a non-regular or symlinked artifact, read BOUNDED
+/// (never allocating the whole file before checking its size), replace
+/// atomically under an exclusive parent lock, and re-prove the parent was not
+/// swapped mid-operation. The local `std::fs::read` / `std::fs::write` pair
+/// they replace had none of that: it allocated first and bounded second, it
+/// followed symlinks, and a partial write left a torn artifact behind.
+const REPORT_LABEL: &str = "durable backfill report";
+const RESOLUTION_LABEL: &str = "durable backfill resolution";
+
+fn read_backfill_artifact_required(path: &Path, label: &'static str) -> BackfillResult<Vec<u8>> {
+    crate::project_catalog_migration::read_artifact_required(
+        path,
+        MAX_BACKFILL_ARTIFACT_BYTES,
+        label,
+    )
 }
 
-fn read_artifact_optional(path: &Path) -> BackfillResult<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(bytes) if bytes.len() > MAX_BACKFILL_ARTIFACT_BYTES => Err(refuse(
-            ERROR_STALE_REPORT,
-            "backfill artifact exceeds its byte bound",
-        )),
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(refuse(
-            ERROR_STALE_REPORT,
-            format!("backfill artifact cannot be read: {error}"),
-        )),
-    }
+fn read_backfill_artifact_optional(
+    path: &Path,
+    label: &'static str,
+) -> BackfillResult<Option<Vec<u8>>> {
+    crate::project_catalog_migration::read_artifact_optional(
+        path,
+        MAX_BACKFILL_ARTIFACT_BYTES,
+        label,
+    )
 }
 
-fn write_artifact(path: &Path, bytes: &[u8]) -> BackfillResult<()> {
-    std::fs::write(path, bytes).map_err(|error| {
-        refuse(
-            ERROR_STALE_REPORT,
-            format!("backfill artifact cannot be written: {error}"),
-        )
-    })
+/// Create the artifact, or accept it unchanged. Byte-different existing content
+/// REFUSES: a reviewed resolution is the operator's, not preflight's to rewrite.
+fn write_backfill_artifact_if_absent(
+    path: &Path,
+    bytes: &[u8],
+    label: &'static str,
+) -> BackfillResult<()> {
+    crate::project_catalog_migration::write_artifact_if_absent(
+        path,
+        bytes,
+        MAX_BACKFILL_ARTIFACT_BYTES,
+        label,
+    )
+}
+
+fn write_backfill_artifact_replacing(
+    path: &Path,
+    bytes: &[u8],
+    label: &'static str,
+) -> BackfillResult<()> {
+    crate::project_catalog_migration::write_artifact_replacing(
+        path,
+        bytes,
+        MAX_BACKFILL_ARTIFACT_BYTES,
+        label,
+    )
 }
 
 #[cfg(test)]
@@ -2084,6 +2155,68 @@ mod tests {
         assert!(
             !root.join("review").join("report.json").exists(),
             "a refused preflight must not publish a report"
+        );
+    }
+
+    /// D-026: the reviewed artifacts are read through the CONFINED BOUNDED
+    /// helper, so a symlinked artifact and an oversize one both refuse.
+    ///
+    /// The local `std::fs::read` this replaced did neither. It followed the
+    /// link, reading whatever the link pointed at as though it were the
+    /// reviewed artifact, and it allocated the entire file into memory before
+    /// comparing its length against the bound - so the bound documented an
+    /// intent the code did not have. The refusals land before the marker check,
+    /// which is why this fixture needs no migration marker.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_or_oversize_reviewed_resolution_refuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let projects_path = root.join("live").join("projects.json");
+        std::fs::create_dir_all(projects_path.parent().unwrap()).unwrap();
+        drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+        let review = root.join("review");
+        std::fs::create_dir_all(&review).unwrap();
+
+        let preflight = || {
+            ProjectCatalogDurableBackfillFacadeV1::preflight(DurableBackfillPreflightRequestV1 {
+                layout: test_layout(&root),
+                target_selection: ProjectCatalogTargetSelectionV1::Configured,
+                report_path: review.join("report.json"),
+                resolution_path: review.join("resolution.json"),
+                stamper: Arc::new(PartialStamper),
+                generated_at: "2026-08-05T00:00:00Z".to_string(),
+            })
+        };
+
+        // A LINK where the reviewed resolution should be. Following it would
+        // read an artifact the operator never placed at the explicit path.
+        std::fs::write(review.join("elsewhere.json"), b"{\"version\":1}").unwrap();
+        std::os::unix::fs::symlink(
+            review.join("elsewhere.json"),
+            review.join("resolution.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            preflight()
+                .expect_err("a symlinked artifact is not a reviewed artifact")
+                .code,
+            "error.project_catalog_migration_artifact_io"
+        );
+        std::fs::remove_file(review.join("resolution.json")).unwrap();
+
+        // And one byte past the bound refuses on the bound, having read at most
+        // one byte beyond it.
+        std::fs::write(
+            review.join("resolution.json"),
+            vec![b'x'; MAX_BACKFILL_ARTIFACT_BYTES + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            preflight()
+                .expect_err("an oversize artifact is refused, never decoded")
+                .code,
+            "error.project_catalog_migration_artifact_io"
         );
     }
 
