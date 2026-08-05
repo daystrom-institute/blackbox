@@ -1027,3 +1027,501 @@ fn the_torn_stamper_delegates_coverage() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The path-free rebuild chain (P6-C)
+// ---------------------------------------------------------------------------
+//
+// Everything below stages history AFTER the migration, deliberately.
+//
+// The migration REFUSES to capture an index whose schema marker is not the
+// running `INDEX_SCHEMA_VERSION` (`capture_index` marks it Corrupt, which
+// surfaces as four `immutable_lane_corrupt` inventory refusals with no
+// resolution kind). The destructive replacement, in turn, only runs when that
+// marker DOES mismatch. So the marker is stamped after the migration has
+// captured, which is also what puts the proof in `Drift`: the recorded
+// fingerprint folds a Present owner state and the recomputed one folds a
+// Corrupt state. Drift is the mode a real migrate-then-rebuild chain reaches on
+// this code, and D-036 refuses it for a CUT-authorizing offline apply, which is
+// exactly what the startup gate below is asserted to refuse too.
+//
+// Staging after the migration is what makes four-bucket coverage reachable at
+// all: in Drift mode "a namespace ABSENT from the asset carries no asset
+// constraint", so post-migration namespaces classify normally against the
+// catalog instead of having to satisfy the migration's own namespace rules.
+
+/// Primary namespace of a repo-history record: the manifest's OWNED bucket.
+const REBUILD_OWNED_NAMESPACE: &str = "rebuild-owned-namespace";
+/// A COMPATIBILITY namespace of that same record. It has no catalog `Ready`
+/// owner of its own and is reachable only through the manifest's
+/// `compatibility_generation_ids` bucket (D-037) - the bucket a verifier that
+/// walked `Ready` requirements would silently skip.
+const REBUILD_COMPAT_NAMESPACE: &str = "rebuild-compat-namespace";
+/// Named by an ambiguous-namespace record: an `rhq_`-id'd quarantine
+/// generation in the AMBIGUOUS bucket.
+const REBUILD_AMBIGUOUS_NAMESPACE: &str = "rebuild-ambiguous-namespace";
+/// Claimed by nothing: the UNCLAIMED bucket, whose only durable owner is
+/// likewise the manifest.
+const REBUILD_UNCLAIMED_NAMESPACE: &str = "rebuild-orphan-namespace";
+
+/// The marker the staged index is left at.
+///
+/// It must differ from the running `INDEX_SCHEMA_VERSION`: that difference is
+/// what `schema_was_reset()` observes, and without it the shared driver returns
+/// `NotRequired` and no destructive pass runs at all.
+const REBUILD_OUTGOING_SCHEMA: &str = "outgoing-test-schema";
+
+/// Host path baked into the staged commit documents, so a consumer can assert
+/// the re-emitted documents do not reproduce it.
+const REBUILD_OUTGOING_HOST_PATH: &str = "/host-checkouts/outgoing-fixture";
+
+/// A migrated root carrying rebuildable legacy history in all four dispositions.
+struct RebuildFixture {
+    fixture: Fixture,
+}
+
+impl RebuildFixture {
+    /// Build the root, stage the history, bind the records that put each
+    /// namespace in a DIFFERENT manifest bucket, run the real backfill, and
+    /// leave the index at the outgoing marker.
+    ///
+    /// ORDER IS LOAD-BEARING at three points, each of which refuses if moved:
+    ///
+    /// 1. the records are bound BEFORE the backfill, because the backfill
+    ///    journal binds the epoch it observed and a `transact` afterwards makes
+    ///    the rebuild's predecessor stale;
+    /// 2. the marker is stamped AFTER the backfill, because a backfill whose
+    ///    capture reached a marker-mismatched index would refuse it as corrupt;
+    /// 3. the marker is stamped AFTER every index write, because reopening a
+    ///    marker-mismatched index triggers the very replacement under test.
+    fn new() -> Self {
+        let fixture = Fixture::new();
+        let paths = fixture.layout.rebuild_index_paths();
+        for (namespace, commits) in [
+            (REBUILD_OWNED_NAMESPACE, 3),
+            (REBUILD_COMPAT_NAMESPACE, 2),
+            (REBUILD_AMBIGUOUS_NAMESPACE, 2),
+            (REBUILD_UNCLAIMED_NAMESPACE, 1),
+        ] {
+            stage_commit_documents(&paths.index_root, namespace, commits);
+        }
+        bind_rebuild_history_records(&fixture.layout);
+
+        // The real backfill, whose journal is the rebuild preflight's
+        // predecessor binding.
+        let stamper = fixture.production_stamper();
+        fixture.preflight(stamper.clone()).unwrap();
+        fixture.apply(stamper).unwrap();
+
+        // Restore the knowledge and thread stores to their valid EMPTY form.
+        //
+        // The backfill fixture writes deliberately minimal owner rows: enough
+        // for the stamper to find and stamp, and no more. The rebuild's drive
+        // runs the real full reindex pass, which parses those stores properly
+        // and rejects a row missing required fields. The stamping is already
+        // proven by the backfill tests above and is not this chain's subject,
+        // so the rows are retired here rather than being grown into full
+        // documents that would make the backfill fixture harder to read for a
+        // property it does not test.
+        let owners = fixture.layout.stamper_owner_paths();
+        write(
+            &owners.knowledge_store_path,
+            br#"{"version":1,"entries":[]}"#,
+        );
+        write(&owners.thread_store_path, br#"{"version":1,"threads":[]}"#);
+
+        write(
+            &paths.index_root.join("schema_version.txt"),
+            format!("{REBUILD_OUTGOING_SCHEMA}\n").as_bytes(),
+        );
+        Self { fixture }
+    }
+
+    fn index_root(&self) -> PathBuf {
+        self.fixture.layout.rebuild_index_paths().index_root
+    }
+
+    fn store(&self) -> ProjectCatalogStore {
+        ProjectCatalogStore::open_existing(self.fixture.layout.projects_path()).unwrap()
+    }
+
+    /// Drive the replacement exactly as daemon startup does: classify recovery
+    /// before the open, inject the SAME guard, open the index, then hand the
+    /// SHARED driver the resume signal.
+    ///
+    /// It is composed here rather than reached through the offline apply
+    /// because the offline apply re-proves D-036 Equality immediately before
+    /// mutation and this chain is in Drift; the driver, the guard, and the
+    /// committer being exercised are the same ones either way.
+    fn drive_replacement(
+        &self,
+    ) -> blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1 {
+        use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+        use bbox_indexing::index::schema_rebuild::{
+            catalog_schema_replacement_guard, recover_rebuild_manifest_before_open,
+        };
+
+        let paths = self.fixture.layout.rebuild_index_paths();
+        let store = Arc::new(ProjectCatalogStore::open_existing(&paths.projects_path).unwrap());
+        let resume = recover_rebuild_manifest_before_open(&paths.index_root).unwrap();
+        let guard = catalog_schema_replacement_guard(
+            store.clone(),
+            HistoryScanLimitsV1::default(),
+            paths.vector_root.clone(),
+        );
+        let records: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider> = Arc::new(
+            bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new(store.clone()),
+        );
+        let index =
+            bbox_corpus_index::index::TranscriptIndex::open_or_create_with_code_source_store_path(
+                &paths.index_root,
+                Vec::new(),
+                None,
+                paths.projects_path.clone(),
+                paths.code_source_root.clone(),
+                paths.knowledge_path.clone(),
+                paths.threads_path.clone(),
+                paths.roadmap_path.clone(),
+                records.clone(),
+                Some(guard),
+            )
+            .unwrap();
+        let broker = Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
+            Arc::new(
+                bbox_indexing::checkout_access_v2::V2CatalogCheckoutAccessAuthority::new(store),
+            ),
+            bbox_indexing::checkout_access::CheckoutAccessObservations::in_memory(),
+        ));
+        let writer =
+            bbox_indexing::index::writer_actor::IndexWriterActor::spawn_for_with_checkout_access(
+                &index, records, broker,
+            );
+        blackbox::project_catalog_rebuild_admin::drive_catalog_schema_replacement(
+            &index, &writer, &resume,
+        )
+        .unwrap()
+    }
+}
+
+/// Bind the catalog records that put each staged namespace in a different
+/// manifest bucket.
+///
+/// Repo-history and ambiguous-namespace records are NOT owner-controlled, so a
+/// regular `transact` may add them. The ORIGIN, which is owner-controlled and
+/// refuses closure mutation, came from the real migration.
+fn bind_rebuild_history_records(layout: &ProjectCatalogMigrationResolvedLayoutV1) {
+    use bbox_corpus_core::project_catalog::{
+        AmbiguousNamespaceRecord, AmbiguousNamespaceStatus, CommitNamespace, RepoHistoryAuthority,
+        RepoHistoryId, RepoHistoryMaterialization, RepoHistoryRecord,
+    };
+
+    let namespace = |value: &str| CommitNamespace::parse(value.to_string()).unwrap();
+    let store = ProjectCatalogStore::open_existing(layout.projects_path()).unwrap();
+    let epoch = store.snapshot().unwrap().epoch();
+    store
+        .transact(epoch, |catalog, _attachments| {
+            let owned = RepoHistoryId::parse(format!("rh_{}", "a1".repeat(16))).unwrap();
+            catalog.repo_histories.insert(
+                owned.clone(),
+                RepoHistoryRecord {
+                    repo_history_id: owned.clone(),
+                    authority: RepoHistoryAuthority::LegacyNamespace(namespace(
+                        REBUILD_OWNED_NAMESPACE,
+                    )),
+                    primary_namespace: namespace(REBUILD_OWNED_NAMESPACE),
+                    // The compatibility namespace rides on the SAME record.
+                    // That is what gives it a generation with no catalog
+                    // `Ready` owner of its own.
+                    compatibility_namespaces: [namespace(REBUILD_COMPAT_NAMESPACE)]
+                        .into_iter()
+                        .collect(),
+                    materialization: RepoHistoryMaterialization::NotBuilt,
+                },
+            );
+            // `validate_catalog` requires an ambiguous record to name at least
+            // two EXISTING candidates, so the second candidate is a real
+            // record the migration already installed.
+            let other = catalog
+                .repo_histories
+                .keys()
+                .find(|id| *id != &owned)
+                .expect("the migration installed repo-history records")
+                .clone();
+            catalog.ambiguous_namespaces.insert(
+                namespace(REBUILD_AMBIGUOUS_NAMESPACE),
+                AmbiguousNamespaceRecord {
+                    namespace: namespace(REBUILD_AMBIGUOUS_NAMESPACE),
+                    candidate_repo_history_ids: [owned, other].into_iter().collect(),
+                    status: AmbiguousNamespaceStatus::Quarantined,
+                    materialization: Default::default(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Append commit documents carrying BOTH path-bearing fields, mirroring what a
+/// pre-cut `build_commit_doc` wrote.
+fn stage_commit_documents(index_path: &Path, namespace: &str, commits: usize) {
+    let index = tantivy::Index::open_in_dir(index_path).unwrap();
+    bbox_corpus_index::index::register_code_tokenizer(&index);
+    let schema = index.schema();
+    let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+    let field = |name: &str| schema.get_field(name).unwrap();
+    for ordinal in 0..commits {
+        let message = format!("carried subject {namespace} {ordinal}\n\nbody {ordinal}");
+        let sha = hex::encode(Sha256::digest(format!("{namespace}:{ordinal}").as_bytes()))[..40]
+            .to_string();
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(field("doc_type"), "commit");
+        doc.add_text(field("chunk_kind"), "git_message");
+        doc.add_text(field("entity_id"), format!("commit:{namespace}:{sha}"));
+        doc.add_text(field("content"), &message);
+        doc.add_text(
+            field("path_tokens"),
+            message.lines().next().unwrap_or_default(),
+        );
+        doc.add_text(
+            field("chunk_hash"),
+            hex::encode(Sha256::digest(message.as_bytes())),
+        );
+        doc.add_text(field("parser_version"), "test-parser");
+        doc.add_text(field("repo_id"), namespace);
+        doc.add_text(field("commit_sha"), &sha);
+        doc.add_text(field("commit_author_name"), "History Fixture");
+        doc.add_text(field("commit_author_email"), "fixture@example.invalid");
+        doc.add_text(field("session_id"), "");
+        doc.add_text(field("account"), "git");
+        doc.add_text(field("project"), REBUILD_OUTGOING_HOST_PATH);
+        doc.add_text(field("file_path"), "git:proj-outgoing");
+        doc.add_text(field("role"), "commit");
+        doc.add_u64(field("byte_offset"), 0);
+        doc.add_u64(field("is_subagent"), 0);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().unwrap();
+}
+
+/// Run one drive on a worker thread behind a bounded wait.
+///
+/// Not stylistic: every defect this phase found in this code path was a lock
+/// that never returns, and an unbounded test surfaces that as an anonymous
+/// harness kill naming no call. The panic names the mechanism, so the next
+/// occurrence is diagnosed from the failure message alone.
+fn watchdogged<T: Send + 'static>(
+    what: &'static str,
+    drive: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(drive());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(120))
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what} did not return within 120s: it is blocked, most likely re-acquiring \
+                 a store or lifetime lock it already holds"
+            )
+        })
+}
+
+/// The SHARED driver rebuilds legacy history into EVERY manifest bucket.
+///
+/// The standing question for this phase is "has anything actually executed this
+/// end to end?", and this is the answer for the replacement half: a real
+/// migrated root, a real backfill journal, the real guard, the real P3-E
+/// committer, and the one shared `drive_catalog_schema_replacement` that daemon
+/// startup also calls. Nothing here is a synthetic manifest.
+///
+/// Four buckets in one pass is the load-bearing part (D-037). A compatibility
+/// generation has no catalog `Ready` owner, so any verification driven from
+/// `Ready` requirements would report success having skipped it, and the
+/// manifest is that generation's only durable identity and GC root.
+#[test]
+fn the_shared_driver_rebuilds_legacy_history_into_every_manifest_bucket() {
+    use bbox_corpus_index::index::history_generations::HistoryProofModeV1;
+    use bbox_indexing::project_catalog_rebuild::{
+        RebuildManifestBucketV1, read_committed_rebuild_manifest, require_equality_proof_mode,
+        verify_manifest_generations,
+    };
+    use blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1;
+    use std::collections::BTreeSet;
+
+    // The fixture is held by THIS binding for the whole test. It owns the
+    // tempdir, and an earlier shape that moved it into the watchdog closure
+    // destroyed the root the instant the worker thread finished: every
+    // assertion afterwards ran against a deleted directory, which reads
+    // identically to "the manifest was never written".
+    let fixture = Arc::new(RebuildFixture::new());
+    let index_root = fixture.index_root();
+    let drive = watchdogged("the shared replacement driver", {
+        let handle = fixture.clone();
+        move || handle.drive_replacement()
+    });
+    // `NotRequired` would mean the index was never reset, so nothing was
+    // rebuilt and any manifest found afterwards was inherited rather than
+    // produced by this pass.
+    assert_eq!(drive, CatalogSchemaReplacementDriveV1::Completed);
+
+    let manifest = read_committed_rebuild_manifest(&index_root)
+        .expect("the P3-E pass committed the manifest, not merely prepared it");
+    let verified = verify_manifest_generations(&index_root, &manifest)
+        .expect("every named generation is present and hash-verified");
+    let buckets = verified
+        .iter()
+        .map(|row| row.bucket)
+        .collect::<BTreeSet<_>>();
+    for bucket in [
+        RebuildManifestBucketV1::Owned,
+        RebuildManifestBucketV1::Compatibility,
+        RebuildManifestBucketV1::Ambiguous,
+        RebuildManifestBucketV1::Unclaimed,
+    ] {
+        assert!(
+            buckets.contains(&bucket),
+            "bucket {bucket:?} carries no verified generation: {verified:?}"
+        );
+    }
+
+    // The proof mode this chain actually reaches, pinned rather than assumed.
+    // The migration refuses to capture a marker-mismatched index, so the
+    // recorded fingerprint always folds a Present owner state; the replacement
+    // only runs when that marker DOES mismatch, so the recomputed one folds a
+    // Corrupt state. `Drift` is the consequence, and D-036 refuses it for a
+    // cut-authorizing offline apply. Pinned here so that if the fingerprint
+    // recipe or the reset trigger changes, this row names what changed instead
+    // of a downstream test failing for an unrelated-looking reason.
+    assert_eq!(manifest.prepared.proof_mode, HistoryProofModeV1::Drift);
+    let refusal = require_equality_proof_mode(&manifest).unwrap_err();
+    assert_eq!(refusal.code, "error.project_catalog_rebuild_proof_mode");
+}
+
+/// EVERY bucket, including the one a `Ready` walk cannot see.
+///
+/// The compatibility generation is removed specifically because it is the
+/// bucket with no catalog record naming it: a verifier that walked `Ready`
+/// requirements would pass this state, and the generation would be both
+/// unverified and sweepable, since the manifest is its only GC root.
+#[test]
+fn manifest_verification_refuses_an_absent_generation_in_the_compatibility_bucket() {
+    use bbox_indexing::project_catalog_rebuild::{
+        RebuildManifestBucketV1, read_committed_rebuild_manifest, verify_manifest_generations,
+    };
+
+    let fixture = Arc::new(RebuildFixture::new());
+    let index_root = fixture.index_root();
+    watchdogged("the shared replacement driver", {
+        let handle = fixture.clone();
+        move || handle.drive_replacement()
+    });
+
+    let manifest = read_committed_rebuild_manifest(&index_root).unwrap();
+    let verified = verify_manifest_generations(&index_root, &manifest).unwrap();
+    let compatibility = verified
+        .iter()
+        .find(|row| row.bucket == RebuildManifestBucketV1::Compatibility)
+        .expect("the fixture produced a compatibility generation");
+
+    // Remove the generation's stored record. Its manifest row survives, which
+    // is the state the refusal exists for: the manifest still CLAIMS it.
+    let removed = remove_generation_record(&index_root, &compatibility.generation_id);
+    assert!(removed, "the generation record was located and removed");
+
+    let refusal = verify_manifest_generations(&index_root, &manifest).unwrap_err();
+    assert_eq!(
+        refusal.code,
+        "error.project_catalog_rebuild_generation_unverified"
+    );
+    assert!(
+        refusal.message.contains(&compatibility.generation_id),
+        "the refusal names the generation it could not verify: {}",
+        refusal.message
+    );
+}
+
+/// Delete the on-disk record for one generation id, whatever the store named
+/// the file. Returns whether anything was removed.
+fn remove_generation_record(index_root: &Path, generation_id: &str) -> bool {
+    let root =
+        bbox_corpus_index::index::history_generations::generations_root_for_index(index_root)
+            .unwrap();
+    let mut removed = false;
+    for entry in fs::read_dir(&root).unwrap().flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy() != generation_id {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).unwrap();
+        } else {
+            fs::remove_file(&path).unwrap();
+        }
+        removed = true;
+    }
+    removed
+}
+
+/// The startup gate refuses a cut-time manifest whose proof mode is not
+/// Equality (P6-C task 1, D-036), driven through the real gate against a real
+/// committed manifest.
+#[test]
+fn the_startup_gate_refuses_a_non_equality_cut_time_manifest() {
+    let fixture = Arc::new(RebuildFixture::new());
+    let index_root = fixture.index_root();
+    watchdogged("the shared replacement driver", {
+        let handle = fixture.clone();
+        move || handle.drive_replacement()
+    });
+    let layout_store = fixture.store();
+
+    let refusal = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+        &layout_store,
+        &index_root,
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, "error.project_catalog_rebuild_proof_mode");
+}
+
+/// The startup gate refuses a migrated store carrying legacy namespaces with
+/// no committed rebuild manifest at all.
+#[test]
+fn the_startup_gate_refuses_a_migrated_store_with_no_rebuild_manifest() {
+    let fixture = Fixture::new();
+    let index_root = fixture.layout.rebuild_index_paths().index_root;
+    let store = ProjectCatalogStore::open_existing(fixture.layout.projects_path()).unwrap();
+
+    let refusal = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+        &store,
+        &index_root,
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal.code,
+        "error.project_catalog_rebuild_manifest_missing"
+    );
+}
+
+/// A fresh-v2 store boots UNGATED (D-011, D-030).
+///
+/// The negative direction matters as much as the refusals: a gate that fired
+/// here would make a correct, never-migrated store unbootable, and a fresh
+/// store has no legacy commit documents and no rollback assets to verify.
+#[test]
+fn a_fresh_v2_store_boots_without_the_gate() {
+    use blackbox::project_catalog_rebuild_admin::RebuildStartupGateV1;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let store = ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap();
+
+    // The index deliberately does not exist. A fresh-v2 store must boot
+    // without one, so reaching any manifest read at all would be the defect.
+    let coverage = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+        &store,
+        &root.join("index"),
+    )
+    .expect("a fresh-v2 origin is exempt");
+    assert_eq!(coverage, RebuildStartupGateV1::ExemptFreshOrigin);
+}
