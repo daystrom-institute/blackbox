@@ -8,6 +8,26 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Added
+
+- Durable project catalog, phases 1-6 (code-complete): corpus project
+  identity is path-free and catalog-owned, checkout access is gated behind
+  observable capability leases, and collected code survives without a
+  local checkout. The offline cut machinery ships as
+  `blackbox project-catalog` subcommands: `migrate` gains
+  `--apply --configured` for the real-store cut, `verify` gains
+  `--require-exclusive-availability` (the bridge-down proof), and two new
+  verbs land with a preflight/apply/verify mode triple:
+  `durable-backfill` (stamps the stable project id across the 14
+  path-keyed durable-store owners from the migration's ledger, publisher
+  dispositions sourced from the installed migration marker) and
+  `path-free-rebuild` (drives the operator-triggered same-schema index
+  replacement to a committed, fully verified rebuild manifest). Startup
+  gates refuse unverified rebuilt history on migrated stores;
+  marker-driven GC exclusion protects every rollback asset. The
+  configured store stays version-1 bridge mode until the operational cut
+  runs (design/daemon-runtime/durable-project-catalog-impl.md).
+
 ### Removed
 
 - The daemon's refactor, slice, code-navigation, and macro MCP surface is

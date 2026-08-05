@@ -14,18 +14,31 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 
 # Locality-first decomposition: the checkout plane and the corpus plane
 
-> **Status: proposed, with the knowledge seam and checkout-local provenance
-> export implemented.** The identity foundation, prerequisite repairs, and
-> dark provisional overlay are landed. Provenance planning now stays in the
-> corpus while `bro provenance export` validates and writes Git notes in its
-> own checkout. The legacy daemon export remains during overlap; provenance
-> import, blame, render, checkout collectors, and all off-host behavior remain
-> proposed. The evidence base is the
-> satellite-arc post-mortem (section 1), the shipped harness process boundary
+> **Status: proposed, with the identity foundation COMPLETE, and the
+> knowledge seam and checkout-local provenance export implemented.** The
+> durable project catalog (phases 1 through 6,
+> [durable-project-catalog-impl.md](durable-project-catalog-impl.md)) is
+> code-complete and certified as of 2026-08-05: path-free project identity,
+> capability-leased checkout access, the accepted-publication authority,
+> and the offline cut machinery (migrate / durable-backfill /
+> path-free-rebuild) all exist and are review-certified at
+> `beta/blackbox-v2` `c25b8c67`; only the operational cut of the
+> configured store and the later bridge-lane retirement remain (thread
+> `catalog-phase6-operational`). That closes the satellite post-mortem's
+> lesson-1 gap - project identity no longer bottoms out in a stat-able
+> local path. Prerequisite repairs and the dark provisional overlay are
+> landed. Provenance planning stays in the corpus while `bro provenance
+> export` validates and writes Git notes in its own checkout. The legacy
+> daemon export remains during overlap; provenance import, blame, render,
+> checkout collectors, and all off-host behavior remain proposed. The
+> evidence base is the satellite-arc post-mortem (section 1), the shipped
+> harness process boundary
 > ([harness-process-boundary.md](../bro-harness/harness-process-boundary.md)),
 > and a code-verified inventory of the daemon's remaining checkout-coupled
-> surfaces (section 3) taken on `beta/blackbox-v2` at `15c8d3cc`. Line cites
-> rot; verify against code before building on any of them.
+> surfaces (section 3) taken on `beta/blackbox-v2` at `15c8d3cc` - that
+> inventory PREDATES the catalog phases 5 and 6 and must be re-verified
+> against code before any move-1 slice becomes an arc. Line cites rot;
+> verify against code before building on any of them.
 
 ## 0. Decision
 

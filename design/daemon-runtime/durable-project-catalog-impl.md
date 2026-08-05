@@ -1,7 +1,7 @@
 ---
 title: "Durable corpus project catalog implementation plan"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -11,6 +11,17 @@ brief: "Split durable corpus project identity from host-local checkout attachmen
 ---
 
 # Durable corpus project catalog implementation plan
+
+> **Status (2026-08-05): phases 1 through 6 are CODE-COMPLETE and
+> review-certified** (each phase closed at exact PASS; per-phase plans
+> carry their own status blocks and `lifecycle` markers). The certified
+> tip is `beta/blackbox-v2` `c25b8c67`. Remaining: the OPERATIONAL cut of
+> the configured store (compressed one-session runbook, work thread
+> `catalog-phase6-operational` / `thread-fcbdf795`), and the later
+> bridge-lane RETIREMENT phase (phase 6 plan section 10.3 criteria; the
+> phase 6 handoff's section 5 steps 2 through 5 are its inventory). Until
+> the cut runs, the configured operator store remains version-1 bridge
+> mode by design (D-002).
 
 Date: 2026-07-22
 

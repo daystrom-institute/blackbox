@@ -1,7 +1,7 @@
 ---
 title: "Durable project catalog Phase 2 implementation plan"
 kind: design
-lifecycle: proposed
+lifecycle: complete
 corpus: blackbox-design
 topic:
   - daemon-runtime

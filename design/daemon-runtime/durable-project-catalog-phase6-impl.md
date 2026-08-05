@@ -1,7 +1,7 @@
 ---
 title: "Durable project catalog Phase 6 implementation plan"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -11,6 +11,23 @@ brief: "Implement the two new offline subcommands (durable-backfill for LegacyPa
 ---
 
 # Durable project catalog Phase 6 implementation plan
+
+> **Status (2026-08-05): code span COMPLETE and certified; operational cut
+> pending.** P6-A, P6-B, and P6-C are implemented, cluster-verified, and
+> closed at the phase's closing code review (CHECKPOINT PASS, round 3, no
+> findings); the certified code span is `f22c10b9..c25b8c67` and the code
+> freeze is absolute. Six mid-implementation adjudications (Q-A through
+> Q-F) and the crash-matrix findings are amended into this text - the plan
+> as written reflects the as-built system. The operational sequence
+> (P6-D through P6-H below) was SUPERSEDED by operator directive with a
+> compressed one-session runbook (state tar + rehearsal-on-copy + stopped
+> service migrate/backfill/rebuild/verify, fix-forward posture); the
+> milestone text is retained as the formal reference for what each step
+> proves. The live runbook and consolidated residuals are in work thread
+> `catalog-phase6-operational` (`thread-fcbdf795`); the code-span
+> round-by-round record is committed at
+> `.bbox/record/thread-2379bfe5.json`. Bridge retirement remains a later
+> phase (section 10.3).
 
 Date: 2026-07-26
 
