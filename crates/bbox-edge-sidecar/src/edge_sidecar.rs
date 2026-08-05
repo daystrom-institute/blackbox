@@ -382,13 +382,7 @@ pub fn stamp_project_catalog_owner_row(
         let path = edges_dir.join(&relative);
         return commit_stamped_lane(&path, &bytes, &rewritten, limits.max_source_bytes)
             .map(|()| OwnerRowStampOutcomeV1::Stamped)
-            .map_err(|code| {
-                OwnerRowStampError::new(if code == OWNER_SOURCE_UNREADABLE {
-                    OWNER_SOURCE_UNREADABLE
-                } else {
-                    OWNER_SOURCE_UNWRITABLE
-                })
-            });
+            .map_err(OwnerRowStampError::new);
     }
     Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
 }
@@ -404,7 +398,7 @@ fn commit_stamped_lane(
     max_bytes: usize,
 ) -> std::result::Result<(), &'static str> {
     use bbox_corpus_core::project_catalog_snapshot::{
-        OWNER_SOURCE_UNREADABLE, OWNER_SOURCE_UNWRITABLE, capture_regular_file_nofollow,
+        OWNER_SOURCE_MOVED, OWNER_SOURCE_UNWRITABLE, capture_regular_file_nofollow,
     };
 
     let parent = path.parent().ok_or(OWNER_SOURCE_UNWRITABLE)?;
@@ -430,7 +424,10 @@ fn commit_stamped_lane(
         // unlinking the temporary, and nothing below can observe a change.
         let current = capture_regular_file_nofollow(path, "transcript_edge", name, max_bytes);
         if current.bytes.as_deref() != Some(expected) {
-            return Err(OWNER_SOURCE_UNREADABLE);
+            // The lane moved under us. Abandon rather than clobber the
+            // concurrent writer; nothing has been committed at this point, so
+            // the caller can retry against the new state.
+            return Err(OWNER_SOURCE_MOVED);
         }
         fs::rename(&tmp_path, path).map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
         // Durability of the rename itself, not of the bytes: without this the
@@ -1473,6 +1470,56 @@ mod project_catalog_snapshot_tests {
             bbox_corpus_core::project_catalog_snapshot::OWNER_ROW_ABSENT
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A lane that MOVED between the stamper's read and its replacement is its
+    /// own diagnostic, distinct from a row that was never there.
+    ///
+    /// The two demand opposite operator responses - re-run preflight against
+    /// the moved state, versus investigate an artifact naming a row the store
+    /// does not have - so collapsing them onto one token would lose the only
+    /// information that distinguishes them. Both are staleness at the backfill
+    /// level; only the diagnostic tells them apart.
+    #[test]
+    fn a_lane_that_moves_mid_stamp_is_distinct_from_an_absent_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        let path = lane_fixture(&root);
+        let row_id = only_row_id(&root, "/repo/one");
+
+        // The absent case, for contrast on the same lane.
+        let absent = stamp_project_catalog_owner_row(
+            &root,
+            "transcript_edge:nope:deadbeef:0",
+            "a1b2c3d4",
+            OwnerSnapshotLimitsV1::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            absent.code,
+            bbox_corpus_core::project_catalog_snapshot::OWNER_ROW_ABSENT
+        );
+
+        // The moved case: commit_stamped_lane rechecks the source against the
+        // bytes the locate step read, so bytes that no longer match abandon
+        // the write. Driven directly because racing a real concurrent writer
+        // would make the test timing-dependent.
+        let stale = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"{\"moved\":true}\n").unwrap();
+        let moved =
+            commit_stamped_lane(&path, &stale, b"irrelevant", 16 * 1024 * 1024).unwrap_err();
+
+        assert_eq!(
+            moved,
+            bbox_corpus_core::project_catalog_snapshot::OWNER_SOURCE_MOVED
+        );
+        assert_ne!(
+            moved,
+            bbox_corpus_core::project_catalog_snapshot::OWNER_ROW_ABSENT
+        );
+        // Abandoned, not clobbered: the concurrent writer's bytes survive.
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"moved\":true}\n");
+        let _ = row_id;
     }
 
     /// Identity ignores `project_id` and ignores key ORDER, but not content.

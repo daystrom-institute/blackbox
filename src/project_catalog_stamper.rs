@@ -20,8 +20,8 @@ use std::path::{Component, Path, PathBuf};
 
 use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_core::project_catalog_snapshot::{
-    OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OwnerRowStampError, OwnerRowStampOutcomeV1,
-    OwnerSnapshotLimitsV1,
+    OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MOVED, OwnerRowStampError,
+    OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
 };
 use bbox_indexing::project_catalog_backfill::{
     ERROR_RESOLUTION_INVALID, ERROR_STALE_POST_IMAGE, LegacyRowStampCoverageV1,
@@ -171,7 +171,14 @@ fn row_stamp_refusal(
     diagnostic: &str,
 ) -> ProjectCatalogMigrationError {
     let code = match diagnostic {
-        OWNER_ROW_ABSENT | OWNER_ROW_PROJECT_ID_CONFLICT => ERROR_STALE_POST_IMAGE,
+        // All three are current-state divergence: the row vanished, the row is
+        // bound elsewhere, or the source moved between the read and the
+        // replacement. Q-E4 enumerated the first two because they were the
+        // cases then known; its PRINCIPLE (state divergence, not artifact
+        // invalidity) governs the third identically.
+        OWNER_ROW_ABSENT | OWNER_ROW_PROJECT_ID_CONFLICT | OWNER_SOURCE_MOVED => {
+            ERROR_STALE_POST_IMAGE
+        }
         _ => ERROR_RESOLUTION_INVALID,
     };
     ProjectCatalogMigrationError::no_mutation(
@@ -630,6 +637,24 @@ mod owner_row_stamper_dispatch {
             error.message.contains(OWNER_ROW_PROJECT_ID_CONFLICT),
             "diagnostic lost: {}",
             error.message
+        );
+    }
+
+    /// The third staleness diagnostic classifies with the other two.
+    ///
+    /// A source that moved between read and replacement is state divergence
+    /// exactly as an absent or reassigned row is, so it must not land on
+    /// artifact invalidity and send the operator to audit a clean artifact.
+    #[test]
+    fn a_moved_owner_source_classifies_as_staleness() {
+        assert_eq!(
+            row_stamp_refusal(
+                LegacyPathStoreKindV1::TranscriptEdge,
+                "row-1",
+                OWNER_SOURCE_MOVED
+            )
+            .code,
+            ERROR_STALE_POST_IMAGE
         );
     }
 

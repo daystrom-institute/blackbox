@@ -288,6 +288,15 @@ pub const OWNER_SOURCE_INVALID: &str = "owner_source_invalid";
 pub const OWNER_SOURCE_UNREADABLE: &str = "owner_source_unreadable";
 /// The rewritten owner source could not be committed to disk.
 pub const OWNER_SOURCE_UNWRITABLE: &str = "owner_source_unwritable";
+/// The owner source CHANGED between the stamper's read and its atomic
+/// replacement, so the write was abandoned rather than clobbering it.
+///
+/// Deliberately not [`OWNER_SOURCE_UNWRITABLE`]: "unwritable" implies a
+/// permissions or disk problem, while this states the fact - the source moved.
+/// It is current-state divergence, so the backfill maps it onto the STALENESS
+/// family rather than artifact invalidity (adjudication Q-E4's principle,
+/// applied to a third diagnostic beyond the two it originally enumerated).
+pub const OWNER_SOURCE_MOVED: &str = "owner_source_moved";
 /// The caller supplied an empty or whitespace-only project id.
 pub const OWNER_PROJECT_ID_INVALID: &str = "owner_project_id_invalid";
 
