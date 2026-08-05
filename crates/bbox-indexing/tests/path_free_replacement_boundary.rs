@@ -239,6 +239,10 @@ fn request(fixture: &Fixture) -> SchemaReplacementRequest<'_> {
         code_source_store_path: &fixture.projects_path,
         observed_schema_version: Some(OUTGOING_SCHEMA.to_string()),
         target_schema_version: "incoming-test-schema",
+        // Every request in this file is the daemon-upgrade trigger: observed
+        // and target differ. The Q-F operator cause is exercised where the
+        // forced same-schema path is under test, not here.
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause::SchemaMismatch,
     }
 }
 
@@ -981,6 +985,10 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
         code_source_store_path: &fixture.projects_path,
         observed_schema_version: None,
         target_schema_version: "incoming-test-schema",
+        // Every request in this file is the daemon-upgrade trigger: observed
+        // and target differ. The Q-F operator cause is exercised where the
+        // forced same-schema path is under test, not here.
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause::SchemaMismatch,
     };
     let authorization = catalog_schema_replacement_guard(
         Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
@@ -1062,6 +1070,10 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
         code_source_store_path: &bridge.projects_path,
         observed_schema_version: None,
         target_schema_version: "incoming-test-schema",
+        // Every request in this file is the daemon-upgrade trigger: observed
+        // and target differ. The Q-F operator cause is exercised where the
+        // forced same-schema path is under test, not here.
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause::SchemaMismatch,
     };
     let authorization = bridge_schema_replacement_guard(Arc::new(StaticRecords(
         ProjectRecordsSnapshot::from_bridge_records(
@@ -1144,6 +1156,10 @@ fn an_empty_pre_marker_directory_authorizes_with_nothing_carried() {
         code_source_store_path: &projects_path,
         observed_schema_version: None,
         target_schema_version: "incoming-test-schema",
+        // Every request in this file is the daemon-upgrade trigger: observed
+        // and target differ. The Q-F operator cause is exercised where the
+        // forced same-schema path is under test, not here.
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause::SchemaMismatch,
     };
 
     let catalog = catalog_schema_replacement_guard(
@@ -1214,6 +1230,10 @@ fn an_index_with_no_history_still_authorizes_both_guards() {
         code_source_store_path: &projects_path,
         observed_schema_version: Some(OUTGOING_SCHEMA.to_string()),
         target_schema_version: "incoming-test-schema",
+        // Every request in this file is the daemon-upgrade trigger: observed
+        // and target differ. The Q-F operator cause is exercised where the
+        // forced same-schema path is under test, not here.
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause::SchemaMismatch,
     };
     assert!(
         scan_commit_documents(&index_path, HistoryScanLimitsV1::default())

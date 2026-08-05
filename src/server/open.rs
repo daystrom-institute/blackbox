@@ -366,7 +366,18 @@ pub(super) fn open_shared_state(
                 records_provider.clone(),
             ),
         };
-    let mut idx = TranscriptIndex::open_or_create_with_code_source_store_path(
+    // DAEMON STARTUP REMAINS `SchemaMismatch`-ONLY (adjudication Q-F): `force`
+    // is false here and only the offline `path-free-rebuild --apply` ever
+    // passes true. What this call DOES carry forward is the recovery
+    // classification above, which the boundary honors: a Prepared or Committed
+    // manifest that survived the destructive drop means the marker-less index
+    // on disk is a replacement in flight, not a pre-marker index to drop.
+    // Without that, a daemon restart into crash state (3) or (4) would re-enter
+    // the guard and mint a second manifest over generations the first already
+    // pins - and in state (4) would drop a finished replacement.
+    let replacement_intent =
+        crate::project_catalog_rebuild_admin::replacement_intent_for(&rebuild_resume, false);
+    let mut idx = TranscriptIndex::open_or_create_at_replacement_boundary(
         &index_path,
         roots,
         codex_root,
@@ -377,6 +388,7 @@ pub(super) fn open_shared_state(
         rm_path.clone(),
         records_provider.clone(),
         Some(schema_replacement_guard),
+        replacement_intent,
     )?;
     // Index harness session event logs (sidecar JSONL next to the resume
     // snapshots) so harness sessions are searchable like any other provider

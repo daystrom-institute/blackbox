@@ -47,6 +47,37 @@ const COMMIT_SPILL_DIRNAME: &str = "commit-spill";
 const COMMIT_SPILL_FILENAME: &str = "commit-spill.json";
 const COMMIT_SPILL_VERSION_V1: u32 = 1;
 
+/// WHY the index is being replaced.
+///
+/// **Adjudication Q-F, ratified: the marker contradiction.** Before Q-F the
+/// only trigger was a marker mismatch, and execution proved that made
+/// "Equality AND Completed" unreachable for the Phase 6 cut. The migration
+/// refuses to capture a marker-mismatched index as `Corrupt`, so a recorded
+/// Equality fingerprint requires the marker to MATCH; the replacement ran only
+/// when it did NOT. One pinned binary means one marker value, so the marker
+/// could never satisfy both at once and the two requirements were structurally
+/// exclusive.
+///
+/// The resolution is a second, explicitly named cause rather than a loosened
+/// predicate: the Phase 6 replacement is OPERATOR-TRIGGERED against an
+/// UNCHANGED marker. Carrying the cause here keeps the two triggers
+/// distinguishable everywhere downstream - in the guard's audit line, in the
+/// drive state, and in the crash-recovery reasoning - instead of collapsing
+/// them into one boolean that no reader can tell apart after the fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogIndexReplacementCause {
+    /// The observed marker differs from the running `INDEX_SCHEMA_VERSION`, or
+    /// a non-empty index carries no marker at all. The daemon-upgrade trigger,
+    /// and the ONLY cause daemon startup can produce.
+    SchemaMismatch,
+    /// The Phase 6 offline `path-free-rebuild --apply`, after artifact
+    /// authorization and the immediate D-036 Equality recapture both succeeded.
+    /// `observed_schema_version` EQUALS `target_schema_version` here by
+    /// construction: that equality is the precondition, not an anomaly.
+    OperatorPathFreeRebuild,
+}
+
 /// What the open path knows about the replacement it is about to perform.
 #[derive(Debug, Clone)]
 pub struct SchemaReplacementRequest<'a> {
@@ -55,9 +86,65 @@ pub struct SchemaReplacementRequest<'a> {
     pub code_source_store_path: &'a Path,
     /// The marker read off the index that is about to be dropped. `None` when
     /// the index directory is non-empty and carries no marker at all, which is
-    /// the "pre-marker index" arm of the mismatch trigger.
+    /// the "pre-marker index" arm of the mismatch trigger. Under
+    /// [`CatalogIndexReplacementCause::OperatorPathFreeRebuild`] this is always
+    /// `Some` and always equal to `target_schema_version`.
     pub observed_schema_version: Option<String>,
     pub target_schema_version: &'static str,
+    /// Which trigger authorized this replacement (Q-F).
+    pub cause: CatalogIndexReplacementCause,
+}
+
+/// What the open path is authorized to do when it reaches the replacement
+/// boundary.
+///
+/// The caller decides this, because only the caller has classified rebuild
+/// recovery: that classification reads the index's schema marker to locate
+/// itself relative to the destructive drop, and opening the index rewrites
+/// the marker, so it can only be done BEFORE the open. Q-F makes honoring it
+/// at this boundary mandatory rather than advisory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogReplacementIntentV1 {
+    /// The ordinary open. A mismatched marker, or a non-empty index with no
+    /// marker, replaces under [`CatalogIndexReplacementCause::SchemaMismatch`].
+    /// Every caller that has no manifest evidence and no operator
+    /// authorization uses this, daemon startup included.
+    #[default]
+    MismatchOnly,
+    /// The Q-F operator force, reachable ONLY from the offline
+    /// `path-free-rebuild --apply` after authorization. It requires the
+    /// outgoing marker to EQUAL the running `INDEX_SCHEMA_VERSION`: a missing
+    /// or mismatched marker means the index is not the predecessor the
+    /// operator authorized against, and it refuses rather than replacing one.
+    ForceSameSchema,
+    /// A durable Prepared or Committed rebuild manifest survives past the
+    /// destructive boundary, so the index on disk IS the replacement and its
+    /// marker is WITHHELD by design.
+    ///
+    /// This flips exactly one arm: a marker-less index is no longer read as a
+    /// pre-marker legacy index to drop. Without it, crash states (3) and (4)
+    /// would re-enter the guard, mint a SECOND prepared manifest over a
+    /// population the first one already pins, and in state (4) drop an index
+    /// whose manifest is already `Committed`. A MISMATCHED marker still
+    /// replaces normally: that is a real daemon upgrade, not an interrupted
+    /// replacement, and suppressing it would make a legitimate schema bump
+    /// unbootable.
+    PreserveInterrupted,
+}
+
+/// What the open path did at the replacement boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexReplacementOutcomeV1 {
+    /// `Some` when THIS open performed the destructive replacement.
+    pub performed: Option<CatalogIndexReplacementCause>,
+    /// Whether the open deliberately did not publish the schema marker.
+    ///
+    /// The marker is the LAST thing published in a replacement, so its absence
+    /// is the evidence a later recovery reads. Withholding it is therefore not
+    /// an omission to tidy up: publishing it early erases the only signal that
+    /// distinguishes "manifest committed, marker pending" from an ordinary
+    /// steady-state boot.
+    pub marker_withheld: bool,
 }
 
 /// A guard's authorization to proceed. Carrying the authority's own label

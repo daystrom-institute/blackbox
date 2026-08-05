@@ -203,7 +203,11 @@ pub struct TranscriptIndex {
     /// Injected project authority. Every selector derivation reads a fresh
     /// snapshot from it, so this index never reads `projects.json` off disk.
     records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
-    schema_was_reset: bool,
+    /// What the open did at the replacement boundary, and whether it withheld
+    /// the schema marker. Both facts are read by the shared replacement driver
+    /// to classify what it must do; neither is recoverable afterwards, because
+    /// the drive itself changes the on-disk state they describe.
+    replacement: schema_replacement::IndexReplacementOutcomeV1,
 }
 
 /// Fixed-snapshot [`ProjectRecordsProvider`] for offline and test callers that
@@ -384,11 +388,48 @@ impl TranscriptIndex {
         records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
         schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
     ) -> Result<Self> {
-        let schema_was_reset = reset_index_on_schema_mismatch(
+        Self::open_or_create_at_replacement_boundary(
+            index_path,
+            roots,
+            codex_root,
+            projects_path,
+            code_source_store_path,
+            knowledge_path,
+            threads_path,
+            roadmap_path,
+            records_provider,
+            schema_replacement_guard,
+            schema_replacement::CatalogReplacementIntentV1::MismatchOnly,
+        )
+    }
+
+    /// The open that carries an explicit replacement intent (Q-F).
+    ///
+    /// Separate from the constructor above rather than an eleventh positional
+    /// argument on it: the callers that have classified rebuild recovery, or
+    /// that hold an operator authorization, are a small and deliberately
+    /// named set, and every other caller should keep getting
+    /// `MismatchOnly` without having to know the vocabulary exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_create_at_replacement_boundary(
+        index_path: &Path,
+        roots: Vec<(String, PathBuf)>,
+        codex_root: Option<PathBuf>,
+        projects_path: PathBuf,
+        code_source_store_path: PathBuf,
+        knowledge_path: PathBuf,
+        threads_path: PathBuf,
+        roadmap_path: PathBuf,
+        records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
+        schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
+        replacement_intent: schema_replacement::CatalogReplacementIntentV1,
+    ) -> Result<Self> {
+        let replacement = reset_index_on_schema_mismatch(
             index_path,
             &projects_path,
             &code_source_store_path,
             schema_replacement_guard.as_ref(),
+            replacement_intent,
         )?;
         let meta_path = index_path.join("_meta.json");
 
@@ -408,7 +449,13 @@ impl TranscriptIndex {
             }
         };
         register_code_tokenizer(&index);
-        if !schema_was_reset {
+        // THE MARKER IS PUBLISHED LAST, or not at all here. A replacement in
+        // flight - freshly performed above, or evidenced by a manifest that
+        // survived the drop - withholds it until the re-emission pass and the
+        // manifest commit have both landed. Publishing it here would declare a
+        // replacement complete before a single document was re-emitted, and
+        // would erase the only signal a later recovery reads.
+        if !replacement.marker_withheld {
             write_schema_version_marker(index_path)?;
         }
 
@@ -468,7 +515,7 @@ impl TranscriptIndex {
             stats_cache: std::sync::Arc::new(Mutex::new(None)),
             active_code_selectors: std::sync::Arc::new(RwLock::new(active_code_selectors)),
             records_provider,
-            schema_was_reset,
+            replacement,
         })
     }
 
@@ -519,7 +566,23 @@ impl TranscriptIndex {
     }
 
     pub fn schema_was_reset(&self) -> bool {
-        self.schema_was_reset
+        self.replacement.performed.is_some()
+    }
+
+    /// WHY this open replaced the index, or `None` if it did not (Q-F).
+    pub fn replacement_cause(&self) -> Option<schema_replacement::CatalogIndexReplacementCause> {
+        self.replacement.performed
+    }
+
+    /// Whether the open withheld the schema marker.
+    ///
+    /// True on a fresh replacement, and also on an open that preserved an
+    /// index whose marker a PREVIOUS process withheld. The second case is how
+    /// "manifest committed, marker never published" is told apart from an
+    /// ordinary steady-state boot, and it is why the marker is never published
+    /// speculatively at open.
+    pub fn schema_marker_withheld(&self) -> bool {
+        self.replacement.marker_withheld
     }
 
     pub fn complete_schema_migration(&self) -> Result<()> {
@@ -1130,6 +1193,17 @@ pub fn register_code_tokenizer(index: &Index) {
     );
 }
 
+/// The replacement boundary: decide whether the index is dropped, and under
+/// which cause, before anything opens it.
+///
+/// **Three triggers, not one (adjudication Q-F).** The marker mismatch is the
+/// daemon-upgrade trigger and stays exactly as it was. The operator force is
+/// the Phase 6 same-schema trigger, and it goes THROUGH this function rather
+/// than around it precisely so it cannot skip the guard, the fail-closed
+/// refusal, or the marker withholding. `PreserveInterrupted` is not a trigger
+/// at all: it is the caller's pre-open recovery classification being honored
+/// here, suppressing the pre-marker arm for an index whose marker is withheld
+/// because a replacement is already in flight.
 // one-time boot path before the runtime serves traffic.
 #[allow(clippy::disallowed_methods)]
 fn reset_index_on_schema_mismatch(
@@ -1137,9 +1211,28 @@ fn reset_index_on_schema_mismatch(
     projects_path: &Path,
     code_source_store_path: &Path,
     guard: Option<&schema_replacement::SchemaReplacementGuard>,
-) -> Result<bool> {
+    intent: schema_replacement::CatalogReplacementIntentV1,
+) -> Result<schema_replacement::IndexReplacementOutcomeV1> {
+    use schema_replacement::{
+        CatalogIndexReplacementCause, CatalogReplacementIntentV1, IndexReplacementOutcomeV1,
+    };
+
+    let not_replaced = |marker_withheld| IndexReplacementOutcomeV1 {
+        performed: None,
+        marker_withheld,
+    };
     if !index_path.exists() {
-        return Ok(false);
+        if intent == CatalogReplacementIntentV1::ForceSameSchema {
+            // The operator authorized a replacement of a specific predecessor.
+            // There is no index here to be that predecessor, so the
+            // authorization does not describe this state.
+            anyhow::bail!(
+                "error.schema_replacement_stale_predecessor: refusing the operator-triggered \
+                 replacement at {}: no index exists to replace",
+                index_path.display()
+            );
+        }
+        return Ok(not_replaced(false));
     }
     let marker_path = index_path.join(SCHEMA_VERSION_FILE);
     let observed = match fs::read_to_string(&marker_path) {
@@ -1147,13 +1240,51 @@ fn reset_index_on_schema_mismatch(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => return Err(err.into()),
     };
-    let should_reset = match observed.as_deref() {
+    let mismatch_reset = match observed.as_deref() {
         Some(marker) => marker != INDEX_SCHEMA_VERSION,
         // A non-empty index directory with no marker at all predates the
-        // marker and must be replaced; an empty one is a fresh create.
-        None => index_path.read_dir()?.next().is_some(),
+        // marker and must be replaced; an empty one is a fresh create. Under
+        // `PreserveInterrupted` the absent marker means the opposite: it was
+        // WITHHELD by a replacement that is still in flight, and the surviving
+        // manifest is the evidence. Dropping there would destroy the exact
+        // population that manifest pins.
+        None => {
+            intent != CatalogReplacementIntentV1::PreserveInterrupted
+                && index_path.read_dir()?.next().is_some()
+        }
     };
-    if should_reset {
+    let cause = if intent == CatalogReplacementIntentV1::ForceSameSchema {
+        // The Q-F precondition, checked here rather than by the caller so no
+        // future caller can reach the drop without it. A marker that is
+        // missing or does not match the running version means the index is not
+        // the predecessor the authorization named.
+        match observed.as_deref() {
+            Some(marker) if marker == INDEX_SCHEMA_VERSION => {}
+            other => anyhow::bail!(
+                "error.schema_replacement_stale_predecessor: refusing the operator-triggered \
+                 replacement at {} (observed {}, required {}): the outgoing marker must equal \
+                 the running schema version",
+                index_path.display(),
+                other.unwrap_or("<no marker>"),
+                INDEX_SCHEMA_VERSION
+            ),
+        }
+        Some(CatalogIndexReplacementCause::OperatorPathFreeRebuild)
+    } else if mismatch_reset {
+        Some(CatalogIndexReplacementCause::SchemaMismatch)
+    } else {
+        None
+    };
+    let Some(cause) = cause else {
+        // Nothing is replaced. The marker is still withheld when a manifest
+        // survives past the drop and the index carries no marker: that is
+        // crash state (3) or (4), and publishing the marker here would erase
+        // the signal the drive state is classified from.
+        return Ok(not_replaced(
+            intent == CatalogReplacementIntentV1::PreserveInterrupted && observed.is_none(),
+        ));
+    };
+    {
         let edges_dir =
             bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
@@ -1179,18 +1310,30 @@ fn reset_index_on_schema_mismatch(
             code_source_store_path,
             observed_schema_version: observed.clone(),
             target_schema_version: INDEX_SCHEMA_VERSION,
+            cause,
         })
         .context("pre-replacement guard refused the index schema replacement")?;
         tracing::info!(
             path = %index_path.display(),
             schema_version = INDEX_SCHEMA_VERSION,
             observed_schema_version = observed.as_deref().unwrap_or("<no marker>"),
+            ?cause,
             authorized_by = %authorization.authorized_by,
-            "dropping transcript index for schema migration"
+            "dropping transcript index for replacement"
         );
+        // The guard has durably published the Prepared manifest by now (that
+        // is what it returns authorization for), so the deletion below is
+        // recoverable from pinned generations rather than a point of no
+        // return.
         fs::remove_dir_all(index_path)?;
     }
-    Ok(should_reset)
+    Ok(IndexReplacementOutcomeV1 {
+        performed: Some(cause),
+        // The marker commits LAST, after the re-emission pass and the
+        // manifest commit. Publishing it here would mark a replacement
+        // complete before a single document had been re-emitted.
+        marker_withheld: true,
+    })
 }
 
 fn verify_collected_schema_migration_sources(

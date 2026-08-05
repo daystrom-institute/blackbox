@@ -1111,6 +1111,10 @@ fn replacement_request<'a>(
         code_source_store_path: projects_path,
         observed_schema_version: Some(OUTGOING_SCHEMA.to_string()),
         target_schema_version: "exit-gate-incoming-schema",
+        // Every request in this file is the daemon-upgrade trigger: observed
+        // and target differ. The Q-F operator cause is exercised where the
+        // forced same-schema path is under test, not here.
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause::SchemaMismatch,
     }
 }
 

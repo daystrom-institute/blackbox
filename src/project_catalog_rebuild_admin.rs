@@ -56,6 +56,45 @@ use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 
 use crate::index::{IndexWriterActor, TranscriptIndex};
 
+/// What the shared driver must do, decided at the open/replacement boundary.
+///
+/// **This replaced a `schema_was_reset`-only predicate (adjudication Q-F).**
+/// The old predicate answered one question - "did the marker mismatch?" - and
+/// Q-F proved that question cannot distinguish the four states the driver has
+/// to act on differently. Two of them (a freshly forced same-schema
+/// replacement, and a committed manifest whose marker was never published)
+/// carry no mismatch at all, so a boolean read them both as "nothing to do".
+///
+/// The state is CLASSIFIED, never manufactured. In particular
+/// [`Self::ResumePrepared`] is derived exclusively from a durable Prepared
+/// manifest observed after the destructive boundary: it is evidence that a
+/// replacement is half done, and synthesizing it to START one would mean
+/// re-emitting from generations no guard had pinned for this operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CatalogReplacementDriveStateV1 {
+    /// This open performed the destructive replacement, for `cause`. The
+    /// index is empty, its marker is withheld, and the Prepared manifest the
+    /// guard published before the deletion is the pin for everything that
+    /// must be re-emitted.
+    FreshReplacement {
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause,
+    },
+    /// A Prepared manifest survived a crash that already dropped the index.
+    /// The guard does NOT rerun and no second manifest is minted: the
+    /// surviving one already pins the generations, and the re-emission pass is
+    /// idempotent, so replaying it is the whole recovery.
+    ResumePrepared,
+    /// The manifest is `Committed` but the marker was never published. The
+    /// index is complete; the only missing step is the publication that a
+    /// crash interrupted. Nothing is dropped and the Committed manifest is
+    /// never replaced with a fresh Prepared one - doing either would destroy a
+    /// finished replacement to redo work that already landed.
+    FinalizeCommitted,
+    /// Steady state. No replacement was performed and none is in flight.
+    NotRequired,
+}
+
 /// The observed disposition of one replacement drive.
 ///
 /// Returned rather than logged so the offline apply can assert the drive
@@ -71,6 +110,12 @@ pub enum CatalogSchemaReplacementDriveV1 {
     /// The synchronous replacement ran to completion and the schema-migration
     /// version marker was committed.
     Completed,
+    /// An already-committed manifest was finalized: the marker a crash left
+    /// unpublished was published and nothing was re-emitted. Distinct from
+    /// `Completed` because no destructive pass ran here, and an operator
+    /// reading a receipt has to be able to tell "the rebuild executed" from
+    /// "a previous rebuild's last step was finished for it".
+    FinalizedCommitted,
 }
 
 /// Drive the synchronous schema-replacement rebuild to completion.
@@ -97,23 +142,47 @@ pub enum CatalogSchemaReplacementDriveV1 {
 ///    replacement detectable and recoverable through the existing
 ///    P3-D/P3-E path; committing earlier would erase the evidence.
 ///
-/// The `Resume` arm forces the same drive a fresh schema mismatch does.
+/// The `ResumePrepared` state forces the same drive a fresh replacement does.
 /// After a crash that already dropped the index there is no marker left to
-/// mismatch against, so `schema_was_reset()` is false and the prepared
-/// manifest is the only surviving evidence that a replacement is half done.
+/// mismatch against, so the prepared manifest is the only surviving evidence
+/// that a replacement is half done.
 pub fn drive_catalog_schema_replacement(
     idx: &TranscriptIndex,
     index_writer: &IndexWriterActor,
     rebuild_resume: &SchemaRebuildResume,
 ) -> Result<CatalogSchemaReplacementDriveV1> {
-    let resume_interrupted_rebuild = matches!(rebuild_resume, SchemaRebuildResume::Resume { .. });
-    if !idx.schema_was_reset() && !resume_interrupted_rebuild {
-        return Ok(CatalogSchemaReplacementDriveV1::NotRequired);
+    let state = classify_replacement_drive(idx, rebuild_resume);
+    match state {
+        CatalogReplacementDriveStateV1::NotRequired => {
+            return Ok(CatalogSchemaReplacementDriveV1::NotRequired);
+        }
+        CatalogReplacementDriveStateV1::FinalizeCommitted => {
+            // Crash state (4). The index is the finished replacement and the
+            // manifest is already Committed, so re-emitting would redo landed
+            // work and re-preparing would destroy the committed evidence. The
+            // selectors still have to be refreshed before the marker: the
+            // process that built this index died before it did that, and a
+            // read view built from the stale map filters out exactly the
+            // documents the replacement staged.
+            tracing::warn!(
+                schema = crate::index::INDEX_SCHEMA_VERSION,
+                "finalizing a committed index replacement whose schema marker was never published"
+            );
+            idx.reader_reload_for_test();
+            idx.refresh_active_code_selectors().context(
+                "refreshing active code selectors while finalizing a committed replacement",
+            )?;
+            idx.complete_schema_migration()
+                .context("publishing the withheld schema-migration version marker failed")?;
+            return Ok(CatalogSchemaReplacementDriveV1::FinalizedCommitted);
+        }
+        CatalogReplacementDriveStateV1::FreshReplacement { .. }
+        | CatalogReplacementDriveStateV1::ResumePrepared => {}
     }
     tracing::info!(
         schema = crate::index::INDEX_SCHEMA_VERSION,
-        resume_interrupted_rebuild,
-        "running synchronous full rebuild after index schema migration"
+        ?state,
+        "running synchronous full rebuild after an index replacement"
     );
     index_writer
         .run_reindex_pass_for_schema_migration()
@@ -124,6 +193,66 @@ pub fn drive_catalog_schema_replacement(
     idx.complete_schema_migration()
         .context("committing schema-migration version marker failed")?;
     Ok(CatalogSchemaReplacementDriveV1::Completed)
+}
+
+/// Classify what the driver must do from the two facts only the
+/// open/replacement boundary holds.
+///
+/// The order of the arms is the contract. A replacement performed by THIS open
+/// wins outright: the guard authorized it, the manifest it prepared is the
+/// current one, and any older manifest state is superseded. Only when no
+/// replacement happened here does surviving manifest evidence decide, and
+/// `AlreadyCommitted` alone is not enough - a committed manifest is the
+/// steady state on every later boot, so it means "finalize" only while the
+/// marker is still withheld.
+pub fn classify_replacement_drive(
+    idx: &TranscriptIndex,
+    rebuild_resume: &SchemaRebuildResume,
+) -> CatalogReplacementDriveStateV1 {
+    if let Some(cause) = idx.replacement_cause() {
+        return CatalogReplacementDriveStateV1::FreshReplacement { cause };
+    }
+    match rebuild_resume {
+        // Evidence-only, never manufactured: a Prepared manifest observed
+        // after the destructive boundary.
+        SchemaRebuildResume::Resume { .. } => CatalogReplacementDriveStateV1::ResumePrepared,
+        SchemaRebuildResume::AlreadyCommitted if idx.schema_marker_withheld() => {
+            CatalogReplacementDriveStateV1::FinalizeCommitted
+        }
+        SchemaRebuildResume::None
+        | SchemaRebuildResume::RolledBack
+        | SchemaRebuildResume::AlreadyCommitted => CatalogReplacementDriveStateV1::NotRequired,
+    }
+}
+
+/// The replacement intent an open should carry, derived from the recovery
+/// classification the caller made BEFORE the open plus whether this caller
+/// holds an operator authorization.
+///
+/// Both callers of the shared driver go through this, so neither can reach the
+/// boundary with an intent the other would not have chosen in the same state.
+/// `force` is true ONLY for the offline `path-free-rebuild --apply` after
+/// authorization; daemon startup passes false and therefore remains
+/// `SchemaMismatch`-only.
+///
+/// Surviving manifest evidence OUTRANKS the force. An operator authorization
+/// describes a predecessor index, and an interrupted replacement is not that
+/// predecessor: forcing a fresh operation over it would mint a second manifest
+/// and abandon the generations the first one pins.
+pub fn replacement_intent_for(
+    rebuild_resume: &SchemaRebuildResume,
+    force: bool,
+) -> bbox_corpus_index::index::schema_replacement::CatalogReplacementIntentV1 {
+    use bbox_corpus_index::index::schema_replacement::CatalogReplacementIntentV1;
+    match rebuild_resume {
+        SchemaRebuildResume::Resume { .. } | SchemaRebuildResume::AlreadyCommitted => {
+            CatalogReplacementIntentV1::PreserveInterrupted
+        }
+        _ if force => CatalogReplacementIntentV1::ForceSameSchema,
+        SchemaRebuildResume::None | SchemaRebuildResume::RolledBack => {
+            CatalogReplacementIntentV1::MismatchOnly
+        }
+    }
 }
 
 /// The offline `path-free-rebuild --preflight` entrypoint (P6-B task 5).
@@ -193,9 +322,14 @@ pub struct PathFreeRebuildApplyReceiptV1 {
 ///    marker and opening the index rewrites that marker, and a crash after
 ///    the destructive drop leaves no mismatch to detect, so the resume signal
 ///    is the only surviving evidence that a replacement is half done.
-/// 4. Invoke the SAME replacement guard the daemon open uses. The guard is
-///    what materializes the prepared manifest and refuses rather than
-///    dropping unproved history.
+/// 4. Invoke the SAME replacement guard the daemon open uses, through the
+///    SAME boundary, under `CatalogIndexReplacementCause::OperatorPathFreeRebuild`
+///    (Q-F). The marker is UNCHANGED across a Phase 6 rebuild and the trigger
+///    is this command, not a mismatch, so the boundary requires the outgoing
+///    marker to EQUAL the running version instead of differing from it. The
+///    guard is what materializes the prepared manifest and refuses rather than
+///    dropping unproved history; it publishes that manifest durably BEFORE the
+///    deletion, and the replacement index then opens with the marker WITHHELD.
 /// 5. Drive the synchronous replacement through the SHARED
 ///    [`drive_catalog_schema_replacement`], never a copy of its ordering.
 /// 6. The existing P3-E pass commits the manifest after its index commit.
@@ -245,7 +379,16 @@ pub fn apply(
     // deletion campaign that consumes the inventory.
     let records: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider> =
         Arc::new(CatalogProjectRecordsProvider::new(store.clone()));
-    let index = TranscriptIndex::open_or_create_with_code_source_store_path(
+    // THE Q-F FORCE, and the only place in the tree that passes `force = true`.
+    // It is reached only here, only after step 2's Equality recapture, and it
+    // travels as an INTENT into the same boundary function daemon startup
+    // uses, so it cannot skip the guard, the fail-closed refusal, or the
+    // marker withholding. The boundary in turn requires the outgoing marker to
+    // EQUAL the running version: the authorization above described a
+    // predecessor at that exact schema, and a marker that is missing or
+    // different means this is not that index.
+    let intent = replacement_intent_for(&resume, true);
+    let index = TranscriptIndex::open_or_create_at_replacement_boundary(
         &paths.index_root,
         Vec::new(),
         None,
@@ -256,6 +399,7 @@ pub fn apply(
         paths.roadmap_path.clone(),
         records.clone(),
         Some(guard),
+        intent,
     )
     .map_err(|error| rebuild_failure(ERROR_REBUILD_GENERATION_UNVERIFIED, error.to_string()))?;
 
@@ -269,6 +413,21 @@ pub fn apply(
     let drive = drive_catalog_schema_replacement(&index, &writer, &resume).map_err(|error| {
         rebuild_failure(ERROR_REBUILD_GENERATION_UNVERIFIED, format!("{error:#}"))
     })?;
+    // A FRESH offline apply REJECTS `NotRequired`. For the daemon a skipped
+    // drive is the ordinary steady-state boot; here it means the destructive
+    // pass never ran, so no manifest can have been committed and the receipt
+    // below would claim a postcondition nothing established. Success is
+    // `Completed`, or the idempotently recovered `FinalizedCommitted`.
+    if drive == CatalogSchemaReplacementDriveV1::NotRequired {
+        return Err(rebuild_failure(
+            ERROR_REBUILD_MANIFEST_MISSING,
+            format!(
+                "the replacement drive reported NotRequired at {}: no destructive pass ran, so \
+                 no rebuild manifest was committed",
+                paths.index_root.display()
+            ),
+        ));
+    }
 
     // Steps 7 and 8. The verifier reads DURABLE state, so it must run after
     // the drive has committed, and its success is the only thing that
