@@ -16,6 +16,14 @@ use sha2::{Digest, Sha256};
 
 use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_corpus_core::json_store::NofollowDirectory;
+use bbox_corpus_core::project_catalog_snapshot::{
+    LegacyProjectSelectorKindV1, LegacySelectorMembersBuilderV1, OWNER_PROJECT_ID_INVALID,
+    OWNER_ROW_ABSENT, OWNER_SOURCE_MISSING, OWNER_SOURCE_MOVED, OWNER_SOURCE_UNREADABLE,
+    OWNER_SOURCE_UNWRITABLE, OwnerRowProjectIdV1, OwnerRowStampError, OwnerRowStampOutcomeV1,
+    OwnerSnapshotLimitsV1, OwnerSnapshotRowV1, RowStampDecisionV1, STREAMED_CHUNK_BYTES,
+    StreamedLineSplitterV1, read_row_object_project_id, stamp_row_object,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Edge {
@@ -101,10 +109,11 @@ pub fn capture_project_catalog_owner_snapshot(
                 .and_then(|extension| extension.to_str())
                 == Some("jsonl")
         },
-        TranscriptEdgeLaneDecoder::new,
+        |subsource_id: &str| TranscriptEdgeLaneDecoder::new(subsource_id, limits.max_rows),
         // The SAME row walk the stamper uses, so the two halves cannot disagree
         // about which rows exist or what they are called.
         TranscriptEdgeLaneDecoder::decode,
+        TranscriptEdgeLaneDecoder::finish,
     ) {
         Ok(captures) => captures,
         Err(error) => {
@@ -168,71 +177,101 @@ pub fn capture_project_catalog_owner_snapshot(
 /// must exclude it, so the three cannot drift apart.
 pub const EDGE_PROJECT_ID_FIELD: &str = "project_id";
 
-/// One catalog-visible row of one edge lane file.
-struct TranscriptEdgeLaneRow {
-    /// Index into the file's `split_inclusive('\n')` segments, so the stamper
-    /// can replace exactly this line and copy every other byte through.
-    segment_index: usize,
-    /// The project-id-independent content hash (see
-    /// [`transcript_edge_row_identity`]).
-    identity: String,
-    /// Which same-identity row within this lane this is, in file order.
-    occurrence: usize,
-    cwd: String,
-}
-
-impl TranscriptEdgeLaneRow {
-    fn stable_row_id(&self, subsource_id: &str) -> String {
-        transcript_edge_stable_row_id(subsource_id, &self.identity, self.occurrence)
-    }
-}
-
-/// The ONE composition of a transcript-edge row id, so the whole-body walk and
-/// the streaming capture cannot mint different ids for the same row.
-fn transcript_edge_stable_row_id(subsource_id: &str, identity: &str, occurrence: usize) -> String {
-    format!("{subsource_id}:{identity}:{occurrence}")
-}
-
-/// What one lane LINE contributes to the catalog view, independent of how the
-/// line was obtained.
-struct TranscriptEdgeRowIdentityV1 {
-    identity: String,
-    occurrence: usize,
-    cwd: String,
-}
-
-/// The per-lane row walk: the filter, the identity, and the occurrence
-/// numbering, with no opinion about where the lines come from.
+/// The ONE composition of a transcript-edge MEMBER row id, so every half of the
+/// backfill names a given lane row identically.
 ///
-/// Both readers of a lane share this. The whole-body walk feeds it segments of a
-/// buffered file; the streaming capture feeds it lines as they come off the
-/// descriptor. Occurrence numbering is stateful and file-ordered, so anything
-/// that re-derives it independently would silently produce different row ids for
-/// duplicate rows, and the backfill keys its ledger on those ids.
+/// The ordinal is the row's position among the lane's lines, not a counter over
+/// same-content rows. Both discriminate duplicates, but only the ordinal is
+/// O(1) to carry: a same-content counter needs a live map of every identity in
+/// the lane, which on a real host is millions of entries and defeats the whole
+/// point of streaming the file. The ordinal is equally stable across a stamp,
+/// because stamping rewrites a line in place and never adds, removes, or
+/// reorders one.
+fn transcript_edge_stable_row_id(subsource_id: &str, identity: &str, ordinal: u64) -> String {
+    format!("{subsource_id}:{identity}:{ordinal}")
+}
+
+/// The prefix an AGGREGATE (selector-keyed) row id carries in one lane.
+///
+/// Separated from the id itself so the apply half can recognise an obligation
+/// belonging to a lane without knowing the selector literal, which the plan
+/// deliberately never gives it: literal selectors are host-local and stay in the
+/// runtime binding set.
+fn transcript_edge_selector_row_prefix(subsource_id: &str) -> String {
+    format!("{subsource_id}:selector:")
+}
+
+/// One aggregate observation id: this lane, this selector.
+///
+/// Unambiguous against a member id because the literal `selector` component can
+/// never be a member's identity, which is always 64 hex characters.
+fn transcript_edge_selector_row_id(subsource_id: &str, literal_selector: &str) -> String {
+    format!(
+        "{}{}",
+        transcript_edge_selector_row_prefix(subsource_id),
+        transcript_edge_selector_digest(literal_selector)
+    )
+}
+
+/// The owner's own digest of a selector literal, used to key aggregates and to
+/// match rows during apply without ever holding the literal in the plan.
+fn transcript_edge_selector_digest(literal_selector: &str) -> String {
+    bbox_corpus_core::project_catalog_snapshot::sha256_hex(literal_selector.as_bytes())
+}
+
+/// The selector digest `source_row_id` names within this lane, if any.
+fn transcript_edge_selector_digest_of<'a>(
+    subsource_id: &str,
+    source_row_id: &'a str,
+) -> Option<&'a str> {
+    source_row_id
+        .strip_prefix(&transcript_edge_selector_row_prefix(subsource_id))
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// One catalog-visible row of one edge lane, as the walk saw it.
+struct TranscriptEdgeLaneRowV1 {
+    /// Position among the lane's lines, counting every line the file has.
+    ordinal: u64,
+    cwd: String,
+    /// The parsed line, so a caller that stamps or reads the row does not parse
+    /// it a second time. Dropped with the row: never accumulated.
+    value: serde_json::Value,
+}
+
+/// The per-lane row walk: which lines are catalog-visible rows, what selector
+/// each carries, and where it sits.
+///
+/// Every half of the backfill goes through this one definition - capture,
+/// stamp, and verify - so they cannot drift on the filter (blank lines skipped,
+/// rows without a nonempty `cwd` skipped, anything else that is not an edge is a
+/// corrupt lane) or on row position. State is O(1): one counter.
 struct TranscriptEdgeLaneWalk {
-    occurrence_by_identity: BTreeMap<String, usize>,
+    next_ordinal: u64,
 }
 
 impl TranscriptEdgeLaneWalk {
     fn new() -> Self {
-        Self {
-            occurrence_by_identity: BTreeMap::new(),
-        }
+        Self { next_ordinal: 0 }
     }
 
-    /// `Ok(None)` is "this line contributes no catalog row" (blank, or an edge
-    /// with no literal `cwd`); `Err` is a corrupt lane.
-    fn accept(
-        &mut self,
-        content: &str,
-    ) -> Result<Option<TranscriptEdgeRowIdentityV1>, &'static str> {
+    /// Feed the NEXT line of the lane, in order and exactly once.
+    ///
+    /// `Ok(None)` is "this line contributes no catalog row"; `Err` is a corrupt
+    /// lane.
+    fn accept(&mut self, content: &str) -> Result<Option<TranscriptEdgeLaneRowV1>, &'static str> {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
         if content.trim().is_empty() {
             return Ok(None);
         }
-        // Parsed as a typed Edge purely to keep capture's existing validity
-        // contract: a lane line that is not an edge is a corrupt owner, not a
-        // row to skip.
-        let edge: Edge = serde_json::from_str(content).map_err(|_| "transcript_edge_invalid")?;
+        let value: serde_json::Value =
+            serde_json::from_str(content).map_err(|_| "transcript_edge_invalid")?;
+        // Validated as a typed Edge to keep capture's existing validity
+        // contract - a lane line that is not an edge is a corrupt owner, not a
+        // row to skip - but deserialized from the value already parsed, because
+        // a second parse of every line of a multi-gigabyte lane is pure cost.
+        let edge = Edge::deserialize(&value).map_err(|_| "transcript_edge_invalid")?;
         let Some(cwd) = edge
             .metadata
             .get("cwd")
@@ -241,56 +280,82 @@ impl TranscriptEdgeLaneWalk {
         else {
             return Ok(None);
         };
-        let identity = transcript_edge_row_identity(content).ok_or("transcript_edge_invalid")?;
-        let occurrence = self
-            .occurrence_by_identity
-            .entry(identity.clone())
-            .or_default();
-        let row = TranscriptEdgeRowIdentityV1 {
-            identity,
-            occurrence: *occurrence,
+        Ok(Some(TranscriptEdgeLaneRowV1 {
+            ordinal,
             cwd: cwd.to_string(),
-        };
-        *occurrence += 1;
-        Ok(Some(row))
+            value,
+        }))
     }
 }
 
-/// The streaming capture's per-lane decoder: [`TranscriptEdgeLaneWalk`] plus the
-/// subsource the rows belong to.
+/// The streaming capture's per-lane decoder: it folds every catalog-visible row
+/// into its selector's member set and emits ONE row per selector.
+///
+/// The aggregation is not an optimization, it is the only shape that fits: a
+/// working host carries millions of `cwd`-bearing edge rows over a couple of
+/// hundred distinct selectors, and the canonical inventory holds a hundred
+/// thousand entries in total. Deepest-root classification, planning, and
+/// stamping all key on the selector, so per-row rows were evidence nothing
+/// consumed at a scale nothing could hold.
 struct TranscriptEdgeLaneDecoder {
     subsource_id: String,
+    max_selectors: usize,
     walk: TranscriptEdgeLaneWalk,
+    selectors: BTreeMap<String, LegacySelectorMembersBuilderV1>,
 }
 
 impl TranscriptEdgeLaneDecoder {
-    fn new(subsource_id: &str) -> Self {
+    fn new(subsource_id: &str, max_selectors: usize) -> Self {
         Self {
             subsource_id: subsource_id.to_string(),
+            max_selectors,
             walk: TranscriptEdgeLaneWalk::new(),
+            selectors: BTreeMap::new(),
         }
     }
 
-    fn decode(
-        &mut self,
-        line: &[u8],
-    ) -> Result<Option<bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotRowV1>, &'static str>
-    {
-        use bbox_corpus_core::project_catalog_snapshot::{
-            LegacyProjectSelectorKindV1, OwnerSnapshotRowV1,
-        };
-
+    fn decode(&mut self, line: &[u8]) -> Result<(), &'static str> {
         // Validated per line rather than per file. Equivalent, because `\n`
         // cannot occur inside a multi-byte UTF-8 sequence, so a lane is valid
         // UTF-8 exactly when all of its lines are.
         let content = std::str::from_utf8(line).map_err(|_| "transcript_edge_invalid")?;
-        Ok(self.walk.accept(content)?.map(|row| {
-            OwnerSnapshotRowV1::legacy_selector(
-                transcript_edge_stable_row_id(&self.subsource_id, &row.identity, row.occurrence),
-                LegacyProjectSelectorKindV1::AbsolutePath,
-                &row.cwd,
-            )
-        }))
+        let Some(row) = self.walk.accept(content)? else {
+            return Ok(());
+        };
+        let TranscriptEdgeLaneRowV1 {
+            ordinal,
+            cwd,
+            value,
+        } = row;
+        let identity = transcript_edge_value_identity(value).ok_or("transcript_edge_invalid")?;
+        let member_row_id = transcript_edge_stable_row_id(&self.subsource_id, &identity, ordinal);
+        if !self.selectors.contains_key(&cwd) && self.selectors.len() >= self.max_selectors {
+            // The distinct-selector map is the decoder's only unbounded
+            // structure, so it carries the row ceiling directly rather than
+            // waiting for the walker to notice after the lane is finished.
+            return Err("owner_row_limit");
+        }
+        self.selectors.entry(cwd).or_default().push(&member_row_id);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<OwnerSnapshotRowV1>, &'static str> {
+        let Self {
+            subsource_id,
+            selectors,
+            ..
+        } = self;
+        Ok(selectors
+            .into_iter()
+            .map(|(literal_selector, members)| {
+                OwnerSnapshotRowV1::legacy_selector_aggregate(
+                    transcript_edge_selector_row_id(&subsource_id, &literal_selector),
+                    LegacyProjectSelectorKindV1::AbsolutePath,
+                    literal_selector,
+                    members.finish(),
+                )
+            })
+            .collect())
     }
 }
 
@@ -314,7 +379,15 @@ impl TranscriptEdgeLaneDecoder {
 /// independent of that, rather than silently dependent on an unrelated crate's
 /// feature selection.
 pub fn transcript_edge_row_identity(line: &str) -> Option<String> {
-    let mut value: serde_json::Value = serde_json::from_str(line).ok()?;
+    transcript_edge_value_identity(serde_json::from_str(line).ok()?)
+}
+
+/// [`transcript_edge_row_identity`] for a line the caller has already parsed.
+///
+/// Consumes the value: the identity is taken from the row WITHOUT `project_id`,
+/// and removing the field in place is what keeps a multi-gigabyte lane walk from
+/// cloning every row it hashes.
+fn transcript_edge_value_identity(mut value: serde_json::Value) -> Option<String> {
     value.as_object_mut()?.remove(EDGE_PROJECT_ID_FIELD);
     let canonical = canonicalize_json_value(&value);
     let bytes = serde_json::to_vec(&canonical).ok()?;
@@ -340,51 +413,130 @@ fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Split one lane file body into its content lines, keeping each line's exact
-/// terminator so a rewrite can reproduce the file byte for byte.
-fn transcript_edge_segments(body: &str) -> impl Iterator<Item = (&str, &str)> {
-    body.split_inclusive('\n').map(|segment| {
-        let content = segment
-            .strip_suffix('\n')
-            .map_or(segment, |rest| rest.strip_suffix('\r').unwrap_or(rest));
-        (content, &segment[content.len()..])
-    })
-}
-
-/// Walk one lane file's catalog-visible rows.
+/// The lane set: every lane file, paired with the subsource id its rows carry.
 ///
-/// The single definition of "which rows does this owner have, and what is each
-/// one called". Capture builds its snapshot rows from this and the stamper
-/// locates its target with it, so the read and write halves cannot drift on the
-/// filter (blank lines skipped, rows without a nonempty `cwd` skipped), on the
-/// identity, or on occurrence numbering.
-fn transcript_edge_lane_rows(body: &str) -> Result<Vec<TranscriptEdgeLaneRow>, &'static str> {
-    let mut walk = TranscriptEdgeLaneWalk::new();
-    let mut rows = Vec::new();
-    for (segment_index, (content, _)) in transcript_edge_segments(body).enumerate() {
-        let Some(row) = walk.accept(content)? else {
-            continue;
-        };
-        rows.push(TranscriptEdgeLaneRow {
-            segment_index,
-            identity: row.identity,
-            occurrence: row.occurrence,
-            cwd: row.cwd,
-        });
+/// Enumeration only. The apply half opens at most the ONE lane an obligation
+/// names, which is what makes stamping a single selector cost one lane rather
+/// than the whole tree.
+fn transcript_edge_lane_set(
+    edges_dir: &Path,
+    limits: OwnerSnapshotLimitsV1,
+) -> std::result::Result<Vec<(PathBuf, String)>, &'static str> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        enumerate_regular_tree_nofollow, stable_subsource_id,
+    };
+
+    // The same root authority the capture takes, so an unsafe or absent lane
+    // tree refuses here instead of reading as an empty lane set, which would
+    // report every obligation as an absent row.
+    if NofollowDirectory::open_existing(edges_dir)
+        .map_err(|_| "owner_tree_unsafe")?
+        .is_none()
+    {
+        return Err(OWNER_SOURCE_MISSING);
     }
-    Ok(rows)
+    Ok(
+        enumerate_regular_tree_nofollow(edges_dir, limits, |relative| {
+            relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        })
+        .map_err(|error| error.code)?
+        .into_iter()
+        .map(|relative| {
+            let subsource_id = stable_subsource_id("transcript_edge", &relative);
+            (relative, subsource_id)
+        })
+        .collect(),
+    )
 }
 
-/// Stamp one transcript-edge row with its durable project id.
+/// Stream one lane's lines through `on_line`, returning the lane's content
+/// digest, or `None` when the lane is not there.
 ///
-/// The physical write is an atomic WHOLE-FILE replacement (plan section 3.3,
-/// Q-E1): the one matching row is transformed through `serde_json::Value`, the
-/// complete lane is streamed to a unique sibling temporary preserving every
-/// unrelated line and every unknown field, the temporary is fsynced, atomically
-/// renamed over the lane, and the parent directory fsynced. Never an in-place
-/// overwrite, which would expose a torn line to a concurrent reader, and never
-/// an appended superseding duplicate, which would give the lane two rows with
-/// the same identity and break occurrence numbering for every later row.
+/// The lane is opened ONCE and read through that descriptor, so the lines a
+/// caller sees are one coherent version of the file even if it is atomically
+/// replaced mid-read. Memory is one chunk plus one line, whatever the lane
+/// weighs.
+// The backfill apply path is an offline admin path, not a tool handler.
+#[allow(clippy::disallowed_methods)]
+fn stream_lane_nofollow(
+    directory: &NofollowDirectory,
+    name: &str,
+    limits: OwnerSnapshotLimitsV1,
+    mut on_line: impl FnMut(&[u8], &[u8]) -> std::result::Result<(), &'static str>,
+) -> std::result::Result<Option<String>, &'static str> {
+    use std::io::Read as _;
+
+    let Some(mut file) = directory
+        .open_regular(name, "edge lane")
+        .map_err(|_| OWNER_SOURCE_UNREADABLE)?
+    else {
+        return Ok(None);
+    };
+    let mut hasher = Sha256::new();
+    let mut budget = limits.max_streamed_source_bytes;
+    let mut chunk = vec![0u8; STREAMED_CHUNK_BYTES];
+    let mut splitter = StreamedLineSplitterV1::new(limits.max_streamed_line_bytes);
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(OWNER_SOURCE_UNREADABLE),
+        };
+        budget = budget
+            .checked_sub(read as u64)
+            .ok_or("owner_source_byte_limit")?;
+        hasher.update(&chunk[..read]);
+        splitter.push_chunk(&chunk[..read], &mut on_line)?;
+    }
+    splitter.finish(on_line)?;
+    Ok(Some(hex::encode(hasher.finalize())))
+}
+
+/// Whether the lane still holds exactly the bytes a rewrite was computed from.
+///
+/// Split out and digest-shaped for two reasons: the stamper cannot hold a
+/// gigabyte lane in memory to compare bytes, and the recheck is the one step a
+/// test must be able to drive directly, because racing a real concurrent writer
+/// would make it timing-dependent.
+fn transcript_edge_lane_unchanged(
+    directory: &NofollowDirectory,
+    name: &str,
+    expected_digest: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> std::result::Result<(), &'static str> {
+    match stream_lane_nofollow(directory, name, limits, |_content, _terminator| Ok(())) {
+        Ok(Some(current)) if current == expected_digest => Ok(()),
+        // The lane moved under us. Abandon rather than clobber the concurrent
+        // writer; nothing has been committed at this point, so the caller can
+        // retry against the new state.
+        Ok(_) => Err(OWNER_SOURCE_MOVED),
+        Err(error) => Err(error),
+    }
+}
+
+/// Stamp every transcript-edge row of ONE lane carrying one legacy selector.
+///
+/// `source_row_id` names a (lane, selector) pair, not a single row. That is the
+/// shape the plan actually has: a working host carries millions of `cwd`-bearing
+/// edge rows over a couple of hundred distinct selectors, deepest-root
+/// classification maps the SELECTOR, and a per-row ledger of the members could
+/// not fit the canonical inventory at all. The obligation is therefore "give
+/// every row in this lane with this selector this project id".
+///
+/// Because a group never spans lanes, applying it is exactly ONE atomic
+/// replacement, so an obligation is never half applied: a crash leaves either
+/// the old lane or the fully stamped one, and the temporary it may leave behind
+/// is not a `.jsonl` file and so is invisible to capture.
+///
+/// The physical write is the whole-file replacement plan section 3.3 (Q-E1)
+/// specifies, done by STREAMING: lines are read through one descriptor, matching
+/// rows are transformed through `serde_json::Value`, every other line is copied
+/// through byte for byte including its exact terminator, and the result lands in
+/// a unique sibling temporary that is fsynced, atomically renamed over the lane,
+/// and followed by a parent fsync. Never an in-place overwrite, which would
+/// expose a torn line to a concurrent reader, and never an appended superseding
+/// duplicate, which would give the lane two rows at one position.
 ///
 /// Edge lane writes normally run on the reindex writer actor, which the backfill
 /// is not. The plan's sanctioned alternative is taken instead: a
@@ -395,196 +547,267 @@ pub fn stamp_project_catalog_owner_row(
     edges_dir: &Path,
     source_row_id: &str,
     project_id: &str,
-    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
-) -> std::result::Result<
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampOutcomeV1,
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
-> {
-    use bbox_corpus_core::project_catalog_snapshot::{
-        OWNER_PROJECT_ID_INVALID, OWNER_ROW_ABSENT, OWNER_SOURCE_UNWRITABLE, OwnerRowStampError,
-        OwnerRowStampOutcomeV1, RowStampDecisionV1, capture_stable_regular_tree_nofollow,
-        stable_subsource_id, stamp_row_object,
-    };
-
+    limits: OwnerSnapshotLimitsV1,
+) -> std::result::Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
     if project_id.trim().is_empty() {
         return Err(OwnerRowStampError::new(OWNER_PROJECT_ID_INVALID));
     }
-    let captures =
-        capture_stable_regular_tree_nofollow(edges_dir, "transcript_edge", limits, |relative| {
-            relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-        })
-        .map_err(|error| OwnerRowStampError::new(error.code))?;
-
-    // Locate the row by rebuilding every lane's row ids through the shared
-    // walk, rather than by parsing the id: subsource ids are opaque hashes and
-    // splitting on ':' would be a second, weaker identity implementation.
-    for (relative, captured) in captures {
-        let subsource_id = stable_subsource_id("transcript_edge", &relative);
-        let Some(bytes) = captured.bytes else {
-            continue;
-        };
-        let Ok(body) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        let Ok(lane_rows) = transcript_edge_lane_rows(body) else {
-            continue;
-        };
-        let Some(row) = lane_rows
-            .iter()
-            .find(|row| row.stable_row_id(&subsource_id) == source_row_id)
+    let lanes = transcript_edge_lane_set(edges_dir, limits).map_err(OwnerRowStampError::new)?;
+    for (relative, subsource_id) in lanes {
+        let Some(selector_digest) =
+            transcript_edge_selector_digest_of(&subsource_id, source_row_id)
         else {
             continue;
         };
-
-        let segments: Vec<(&str, &str)> = transcript_edge_segments(body).collect();
-        let (content, terminator) = segments[row.segment_index];
-        let mut value: serde_json::Value = serde_json::from_str(content)
-            .map_err(|_| OwnerRowStampError::new("transcript_edge_invalid"))?;
-        // The shared three-way rule: unstamped writes, same-project elides,
-        // different-project refuses. Never re-implemented here.
-        if stamp_row_object(&mut value, project_id)? == RowStampDecisionV1::AlreadyStamped {
-            return Ok(OwnerRowStampOutcomeV1::AlreadyStamped);
-        }
-        let stamped = serde_json::to_string(&value)
-            .map_err(|_| OwnerRowStampError::new(OWNER_SOURCE_UNWRITABLE))?;
-
-        let mut rewritten = Vec::with_capacity(bytes.len() + stamped.len());
-        for (index, (segment_content, segment_terminator)) in segments.iter().enumerate() {
-            if index == row.segment_index {
-                rewritten.extend_from_slice(stamped.as_bytes());
-                rewritten.extend_from_slice(terminator.as_bytes());
-            } else {
-                rewritten.extend_from_slice(segment_content.as_bytes());
-                rewritten.extend_from_slice(segment_terminator.as_bytes());
-            }
-        }
-
-        let path = edges_dir.join(&relative);
-        return commit_stamped_lane(&path, &bytes, &rewritten, limits.max_source_bytes)
-            .map(|()| OwnerRowStampOutcomeV1::Stamped)
-            .map_err(OwnerRowStampError::new);
+        return stamp_lane_selector(
+            &edges_dir.join(&relative),
+            selector_digest,
+            project_id,
+            limits,
+        )
+        .map_err(OwnerRowStampError::new);
     }
     Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
 }
 
-/// Read the stable project ids of MANY transcript-edge rows, the VERIFY half of
-/// [`stamp_project_catalog_owner_row`].
-///
-/// Locates the rows by rebuilding every lane's row ids through the same shared
-/// walk the stamper uses, for the same reason: subsource ids are opaque hashes
-/// and splitting the composite id would be a second, weaker identity
-/// implementation.
-///
-/// ONE walk of the lane set answers every requested id. This owner is the worst
-/// case for a per-row reader: each row would re-walk every lane file and
-/// re-derive every lane's row ids, and the answers would come from as many
-/// different snapshots of the lane set as there were requested rows.
-pub fn read_project_catalog_owner_rows(
-    edges_dir: &Path,
-    source_row_ids: &std::collections::BTreeSet<String>,
-    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
-) -> std::result::Result<
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowBatchV1,
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
-> {
-    use bbox_corpus_core::project_catalog_snapshot::{
-        OwnerRowBatchV1, OwnerRowStampError, capture_stable_regular_tree_nofollow,
-        note_owner_row_read_capture, read_row_object_project_id, stable_subsource_id,
-    };
-
-    note_owner_row_read_capture();
-    let captures =
-        capture_stable_regular_tree_nofollow(edges_dir, "transcript_edge", limits, |relative| {
-            relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-        })
-        .map_err(|error| OwnerRowStampError::new(error.code))?;
-
-    let mut batch = OwnerRowBatchV1::new();
-    for (relative, captured) in captures {
-        let subsource_id = stable_subsource_id("transcript_edge", &relative);
-        let Some(bytes) = captured.bytes else {
-            continue;
-        };
-        let Ok(body) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        let Ok(lane_rows) = transcript_edge_lane_rows(body) else {
-            continue;
-        };
-        // The lane's segments are split ONCE for the whole lane rather than
-        // once per matching row: the split is over the same body every match
-        // reads from.
-        let mut segments: Option<Vec<(&str, &str)>> = None;
-        for row in &lane_rows {
-            let row_id = row.stable_row_id(&subsource_id);
-            if !source_row_ids.contains(&row_id) || batch.contains_key(&row_id) {
-                continue;
-            }
-            let segments = segments.get_or_insert_with(|| transcript_edge_segments(body).collect());
-            let (content, _terminator) = segments[row.segment_index];
-            let value: serde_json::Value = serde_json::from_str(content)
-                .map_err(|_| OwnerRowStampError::new("transcript_edge_invalid"))?;
-            batch.insert(row_id, read_row_object_project_id(&value)?);
-        }
-    }
-    Ok(batch)
-}
-
-/// Write `rewritten` over `path` atomically, refusing if the lane changed since
-/// `expected` was read.
-// The backfill stamper is an offline admin path, not a tool handler.
-#[allow(clippy::disallowed_methods)]
-fn commit_stamped_lane(
+/// Rewrite one lane, stamping its selector group, and clean up after a failure.
+fn stamp_lane_selector(
     path: &Path,
-    expected: &[u8],
-    rewritten: &[u8],
-    max_bytes: usize,
-) -> std::result::Result<(), &'static str> {
-    use bbox_corpus_core::project_catalog_snapshot::{
-        OWNER_SOURCE_MOVED, OWNER_SOURCE_UNWRITABLE, capture_regular_file_nofollow,
-    };
-
+    selector_digest: &str,
+    project_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> std::result::Result<OwnerRowStampOutcomeV1, &'static str> {
     let parent = path.parent().ok_or(OWNER_SOURCE_UNWRITABLE)?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(OWNER_SOURCE_UNWRITABLE)?;
+    let directory = NofollowDirectory::open_existing(parent)
+        .map_err(|_| OWNER_SOURCE_UNREADABLE)?
+        .ok_or(OWNER_SOURCE_MISSING)?;
     let tmp_path = parent.join(format!(
         "{name}.stamp.tmp.{pid}.{seq}",
         pid = std::process::id(),
         seq = writer_temp_sequence()
     ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
-    let committed = (|| -> std::result::Result<(), &'static str> {
-        file.write_all(rewritten)
-            .map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
-        file.sync_all().map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
-        // The recheck, as late as it can be: everything above is reversible by
-        // unlinking the temporary, and nothing below can observe a change.
-        let current = capture_regular_file_nofollow(path, "transcript_edge", name, max_bytes);
-        if current.bytes.as_deref() != Some(expected) {
-            // The lane moved under us. Abandon rather than clobber the
-            // concurrent writer; nothing has been committed at this point, so
-            // the caller can retry against the new state.
-            return Err(OWNER_SOURCE_MOVED);
-        }
-        fs::rename(&tmp_path, path).map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
-        // Durability of the rename itself, not of the bytes: without this the
-        // directory entry can be lost even though the temporary was fsynced.
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
-        Ok(())
-    })();
-    drop(file);
-    if committed.is_err() {
+
+    let outcome = rewrite_lane_stamping_selector(
+        &directory,
+        path,
+        name,
+        &tmp_path,
+        selector_digest,
+        project_id,
+        limits,
+    );
+    if !matches!(outcome, Ok(OwnerRowStampOutcomeV1::Stamped)) {
+        // Nothing was committed, so the temporary is the only trace of the
+        // attempt and must not be left behind. A committed rewrite renamed it
+        // away already, which is why this is not an unconditional unlink.
         let _ = fs::remove_file(&tmp_path);
     }
-    committed
+    outcome
+}
+
+/// The streaming rewrite itself, and the only place a lane is written by the
+/// backfill.
+// The backfill stamper is an offline admin path, not a tool handler.
+#[allow(clippy::disallowed_methods)]
+fn rewrite_lane_stamping_selector(
+    directory: &NofollowDirectory,
+    path: &Path,
+    name: &str,
+    tmp_path: &Path,
+    selector_digest: &str,
+    project_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> std::result::Result<OwnerRowStampOutcomeV1, &'static str> {
+    let temporary = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(tmp_path)
+        .map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
+    let mut writer = BufWriter::new(temporary);
+    let mut walk = TranscriptEdgeLaneWalk::new();
+    let mut matched = 0u64;
+    let mut stamped = 0u64;
+
+    let digest = stream_lane_nofollow(directory, name, limits, |content, terminator| {
+        let text = std::str::from_utf8(content).map_err(|_| "transcript_edge_invalid")?;
+        let mut rewritten = None;
+        if let Some(row) = walk.accept(text)?
+            && transcript_edge_selector_digest(&row.cwd) == selector_digest
+        {
+            matched += 1;
+            let mut value = row.value;
+            // The shared three-way rule: unstamped writes, same-project elides,
+            // different-project refuses. Never re-implemented here.
+            match stamp_row_object(&mut value, project_id).map_err(|error| error.code)? {
+                RowStampDecisionV1::AlreadyStamped => {}
+                RowStampDecisionV1::Write => {
+                    stamped += 1;
+                    rewritten =
+                        Some(serde_json::to_string(&value).map_err(|_| OWNER_SOURCE_UNWRITABLE)?);
+                }
+            }
+        }
+        match &rewritten {
+            Some(line) => writer.write_all(line.as_bytes()),
+            None => writer.write_all(content),
+        }
+        .map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
+        writer
+            .write_all(terminator)
+            .map_err(|_| OWNER_SOURCE_UNWRITABLE)
+    })?
+    .ok_or(OWNER_SOURCE_MISSING)?;
+
+    if matched == 0 {
+        // The lane exists but holds no row with this selector: the group form of
+        // naming a row the owner does not have.
+        return Err(OWNER_ROW_ABSENT);
+    }
+    if stamped == 0 {
+        // Every member already carries exactly this project id, so the re-apply
+        // of a completed obligation writes nothing at all. That is what makes a
+        // torn backfill safe to repeat.
+        return Ok(OwnerRowStampOutcomeV1::AlreadyStamped);
+    }
+
+    let mut temporary = writer.into_inner().map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
+    temporary.flush().map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
+    temporary.sync_all().map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
+    // The recheck, as late as it can be: everything above is reversible by
+    // unlinking the temporary, and nothing below can observe a change.
+    transcript_edge_lane_unchanged(directory, name, &digest, limits)?;
+    fs::rename(tmp_path, path).map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
+    // Durability of the rename itself, not of the bytes: without this the
+    // directory entry can be lost even though the temporary was fsynced.
+    fs::File::open(path.parent().ok_or(OWNER_SOURCE_UNWRITABLE)?)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|_| OWNER_SOURCE_UNWRITABLE)?;
+    Ok(OwnerRowStampOutcomeV1::Stamped)
+}
+
+/// What one lane's rows say about the project id of ONE selector group.
+///
+/// A group is stamped only when EVERY member carries the same id. Anything else
+/// is not a stamped group, and verify must refuse it rather than accept a
+/// majority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectorProjectFoldV1 {
+    Unseen,
+    Unstamped,
+    Stamped(String),
+    /// Members disagree: some stamped and some not, or stamped with different
+    /// project ids.
+    Divergent,
+}
+
+impl SelectorProjectFoldV1 {
+    fn observe(&mut self, observed: OwnerRowProjectIdV1) {
+        *self = match (std::mem::replace(self, Self::Divergent), observed) {
+            (Self::Divergent, _) => Self::Divergent,
+            (Self::Unseen, OwnerRowProjectIdV1::Unstamped) => Self::Unstamped,
+            (Self::Unseen, OwnerRowProjectIdV1::Stamped(project)) => Self::Stamped(project),
+            (Self::Unstamped, OwnerRowProjectIdV1::Unstamped) => Self::Unstamped,
+            (Self::Stamped(held), OwnerRowProjectIdV1::Stamped(project)) if held == project => {
+                Self::Stamped(held)
+            }
+            _ => Self::Divergent,
+        };
+    }
+
+    /// `None` is "this owner holds no such group", which verify reads as an
+    /// absent row.
+    fn into_observation(self) -> Option<OwnerRowProjectIdV1> {
+        match self {
+            Self::Unseen => None,
+            Self::Unstamped => Some(OwnerRowProjectIdV1::Unstamped),
+            Self::Stamped(project) => Some(OwnerRowProjectIdV1::Stamped(project)),
+            // A divergent group reports as UNSTAMPED rather than as one of the
+            // ids it partly carries. Verify refuses either way, and the owner
+            // must not invent a uniform answer for a group that does not have
+            // one.
+            Self::Divergent => Some(OwnerRowProjectIdV1::Unstamped),
+        }
+    }
+}
+
+/// Read the stable project ids of MANY transcript-edge selector groups, the
+/// VERIFY half of [`stamp_project_catalog_owner_row`].
+///
+/// ONE walk of the lane set answers every requested id, and only lanes that own
+/// a requested id are opened at all. This owner is the worst case for a per-row
+/// reader: each row would re-walk the lane set, and the answers would come from
+/// as many different durable states as there were requested rows.
+pub fn read_project_catalog_owner_rows(
+    edges_dir: &Path,
+    source_row_ids: &std::collections::BTreeSet<String>,
+    limits: OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowBatchV1,
+    OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        OwnerRowBatchV1, note_owner_row_read_capture,
+    };
+
+    note_owner_row_read_capture();
+    let lanes = transcript_edge_lane_set(edges_dir, limits).map_err(OwnerRowStampError::new)?;
+    let mut batch = OwnerRowBatchV1::new();
+    for (relative, subsource_id) in lanes {
+        // Which requested obligations belong to THIS lane, keyed by the digest
+        // its rows will be matched on.
+        let mut wanted = source_row_ids
+            .iter()
+            .filter_map(|source_row_id| {
+                transcript_edge_selector_digest_of(&subsource_id, source_row_id).map(|digest| {
+                    (
+                        digest.to_string(),
+                        (source_row_id.clone(), SelectorProjectFoldV1::Unseen),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        if wanted.is_empty() {
+            // Never opened: a lane owning none of the requested ids has nothing
+            // to say, and reading it would be pure I/O.
+            continue;
+        }
+        let path = edges_dir.join(&relative);
+        let parent = path
+            .parent()
+            .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_UNREADABLE))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_UNREADABLE))?;
+        let Some(directory) = NofollowDirectory::open_existing(parent)
+            .map_err(|_| OwnerRowStampError::new(OWNER_SOURCE_UNREADABLE))?
+        else {
+            continue;
+        };
+        let mut walk = TranscriptEdgeLaneWalk::new();
+        stream_lane_nofollow(&directory, name, limits, |content, _terminator| {
+            let text = std::str::from_utf8(content).map_err(|_| "transcript_edge_invalid")?;
+            let Some(row) = walk.accept(text)? else {
+                return Ok(());
+            };
+            let Some((_, fold)) = wanted.get_mut(&transcript_edge_selector_digest(&row.cwd)) else {
+                return Ok(());
+            };
+            fold.observe(read_row_object_project_id(&row.value).map_err(|error| error.code)?);
+            Ok(())
+        })
+        .map_err(OwnerRowStampError::new)?;
+        for (source_row_id, fold) in wanted.into_values() {
+            if let Some(observation) = fold.into_observation() {
+                batch.insert(source_row_id, observation);
+            }
+        }
+    }
+    Ok(batch)
 }
 
 impl Edge {
@@ -1484,6 +1707,17 @@ mod project_catalog_snapshot_tests {
             .clone()
     }
 
+    fn selector_members(
+        row: &OwnerSnapshotRowV1,
+    ) -> bbox_corpus_core::project_catalog_snapshot::LegacySelectorMembersV1 {
+        match &row.value {
+            OwnerSnapshotRowValueV1::LegacyProjectSelector { members, .. } => members.clone(),
+            OwnerSnapshotRowValueV1::InventoryTarget { .. } => {
+                panic!("transcript-edge rows are legacy selectors")
+            }
+        }
+    }
+
     /// THE Q-E1 INVARIANT. A row's identity is the same before and after it is
     /// stamped, so a crash-retry recognises its own completed work.
     ///
@@ -1643,14 +1877,27 @@ mod project_catalog_snapshot_tests {
             bbox_corpus_core::project_catalog_snapshot::OWNER_ROW_ABSENT
         );
 
-        // The moved case: commit_stamped_lane rechecks the source against the
-        // bytes the locate step read, so bytes that no longer match abandon
-        // the write. Driven directly because racing a real concurrent writer
-        // would make the test timing-dependent.
-        let stale = std::fs::read(&path).unwrap();
+        // The moved case: the rewrite rechecks the source digest immediately
+        // before the rename, so a lane whose bytes no longer match abandons the
+        // write. Driven directly because racing a real concurrent writer would
+        // make the test timing-dependent.
+        let directory = NofollowDirectory::open_existing(&root).unwrap().unwrap();
+        let digest = stream_lane_nofollow(
+            &directory,
+            "tool.jsonl",
+            OwnerSnapshotLimitsV1::default(),
+            |_, _| Ok(()),
+        )
+        .unwrap()
+        .unwrap();
         std::fs::write(&path, b"{\"moved\":true}\n").unwrap();
-        let moved =
-            commit_stamped_lane(&path, &stale, b"irrelevant", 16 * 1024 * 1024).unwrap_err();
+        let moved = transcript_edge_lane_unchanged(
+            &directory,
+            "tool.jsonl",
+            &digest,
+            OwnerSnapshotLimitsV1::default(),
+        )
+        .unwrap_err();
 
         assert_eq!(
             moved,
@@ -1683,10 +1930,14 @@ mod project_catalog_snapshot_tests {
         assert_ne!(transcript_edge_row_identity(different).unwrap(), identity);
     }
 
-    /// Two rows identical except for their project stamp still get distinct
-    /// ids, and stamping the unstamped one does not renumber the other.
+    /// Byte-identical rows sharing one selector are ONE observation standing for
+    /// both, and the aggregate id survives the stamp that fills them in.
+    ///
+    /// The member commitment is what keeps the duplicate visible: two rows and
+    /// one row committed differently, so a lost duplicate cannot hide behind an
+    /// unchanged observation.
     #[test]
-    fn same_identity_rows_keep_distinct_occurrences_across_a_stamp() {
+    fn duplicate_rows_aggregate_into_one_observation_that_survives_a_stamp() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("edges");
         std::fs::create_dir_all(&root).unwrap();
@@ -1696,30 +1947,43 @@ mod project_catalog_snapshot_tests {
         let snapshot =
             capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
                 .unwrap();
-        assert_eq!(snapshot.row_count, 2);
-        let first = snapshot.rows[0].stable_row_id.clone();
-        let second = snapshot.rows[1].stable_row_id.clone();
-        assert_ne!(first, second);
-        assert!(first.ends_with(":0") && second.ends_with(":1"));
+        assert_eq!(snapshot.row_count, 1);
+        let observation = snapshot.rows[0].clone();
+        assert_eq!(selector_members(&observation).row_count, 2);
 
+        // The same lane holding ONE copy commits differently.
+        std::fs::write(root.join("tool.jsonl"), format!("{row}\n")).unwrap();
+        let single =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_eq!(single.rows[0].stable_row_id, observation.stable_row_id);
+        assert_ne!(
+            selector_members(&single.rows[0]).commitment_sha256,
+            selector_members(&observation).commitment_sha256
+        );
+
+        std::fs::write(root.join("tool.jsonl"), format!("{row}\n{row}\n")).unwrap();
         stamp_project_catalog_owner_row(
             &root,
-            &first,
+            &observation.stable_row_id,
             "a1b2c3d4",
             OwnerSnapshotLimitsV1::default(),
         )
         .unwrap();
 
-        // Both ids still resolve after the stamp: occurrence numbering did not
-        // shift under the row that was not touched.
+        // BOTH duplicates were stamped by the one obligation, and the aggregate
+        // id is unchanged, so a crash-retry recognises its own completed work.
         let after = capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
             .unwrap();
-        let ids: Vec<&str> = after
-            .rows
-            .iter()
-            .map(|row| row.stable_row_id.as_str())
-            .collect();
-        assert!(ids.contains(&first.as_str()) && ids.contains(&second.as_str()));
+        assert_eq!(after.rows[0].stable_row_id, observation.stable_row_id);
+        assert_eq!(selector_members(&after.rows[0]).row_count, 2);
+        assert_eq!(
+            std::fs::read_to_string(root.join("tool.jsonl"))
+                .unwrap()
+                .matches(r#""project_id":"a1b2c3d4""#)
+                .count(),
+            2
+        );
     }
 
     /// Write `rows` catalog-visible edge lines, each padded so a handful of
@@ -1806,10 +2070,9 @@ mod project_catalog_snapshot_tests {
     }
 
     /// ONE lane larger than the whole buffered budget: the streamed digest is
-    /// the same commitment a whole-file read would have produced, and the row
-    /// ids are the same ones the stamper's whole-body walk mints - which is the
-    /// only reason a streamed capture and a buffered stamp can be two halves of
-    /// one backfill.
+    /// the same commitment a whole-file read would have produced, and the id the
+    /// capture minted is the one the apply half resolves - which is the only
+    /// reason capture and stamp are two halves of one backfill.
     #[test]
     fn one_oversized_lane_streams_the_whole_file_digest_and_stampable_ids() {
         let dir = tempfile::tempdir().unwrap();
@@ -1832,7 +2095,7 @@ mod project_catalog_snapshot_tests {
         );
 
         // The lane is comfortably inside the DEFAULT buffered budget, so the
-        // stamper can still locate this streamed id by its own whole-body walk.
+        // stamper resolves this streamed id by re-walking the lane it names.
         let row_id = snapshot
             .rows
             .iter()
@@ -1895,6 +2158,248 @@ mod project_catalog_snapshot_tests {
             OwnerSnapshotStateV1::Corrupt { diagnostic_code, .. }
                 if diagnostic_code == "owner_source_unreadable"
         ));
+    }
+
+    /// Write a lane whose `rows` rows cycle through `selectors`, padded so a
+    /// handful of rows already exceeds a small injected byte budget.
+    fn write_selector_lane(path: &Path, selectors: &[&str], rows: usize) {
+        let padding = "p".repeat(160);
+        let body = (0..rows)
+            .map(|index| {
+                format!(
+                    concat!(
+                        r#"{{"source":{{"type":"task","task_id":"row-{index}"}},"#,
+                        r#""kind":"RAN_BASH","target":{{"type":"task","task_id":"peer"}},"#,
+                        r#""provenance":"explicit","confidence":"exact","#,
+                        r#""metadata":{{"cwd":"{cwd}","pad":"{padding}"}}}}"#,
+                        "\n",
+                    ),
+                    index = index,
+                    cwd = selectors[index % selectors.len()],
+                    padding = padding,
+                )
+            })
+            .collect::<String>();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// THE F8 SHAPE: millions of rows over a handful of selectors collapse to
+    /// one observation per (lane, selector), carrying the count and an ordered
+    /// commitment instead of the rows themselves.
+    ///
+    /// A per-row ledger of a real host's edge lanes is a few million entries
+    /// against a canonical inventory that holds a hundred thousand in total, so
+    /// this is not a size optimization: it is the only shape that fits.
+    #[test]
+    fn selectors_aggregate_per_lane_with_counts_and_an_ordered_commitment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        write_selector_lane(&root.join("a.jsonl"), &["/repo/one", "/repo/two"], 400);
+        write_selector_lane(&root.join("b.jsonl"), &["/repo/one"], 30);
+
+        let snapshot =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        // Two lanes, three (lane, selector) pairs, 430 member rows.
+        assert_eq!(snapshot.row_count, 3);
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|row| selector_members(row).row_count)
+                .sum::<u64>(),
+            430
+        );
+        // The SAME selector in two lanes is two observations, because an
+        // obligation must never span lanes: one lane is one atomic write.
+        let one_lane_a = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(&row.value, OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                literal_selector, ..
+            } if literal_selector == "/repo/one")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(one_lane_a.len(), 2);
+        assert_ne!(one_lane_a[0].stable_row_id, one_lane_a[1].stable_row_id);
+
+        // Deterministic over identical content, and moves with membership: a
+        // dropped member cannot hide behind an unchanged observation.
+        let replay =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_eq!(replay.rows, snapshot.rows);
+        write_selector_lane(&root.join("b.jsonl"), &["/repo/one"], 29);
+        let shrunk =
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+                .unwrap();
+        assert_ne!(shrunk.rows, snapshot.rows);
+        assert_ne!(shrunk.canonical_sha256, snapshot.canonical_sha256);
+    }
+
+    /// F7: the apply half streams too. A lane far past the buffered byte budget
+    /// is stamped in full, every unrelated line survives byte for byte, and a
+    /// second apply writes nothing at all.
+    #[test]
+    fn a_lane_over_the_buffered_budget_stamps_streaming_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("tool.jsonl");
+        write_selector_lane(&path, &["/repo/one", "/repo/two"], 500);
+        let limits = tiny_buffered_budget();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.len() > limits.max_source_bytes);
+
+        let row_id = capture_project_catalog_owner_snapshot(&root, limits)
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| {
+                matches!(&row.value, OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                literal_selector, ..
+            } if literal_selector == "/repo/one")
+            })
+            .expect("the oversized lane still yields its selectors")
+            .stable_row_id
+            .clone();
+
+        assert_eq!(
+            stamp_project_catalog_owner_row(&root, &row_id, "a1b2c3d4", limits).unwrap(),
+            OwnerRowStampOutcomeV1::Stamped
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.lines().count(), before.lines().count());
+        // Exactly the 250 rows carrying that selector were stamped, and the
+        // rows carrying the other selector were copied through untouched.
+        assert_eq!(after.matches(r#""project_id":"a1b2c3d4""#).count(), 250);
+        for (stamped_line, original) in after.lines().zip(before.lines()) {
+            if original.contains(r#""cwd":"/repo/two""#) {
+                assert_eq!(stamped_line, original);
+            }
+        }
+
+        // The second apply of a completed obligation writes NOTHING.
+        assert_eq!(
+            stamp_project_catalog_owner_row(&root, &row_id, "a1b2c3d4", limits).unwrap(),
+            OwnerRowStampOutcomeV1::AlreadyStamped
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+    }
+
+    /// The verify half answers per selector group, and answers only what the
+    /// group uniformly carries.
+    #[test]
+    fn the_batched_read_answers_per_selector_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        write_selector_lane(&root.join("tool.jsonl"), &["/repo/one", "/repo/two"], 6);
+        let limits = OwnerSnapshotLimitsV1::default();
+        let one = only_row_id(&root, "/repo/one");
+        let two = only_row_id(&root, "/repo/two");
+        stamp_project_catalog_owner_row(&root, &one, "a1b2c3d4", limits).unwrap();
+
+        let requested = [
+            one.clone(),
+            two.clone(),
+            "transcript_edge:nope:0".to_string(),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let batch = read_project_catalog_owner_rows(&root, &requested, limits).unwrap();
+
+        assert_eq!(
+            batch.get(&one),
+            Some(
+                &bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1::Stamped(
+                    "a1b2c3d4".to_string()
+                )
+            )
+        );
+        assert_eq!(
+            batch.get(&two),
+            Some(&bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1::Unstamped)
+        );
+        // An id no lane holds is absent from the batch, never a default answer.
+        assert_eq!(batch.get("transcript_edge:nope:0"), None);
+
+        // A group that is only PARTLY stamped is not a stamped group: appending
+        // an unstamped member with the same selector must stop it reading as
+        // `Stamped`, or a torn apply would verify as complete.
+        let torn = format!(
+            "{}{}\n",
+            std::fs::read_to_string(root.join("tool.jsonl")).unwrap(),
+            r#"{"source":{"type":"task","task_id":"late"},"kind":"RAN_BASH","target":{"type":"task","task_id":"peer"},"provenance":"explicit","confidence":"exact","metadata":{"cwd":"/repo/one"}}"#
+        );
+        std::fs::write(root.join("tool.jsonl"), torn).unwrap();
+        let batch = read_project_catalog_owner_rows(&root, &requested, limits).unwrap();
+        assert_eq!(
+            batch.get(&one),
+            Some(&bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1::Unstamped)
+        );
+    }
+
+    /// THE CRASH SHAPE. A temporary left behind by an interrupted stamp is not a
+    /// lane: capture must not read it, and the next apply must not trip on it.
+    ///
+    /// The temporary deliberately does not end in `.jsonl`, which is what keeps
+    /// a crashed rewrite from presenting a half-written duplicate of a lane to
+    /// the very capture the plan is derived from.
+    #[test]
+    fn an_abandoned_stamp_temporary_does_not_corrupt_a_re_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = lane_fixture(&root);
+        let limits = OwnerSnapshotLimitsV1::default();
+        let before = capture_project_catalog_owner_snapshot(&root, limits).unwrap();
+
+        // Exactly what a crash between the temporary's creation and its rename
+        // leaves on disk: a partial copy of the lane under the stamper's
+        // temporary name.
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            root.join("tool.jsonl.stamp.tmp.99999.7"),
+            &body[..body.len() / 2],
+        )
+        .unwrap();
+
+        let after = capture_project_catalog_owner_snapshot(&root, limits).unwrap();
+        assert_eq!(after.rows, before.rows);
+        assert_eq!(after.canonical_sha256, before.canonical_sha256);
+
+        // And the retry still applies against the real lane.
+        let row_id = only_row_id(&root, "/repo/one");
+        assert_eq!(
+            stamp_project_catalog_owner_row(&root, &row_id, "a1b2c3d4", limits).unwrap(),
+            OwnerRowStampOutcomeV1::Stamped
+        );
+        assert!(root.join("tool.jsonl.stamp.tmp.99999.7").exists());
+    }
+
+    /// A refused stamp leaves no temporary of its own behind.
+    #[test]
+    fn a_refused_stamp_cleans_up_its_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        lane_fixture(&root);
+        let limits = OwnerSnapshotLimitsV1::default();
+        let row_id = only_row_id(&root, "/repo/one");
+        stamp_project_catalog_owner_row(&root, &row_id, "a1b2c3d4", limits).unwrap();
+
+        // A conflicting re-stamp refuses mid-stream, after the temporary exists.
+        stamp_project_catalog_owner_row(&root, &row_id, "99999999", limits).unwrap_err();
+
+        let leftovers = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".stamp.tmp."))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     }
 
     #[test]

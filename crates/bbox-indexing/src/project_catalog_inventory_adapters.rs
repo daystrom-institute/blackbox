@@ -3565,6 +3565,7 @@ fn capture_legacy_path_observations_lane(
                     let OwnerSnapshotRowValueV1::LegacyProjectSelector {
                         selector_kind: raw_kind,
                         literal_selector,
+                        members,
                     } = &raw.value
                     else {
                         continue;
@@ -3603,6 +3604,14 @@ fn capture_legacy_path_observations_lane(
                         stable_row_id,
                         selector_kind: selector_kind(*raw_kind),
                         selector_digest: digest,
+                        member_row_count: members.row_count,
+                        // Carried through verbatim rather than recomputed: the
+                        // owner walked the rows, and this inventory never sees
+                        // them.
+                        member_commitment_sha256: Sha256ValueV1::parse(
+                            members.commitment_sha256.clone(),
+                        )
+                        .map_err(|_| invalid_source("legacy_path_member_commitment_invalid"))?,
                     });
                 }
             }
