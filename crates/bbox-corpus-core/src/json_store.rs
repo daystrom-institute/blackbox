@@ -175,6 +175,25 @@ impl NofollowDirectory {
         max_bytes: usize,
         label: &str,
     ) -> Result<Option<Vec<u8>>> {
+        let Some(mut file) = self.open_regular(name, label)? else {
+            return Ok(None);
+        };
+        read_bounded(&mut file, max_bytes, label).map(Some)
+    }
+
+    /// Open one regular file by basename through the held directory descriptor,
+    /// without following a link at the final component.
+    ///
+    /// The STREAMING counterpart to [`Self::read_regular`]: identical open flags
+    /// and identical non-regular refusal, but the caller receives the descriptor
+    /// instead of a buffer, so a source far larger than memory can be digested
+    /// or parsed in bounded chunks. `read_regular` is implemented on top of this
+    /// precisely so the two can never drift on what counts as safe to read.
+    ///
+    /// `O_NONBLOCK` is load-bearing on the open itself: without it, opening a
+    /// FIFO that a hostile or accidental writer left in the tree would block
+    /// forever instead of failing the non-regular check below.
+    pub fn open_regular(&self, name: &str, label: &str) -> Result<Option<File>> {
         validate_relative_basename(name)?;
         #[cfg(unix)]
         {
@@ -197,7 +216,7 @@ impl NofollowDirectory {
                 return Err(error)
                     .with_context(|| format!("failed to open {label} in {}", self.path.display()));
             }
-            let mut file = unsafe { File::from_raw_fd(descriptor) };
+            let file = unsafe { File::from_raw_fd(descriptor) };
             if !file
                 .metadata()
                 .with_context(|| format!("failed to inspect {label}"))?
@@ -206,12 +225,12 @@ impl NofollowDirectory {
             {
                 anyhow::bail!("refusing non-regular {label}");
             }
-            return read_bounded(&mut file, max_bytes, label).map(Some);
+            return Ok(Some(file));
         }
         #[cfg(not(unix))]
         {
             let path = self.path.join(name);
-            let mut file = match OpenOptions::new().read(true).open(&path) {
+            let file = match OpenOptions::new().read(true).open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => {
@@ -222,7 +241,7 @@ impl NofollowDirectory {
             if !file.metadata()?.file_type().is_file() {
                 anyhow::bail!("refusing non-regular {label}");
             }
-            read_bounded(&mut file, max_bytes, label).map(Some)
+            Ok(Some(file))
         }
     }
 

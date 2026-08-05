@@ -48,6 +48,20 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   snapshot. The task and consultant proposal projections live here only to
   break the root-crate dependency cycle and expose their narrow persisted
   selector surface.
+- Owner capture has TWO lanes and they are not interchangeable. The buffered
+  lane reads each source whole and spends `max_source_bytes` cumulatively
+  across the tree; that is a MEMORY ceiling and is right for the small JSON
+  stores, whose fingerprints are over bytes they must hold anyway. The
+  streaming lane digests incrementally and hands the owner one line at a
+  time, bounded by `max_streamed_source_bytes` (wall time) and
+  `max_streamed_line_bytes` (the only real allocation bound there). A
+  line-oriented owner whose sources are unbounded by design (edge lanes run
+  to gigabytes on a working host) MUST use the streaming lane: under the
+  buffered one its first file exhausts the budget, reads back empty, and the
+  owner reports a healthy host as `owner_source_unreadable`. Never "fix" that
+  by raising the buffered budget, and never move a buffered owner onto the
+  streaming lane casually: the streamed digest is byte-identical to the
+  buffered one, but the lanes differ in what they refuse.
 
 ## Rerank math (search/rerank.rs)
 
