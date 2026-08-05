@@ -50,7 +50,8 @@ counters consume the compatibility observation counters from the same
 handoff.
 
 `DECISION_LEDGER.md` entries cited in this document, verified line-by-line
-at authoring time (ledger holds 34 entries, D-001 through D-034): D-002
+at authoring time and re-verified at revision `217dc5b1` (the ledger now
+holds 41 entries, D-001 through D-041): D-002
 (line 33, "Do not activate v2 state before the complete v2 runtime can
 preserve parity"), D-004 (line 89, "Split catalog administration by proof,
 not by a claimed MCP identity"), D-006 (line 145, "Migration rehearsal
@@ -72,9 +73,24 @@ sanctioned bridge lane; v2 enforces recorded capabilities"), D-034 (line
 861, "The bridge identity marker is identity provenance, not a scope
 variant").
 
+Seven entries landed after this plan's first authoring, and this revision
+binds them explicitly. Direct Phase 6 constraints: D-036 (line 927,
+Equality proof mode is mandatory for the Phase 6 offline rebuild,
+sections 3.4 and P6-C), D-037 (line 962, compatibility generations are
+manifest-owned and never inferred from record `Ready`, P6-C and P6-E),
+D-040 (line 1071, publisher establishment is explicit and
+pointer-absence-gated, section 3.3 backfill verification), D-041 (line
+1115, bridge parity narrowed for one timing-dependent acquisition count,
+governing the parity discipline the handoff carries). Inherited
+existing-machinery contracts Phase 6 relies on but does not modify:
+D-035 (line 892, version bumps migrate collected materializations in
+place), D-038 (line 997, the history reference manifest re-baselines on
+divergence), D-039 (line 1030, generation identity excludes source
+evidence).
+
 New decisions proposed in this plan are UNNUMBERED. No ledger number is
-pre-assigned; concurrent implementation sessions are actively minting D-035
-and beyond, and hard-coding a number here would collide.
+pre-assigned; implementation sessions mint numbers at landing time, and
+hard-coding a number here would collide.
 
 ## 1. Required outcome
 
@@ -1143,6 +1159,9 @@ GC exclusion: marker-driven refusal scoped to `MigratedV1`; `FreshV2` stores
 carry no rollback assets (D-011). Error codes conform to
 `error.project_catalog_*`; envelope values are snake_case.
 
-DECISION_LEDGER.md citations: 16 entries (D-002, D-004, D-006, D-011, D-014,
-D-019, D-020, D-021, D-025, D-026, D-027, D-028, D-029, D-030, D-032, D-034),
-each verified line-by-line at authoring time.
+DECISION_LEDGER.md citations: 23 entries. The original 16 (D-002, D-004,
+D-006, D-011, D-014, D-019, D-020, D-021, D-025, D-026, D-027, D-028,
+D-029, D-030, D-032, D-034) plus the seven post-authoring entries bound by
+this revision: D-036, D-037, D-040, and D-041 as direct Phase 6
+constraints, and D-035, D-038, and D-039 as inherited existing-machinery
+contracts. Each verified line-by-line, re-verified at revision `217dc5b1`.
