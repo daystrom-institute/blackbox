@@ -245,6 +245,8 @@ pub struct ProjectCatalogStamperOwnerPathsV1 {
     /// The JSONL edge lane TREE, not a single file: the transcript-edge owner
     /// is a directory of lanes (Q-E1).
     pub transcript_edge_root: PathBuf,
+    /// The central task store (Q-E2).
+    pub task_store_path: PathBuf,
 }
 
 /// Opaque, validated, non-serializable owner and transaction layout.
@@ -356,6 +358,7 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             // inventory looked at, or the row ids it was handed name rows in a
             // different tree.
             transcript_edge_root: inventory.edge_root,
+            task_store_path: inventory.task_store_path,
         }
     }
 

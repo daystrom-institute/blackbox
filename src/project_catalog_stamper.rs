@@ -53,6 +53,7 @@ pub struct ProjectCatalogStamperPathsV1 {
     /// owner is a directory of lanes and the stamper locates a row across all
     /// of them.
     pub transcript_edge_root: PathBuf,
+    pub task_store_path: PathBuf,
 }
 
 /// Reject a path that is not absolute or that contains a traversal or prefix
@@ -97,6 +98,7 @@ impl ProjectCatalogOwnerRowStamperV1 {
             &paths.whiteboard_root,
             &paths.artifact_root,
             &paths.transcript_edge_root,
+            &paths.task_store_path,
         ] {
             validate_owner_path(path)?;
         }
@@ -220,11 +222,11 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
             | LegacyPathStoreKindV1::Artifact
             // Q-E1: a typed top-level project_id on the edge record plus an
             // atomic whole-file lane replacement.
-            | LegacyPathStoreKindV1::TranscriptEdge => LegacyRowStampCoverageV1::Covered,
-            // Task: the persisted record has no project id field at all, only
-            // an orchestration cwd, and it is owned by the root crate. Its
-            // schema change is a separate dedicated commit (Q-E2).
-            LegacyPathStoreKindV1::Task => LegacyRowStampCoverageV1::NotImplemented,
+            | LegacyPathStoreKindV1::TranscriptEdge
+            // Q-E2: project_id on PersistedTask AND TaskInner, so a stamp
+            // survives the daemon's load-then-persist projection.
+            | LegacyPathStoreKindV1::Task => LegacyRowStampCoverageV1::Covered,
+
             // Provenance (Q-E3b): not unimplemented, EXEMPT. Its capture
             // requires a nonempty project id, derives it from the legacy
             // project record, and emits only inventory-target rows, so it never
@@ -411,14 +413,25 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     )
                 },
             ),
+            LegacyPathStoreKindV1::Task => self.stamp_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.task_store_path,
+                |path| {
+                    bbox_corpus_core::project_catalog_snapshot::stamp_legacy_task_owner_row(
+                        path,
+                        source_row_id,
+                        project_id,
+                        limits,
+                    )
+                },
+            ),
             // Reached only if preflight's coverage refusal were bypassed. A
             // typed refusal, never a silent success.
-            LegacyPathStoreKindV1::Task | LegacyPathStoreKindV1::Provenance => {
-                Err(stamp_refusal(format!(
-                    "{} has no durable write-back",
-                    legacy_store_token(store_kind)
-                )))
-            }
+            LegacyPathStoreKindV1::Provenance => Err(stamp_refusal(format!(
+                "{} has no durable write-back",
+                legacy_store_token(store_kind)
+            ))),
         }
     }
 }
@@ -456,6 +469,7 @@ mod owner_row_stamper_dispatch {
                 whiteboard_root: root.join("whiteboards"),
                 artifact_root: root.join("artifacts"),
                 transcript_edge_root: root.join("edges"),
+                task_store_path: root.join("tasks.json"),
             },
             OwnerSnapshotLimitsV1::default(),
         )
@@ -560,6 +574,107 @@ mod owner_row_stamper_dispatch {
                 .unwrap(),
             LegacyRowStampOutcomeV1::AlreadyStamped
         );
+    }
+
+    /// THE Q-E2 PROOF SET. Five conditions, all against the REAL daemon types
+    /// rather than a stand-in, which is the whole reason this owner's stamper
+    /// had to live root-side.
+    ///
+    /// Proof 1 is the load-then-persist survival that motivated putting the
+    /// field on `TaskInner` and not only `PersistedTask`: the daemon's snapshot
+    /// is a projection of live memory, so a persisted-only field is erased by
+    /// the first cycle. The other four are backward compatibility, unknown
+    /// field survival, conflict refusal, and new-write persistence.
+    #[test]
+    fn the_task_owner_satisfies_the_five_q_e2_conditions() {
+        use crate::orchestration::TaskStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let stamper = stamper(&root);
+        let tasks_path = root.join("tasks.json");
+
+        // A legacy record with a cwd, no project_id, and a field this binary's
+        // PersistedTask has never heard of.
+        std::fs::write(
+            &tasks_path,
+            concat!(
+                r#"[{"id":"t1","provider":"glm","session_id":"s1","events":[],"#,
+                r#""last_assistant_message":null,"usage":null,"cost_usd":null,"#,
+                r#""num_turns":null,"stderr":"","status":"completed","started_at":1,"#,
+                r#""completed_at":2,"exit_code":0,"cwd":"/repo/one","#,
+                r#""future_field":{"written_by":"a newer daemon"}}]"#,
+            ),
+        )
+        .unwrap();
+
+        // PROOF 4: an unstamped legacy task loads at all (backward compatible).
+        // `u64::MAX` ttl: the fixture's started_at is epoch-1, and a realistic
+        // ttl would prune it before the proof could run.
+        let store = TaskStore::load(&root, u64::MAX);
+        assert!(store.get("t1").is_some(), "unstamped task must still load");
+
+        // Stamp it through the production dispatch.
+        assert_eq!(
+            stamper
+                .stamp(LegacyPathStoreKindV1::Task, "t1", &project())
+                .unwrap(),
+            LegacyRowStampOutcomeV1::Stamped
+        );
+        let after_stamp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&tasks_path).unwrap()).unwrap();
+        assert_eq!(after_stamp[0]["project_id"], "a1b2c3d4");
+        // PROOF 2: the unknown field survived the backfill mutation.
+        assert_eq!(
+            after_stamp[0]["future_field"]["written_by"],
+            "a newer daemon"
+        );
+
+        // PROOF 1: the stamp survives a load AND the next persist. This is the
+        // one that fails if project_id lives only on PersistedTask.
+        let reloaded = TaskStore::load(&root, u64::MAX);
+        assert_eq!(
+            reloaded
+                .get("t1")
+                .unwrap()
+                .inner
+                .lock()
+                .project_id
+                .as_deref(),
+            Some("a1b2c3d4"),
+            "the stamp must reach the LIVE record, not just the persisted one"
+        );
+        reloaded.persist(&root);
+        let after_cycle: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&tasks_path).unwrap()).unwrap();
+        assert_eq!(
+            after_cycle[0]["project_id"], "a1b2c3d4",
+            "a load-then-persist cycle must not erase the stamp"
+        );
+
+        // PROOF 3: a conflicting project id refuses, and writes nothing.
+        let before_conflict = std::fs::read(&tasks_path).unwrap();
+        let conflict = stamper
+            .stamp(
+                LegacyPathStoreKindV1::Task,
+                "t1",
+                &ProjectId::parse("99999999".to_string()).unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(conflict.code, ERROR_STALE_POST_IMAGE);
+        assert_eq!(std::fs::read(&tasks_path).unwrap(), before_conflict);
+
+        // PROOF 5: a new write carrying known catalog authority persists the
+        // stable id rather than dropping it.
+        {
+            let task = reloaded.get("t1").unwrap();
+            let mut inner = task.inner.lock();
+            inner.project_id = Some("a1b2c3d4".to_string());
+        }
+        reloaded.persist(&root);
+        let after_write: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&tasks_path).unwrap()).unwrap();
+        assert_eq!(after_write[0]["project_id"], "a1b2c3d4");
     }
 
     /// Re-running a partially completed pass completes without double-writing,
@@ -704,7 +819,7 @@ mod owner_row_stamper_dispatch {
         let stamper = stamper(&root);
 
         let error = stamper
-            .stamp(LegacyPathStoreKindV1::Task, "any-row", &project())
+            .stamp(LegacyPathStoreKindV1::Provenance, "any-row", &project())
             .unwrap_err();
         assert_eq!(error.code, ERROR_RESOLUTION_INVALID);
     }
@@ -734,7 +849,7 @@ mod owner_row_stamper_dispatch {
             (LegacyPathStoreKindV1::Whiteboard, Covered),
             (LegacyPathStoreKindV1::Artifact, Covered),
             (LegacyPathStoreKindV1::TranscriptEdge, Covered),
-            (LegacyPathStoreKindV1::Task, NotImplemented),
+            (LegacyPathStoreKindV1::Task, Covered),
             (LegacyPathStoreKindV1::Provenance, ExemptByConstruction),
         ] {
             assert_eq!(

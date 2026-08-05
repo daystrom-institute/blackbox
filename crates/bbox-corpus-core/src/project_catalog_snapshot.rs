@@ -612,6 +612,40 @@ pub fn capture_legacy_task_owner_snapshot(
     })
 }
 
+/// Stamp one task row, the write half of
+/// [`capture_legacy_task_owner_snapshot`].
+///
+/// `tasks.json` is a TOP-LEVEL ARRAY rather than an object holding a named
+/// array, so it cannot use [`stamp_json_array_row`]; the row lookup differs and
+/// nothing else does. Everything that matters is still shared: the exclusive
+/// store lock, the nofollow read, the atomic fsynced replace, and the one
+/// three-way stamp decision in [`stamp_row_object`].
+///
+/// Stamping through `serde_json::Value` is what preserves a field this binary's
+/// `PersistedTask` does not know about. A typed round-trip would silently drop
+/// it, so a newer daemon's task record would lose data as a side effect of the
+/// backfill adding one field.
+pub fn stamp_legacy_task_owner_row(
+    tasks_path: &Path,
+    source_row_id: &str,
+    project_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
+    stamp_json_owner_row(tasks_path, "task", "task:central-json", limits, |bytes| {
+        let mut document: serde_json::Value = decode_owner_source(bytes)?;
+        let row = document
+            .as_array_mut()
+            .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_INVALID))?
+            .iter_mut()
+            .find(|row| row.get("id").and_then(serde_json::Value::as_str) == Some(source_row_id))
+            .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+        match stamp_row_object(row, project_id)? {
+            RowStampDecisionV1::AlreadyStamped => Ok(OwnerSourceEditV1::AlreadyStamped),
+            RowStampDecisionV1::Write => encode_owner_source(&document),
+        }
+    })
+}
+
 /// Minimal dependency-safe projection of the root consultant proposal store.
 /// Current proposal records carry stable project ids through their owning
 /// consultant instance, not literal paths. Optional legacy path fields are

@@ -536,6 +536,19 @@ pub struct TaskInner {
     pub completed_at: Option<u64>,
     pub exit_code: Option<i32>,
     pub cwd: Option<String>,
+    /// The durable catalog project this task belongs to (plan section 3.3,
+    /// adjudication Q-E2).
+    ///
+    /// Populated ONLY from authoritative project identity already available to
+    /// the dispatch path, never inferred from [`Self::cwd`]. A cwd is a host
+    /// path, and hashing or resolving one back into a project id is exactly the
+    /// path-keyed guessing the catalog exists to retire; a task whose project
+    /// is not known authoritatively stays `None` and is backfilled later.
+    ///
+    /// Held in the LIVE record, not only the persisted one: the runtime state
+    /// is the authority that `serialize_snapshot` projects, so a persisted-only
+    /// field would be silently erased by the first load-then-persist cycle.
+    pub project_id: Option<String>,
     /// Concrete cockpit-managed worktree root for this task, if its cwd sits
     /// under a daemon-recognized managed worktree parent.
     pub managed_worktree: Option<String>,
@@ -930,6 +943,7 @@ mod roster_view_tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Cockpit,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Cockpit),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -1417,6 +1431,7 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+            project_id: None,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -1553,6 +1568,12 @@ struct PersistedTask {
     completed_at: Option<u64>,
     exit_code: Option<i32>,
     cwd: Option<String>,
+    /// See [`TaskInner::project_id`]. `skip_serializing_if` keeps an unstamped
+    /// task byte-identical to what every pre-Phase-6 daemon wrote, so adding
+    /// this field neither rewrites the store nor disturbs the row identity the
+    /// backfill keys on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
     #[serde(default)]
     managed_worktree: Option<String>,
     #[serde(default)]
@@ -1656,6 +1677,7 @@ impl TaskStore {
                     completed_at: inner.completed_at,
                     exit_code: inner.exit_code,
                     cwd: inner.cwd.clone(),
+                    project_id: inner.project_id.clone(),
                     managed_worktree: inner.managed_worktree.clone(),
                     bro_label: inner.bro_label.clone(),
                     name: inner.name.clone(),
@@ -1747,6 +1769,7 @@ impl TaskStore {
                     completed_at: rec.completed_at,
                     exit_code: rec.exit_code,
                     cwd: rec.cwd,
+                    project_id: rec.project_id,
                     managed_worktree: rec.managed_worktree,
                     bro_label: rec.bro_label,
                     name: rec.name,
@@ -2498,6 +2521,7 @@ fn failed_duplicate_task(
             supervision: SupervisionState::default(),
             origin,
             workflow_owned: workflow_owned_for_origin(origin),
+            project_id: None,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -2576,6 +2600,7 @@ pub fn spawn_in_process_task(
             supervision: SupervisionState::default(),
             origin,
             workflow_owned: workflow_owned_for_origin(origin),
+            project_id: None,
         }),
         notify: Arc::new(Notify::new()),
         child_id: Mutex::new(None),
@@ -3276,6 +3301,7 @@ async fn spawn_harness_child_task(
             supervision: SupervisionState::default(),
             origin,
             workflow_owned: workflow_owned_for_origin(origin),
+            project_id: None,
         }),
         notify: Arc::new(Notify::new()),
         // child_id is display-only now; cancellation goes through the handle's
@@ -6117,6 +6143,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -6548,6 +6575,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -6585,6 +6613,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -6639,6 +6668,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -6692,6 +6722,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -6925,6 +6956,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -7768,6 +7800,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -7867,6 +7900,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -7922,6 +7956,7 @@ mod tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -7977,6 +8012,7 @@ mod tests {
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+            project_id: None,
         };
 
         reject_forked_session(&mut inner, "forked-session");
@@ -8034,6 +8070,7 @@ mod tests {
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+            project_id: None,
         };
 
         let sink = EventSink {
@@ -8104,6 +8141,7 @@ mod tests {
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+            project_id: None,
         };
         let evt = serde_json::json!({
             "type": "user",
@@ -8161,6 +8199,7 @@ mod tests {
             supervision: SupervisionState::default(),
             origin: bro_core::Origin::Unknown,
             workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+            project_id: None,
         };
         let evt = serde_json::json!({
             "type": "user",
@@ -8266,6 +8305,7 @@ mod async_tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -8309,6 +8349,7 @@ mod async_tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -8358,6 +8399,7 @@ mod async_tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -8403,6 +8445,7 @@ mod async_tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -8460,6 +8503,7 @@ mod async_tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),
@@ -8510,6 +8554,7 @@ mod async_tests {
                 supervision: SupervisionState::default(),
                 origin: bro_core::Origin::Unknown,
                 workflow_owned: workflow_owned_for_origin(bro_core::Origin::Unknown),
+                project_id: None,
             }),
             notify: Arc::new(Notify::new()),
             child_id: Mutex::new(None),

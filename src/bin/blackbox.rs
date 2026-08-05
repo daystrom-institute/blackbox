@@ -871,6 +871,7 @@ fn owner_row_stamper(
             whiteboard_root: owners.whiteboard_root,
             artifact_root: owners.artifact_root,
             transcript_edge_root: owners.transcript_edge_root,
+            task_store_path: owners.task_store_path,
         },
         OwnerSnapshotLimitsV1::default(),
     )?;
