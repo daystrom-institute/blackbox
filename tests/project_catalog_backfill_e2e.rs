@@ -967,6 +967,67 @@ impl Fixture {
         .unwrap();
     }
 
+    /// Seed an owner whose ONLY effective binding is UNSCOPED.
+    ///
+    /// This is the store an omission hides in. An unscoped row is counted per
+    /// store and then never stamped and never read back, so a store carrying
+    /// nothing else appears in the journal's classification and in NEITHER of
+    /// the sets a mapped row would put it in. Seeded opt-in so the other
+    /// fixtures' counts stay exactly what they were.
+    fn seed_the_unscoped_only_store(&self) {
+        let owners = self.layout.stamper_owner_paths();
+        write_owner(
+            &owners.pin_store_path,
+            "pins",
+            serde_json::json!({
+                "id": "pn1",
+                "title": "fixture pin",
+                "content": "fixture content",
+                "scope": "bro",
+                "target": "executor",
+                "project": "/legacy/unscoped",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }),
+        );
+        let store = ProjectCatalogStore::open_existing(self.layout.projects_path()).unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |_catalog, attachments| {
+                let entry = LegacyPathLedgerEntry {
+                    legacy_path_binding_id: LegacyPathBindingId::parse(format!("lpb_{:032x}", 4))
+                        .unwrap(),
+                    historical_path: "/host/checkouts/unscoped".to_string(),
+                    source_store: "pin".to_string(),
+                    source_row_id: "pn1".to_string(),
+                    inventory_epoch: 1,
+                    status: LegacyPathBindingStatus::Unscoped {},
+                };
+                attachments
+                    .legacy_path_bindings
+                    .insert(entry.legacy_path_binding_id.clone(), entry);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The completion journal this fixture's apply published, as raw JSON.
+    fn journal_path(&self) -> PathBuf {
+        self.layout
+            .projects_path()
+            .parent()
+            .unwrap()
+            .join("backfill-completion.json")
+    }
+
+    fn journal_json(&self) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(self.journal_path()).unwrap()).unwrap()
+    }
+
+    fn write_journal_json(&self, journal: &serde_json::Value) {
+        fs::write(self.journal_path(), serde_json::to_vec(journal).unwrap()).unwrap();
+    }
+
     fn stamped(&self, which: Owner) -> Option<String> {
         let (path, field) = match which {
             Owner::Knowledge => (&self.knowledge_path, "entries"),
@@ -1365,6 +1426,122 @@ fn verify_fails_when_the_journal_misreports_one_stores_classification() {
         fixture
             .verify()
             .expect_err("a journal that misreports a store cannot verify")
+            .code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+}
+
+/// A store the journal OMITS ENTIRELY is compared, not skipped.
+///
+/// The two per-store comparisons used to iterate one side each: the stamp check
+/// walked the ledger's MAPPED stores and the classification check walked the
+/// JOURNAL's own keys. A store whose effective rows are only unscoped is in
+/// neither list once the journal drops it, so the omission fell between the two
+/// checks and verified clean while the journal silently disclaimed a whole
+/// store's classification.
+#[test]
+fn verify_fails_when_the_journal_omits_an_unscoped_only_store() {
+    let fixture = Fixture::new();
+    fixture.seed_the_unscoped_only_store();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    fixture.verify().expect("the applied backfill verifies");
+
+    let mut journal = fixture.journal_json();
+    // The premise: the store really is in the journal, really is unscoped-only,
+    // and really has no stamped rows to give the mappable check something to
+    // catch instead.
+    let pin = journal["stamp_counts"]["pin"].clone();
+    assert_eq!(pin["unscoped"].as_u64(), Some(1));
+    assert_eq!(pin["mappable"].as_u64(), Some(0));
+    assert_eq!(pin["stamped"].as_u64(), Some(0));
+
+    journal["stamp_counts"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pin");
+    fixture.write_journal_json(&journal);
+
+    assert_eq!(
+        fixture
+            .verify()
+            .expect_err("a journal that omits a whole store cannot verify")
+            .code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+}
+
+/// Conversions cannot be REASSIGNED between stores.
+///
+/// The per-store conversion count used to be bounded rather than exact - a
+/// store could claim any number of conversions up to the rows able to carry one
+/// - so moving a conversion from the owner that really converted to another
+/// owner preserved the global total, the epoch transition, and every other
+/// count, and verified clean. The journal now names the bindings it converted,
+/// and the store each one counts against comes from the LEDGER.
+#[test]
+fn verify_fails_when_the_journal_moves_a_conversion_to_another_store() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    fixture.convert_the_quarantined_binding();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    fixture.verify().expect("the applied backfill verifies");
+
+    let mut journal = fixture.journal_json();
+    // The premise: the note store converted exactly one row, and the knowledge
+    // store has a mappable row that could plausibly have carried one.
+    assert_eq!(
+        journal["stamp_counts"]["note"]["converted"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        journal["stamp_counts"]["knowledge"]["converted"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        journal["stamp_counts"]["knowledge"]["mappable"].as_u64(),
+        Some(1)
+    );
+    let post_image = journal["post_image_catalog_epoch"].clone();
+    let predecessor = journal["predecessor_catalog_epoch"].clone();
+
+    journal["stamp_counts"]["note"]["converted"] = serde_json::json!(0);
+    journal["stamp_counts"]["knowledge"]["converted"] = serde_json::json!(1);
+    fixture.write_journal_json(&journal);
+
+    // Nothing else moved: same global total, same epoch pair, so every check
+    // that survived the old bound still passes.
+    let rewritten = fixture.journal_json();
+    let total: u64 = rewritten["stamp_counts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|counts| counts["converted"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 1);
+    assert_eq!(rewritten["post_image_catalog_epoch"], post_image);
+    assert_eq!(rewritten["predecessor_catalog_epoch"], predecessor);
+
+    assert_eq!(
+        fixture
+            .verify()
+            .expect_err("a conversion reassigned to another store cannot verify")
             .code,
         "error.project_catalog_inventory_stale_post_image"
     );

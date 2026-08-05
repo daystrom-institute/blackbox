@@ -911,6 +911,7 @@ mod tests {
             predecessor_attachment_hash: hash(0x22),
             post_image_catalog_epoch: post_image_epoch,
             stamp_counts: Default::default(),
+            converted_binding_ids: Default::default(),
             identity: BackfillArtifactIdentityV1 {
                 inventory_hash: hash(0x33),
                 plan_hash: hash(0x44),

@@ -500,6 +500,20 @@ pub struct BackfillCompletionJournalV1 {
     /// Equals the predecessor epoch when no quarantine conversion landed.
     pub post_image_catalog_epoch: u64,
     pub stamp_counts: BTreeMap<LegacyPathStoreKindV1, BackfillStoreStampCountsV1>,
+    /// The EXACT bindings this apply appended, naming its conversions
+    /// individually rather than only counting them per store.
+    ///
+    /// Counts alone cannot be verified per store. Verify can bound a store's
+    /// conversions by the rows that could carry one, but a bound admits any
+    /// redistribution that preserves the total, so a journal could move
+    /// conversions between owners and still satisfy every count and the epoch
+    /// transition. Naming the bindings makes the population exact and
+    /// checkable: verify resolves each id in the durable ledger, derives its
+    /// store from the LEDGER's own `source_store` rather than from the
+    /// journal's grouping, and requires the per-store totals to match. It also
+    /// scopes the claim to THIS apply's wave, which a ledger-derived count
+    /// cannot do once a second backfill has run over the same target.
+    pub converted_binding_ids: BTreeSet<LegacyPathBindingId>,
     pub identity: BackfillArtifactIdentityV1,
     /// The publisher/G1 disposition set apply committed against, digested at its
     /// FINAL publication boundary.
@@ -1977,6 +1991,7 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
 
         // Step 2: the pair moves only for appended supersessions.
         let mut converted: BTreeMap<LegacyPathStoreKindV1, u64> = BTreeMap::new();
+        let mut converted_binding_ids: BTreeSet<LegacyPathBindingId> = BTreeSet::new();
         let post_image_catalog_epoch = if plan.appended.is_empty() {
             epoch
         } else {
@@ -2001,6 +2016,10 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 if let Some(kind) = legacy_store_kind_from_token(&entry.source_store) {
                     *converted.entry(kind).or_default() += 1;
                 }
+                // Recorded whatever the store token resolves to, so a journal
+                // can never omit a committed conversion by naming an owner the
+                // token map does not know.
+                converted_binding_ids.insert(entry.legacy_path_binding_id.clone());
             }
             commit.epoch
         };
@@ -2046,6 +2065,7 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             predecessor_attachment_hash: attachment_hash,
             post_image_catalog_epoch,
             stamp_counts,
+            converted_binding_ids,
             identity: BackfillArtifactIdentityV1 {
                 inventory_hash: plan.inventory_hash,
                 plan_hash: plan.plan_hash,
@@ -2133,38 +2153,81 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 }
             }
         }
-        // The stamp set the journal records must be exactly the mappable set
-        // the ledger now resolves to, per store. A store whose ledger grew
-        // mappable rows the journal never stamped is an incomplete backfill,
-        // not a tolerable drift.
-        for (kind, observed) in &observed_per_store {
-            let recorded = journal
-                .stamp_counts
-                .get(kind)
-                .map(|counts| counts.stamped + counts.already_stamped)
-                .unwrap_or_default();
-            if recorded != *observed {
+        // THE EXACT CONVERSION POPULATION, resolved from the DURABLE ledger.
+        //
+        // Each id the journal names must still be a real, effective, converted
+        // binding, and the store it counts against is the LEDGER's, not the
+        // journal's. That is what makes the per-store conversion counts below
+        // exact rather than merely bounded: a journal that moved a conversion
+        // from one owner to another - preserving the total, the epoch
+        // transition, and every other count - now disagrees with the store the
+        // ledger itself puts that binding in.
+        let effective_by_id = effective
+            .values()
+            .map(|binding| (binding.effective.legacy_path_binding_id.clone(), binding))
+            .collect::<BTreeMap<_, _>>();
+        let mut journal_converted_per_store: BTreeMap<LegacyPathStoreKindV1, u64> = BTreeMap::new();
+        for binding_id in &journal.converted_binding_ids {
+            let Some(binding) = effective_by_id.get(binding_id) else {
                 return Err(refuse(
                     ERROR_STALE_POST_IMAGE,
-                    "journal stamp counts disagree with the ledger's mappable set",
+                    "the journal names a conversion the ledger does not resolve as effective",
                 ));
-            }
-        }
-        for (kind, counts) in &journal.stamp_counts {
-            let recorded = counts.stamped + counts.already_stamped;
-            if recorded > 0 && !observed_per_store.contains_key(kind) {
+            };
+            let Some(kind) = legacy_store_kind_from_token(&binding.effective.source_store) else {
                 return Err(refuse(
                     ERROR_STALE_POST_IMAGE,
-                    "journal records stamps for a store with no mappable ledger rows",
+                    "legacy path ledger names a store outside the owner set",
+                ));
+            };
+            // A conversion appended a superseding binding over a QUARANTINED
+            // predecessor at the same key, and resolved it to mapped or
+            // unscoped. Anything else is not the row the journal claims.
+            if matches!(
+                binding.effective.status,
+                LegacyPathBindingStatus::Quarantined {}
+            ) {
+                return Err(refuse(
+                    ERROR_STALE_POST_IMAGE,
+                    "the journal names a conversion whose binding is still quarantined",
                 ));
             }
+            match binding.superseded.first() {
+                Some(predecessor)
+                    if matches!(predecessor.status, LegacyPathBindingStatus::Quarantined {}) => {}
+                Some(_) => {
+                    return Err(refuse(
+                        ERROR_STALE_POST_IMAGE,
+                        "the journal names a conversion that superseded a binding which was \
+                         not quarantined",
+                    ));
+                }
+                None => {
+                    return Err(refuse(
+                        ERROR_STALE_POST_IMAGE,
+                        "the journal names a conversion that supersedes nothing",
+                    ));
+                }
+            }
+            *journal_converted_per_store.entry(kind).or_default() += 1;
         }
-        // The journal's COMPLETE per-store classification, not just its stamp
-        // total. Each of these was recorded by apply and none of them was ever
-        // checked, so a journal could disagree with the ledger in three
-        // different ways and still verify.
-        for (kind, counts) in &journal.stamp_counts {
-            if counts.mappable != observed_per_store.get(kind).copied().unwrap_or_default() {
+
+        // The journal's COMPLETE per-store classification, over the UNION of
+        // every store any of the four records names. Iterating one side only is
+        // how an omission hides: a store the journal never mentions is absent
+        // from a journal-keyed loop, and a store with no MAPPED rows is absent
+        // from a mappable-keyed one, so an unscoped-only store omitted from the
+        // journal fell between the two and passed. Every store is compared
+        // here, and an omission is read as zero only AFTER it has been compared
+        // against what the ledger holds.
+        let mut all_stores: BTreeSet<LegacyPathStoreKindV1> = BTreeSet::new();
+        all_stores.extend(journal.stamp_counts.keys().copied());
+        all_stores.extend(observed_per_store.keys().copied());
+        all_stores.extend(observed_unscoped_per_store.keys().copied());
+        all_stores.extend(journal_converted_per_store.keys().copied());
+        for kind in all_stores {
+            let counts = journal.stamp_counts.get(&kind).copied().unwrap_or_default();
+            if counts.mappable != observed_per_store.get(&kind).copied().unwrap_or_default() {
                 return Err(refuse(
                     ERROR_STALE_POST_IMAGE,
                     "journal mappable counts disagree with the ledger's mappable set",
@@ -2181,7 +2244,7 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             }
             if counts.unscoped
                 != observed_unscoped_per_store
-                    .get(kind)
+                    .get(&kind)
                     .copied()
                     .unwrap_or_default()
             {
@@ -2190,12 +2253,16 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                     "journal unscoped counts disagree with the ledger's unscoped set",
                 ));
             }
-            // A conversion appended a superseding binding, so it can only have
-            // produced a row that now resolves mappable or unscoped.
-            if counts.converted > counts.mappable + counts.unscoped {
+            if counts.converted
+                != journal_converted_per_store
+                    .get(&kind)
+                    .copied()
+                    .unwrap_or_default()
+            {
                 return Err(refuse(
                     ERROR_STALE_POST_IMAGE,
-                    "journal records more conversions than the store has converted rows",
+                    "journal conversion counts disagree with the conversions the ledger \
+                     puts in that store",
                 ));
             }
         }
@@ -3499,6 +3566,7 @@ mod tests {
                     unscoped: 0,
                 },
             )]),
+            converted_binding_ids: BTreeSet::new(),
             identity: BackfillArtifactIdentityV1 {
                 inventory_hash: hash(3),
                 plan_hash: hash(4),
@@ -3531,6 +3599,7 @@ mod tests {
             predecessor_attachment_hash: hash(2),
             post_image_catalog_epoch: 7,
             stamp_counts: BTreeMap::new(),
+            converted_binding_ids: BTreeSet::new(),
             identity: BackfillArtifactIdentityV1 {
                 inventory_hash: hash(3),
                 plan_hash: hash(4),
