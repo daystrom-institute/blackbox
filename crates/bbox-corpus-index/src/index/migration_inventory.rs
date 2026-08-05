@@ -17,6 +17,7 @@ use tantivy::{Index, TantivyDocument};
 
 use bbox_corpus_core::entity_ref::EntityRef;
 
+use super::project_files::local_activation_marker;
 use super::{FileMeta, FileMetaSource, INDEX_SCHEMA_VERSION, SCHEMA_VERSION_FILE, optional_text};
 
 const SNAPSHOT_VERSION_V1: u32 = 1;
@@ -546,17 +547,33 @@ fn capture_index(
         let entity = optional_text(&document, entity_id).unwrap_or_default();
         let project = optional_text(&document, project_id).unwrap_or_default();
         if !entity.is_empty() && !project.is_empty() {
-            if project_id_from_entity_ref(&entity) != Some(project.as_str()) {
-                return corrupt_index("corpus_index_project_ref_invalid");
-            }
-            total_string_bytes = match total_string_bytes.checked_add(entity.len() + project.len())
-            {
-                Some(value) if value <= limits.max_total_string_bytes => value,
-                _ => return corrupt_index("corpus_index_string_byte_limit"),
-            };
-            *project_refs.entry((project, entity)).or_default() += 1;
-            if project_refs.len() > limits.max_project_scoped_refs {
-                return corrupt_index("corpus_index_project_ref_limit");
+            if optional_text(&document, doc_type).as_deref() == Some("code_source_activation") {
+                // The pending-local-activation marker (R28F2) is durable index
+                // STATE, not a corpus ref: it carries the `project_id` term
+                // lane so recovery can find it by project, and its entity id
+                // is a non-EntityRef sentinel by construction
+                // (`local_activation_marker`). Validate it against its own
+                // contract and keep it out of the project-scoped ref
+                // inventory: retirement discharges activations through
+                // code-source evidence, never through corpus refs, so
+                // counting it here would make the ref inventory claim rows
+                // the discharge path cannot clear.
+                if entity != local_activation_marker(&project) {
+                    return corrupt_index("corpus_index_activation_marker_invalid");
+                }
+            } else {
+                if project_id_from_entity_ref(&entity) != Some(project.as_str()) {
+                    return corrupt_index("corpus_index_project_ref_invalid");
+                }
+                total_string_bytes =
+                    match total_string_bytes.checked_add(entity.len() + project.len()) {
+                        Some(value) if value <= limits.max_total_string_bytes => value,
+                        _ => return corrupt_index("corpus_index_string_byte_limit"),
+                    };
+                *project_refs.entry((project, entity)).or_default() += 1;
+                if project_refs.len() > limits.max_project_scoped_refs {
+                    return corrupt_index("corpus_index_project_ref_limit");
+                }
             }
         }
         if optional_text(&document, doc_type).as_deref() != Some("commit") {
@@ -1139,6 +1156,120 @@ mod tests {
         assert_eq!(discharged.index.project_scoped_ref_count, 0);
         assert_eq!(discharged.code_metadata.project_scoped_row_count, 0);
         assert_eq!(discharged.git_cursors.row_count, 0);
+    }
+
+    /// A real reindex pass writes one `code_source_activation` sentinel per
+    /// project with a pending local snapshot (R28F2), carrying `project_id`
+    /// and a non-EntityRef entity id. The scan must validate the sentinel
+    /// against its own marker contract, keep it out of the project-scoped
+    /// ref inventory, and stay Present. This is the shape the certified
+    /// fixture never held: every earlier fixture index either had zero docs
+    /// or hand-built `project_file` docs only, so the sentinel arm was
+    /// unreachable until it refused on the first production host.
+    #[test]
+    fn accepts_activation_sentinels_without_counting_them_as_refs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let index = super::super::TranscriptIndex::open_or_create_with_records(
+            &index_path,
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(20_000_000).unwrap();
+
+        let mut project_doc = TantivyDocument::new();
+        project_doc.add_text(fields.doc_type, "project_file");
+        project_doc.add_text(fields.project_id, "project-a");
+        project_doc.add_text(
+            fields.entity_id,
+            "project_file:project-a:path-hash:chunk-hash:0",
+        );
+        writer.add_document(project_doc).unwrap();
+
+        let mut activation_doc = TantivyDocument::new();
+        activation_doc.add_text(fields.doc_type, "code_source_activation");
+        activation_doc.add_text(fields.project_id, "project-a");
+        activation_doc.add_text(
+            fields.entity_id,
+            local_activation_marker("project-a"),
+        );
+        writer.add_document(activation_doc).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+        fs::write(index_path.join("_meta.json"), b"{}").unwrap();
+        drop(writer);
+        drop(index);
+
+        let git_meta = root.join("git_meta");
+        fs::create_dir(&git_meta).unwrap();
+
+        let snapshot = capture_owner_migration_snapshot_no_create(
+            &index_path,
+            &git_meta,
+            CorpusMigrationSnapshotLimitsV1::default(),
+        );
+        assert_eq!(snapshot.index.state, CorpusMigrationSourceStateV1::Present);
+        assert_eq!(snapshot.index.project_scoped_ref_count, 1);
+    }
+
+    /// A sentinel whose entity id does not match the marker for its own
+    /// stamped project is real corruption, not a tolerated shape: the
+    /// doc_type gate must not become a bypass lane for arbitrary
+    /// project-stamped rows.
+    #[test]
+    fn refuses_an_activation_sentinel_bound_to_the_wrong_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let index = super::super::TranscriptIndex::open_or_create_with_records(
+            &index_path,
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let mut writer = index.index_handle().writer(20_000_000).unwrap();
+        let mut activation_doc = TantivyDocument::new();
+        activation_doc.add_text(fields.doc_type, "code_source_activation");
+        activation_doc.add_text(fields.project_id, "project-a");
+        activation_doc.add_text(
+            fields.entity_id,
+            local_activation_marker("project-b"),
+        );
+        writer.add_document(activation_doc).unwrap();
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+        fs::write(index_path.join("_meta.json"), b"{}").unwrap();
+        drop(writer);
+        drop(index);
+
+        let git_meta = root.join("git_meta");
+        fs::create_dir(&git_meta).unwrap();
+
+        let snapshot = capture_owner_migration_snapshot_no_create(
+            &index_path,
+            &git_meta,
+            CorpusMigrationSnapshotLimitsV1::default(),
+        );
+        assert_eq!(
+            snapshot.index.state,
+            CorpusMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "corpus_index_activation_marker_invalid",
+            }
+        );
     }
 
     #[test]
