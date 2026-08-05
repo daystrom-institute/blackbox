@@ -1023,10 +1023,14 @@ exact copied inventory.
 3. Run backfill preflight and apply (after migration apply).
 4. Run rebuild preflight and apply (after backfill apply).
 5. Verify every ambiguous or unclaimed namespace materializes into an
-   immutable quarantine generation (an `rhg_`-id'd generation tracked by
+   immutable quarantine generation (an `rhq_`-id'd generation tracked by
    `RepoHistoryQuarantineGenerationId` with
    `RepoHistoryQuarantineMaterialization` state) with complete ordered
-   document commitments (D-027).
+   document commitments (D-027). Prefix discipline: owned and
+   compatibility generations carry `rhg_` ids
+   (`RepoHistoryGenerationId`); quarantine generations carry `rhq_` ids.
+   A verifier expecting `rhg_` on a quarantine generation would reject
+   valid state.
 6. Run exact post-image verification: every generation in every manifest
    bucket verifies (primary, `compatibility_generation_ids`, quarantine;
    D-037), the manifest covers every `Ready` requirement, and the
