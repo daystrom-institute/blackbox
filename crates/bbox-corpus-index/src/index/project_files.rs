@@ -4004,7 +4004,7 @@ mod purge_exemption_tests {
         // Built through the real opener so the code tokenizers are
         // registered; a hand-rolled `Index::create_in_dir` cannot write a
         // project-file document at all.
-        let transcript_index = crate::index::TranscriptIndex::open_or_create(
+        let transcript_index = crate::index::TranscriptIndex::open_or_create_with_records(
             &root.join("idx"),
             Vec::new(),
             None,
@@ -4012,6 +4012,7 @@ mod purge_exemption_tests {
             root.join("kb.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let index = transcript_index.index_handle();

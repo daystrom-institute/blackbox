@@ -1303,7 +1303,7 @@ mod tests {
     #[test]
     fn tool_calls_empty_index_returns_message() {
         let tmp = tempfile::tempdir().unwrap();
-        let idx = TranscriptIndex::open_or_create(
+        let idx = TranscriptIndex::open_or_create_with_records(
             &tmp.path().join("idx"),
             Vec::new(),
             None,
@@ -1311,6 +1311,7 @@ mod tests {
             tmp.path().join("kb.json"),
             tmp.path().join("threads.json"),
             tmp.path().join("roadmap.json"),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
 

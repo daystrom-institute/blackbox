@@ -1998,7 +1998,7 @@ mod agentic_project_file_tests {
             .unwrap();
         let project = register_test_project(&projects_path, repo_root);
 
-        let mut index = TranscriptIndex::open_or_create(
+        let mut index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -2006,6 +2006,12 @@ mod agentic_project_file_tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(
+                crate::index::StaticProjectRecordsProvider::from_bridge_records(
+                    vec![project.clone()],
+                    0,
+                ),
+            ),
         )
         .unwrap();
         let identity =
@@ -2100,7 +2106,7 @@ mod agentic_project_file_tests {
 
         let projects_path = dir.path().join("projects.json");
         let project = register_test_project(&projects_path, &repo);
-        let mut index = TranscriptIndex::open_or_create(
+        let mut index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -2108,6 +2114,12 @@ mod agentic_project_file_tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(
+                crate::index::StaticProjectRecordsProvider::from_bridge_records(
+                    vec![project.clone()],
+                    0,
+                ),
+            ),
         )
         .unwrap();
         let identity =
@@ -2170,7 +2182,7 @@ mod project_filter_lane_tests {
     const PROJECT: &str = "p_00000000000000000000000000000f71";
 
     fn index_with_project_file_document(root: &std::path::Path) -> TranscriptIndex {
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &root.join("idx"),
             Vec::new(),
             None,
@@ -2178,6 +2190,7 @@ mod project_filter_lane_tests {
             root.join("kb.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -2292,7 +2305,7 @@ mod project_filter_lane_tests {
     fn a_host_path_fragment_no_longer_reaches_project_file_documents() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &root.join("idx"),
             Vec::new(),
             None,
@@ -2300,6 +2313,7 @@ mod project_filter_lane_tests {
             root.join("kb.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -2371,7 +2385,7 @@ mod legacy_purge_exemption_tests {
     fn a_project_this_build_does_not_scan_keeps_its_documents_and_rows() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let mut index = TranscriptIndex::open_or_create(
+        let mut index = TranscriptIndex::open_or_create_with_records(
             &root.join("idx"),
             Vec::new(),
             None,
@@ -2379,6 +2393,7 @@ mod legacy_purge_exemption_tests {
             root.join("kb.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();

@@ -980,7 +980,7 @@ mod tests {
     #[test]
     fn tantivy_projection_streams_session_and_file_edges() {
         let dir = tempfile::tempdir().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -988,6 +988,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();

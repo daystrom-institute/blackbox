@@ -43,6 +43,7 @@ fn open_index(root: &Path, guard: Option<SchemaReplacementGuard>) -> TranscriptI
         root.join("knowledge.json"),
         root.join("threads.json"),
         root.join("roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         guard,
     )
     .expect("index opens")

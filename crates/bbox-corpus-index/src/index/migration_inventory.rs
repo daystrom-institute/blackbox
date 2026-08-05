@@ -1027,7 +1027,7 @@ mod tests {
         let root = directory.path().canonicalize().unwrap();
         let index_path = root.join("index");
         let projects_path = root.join("projects.json");
-        let index = super::super::TranscriptIndex::open_or_create(
+        let index = super::super::TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -1035,6 +1035,7 @@ mod tests {
             root.join("knowledge.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1145,7 +1146,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let index_path = root.join("index");
-        let index = super::super::TranscriptIndex::open_or_create(
+        let index = super::super::TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -1153,6 +1154,7 @@ mod tests {
             root.join("knowledge.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         drop(index);

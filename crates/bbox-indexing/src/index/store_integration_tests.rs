@@ -12,7 +12,7 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
     let dir = tempfile::tempdir().unwrap();
     let index_path = dir.path().join("index");
     let knowledge_path = dir.path().join("knowledge.json");
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &index_path,
         Vec::new(),
         None,
@@ -20,6 +20,7 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
         knowledge_path.clone(),
         dir.path().join("threads.json"),
         dir.path().join("roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     let entry = bbox_knowledge::knowledge::KnowledgeEntry {
@@ -122,7 +123,7 @@ fn knowledge_entries_are_searchable_after_reindex() {
         )
         .unwrap();
 
-    let mut index = TranscriptIndex::open_or_create(
+    let mut index = TranscriptIndex::open_or_create_with_records(
         &dir.path().join("index"),
         Vec::new(),
         None,
@@ -130,6 +131,7 @@ fn knowledge_entries_are_searchable_after_reindex() {
         knowledge_path,
         dir.path().join("threads.json"),
         dir.path().join("roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     index.build_index(false, &[]).unwrap();

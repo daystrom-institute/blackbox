@@ -217,13 +217,29 @@ impl StaticProjectRecordsProvider {
         Self { snapshot }
     }
 
-    /// Test and offline construction path only: reads `projects.json` once and
-    /// freezes it. Daemon-runtime consumers take a live authority instead.
-    pub fn from_projects_path(projects_path: &Path) -> Result<Self> {
-        let records = bbox_corpus_core::project_record::load_project_records(projects_path)?;
-        Ok(Self::new(ProjectRecordsSnapshot::from_bridge_records(
-            records, 0,
-        )))
+    /// Frozen provider over an EMPTY authority, for the offline and test lanes
+    /// that never resolve a project identity.
+    ///
+    /// The `projects.json`-reading constructor this replaces was the last
+    /// direct `load_project_records` consumer (Phase 6 plan section 5.2). A
+    /// caller that does need records supplies them explicitly through
+    /// [`StaticProjectRecordsProvider::from_bridge_records`]; project identity
+    /// is never re-derived from a host path.
+    pub fn empty() -> Self {
+        Self::new(ProjectRecordsSnapshot::empty())
+    }
+
+    /// Frozen provider over explicit catalog-bridge records (FD-8 retains the
+    /// bridge decode path). Callers hold the records already; nothing here
+    /// reads a host path.
+    pub fn from_bridge_records(
+        records: Vec<bbox_corpus_core::project_record::ProjectRecord>,
+        authority_epoch: u64,
+    ) -> Self {
+        Self::new(ProjectRecordsSnapshot::from_bridge_records(
+            records,
+            authority_epoch,
+        ))
     }
 }
 
@@ -283,16 +299,23 @@ pub struct EmbeddingSourceDoc {
 }
 
 impl TranscriptIndex {
-    /// Test and offline construction path only: derives a frozen project
-    /// authority from `projects.json`. The daemon opens the index through
+    /// Test and offline construction path only: opens with an EXPLICIT project
+    /// authority. The daemon opens the index through
     /// [`TranscriptIndex::open_or_create_with_code_source_store_path`] with a
     /// live [`ProjectRecordsProvider`].
+    ///
+    /// The `projects.json`-derived predecessor of this constructor was deleted
+    /// in Phase 6 (plan section 5.2/5.3): no lane may reconstruct a project
+    /// authority by reading a host path. `projects_path` survives as a state
+    /// LOCATION (it still anchors the code-source store and the edge sidecar),
+    /// never as an identity source.
     ///
     /// No guard is injected here, so this path REFUSES a destructive schema
     /// replacement (P3-E fail-closed contract). A fresh index directory never
     /// triggers one; a test or offline caller that intends a replacement must
     /// use [`TranscriptIndex::open_or_create_guarded`].
-    pub fn open_or_create(
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_create_with_records(
         index_path: &Path,
         roots: Vec<(String, PathBuf)>,
         codex_root: Option<PathBuf>,
@@ -300,6 +323,7 @@ impl TranscriptIndex {
         knowledge_path: PathBuf,
         threads_path: PathBuf,
         roadmap_path: PathBuf,
+        records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
     ) -> Result<Self> {
         Self::open_or_create_guarded(
             index_path,
@@ -309,13 +333,14 @@ impl TranscriptIndex {
             knowledge_path,
             threads_path,
             roadmap_path,
+            records_provider,
             None,
         )
     }
 
-    /// [`TranscriptIndex::open_or_create`] with an explicit pre-replacement
-    /// guard, for the test and offline lanes that exercise the replacement
-    /// boundary itself.
+    /// [`TranscriptIndex::open_or_create_with_records`] with an explicit
+    /// pre-replacement guard, for the test and offline lanes that exercise the
+    /// replacement boundary itself.
     #[allow(clippy::too_many_arguments)]
     pub fn open_or_create_guarded(
         index_path: &Path,
@@ -325,15 +350,13 @@ impl TranscriptIndex {
         knowledge_path: PathBuf,
         threads_path: PathBuf,
         roadmap_path: PathBuf,
+        records_provider: std::sync::Arc<dyn ProjectRecordsProvider>,
         schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
     ) -> Result<Self> {
         let code_source_store_path = projects_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("code-sources");
-        let records_provider = std::sync::Arc::new(
-            StaticProjectRecordsProvider::from_projects_path(&projects_path)?,
-        );
         Self::open_or_create_with_code_source_store_path(
             index_path,
             roots,
@@ -1235,7 +1258,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("index");
 
-        let _index = TranscriptIndex::open_or_create(
+        let _index = TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -1243,6 +1266,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
 
@@ -1280,7 +1304,7 @@ mod tests {
     #[test]
     fn pinned_searcher_keeps_entity_properties_on_one_index_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -1288,6 +1312,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1342,6 +1367,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(test_authorizing_guard()),
         )
         .unwrap();
@@ -1375,7 +1401,7 @@ mod tests {
         fs::write(index_path.join(SCHEMA_VERSION_FILE), "old-schema\n").unwrap();
         fs::write(index_path.join("stale-file"), "stale").unwrap();
 
-        let error = TranscriptIndex::open_or_create(
+        let error = TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -1383,6 +1409,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .err()
         .expect("an unguarded replacement must be refused");
@@ -1423,6 +1450,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(guard),
         )
         .err()
@@ -1470,6 +1498,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(guard),
         )
         .unwrap();
@@ -1504,6 +1533,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
             Some(guard),
         )
         .unwrap();
@@ -1513,7 +1543,7 @@ mod tests {
     #[test]
     fn for_each_edge_projection_doc_streams_all_segments_and_skips_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -1521,6 +1551,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1581,7 +1612,7 @@ mod tests {
     #[test]
     fn hybrid_bm25_canonicalizes_legacy_transcript_entity_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -1589,6 +1620,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1649,7 +1681,7 @@ mod tests {
         // this cheap TermQuery + Count collector, not from EdgeIndex (which
         // deliberately excludes transcript from its active counts).
         let dir = tempfile::tempdir().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -1657,6 +1689,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1694,7 +1727,7 @@ mod tests {
         // one it dropped (tantivy's tie-break favors later doc ids), and
         // that's the doc this test resolves.
         let dir = tempfile::tempdir().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -1702,6 +1735,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1738,7 +1772,7 @@ mod tests {
     #[test]
     fn for_each_edge_projection_doc_callback_error_propagates() {
         let dir = tempfile::tempdir().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -1746,6 +1780,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1765,7 +1800,7 @@ mod tests {
     fn code_content_tokenizer_finds_identifier_fragments() {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("index");
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -1773,6 +1808,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let project = bbox_corpus_core::project_record::ProjectRecord {
@@ -1866,7 +1902,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &dir.path().join("index"),
             Vec::new(),
             None,
@@ -1874,6 +1910,22 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            // The SAME record the file above carries. Injected explicitly
+            // rather than read back off `projects_path`: the assertion below
+            // is that a registered record never resolves an id inside this
+            // crate, and an empty authority would make that vacuous.
+            std::sync::Arc::new(StaticProjectRecordsProvider::from_bridge_records(
+                vec![bbox_corpus_core::project_record::ProjectRecord {
+                    project_id: "feedbeef".into(),
+                    repo_id: None,
+                    canonical_path: "/tmp/registered-base".into(),
+                    registered_at: "2026-01-01T00:00:00Z".into(),
+                    is_git_repo: true,
+                    languages: Default::default(),
+                    aliases: ["blackbox".to_string()].into_iter().collect(),
+                }],
+                0,
+            )),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -1961,7 +2013,7 @@ mod tests {
     fn project_file_doc_round_trips_symbol_kind_parent_kind_line_ranges_and_project_id() {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("index");
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -1969,6 +2021,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let project = bbox_corpus_core::project_record::ProjectRecord {
@@ -2046,7 +2099,7 @@ mod tests {
     fn embedding_source_doc_for_entity_id_returns_full_content() {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("index");
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -2054,6 +2107,7 @@ mod tests {
             dir.path().join("knowledge.json"),
             dir.path().join("threads.json"),
             dir.path().join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let project = bbox_corpus_core::project_record::ProjectRecord {

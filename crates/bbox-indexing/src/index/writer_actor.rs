@@ -2252,7 +2252,7 @@ mod tests {
     }
 
     fn test_index(dir: &std::path::Path) -> TranscriptIndex {
-        TranscriptIndex::open_or_create(
+        TranscriptIndex::open_or_create_with_records(
             &dir.join("idx"),
             Vec::new(),
             None,
@@ -2260,6 +2260,7 @@ mod tests {
             dir.join("kb.json"),
             dir.join("threads.json"),
             dir.join("roadmap.json"),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap()
     }
@@ -3542,7 +3543,7 @@ mod source_planning_tests {
     fn fixture_with_broker(grant: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &root.join("idx"),
             Vec::new(),
             None,
@@ -3550,6 +3551,7 @@ mod source_planning_tests {
             root.join("kb.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let config = index.reindex_config();
@@ -3973,7 +3975,7 @@ mod source_planning_tests {
     fn a_detached_project_survives_an_incremental_tick_and_a_full_rebuild() {
         let fixture = fixture();
         let entry_key = format!("entry-{REMOTE}");
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &fixture.root.join("idx"),
             Vec::new(),
             None,
@@ -3981,6 +3983,7 @@ mod source_planning_tests {
             fixture.config.knowledge_path.clone(),
             fixture.config.threads_path.clone(),
             fixture.config.roadmap_path.clone(),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();
@@ -4138,7 +4141,7 @@ mod source_planning_tests {
             )),
             crate::checkout_access::CheckoutAccessObservations::in_memory(),
         ));
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &root.join("idx"),
             Vec::new(),
             None,
@@ -4146,6 +4149,7 @@ mod source_planning_tests {
             root.join("kb.json"),
             root.join("threads.json"),
             root.join("roadmap.json"),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         let fields = index.field_handles();

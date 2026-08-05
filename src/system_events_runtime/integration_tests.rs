@@ -25,7 +25,7 @@ use crate::{
 use tokio::sync::broadcast;
 
 fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &tmp.path().join("index"),
         Vec::new(),
         None,
@@ -33,6 +33,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         tmp.path().join("knowledge.json"),
         tmp.path().join("threads.json"),
         tmp.path().join("roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     let kb_path = tmp.path().join("knowledge.json");

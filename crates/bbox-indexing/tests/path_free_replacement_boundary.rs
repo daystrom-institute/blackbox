@@ -172,7 +172,7 @@ fn fixture(namespace: &str, commits: usize) -> Fixture {
     fs::create_dir_all(&state).unwrap();
     let index_path = state.join("index");
     {
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -180,6 +180,7 @@ fn fixture(namespace: &str, commits: usize) -> Fixture {
             state.join("knowledge.json"),
             state.join("threads.json"),
             state.join("roadmap.json"),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         index.complete_schema_migration().unwrap();
@@ -337,7 +338,7 @@ fn the_catalog_guard_prepares_a_manifest_and_reemission_preserves_every_commit()
 
     // 2. The destructive step, then a fresh index under the incoming schema.
     fs::remove_dir_all(&fixture.index_path).unwrap();
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &fixture.index_path,
         Vec::new(),
         None,
@@ -349,6 +350,7 @@ fn the_catalog_guard_prepares_a_manifest_and_reemission_preserves_every_commit()
             .join("knowledge.json"),
         fixture.projects_path.parent().unwrap().join("threads.json"),
         fixture.projects_path.parent().unwrap().join("roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     assert!(commit_rows(&fixture.index_path).is_empty());
@@ -754,7 +756,7 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
     // Stage the generation into the PRE-DROP index so its count and inventory
     // are real. This is the state a pre-bump daemon actually left behind.
     let (true_document_count, true_inventory) = {
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &fixture.index_path,
             Vec::new(),
             None,
@@ -762,6 +764,7 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
             state.join("knowledge.json"),
             state.join("threads.json"),
             state.join("roadmap.json"),
+            records.clone(),
         )
         .unwrap();
         let actor = bbox_indexing::index::IndexWriterActor::spawn_for_with_checkout_access(
@@ -854,7 +857,7 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
 
     // 3. Reopen under the incoming schema: the index is now EMPTY while the
     //    activation record still promises `true_document_count` documents.
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &fixture.index_path,
         Vec::new(),
         None,
@@ -862,6 +865,7 @@ fn a_collected_project_survives_the_guarded_replacement_and_stays_searchable() {
         state.join("knowledge.json"),
         state.join("threads.json"),
         state.join("roadmap.json"),
+        records.clone(),
     )
     .unwrap();
     let fields = index.field_handles();
@@ -1011,7 +1015,7 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
     // generation, and the carried set is identical.
     fs::remove_dir_all(&fixture.index_path).unwrap();
     let state = fixture.index_path.parent().unwrap().to_path_buf();
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &fixture.index_path,
         Vec::new(),
         None,
@@ -1019,6 +1023,7 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
         state.join("knowledge.json"),
         state.join("threads.json"),
         state.join("roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     assert!(commit_rows(&fixture.index_path).is_empty());
@@ -1093,7 +1098,7 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
     // authorized.
     fs::remove_dir_all(&bridge.index_path).unwrap();
     let bridge_state = bridge.index_path.parent().unwrap().to_path_buf();
-    let reopened = TranscriptIndex::open_or_create(
+    let reopened = TranscriptIndex::open_or_create_with_records(
         &bridge.index_path,
         Vec::new(),
         None,
@@ -1101,6 +1106,7 @@ fn a_pre_marker_index_carries_its_commit_documents_through_both_guards() {
         bridge_state.join("knowledge.json"),
         bridge_state.join("threads.json"),
         bridge_state.join("roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     reopened.reader_reload_for_test();
@@ -1187,7 +1193,7 @@ fn an_index_with_no_history_still_authorizes_both_guards() {
     fs::create_dir_all(&state).unwrap();
     let index_path = state.join("index");
     {
-        let index = TranscriptIndex::open_or_create(
+        let index = TranscriptIndex::open_or_create_with_records(
             &index_path,
             Vec::new(),
             None,
@@ -1195,6 +1201,7 @@ fn an_index_with_no_history_still_authorizes_both_guards() {
             state.join("knowledge.json"),
             state.join("threads.json"),
             state.join("roadmap.json"),
+            std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap();
         index.complete_schema_migration().unwrap();

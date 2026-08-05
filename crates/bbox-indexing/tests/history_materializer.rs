@@ -136,7 +136,7 @@ fn initialize_empty_provenance_ref(root: &Path, config: &Config) {
 fn initialize_empty_owner_state(root: &Path) {
     let state = root.join("state");
     let index_path = state.join("index");
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &index_path,
         Vec::new(),
         None,
@@ -144,6 +144,7 @@ fn initialize_empty_owner_state(root: &Path) {
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
         state.join("blackbox-roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     drop(index);
@@ -320,7 +321,7 @@ fn fresh_fixture(owned: &[(&str, u8)], ambiguous: Option<&str>) -> FreshFixture 
     let state = root.join("state");
     fs::create_dir_all(&state).unwrap();
     let index_path = state.join("index");
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &index_path,
         Vec::new(),
         None,
@@ -328,6 +329,7 @@ fn fresh_fixture(owned: &[(&str, u8)], ambiguous: Option<&str>) -> FreshFixture 
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
         state.join("blackbox-roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     drop(index);

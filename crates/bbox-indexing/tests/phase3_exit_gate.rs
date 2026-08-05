@@ -213,7 +213,7 @@ fn initialize_empty_provenance_ref(root: &Path, config: &Config) {
 fn initialize_empty_owner_state(root: &Path) {
     let state = root.join("state");
     let index_path = state.join("index");
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &index_path,
         Vec::new(),
         None,
@@ -221,6 +221,7 @@ fn initialize_empty_owner_state(root: &Path) {
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
         state.join("blackbox-roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     drop(index);
@@ -1263,7 +1264,7 @@ fn the_forced_replacement_rematerializes_every_bucket_of_the_fixture() {
 
     // 4. The destructive drop, then the rebuild's re-emission.
     fs::remove_dir_all(&index_path).unwrap();
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &index_path,
         Vec::new(),
         None,
@@ -1271,6 +1272,7 @@ fn the_forced_replacement_rematerializes_every_bucket_of_the_fixture() {
         fixture.state().join("blackbox-knowledge.json"),
         fixture.state().join("blackbox-threads.json"),
         fixture.state().join("blackbox-roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     assert!(commit_entity_ids(&index_path).is_empty());

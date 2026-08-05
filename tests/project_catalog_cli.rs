@@ -47,7 +47,7 @@ fn write_collected_activation(state: &Path, project_id: &str, generation_id: &st
 fn initialize_empty_owner_state(root: &Path, config_path: &Path) {
     let state = root.join("state");
     let index_path = state.join("index");
-    let index = TranscriptIndex::open_or_create(
+    let index = TranscriptIndex::open_or_create_with_records(
         &index_path,
         Vec::new(),
         None,
@@ -55,6 +55,7 @@ fn initialize_empty_owner_state(root: &Path, config_path: &Path) {
         state.join("blackbox-knowledge.json"),
         state.join("blackbox-threads.json"),
         state.join("blackbox-roadmap.json"),
+        std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
     )
     .unwrap();
     drop(index);
