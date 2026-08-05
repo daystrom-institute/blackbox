@@ -3112,3 +3112,86 @@ fn a_post_cut_live_refresh_survives_a_restart() {
         "generation {refreshed} is verified through the record, which the manifest never named"
     );
 }
+
+/// Re-running a SUCCESSFUL offline apply refuses; it never reports success a
+/// second time.
+///
+/// This is the reachability probe behind the `NotRequired` rejection inside
+/// `apply`. A mutation-verify pass showed that removing that rejection failed
+/// no test, so the question it raises is whether the state is reachable at all.
+/// It is not, and which guard blocks it is the interesting part: not the D-036
+/// recapture, but the PREDECESSOR binding, one step earlier. The first apply's
+/// guard drove every namespace to `Ready`, and that materialization advanced
+/// the catalog epoch past the epoch the backfill completion journal pinned, so
+/// the re-run's predecessor is stale before its fingerprints are ever compared.
+///
+/// That is the same mechanism as the pre-drop crash above, and observing it
+/// twice is what makes it a general rule rather than an anecdote: ANY second
+/// rebuild operation against one backfill journal blocks on predecessor
+/// staleness, because the first one moved the epoch that journal names.
+///
+/// The `NotRequired` arm downstream is therefore a fail-safe covering a state
+/// two upstream gates currently make unreachable, not dead weight: it is the
+/// assertion that a drive which did nothing can never be reported as a
+/// committed rebuild if a future change moves either gate.
+///
+/// What this test guarantees regardless of which guard fires is the property an
+/// operator depends on: a second `path-free-rebuild --apply` does not
+/// silently claim a cut it did not perform.
+#[test]
+fn a_second_offline_apply_refuses_rather_than_reporting_success_again() {
+    use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+    use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
+    use blackbox::project_catalog_rebuild_admin::{
+        CatalogSchemaReplacementDriveV1, PathFreeRebuildApplyRequestV1,
+    };
+
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let (report_path, resolution_path) = fixture.rebuild_artifacts();
+    let first = watchdogged("the first apply", {
+        let handle = fixture.clone();
+        let (report_path, resolution_path) = (report_path.clone(), resolution_path.clone());
+        move || {
+            blackbox::project_catalog_rebuild_admin::preflight(PathFreeRebuildPreflightRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path: report_path.clone(),
+                resolution_path: resolution_path.clone(),
+                scan_limits: HistoryScanLimitsV1::default(),
+                generated_at: "2026-08-05T00:00:06Z".to_string(),
+            })
+            .unwrap();
+            blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+            })
+            .unwrap()
+        }
+    });
+    assert_eq!(first.drive, CatalogSchemaReplacementDriveV1::Completed);
+
+    // Same authorized artifacts, same target, immediately again.
+    let refusal = watchdogged("the second apply", {
+        let handle = fixture.clone();
+        move || {
+            blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+            })
+            .map(|receipt| receipt.drive)
+        }
+    })
+    .expect_err("a second apply must not report a second success");
+    assert_eq!(
+        refusal.code, "error.project_catalog_inventory_stale_post_image",
+        "the first apply moved the catalog epoch the backfill journal pinned, so the \
+         predecessor binding refuses upstream of both the D-036 gate and the drive: {}",
+        refusal.message
+    );
+}
