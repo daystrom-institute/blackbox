@@ -439,7 +439,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
 #[cfg(test)]
 mod owner_row_stamper_dispatch {
     use super::*;
-    use LegacyRowStampCoverageV1::{Covered, ExemptByConstruction, NotImplemented};
+    use LegacyRowStampCoverageV1::{Covered, ExemptByConstruction};
 
     /// Every path the stamper may touch is rooted in one tempdir, so a test
     /// that reaches the wrong owner writes somewhere observable instead of
