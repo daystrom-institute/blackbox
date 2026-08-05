@@ -112,10 +112,12 @@ pub struct ProjectCatalogMigrationError {
 }
 
 impl ProjectCatalogMigrationError {
-    /// Visible crate-wide so the Phase 6 durable-backfill and path-free-rebuild
-    /// facades share this ONE error boundary. A second boundary would mint a
-    /// parallel code vocabulary, which section 7 forbids.
-    pub(crate) fn new(
+    /// Public so the Phase 6 facades AND the root-crate row stamper share this
+    /// ONE error boundary. A second boundary would mint a parallel code
+    /// vocabulary, which section 7 forbids; the stamper implements a trait
+    /// declared here but lives root-side (it needs the real owner schemas), so
+    /// it must be able to construct this error across the crate boundary.
+    pub fn new(
         code: &'static str,
         message: impl Into<String>,
         mutation_disposition: ProjectCatalogMigrationMutationDispositionV1,
@@ -136,7 +138,7 @@ impl ProjectCatalogMigrationError {
         }
     }
 
-    pub(crate) fn no_mutation(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn no_mutation(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(
             code,
             message,
