@@ -13,10 +13,33 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnerSnapshotLimitsV1 {
+    /// The BUFFERED budget: how many bytes a whole-file-read owner may hold in
+    /// memory across one capture. Applied cumulatively by
+    /// [`capture_regular_tree_nofollow`], because for those owners it is an
+    /// allocation ceiling, not a work ceiling.
+    ///
+    /// It does NOT apply to the streaming lane below. A line-oriented owner
+    /// whose sources are legitimately multi-gigabyte (edge lanes) would refuse
+    /// its own first file under a memory budget, which is exactly the failure
+    /// the streaming lane exists to remove.
     pub max_source_bytes: usize,
     pub max_subsources: usize,
     pub max_rows: usize,
     pub max_selector_bytes: usize,
+    /// The STREAMED budget: total bytes one streaming pass may read across the
+    /// whole tree. Memory is O(chunk) regardless, so this bounds WALL TIME, not
+    /// allocation, and is therefore set orders of magnitude above the buffered
+    /// budget. It exists so a runaway or adversarial tree cannot make a
+    /// migration preflight run unboundedly long; it is not a correctness bound.
+    ///
+    /// `u64` rather than `usize` because it is a quantity of work over a tree
+    /// rather than the size of any allocation, and the default must be
+    /// expressible on a 32-bit host.
+    pub max_streamed_source_bytes: u64,
+    /// Per-line ceiling for the streaming lane, the one bound that really is an
+    /// allocation ceiling there: a streamed line is buffered whole so the owner
+    /// can decode it. A single JSONL record above this is corruption, not data.
+    pub max_streamed_line_bytes: usize,
 }
 
 impl Default for OwnerSnapshotLimitsV1 {
@@ -26,6 +49,11 @@ impl Default for OwnerSnapshotLimitsV1 {
             max_subsources: 100_000,
             max_rows: 100_000,
             max_selector_bytes: 16 * 1024,
+            // Generous on purpose: observed production edge-lane trees run to
+            // several GiB with individual lanes above 1 GiB, and a preflight
+            // that refuses a host for being BIG is the defect this replaces.
+            max_streamed_source_bytes: 64 * 1024 * 1024 * 1024,
+            max_streamed_line_bytes: 1024 * 1024,
         }
     }
 }
@@ -1104,6 +1132,341 @@ pub fn capture_regular_tree_nofollow(
     include: impl Fn(&Path) -> bool,
 ) -> Result<Vec<(PathBuf, CapturedOwnerBytesV1)>, OwnerSnapshotError> {
     validate_limits(limits)?;
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+    for relative in enumerate_regular_tree_nofollow(root, limits, include)? {
+        let subsource_id = stable_subsource_id(source_id, &relative);
+        let captured = capture_regular_file_nofollow(
+            &root.join(&relative),
+            source_id,
+            &subsource_id,
+            limits.max_source_bytes.saturating_sub(total_bytes),
+        );
+        if let OwnerSnapshotStateV1::Present { byte_len, .. } = &captured.state {
+            total_bytes =
+                total_bytes
+                    .checked_add(*byte_len as usize)
+                    .ok_or(OwnerSnapshotError {
+                        code: "owner_source_byte_limit",
+                    })?;
+            if total_bytes > limits.max_source_bytes {
+                return Err(OwnerSnapshotError {
+                    code: "owner_source_byte_limit",
+                });
+            }
+        }
+        files.push((relative, captured));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// The streaming lane: owners whose sources do not fit in memory
+// ---------------------------------------------------------------------------
+//
+// [`capture_regular_tree_nofollow`] reads each source whole and spends one
+// shared byte budget across the tree. That is right for the small JSON stores:
+// their fingerprint is over bytes they must hold anyway, and a cumulative cap
+// is a real memory ceiling.
+//
+// It is wrong for a LINE-ORIENTED owner. Edge lanes on a working host run to
+// several GiB with single lanes above 1 GiB, so the first file alone exhausts a
+// memory-shaped budget, comes back with no bytes, and the owner reports the host
+// as corrupt (`owner_source_unreadable`) purely for being large. The lane below
+// reads the same trees with the same safety rules, but digests incrementally and
+// hands the owner one complete line at a time, so memory is O(chunk + line) no
+// matter how big the source is, and the budget that remains is a WALL-TIME bound
+// rather than an allocation one.
+
+/// One file of a streamed owner-tree capture: the same `Present`/`Missing`/
+/// `Corrupt` state the buffered lane produces, plus the rows the owner decoded
+/// from it. The raw bytes are deliberately absent - not holding them is the
+/// entire point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedOwnerFileV1 {
+    pub relative: PathBuf,
+    pub subsource_id: String,
+    pub state: OwnerSnapshotStateV1,
+    pub rows: Vec<OwnerSnapshotRowV1>,
+}
+
+/// A refusal from the streaming capture, carrying the subsource it is ABOUT.
+///
+/// The buffered lane's [`OwnerSnapshotError`] can only say "the tree is bad",
+/// which is all a whole-tree read needs. A streaming decoder refuses on one
+/// specific line of one specific file, and an owner reporting corruption must
+/// name it, so the subsource travels with the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedOwnerTreeErrorV1 {
+    pub code: &'static str,
+    /// `None` when the refusal is about the tree rather than any one file.
+    pub subsource_id: Option<String>,
+}
+
+impl From<OwnerSnapshotError> for StreamedOwnerTreeErrorV1 {
+    fn from(error: OwnerSnapshotError) -> Self {
+        Self {
+            code: error.code,
+            subsource_id: None,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamedOwnerTreeErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for StreamedOwnerTreeErrorV1 {}
+
+/// How many bytes one read syscall takes. The streaming lane's resident set is
+/// this plus the longest line it has seen, and nothing else.
+const STREAMED_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Capture a line-oriented owner tree by streaming, with the same two-identical-
+/// scans stability contract [`capture_stable_regular_tree_nofollow`] gives the
+/// buffered owners.
+///
+/// The stability comparison is over per-file CONTENT DIGESTS rather than over
+/// bytes. That is the same guarantee at a fraction of the memory: rows are a
+/// pure function of the bytes, so two passes that agree on every file's sha256
+/// necessarily agree on every row. The first pass therefore decodes nothing at
+/// all - it only digests - and the rows come from the pass that has to agree
+/// with it.
+///
+/// `new_lane` builds the owner's per-file decoding state and `decode_line`
+/// advances it. A FRESH state is built for every file in every pass, so a pass
+/// abandoned mid-tree can never leak occurrence counters or partial rows into
+/// the retry that replaces it.
+pub fn capture_stable_streamed_tree_nofollow<D>(
+    root: &Path,
+    source_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    include: impl Fn(&Path) -> bool + Copy,
+    new_lane: impl Fn(&str) -> D + Copy,
+    decode_line: impl Fn(&mut D, &[u8]) -> Result<Option<OwnerSnapshotRowV1>, &'static str> + Copy,
+) -> Result<Vec<StreamedOwnerFileV1>, StreamedOwnerTreeErrorV1> {
+    validate_limits(limits)?;
+    let authority = crate::json_store::NofollowDirectory::open_existing(root)
+        .map_err(|_| OwnerSnapshotError {
+            code: "owner_tree_unsafe",
+        })?
+        .ok_or(OwnerSnapshotError {
+            code: "owner_tree_changed_during_capture",
+        })?;
+    // Digest-only, so the cheap pass is the one that may have to be discarded.
+    let mut prior = stream_regular_tree_nofollow(
+        root,
+        source_id,
+        limits,
+        include,
+        |_subsource_id: &str| (),
+        |_lane: &mut (), _line: &[u8]| -> Result<Option<OwnerSnapshotRowV1>, &'static str> {
+            Ok(None)
+        },
+    )?;
+    for _ in 0..3 {
+        let current =
+            stream_regular_tree_nofollow(root, source_id, limits, include, new_lane, decode_line)?;
+        if streamed_states_agree(&prior, &current) {
+            authority
+                .ensure_still_current()
+                .map_err(|_| OwnerSnapshotError {
+                    code: "owner_tree_changed_during_capture",
+                })?;
+            return Ok(current);
+        }
+        prior = current;
+    }
+    Err(OwnerSnapshotError {
+        code: "owner_tree_changed_during_capture",
+    }
+    .into())
+}
+
+/// Two passes agree when they saw the same files in the same states. Rows are
+/// excluded deliberately: they are derived from bytes the digests already cover,
+/// and comparing them would make the stability check quadratic in row count for
+/// no additional guarantee.
+fn streamed_states_agree(left: &[StreamedOwnerFileV1], right: &[StreamedOwnerFileV1]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.relative == right.relative
+                && left.subsource_id == right.subsource_id
+                && left.state == right.state
+        })
+}
+
+/// One streaming pass over the tree.
+fn stream_regular_tree_nofollow<D>(
+    root: &Path,
+    source_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    include: impl Fn(&Path) -> bool,
+    new_lane: impl Fn(&str) -> D,
+    decode_line: impl Fn(&mut D, &[u8]) -> Result<Option<OwnerSnapshotRowV1>, &'static str>,
+) -> Result<Vec<StreamedOwnerFileV1>, StreamedOwnerTreeErrorV1> {
+    // Per PASS, never across passes: a retried pass re-reads the same tree and
+    // must be allowed the same work as the pass it replaces.
+    let mut budget = limits.max_streamed_source_bytes;
+    let mut rows_seen = 0usize;
+    let mut files = Vec::new();
+    for relative in enumerate_regular_tree_nofollow(root, limits, include)? {
+        let subsource_id = stable_subsource_id(source_id, &relative);
+        let mut lane = new_lane(subsource_id.as_str());
+        let mut rows = Vec::new();
+        let state = stream_regular_file_nofollow(
+            &root.join(&relative),
+            source_id,
+            &subsource_id,
+            limits,
+            &mut budget,
+            |line| {
+                let Some(row) = decode_line(&mut lane, line)? else {
+                    return Ok(());
+                };
+                rows_seen += 1;
+                // Enforced HERE rather than only in `build_owner_snapshot` so a
+                // pathological tree is refused before its rows are accumulated,
+                // not after.
+                if rows_seen > limits.max_rows {
+                    return Err("owner_row_limit");
+                }
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .map_err(|code| StreamedOwnerTreeErrorV1 {
+            code,
+            subsource_id: Some(subsource_id.clone()),
+        })?;
+        files.push(StreamedOwnerFileV1 {
+            relative,
+            subsource_id,
+            state,
+            rows,
+        });
+    }
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Ok(files)
+}
+
+/// Stream one regular file: incremental sha256 over the raw bytes, plus every
+/// complete line handed to `on_line`.
+///
+/// The state vocabulary is identical to [`capture_regular_file_nofollow`]'s, so
+/// an owner that switches lanes keeps its diagnostics: an absent file is
+/// `Missing`, an unsafe parent is `owner_parent_unsafe`, and anything that
+/// cannot be opened or read - a non-regular entry, a permission refusal, an I/O
+/// failure - is `owner_source_unreadable`. `Err` is reserved for the bounds that
+/// abandon the whole capture rather than describing one file.
+///
+/// Line splitting reproduces `split_inclusive('\n')` exactly: a trailing
+/// terminator does not mint an empty final line, an unterminated tail IS a line,
+/// and a `\r` is trimmed only when a `\n` actually terminated the line. Owners
+/// index rows by line, so the streamed walk and any whole-body walk of the same
+/// file must agree line for line.
+fn stream_regular_file_nofollow(
+    path: &Path,
+    source_id: &str,
+    subsource_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    budget: &mut u64,
+    mut on_line: impl FnMut(&[u8]) -> Result<(), &'static str>,
+) -> Result<OwnerSnapshotStateV1, &'static str> {
+    use std::io::Read as _;
+
+    let missing = || OwnerSnapshotStateV1::Missing {
+        fingerprint: state_fingerprint("missing", source_id, subsource_id),
+    };
+    let corrupt = |diagnostic_code: &str| OwnerSnapshotStateV1::Corrupt {
+        diagnostic_code: diagnostic_code.to_string(),
+        fingerprint: state_fingerprint(diagnostic_code, source_id, subsource_id),
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(corrupt("owner_path_has_no_parent"));
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(corrupt("owner_filename_invalid"));
+    };
+    let directory = match crate::json_store::NofollowDirectory::open_existing(parent) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return Ok(missing()),
+        Err(_) => return Ok(corrupt("owner_parent_unsafe")),
+    };
+    let mut file = match directory.open_regular(name, "owner source") {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(missing()),
+        Err(_) => return Ok(corrupt("owner_source_unreadable")),
+    };
+
+    let mut hasher = Sha256::new();
+    let mut byte_len = 0u64;
+    let mut chunk = vec![0u8; STREAMED_CHUNK_BYTES];
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let read = match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            // A signal is not corruption. `read_to_end` retries this for the
+            // buffered lane; a raw `read` has to do it itself, and a capture
+            // that streams gigabytes gets far more chances to be interrupted.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(corrupt("owner_source_unreadable")),
+        };
+        *budget = budget
+            .checked_sub(read as u64)
+            .ok_or("owner_source_byte_limit")?;
+        hasher.update(&chunk[..read]);
+        byte_len += read as u64;
+
+        let mut rest = &chunk[..read];
+        while let Some(position) = rest.iter().position(|byte| *byte == b'\n') {
+            line.extend_from_slice(&rest[..position]);
+            if line.len() > limits.max_streamed_line_bytes {
+                return Err("owner_source_line_limit");
+            }
+            let content = if line.last() == Some(&b'\r') {
+                &line[..line.len() - 1]
+            } else {
+                &line[..]
+            };
+            on_line(content)?;
+            line.clear();
+            rest = &rest[position + 1..];
+        }
+        line.extend_from_slice(rest);
+        // Checked every chunk, not only at a terminator, so an unterminated
+        // multi-gigabyte "line" is refused instead of buffered.
+        if line.len() > limits.max_streamed_line_bytes {
+            return Err("owner_source_line_limit");
+        }
+    }
+    if !line.is_empty() {
+        on_line(&line)?;
+    }
+    Ok(OwnerSnapshotStateV1::Present {
+        content_sha256: hex::encode(hasher.finalize()),
+        byte_len,
+    })
+}
+
+/// The tree RULES, with no reads: which entries an owner tree admits, and what
+/// makes it unsafe.
+///
+/// Split out so the buffered and streaming captures cannot disagree about the
+/// shape of a legal owner tree (no symlink at any depth, no non-UTF-8 or
+/// non-normal component, directories recursed, everything else ignored).
+/// Deliberately returns VISIT order rather than sorted order: the buffered
+/// caller applies a cumulative byte budget while it reads, so the order it sees
+/// files in is part of its observable behavior.
+fn enumerate_regular_tree_nofollow(
+    root: &Path,
+    limits: OwnerSnapshotLimitsV1,
+    include: impl Fn(&Path) -> bool,
+) -> Result<Vec<PathBuf>, OwnerSnapshotError> {
     let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1120,8 +1483,7 @@ pub fn capture_regular_tree_nofollow(
     }
 
     let mut pending = vec![PathBuf::new()];
-    let mut files = Vec::new();
-    let mut total_bytes = 0usize;
+    let mut files: Vec<PathBuf> = Vec::new();
     while let Some(relative_dir) = pending.pop() {
         let absolute_dir = root.join(&relative_dir);
         let mut entries = std::fs::read_dir(&absolute_dir)
@@ -1166,30 +1528,9 @@ pub fn capture_regular_tree_nofollow(
                     code: "owner_subsource_limit",
                 });
             }
-            let subsource_id = stable_subsource_id(source_id, &relative);
-            let captured = capture_regular_file_nofollow(
-                &entry.path(),
-                source_id,
-                &subsource_id,
-                limits.max_source_bytes.saturating_sub(total_bytes),
-            );
-            if let OwnerSnapshotStateV1::Present { byte_len, .. } = &captured.state {
-                total_bytes =
-                    total_bytes
-                        .checked_add(*byte_len as usize)
-                        .ok_or(OwnerSnapshotError {
-                            code: "owner_source_byte_limit",
-                        })?;
-                if total_bytes > limits.max_source_bytes {
-                    return Err(OwnerSnapshotError {
-                        code: "owner_source_byte_limit",
-                    });
-                }
-            }
-            files.push((relative, captured));
+            files.push(relative);
         }
     }
-    files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
 }
 
@@ -1401,6 +1742,8 @@ fn validate_limits(limits: OwnerSnapshotLimitsV1) -> Result<(), OwnerSnapshotErr
         || limits.max_subsources == 0
         || limits.max_rows == 0
         || limits.max_selector_bytes == 0
+        || limits.max_streamed_source_bytes == 0
+        || limits.max_streamed_line_bytes == 0
     {
         return Err(OwnerSnapshotError {
             code: "owner_snapshot_limits_invalid",
@@ -1575,6 +1918,173 @@ fn hash_row(hasher: &mut Sha256, row: &OwnerSnapshotRowV1) {
 fn hash_field(hasher: &mut Sha256, field: &[u8]) {
     hasher.update((field.len() as u64).to_be_bytes());
     hasher.update(field);
+}
+
+#[cfg(test)]
+mod streamed_owner_tree {
+    use super::*;
+
+    /// A decoder that turns every line into a row, so a test can read back the
+    /// exact line sequence the walk produced.
+    struct LineProbe {
+        subsource_id: String,
+        index: usize,
+    }
+
+    fn new_probe(subsource_id: &str) -> LineProbe {
+        LineProbe {
+            subsource_id: subsource_id.to_string(),
+            index: 0,
+        }
+    }
+
+    fn probe_line(
+        probe: &mut LineProbe,
+        line: &[u8],
+    ) -> Result<Option<OwnerSnapshotRowV1>, &'static str> {
+        let text = std::str::from_utf8(line).map_err(|_| "probe_line_invalid")?;
+        let row = OwnerSnapshotRowV1::legacy_selector(
+            format!("{}:{}", probe.subsource_id, probe.index),
+            LegacyProjectSelectorKindV1::AbsolutePath,
+            // Bracketed so an empty line is still a legible, non-empty literal.
+            format!("[{text}]"),
+        );
+        probe.index += 1;
+        Ok(Some(row))
+    }
+
+    fn capture(
+        root: &Path,
+        limits: OwnerSnapshotLimitsV1,
+    ) -> Result<Vec<StreamedOwnerFileV1>, StreamedOwnerTreeErrorV1> {
+        capture_stable_streamed_tree_nofollow(
+            root,
+            "probe",
+            limits,
+            |relative| relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
+            new_probe,
+            probe_line,
+        )
+    }
+
+    fn selectors(file: &StreamedOwnerFileV1) -> Vec<String> {
+        file.rows
+            .iter()
+            .map(|row| match &row.value {
+                OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                    literal_selector, ..
+                } => literal_selector.clone(),
+                OwnerSnapshotRowValueV1::InventoryTarget { .. } => unreachable!("probe rows"),
+            })
+            .collect()
+    }
+
+    /// The streamed walk must see EXACTLY the lines a `split_inclusive('\n')`
+    /// walk of the same bytes sees. Owners index rows by line position, so a
+    /// walk that invented or dropped a line would mint row ids no other half of
+    /// the backfill could reproduce.
+    #[test]
+    fn streamed_lines_reproduce_split_inclusive_with_crlf_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // A CRLF line, a bare-LF line, an empty line, and an UNTERMINATED tail.
+        std::fs::write(root.join("lane.jsonl"), b"a\r\nb\n\nc").unwrap();
+
+        let captured = capture(&root, OwnerSnapshotLimitsV1::default()).unwrap();
+        assert_eq!(selectors(&captured[0]), vec!["[a]", "[b]", "[]", "[c]"]);
+
+        // A trailing terminator does NOT mint an empty final line, and an empty
+        // file has no lines at all.
+        std::fs::write(root.join("lane.jsonl"), b"a\n").unwrap();
+        let captured = capture(&root, OwnerSnapshotLimitsV1::default()).unwrap();
+        assert_eq!(selectors(&captured[0]), vec!["[a]"]);
+
+        std::fs::write(root.join("lane.jsonl"), b"").unwrap();
+        let captured = capture(&root, OwnerSnapshotLimitsV1::default()).unwrap();
+        assert!(captured[0].rows.is_empty());
+    }
+
+    /// The incremental digest is the same commitment a whole-file read would
+    /// have produced. Without this, moving an owner onto the streaming lane
+    /// would silently re-fingerprint its entire corpus.
+    #[test]
+    fn the_incremental_digest_equals_the_whole_file_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("lane.jsonl");
+        let body = (0..5_000)
+            .map(|index| format!("line-{index}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &body).unwrap();
+
+        // A per-file buffered budget far below the file size: the streaming
+        // lane must not consult it at all.
+        let limits = OwnerSnapshotLimitsV1 {
+            max_source_bytes: 1024,
+            ..OwnerSnapshotLimitsV1::default()
+        };
+        let captured = capture(&root, limits).unwrap();
+        assert_eq!(
+            captured[0].state,
+            OwnerSnapshotStateV1::Present {
+                content_sha256: sha256_hex(body.as_bytes()),
+                byte_len: body.len() as u64,
+            }
+        );
+        assert_eq!(captured[0].rows.len(), 5_000);
+    }
+
+    /// The streamed budget bounds WORK, and names the file it ran out on.
+    #[test]
+    fn the_streamed_byte_budget_refuses_and_names_its_subsource() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("lane.jsonl"), "x".repeat(4096)).unwrap();
+
+        let limits = OwnerSnapshotLimitsV1 {
+            max_streamed_source_bytes: 64,
+            ..OwnerSnapshotLimitsV1::default()
+        };
+        let error = capture(&root, limits).unwrap_err();
+        assert_eq!(error.code, "owner_source_byte_limit");
+        assert_eq!(
+            error.subsource_id.as_deref(),
+            Some(stable_subsource_id("probe", Path::new("lane.jsonl")).as_str())
+        );
+    }
+
+    /// One unterminated line cannot become an unbounded buffer: the per-line
+    /// ceiling is the streaming lane's real allocation bound.
+    #[test]
+    fn an_overlong_line_refuses_instead_of_buffering() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("lane.jsonl"), "x".repeat(4096)).unwrap();
+
+        let limits = OwnerSnapshotLimitsV1 {
+            max_streamed_line_bytes: 64,
+            ..OwnerSnapshotLimitsV1::default()
+        };
+        assert_eq!(
+            capture(&root, limits).unwrap_err().code,
+            "owner_source_line_limit"
+        );
+    }
+
+    /// Rows are counted as they stream, so a pathological tree is refused
+    /// BEFORE its rows are accumulated rather than after.
+    #[test]
+    fn the_row_ceiling_refuses_while_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("lane.jsonl"), "a\nb\nc\nd\n").unwrap();
+
+        let limits = OwnerSnapshotLimitsV1 {
+            max_rows: 2,
+            ..OwnerSnapshotLimitsV1::default()
+        };
+        assert_eq!(capture(&root, limits).unwrap_err().code, "owner_row_limit");
+    }
 }
 
 #[cfg(test)]

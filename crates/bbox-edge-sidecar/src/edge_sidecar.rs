@@ -56,6 +56,14 @@ pub struct EdgeKey {
 /// complete tree is accepted only after two identical scans. This makes the
 /// read-only capture coherent with atomic lane replacement without creating
 /// an edge store or coordination file.
+///
+/// STREAMED, unlike every other durable owner. Edge lanes are the one owner
+/// whose sources are unbounded by design: a working host carries several GiB of
+/// them with individual lanes above 1 GiB, so a whole-file read would refuse the
+/// host for being large (`owner_source_unreadable`) long before it found
+/// anything wrong with it. Digesting incrementally and decoding line by line
+/// keeps this capture's memory independent of lane size, and leaves
+/// `owner_source_unreadable` to mean what it says.
 pub fn capture_project_catalog_owner_snapshot(
     edges_dir: &Path,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
@@ -64,10 +72,9 @@ pub fn capture_project_catalog_owner_snapshot(
     bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotError,
 > {
     use bbox_corpus_core::project_catalog_snapshot::{
-        LegacyProjectSelectorKindV1, OwnerSnapshotRowV1, OwnerSnapshotStateV1,
-        build_owner_snapshot, capture_stable_regular_tree_nofollow, corrupt_owner_snapshot,
-        finalize_owner_snapshot, missing_owner_snapshot, owner_subsource, sha256_hex,
-        stable_subsource_id,
+        OwnerSnapshotStateV1, build_owner_snapshot, capture_stable_streamed_tree_nofollow,
+        corrupt_owner_snapshot, finalize_owner_snapshot, missing_owner_snapshot, owner_subsource,
+        sha256_hex,
     };
 
     match std::fs::symlink_metadata(edges_dir) {
@@ -84,7 +91,7 @@ pub fn capture_project_catalog_owner_snapshot(
             );
         }
     }
-    let captures = match capture_stable_regular_tree_nofollow(
+    let captures = match capture_stable_streamed_tree_nofollow(
         edges_dir,
         "transcript_edge",
         limits,
@@ -94,12 +101,19 @@ pub fn capture_project_catalog_owner_snapshot(
                 .and_then(|extension| extension.to_str())
                 == Some("jsonl")
         },
+        TranscriptEdgeLaneDecoder::new,
+        // The SAME row walk the stamper uses, so the two halves cannot disagree
+        // about which rows exist or what they are called.
+        TranscriptEdgeLaneDecoder::decode,
     ) {
         Ok(captures) => captures,
         Err(error) => {
             return corrupt_owner_snapshot(
                 "transcript_edge",
-                "transcript_edge:root",
+                error
+                    .subsource_id
+                    .as_deref()
+                    .unwrap_or("transcript_edge:root"),
                 error.code,
                 limits,
             );
@@ -119,51 +133,25 @@ pub fn capture_project_catalog_owner_snapshot(
     }
     let mut rows = Vec::new();
     let mut subsources = Vec::new();
-    for (relative, captured) in captures {
-        let subsource_id = stable_subsource_id("transcript_edge", &relative);
-        let Some(bytes) = captured.bytes else {
+    for capture in captures {
+        // A lane that is anything other than fully present - vanished mid-walk,
+        // unopenable, non-regular - fails the whole capture rather than
+        // contributing an empty subsource, because a partial lane set would
+        // under-report the legacy selectors still needing migration.
+        if !matches!(capture.state, OwnerSnapshotStateV1::Present { .. }) {
             return corrupt_owner_snapshot(
                 "transcript_edge",
-                &subsource_id,
+                &capture.subsource_id,
                 "owner_source_unreadable",
                 limits,
             );
-        };
-        let body = match std::str::from_utf8(&bytes) {
-            Ok(body) => body,
-            Err(_) => {
-                return corrupt_owner_snapshot(
-                    "transcript_edge",
-                    &subsource_id,
-                    "transcript_edge_invalid",
-                    limits,
-                );
-            }
-        };
-        // The SAME walk the stamper uses, so the two halves cannot disagree
-        // about which rows exist or what they are called.
-        let lane_rows = match transcript_edge_lane_rows(body) {
-            Ok(lane_rows) => lane_rows,
-            Err(code) => {
-                return corrupt_owner_snapshot("transcript_edge", &subsource_id, code, limits);
-            }
-        };
-        let subsource_rows = lane_rows
-            .iter()
-            .map(|row| {
-                OwnerSnapshotRowV1::legacy_selector(
-                    row.stable_row_id(&subsource_id),
-                    LegacyProjectSelectorKindV1::AbsolutePath,
-                    &row.cwd,
-                )
-            })
-            .collect::<Vec<_>>();
+        }
         subsources.push(owner_subsource(
-            subsource_id,
-            captured.state,
-            &subsource_rows,
+            capture.subsource_id,
+            capture.state,
+            &capture.rows,
         ));
-        rows.extend(subsource_rows);
+        rows.extend(capture.rows);
     }
     finalize_owner_snapshot(
         "transcript_edge",
@@ -195,7 +183,114 @@ struct TranscriptEdgeLaneRow {
 
 impl TranscriptEdgeLaneRow {
     fn stable_row_id(&self, subsource_id: &str) -> String {
-        format!("{subsource_id}:{}:{}", self.identity, self.occurrence)
+        transcript_edge_stable_row_id(subsource_id, &self.identity, self.occurrence)
+    }
+}
+
+/// The ONE composition of a transcript-edge row id, so the whole-body walk and
+/// the streaming capture cannot mint different ids for the same row.
+fn transcript_edge_stable_row_id(subsource_id: &str, identity: &str, occurrence: usize) -> String {
+    format!("{subsource_id}:{identity}:{occurrence}")
+}
+
+/// What one lane LINE contributes to the catalog view, independent of how the
+/// line was obtained.
+struct TranscriptEdgeRowIdentityV1 {
+    identity: String,
+    occurrence: usize,
+    cwd: String,
+}
+
+/// The per-lane row walk: the filter, the identity, and the occurrence
+/// numbering, with no opinion about where the lines come from.
+///
+/// Both readers of a lane share this. The whole-body walk feeds it segments of a
+/// buffered file; the streaming capture feeds it lines as they come off the
+/// descriptor. Occurrence numbering is stateful and file-ordered, so anything
+/// that re-derives it independently would silently produce different row ids for
+/// duplicate rows, and the backfill keys its ledger on those ids.
+struct TranscriptEdgeLaneWalk {
+    occurrence_by_identity: BTreeMap<String, usize>,
+}
+
+impl TranscriptEdgeLaneWalk {
+    fn new() -> Self {
+        Self {
+            occurrence_by_identity: BTreeMap::new(),
+        }
+    }
+
+    /// `Ok(None)` is "this line contributes no catalog row" (blank, or an edge
+    /// with no literal `cwd`); `Err` is a corrupt lane.
+    fn accept(
+        &mut self,
+        content: &str,
+    ) -> Result<Option<TranscriptEdgeRowIdentityV1>, &'static str> {
+        if content.trim().is_empty() {
+            return Ok(None);
+        }
+        // Parsed as a typed Edge purely to keep capture's existing validity
+        // contract: a lane line that is not an edge is a corrupt owner, not a
+        // row to skip.
+        let edge: Edge = serde_json::from_str(content).map_err(|_| "transcript_edge_invalid")?;
+        let Some(cwd) = edge
+            .metadata
+            .get("cwd")
+            .map(|cwd| cwd.trim())
+            .filter(|cwd| !cwd.is_empty())
+        else {
+            return Ok(None);
+        };
+        let identity = transcript_edge_row_identity(content).ok_or("transcript_edge_invalid")?;
+        let occurrence = self
+            .occurrence_by_identity
+            .entry(identity.clone())
+            .or_default();
+        let row = TranscriptEdgeRowIdentityV1 {
+            identity,
+            occurrence: *occurrence,
+            cwd: cwd.to_string(),
+        };
+        *occurrence += 1;
+        Ok(Some(row))
+    }
+}
+
+/// The streaming capture's per-lane decoder: [`TranscriptEdgeLaneWalk`] plus the
+/// subsource the rows belong to.
+struct TranscriptEdgeLaneDecoder {
+    subsource_id: String,
+    walk: TranscriptEdgeLaneWalk,
+}
+
+impl TranscriptEdgeLaneDecoder {
+    fn new(subsource_id: &str) -> Self {
+        Self {
+            subsource_id: subsource_id.to_string(),
+            walk: TranscriptEdgeLaneWalk::new(),
+        }
+    }
+
+    fn decode(
+        &mut self,
+        line: &[u8],
+    ) -> Result<Option<bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotRowV1>, &'static str>
+    {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            LegacyProjectSelectorKindV1, OwnerSnapshotRowV1,
+        };
+
+        // Validated per line rather than per file. Equivalent, because `\n`
+        // cannot occur inside a multi-byte UTF-8 sequence, so a lane is valid
+        // UTF-8 exactly when all of its lines are.
+        let content = std::str::from_utf8(line).map_err(|_| "transcript_edge_invalid")?;
+        Ok(self.walk.accept(content)?.map(|row| {
+            OwnerSnapshotRowV1::legacy_selector(
+                transcript_edge_stable_row_id(&self.subsource_id, &row.identity, row.occurrence),
+                LegacyProjectSelectorKindV1::AbsolutePath,
+                &row.cwd,
+            )
+        }))
     }
 }
 
@@ -264,33 +359,18 @@ fn transcript_edge_segments(body: &str) -> impl Iterator<Item = (&str, &str)> {
 /// filter (blank lines skipped, rows without a nonempty `cwd` skipped), on the
 /// identity, or on occurrence numbering.
 fn transcript_edge_lane_rows(body: &str) -> Result<Vec<TranscriptEdgeLaneRow>, &'static str> {
-    let mut occurrence_by_identity = BTreeMap::<String, usize>::new();
+    let mut walk = TranscriptEdgeLaneWalk::new();
     let mut rows = Vec::new();
     for (segment_index, (content, _)) in transcript_edge_segments(body).enumerate() {
-        if content.trim().is_empty() {
-            continue;
-        }
-        // Parsed as a typed Edge purely to keep capture's existing validity
-        // contract: a lane line that is not an edge is a corrupt owner, not a
-        // row to skip.
-        let edge: Edge = serde_json::from_str(content).map_err(|_| "transcript_edge_invalid")?;
-        let Some(cwd) = edge
-            .metadata
-            .get("cwd")
-            .map(|cwd| cwd.trim())
-            .filter(|cwd| !cwd.is_empty())
-        else {
+        let Some(row) = walk.accept(content)? else {
             continue;
         };
-        let identity = transcript_edge_row_identity(content).ok_or("transcript_edge_invalid")?;
-        let occurrence = occurrence_by_identity.entry(identity.clone()).or_default();
         rows.push(TranscriptEdgeLaneRow {
             segment_index,
-            identity,
-            occurrence: *occurrence,
-            cwd: cwd.to_string(),
+            identity: row.identity,
+            occurrence: row.occurrence,
+            cwd: row.cwd,
         });
-        *occurrence += 1;
     }
     Ok(rows)
 }
@@ -1640,6 +1720,181 @@ mod project_catalog_snapshot_tests {
             .map(|row| row.stable_row_id.as_str())
             .collect();
         assert!(ids.contains(&first.as_str()) && ids.contains(&second.as_str()));
+    }
+
+    /// Write `rows` catalog-visible edge lines, each padded so a handful of
+    /// rows already exceeds a small injected byte budget.
+    fn write_bulky_lane(path: &Path, lane: usize, rows: usize) {
+        let padding = "p".repeat(160);
+        let body = (0..rows)
+            .map(|index| {
+                format!(
+                    concat!(
+                        r#"{{"source":{{"type":"task","task_id":"lane-{lane}-{index}"}},"#,
+                        r#""kind":"RAN_BASH","target":{{"type":"task","task_id":"peer"}},"#,
+                        r#""provenance":"explicit","confidence":"exact","#,
+                        r#""metadata":{{"cwd":"/repo/lane-{lane}/{index}","pad":"{padding}"}}}}"#,
+                        "\n",
+                    ),
+                    // Named explicitly: a format string expanded from `concat!`
+                    // cannot capture from the environment.
+                    lane = lane,
+                    index = index,
+                    padding = padding,
+                )
+            })
+            .collect::<String>();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// A small stand-in for the shipped 16 MiB buffered default, so the fixture
+    /// can stay a few hundred KiB while being exactly the same shape.
+    fn tiny_buffered_budget() -> OwnerSnapshotLimitsV1 {
+        OwnerSnapshotLimitsV1 {
+            max_source_bytes: 32 * 1024,
+            ..OwnerSnapshotLimitsV1::default()
+        }
+    }
+
+    /// THE F3 SHAPE, which no fixture covered: a lane TREE bigger than the
+    /// buffered byte budget.
+    ///
+    /// The budget was spent cumulatively across the whole walk, so on a real
+    /// host the FIRST multi-hundred-megabyte lane exhausted it, every read came
+    /// back empty, and the preflight reported a perfectly healthy host as
+    /// `owner_source_unreadable`. The first assertion pins that the buffered
+    /// walk really does behave that way on this fixture, so the test cannot
+    /// quietly stop reproducing the defect; the second pins that this owner no
+    /// longer goes through it.
+    #[test]
+    fn a_lane_tree_over_the_buffered_budget_captures_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        for lane in 0..3 {
+            write_bulky_lane(&root.join(format!("lane-{lane}.jsonl")), lane, 200);
+        }
+        let limits = tiny_buffered_budget();
+
+        let buffered = bbox_corpus_core::project_catalog_snapshot::capture_regular_tree_nofollow(
+            &root,
+            "transcript_edge",
+            limits,
+            |relative| relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
+        )
+        .unwrap();
+        assert!(
+            buffered
+                .iter()
+                .all(|(_, captured)| captured.bytes.is_none()),
+            "the buffered lane must still refuse this fixture, or the test has \
+             stopped reproducing the defect"
+        );
+
+        let snapshot = capture_project_catalog_owner_snapshot(&root, limits).unwrap();
+        assert!(matches!(
+            snapshot.state,
+            OwnerSnapshotStateV1::Present { .. }
+        ));
+        assert_eq!(snapshot.row_count, 600);
+        assert_eq!(snapshot.subsources.len(), 3);
+        assert!(snapshot.rows.iter().any(|row| matches!(
+            &row.value,
+            OwnerSnapshotRowValueV1::LegacyProjectSelector { literal_selector, .. }
+                if literal_selector == "/repo/lane-2/199"
+        )));
+    }
+
+    /// ONE lane larger than the whole buffered budget: the streamed digest is
+    /// the same commitment a whole-file read would have produced, and the row
+    /// ids are the same ones the stamper's whole-body walk mints - which is the
+    /// only reason a streamed capture and a buffered stamp can be two halves of
+    /// one backfill.
+    #[test]
+    fn one_oversized_lane_streams_the_whole_file_digest_and_stampable_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("tool.jsonl");
+        write_bulky_lane(&path, 0, 500);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > tiny_buffered_budget().max_source_bytes);
+
+        let snapshot =
+            capture_project_catalog_owner_snapshot(&root, tiny_buffered_budget()).unwrap();
+        assert_eq!(snapshot.row_count, 500);
+        assert_eq!(
+            snapshot.subsources[0].state,
+            OwnerSnapshotStateV1::Present {
+                content_sha256: bbox_corpus_core::project_catalog_snapshot::sha256_hex(&bytes),
+                byte_len: bytes.len() as u64,
+            }
+        );
+
+        // The lane is comfortably inside the DEFAULT buffered budget, so the
+        // stamper can still locate this streamed id by its own whole-body walk.
+        let row_id = snapshot
+            .rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.value,
+                    OwnerSnapshotRowValueV1::LegacyProjectSelector { literal_selector, .. }
+                        if literal_selector == "/repo/lane-0/17"
+                )
+            })
+            .expect("the streamed capture emits a row for every literal cwd")
+            .stable_row_id
+            .clone();
+        assert_eq!(
+            stamp_project_catalog_owner_row(
+                &root,
+                &row_id,
+                "a1b2c3d4",
+                OwnerSnapshotLimitsV1::default()
+            )
+            .unwrap(),
+            bbox_corpus_core::project_catalog_snapshot::OwnerRowStampOutcomeV1::Stamped
+        );
+    }
+
+    /// Streaming must not soften the failure mode it was introduced to stop
+    /// misreporting: a lane that genuinely cannot be read is still
+    /// `owner_source_unreadable`.
+    ///
+    /// Skips itself where the process can read a `0o000` file anyway (running
+    /// privileged), because there is no unprivileged way to stage a real read
+    /// failure there.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_that_cannot_be_read_is_still_owner_source_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("tool.jsonl");
+        write_bulky_lane(&path, 0, 2);
+
+        let restore = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = std::fs::File::open(&path).is_err();
+        let snapshot = blocked.then(|| {
+            capture_project_catalog_owner_snapshot(&root, OwnerSnapshotLimitsV1::default())
+        });
+        // Restored before any assertion so a failure cannot leave the fixture
+        // undeletable.
+        std::fs::set_permissions(&path, restore).unwrap();
+
+        let Some(snapshot) = snapshot else {
+            eprintln!("skipped: this process can read a 0o000 file");
+            return;
+        };
+        assert!(matches!(
+            snapshot.unwrap().state,
+            OwnerSnapshotStateV1::Corrupt { diagnostic_code, .. }
+                if diagnostic_code == "owner_source_unreadable"
+        ));
     }
 
     #[test]
