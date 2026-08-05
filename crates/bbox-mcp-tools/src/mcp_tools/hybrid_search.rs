@@ -15,7 +15,7 @@ use bbox_embed::embed_queue;
 use bbox_indexing::index::{HybridBm25Hit, TranscriptIndex};
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_providers::entity_loader;
-use bbox_providers::providers::ProviderContext;
+use bbox_providers::providers::{ProviderContext, ProviderProjectAuthority};
 use bbox_vectors::{self as vectors, PartitionMetrics};
 
 const DEFAULT_LIMIT: usize = 10;
@@ -673,10 +673,50 @@ fn thread_matches_project_filter(
     let Some(thread) = threads.all().iter().find(|thread| thread.id == thread_id) else {
         return true;
     };
-    bbox_corpus_core::entity_ref::project_id_for_path(&thread.project)
-        .ok()
-        .as_deref()
-        == Some(target_project_id)
+    thread_project_matches(stores.project_authority, &thread.project, target_project_id)
+}
+
+/// Whether a thread's stored `project` denotes `target_project_id`.
+///
+/// A thread stores a HOST PATH in `project`. Deriving identity from that path
+/// is a version-1 lane: in catalog mode identity comes from the catalog store,
+/// never from a path hash (Phase 6 plan section 5.1).
+///
+/// Both arms keep the shipped failure semantics: a stored path that does not
+/// resolve to an identity EXCLUDES the thread, exactly as the path-hash lane
+/// already did for a path that no longer canonicalizes.
+fn thread_project_matches(
+    authority: ProviderProjectAuthority<'_>,
+    thread_project: &str,
+    target_project_id: &str,
+) -> bool {
+    match authority {
+        ProviderProjectAuthority::Catalog { catalog } => {
+            let Ok(state) = catalog.snapshot() else {
+                return false;
+            };
+            let engine = bbox_indexing::project_resolver::ProjectResolverEngine::v2(
+                state.catalog(),
+                state.attachments(),
+            );
+            let request = bbox_corpus_core::project_selector::ProjectSelectorRequest::filter(
+                thread_project.to_owned(),
+            );
+            engine
+                .resolve(&request)
+                .ok()
+                .and_then(|resolution| resolution.project_id().map(str::to_owned))
+                .as_deref()
+                == Some(target_project_id)
+        }
+        // Version-1 bridge lane, retained through Phase 6 by FD-8.
+        ProviderProjectAuthority::Bridge => {
+            bbox_corpus_core::entity_ref::project_id_for_path(thread_project)
+                .ok()
+                .as_deref()
+                == Some(target_project_id)
+        }
+    }
 }
 
 /// Returns a per-file dedup key when `entity_id` refers to a project_file
@@ -2114,6 +2154,159 @@ pdf_figure = "voyage_visual"
         assert_eq!(
             file_dedup_key("project_file_v2:p:snapshot:pathhash:chunk:0").as_deref(),
             Some("project_file_v2:p:snapshot:pathhash")
+        );
+    }
+}
+
+/// Phase 6 P6-A exit gate: the thread project filter is the one production
+/// site that derived project identity from a host path, and in catalog mode
+/// it must not.
+#[cfg(test)]
+mod catalog_thread_filter_exit_gate {
+    use super::*;
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_corpus_core::project_catalog::{
+        AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus, CheckoutAttachment,
+        CorpusProject, ProjectId, ProjectScope,
+    };
+    use bbox_indexing::project_catalog_store::ProjectCatalogStore;
+
+    const PROJECT: &str = "p_000000000000000000000000000000a1";
+    const ATTACHMENT: &str = "att_11111111111111111111111111111111";
+    const CHECKOUT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01";
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        checkout_dir: std::path::PathBuf,
+        store: ProjectCatalogStore,
+    }
+
+    /// One catalog project with one attached checkout at a REAL directory, so
+    /// the same host path is simultaneously (a) resolvable through the catalog
+    /// and (b) derivable to a version-1 path hash. Both lanes being available
+    /// is what makes the assertions below discriminating rather than vacuous.
+    fn fixture() -> Fixture {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let checkout_dir = root.join("checkout");
+        std::fs::create_dir_all(checkout_dir.join(".bbox/local")).unwrap();
+        std::fs::write(
+            checkout_dir.join(".bbox/local/checkout-id"),
+            format!("{CHECKOUT}\n"),
+        )
+        .unwrap();
+        let store = ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap();
+        let project_id = ProjectId::parse(PROJECT.to_string()).unwrap();
+        let attachment_id = AttachmentId::parse(ATTACHMENT.to_string()).unwrap();
+        let scope = PublishedScope::try_new("repo_example", ".").unwrap();
+        let dir_string = checkout_dir.to_string_lossy().into_owned();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |catalog, attachments| {
+                catalog.projects.insert(
+                    project_id.clone(),
+                    CorpusProject {
+                        project_id: project_id.clone(),
+                        scope: ProjectScope::Published(scope.clone()),
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: project_id.as_str().to_string(),
+                        created_at: "2026-08-04T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                attachments.attachments.insert(
+                    attachment_id.clone(),
+                    CheckoutAttachment {
+                        attachment_id: attachment_id.clone(),
+                        project_id: project_id.clone(),
+                        checkout_id: CHECKOUT.into(),
+                        checkout_dir: dir_string.clone(),
+                        checkout_project_dir: dir_string.clone(),
+                        project_root_relpath: scope.bbox_root_relpath().to_string(),
+                        kind: AttachmentKind::Base,
+                        validated_scope: Some(scope.clone()),
+                        computed_repo_hint: None,
+                        branch_ref: Some("refs/heads/main".into()),
+                        capabilities: AttachmentCapabilities::default(),
+                        status: AttachmentStatus::Attached,
+                        attached_at: "2026-08-04T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        Fixture {
+            _directory: directory,
+            checkout_dir,
+            store,
+        }
+    }
+
+    /// The version-1 id the SAME host path derives to. Its existence is the
+    /// non-vacuity premise: the catalog assertions below are only meaningful
+    /// because a path hash was available and went unused.
+    fn path_hash_id(fixture: &Fixture) -> String {
+        bbox_corpus_core::entity_ref::project_id_for_path(&fixture.checkout_dir)
+            .expect("the fixture checkout must be path-hash derivable")
+    }
+
+    /// The premise, asserted rather than assumed: on the bridge the stored
+    /// thread path DOES resolve through the path hash. Without this, a catalog
+    /// arm that simply always returned `false` would pass the gate below.
+    #[test]
+    fn the_bridge_lane_still_derives_identity_from_the_stored_path() {
+        let fixture = fixture();
+        let hashed = path_hash_id(&fixture);
+
+        assert!(
+            thread_project_matches(
+                ProviderProjectAuthority::Bridge,
+                &fixture.checkout_dir.to_string_lossy(),
+                &hashed,
+            ),
+            "the retained bridge lane (FD-8) must still match on the path hash"
+        );
+    }
+
+    /// The gate: catalog mode resolves the stored path through the CATALOG.
+    /// A path-hash implementation cannot satisfy this, because the catalog id
+    /// is not any hash of the path.
+    #[test]
+    fn catalog_mode_resolves_a_thread_path_through_the_catalog() {
+        let fixture = fixture();
+
+        assert!(
+            thread_project_matches(
+                ProviderProjectAuthority::Catalog {
+                    catalog: &fixture.store
+                },
+                &fixture.checkout_dir.to_string_lossy(),
+                PROJECT,
+            ),
+            "catalog mode must resolve the attached checkout to its catalog project id"
+        );
+    }
+
+    /// The negative half: the path-hash id is not an identity catalog mode
+    /// will answer to, even though the path derives to it.
+    #[test]
+    fn catalog_mode_never_answers_to_the_path_hash_identity() {
+        let fixture = fixture();
+        let hashed = path_hash_id(&fixture);
+
+        assert!(
+            !thread_project_matches(
+                ProviderProjectAuthority::Catalog {
+                    catalog: &fixture.store
+                },
+                &fixture.checkout_dir.to_string_lossy(),
+                &hashed,
+            ),
+            "catalog mode must not derive project identity from a host path"
         );
     }
 }
