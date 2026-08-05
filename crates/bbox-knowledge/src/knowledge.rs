@@ -1332,6 +1332,29 @@ pub fn capture_project_catalog_owner_snapshot(
     )
 }
 
+/// Stamp one central knowledge row with its stable project id, the write-back
+/// inverse of [`capture_project_catalog_owner_snapshot`]. Idempotent: a row
+/// already carrying this exact id reports `AlreadyStamped` without writing.
+pub fn stamp_project_catalog_owner_row(
+    store_path: &Path,
+    source_row_id: &str,
+    project_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampOutcomeV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{stamp_json_array_row, stamp_json_owner_row};
+
+    stamp_json_owner_row(
+        store_path,
+        "knowledge",
+        "knowledge:central-json",
+        limits,
+        |bytes| stamp_json_array_row(bytes, "entries", "id", source_row_id, project_id),
+    )
+}
+
 impl StoreSnapshot for Knowledge {
     type Snapshot = KnowledgeStore;
 
@@ -7545,5 +7568,155 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             !miss.contains("kbdddddd"),
             "no ledger path must not match: {miss}"
         );
+    }
+
+    // ── Project-catalog row stamping (P6-B) ────────────────────────────
+
+    mod owner_row_stamping {
+        use super::*;
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MISSING,
+            OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
+        };
+
+        /// A store carrying one legacy-selector row plus a field this binary
+        /// does not model, so every test also witnesses field preservation.
+        fn write_fixture(store_path: &Path) {
+            std::fs::write(
+                store_path,
+                br#"{
+  "version": 1,
+  "entries": [
+    {
+      "id": "kb00000001",
+      "content": "first",
+      "project": "/legacy/path/one",
+      "future_field": {"kept": true}
+    },
+    {
+      "id": "kb00000002",
+      "content": "second",
+      "project": "/legacy/path/two"
+    }
+  ]
+}
+"#,
+            )
+            .unwrap();
+        }
+
+        fn stamp(
+            store_path: &Path,
+            row: &str,
+            project_id: &str,
+        ) -> std::result::Result<
+            OwnerRowStampOutcomeV1,
+            bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+        > {
+            stamp_project_catalog_owner_row(
+                store_path,
+                row,
+                project_id,
+                OwnerSnapshotLimitsV1::default(),
+            )
+        }
+
+        fn read_row(store_path: &Path, row: &str) -> serde_json::Value {
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(store_path).unwrap()).unwrap();
+            document["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == row)
+                .cloned()
+                .unwrap()
+        }
+
+        #[test]
+        fn a_fresh_row_takes_the_stamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().canonicalize().unwrap().join("knowledge.json");
+            write_fixture(&store_path);
+
+            assert_eq!(
+                stamp(&store_path, "kb00000001", "a1b2c3d4").unwrap(),
+                OwnerRowStampOutcomeV1::Stamped
+            );
+
+            let row = read_row(&store_path, "kb00000001");
+            assert_eq!(row["project_id"], "a1b2c3d4");
+            // The legacy selector is RETAINED: dual-read still resolves through
+            // it until the later path-fallback removal gate.
+            assert_eq!(row["project"], "/legacy/path/one");
+            // A field this binary does not model survives the write-back.
+            assert_eq!(row["future_field"]["kept"], true);
+            // Stamping one row must not touch its neighbours.
+            assert!(
+                read_row(&store_path, "kb00000002")
+                    .get("project_id")
+                    .is_none()
+            );
+        }
+
+        /// Re-applying a torn backfill must complete, not double-write.
+        #[test]
+        fn restamping_the_same_id_is_an_idempotent_no_op() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().canonicalize().unwrap().join("knowledge.json");
+            write_fixture(&store_path);
+
+            stamp(&store_path, "kb00000001", "a1b2c3d4").unwrap();
+            let after_first = std::fs::read(&store_path).unwrap();
+
+            assert_eq!(
+                stamp(&store_path, "kb00000001", "a1b2c3d4").unwrap(),
+                OwnerRowStampOutcomeV1::AlreadyStamped
+            );
+            // Byte-identical: the second stamp elided the write entirely.
+            assert_eq!(std::fs::read(&store_path).unwrap(), after_first);
+        }
+
+        /// Never a silent overwrite: a row bound to another project refuses.
+        #[test]
+        fn a_conflicting_id_refuses_and_leaves_the_row_untouched() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().canonicalize().unwrap().join("knowledge.json");
+            write_fixture(&store_path);
+
+            stamp(&store_path, "kb00000001", "a1b2c3d4").unwrap();
+            let before = std::fs::read(&store_path).unwrap();
+
+            let error = stamp(&store_path, "kb00000001", "99998888").unwrap_err();
+            assert_eq!(error.code, OWNER_ROW_PROJECT_ID_CONFLICT);
+            assert_eq!(
+                read_row(&store_path, "kb00000001")["project_id"],
+                "a1b2c3d4"
+            );
+            assert_eq!(std::fs::read(&store_path).unwrap(), before);
+        }
+
+        /// Absence is a refusal, never a success: a resolution naming a row
+        /// this store does not have must not report progress.
+        #[test]
+        fn an_absent_row_refuses() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().canonicalize().unwrap().join("knowledge.json");
+            write_fixture(&store_path);
+
+            let error = stamp(&store_path, "kb-does-not-exist", "a1b2c3d4").unwrap_err();
+            assert_eq!(error.code, OWNER_ROW_ABSENT);
+        }
+
+        /// An absent SOURCE is likewise a refusal, and must not create a store.
+        #[test]
+        fn an_absent_source_refuses_without_creating_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().canonicalize().unwrap().join("knowledge.json");
+
+            let error = stamp(&store_path, "kb00000001", "a1b2c3d4").unwrap_err();
+            assert_eq!(error.code, OWNER_SOURCE_MISSING);
+            assert!(!store_path.exists());
+        }
     }
 }

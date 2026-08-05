@@ -230,6 +230,298 @@ pub fn capture_json_owner(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Row stamping: the write-back half of the owner snapshot contract
+// ---------------------------------------------------------------------------
+//
+// Capture answers "which rows still carry a legacy path selector". Stamping is
+// its inverse: write the stable `project_id` onto one such row. The two halves
+// live side by side deliberately, because they must agree on the row identity
+// (`stable_row_id`) that the backfill ledger keys on.
+
+/// What stamping one durable-store row did.
+///
+/// There is no `Skipped` variant. A row that cannot be stamped is a typed
+/// error, never a quiet success: absence-as-success is exactly how a partial
+/// backfill would report itself complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerRowStampOutcomeV1 {
+    /// The row carried no project id and now carries the requested one.
+    Stamped,
+    /// The row already carried EXACTLY the requested project id, so the write
+    /// was elided. This is what makes re-applying a torn backfill safe: the
+    /// already-completed prefix reports `AlreadyStamped` instead of erroring or
+    /// double-writing.
+    AlreadyStamped,
+}
+
+/// A typed refusal from the stamping path. `code` is a stable diagnostic token,
+/// matching the owner snapshot error convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerRowStampError {
+    pub code: &'static str,
+}
+
+impl OwnerRowStampError {
+    pub const fn new(code: &'static str) -> Self {
+        Self { code }
+    }
+}
+
+impl std::fmt::Display for OwnerRowStampError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for OwnerRowStampError {}
+
+/// The requested row does not exist in the owner source.
+pub const OWNER_ROW_ABSENT: &str = "owner_row_absent";
+/// The row already carries a DIFFERENT stable project id. Never overwritten.
+pub const OWNER_ROW_PROJECT_ID_CONFLICT: &str = "owner_row_project_id_conflict";
+/// The owner source file does not exist.
+pub const OWNER_SOURCE_MISSING: &str = "owner_source_missing";
+/// The owner source exists but could not be decoded.
+pub const OWNER_SOURCE_INVALID: &str = "owner_source_invalid";
+/// The owner source could not be read (unsafe parent, symlink, oversize).
+pub const OWNER_SOURCE_UNREADABLE: &str = "owner_source_unreadable";
+/// The rewritten owner source could not be committed to disk.
+pub const OWNER_SOURCE_UNWRITABLE: &str = "owner_source_unwritable";
+/// The caller supplied an empty or whitespace-only project id.
+pub const OWNER_PROJECT_ID_INVALID: &str = "owner_project_id_invalid";
+
+/// Whether a row needs a write, decided from its CURRENT project id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowStampDecisionV1 {
+    /// Row is unstamped: write the project id.
+    Write,
+    /// Row already carries the requested project id: elide the write.
+    AlreadyStamped,
+}
+
+/// The single implementation of stamp idempotency, shared by every owner.
+///
+/// Every owner crate routes its row decision through this function rather than
+/// re-deriving the three-way rule, so "an already-stamped row is a no-op, a
+/// differently-stamped row is a refusal, and nothing is ever silently
+/// overwritten" has exactly one definition to audit and to change.
+pub fn decide_row_stamp(
+    existing_project_id: Option<&str>,
+    project_id: &str,
+) -> Result<RowStampDecisionV1, OwnerRowStampError> {
+    if project_id.trim().is_empty() {
+        return Err(OwnerRowStampError::new(OWNER_PROJECT_ID_INVALID));
+    }
+    match existing_project_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        None => Ok(RowStampDecisionV1::Write),
+        Some(existing) if existing == project_id => Ok(RowStampDecisionV1::AlreadyStamped),
+        // A row bound to another project is a real inconsistency between the
+        // resolution artifact and durable state. Overwriting it would silently
+        // move content between projects, so the backfill refuses and surfaces
+        // it instead.
+        Some(_) => Err(OwnerRowStampError::new(OWNER_ROW_PROJECT_ID_CONFLICT)),
+    }
+}
+
+/// What an owner's decode-and-stamp closure decided to do with the source.
+pub enum OwnerSourceEditV1 {
+    /// The target row was already stamped; leave the bytes untouched.
+    AlreadyStamped,
+    /// Commit these bytes as the new owner source.
+    Rewrite(Vec<u8>),
+}
+
+/// Locked read-modify-write plumbing for stamping one row of a JSON owner
+/// source, mirroring [`capture_json_owner`] on the read side.
+///
+/// The owner crate keeps ownership of its own schema: `edit` receives the raw
+/// source bytes and returns either the rewritten bytes or `AlreadyStamped`.
+/// This function owns only what every owner must share: the exclusive store
+/// lock, the nofollow read, the missing/unreadable refusals, and the atomic
+/// fsynced replace. Holding the lock across BOTH the read and the write is
+/// load-bearing: a stamp is a read-modify-write, so a concurrent writer between
+/// the two would be lost.
+pub fn stamp_json_owner_row(
+    store_path: &Path,
+    source_id: &str,
+    subsource_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    edit: impl FnOnce(&[u8]) -> Result<OwnerSourceEditV1, OwnerRowStampError>,
+) -> Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
+    validate_limits(limits).map_err(|error| OwnerRowStampError::new(error.code))?;
+    crate::json_store::with_store_lock(store_path, || {
+        let captured = capture_regular_file_nofollow(
+            store_path,
+            source_id,
+            subsource_id,
+            limits.max_source_bytes,
+        );
+        let Some(bytes) = captured.bytes else {
+            // An absent owner source is a refusal, not an empty success: the
+            // resolution named a row that this store cannot produce.
+            let code = match captured.state {
+                OwnerSnapshotStateV1::Missing { .. } => OWNER_SOURCE_MISSING,
+                _ => OWNER_SOURCE_UNREADABLE,
+            };
+            return Ok(Err(OwnerRowStampError::new(code)));
+        };
+        let edited = match edit(&bytes) {
+            Ok(edited) => edited,
+            Err(error) => return Ok(Err(error)),
+        };
+        let rewritten = match edited {
+            OwnerSourceEditV1::AlreadyStamped => {
+                return Ok(Ok(OwnerRowStampOutcomeV1::AlreadyStamped));
+            }
+            OwnerSourceEditV1::Rewrite(rewritten) => rewritten,
+        };
+        match crate::json_store::atomic_write_bytes_locked(store_path, &rewritten) {
+            Ok(()) => Ok(Ok(OwnerRowStampOutcomeV1::Stamped)),
+            Err(_) => Ok(Err(OwnerRowStampError::new(OWNER_SOURCE_UNWRITABLE))),
+        }
+    })
+    // A lock failure is indistinguishable from an unwritable source from the
+    // caller's perspective: neither committed anything.
+    .unwrap_or_else(|_| Err(OwnerRowStampError::new(OWNER_SOURCE_UNWRITABLE)))
+}
+
+/// Decode helper for owners whose source is a single JSON document: maps a
+/// serde failure onto the shared `owner_source_invalid` refusal.
+pub fn decode_owner_source<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, OwnerRowStampError> {
+    serde_json::from_slice(bytes).map_err(|_| OwnerRowStampError::new(OWNER_SOURCE_INVALID))
+}
+
+/// Re-encode helper preserving the repo's pretty-with-trailing-newline JSON
+/// convention, so a stamp does not reformat an otherwise untouched store.
+pub fn encode_owner_source<T: serde::Serialize>(
+    value: &T,
+) -> Result<OwnerSourceEditV1, OwnerRowStampError> {
+    crate::json_store::to_vec_pretty_newline(value)
+        .map(OwnerSourceEditV1::Rewrite)
+        .map_err(|_| OwnerRowStampError::new(OWNER_SOURCE_UNWRITABLE))
+}
+
+/// The name of the durable field every owner stamps.
+pub const OWNER_ROW_PROJECT_ID_FIELD: &str = "project_id";
+
+/// Apply the stamp decision to one row object IN PLACE.
+///
+/// Owners stamp through `serde_json::Value` rather than round-tripping their
+/// typed schema on purpose. A typed round-trip silently drops any field the
+/// compiled struct does not know about, so stamping a store written by a newer
+/// binary would delete data as a side effect of adding one field. Editing the
+/// value tree touches the target field and leaves every other byte of meaning
+/// intact.
+pub fn stamp_row_object(
+    row: &mut serde_json::Value,
+    project_id: &str,
+) -> Result<RowStampDecisionV1, OwnerRowStampError> {
+    let object = row
+        .as_object_mut()
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_INVALID))?;
+    let existing = match object.get(OWNER_ROW_PROJECT_ID_FIELD) {
+        None => None,
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(existing)) => Some(existing.as_str()),
+        // A present-but-not-a-string project id is a corrupt row, not an
+        // unstamped one. Treating it as absent would overwrite it.
+        Some(_) => return Err(OwnerRowStampError::new(OWNER_SOURCE_INVALID)),
+    };
+    let decision = decide_row_stamp(existing, project_id)?;
+    if decision == RowStampDecisionV1::Write {
+        object.insert(
+            OWNER_ROW_PROJECT_ID_FIELD.to_string(),
+            serde_json::Value::String(project_id.to_string()),
+        );
+    }
+    Ok(decision)
+}
+
+/// Locate one row inside a top-level array field, matched on its id field.
+pub fn find_json_array_row_mut<'a>(
+    document: &'a mut serde_json::Value,
+    array_field: &str,
+    id_field: &str,
+    source_row_id: &str,
+) -> Option<&'a mut serde_json::Value> {
+    document
+        .get_mut(array_field)?
+        .as_array_mut()?
+        .iter_mut()
+        .find(|row| row.get(id_field).and_then(serde_json::Value::as_str) == Some(source_row_id))
+}
+
+/// Stamp one row of an owner whose source is a top-level object holding an
+/// array of row objects keyed by an id field. This covers most central JSON
+/// stores (knowledge entries, gaps, threads, notes, pins, roadmap items).
+pub fn stamp_json_array_row(
+    bytes: &[u8],
+    array_field: &str,
+    id_field: &str,
+    source_row_id: &str,
+    project_id: &str,
+) -> Result<OwnerSourceEditV1, OwnerRowStampError> {
+    let mut document: serde_json::Value = decode_owner_source(bytes)?;
+    let row = find_json_array_row_mut(&mut document, array_field, id_field, source_row_id)
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+    match stamp_row_object(row, project_id)? {
+        RowStampDecisionV1::AlreadyStamped => Ok(OwnerSourceEditV1::AlreadyStamped),
+        RowStampDecisionV1::Write => encode_owner_source(&document),
+    }
+}
+
+/// Stamp one row of an owner whose source is a top-level object holding a MAP
+/// of row objects, where the backfill's stable row id is derived from the row's
+/// own fields rather than the map key (the Slack binding shape).
+pub fn stamp_json_map_row(
+    bytes: &[u8],
+    map_field: &str,
+    source_row_id: &str,
+    project_id: &str,
+    row_id_of: impl Fn(&serde_json::Value) -> Option<String>,
+) -> Result<OwnerSourceEditV1, OwnerRowStampError> {
+    let mut document: serde_json::Value = decode_owner_source(bytes)?;
+    let rows = document
+        .get_mut(map_field)
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+    let row = rows
+        .values_mut()
+        .find(|row| row_id_of(row).as_deref() == Some(source_row_id))
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+    match stamp_row_object(row, project_id)? {
+        RowStampDecisionV1::AlreadyStamped => Ok(OwnerSourceEditV1::AlreadyStamped),
+        RowStampDecisionV1::Write => encode_owner_source(&document),
+    }
+}
+
+/// Stamp an owner whose source file IS the row (one JSON document per record:
+/// the packet, whiteboard, and artifact-metadata shape). `source_row_id` is
+/// verified against the document's own id field so a resolution cannot stamp a
+/// record it did not name.
+pub fn stamp_json_document_row(
+    bytes: &[u8],
+    id_field: Option<(&str, &str)>,
+    project_id: &str,
+) -> Result<OwnerSourceEditV1, OwnerRowStampError> {
+    let mut document: serde_json::Value = decode_owner_source(bytes)?;
+    if let Some((id_field, source_row_id)) = id_field
+        && document.get(id_field).and_then(serde_json::Value::as_str) != Some(source_row_id)
+    {
+        return Err(OwnerRowStampError::new(OWNER_ROW_ABSENT));
+    }
+    match stamp_row_object(&mut document, project_id)? {
+        RowStampDecisionV1::AlreadyStamped => Ok(OwnerSourceEditV1::AlreadyStamped),
+        RowStampDecisionV1::Write => encode_owner_source(&document),
+    }
+}
+
 /// Minimal dependency-safe projection of the root daemon's persisted
 /// `tasks.json` schema. The orchestration cwd is the only field that is a
 /// legacy path selector; all other task payload remains owned by the root
