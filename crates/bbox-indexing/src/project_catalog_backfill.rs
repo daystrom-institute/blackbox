@@ -1169,9 +1169,21 @@ pub fn verify_publisher_dispositions(
                 pointer_sha256,
                 ..
             } => {
+                // MIRRORS `AcceptedPublicationStorePaths::generation`:
+                // `<generations>/<project_id>/<generation_id>.json`. An earlier
+                // revision joined the generation id straight onto the root,
+                // which matches no file the store ever writes, so EVERY SeedG1
+                // disposition reported GenerationMissing and every preflight
+                // against a real migrated root refused. Re-derived here rather
+                // than called because that helper needs the whole paths struct
+                // and a typed id; the test below pins the two shapes together
+                // so this copy cannot drift from the store's own layout.
+                let generation_path = generations_root
+                    .join(project_id.as_str())
+                    .join(format!("{generation_id}.json"));
                 let outcome = if !pointer_present {
                     PublisherVerificationOutcomeV1::PointerMissing
-                } else if !generations_root.join(generation_id).exists() {
+                } else if !generation_path.exists() {
                     PublisherVerificationOutcomeV1::GenerationMissing
                 } else {
                     match std::fs::read(&pointer_path) {
@@ -2505,6 +2517,43 @@ mod tests {
         }
     }
 
+    /// The generation path this verification checks must be the path the
+    /// accepted-publication store actually WRITES.
+    ///
+    /// Pinned against `AcceptedPublicationStorePaths::generation` rather than
+    /// restated, because a private re-derivation drifting from the store's own
+    /// layout is exactly the defect this test exists because of: the check
+    /// joined the generation id straight onto the root, matched nothing the
+    /// store ever writes, and reported GenerationMissing for every SeedG1
+    /// disposition on every real migrated root.
+    #[test]
+    fn the_generation_probe_uses_the_stores_own_path_shape() {
+        let root = tempfile::tempdir().unwrap();
+        let projects_path = root.path().join("projects.json");
+        let paths = crate::accepted_publication_store::AcceptedPublicationStorePaths::derive(
+            &projects_path,
+        )
+        .unwrap();
+        let project_id = project('e');
+        let generation_id =
+            crate::accepted_publication_store::AcceptedPublicationGenerationId::parse(
+                "a".repeat(64),
+            )
+            .unwrap();
+
+        let canonical = paths.generation(&project_id, &generation_id);
+        // The shape the verification builds, spelled out the same way.
+        let probed = paths
+            .generations()
+            .join(project_id.as_str())
+            .join(format!("{generation_id}.json"));
+
+        assert_eq!(
+            canonical, probed,
+            "the verification's generation path drifted from the store's layout"
+        );
+    }
+
     /// D-040, the branch most likely to be got backwards: a
     /// NoPublishedContentAcknowledged project must have NO pointer. A pointer
     /// found there is a DEFECT, not a gap the backfill may fill.
@@ -2566,7 +2615,16 @@ mod tests {
             pointer_bytes,
         )
         .unwrap();
-        std::fs::create_dir_all(generations.join("g1")).unwrap();
+        // The store's real shape: <generations>/<project_id>/<id>.json. The
+        // previous fixture created a bare `<generations>/g1` DIRECTORY, which
+        // is why a verification that looked there passed its test and failed
+        // against every real store.
+        std::fs::create_dir_all(generations.join(project_id.as_str())).unwrap();
+        std::fs::write(
+            generations.join(project_id.as_str()).join("g1.json"),
+            b"generation-bytes",
+        )
+        .unwrap();
 
         let consistent = verify_publisher_dispositions(
             &[seed_g1(
