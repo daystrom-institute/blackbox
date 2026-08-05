@@ -4903,11 +4903,36 @@ fn owner_inventory_paths(
     }
 }
 
+/// The canonical checkout roots of a CONFIGURED layout (plan section 6.3).
+///
+/// Section 6.3 inventories `.bbox/local/checkout-id` once per canonical
+/// checkout root, and on a live host those roots are the paths the v1 store
+/// registers. The replica tree is the rehearsal SUBSTITUTE for that set, so a
+/// configured layout without one derives the roots from the store instead of
+/// reporting that the host has no checkouts: an empty set captured no
+/// checkout, planned no attachment, and left every git cursor row
+/// unrepresented, which the git-metadata lane classifies as corrupt.
+fn discover_configured_checkout_roots(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<Vec<PathBuf>, ProjectCatalogMigrationError> {
+    if layout.rehearsal_root.is_some() {
+        // A rehearsal's checkout authorities are exactly its replica tree, so
+        // an absent tree means no checkouts. Deriving store paths here would
+        // hand a rehearsal the live host's roots, which is precisely what the
+        // rehearsal containment proof exists to refuse.
+        return Ok(Vec::new());
+    }
+    ProjectCatalogMigrationInventoryFacadeV1::discover_configured_checkout_roots(
+        &layout.projects_path,
+    )
+    .map_err(adapter_error)
+}
+
 fn discover_checkout_roots(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> Result<Vec<PathBuf>, ProjectCatalogMigrationError> {
     let Some(root) = &layout.checkout_replicas_root else {
-        return Ok(Vec::new());
+        return discover_configured_checkout_roots(layout);
     };
     let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) => metadata,

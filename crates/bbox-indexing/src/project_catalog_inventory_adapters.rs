@@ -30,8 +30,8 @@ use bbox_corpus_core::git::{
 use bbox_corpus_core::identity::{PublishedScope, resolve_recorded_repo_id};
 use bbox_corpus_core::json_store::NofollowDirectory;
 use bbox_corpus_core::project_catalog::{
-    AttachmentId, CommitNamespace, LegacyProjectStoreV1, MAX_LEGACY_PROJECT_STORE_BYTES, ProjectId,
-    RecordedRepoAuthority, decode_legacy_project_store,
+    AttachmentId, CommitNamespace, LegacyProjectStoreV1, MAX_LEGACY_PROJECT_STORE_BYTES,
+    MAX_PROJECT_CATALOG_ENTRIES, ProjectId, RecordedRepoAuthority, decode_legacy_project_store,
 };
 use bbox_corpus_core::project_catalog_snapshot::{
     LegacyProjectSelectorKindV1, OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1,
@@ -2218,6 +2218,63 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
                 ))
             })
             .collect()
+    }
+
+    /// The canonical checkout roots a CONFIGURED-mode preflight inventories.
+    ///
+    /// A live host has no replica tree to enumerate: its canonical checkout
+    /// roots ARE the paths the v1 project store registers, and
+    /// `checkout_replicas_root` is only the rehearsal substitute for them.
+    /// The derivation lives here rather than in the migration facade so the
+    /// bounded, no-follow decode of the v1 store stays in the one module that
+    /// owns legacy project observation; a root can then never be admitted
+    /// through a weaker read than the one that later observes the same record.
+    ///
+    /// The read is deliberately UNLOCKED. Installed verification asks for
+    /// roots while it already holds the catalog mutation lock across its
+    /// registry bootstrap, and taking that same exclusive lock again in this
+    /// process would never return. Discovery is therefore advisory: both
+    /// locked phases re-read the store and cross-validate every root they
+    /// were handed, so a store that moves under this read fails closed there
+    /// instead of being trusted here.
+    pub(crate) fn discover_configured_checkout_roots(
+        legacy_project_store_path: &Path,
+    ) -> Result<Vec<PathBuf>, InventoryAdapterError> {
+        let store_path = AuthorizedInventoryPath::new(legacy_project_store_path)?;
+        let observed = capture_legacy_projects_source(&store_path)?;
+        if matches!(observed, DecodedSourceObservationV1::Invalid { .. }) {
+            // Bytes that do not decode carry no trustworthy roots. The locked
+            // capture classifies the store itself as corrupt evidence, and
+            // refusing here would replace that classified inventory with an
+            // opaque discovery error.
+            return Ok(Vec::new());
+        }
+        let source = accept_missing_legacy_projects_source(observed)?;
+        // The same probe derivation legacy observation uses: a root reaches
+        // the checkout lane only under the path authorization, symlink
+        // refusal, and Git containment rules that observation applies.
+        let probes = derive_legacy_project_probes(&source, None)?;
+        // Canonical-path set, not a vector: two records may name one path,
+        // and an aliased checkout root is a hard refusal downstream.
+        let mut roots = BTreeSet::new();
+        for probe in probes {
+            let root = probe.authorized_canonical_path;
+            if !matches!(inspect_path(root.as_path()), InspectedPath::Directory) {
+                // A registered path that is absent stays in the inventory as
+                // its own classified missing-path record; it just cannot host
+                // a checkout observation. Any other shape is refused by the
+                // locked observation that owns that judgment.
+                continue;
+            }
+            root.ensure_authority()?;
+            roots.insert(root.as_path().to_path_buf());
+            if roots.len() > MAX_PROJECT_CATALOG_ENTRIES {
+                return Err(invalid_input(
+                    "configured checkout roots exceed their cardinality limit",
+                ));
+            }
+        }
+        Ok(roots.into_iter().collect())
     }
 
     pub(crate) fn discover_attachment_candidate_keys(
