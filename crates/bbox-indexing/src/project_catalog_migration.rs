@@ -3764,6 +3764,7 @@ fn build_migration_report(
         })
         .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
     let refusals = assessment.refusals.clone();
+    let pre_existing_orphans = inventory.pre_existing_orphans.clone();
     let report = ProjectCatalogMigrationReportV1 {
         version: 1,
         transaction_id: identities.transaction_id.clone(),
@@ -3796,6 +3797,7 @@ fn build_migration_report(
         unscoped_legacy_counts,
         required_resolutions: assessment.required_resolutions.clone(),
         refusals,
+        pre_existing_orphans,
         predicted_catalog_hash: predicted.catalog_hash.clone(),
         predicted_attachment_hash: predicted.attachment_hash.clone(),
         predicted_participant_hashes: predicted.participant_hashes.clone(),
@@ -5626,7 +5628,7 @@ fn adapter_error(
 ) -> ProjectCatalogMigrationError {
     ProjectCatalogMigrationError::no_mutation(
         error.code(),
-        "migration owner snapshot contract failed",
+        format!("migration owner snapshot contract failed: {error}"),
     )
 }
 

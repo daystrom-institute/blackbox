@@ -66,7 +66,8 @@ use crate::project_catalog_inventory::{
     LegacyProjectRecordInventoryV1, LegacySelectorKindV1, MaterializedAliasObservationV1,
     MutableInventorySourceEvidenceV1, MutableInventorySourceKindV1,
     MutableInventorySourceLocatorV1, OwnerSubsourceEvidenceV1,
-    PROJECT_CATALOG_INVENTORY_VERSION_V1, ProjectScopedRefObservationV1,
+    PROJECT_CATALOG_INVENTORY_VERSION_V1, PreExistingOrphanEvidenceV1,
+    ProjectScopedRefObservationV1,
     ProjectScopedRefStoreKindV1, PublisherPinObservationV1, QuarantinedGenerationObservationV1,
     RecordedAuthorityEvidenceMemberV1, RepoGroupingProofV1,
     RetainedGenerationOwnerResolutionObservationV1, Sha256ValueV1,
@@ -1941,6 +1942,7 @@ struct ImmutableInventoryLanesV1 {
 struct RequiredOwnerLaneCaptureV1 {
     lanes: ImmutableInventoryLanesV1,
     legacy_commit_namespaces: Vec<LegacyCommitNamespaceInventoryV1>,
+    pre_existing_orphans: Vec<PreExistingOrphanEvidenceV1>,
     git_common_directories: BTreeMap<String, AuthorizedInventoryPath>,
     legacy_selectors: BTreeMap<String, RuntimeLiteralBindingV1>,
 }
@@ -2665,6 +2667,7 @@ fn capture_inventory_locked(
         repo_grouping_proofs: lanes.repo_grouping_proofs.rows,
         legacy_namespace_clusters: lanes.legacy_namespace_clusters.rows,
         legacy_commit_namespaces: owner_capture.legacy_commit_namespaces,
+        pre_existing_orphans: owner_capture.pre_existing_orphans,
     };
     inventory
         .validate()
@@ -2740,8 +2743,16 @@ fn capture_required_owner_lanes(
     paths.git_cursor_root.ensure_authority()?;
 
     let durable = capture_durable_owner_snapshots(paths, limits.durable_owners, legacy)?;
-    let project_scoped_refs = capture_project_scoped_refs_lane(&corpus, &vectors)?;
-    let edge_workspaces = capture_edge_workspaces_lane(&edges)?;
+    let registered = registered_project_ids(legacy)?;
+    let mut pre_existing_orphans = Vec::new();
+    let project_scoped_refs = capture_project_scoped_refs_lane(
+        &corpus,
+        &vectors,
+        &registered,
+        &mut pre_existing_orphans,
+    )?;
+    let edge_workspaces =
+        capture_edge_workspaces_lane(&edges, &registered, &mut pre_existing_orphans)?;
     let checkouts = capture_checkouts_lane(checkout_captures)?;
     let attachment_candidates =
         capture_attachment_candidates_lane(legacy, checkout_captures, attachment_identity_plan)?;
@@ -2757,6 +2768,8 @@ fn capture_required_owner_lanes(
             publisher_source,
             checkout_captures,
             &attachment_candidates.rows,
+            &registered,
+            &mut pre_existing_orphans,
         )?;
     let repo_grouping_proofs =
         capture_repo_grouping_proofs_lane(legacy, code_sources, &git_metadata)?;
@@ -2776,6 +2789,7 @@ fn capture_required_owner_lanes(
             legacy_namespace_clusters,
         },
         legacy_commit_namespaces,
+        pre_existing_orphans,
         git_common_directories,
         legacy_selectors,
     })
@@ -3146,9 +3160,45 @@ fn finish_project_ref_commitment(hasher: Sha256) -> AdapterResult<Sha256ValueV1>
         .map_err(|_| invalid_source("project_ref_commitment_invalid"))
 }
 
+/// The registered id set for orphan classification: every project the v1
+/// store still records, INCLUDING missing-path records, which migrate as
+/// unattached projects and are not orphans.
+fn registered_project_ids(legacy: &LegacyProjectsCaptureV1) -> AdapterResult<BTreeSet<ProjectId>> {
+    let mut registered = BTreeSet::new();
+    for observation in &legacy.observations {
+        registered.insert(
+            ProjectId::parse(observation.record.project_id.clone())
+                .map_err(|_| invalid_source("legacy_project_id_invalid"))?,
+        );
+    }
+    Ok(registered)
+}
+
+fn orphan_evidence(
+    owner_kind: ImmutableInventoryOwnerKindV1,
+    owner_token: &[u8],
+    project_id: ProjectId,
+    row_count: u64,
+    hasher: Sha256,
+) -> AdapterResult<PreExistingOrphanEvidenceV1> {
+    let observation_id = stable_observation_id_v1(
+        "pre-existing-orphan",
+        &[owner_token, project_id.as_str().as_bytes()],
+    )?;
+    Ok(PreExistingOrphanEvidenceV1 {
+        observation_id,
+        owner_kind,
+        project_id,
+        row_count,
+        ref_commitment_sha256: finish_project_ref_commitment(hasher)?,
+    })
+}
+
 fn capture_project_scoped_refs_lane(
     corpus: &CorpusOwnerMigrationSnapshotV1,
     vectors: &VectorMigrationSnapshotV1,
+    registered: &BTreeSet<ProjectId>,
+    orphans: &mut Vec<PreExistingOrphanEvidenceV1>,
 ) -> AdapterResult<ImmutableLaneCaptureV1<ProjectScopedRefObservationV1>> {
     let corpus_state = corpus_source_state(
         "tantivy",
@@ -3179,6 +3229,18 @@ fn capture_project_scoped_refs_lane(
         for (project, (hasher, distinct_entity_count, document_count)) in aggregates {
             let project_id = ProjectId::parse(project.clone())
                 .map_err(|_| invalid_source("tantivy_project_id_invalid"))?;
+            if !registered.contains(&project_id) {
+                // Left behind by an unregistration; the post-cut rebuild
+                // sources from the catalog and drops these documents.
+                orphans.push(orphan_evidence(
+                    ImmutableInventoryOwnerKindV1::Tantivy,
+                    b"tantivy",
+                    project_id,
+                    document_count,
+                    hasher,
+                )?);
+                continue;
+            }
             let stable_row_id =
                 stable_observation_id_v1("tantivy-project-refs", &[project.as_bytes()])?;
             let observation_id =
@@ -3221,6 +3283,16 @@ fn capture_project_scoped_refs_lane(
                 distinct.insert(entity_ref);
                 document_count = document_count.saturating_add(1);
             }
+            if !registered.contains(&project_id) {
+                orphans.push(orphan_evidence(
+                    ImmutableInventoryOwnerKindV1::VectorMetadata,
+                    b"vector",
+                    project_id,
+                    document_count,
+                    hasher,
+                )?);
+                continue;
+            }
             let stable_row_id =
                 stable_observation_id_v1("vector-project-refs", &[project.as_bytes()])?;
             let observation_id =
@@ -3260,6 +3332,8 @@ fn capture_project_scoped_refs_lane(
 
 fn capture_edge_workspaces_lane(
     edges: &EdgeMigrationSnapshotV1,
+    registered: &BTreeSet<ProjectId>,
+    orphans: &mut Vec<PreExistingOrphanEvidenceV1>,
 ) -> AdapterResult<ImmutableLaneCaptureV1<EdgeWorkspaceObservationV1>> {
     let state = edge_source_state(edges);
     let mut rows = Vec::new();
@@ -3268,6 +3342,20 @@ fn capture_edge_workspaces_lane(
         for workspace in &edges.workspaces {
             let project_id = ProjectId::parse(workspace.project_id.clone())
                 .map_err(|_| invalid_source("edge_workspace_project_id_invalid"))?;
+            if !registered.contains(&project_id) {
+                // A workspace whose project was unregistered: doomed
+                // derived state, ledgered as an orphan rather than refused.
+                let mut hasher = project_ref_commitment_hasher(b"edge-workspace");
+                hash_project_ref_pair(&mut hasher, &workspace.workspace_id, 1);
+                orphans.push(orphan_evidence(
+                    ImmutableInventoryOwnerKindV1::EdgeManifest,
+                    b"edge-workspace",
+                    project_id,
+                    1,
+                    hasher,
+                )?);
+                continue;
+            }
             let observation_id = stable_observation_id_v1(
                 "edge-workspace",
                 &[
@@ -3904,6 +3992,8 @@ fn capture_git_metadata_lane(
     publisher_source: &ExactDecodedSourceV1<PublisherRefInventoryV1>,
     checkout_captures: &[CheckoutCaptureV1],
     attachment_candidates: &[AttachmentCandidateObservationV1],
+    registered: &BTreeSet<ProjectId>,
+    orphans: &mut Vec<PreExistingOrphanEvidenceV1>,
 ) -> AdapterResult<(
     ImmutableLaneCaptureV1<GitMetadataObservationV1>,
     Vec<LegacyCommitNamespaceInventoryV1>,
@@ -4053,17 +4143,33 @@ fn capture_git_metadata_lane(
             resolved_refs,
         });
     }
-    let represented_cursor_projects = rows
-        .iter()
-        .map(|row| row.project_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if corpus
-        .git_cursors
-        .rows
-        .iter()
-        .any(|cursor| !represented_cursor_projects.contains(cursor.project_id.as_str()))
-    {
-        git_probe_corrupt.get_or_insert("git_cursor_checkout_evidence_missing");
+    // A cursor's project must be REGISTERED, not necessarily attached: a
+    // registered record whose path is gone migrates as an unattached
+    // project and legitimately keeps its cursor. A cursor for a project the
+    // store no longer records is a pre-existing orphan, ledgered rather
+    // than refused. Only a cursor row the store cannot explain at all
+    // remains corrupt evidence.
+    for cursor in &corpus.git_cursors.rows {
+        let Ok(cursor_project) = ProjectId::parse(cursor.project_id.clone()) else {
+            git_probe_corrupt.get_or_insert("git_cursor_checkout_evidence_missing");
+            continue;
+        };
+        if registered.contains(&cursor_project) {
+            continue;
+        }
+        let mut hasher = project_ref_commitment_hasher(b"git-cursor");
+        hash_project_ref_pair(
+            &mut hasher,
+            cursor.last_ingested_sha.as_deref().unwrap_or_default(),
+            1,
+        );
+        orphans.push(orphan_evidence(
+            ImmutableInventoryOwnerKindV1::GitMetadata,
+            b"git-cursor",
+            cursor_project,
+            1,
+            hasher,
+        )?);
     }
     let direct_git_state = if let Some(code) = git_probe_corrupt {
         direct_owner_state("git-metadata", "corrupt", None, Some(code))
@@ -5384,7 +5490,14 @@ mod tests {
         ];
         let vectors = namespace_vector_snapshot();
 
-        let lane = capture_project_scoped_refs_lane(&corpus, &vectors).unwrap();
+        let registered = BTreeSet::from([
+            ProjectId::parse("project-a").unwrap(),
+            ProjectId::parse("project-b").unwrap(),
+        ]);
+        let mut orphans = Vec::new();
+        let lane =
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
+                .unwrap();
         let tantivy_rows: Vec<_> = lane
             .rows
             .iter()
@@ -5401,10 +5514,14 @@ mod tests {
         // The commitment is deterministic over identical content and moves
         // with multiplicity, so a dropped or duplicated document cannot
         // hide behind an unchanged row.
-        let replay = capture_project_scoped_refs_lane(&corpus, &vectors).unwrap();
+        let replay =
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
+                .unwrap();
         assert_eq!(lane.rows, replay.rows);
         corpus.index.project_scoped_refs[0].document_count = 100_002;
-        let moved = capture_project_scoped_refs_lane(&corpus, &vectors).unwrap();
+        let moved =
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
+                .unwrap();
         let moved_alpha = moved
             .rows
             .iter()
@@ -5417,6 +5534,46 @@ mod tests {
             moved_alpha.ref_commitment_sha256,
             alpha.ref_commitment_sha256
         );
+    }
+
+    /// Index refs for a project the v1 store no longer records are typed
+    /// orphan evidence, never lane rows and never a refusal: the post-cut
+    /// rebuild drops them, and refusing them blocked migration on every
+    /// host that ever unregistered a project (there is no purge tool).
+    #[test]
+    fn unregistered_project_refs_become_orphan_evidence() {
+        use bbox_corpus_index::index::migration_inventory::CorpusProjectScopedRefV1;
+
+        let mut corpus = namespace_corpus_snapshot();
+        corpus.index.project_scoped_refs = vec![
+            CorpusProjectScopedRefV1 {
+                project_id: "project-a".to_string(),
+                entity_ref: "project_file:project-a:x:y:0".to_string(),
+                document_count: 3,
+            },
+            CorpusProjectScopedRefV1 {
+                project_id: "project-gone".to_string(),
+                entity_ref: "project_file:project-gone:z:w:0".to_string(),
+                document_count: 7,
+            },
+        ];
+        let vectors = namespace_vector_snapshot();
+        let registered = BTreeSet::from([ProjectId::parse("project-a").unwrap()]);
+        let mut orphans = Vec::new();
+        let lane =
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
+                .unwrap();
+        assert_eq!(
+            lane.rows
+                .iter()
+                .filter(|row| row.store_kind == ProjectScopedRefStoreKindV1::Tantivy)
+                .count(),
+            1
+        );
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].project_id.as_str(), "project-gone");
+        assert_eq!(orphans[0].owner_kind, ImmutableInventoryOwnerKindV1::Tantivy);
+        assert_eq!(orphans[0].row_count, 7);
     }
 
     fn namespace_legacy_capture() -> LegacyProjectsCaptureV1 {
@@ -5879,6 +6036,8 @@ mod tests {
             value: PublisherRefInventoryV1 { rows: Vec::new() },
             was_missing: true,
         };
+        let registered = registered_project_ids(&legacy).unwrap();
+        let mut orphans = Vec::new();
         let (lane, namespaces, _) = capture_git_metadata_lane(
             &corpus,
             &vectors,
@@ -5886,6 +6045,8 @@ mod tests {
             &publisher,
             &[checkout],
             &[attachment],
+            &registered,
+            &mut orphans,
         )
         .unwrap();
         assert_eq!(
@@ -5940,41 +6101,65 @@ mod tests {
         );
     }
 
+    /// A cursor's project must be REGISTERED, not attached: a registered
+    /// record whose checkout is gone migrates as an unattached project and
+    /// keeps its cursor, and a cursor for a project the store no longer
+    /// records is typed pre-existing-orphan evidence. The certified rule
+    /// required checkout evidence for every cursor, which refused migration
+    /// on every configured host (cursors always exist; attachments only
+    /// exist for live checkouts) and on every host that ever unregistered
+    /// a project.
     #[test]
-    fn unrepresented_git_cursor_fails_the_git_lane_closed() {
+    fn cursors_of_registered_projects_are_tolerated_and_orphans_are_ledgered() {
         use bbox_corpus_index::index::migration_inventory::GitCursorMigrationRowV1;
 
         let legacy = namespace_legacy_capture();
         let mut corpus = namespace_corpus_snapshot();
-        corpus.git_cursors.row_count = 1;
-        corpus.git_cursors.rows = vec![GitCursorMigrationRowV1 {
-            project_id: "project-a".to_string(),
-            last_ingested_sha: Some("1".repeat(40)),
-        }];
+        corpus.git_cursors.row_count = 2;
+        corpus.git_cursors.rows = vec![
+            GitCursorMigrationRowV1 {
+                project_id: "project-a".to_string(),
+                last_ingested_sha: Some("1".repeat(40)),
+            },
+            GitCursorMigrationRowV1 {
+                project_id: "project-z".to_string(),
+                last_ingested_sha: Some("2".repeat(40)),
+            },
+        ];
         let vectors = namespace_vector_snapshot();
         let publisher = ExactDecodedSourceV1 {
             source: ExactSourceBytesV1::new(Vec::new()),
             value: PublisherRefInventoryV1 { rows: Vec::new() },
             was_missing: true,
         };
-        let (lane, namespaces, runtime_common_dirs) =
-            capture_git_metadata_lane(&corpus, &vectors, &legacy, &publisher, &[], &[]).unwrap();
-        assert_eq!(
+        let mut orphans = Vec::new();
+        let (lane, _, runtime_common_dirs) = capture_git_metadata_lane(
+            &corpus,
+            &vectors,
+            &legacy,
+            &publisher,
+            &[],
+            &[],
+            &registered_project_ids(&legacy).unwrap(),
+            &mut orphans,
+        )
+        .unwrap();
+        // project-a is registered (missing path) with no attachment: its
+        // cursor is tolerated and the lane stays uncorrupted.
+        assert_ne!(
             lane.evidence.completeness,
             crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Corrupt
         );
-        assert!(lane.rows.is_empty());
-        assert!(namespaces.is_empty());
         assert!(runtime_common_dirs.is_empty());
-        assert!(lane.evidence.owner_subsources.iter().any(|owner| {
-            matches!(
-                &owner.source_state,
-                InventorySourceStateV1::Corrupt {
-                    diagnostic_code,
-                    ..
-                } if diagnostic_code == "git_cursor_checkout_evidence_missing"
-            )
-        }));
+        // project-z is unregistered: its cursor is ledgered as an orphan,
+        // never silently dropped.
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].project_id.as_str(), "project-z");
+        assert_eq!(
+            orphans[0].owner_kind,
+            ImmutableInventoryOwnerKindV1::GitMetadata
+        );
+        assert_eq!(orphans[0].row_count, 1);
     }
 
     #[test]

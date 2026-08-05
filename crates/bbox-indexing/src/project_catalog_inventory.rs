@@ -878,6 +878,29 @@ pub struct V1ProjectCatalogInventory {
     pub repo_grouping_proofs: Vec<RepoGroupingProofV1>,
     pub legacy_namespace_clusters: Vec<LegacyNamespaceClusterObservationV1>,
     pub legacy_commit_namespaces: Vec<LegacyCommitNamespaceInventoryV1>,
+    /// Typed evidence for structured-owner rows whose project id is absent
+    /// from the v1 store: content left behind by an unregistration, never
+    /// covered by any old `ProjectRecord`. Ledgered rather than refused
+    /// because such rows are doomed by construction (the post-cut path-free
+    /// rebuild sources from the v2 catalog and drops them), and a hard
+    /// refusal with no purge tool would block migration on every host that
+    /// ever unregistered a project. Orphans never enter the plan, are never
+    /// attachment candidates, and are never stamped; the report surfaces
+    /// them for operator review before apply.
+    pub pre_existing_orphans: Vec<PreExistingOrphanEvidenceV1>,
+}
+
+/// One (owner, project) orphan aggregate: a complete row count plus a
+/// canonical ordered commitment over the member rows, following the same
+/// counts-and-commitments idiom the rest of the corpus evidence uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreExistingOrphanEvidenceV1 {
+    pub observation_id: String,
+    pub owner_kind: ImmutableInventoryOwnerKindV1,
+    pub project_id: ProjectId,
+    pub row_count: u64,
+    pub ref_commitment_sha256: Sha256ValueV1,
 }
 
 impl V1ProjectCatalogInventory {
@@ -1091,6 +1114,7 @@ impl V1ProjectCatalogInventory {
                 "legacy commit namespaces",
                 self.legacy_commit_namespaces.len(),
             ),
+            ("pre-existing orphans", self.pre_existing_orphans.len()),
         ] {
             if count > MAX_PROJECT_CATALOG_ENTRIES {
                 return Err(limit(kind));
@@ -1321,6 +1345,18 @@ impl V1ProjectCatalogInventory {
             insert_observation(&mut observations, &row.observation_id)?;
             ensure_known_project(&projects, &row.project_id)?;
             validate_stable_id(&row.stable_row_id, "project ref row id")?;
+        }
+        for row in &self.pre_existing_orphans {
+            insert_observation(&mut observations, &row.observation_id)?;
+            // The inverse of ensure_known_project: an orphan entry naming a
+            // REGISTERED project would let a capture smuggle real rows past
+            // the plan by mislabeling them.
+            if projects.contains(&row.project_id) {
+                return Err(invalid("orphan evidence names a registered project"));
+            }
+            if row.row_count == 0 {
+                return Err(invalid("orphan evidence carries no rows"));
+            }
         }
         for row in &self.edge_workspaces {
             insert_observation(&mut observations, &row.observation_id)?;
@@ -1667,6 +1703,8 @@ impl V1ProjectCatalogInventory {
             .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
         self.legacy_commit_namespaces
             .sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        self.pre_existing_orphans
+            .sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
     }
 }
 
@@ -1885,6 +1923,11 @@ pub struct ProjectCatalogMigrationReportV1 {
     pub unscoped_legacy_counts: BTreeMap<LegacyPathStoreKindV1, u64>,
     pub required_resolutions: Vec<RequiredResolutionV1>,
     pub refusals: Vec<MigrationRefusalReportV1>,
+    /// Structured-owner rows whose project id the v1 store no longer
+    /// records (see `V1ProjectCatalogInventory::pre_existing_orphans`):
+    /// surfaced so the operator reviews what the post-cut rebuild will
+    /// drop before authorizing apply.
+    pub pre_existing_orphans: Vec<PreExistingOrphanEvidenceV1>,
     pub predicted_catalog_hash: Sha256ValueV1,
     pub predicted_attachment_hash: Sha256ValueV1,
     pub predicted_participant_hashes: BTreeMap<String, Sha256ValueV1>,
@@ -6400,6 +6443,7 @@ pub(crate) mod tests {
             }],
             legacy_namespace_clusters: Vec::new(),
             legacy_commit_namespaces: Vec::new(),
+            pre_existing_orphans: Vec::new(),
         }
     }
 
@@ -6725,6 +6769,7 @@ pub(crate) mod tests {
             unscoped_legacy_counts: BTreeMap::new(),
             required_resolutions: Vec::new(),
             refusals: Vec::new(),
+            pre_existing_orphans: Vec::new(),
             predicted_catalog_hash: post_image.predicted_hashes.catalog_hash.clone(),
             predicted_attachment_hash: post_image.predicted_hashes.attachment_hash.clone(),
             predicted_participant_hashes: post_image.predicted_hashes.participant_hashes.clone(),
