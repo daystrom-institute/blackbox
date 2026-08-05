@@ -48,7 +48,9 @@ use bbox_corpus_core::project_catalog::{
     ProjectId,
 };
 use bbox_corpus_index::index::TranscriptIndex;
+use bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause;
 use bbox_edge_sidecar::manifest::ManifestIndex;
+use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
 use bbox_indexing::project_catalog_backfill::{
     DurableBackfillApplyOutcomeV1, DurableBackfillApplyRequestV1,
     DurableBackfillPreflightRequestV1, DurableBackfillStatusV1, DurableBackfillVerifyRequestV1,
@@ -1291,6 +1293,20 @@ impl RebuildFixture {
     fn drive_replacement(
         &self,
     ) -> blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1 {
+        self.drive_as_daemon_open().1
+    }
+
+    /// The daemon-open composition, returning the recovery classification too.
+    ///
+    /// `force = false` is the load-bearing argument: daemon startup remains
+    /// `SchemaMismatch`-only (Q-F), so this composition can RECOVER a crashed
+    /// operator replacement but can never INITIATE one.
+    fn drive_as_daemon_open(
+        &self,
+    ) -> (
+        SchemaRebuildResume,
+        blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1,
+    ) {
         use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
         use bbox_indexing::index::schema_rebuild::{
             catalog_schema_replacement_guard, recover_rebuild_manifest_before_open,
@@ -1299,6 +1315,8 @@ impl RebuildFixture {
         let paths = self.fixture.layout.rebuild_index_paths();
         let store = Arc::new(ProjectCatalogStore::open_existing(&paths.projects_path).unwrap());
         let resume = recover_rebuild_manifest_before_open(&paths.index_root).unwrap();
+        let intent =
+            blackbox::project_catalog_rebuild_admin::replacement_intent_for(&resume, false);
         let guard = catalog_schema_replacement_guard(
             store.clone(),
             HistoryScanLimitsV1::default(),
@@ -1308,7 +1326,7 @@ impl RebuildFixture {
             bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new(store.clone()),
         );
         let index =
-            bbox_corpus_index::index::TranscriptIndex::open_or_create_with_code_source_store_path(
+            bbox_corpus_index::index::TranscriptIndex::open_or_create_at_replacement_boundary(
                 &paths.index_root,
                 Vec::new(),
                 None,
@@ -1319,6 +1337,7 @@ impl RebuildFixture {
                 paths.roadmap_path.clone(),
                 records.clone(),
                 Some(guard),
+                intent,
             )
             .unwrap();
         let broker = Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
@@ -1331,10 +1350,171 @@ impl RebuildFixture {
             bbox_indexing::index::writer_actor::IndexWriterActor::spawn_for_with_checkout_access(
                 &index, records, broker,
             );
-        blackbox::project_catalog_rebuild_admin::drive_catalog_schema_replacement(
+        let drive = blackbox::project_catalog_rebuild_admin::drive_catalog_schema_replacement(
             &index, &writer, &resume,
         )
+        .unwrap();
+        (resume, drive)
+    }
+
+    /// Run ONLY the pre-replacement guard, exactly as the open boundary
+    /// invokes it, and stop.
+    ///
+    /// This IS crash state (1): the guard has durably published the Prepared
+    /// manifest and the process died before `fs::remove_dir_all`. Nothing is
+    /// simulated; the next production statement is simply not executed.
+    fn run_guard_only(&self, cause: CatalogIndexReplacementCause) -> String {
+        use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+        use bbox_corpus_index::index::schema_replacement::SchemaReplacementRequest;
+        use bbox_indexing::index::schema_rebuild::catalog_schema_replacement_guard;
+
+        let paths = self.fixture.layout.rebuild_index_paths();
+        let store = Arc::new(ProjectCatalogStore::open_existing(&paths.projects_path).unwrap());
+        let guard = catalog_schema_replacement_guard(
+            store,
+            HistoryScanLimitsV1::default(),
+            paths.vector_root.clone(),
+        );
+        let observed = fs::read_to_string(paths.index_root.join("schema_version.txt"))
+            .map(|raw| raw.trim().to_string())
+            .ok();
+        guard(&SchemaReplacementRequest {
+            index_path: &paths.index_root,
+            projects_path: &paths.projects_path,
+            code_source_store_path: &paths.code_source_root,
+            observed_schema_version: observed,
+            target_schema_version: bbox_corpus_index::index::INDEX_SCHEMA_VERSION,
+            cause,
+        })
+        .expect("the guard authorizes the replacement and publishes the prepared manifest");
+        read_rebuild_id(&paths.index_root).expect("the guard published a prepared manifest")
+    }
+
+    /// Leave the root in exactly the on-disk state one crash point produces.
+    ///
+    /// Every state is REACHED by running the real steps and stopping, or by
+    /// undoing precisely the one step that a crash would have prevented. The
+    /// Prepared manifest bytes restored for state (3) are the bytes the real
+    /// guard wrote, captured before the drive consumed them, so nothing here
+    /// is a hand-authored artifact.
+    fn stage_crash(&self, point: CrashPoint, cause: CatalogIndexReplacementCause) -> String {
+        let index_root = self.index_root();
+        let manifest_path = rebuild_manifest_path(&index_root);
+        let rebuild_id = self.run_guard_only(cause);
+        let prepared_bytes = fs::read(&manifest_path).unwrap();
+        if point == CrashPoint::AfterPreparedBeforeDrop {
+            return rebuild_id;
+        }
+
+        // The exact next production statement.
+        fs::remove_dir_all(&index_root).unwrap();
+        if point == CrashPoint::AfterDrop {
+            return rebuild_id;
+        }
+
+        // Run the recovery drive to completion, then rewind the one or two
+        // steps the crash under test would have prevented.
+        let drive = self.drive_as_daemon_open().1;
+        assert_eq!(
+            drive,
+            blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1::Completed,
+            "staging a late crash point requires the replacement to have landed first"
+        );
+        fs::remove_file(index_root.join("schema_version.txt")).unwrap();
+        if point == CrashPoint::AfterIndexCommitBeforeManifestCommit {
+            fs::write(&manifest_path, &prepared_bytes).unwrap();
+        }
+        rebuild_id
+    }
+}
+
+/// Where a crash landed, named by the plan's four recovery states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashPoint {
+    /// (1) The guard published Prepared; the index was never dropped.
+    AfterPreparedBeforeDrop,
+    /// (2) The index is gone and only the Prepared manifest survives.
+    AfterDrop,
+    /// (3) The replacement index carries its documents, the marker is still
+    /// withheld, and the manifest never reached Committed.
+    AfterIndexCommitBeforeManifestCommit,
+    /// (4) The manifest is Committed and only the marker publication is
+    /// missing.
+    CommittedBeforeMarker,
+}
+
+fn rebuild_manifest_path(index_root: &Path) -> PathBuf {
+    bbox_corpus_index::index::history_generations::generations_root_for_index(index_root)
         .unwrap()
+        .join("rebuild-manifest.json")
+}
+
+/// The rebuild id currently on disk, whatever state the manifest is in.
+///
+/// Identity is what proves the guard did not rerun: a second guard pass mints
+/// a NEW rebuild id, so an unchanged id across a recovery is direct evidence
+/// that no second manifest was prepared over generations the first one pins.
+fn read_rebuild_id(index_root: &Path) -> Option<String> {
+    let bytes = fs::read(rebuild_manifest_path(index_root)).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("rebuild_id")
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+}
+
+/// Documents currently in the index carrying one exact term.
+fn indexed_term_hits(index_root: &Path, field: &str, value: &str) -> usize {
+    use tantivy::collector::DocSetCollector;
+    use tantivy::query::TermQuery;
+    use tantivy::schema::IndexRecordOption;
+
+    let index = tantivy::Index::open_in_dir(index_root).unwrap();
+    bbox_corpus_index::index::register_code_tokenizer(&index);
+    let schema = index.schema();
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    let query = TermQuery::new(
+        tantivy::Term::from_field_text(schema.get_field(field).unwrap(), value),
+        IndexRecordOption::Basic,
+    );
+    searcher.search(&query, &DocSetCollector).unwrap().len()
+}
+
+/// The entity ids `stage_commit_documents` wrote for one namespace.
+///
+/// Recomputed from the same recipe rather than captured, so a change to the
+/// staging shape cannot leave these silently pointing at nothing.
+fn staged_entity_ids(namespace: &str, commits: usize) -> Vec<String> {
+    (0..commits)
+        .map(|ordinal| {
+            let sha = hex::encode(Sha256::digest(format!("{namespace}:{ordinal}").as_bytes()))
+                [..40]
+                .to_string();
+            format!("commit:{namespace}:{sha}")
+        })
+        .collect()
+}
+
+/// Every staged commit document is present EXACTLY once.
+///
+/// Duplication is the failure mode idempotent re-emission exists to prevent,
+/// and it is invisible to a total count here: the reindex pass also walks the
+/// registered checkouts, so a namespace legitimately carries git-walked commits
+/// the generation never pinned. Per-entity-id uniqueness is the assertion that
+/// isolates re-emission from that traffic.
+fn assert_staged_documents_present_exactly_once(
+    index_root: &Path,
+    namespace: &str,
+    commits: usize,
+    label: &str,
+) {
+    for entity_id in staged_entity_ids(namespace, commits) {
+        assert_eq!(
+            indexed_term_hits(index_root, "entity_id", &entity_id),
+            1,
+            "{label}: {entity_id} must appear exactly once"
+        );
     }
 }
 
@@ -2206,4 +2386,488 @@ fn marker_path(layout: &ProjectCatalogMigrationResolvedLayoutV1) -> PathBuf {
         .parent()
         .unwrap()
         .join("project-catalog-migration.json")
+}
+
+// ---------------------------------------------------------------------------
+// D5: the crash matrix (P6-C task 4, states refined by Q-F)
+// ---------------------------------------------------------------------------
+//
+// Four recovery states, both trigger classes, both callers. The states are
+// on-disk facts, so the trigger class is carried by which marker the outgoing
+// index holds: `REBUILD_OUTGOING_SCHEMA` for the daemon-upgrade class and the
+// running `INDEX_SCHEMA_VERSION` for the operator class. Only the offline apply
+// ever INITIATES the same-schema force; the daemon composition below always
+// passes `force = false`, which is the property `daemon_open_never_initiates_
+// the_same_schema_force` pins directly.
+
+/// State (1), operator class, daemon recovery: the source is intact, the
+/// Prepared manifest rolls back, and the daemon serves what it already had.
+///
+/// The refusal this encodes is the important one: a daemon restart must NEVER
+/// silently restart an operator command it did not issue. The index here is at
+/// the running schema, so after the rollback there is no mismatch to act on and
+/// the correct outcome is to do nothing at all.
+#[test]
+fn a_pre_drop_operator_crash_rolls_back_and_serves_the_intact_source() {
+    use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
+    use blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1;
+
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let index_root = fixture.index_root();
+    let prepared = watchdogged("staging the pre-drop crash", {
+        let handle = fixture.clone();
+        move || {
+            handle.stage_crash(
+                CrashPoint::AfterPreparedBeforeDrop,
+                CatalogIndexReplacementCause::OperatorPathFreeRebuild,
+            )
+        }
+    });
+    assert_eq!(
+        read_rebuild_id(&index_root).as_deref(),
+        Some(prepared.as_str())
+    );
+    assert_staged_documents_present_exactly_once(
+        &index_root,
+        REBUILD_OWNED_NAMESPACE,
+        3,
+        "the source index was never dropped",
+    );
+
+    let (resume, drive) = watchdogged("the daemon-open recovery", {
+        let handle = fixture.clone();
+        move || handle.drive_as_daemon_open()
+    });
+    assert_eq!(resume, SchemaRebuildResume::RolledBack);
+    assert_eq!(drive, CatalogSchemaReplacementDriveV1::NotRequired);
+    assert_eq!(
+        read_rebuild_id(&index_root),
+        None,
+        "the prepared manifest was rolled back, not left to authorize a later drop"
+    );
+    assert_staged_documents_present_exactly_once(
+        &index_root,
+        REBUILD_OWNED_NAMESPACE,
+        3,
+        "the intact source survives the recovery untouched",
+    );
+}
+
+/// State (1), operator class, offline retry: the retry BLOCKS for diagnosis.
+///
+/// FINDING, and it contradicts the optimistic reading of P6-C task 4 ("a later
+/// offline retry reauthorizes Equality and starts a fresh forced operation").
+/// It cannot, and the reason is structural rather than incidental: the guard
+/// that published the Prepared manifest also drove every observed namespace
+/// from `NotBuilt` to `Ready`, and that materialization advances the catalog
+/// epoch BEFORE the crash. The backfill completion journal pins the epoch it
+/// observed, so the retry's predecessor binding now names an epoch the target
+/// has moved past.
+///
+/// The refusal is section 6.2 working as designed: stale recapture blocks for
+/// diagnosis and never loops. What it means operationally is that a pre-drop
+/// crash is not self-healing from the operator side. The daemon rolls the
+/// manifest back and keeps serving the intact source (proven above), but
+/// resuming the CUT requires re-running the durable backfill to rebind the
+/// predecessor, not just re-running `path-free-rebuild --apply`.
+///
+/// Pinned here rather than reported and forgotten, because the failure it
+/// prevents is the one this discipline exists for: an apply authorized by
+/// artifacts that describe a catalog state the target no longer has.
+#[test]
+fn an_offline_retry_after_a_pre_drop_crash_blocks_on_the_moved_predecessor() {
+    use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+    use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
+
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let index_root = fixture.index_root();
+    let epoch_before = fixture.store().snapshot().unwrap().epoch();
+    watchdogged("staging the pre-drop crash", {
+        let handle = fixture.clone();
+        move || {
+            handle.stage_crash(
+                CrashPoint::AfterPreparedBeforeDrop,
+                CatalogIndexReplacementCause::OperatorPathFreeRebuild,
+            )
+        }
+    });
+    // The guard's materialization is what moved the epoch, before any drop.
+    let epoch_after = fixture.store().snapshot().unwrap().epoch();
+    assert!(
+        epoch_after > epoch_before,
+        "the guard advanced the catalog while preparing: {epoch_before} -> {epoch_after}"
+    );
+
+    // The daemon rolls the abandoned manifest back first, which is the state a
+    // real operator retry begins from.
+    watchdogged("the daemon-open rollback", {
+        let handle = fixture.clone();
+        move || handle.drive_as_daemon_open()
+    });
+
+    let (report_path, resolution_path) = fixture.rebuild_artifacts();
+    let refusal = watchdogged("the offline retry", {
+        let handle = fixture.clone();
+        move || {
+            blackbox::project_catalog_rebuild_admin::preflight(PathFreeRebuildPreflightRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+                generated_at: "2026-08-05T00:00:03Z".to_string(),
+            })
+            .map(|_| ())
+        }
+    })
+    .expect_err("the predecessor moved when the guard materialized");
+    assert_eq!(
+        refusal.code, "error.project_catalog_inventory_stale_post_image",
+        "the refusal is the section 7.2 staleness family, not a rebuild-specific code: {}",
+        refusal.message
+    );
+    // Nothing was mutated by the refused retry, and the source is still there.
+    assert_eq!(read_rebuild_id(&index_root), None);
+    assert_staged_documents_present_exactly_once(
+        &index_root,
+        REBUILD_OWNED_NAMESPACE,
+        3,
+        "a blocked retry leaves the intact source untouched",
+    );
+}
+
+/// State (1), daemon-upgrade class: the rollback is followed by the ordinary
+/// mismatch replacement, because that trigger is still armed.
+///
+/// The contrast with the operator class is the point. Same crash, same
+/// rollback, opposite next step, and the marker is the only thing that differs.
+#[test]
+fn a_pre_drop_mismatch_crash_rolls_back_then_replaces_on_the_next_boot() {
+    use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
+    use bbox_indexing::project_catalog_rebuild::read_committed_rebuild_manifest;
+    use blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1;
+
+    let fixture = Arc::new(RebuildFixture::new());
+    let index_root = fixture.index_root();
+    let abandoned = watchdogged("staging the pre-drop crash", {
+        let handle = fixture.clone();
+        move || {
+            handle.stage_crash(
+                CrashPoint::AfterPreparedBeforeDrop,
+                CatalogIndexReplacementCause::SchemaMismatch,
+            )
+        }
+    });
+
+    let (resume, drive) = watchdogged("the daemon-open recovery", {
+        let handle = fixture.clone();
+        move || handle.drive_as_daemon_open()
+    });
+    assert_eq!(resume, SchemaRebuildResume::RolledBack);
+    assert_eq!(drive, CatalogSchemaReplacementDriveV1::Completed);
+    // The manifest is prepared FRESH by this boot's own guard pass. Its id is
+    // deliberately NOT asserted to differ: rebuild ids are content-addressed,
+    // so re-preparing over identical history reproduces the same id by design.
+    // The rollback above is what proves the abandoned manifest did not
+    // authorize this drop, and the id is recorded only to show the fresh pass
+    // converged on the same content.
+    let manifest = read_committed_rebuild_manifest(&index_root).unwrap();
+    assert_eq!(manifest.rebuild_id, abandoned);
+}
+
+/// State (2), both classes: `ResumePrepared` re-emits from the pinned
+/// generations WITHOUT rerunning the guard.
+///
+/// The rebuild id is the evidence. A rerun guard mints a new one, so an
+/// unchanged id across the recovery proves no second manifest was prepared over
+/// generations the first already pins. The index is gone here, so there is no
+/// last-good state to return to and re-emission is the only recovery.
+#[test]
+fn a_post_drop_crash_resumes_from_pinned_generations_without_rerunning_the_guard() {
+    use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
+    use bbox_indexing::project_catalog_rebuild::read_committed_rebuild_manifest;
+    use blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1;
+
+    for (label, fixture, cause) in [
+        (
+            "operator",
+            RebuildFixture::at_current_schema(),
+            CatalogIndexReplacementCause::OperatorPathFreeRebuild,
+        ),
+        (
+            "mismatch",
+            RebuildFixture::new(),
+            CatalogIndexReplacementCause::SchemaMismatch,
+        ),
+    ] {
+        let fixture = Arc::new(fixture);
+        let index_root = fixture.index_root();
+        let prepared = watchdogged("staging the post-drop crash", {
+            let handle = fixture.clone();
+            move || handle.stage_crash(CrashPoint::AfterDrop, cause)
+        });
+        assert!(!index_root.exists(), "{label}: the drop landed");
+
+        let (resume, drive) = watchdogged("the daemon-open resume", {
+            let handle = fixture.clone();
+            move || handle.drive_as_daemon_open()
+        });
+        assert!(
+            matches!(resume, SchemaRebuildResume::Resume { .. }),
+            "{label}: a Prepared manifest past the drop is the resume evidence, got {resume:?}"
+        );
+        assert_eq!(drive, CatalogSchemaReplacementDriveV1::Completed, "{label}");
+        let manifest = read_committed_rebuild_manifest(&index_root).unwrap();
+        assert_eq!(
+            manifest.rebuild_id, prepared,
+            "{label}: the surviving manifest was committed, not replaced by a second one"
+        );
+        // The stronger evidence that the guard did not rerun. A rerun would
+        // have scanned the DROPPED index and prepared over an empty inventory;
+        // the four pinned namespaces survive only because the manifest that
+        // pinned them was reused rather than re-derived.
+        assert_eq!(
+            manifest.prepared.namespace_inventory.len(),
+            REBUILD_NAMESPACE_STAGING.len(),
+            "{label}: the pinned namespace inventory survived intact"
+        );
+        assert_staged_documents_present_exactly_once(
+            &index_root,
+            REBUILD_OWNED_NAMESPACE,
+            3,
+            &format!("{label}: the pinned generation was re-emitted exactly once"),
+        );
+    }
+}
+
+/// State (3), both classes: the idempotent pass reruns and commits, with the
+/// marker still withheld on entry.
+///
+/// Duplication is what this catches. The documents are already in the index
+/// when recovery starts, so a re-emission that appended instead of
+/// delete-term-then-adding would double every namespace and no other assertion
+/// in this file would notice.
+#[test]
+fn a_crash_between_the_index_commit_and_the_manifest_commit_reruns_idempotently() {
+    use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
+    use bbox_indexing::project_catalog_rebuild::read_committed_rebuild_manifest;
+    use blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1;
+
+    for (label, fixture, cause) in [
+        (
+            "operator",
+            RebuildFixture::at_current_schema(),
+            CatalogIndexReplacementCause::OperatorPathFreeRebuild,
+        ),
+        (
+            "mismatch",
+            RebuildFixture::new(),
+            CatalogIndexReplacementCause::SchemaMismatch,
+        ),
+    ] {
+        let fixture = Arc::new(fixture);
+        let index_root = fixture.index_root();
+        let prepared = watchdogged("staging the mid-commit crash", {
+            let handle = fixture.clone();
+            move || handle.stage_crash(CrashPoint::AfterIndexCommitBeforeManifestCommit, cause)
+        });
+        assert!(
+            !index_root.join("schema_version.txt").exists(),
+            "{label}: the marker is still withheld at this crash point"
+        );
+        assert_staged_documents_present_exactly_once(
+            &index_root,
+            REBUILD_OWNED_NAMESPACE,
+            3,
+            &format!("{label}: the index commit landed before the crash"),
+        );
+
+        let (resume, drive) = watchdogged("the daemon-open rerun", {
+            let handle = fixture.clone();
+            move || handle.drive_as_daemon_open()
+        });
+        assert!(
+            matches!(resume, SchemaRebuildResume::Resume { .. }),
+            "{label}: a Prepared manifest with the marker withheld resumes, got {resume:?}"
+        );
+        assert_eq!(drive, CatalogSchemaReplacementDriveV1::Completed, "{label}");
+        let manifest = read_committed_rebuild_manifest(&index_root).unwrap();
+        assert_eq!(
+            manifest.rebuild_id, prepared,
+            "{label}: the same manifest was committed"
+        );
+        assert_eq!(
+            manifest.prepared.namespace_inventory.len(),
+            REBUILD_NAMESPACE_STAGING.len(),
+            "{label}: the guard did not rerun over the already-replaced index"
+        );
+        assert_staged_documents_present_exactly_once(
+            &index_root,
+            REBUILD_OWNED_NAMESPACE,
+            3,
+            &format!("{label}: the rerun did not duplicate a single document"),
+        );
+        assert_eq!(
+            fs::read_to_string(index_root.join("schema_version.txt"))
+                .unwrap()
+                .trim(),
+            bbox_corpus_index::index::INDEX_SCHEMA_VERSION,
+            "{label}: the marker is published last"
+        );
+    }
+}
+
+/// State (4), both classes: a Committed manifest with an unpublished marker is
+/// FINALIZED, never dropped and never re-Prepared.
+///
+/// Both wrong answers are excluded explicitly. Dropping would destroy a
+/// finished replacement to redo work that already landed, and re-Preparing
+/// would replace committed evidence with a plan for work nobody needs to do.
+#[test]
+fn a_committed_manifest_with_an_unpublished_marker_is_finalized_not_redone() {
+    use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
+    use bbox_indexing::project_catalog_rebuild::read_committed_rebuild_manifest;
+    use blackbox::project_catalog_rebuild_admin::CatalogSchemaReplacementDriveV1;
+
+    for (label, fixture, cause) in [
+        (
+            "operator",
+            RebuildFixture::at_current_schema(),
+            CatalogIndexReplacementCause::OperatorPathFreeRebuild,
+        ),
+        (
+            "mismatch",
+            RebuildFixture::new(),
+            CatalogIndexReplacementCause::SchemaMismatch,
+        ),
+    ] {
+        let fixture = Arc::new(fixture);
+        let index_root = fixture.index_root();
+        let committed = watchdogged("staging the pre-marker crash", {
+            let handle = fixture.clone();
+            move || handle.stage_crash(CrashPoint::CommittedBeforeMarker, cause)
+        });
+        assert!(!index_root.join("schema_version.txt").exists(), "{label}");
+        let before = read_committed_rebuild_manifest(&index_root)
+            .unwrap_or_else(|_| panic!("{label}: the manifest is already Committed"));
+        assert_eq!(before.rebuild_id, committed, "{label}");
+
+        let (resume, drive) = watchdogged("the daemon-open finalization", {
+            let handle = fixture.clone();
+            move || handle.drive_as_daemon_open()
+        });
+        assert_eq!(resume, SchemaRebuildResume::AlreadyCommitted, "{label}");
+        assert_eq!(
+            drive,
+            CatalogSchemaReplacementDriveV1::FinalizedCommitted,
+            "{label}: nothing is re-emitted; only the interrupted publication is finished"
+        );
+        assert_eq!(
+            read_committed_rebuild_manifest(&index_root)
+                .unwrap()
+                .rebuild_id,
+            committed,
+            "{label}: the Committed manifest was never replaced with a fresh Prepared one"
+        );
+        assert_staged_documents_present_exactly_once(
+            &index_root,
+            REBUILD_OWNED_NAMESPACE,
+            3,
+            &format!("{label}: the replacement index was never dropped"),
+        );
+        assert_eq!(
+            fs::read_to_string(index_root.join("schema_version.txt"))
+                .unwrap()
+                .trim(),
+            bbox_corpus_index::index::INDEX_SCHEMA_VERSION,
+            "{label}: the withheld marker is published"
+        );
+    }
+}
+
+/// Daemon startup NEVER initiates the same-schema force (Q-F).
+///
+/// Asserted at the intent derivation both callers share, so the property is
+/// pinned where it is decided rather than inferred from a call site that a
+/// later edit could change without failing anything.
+#[test]
+fn daemon_open_never_initiates_the_same_schema_force() {
+    use bbox_corpus_index::index::schema_replacement::CatalogReplacementIntentV1;
+    use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
+    use blackbox::project_catalog_rebuild_admin::replacement_intent_for;
+
+    for resume in [SchemaRebuildResume::None, SchemaRebuildResume::RolledBack] {
+        assert_eq!(
+            replacement_intent_for(&resume, false),
+            CatalogReplacementIntentV1::MismatchOnly,
+            "daemon startup stays SchemaMismatch-only from {resume:?}"
+        );
+        assert_eq!(
+            replacement_intent_for(&resume, true),
+            CatalogReplacementIntentV1::ForceSameSchema,
+            "the offline apply is the caller that forces, from {resume:?}"
+        );
+    }
+    // Surviving manifest evidence OUTRANKS the force in BOTH directions: an
+    // operator authorization describes a predecessor index, and an interrupted
+    // replacement is not that predecessor.
+    for resume in [SchemaRebuildResume::AlreadyCommitted] {
+        for force in [false, true] {
+            assert_eq!(
+                replacement_intent_for(&resume, force),
+                CatalogReplacementIntentV1::PreserveInterrupted,
+                "{resume:?} with force={force} must not start a fresh operation"
+            );
+        }
+    }
+}
+
+/// The forced path REFUSES a predecessor whose marker is not the running
+/// version, and refuses before anything is touched.
+///
+/// This is the Q-F precondition, and it is checked at the boundary rather than
+/// by the caller so no future caller can reach the drop without it. A stale or
+/// missing marker means the index is not the predecessor the authorization
+/// named.
+#[test]
+fn the_forced_replacement_refuses_a_stale_predecessor_marker() {
+    use bbox_corpus_index::index::schema_replacement::CatalogReplacementIntentV1;
+
+    let fixture = RebuildFixture::new(); // left at REBUILD_OUTGOING_SCHEMA
+    let paths = fixture.fixture.layout.rebuild_index_paths();
+    let store = Arc::new(ProjectCatalogStore::open_existing(&paths.projects_path).unwrap());
+    let guard = bbox_indexing::index::schema_rebuild::catalog_schema_replacement_guard(
+        store.clone(),
+        bbox_corpus_index::index::history_generations::HistoryScanLimitsV1::default(),
+        paths.vector_root.clone(),
+    );
+    let records: Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider> =
+        Arc::new(bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new(store));
+    let error = bbox_corpus_index::index::TranscriptIndex::open_or_create_at_replacement_boundary(
+        &paths.index_root,
+        Vec::new(),
+        None,
+        paths.projects_path.clone(),
+        paths.code_source_root.clone(),
+        paths.knowledge_path.clone(),
+        paths.threads_path.clone(),
+        paths.roadmap_path.clone(),
+        records,
+        Some(guard),
+        CatalogReplacementIntentV1::ForceSameSchema,
+    )
+    .err()
+    .expect("a marker that is not the running version is a stale predecessor");
+    assert!(
+        format!("{error:#}").contains("error.schema_replacement_stale_predecessor"),
+        "the refusal names the stale predecessor: {error:#}"
+    );
+    // Nothing was touched: no manifest was prepared and the source survives.
+    assert_eq!(read_rebuild_id(&paths.index_root), None);
+    assert_staged_documents_present_exactly_once(
+        &paths.index_root,
+        REBUILD_OWNED_NAMESPACE,
+        3,
+        "a refused force leaves the source untouched",
+    );
 }
