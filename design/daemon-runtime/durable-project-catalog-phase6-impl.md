@@ -140,17 +140,20 @@ bindings, accepted publication pointers, and G1 content references are already
 installed by the migration transaction itself (governing section 13.2, D-006,
 D-014); durable-backfill verifies their presence but does not seed them.
 
-**FD-2. Explicit target selection on every mutating apply.** Every apply
-selects exactly one of `--rehearsal-root <path>` or `--configured`. This
-generalizes the shipped `--rehearsal-root` gate
-(`required_if_eq("apply","true")`, `conflicts_with = "preflight"` at
-`src/bin/blackbox.rs:232-238`) so that touching real configured state is
-always an explicit operator opt-in. Preflight requires NO target flag: live
-migration preflight captures configured state through `ConfigArgs` resolution
-(D-021), exactly as governing section 6.3 specifies. `ConfigArgs` precedence
-(`--config`, `--state-dir`, `--projects-path`) is retained unchanged. The
-isolated rehearsal is the only mechanical barrier between a test and a
-destructive invocation on two new destructive commands (D-006, D-026).
+**FD-2. Explicit target selection on every mutating apply and every
+verify.** Apply and verify each select exactly one of
+`--rehearsal-root <path>` or `--configured`. This generalizes the shipped
+`--rehearsal-root` gate (`required_if_eq("apply","true")`,
+`conflicts_with = "preflight"` at `src/bin/blackbox.rs:272-278`) so that
+touching or attesting real configured state is always an explicit operator
+opt-in. Preflight accepts an OPTIONAL `--rehearsal-root`, which runs the
+D-026 isolated-bundle preflight that must precede rehearsal apply; without
+it, preflight captures the real configured state through `ConfigArgs`
+resolution (D-021), exactly as governing section 6.3 specifies (section
+3.1 states the full per-mode rules). `ConfigArgs` precedence (`--config`,
+`--state-dir`, `--projects-path`) is retained unchanged. The isolated
+rehearsal is the only mechanical barrier between a test and a destructive
+invocation on two new destructive commands (D-006, D-026).
 
 **FD-3. Artifact vocabulary is report plus resolution.** All new commands use
 the migrate artifact pair: `--report <path>` and `--resolution <path>`. A
@@ -212,39 +215,60 @@ section 11.
 
 ### 3.1. New commands
 
-The two new verbs follow the shipped `Migrate` shape internally: each has an
-`ArgGroup("mode")` over `preflight|apply`, plus `--verify` as a separate flag
-that runs fresh verification against the target root. Each carries `--report`,
-`--resolution`, and a target-selection flag required at apply only.
+The two new verbs carry one exclusive mode group: `ArgGroup("mode")` over
+`preflight|apply|verify`, required, exactly one. Verify is a MODE inside
+the group, not a separate flag; a mode group that admitted `--verify`
+alongside `--apply` would leave the combination's meaning undefined.
 
 ```text
 blackbox project-catalog durable-backfill \
-    (--preflight | --apply) \
-    --report <path> --resolution <path> \
-    [--rehearsal-root <path> | --configured] \
+    (--preflight | --apply | --verify) \
+    [--report <path> --resolution <path>]      # required for preflight and apply
+    [--rehearsal-root <path> | --configured] \ # exactly one for apply and verify
     [--config <path>] [--state-dir <path>] [--projects-path <path>]
 
 blackbox project-catalog path-free-rebuild \
-    (--preflight | --apply) \
-    --report <path> --resolution <path> \
+    (--preflight | --apply | --verify) \
+    [--report <path> --resolution <path>] \
     [--rehearsal-root <path> | --configured] \
     [--config <path>] [--state-dir <path>] [--projects-path <path>]
 ```
 
-Target selection uses `required_if_eq("apply","true")` on both
-`--rehearsal-root` and `--configured`, matching the shipped `migrate` gate.
-The two are `conflicts_with` each other. Preflight requires neither; it
-captures predecessor state through `ConfigArgs` resolution (D-021). When
-`--configured` is selected at apply, the command derives the real configured
-projects path and requires the exclusive lifetime lock (section 4). When
-`--rehearsal-root` is selected, the command derives participant paths from the
-rehearsal root, exactly as shipped `migrate --apply` does today.
+**Target rules per mode.** `--rehearsal-root` and `--configured` are
+`conflicts_with` each other.
 
-Preflight mode captures the predecessor state, plans the deterministic
-post-image, and writes the report and resolution. Apply mode reads the exact
-report and resolution, verifies the four-hash identity, and installs the
-post-image under the exclusive lock. Verify mode loads the target root and
-runs fresh verification.
+- **Apply and verify require exactly one of them.** Both modes operate on
+  a concrete root; an implicit target would let artifacts or verification
+  claims silently cross roots. `--configured` derives the real configured
+  projects path and (for apply) requires the exclusive lifetime lock
+  (section 4). `--rehearsal-root` derives participant paths from the
+  isolated root, exactly as shipped `migrate --apply` does today.
+- **Preflight targets the state it captures.** With `--rehearsal-root`,
+  preflight runs against the operator-created isolated bundle: D-026
+  requires rerunning preflight against that bundle before rehearsal
+  apply, and the explicit flag names the bundle rather than smuggling it
+  through config resolution. Without a target flag, preflight captures
+  the real configured state through `ConfigArgs` resolution (D-021); this
+  is the live-cut preflight of P6-F. `--configured` is not accepted at
+  preflight (it is the default, and writing it would imply a choice that
+  does not exist).
+
+**Artifact rules per mode.**
+
+- **Preflight** requires `--report` and `--resolution` as OUTPUT paths: it
+  captures predecessor state, plans the deterministic post-image, and
+  writes both artifacts. A first preflight may create the canonical empty
+  resolution at the explicit path (D-026).
+- **Apply** requires both as INPUT paths: it reads the exact reviewed
+  files, verifies the four-hash identity against the CURRENT state of the
+  selected target, and installs the post-image. The identity check is the
+  cross-root guard: a report captured against one root fails the
+  inventory-hash recheck against any other, so artifacts cannot authorize
+  an apply on a root they never described.
+- **Verify** takes neither. It loads the selected target root and runs
+  fresh verification against durable state (journals, receipts, manifest,
+  store), not against operator artifacts; the durable records already
+  carry the artifact hashes they were applied from (FD-4).
 
 Both new commands produce the D-020 versioned result envelope. The envelope
 `command` values are snake_case, following the shipped shape:
@@ -263,8 +287,13 @@ carry `required_if_eq("apply","true")` and are `conflicts_with` each other,
 matching the shipped `--rehearsal-root` gate. Preflight requires neither flag:
 live migration preflight captures configured state through `ConfigArgs`
 resolution with no target flag, exactly as governing section 6.3 specifies
-("It can run while the v1 daemon remains available"). When `--configured` is
-selected at apply, the command runs `open_admin_store` (section 4).
+("It can run while the v1 daemon remains available"). The D-026
+isolated-bundle preflight that precedes a `migrate` rehearsal apply keeps
+its shipped shape: `ConfigArgs` (`--projects-path`/`--state-dir`) pointed
+at the bundle, since `--rehearsal-root` conflicts with `--preflight` on
+the shipped `MigrateArgs` and this plan does not change the shipped
+surface. When `--configured` is selected at apply, the command runs
+`open_admin_store` (section 4).
 
 **Lock discipline (preflight).** Governing section 6.3 states "preflight
 takes a shared/read lock." This matches the shipped code: preflight capture
@@ -793,9 +822,12 @@ removed.
 
 1. Add `DurableBackfill(DurableBackfillArgs)` and
    `PathFreeRebuild(PathFreeRebuildArgs)` to `ProjectCatalogCommand`
-   (`src/bin/blackbox.rs:44`). Each has `ArgGroup("mode")` over
-   `preflight|apply`, `--report`, `--resolution`, and target flags
-   (`--rehearsal-root`, `--configured`) with `required_if_eq("apply","true")`.
+   (`src/bin/blackbox.rs:45`). Each has `ArgGroup("mode")` over
+   `preflight|apply|verify` (required, exactly one), `--report` and
+   `--resolution` required for preflight and apply, and target flags per
+   the section 3.1 mode rules: exactly one of
+   `--rehearsal-root`/`--configured` for apply and verify, optional
+   `--rehearsal-root` for preflight (D-026 bundle preflight).
 2. Add `--configured` to `MigrateArgs` with `required_if_eq("apply","true")`
    and `conflicts_with = "rehearsal_root"`. Preflight requires neither.
 3. Add `--require-exclusive-availability` to `VerifyArgs`.
