@@ -666,7 +666,9 @@ pub fn plan_catalog_gc_exclusions(
     for asset in &marker.immutable_assets {
         roots.push(CatalogGcProtectedRootV1 {
             role: "migration_immutable_asset",
-            path: paths.migration_assets_dir.join(asset.validated_name.as_str()),
+            path: paths
+                .migration_assets_dir
+                .join(asset.validated_name.as_str()),
         });
     }
 
