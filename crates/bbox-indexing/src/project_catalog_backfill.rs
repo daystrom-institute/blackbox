@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bbox_corpus_core::json_store::NofollowDirectory;
 use bbox_corpus_core::project_catalog::{
     AttachmentSnapshotV1, LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry,
     LegacyPathRelationship, ProjectId,
@@ -82,6 +83,25 @@ type BackfillResult<T> = Result<T, ProjectCatalogMigrationError>;
 
 fn refuse(code: &'static str, message: impl Into<String>) -> ProjectCatalogMigrationError {
     ProjectCatalogMigrationError::no_mutation(code, message)
+}
+
+/// A refusal raised AFTER apply began mutating durable state.
+///
+/// Never `NoDurableMutation`: past the pair transaction, an appended
+/// supersession has committed and an unknown prefix of the stamp set has landed,
+/// so the only truthful disposition is the one that sends the operator to a
+/// fresh preflight and re-apply. This is the same rule
+/// `with_backfill_stamping_disposition` applies to stamping refusals, stated for
+/// the failures raised by the facade itself rather than by the stamper.
+fn post_mutation_refusal(
+    code: &'static str,
+    message: impl Into<String>,
+) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::new(
+        code,
+        message,
+        ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -539,41 +559,91 @@ pub fn read_backfill_completion_journal(
     Ok(Some(journal))
 }
 
-/// Write and fsync the completion journal, then fsync its directory.
+/// The two points a journal publication can fail at, in order.
 ///
-/// Both syncs matter: apply returns only once the record is durable, because
-/// the rebuild preflight treats its presence as proof the stamp set landed.
+/// Named rather than implicit because the two sides of the rename are
+/// OBSERVABLY different failures and both must be handled: before it, nothing
+/// is published; after it, the bytes are visible but not yet proven durable.
+/// The production path passes a no-op checkpoint; the tests below drive a fault
+/// at each so both sides are covered by a real refusal rather than by argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalDurabilityStepV1 {
+    BeforeReplace,
+    /// After the atomic replacement landed, immediately before the parent
+    /// directory fsync that makes the new directory entry durable.
+    AfterReplace,
+}
+
+/// Publish the completion journal durably beside the store, or refuse.
+///
+/// Three properties are load-bearing, and each was missing:
+///
+/// 1. **Unique and confined.** The publication rides a NOFOLLOW handle on the
+///    state directory, and the temporary is an `O_EXCL` name unique per process
+///    and per call. A FIXED staging name is not merely untidy: a leftover from a
+///    torn or concurrent publication wedges every later one when it is a
+///    directory, and REDIRECTS the write outside the state directory when it is
+///    a symlink.
+/// 2. **The parent fsync is mandatory.** A rename is durable only once the
+///    directory entry is, and this record is exactly what the rebuild preflight
+///    later reads as proof the stamp set landed. A directory that refuses an
+///    fsync handle therefore FAILS the publication; the previous revision opened
+///    it best-effort and discarded both the open error and the fsync error.
+/// 3. **Every failure here is post-mutation.** By the time this runs, any
+///    appended supersession has committed to the pair and the stamp set has
+///    landed, so a refusal is `RetryExactPlanRequired`. Reporting
+///    `NoDurableMutation` would tell the operator nothing happened while the
+///    owner stores have already moved.
 fn write_backfill_completion_journal(
     state_dir: &Path,
     journal: &BackfillCompletionJournalV1,
 ) -> BackfillResult<()> {
-    use std::io::Write;
+    publish_backfill_completion_journal(state_dir, journal, |_step| Ok(()))
+}
 
-    let path = backfill_completion_journal_path(state_dir);
+fn publish_backfill_completion_journal(
+    state_dir: &Path,
+    journal: &BackfillCompletionJournalV1,
+    checkpoint: impl Fn(JournalDurabilityStepV1) -> BackfillResult<()>,
+) -> BackfillResult<()> {
     let bytes = serde_json::to_vec(journal).map_err(|error| {
-        refuse(
+        post_mutation_refusal(
             ERROR_STALE_POST_IMAGE,
             format!("backfill completion journal cannot be encoded: {error}"),
         )
     })?;
-    let io_refusal = |error: std::io::Error| {
-        refuse(
+    if bytes.is_empty() || bytes.len() > MAX_BACKFILL_JOURNAL_BYTES {
+        return Err(post_mutation_refusal(
             ERROR_STALE_POST_IMAGE,
-            format!("backfill completion journal cannot be written: {error}"),
+            "backfill completion journal bytes are empty or exceed their bound",
+        ));
+    }
+    // Fixed diagnostics rather than the underlying error: these carry directory
+    // paths, and a facade refusal is path-redacted.
+    let io_refusal = |detail: &'static str| {
+        post_mutation_refusal(
+            ERROR_STALE_POST_IMAGE,
+            format!("backfill completion journal cannot be published: {detail}"),
         )
     };
-    let staging = path.with_extension("json.staging");
-    let mut file = std::fs::File::create(&staging).map_err(io_refusal)?;
-    file.write_all(&bytes).map_err(io_refusal)?;
-    file.sync_all().map_err(io_refusal)?;
-    drop(file);
-    std::fs::rename(&staging, &path).map_err(io_refusal)?;
-    if let Ok(directory) = std::fs::File::open(state_dir) {
-        // Best-effort: the rename is already durable-ordered behind the file
-        // fsync on every filesystem this daemon supports, and a directory that
-        // refuses an fsync handle must not fail an otherwise complete apply.
-        let _ = directory.sync_all();
-    }
+    let directory = NofollowDirectory::open_existing(state_dir)
+        .map_err(|_| io_refusal("the state directory is unsafe or unreadable"))?
+        .ok_or_else(|| io_refusal("the state directory is absent"))?;
+    checkpoint(JournalDurabilityStepV1::BeforeReplace)?;
+    directory
+        .atomic_replace(BACKFILL_COMPLETION_JOURNAL_FILE, &bytes)
+        .map_err(|_| io_refusal("the atomic replacement failed"))?;
+    checkpoint(JournalDurabilityStepV1::AfterReplace)?;
+    // The replacement fsyncs the parent itself, and this call site syncs it
+    // AGAIN rather than relying on that: the contract "durable when this
+    // returns" belongs to this function, not to a helper's internal choice, and
+    // an fsync of an already-synced directory costs nothing.
+    directory
+        .sync_all()
+        .map_err(|_| io_refusal("the parent directory fsync failed"))?;
+    directory
+        .ensure_still_current()
+        .map_err(|_| io_refusal("the state directory changed during publication"))?;
     Ok(())
 }
 
@@ -2743,6 +2813,179 @@ mod tests {
                 .file_name()
                 .unwrap(),
             BACKFILL_COMPLETION_JOURNAL_FILE
+        );
+    }
+
+    /// A journal worth publishing, for the durability tests below.
+    fn sample_journal() -> BackfillCompletionJournalV1 {
+        BackfillCompletionJournalV1 {
+            version: BACKFILL_COMPLETION_JOURNAL_VERSION_V1,
+            completed_at: "2026-08-05T00:00:00Z".to_string(),
+            predecessor_catalog_epoch: 7,
+            predecessor_catalog_hash: hash(1),
+            predecessor_attachment_hash: hash(2),
+            post_image_catalog_epoch: 7,
+            stamp_counts: BTreeMap::new(),
+            identity: BackfillArtifactIdentityV1 {
+                inventory_hash: hash(3),
+                plan_hash: hash(4),
+                report_artifact_hash: hash(5),
+                resolution_artifact_hash: hash(6),
+            },
+        }
+    }
+
+    fn injected_publication_fault(
+        at: JournalDurabilityStepV1,
+    ) -> impl Fn(JournalDurabilityStepV1) -> BackfillResult<()> {
+        move |step| {
+            if step == at {
+                Err(post_mutation_refusal(
+                    ERROR_STALE_POST_IMAGE,
+                    "injected journal publication fault",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A publication that fails BEFORE the replacement publishes nothing, and
+    /// still reports the mutation that already happened upstream.
+    #[test]
+    fn a_pre_rename_publication_failure_publishes_nothing_and_stays_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().canonicalize().unwrap();
+
+        let error = publish_backfill_completion_journal(
+            &state_dir,
+            &sample_journal(),
+            injected_publication_fault(JournalDurabilityStepV1::BeforeReplace),
+        )
+        .expect_err("the injected pre-replacement fault must refuse");
+
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired,
+            "a failure past the pair transaction is never no-mutation"
+        );
+        assert!(
+            !backfill_completion_journal_path(&state_dir).exists(),
+            "a pre-replacement failure must publish nothing"
+        );
+        // And no residue is left behind for the next publication to trip on.
+        assert_eq!(
+            std::fs::read_dir(&state_dir).unwrap().count(),
+            0,
+            "a failed publication leaves no temporary behind"
+        );
+    }
+
+    /// THE MISREPORT F3 NAMES: a failure AFTER the replacement landed, which the
+    /// previous revision routed through the no-mutation constructor. The pair
+    /// transaction, the stamp set, AND the journal are all on disk by then, so
+    /// telling the operator nothing was mutated invites a retry of a plan whose
+    /// predecessor has already moved.
+    #[test]
+    fn a_post_rename_publication_failure_is_not_reported_as_no_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().canonicalize().unwrap();
+
+        let error = publish_backfill_completion_journal(
+            &state_dir,
+            &sample_journal(),
+            injected_publication_fault(JournalDurabilityStepV1::AfterReplace),
+        )
+        .expect_err("the injected post-replacement fault must refuse");
+
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired
+        );
+        assert!(
+            backfill_completion_journal_path(&state_dir).is_file(),
+            "the replacement genuinely landed before the fault, which is what \
+             makes the disposition the point"
+        );
+    }
+
+    /// The parent handle the MANDATORY fsync rides on fails CLOSED.
+    ///
+    /// A state directory reached through a symlink cannot be opened nofollow, so
+    /// the publication refuses. The previous revision opened the directory with
+    /// `if let Ok(..)` and discarded the result, so this case, and a genuine
+    /// fsync failure with it, passed as a complete apply.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_that_cannot_be_opened_nofollow_fails_the_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let real = root.join("live");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = root.join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+        let error = write_backfill_completion_journal(&linked, &sample_journal())
+            .expect_err("a state directory behind a symlink is not a publication target");
+
+        assert_eq!(error.code, ERROR_STALE_POST_IMAGE);
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::RetryExactPlanRequired
+        );
+        assert!(
+            !backfill_completion_journal_path(&real).exists(),
+            "nothing may be written through the link"
+        );
+    }
+
+    /// A leftover at the OLD FIXED staging name neither wedges the publication
+    /// nor redirects it out of the state directory.
+    ///
+    /// Both halves were real with a fixed `backfill-completion.json.staging`:
+    /// a leftover DIRECTORY made `File::create` fail forever, and a leftover
+    /// SYMLINK made it write the journal bytes to the link's target and then
+    /// rename the link into place. The unique `O_EXCL` temporary makes both
+    /// irrelevant.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_fixed_name_temporary_neither_wedges_nor_redirects_the_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let state_dir = root.join("live");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let fixed_staging =
+            backfill_completion_journal_path(&state_dir).with_extension("json.staging");
+
+        // Half one: a leftover directory at the fixed name.
+        std::fs::create_dir(&fixed_staging).unwrap();
+        write_backfill_completion_journal(&state_dir, &sample_journal())
+            .expect("a stale fixed-name leftover must not wedge the publication");
+        std::fs::remove_dir(&fixed_staging).unwrap();
+        std::fs::remove_file(backfill_completion_journal_path(&state_dir)).unwrap();
+
+        // Half two: a leftover symlink pointing OUT of the state directory.
+        let escape = root.join("escape.json");
+        std::os::unix::fs::symlink(&escape, &fixed_staging).unwrap();
+        write_backfill_completion_journal(&state_dir, &sample_journal())
+            .expect("a stale fixed-name symlink must not redirect the publication");
+
+        assert!(
+            !escape.exists(),
+            "journal bytes must never be written through a symlink out of the \
+             state directory"
+        );
+        let published = backfill_completion_journal_path(&state_dir);
+        assert!(
+            !std::fs::symlink_metadata(&published)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the published journal must be a regular file, not a link"
+        );
+        assert_eq!(
+            read_backfill_completion_journal(&state_dir).unwrap(),
+            Some(sample_journal())
         );
     }
 
