@@ -23,9 +23,10 @@ use bbox_corpus_core::project_catalog::{CatalogOriginV2, ProjectCatalogTransacti
 use bbox_corpus_index::index::history_generations::{
     HistoryProofModeV1, HistoryScanLimitsV1, scan_commit_documents,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::project_catalog_inventory::Sha256ValueV1;
+use crate::project_catalog_inventory::{OperatorResolutionNoteV1, Sha256ValueV1};
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationError, ProjectCatalogMigrationResolvedLayoutV1,
     load_legacy_commit_namespace_inventory_asset,
@@ -57,7 +58,8 @@ pub const ERROR_REBUILD_STALE_PREDECESSOR: &str =
 /// index, which is the same scan the replacement guard performs. The
 /// commitment travels because a count alone cannot distinguish "the same 400
 /// documents" from "400 different documents".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebuildNamespaceDispositionV1 {
     pub namespace: String,
     pub commit_document_count: u64,
@@ -77,7 +79,8 @@ pub struct RebuildNamespaceDispositionV1 {
 /// already revalidates them. Section 3.1 is explicit that verify takes no
 /// artifacts, so binding it to a required artifact path would contradict the
 /// mode's definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebuildSourceBindingV1 {
     /// The fingerprint the migration persisted in its inventory asset.
     /// `None` for a catalog that is not `MigratedV1`.
@@ -113,7 +116,8 @@ impl RebuildSourceBindingV1 {
 /// predecessor epoch, so an epoch comparison alone cannot tell "the backfill
 /// ran and changed nothing" from "the backfill never ran". The journal can,
 /// which is why it is a required predecessor rather than an optimization.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebuildPredecessorBindingV1 {
     pub backfill_post_image_catalog_epoch: u64,
     pub backfill_inventory_hash: Sha256ValueV1,
@@ -124,12 +128,210 @@ pub struct RebuildPredecessorBindingV1 {
     pub observed_catalog_epoch: u64,
 }
 
+pub const PATH_FREE_REBUILD_REPORT_VERSION_V1: u32 = 1;
+pub const PATH_FREE_REBUILD_RESOLUTION_VERSION_V1: u32 = 1;
+
+/// Whether the planned rebuild is executable.
+///
+/// Mirrors the backfill's status rather than inventing a vocabulary: a
+/// reviewer reading a rebuild report should not have to learn a second set of
+/// words for the same idea (D-028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathFreeRebuildStatusV1 {
+    Clean,
+    Refused,
+}
+
+/// The four-hash identity the cut chain is bound by (FD-3, FD-4).
+///
+/// Lives in receipts and durable records, NEVER inside the report: no
+/// artifact contains its own byte hash and no two artifacts contain each
+/// other's, so the artifact hash graph stays acyclic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RebuildArtifactIdentityV1 {
+    pub inventory_hash: Sha256ValueV1,
+    pub plan_hash: Sha256ValueV1,
+    pub report_artifact_hash: Sha256ValueV1,
+    pub resolution_artifact_hash: Sha256ValueV1,
+}
+
+/// The reviewed rebuild report (section 3.4, FD-3 artifact vocabulary).
+///
+/// Carries the inventory hash, the plan hash, and the RESOLUTION artifact
+/// hash. It never carries its own byte hash, and the resolution never carries
+/// the report's, which is what keeps the graph acyclic (FD-4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathFreeRebuildReportV1 {
+    pub version: u32,
+    pub generated_at: String,
+    pub status: PathFreeRebuildStatusV1,
+    pub inventory_hash: Sha256ValueV1,
+    pub plan_hash: Sha256ValueV1,
+    pub resolution_artifact_hash: Sha256ValueV1,
+    /// The predecessor backfill this rebuild is chained to (section 3.3).
+    pub predecessor: RebuildPredecessorBindingV1,
+    /// The Finding-2 binding: fingerprints, namespace set, proof mode.
+    pub source_binding: RebuildSourceBindingV1,
+    /// Total commit documents the rebuild must rematerialize, carried
+    /// explicitly so a reviewer sees the magnitude without summing rows.
+    pub planned_commit_document_total: u64,
+}
+
+/// The rebuild resolution.
+///
+/// A path-free rebuild is DETERMINISTIC: the generations it rematerializes
+/// come from immutable history, and the operator chooses nothing. So the
+/// canonical empty resolution is the normal case, exactly as FD-3 describes
+/// for an operation with nothing to resolve. It exists at all because the
+/// four-hash identity needs a resolution artifact to bind, and because a
+/// reviewer may need to attach a bounded note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathFreeRebuildResolutionV1 {
+    pub version: u32,
+    pub inventory_hash: Sha256ValueV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_notes: Vec<OperatorResolutionNoteV1>,
+}
+
+impl PathFreeRebuildResolutionV1 {
+    /// The canonical empty resolution (FD-3).
+    pub fn empty(inventory_hash: Sha256ValueV1) -> Self {
+        Self {
+            version: PATH_FREE_REBUILD_RESOLUTION_VERSION_V1,
+            inventory_hash,
+            operator_notes: Vec::new(),
+        }
+    }
+}
+
+fn field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn optional_hash_field(hasher: &mut Sha256, value: Option<&Sha256ValueV1>) {
+    match value {
+        // The presence marker is hashed separately from the value so an
+        // absent fingerprint can never collide with a present one whose bytes
+        // happen to be empty.
+        Some(value) => {
+            field(hasher, b"present");
+            field(hasher, value.as_str().as_bytes());
+        }
+        None => field(hasher, b"absent"),
+    }
+}
+
+/// Canonical hash over the PREDECESSOR state this plan was captured from.
+///
+/// Folds the backfill journal binding, because that journal is what proves
+/// the predecessor ran at all when a clean backfill leaves the epoch
+/// unmoved (section 3.3).
+pub fn rebuild_inventory_hash(predecessor: &RebuildPredecessorBindingV1) -> Sha256ValueV1 {
+    let mut hasher = Sha256::new();
+    field(
+        &mut hasher,
+        b"blackbox.project-catalog.rebuild-inventory.v1",
+    );
+    hasher.update(predecessor.backfill_post_image_catalog_epoch.to_be_bytes());
+    hasher.update(predecessor.observed_catalog_epoch.to_be_bytes());
+    field(
+        &mut hasher,
+        predecessor.backfill_inventory_hash.as_str().as_bytes(),
+    );
+    field(
+        &mut hasher,
+        predecessor.backfill_plan_hash.as_str().as_bytes(),
+    );
+    hasher.update(predecessor.applied_stamp_total.to_be_bytes());
+    Sha256ValueV1::parse(hex::encode(hasher.finalize())).expect("code-owned digest is valid")
+}
+
+/// Canonical hash over the EXECUTABLE plan: the exact source binding the
+/// rebuild will consume, in the scan's deterministic namespace order.
+///
+/// The proof mode and BOTH fingerprints are folded, not just the mode. Two
+/// plans that agree on the mode but disagree on which index they proved it
+/// against are different plans, and an identity check that could not tell
+/// them apart would let artifacts captured against one index authorize an
+/// apply against another.
+pub fn rebuild_plan_hash(
+    inventory_hash: &Sha256ValueV1,
+    binding: &RebuildSourceBindingV1,
+) -> Sha256ValueV1 {
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"blackbox.project-catalog.rebuild-plan.v1");
+    field(&mut hasher, inventory_hash.as_str().as_bytes());
+    field(
+        &mut hasher,
+        match binding.proof_mode {
+            HistoryProofModeV1::Equality => b"equality".as_slice(),
+            HistoryProofModeV1::Drift => b"drift".as_slice(),
+        },
+    );
+    optional_hash_field(
+        &mut hasher,
+        binding.recorded_source_index_fingerprint.as_ref(),
+    );
+    optional_hash_field(
+        &mut hasher,
+        binding.observed_source_index_fingerprint.as_ref(),
+    );
+    match &binding.source_schema_version {
+        Some(schema) => {
+            field(&mut hasher, b"schema");
+            field(&mut hasher, schema.as_bytes());
+        }
+        None => field(&mut hasher, b"no-schema"),
+    }
+    hasher.update((binding.namespace_dispositions.len() as u64).to_be_bytes());
+    for row in &binding.namespace_dispositions {
+        field(&mut hasher, row.namespace.as_bytes());
+        hasher.update(row.commit_document_count.to_be_bytes());
+        field(
+            &mut hasher,
+            row.commit_document_commitment_sha256.as_bytes(),
+        );
+        hasher.update(row.truncated_message_count.to_be_bytes());
+    }
+    Sha256ValueV1::parse(hex::encode(hasher.finalize())).expect("code-owned digest is valid")
+}
+
 /// The complete read-only rebuild plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PathFreeRebuildPlanV1 {
     pub predecessor: RebuildPredecessorBindingV1,
     pub source_binding: RebuildSourceBindingV1,
     pub catalog_transaction_id: Option<ProjectCatalogTransactionId>,
+    pub inventory_hash: Sha256ValueV1,
+    pub plan_hash: Sha256ValueV1,
+}
+
+impl PathFreeRebuildPlanV1 {
+    /// Render the reviewable report for this plan.
+    ///
+    /// `resolution_bytes` are the EXACT bytes of the resolution this report
+    /// is bound to, hashed here rather than taken as a hash, so a caller
+    /// cannot bind a report to a resolution it never read.
+    pub fn report(&self, generated_at: String, resolution_bytes: &[u8]) -> PathFreeRebuildReportV1 {
+        PathFreeRebuildReportV1 {
+            version: PATH_FREE_REBUILD_REPORT_VERSION_V1,
+            generated_at,
+            // Reaching a report at all means the D-036 gate passed; a refused
+            // plan returns its refusal instead of rendering.
+            status: PathFreeRebuildStatusV1::Clean,
+            inventory_hash: self.inventory_hash.clone(),
+            plan_hash: self.plan_hash.clone(),
+            resolution_artifact_hash: Sha256ValueV1::digest(resolution_bytes),
+            predecessor: self.predecessor.clone(),
+            source_binding: self.source_binding.clone(),
+            planned_commit_document_total: self.source_binding.commit_document_total(),
+        }
+    }
 }
 
 /// Read the predecessor backfill binding and prove it still describes the
@@ -303,6 +505,8 @@ pub fn plan_path_free_rebuild(
     let source_binding = plan_source_binding(layout, &origin, scan_limits)?;
     require_equality_proof(&source_binding)?;
 
+    let inventory_hash = rebuild_inventory_hash(&predecessor);
+    let plan_hash = rebuild_plan_hash(&inventory_hash, &source_binding);
     Ok(PathFreeRebuildPlanV1 {
         predecessor,
         source_binding,
@@ -310,6 +514,8 @@ pub fn plan_path_free_rebuild(
             CatalogOriginV2::MigratedV1 { transaction_id } => Some(transaction_id),
             CatalogOriginV2::FreshV2 {} => None,
         },
+        inventory_hash,
+        plan_hash,
     })
 }
 
@@ -479,5 +685,150 @@ mod tests {
             .expect("an unchanged epoch is the ordinary clean-backfill case");
         assert_eq!(bound.backfill_post_image_catalog_epoch, 0);
         assert_eq!(bound.applied_stamp_total, 0);
+    }
+
+    fn namespace(name: &str, count: u64, commitment: &str) -> RebuildNamespaceDispositionV1 {
+        RebuildNamespaceDispositionV1 {
+            namespace: name.to_string(),
+            commit_document_count: count,
+            commit_document_commitment_sha256: commitment.to_string(),
+            truncated_message_count: 0,
+        }
+    }
+
+    fn predecessor(epoch: u64) -> RebuildPredecessorBindingV1 {
+        RebuildPredecessorBindingV1 {
+            backfill_post_image_catalog_epoch: epoch,
+            backfill_inventory_hash: hash(0x33),
+            backfill_plan_hash: hash(0x44),
+            applied_stamp_total: 12,
+            observed_catalog_epoch: epoch,
+        }
+    }
+
+    fn equality_binding() -> RebuildSourceBindingV1 {
+        RebuildSourceBindingV1 {
+            recorded_source_index_fingerprint: Some(hash(0xaa)),
+            observed_source_index_fingerprint: Some(hash(0xaa)),
+            proof_mode: HistoryProofModeV1::Equality,
+            namespace_dispositions: vec![namespace("alpha", 3, "c1"), namespace("beta", 5, "c2")],
+            source_schema_version: Some("schema-1".to_string()),
+        }
+    }
+
+    /// The plan hash must move when ANY component of the executable plan
+    /// moves. A hash that ignored a component would let artifacts captured
+    /// against one plan authorize an apply of a different one.
+    #[test]
+    fn the_plan_hash_is_sensitive_to_every_plan_component() {
+        let inventory = rebuild_inventory_hash(&predecessor(7));
+        let baseline = rebuild_plan_hash(&inventory, &equality_binding());
+
+        let mut drift = equality_binding();
+        drift.proof_mode = HistoryProofModeV1::Drift;
+
+        let mut other_index = equality_binding();
+        other_index.observed_source_index_fingerprint = Some(hash(0xbb));
+
+        let mut fewer_documents = equality_binding();
+        fewer_documents.namespace_dispositions[0].commit_document_count = 2;
+
+        let mut other_documents = equality_binding();
+        other_documents.namespace_dispositions[0].commit_document_commitment_sha256 =
+            "c9".to_string();
+
+        let mut extra_namespace = equality_binding();
+        extra_namespace
+            .namespace_dispositions
+            .push(namespace("gamma", 1, "c3"));
+
+        let mut other_schema = equality_binding();
+        other_schema.source_schema_version = Some("schema-2".to_string());
+
+        for (label, mutated) in [
+            ("proof mode", drift),
+            ("observed fingerprint", other_index),
+            ("document count", fewer_documents),
+            ("document commitment", other_documents),
+            ("namespace set", extra_namespace),
+            ("source schema", other_schema),
+        ] {
+            assert_ne!(
+                baseline,
+                rebuild_plan_hash(&inventory, &mutated),
+                "the plan hash must move when the {label} moves"
+            );
+        }
+
+        // And a different predecessor is a different plan even when the
+        // source binding is byte-identical.
+        assert_ne!(
+            baseline,
+            rebuild_plan_hash(
+                &rebuild_inventory_hash(&predecessor(8)),
+                &equality_binding()
+            )
+        );
+    }
+
+    /// A present fingerprint must never collide with an absent one. Hashing
+    /// the value alone would make `None` and `Some("")` indistinguishable.
+    #[test]
+    fn absent_and_present_fingerprints_do_not_collide() {
+        let inventory = rebuild_inventory_hash(&predecessor(7));
+        let mut absent = equality_binding();
+        absent.recorded_source_index_fingerprint = None;
+        absent.proof_mode = HistoryProofModeV1::Drift;
+        let mut present = absent.clone();
+        present.recorded_source_index_fingerprint = Some(hash(0x00));
+        assert_ne!(
+            rebuild_plan_hash(&inventory, &absent),
+            rebuild_plan_hash(&inventory, &present)
+        );
+    }
+
+    /// FD-4: the artifact hash graph is ACYCLIC. The report carries the
+    /// resolution's hash; neither carries its own, and the resolution does
+    /// not carry the report's.
+    #[test]
+    fn the_artifact_hash_graph_stays_acyclic() {
+        let inventory = rebuild_inventory_hash(&predecessor(7));
+        let plan = PathFreeRebuildPlanV1 {
+            predecessor: predecessor(7),
+            source_binding: equality_binding(),
+            catalog_transaction_id: None,
+            inventory_hash: inventory.clone(),
+            plan_hash: rebuild_plan_hash(&inventory, &equality_binding()),
+        };
+        let resolution = PathFreeRebuildResolutionV1::empty(inventory.clone());
+        let resolution_bytes = serde_json::to_vec(&resolution).unwrap();
+        let report = plan.report("2026-08-04T00:00:00Z".to_string(), &resolution_bytes);
+
+        assert_eq!(
+            report.resolution_artifact_hash,
+            Sha256ValueV1::digest(&resolution_bytes),
+            "the report binds the EXACT resolution bytes it was given"
+        );
+        assert_eq!(report.planned_commit_document_total, 8);
+
+        let report_bytes = serde_json::to_vec(&report).unwrap();
+        let report_hash = Sha256ValueV1::digest(&report_bytes);
+        let rendered = String::from_utf8(report_bytes).unwrap();
+        assert!(
+            !rendered.contains(report_hash.as_str()),
+            "no artifact may contain its own byte hash"
+        );
+        let rendered_resolution = String::from_utf8(resolution_bytes).unwrap();
+        assert!(
+            !rendered_resolution.contains(report_hash.as_str()),
+            "the resolution must not carry the report's hash"
+        );
+
+        // Both artifacts round-trip under deny_unknown_fields.
+        let decoded: PathFreeRebuildReportV1 = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(decoded, report);
+        let decoded: PathFreeRebuildResolutionV1 =
+            serde_json::from_str(&rendered_resolution).unwrap();
+        assert_eq!(decoded, resolution);
     }
 }
