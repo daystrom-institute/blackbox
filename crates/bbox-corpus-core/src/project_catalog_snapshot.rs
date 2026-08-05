@@ -605,20 +605,78 @@ pub enum OwnerRowProjectIdV1 {
     Unstamped,
 }
 
-/// Read one row of a JSON owner source, mirroring [`stamp_json_owner_row`].
+/// What one owner answered about the rows a verify asked it for.
+///
+/// An id ABSENT from this map is the owner saying "I hold no such row", which is
+/// the batched form of the single-row `OWNER_ROW_ABSENT` refusal. The map is
+/// keyed by the caller's own `source_row_id` strings, so a caller never has to
+/// re-derive row identity to read an answer back.
+pub type OwnerRowBatchV1 = std::collections::BTreeMap<String, OwnerRowProjectIdV1>;
+
+// ---------------------------------------------------------------------------
+// Capture instrumentation
+// ---------------------------------------------------------------------------
+//
+// The read half's cost contract - ONE lock-and-decode, or ONE tree walk, per
+// owner no matter how many rows are asked for - is not visible in a result
+// value: a reader that re-captured per row would return exactly the same
+// answers, only slowly and from as many different durable snapshots as it made
+// captures. That is what makes it a defect a test cannot otherwise see, so the
+// captures are counted and the count is assertable.
+//
+// The counter is THREAD-LOCAL, not global. Every owner read runs inline on its
+// caller's thread, so a thread-local count is exact for that caller and cannot
+// be perturbed by a parallel test in the same process - which a global counter
+// would be, silently, under any harness that shares one.
+thread_local! {
+    static OWNER_ROW_READ_CAPTURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one owner-source capture: a locked whole-file read, or one tree walk.
+///
+/// Owners implementing their own walk (the transcript-edge lane set) call this
+/// themselves; the shared helpers below call it for everyone else.
+pub fn note_owner_row_read_capture() {
+    OWNER_ROW_READ_CAPTURES.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Owner-source captures performed by the row READ path on this thread.
+pub fn owner_row_read_captures() -> u64 {
+    OWNER_ROW_READ_CAPTURES.with(std::cell::Cell::get)
+}
+
+/// Zero the capture count, so a test can measure one owner read in isolation.
+pub fn reset_owner_row_read_captures() {
+    OWNER_ROW_READ_CAPTURES.with(|count| count.set(0));
+}
+
+/// Read MANY rows of a JSON owner source, mirroring [`stamp_json_owner_row`].
+///
+/// One lock, one capture, one decode, all requested ids resolved from that
+/// single snapshot. Batched rather than per-row for two reasons, and the second
+/// is the load-bearing one:
+///
+/// 1. Per-row reads make verifying an owner quadratic - O(rows x source bytes) -
+///    which on a large store can extend or abort the stopped-service closeout
+///    window a backfill verify runs inside.
+/// 2. Separate lock-and-capture cycles observe separate durable snapshots. A
+///    per-row reader can therefore return one owner's answers assembled from
+///    several different states of that owner, and report a combination that
+///    never existed. A batch has ONE state by construction.
 ///
 /// The exclusive store lock is held for the read for the same reason the write
 /// half holds it: a verify that raced a concurrent writer could observe a row
 /// mid-replacement and report a defect that never existed.
-pub fn read_json_owner_row(
+pub fn read_json_owner_rows(
     store_path: &Path,
     source_id: &str,
     subsource_id: &str,
     limits: OwnerSnapshotLimitsV1,
-    locate: impl FnOnce(&[u8]) -> Result<OwnerRowProjectIdV1, OwnerRowStampError>,
-) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    locate: impl FnOnce(&[u8]) -> Result<OwnerRowBatchV1, OwnerRowStampError>,
+) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
     validate_limits(limits).map_err(|error| OwnerRowStampError::new(error.code))?;
     crate::json_store::with_store_lock(store_path, || {
+        note_owner_row_read_capture();
         let captured = capture_regular_file_nofollow(
             store_path,
             source_id,
@@ -661,49 +719,90 @@ pub fn read_row_object_project_id(
     }
 }
 
-/// Read half of [`stamp_json_array_row`].
-pub fn read_json_array_row_project_id(
+/// Collect the requested rows of a decoded row sequence into a batch.
+///
+/// Shared by the array, map, and top-level-array shapes so all three agree on
+/// what a batch answer means: an id present in the map was found, an id absent
+/// was not held by the owner, and a CORRUPT row fails the whole batch rather
+/// than reading as unstamped.
+fn collect_requested_rows<'a>(
+    rows: impl Iterator<Item = &'a serde_json::Value>,
+    source_row_ids: &BTreeSet<String>,
+    row_id_of: impl Fn(&serde_json::Value) -> Option<String>,
+) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
+    let mut batch = OwnerRowBatchV1::new();
+    for row in rows {
+        let Some(row_id) = row_id_of(row) else {
+            continue;
+        };
+        // FIRST match wins, exactly as the stamping side's `find` does: the two
+        // halves of the contract must resolve one id to the same row even in a
+        // source that duplicates it.
+        if !source_row_ids.contains(&row_id) || batch.contains_key(&row_id) {
+            continue;
+        }
+        batch.insert(row_id, read_row_object_project_id(row)?);
+    }
+    Ok(batch)
+}
+
+/// Read half of [`stamp_json_array_row`], for MANY rows of one decoded source.
+pub fn read_json_array_rows_project_id(
     bytes: &[u8],
     array_field: &str,
     id_field: &str,
-    source_row_id: &str,
-) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
-    let mut document: serde_json::Value = decode_owner_source(bytes)?;
-    let row = find_json_array_row_mut(&mut document, array_field, id_field, source_row_id)
-        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
-    read_row_object_project_id(row)
+    source_row_ids: &BTreeSet<String>,
+) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
+    let document: serde_json::Value = decode_owner_source(bytes)?;
+    let Some(rows) = document
+        .get(array_field)
+        .and_then(serde_json::Value::as_array)
+    else {
+        // A source holding no such array holds none of the requested rows. The
+        // caller reports that as an absent row, which is what it is.
+        return Ok(OwnerRowBatchV1::new());
+    };
+    collect_requested_rows(rows.iter(), source_row_ids, |row| {
+        row.get(id_field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
 }
 
-/// Read half of [`stamp_json_map_row`].
-pub fn read_json_map_row_project_id(
+/// Read half of [`stamp_json_map_row`], for MANY rows of one decoded source.
+pub fn read_json_map_rows_project_id(
     bytes: &[u8],
     map_field: &str,
-    source_row_id: &str,
+    source_row_ids: &BTreeSet<String>,
     row_id_of: impl Fn(&serde_json::Value) -> Option<String>,
-) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
     let document: serde_json::Value = decode_owner_source(bytes)?;
-    let rows = document
+    let Some(rows) = document
         .get(map_field)
         .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
-    let row = rows
-        .values()
-        .find(|row| row_id_of(row).as_deref() == Some(source_row_id))
-        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
-    read_row_object_project_id(row)
+    else {
+        return Ok(OwnerRowBatchV1::new());
+    };
+    collect_requested_rows(rows.values(), source_row_ids, row_id_of)
 }
 
-/// Read half of [`stamp_json_tree_row`], locating the record the same way.
-pub fn read_json_tree_row_project_id(
+/// Read half of [`stamp_json_tree_row`], locating the records the same way.
+///
+/// ONE walk of the tree answers every requested id. The walk is the expensive
+/// half of a tree owner's read, and the whole point of the batch: a per-row
+/// caller walked the entire tree once per row.
+pub fn read_json_tree_rows_project_id(
     root: &Path,
     source_id: &str,
     limits: OwnerSnapshotLimitsV1,
     include: impl Fn(&Path) -> bool + Copy,
     row_id_of: impl Fn(&str, &serde_json::Value) -> Option<String>,
-    source_row_id: &str,
-) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    source_row_ids: &BTreeSet<String>,
+) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
+    note_owner_row_read_capture();
     let captures = capture_stable_regular_tree_nofollow(root, source_id, limits, include)
         .map_err(|error| OwnerRowStampError::new(error.code))?;
+    let mut batch = OwnerRowBatchV1::new();
     for (relative, captured) in captures {
         let subsource_id = stable_subsource_id(source_id, &relative);
         let Some(bytes) = captured.bytes else {
@@ -712,40 +811,44 @@ pub fn read_json_tree_row_project_id(
         let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
-        if row_id_of(&subsource_id, &document).as_deref() != Some(source_row_id) {
+        let Some(row_id) = row_id_of(&subsource_id, &document) else {
+            continue;
+        };
+        if !source_row_ids.contains(&row_id) || batch.contains_key(&row_id) {
             continue;
         }
-        return read_row_object_project_id(&document);
+        batch.insert(row_id, read_row_object_project_id(&document)?);
     }
-    Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
+    Ok(batch)
 }
 
 /// Read half of [`stamp_legacy_task_owner_row`]. `tasks.json` is a top-level
-/// array, so it locates its row the same non-shared way the stamper does.
-pub fn read_legacy_task_owner_row(
+/// array, so it locates its rows the same non-shared way the stamper does.
+pub fn read_legacy_task_owner_rows(
     tasks_path: &Path,
-    source_row_id: &str,
+    source_row_ids: &BTreeSet<String>,
     limits: OwnerSnapshotLimitsV1,
-) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
-    read_json_owner_row(tasks_path, "task", "task:central-json", limits, |bytes| {
+) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
+    read_json_owner_rows(tasks_path, "task", "task:central-json", limits, |bytes| {
         let document: serde_json::Value = decode_owner_source(bytes)?;
-        let row = document
+        let rows = document
             .as_array()
-            .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_INVALID))?
-            .iter()
-            .find(|row| row.get("id").and_then(serde_json::Value::as_str) == Some(source_row_id))
-            .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
-        read_row_object_project_id(row)
+            .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_INVALID))?;
+        collect_requested_rows(rows.iter(), source_row_ids, |row| {
+            row.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
     })
 }
 
 /// Read half of [`stamp_legacy_proposal_owner_row`].
-pub fn read_legacy_proposal_owner_row(
+pub fn read_legacy_proposal_owner_rows(
     proposals_root: &Path,
-    source_row_id: &str,
+    source_row_ids: &BTreeSet<String>,
     limits: OwnerSnapshotLimitsV1,
-) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
-    read_json_tree_row_project_id(
+) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
+    read_json_tree_rows_project_id(
         proposals_root,
         "proposal",
         limits,
@@ -761,7 +864,7 @@ pub fn read_legacy_proposal_owner_row(
                 .and_then(serde_json::Value::as_str)
                 .map(|id| format!("{subsource_id}:{id}"))
         },
-        source_row_id,
+        source_row_ids,
     )
 }
 

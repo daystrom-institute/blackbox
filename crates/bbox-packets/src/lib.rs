@@ -378,20 +378,23 @@ pub fn stamp_project_catalog_owner_row(
     )
 }
 
-/// Read one packet row's stable project id, the VERIFY half of
-/// [`stamp_project_catalog_owner_row`]. Locates the record exactly as the
+/// Read the stable project ids of MANY packet rows, the VERIFY half of
+/// [`stamp_project_catalog_owner_row`]. Locates the records exactly as the
 /// stamper does, so the two agree on row identity by construction.
-pub fn read_project_catalog_owner_row(
+///
+/// Batched over the whole requested set because this owner is a TREE: a per-row
+/// caller walks every packet file once per row.
+pub fn read_project_catalog_owner_rows(
     packets_dir: &Path,
-    source_row_id: &str,
+    source_row_ids: &std::collections::BTreeSet<String>,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
 ) -> std::result::Result<
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowBatchV1,
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
 > {
-    use bbox_corpus_core::project_catalog_snapshot::read_json_tree_row_project_id;
+    use bbox_corpus_core::project_catalog_snapshot::read_json_tree_rows_project_id;
 
-    read_json_tree_row_project_id(
+    read_json_tree_rows_project_id(
         packets_dir,
         "packet",
         limits,
@@ -407,7 +410,7 @@ pub fn read_project_catalog_owner_row(
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
         },
-        source_row_id,
+        source_row_ids,
     )
 }
 

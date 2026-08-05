@@ -387,32 +387,39 @@ pub fn stamp_project_catalog_owner_row(
     Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
 }
 
-/// Read one transcript-edge row's stable project id, the VERIFY half of
+/// Read the stable project ids of MANY transcript-edge rows, the VERIFY half of
 /// [`stamp_project_catalog_owner_row`].
 ///
-/// Locates the row by rebuilding every lane's row ids through the same shared
+/// Locates the rows by rebuilding every lane's row ids through the same shared
 /// walk the stamper uses, for the same reason: subsource ids are opaque hashes
 /// and splitting the composite id would be a second, weaker identity
 /// implementation.
-pub fn read_project_catalog_owner_row(
+///
+/// ONE walk of the lane set answers every requested id. This owner is the worst
+/// case for a per-row reader: each row would re-walk every lane file and
+/// re-derive every lane's row ids, and the answers would come from as many
+/// different snapshots of the lane set as there were requested rows.
+pub fn read_project_catalog_owner_rows(
     edges_dir: &Path,
-    source_row_id: &str,
+    source_row_ids: &std::collections::BTreeSet<String>,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
 ) -> std::result::Result<
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowBatchV1,
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
 > {
     use bbox_corpus_core::project_catalog_snapshot::{
-        OWNER_ROW_ABSENT, OwnerRowStampError, capture_stable_regular_tree_nofollow,
-        read_row_object_project_id, stable_subsource_id,
+        OwnerRowBatchV1, OwnerRowStampError, capture_stable_regular_tree_nofollow,
+        note_owner_row_read_capture, read_row_object_project_id, stable_subsource_id,
     };
 
+    note_owner_row_read_capture();
     let captures =
         capture_stable_regular_tree_nofollow(edges_dir, "transcript_edge", limits, |relative| {
             relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
         })
         .map_err(|error| OwnerRowStampError::new(error.code))?;
 
+    let mut batch = OwnerRowBatchV1::new();
     for (relative, captured) in captures {
         let subsource_id = stable_subsource_id("transcript_edge", &relative);
         let Some(bytes) = captured.bytes else {
@@ -424,19 +431,23 @@ pub fn read_project_catalog_owner_row(
         let Ok(lane_rows) = transcript_edge_lane_rows(body) else {
             continue;
         };
-        let Some(row) = lane_rows
-            .iter()
-            .find(|row| row.stable_row_id(&subsource_id) == source_row_id)
-        else {
-            continue;
-        };
-        let segments: Vec<(&str, &str)> = transcript_edge_segments(body).collect();
-        let (content, _terminator) = segments[row.segment_index];
-        let value: serde_json::Value = serde_json::from_str(content)
-            .map_err(|_| OwnerRowStampError::new("transcript_edge_invalid"))?;
-        return read_row_object_project_id(&value);
+        // The lane's segments are split ONCE for the whole lane rather than
+        // once per matching row: the split is over the same body every match
+        // reads from.
+        let mut segments: Option<Vec<(&str, &str)>> = None;
+        for row in &lane_rows {
+            let row_id = row.stable_row_id(&subsource_id);
+            if !source_row_ids.contains(&row_id) || batch.contains_key(&row_id) {
+                continue;
+            }
+            let segments = segments.get_or_insert_with(|| transcript_edge_segments(body).collect());
+            let (content, _terminator) = segments[row.segment_index];
+            let value: serde_json::Value = serde_json::from_str(content)
+                .map_err(|_| OwnerRowStampError::new("transcript_edge_invalid"))?;
+            batch.insert(row_id, read_row_object_project_id(&value)?);
+        }
     }
-    Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
+    Ok(batch)
 }
 
 /// Write `rewritten` over `path` atomically, refusing if the lane changed since

@@ -27,8 +27,8 @@ use std::path::{Component, Path, PathBuf};
 
 use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_core::project_catalog_snapshot::{
-    OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MOVED, OwnerRowProjectIdV1,
-    OwnerRowStampError, OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
+    OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MOVED, OwnerRowBatchV1,
+    OwnerRowProjectIdV1, OwnerRowStampError, OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
 };
 use bbox_indexing::project_catalog_backfill::{
     ERROR_RESOLUTION_INVALID, ERROR_STALE_POST_IMAGE, LegacyRowObservationV1,
@@ -495,56 +495,65 @@ impl ProjectCatalogOwnerRowReaderV1 {
         Ok(Self { paths, limits })
     }
 
-    /// Re-prove the path is safe, then read. Same discipline as the write side,
-    /// for the same reason: the proof belongs immediately before the access.
+    /// Re-prove the path is safe, then read the WHOLE requested set from it in
+    /// ONE batch. Same path discipline as the write side, for the same reason:
+    /// the proof belongs immediately before the access.
     fn read_owner_path(
         &self,
         store_kind: LegacyPathStoreKindV1,
-        source_row_id: &str,
+        source_row_ids: &BTreeSet<String>,
         path: &Path,
-        read: impl FnOnce(&Path) -> std::result::Result<OwnerRowProjectIdV1, OwnerRowStampError>,
-    ) -> Result<LegacyRowObservationV1, ProjectCatalogMigrationError> {
+        read: impl FnOnce(&Path) -> std::result::Result<OwnerRowBatchV1, OwnerRowStampError>,
+    ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
         validate_owner_path(path)?;
-        map_read_outcome(store_kind, source_row_id, read(path))
+        map_read_batch(store_kind, source_row_ids, read(path))
     }
 }
 
-/// Translate an owner-crate read result into the backfill's vocabulary.
+/// Translate one owner's batch read into the backfill's vocabulary.
 ///
-/// An ABSENT row is an observation, not a refusal: verify's job is to REPORT
-/// that a mapped binding names a row the owner no longer holds, and it names
-/// the store and the row while doing so. Every other failure - an undecodable
-/// source, a corrupt row, an unsafe path - is a refusal, because a verifier
-/// that could not read a store must never answer "not stamped".
-fn map_read_outcome(
+/// An ABSENT row - an id the owner's batch does not hold - is an observation,
+/// not a refusal: verify's job is to REPORT that a mapped binding names a row
+/// the owner no longer holds, and it names the store while doing so. Every
+/// other failure - an undecodable source, a corrupt row, an unsafe path - fails
+/// the WHOLE batch, because a verifier that could not read a store must never
+/// answer "not stamped" for any row in it.
+fn map_read_batch(
     store_kind: LegacyPathStoreKindV1,
-    source_row_id: &str,
-    outcome: std::result::Result<OwnerRowProjectIdV1, OwnerRowStampError>,
-) -> Result<LegacyRowObservationV1, ProjectCatalogMigrationError> {
-    match outcome {
-        Ok(OwnerRowProjectIdV1::Stamped(project_id)) => ProjectId::parse(project_id)
-            .map(LegacyRowObservationV1::StampedWith)
-            .map_err(|_| {
-                ProjectCatalogMigrationError::no_mutation(
-                    ERROR_STALE_POST_IMAGE,
-                    format!(
-                        "legacy row read refused: store {} row {source_row_id}: the row \
-                         carries a malformed project id",
-                        legacy_store_token(store_kind)
-                    ),
-                )
-            }),
-        Ok(OwnerRowProjectIdV1::Unstamped) => Ok(LegacyRowObservationV1::Unstamped),
-        Err(error) if error.code == OWNER_ROW_ABSENT => Ok(LegacyRowObservationV1::Absent),
-        Err(error) => Err(ProjectCatalogMigrationError::no_mutation(
+    source_row_ids: &BTreeSet<String>,
+    outcome: std::result::Result<OwnerRowBatchV1, OwnerRowStampError>,
+) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
+    let batch = outcome.map_err(|error| {
+        ProjectCatalogMigrationError::no_mutation(
             ERROR_STALE_POST_IMAGE,
             format!(
-                "legacy row read refused: store {} row {source_row_id}: {}",
+                "legacy row read refused: store {}: {}",
                 legacy_store_token(store_kind),
                 error.code
             ),
-        )),
+        )
+    })?;
+    let mut observations = BTreeMap::new();
+    for source_row_id in source_row_ids {
+        let observation = match batch.get(source_row_id) {
+            None => LegacyRowObservationV1::Absent,
+            Some(OwnerRowProjectIdV1::Unstamped) => LegacyRowObservationV1::Unstamped,
+            Some(OwnerRowProjectIdV1::Stamped(project_id)) => ProjectId::parse(project_id.clone())
+                .map(LegacyRowObservationV1::StampedWith)
+                .map_err(|_| {
+                    ProjectCatalogMigrationError::no_mutation(
+                        ERROR_STALE_POST_IMAGE,
+                        format!(
+                            "legacy row read refused: store {} row {source_row_id}: the \
+                                 row carries a malformed project id",
+                            legacy_store_token(store_kind)
+                        ),
+                    )
+                })?,
+        };
+        observations.insert(source_row_id.clone(), observation);
     }
+    Ok(observations)
 }
 
 impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
@@ -555,171 +564,185 @@ impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
         ProjectCatalogOwnerRowStamperV1::coverage_verdict(store_kind)
     }
 
+    /// ONE batched read per owner, dispatched through the SAME fourteen-arm
+    /// match the stamper writes through.
+    ///
+    /// Every arm hands the whole requested set to its owner's batch reader, so
+    /// an owner is locked-and-decoded once, or walked once, however many rows
+    /// verify asks about. Two properties ride on that, and the second is the
+    /// one a slow implementation would silently break: verifying an owner stays
+    /// linear in the owner's size rather than O(rows x owner size), and every
+    /// row of one owner's answer comes from ONE durable snapshot, so a verdict
+    /// can never combine rows observed in different states of the same store.
     fn observe(
         &self,
         store_kind: LegacyPathStoreKindV1,
         source_row_ids: &BTreeSet<String>,
     ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
-        let mut observations = BTreeMap::new();
-        for source_row_id in source_row_ids {
-            observations.insert(
-                source_row_id.clone(),
-                self.observe_one(store_kind, source_row_id)?,
-            );
-        }
-        Ok(observations)
-    }
-}
-
-impl ProjectCatalogOwnerRowReaderV1 {
-    fn observe_one(
-        &self,
-        store_kind: LegacyPathStoreKindV1,
-        source_row_id: &str,
-    ) -> Result<LegacyRowObservationV1, ProjectCatalogMigrationError> {
         let limits = self.limits;
         match store_kind {
             LegacyPathStoreKindV1::Knowledge => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.knowledge_store_path,
                 |path| {
-                    bbox_knowledge::knowledge::read_project_catalog_owner_row(
+                    bbox_knowledge::knowledge::read_project_catalog_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
             ),
             LegacyPathStoreKindV1::Gap => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.gap_store_path,
-                |path| bbox_gaps::gaps::read_project_catalog_owner_row(path, source_row_id, limits),
+                |path| {
+                    bbox_gaps::gaps::read_project_catalog_owner_rows(path, source_row_ids, limits)
+                },
             ),
             LegacyPathStoreKindV1::Thread => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.thread_store_path,
                 |path| {
-                    bbox_threads::threads::read_project_catalog_owner_row(
+                    bbox_threads::threads::read_project_catalog_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
             ),
             LegacyPathStoreKindV1::Note => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.note_store_path,
                 |path| {
-                    bbox_threads::notes::read_project_catalog_owner_row(path, source_row_id, limits)
+                    bbox_threads::notes::read_project_catalog_owner_rows(
+                        path,
+                        source_row_ids,
+                        limits,
+                    )
                 },
             ),
             LegacyPathStoreKindV1::Pin => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.pin_store_path,
                 |path| {
-                    bbox_stores::pins::read_project_catalog_owner_row(path, source_row_id, limits)
+                    bbox_stores::pins::read_project_catalog_owner_rows(path, source_row_ids, limits)
                 },
             ),
             LegacyPathStoreKindV1::Roadmap => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.roadmap_store_path,
                 |path| {
-                    bbox_stores::roadmap::read_project_catalog_owner_row(
+                    bbox_stores::roadmap::read_project_catalog_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
             ),
-            LegacyPathStoreKindV1::Packet => {
-                self.read_owner_path(store_kind, source_row_id, &self.paths.packet_root, |path| {
-                    bbox_packets::read_project_catalog_owner_row(path, source_row_id, limits)
-                })
-            }
+            LegacyPathStoreKindV1::Packet => self.read_owner_path(
+                store_kind,
+                source_row_ids,
+                &self.paths.packet_root,
+                |path| bbox_packets::read_project_catalog_owner_rows(path, source_row_ids, limits),
+            ),
             LegacyPathStoreKindV1::Proposal => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.proposal_root,
                 |path| {
-                    bbox_corpus_core::project_catalog_snapshot::read_legacy_proposal_owner_row(
+                    bbox_corpus_core::project_catalog_snapshot::read_legacy_proposal_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
             ),
-            // One store kind, two sources, resolved in the SAME order the
-            // stamper resolves them: channel bindings first, proposal links
-            // only on a row-absent answer.
-            LegacyPathStoreKindV1::SlackBinding => self.read_owner_path(
-                store_kind,
-                source_row_id,
-                &self.paths.slack_store_root,
-                |path| match bbox_slack::slack_channel_bindings::read_project_catalog_owner_row(
+            // One store kind, TWO sources. The channel bindings source answers
+            // first and the proposal links source is asked only for the ids it
+            // did not hold, which is the batched form of the stamper's
+            // row-absent fallthrough: same order, same precedence, one capture
+            // per source rather than one per row. A channel source that cannot
+            // be READ still refuses outright rather than falling through, for
+            // the same reason it does on the write side.
+            LegacyPathStoreKindV1::SlackBinding => {
+                let path = &self.paths.slack_store_root;
+                validate_owner_path(path)?;
+                let mut batch = bbox_slack::slack_channel_bindings::read_project_catalog_owner_rows(
                     path,
-                    source_row_id,
+                    source_row_ids,
                     limits,
-                ) {
-                    Err(error) if error.code == OWNER_ROW_ABSENT => {
-                        bbox_slack::slack_proposal_links::read_project_catalog_owner_row(
+                );
+                if let Ok(bound) = &batch {
+                    let unresolved = source_row_ids
+                        .iter()
+                        .filter(|source_row_id| !bound.contains_key(*source_row_id))
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    if !unresolved.is_empty() {
+                        batch = bbox_slack::slack_proposal_links::read_project_catalog_owner_rows(
                             path,
-                            source_row_id,
+                            &unresolved,
                             limits,
                         )
+                        .map(|links| {
+                            let mut merged = bound.clone();
+                            merged.extend(links);
+                            merged
+                        });
                     }
-                    other => other,
-                },
-            ),
+                }
+                map_read_batch(store_kind, source_row_ids, batch)
+            }
             LegacyPathStoreKindV1::Whiteboard => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.whiteboard_root,
                 |path| {
-                    bbox_whiteboards::whiteboards::read_project_catalog_owner_row(
+                    bbox_whiteboards::whiteboards::read_project_catalog_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
             ),
             LegacyPathStoreKindV1::Artifact => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.artifact_root,
                 |path| {
-                    bbox_artifacts::artifacts::read_project_catalog_owner_row(
+                    bbox_artifacts::artifacts::read_project_catalog_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
             ),
             LegacyPathStoreKindV1::TranscriptEdge => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.transcript_edge_root,
                 |path| {
-                    bbox_edge_sidecar::edge_sidecar::read_project_catalog_owner_row(
+                    bbox_edge_sidecar::edge_sidecar::read_project_catalog_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
             ),
             LegacyPathStoreKindV1::Task => self.read_owner_path(
                 store_kind,
-                source_row_id,
+                source_row_ids,
                 &self.paths.task_store_path,
                 |path| {
-                    bbox_corpus_core::project_catalog_snapshot::read_legacy_task_owner_row(
+                    bbox_corpus_core::project_catalog_snapshot::read_legacy_task_owner_rows(
                         path,
-                        source_row_id,
+                        source_row_ids,
                         limits,
                     )
                 },
@@ -741,6 +764,9 @@ impl ProjectCatalogOwnerRowReaderV1 {
 mod owner_row_stamper_dispatch {
     use super::*;
     use LegacyRowStampCoverageV1::{Covered, ExemptByConstruction};
+    use bbox_corpus_core::project_catalog_snapshot::{
+        owner_row_read_captures, reset_owner_row_read_captures,
+    };
 
     /// Every path the stamper may touch is rooted in one tempdir, so a test
     /// that reaches the wrong owner writes somewhere observable instead of
@@ -874,6 +900,148 @@ mod owner_row_stamper_dispatch {
                 .stamp(LegacyPathStoreKindV1::TranscriptEdge, &row_id, &project())
                 .unwrap(),
             LegacyRowStampOutcomeV1::AlreadyStamped
+        );
+    }
+
+    /// The production READER over the same owner paths, so a test can prove
+    /// what a verify observes as well as what an apply writes.
+    fn reader(root: &Path) -> ProjectCatalogOwnerRowReaderV1 {
+        for directory in [
+            "packets",
+            "proposals",
+            "slack",
+            "whiteboards",
+            "artifacts",
+            "edges",
+        ] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        ProjectCatalogOwnerRowReaderV1::new(
+            ProjectCatalogStamperPathsV1 {
+                knowledge_store_path: root.join("knowledge.json"),
+                gap_store_path: root.join("gaps.json"),
+                thread_store_path: root.join("threads.json"),
+                note_store_path: root.join("notes.json"),
+                pin_store_path: root.join("pins.json"),
+                roadmap_store_path: root.join("roadmap.json"),
+                packet_root: root.join("packets"),
+                proposal_root: root.join("proposals"),
+                slack_store_root: root.join("slack"),
+                whiteboard_root: root.join("whiteboards"),
+                artifact_root: root.join("artifacts"),
+                transcript_edge_root: root.join("edges"),
+                task_store_path: root.join("tasks.json"),
+            },
+            OwnerSnapshotLimitsV1::default(),
+        )
+        .unwrap()
+    }
+
+    fn row_ids(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// A MULTI-ROW read of a central-JSON owner captures that owner ONCE.
+    ///
+    /// The batched contract is not a cost preference. A reader that looped a
+    /// per-row read would take the store lock, re-read and re-decode the whole
+    /// file once per row - O(rows x store size) inside the stopped-service
+    /// closeout window a verify runs in - and, because each cycle is its own
+    /// lock-and-capture, could answer for one owner out of several different
+    /// durable states of it. Neither shows up in the returned values, which is
+    /// why the captures are counted here rather than argued about.
+    #[test]
+    fn a_multi_row_owner_read_captures_the_store_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("knowledge.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "entries": [
+                    {"id": "kb1", "project": "/legacy/one", "project_id": "a1b2c3d4"},
+                    {"id": "kb2", "project": "/legacy/two"},
+                    {"id": "kb3", "project": "/legacy/three", "project_id": "a1b2c3d4"},
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let reader = reader(&root);
+
+        let requested = row_ids(&["kb1", "kb2", "kb3", "kb-gone"]);
+        reset_owner_row_read_captures();
+        let observed = reader
+            .observe(LegacyPathStoreKindV1::Knowledge, &requested)
+            .unwrap();
+
+        assert_eq!(
+            owner_row_read_captures(),
+            1,
+            "four requested rows must cost ONE locked capture of the owner"
+        );
+        // And that single capture answers for every requested row, including
+        // the one the owner does not hold.
+        assert_eq!(
+            observed.get("kb1"),
+            Some(&LegacyRowObservationV1::StampedWith(project()))
+        );
+        assert_eq!(
+            observed.get("kb2"),
+            Some(&LegacyRowObservationV1::Unstamped)
+        );
+        assert_eq!(
+            observed.get("kb3"),
+            Some(&LegacyRowObservationV1::StampedWith(project()))
+        );
+        assert_eq!(
+            observed.get("kb-gone"),
+            Some(&LegacyRowObservationV1::Absent)
+        );
+        assert_eq!(observed.len(), 4, "every requested row is answered");
+    }
+
+    /// The same obligation for a TREE owner, where the per-row cost is a full
+    /// walk of the tree rather than one file read.
+    #[test]
+    fn a_multi_row_tree_owner_read_walks_the_tree_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let reader = reader(&root);
+        for (id, stamped) in [("pk1", true), ("pk2", false), ("pk3", true)] {
+            let mut document = serde_json::json!({"id": id, "project": "/legacy/one"});
+            if stamped {
+                document["project_id"] = serde_json::json!("a1b2c3d4");
+            }
+            std::fs::write(
+                root.join("packets").join(format!("{id}.json")),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let requested = row_ids(&["pk1", "pk2", "pk3"]);
+        reset_owner_row_read_captures();
+        let observed = reader
+            .observe(LegacyPathStoreKindV1::Packet, &requested)
+            .unwrap();
+
+        assert_eq!(
+            owner_row_read_captures(),
+            1,
+            "three requested rows must cost ONE walk of the packet tree"
+        );
+        assert_eq!(
+            observed.get("pk1"),
+            Some(&LegacyRowObservationV1::StampedWith(project()))
+        );
+        assert_eq!(
+            observed.get("pk2"),
+            Some(&LegacyRowObservationV1::Unstamped)
+        );
+        assert_eq!(
+            observed.get("pk3"),
+            Some(&LegacyRowObservationV1::StampedWith(project()))
         );
     }
 

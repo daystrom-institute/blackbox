@@ -743,6 +743,18 @@ pub trait LegacyRowOwnerReaderV1: Send + Sync {
     /// Batched per owner rather than per row because several owners are trees
     /// or lane sets whose row lookup is a full walk; a per-row call would make
     /// verifying an owner quadratic in its rows.
+    ///
+    /// Implementations MUST honour that batching rather than merely accept it:
+    /// ONE lock-and-decode, or ONE tree walk, per owner per call. It is a
+    /// correctness obligation and not only a cost one. An implementation that
+    /// looped a per-row read here would capture the owner once per row, so the
+    /// answers it returned for one owner could come from several different
+    /// durable states of that store and describe a combination that never
+    /// existed - while also turning verify into O(rows x owner size), which is
+    /// spent inside a stopped-service closeout window. The production reader is
+    /// held to this by
+    /// `bbox_corpus_core::project_catalog_snapshot::owner_row_read_captures`,
+    /// which counts the captures a batch actually performs.
     fn observe(
         &self,
         store_kind: LegacyPathStoreKindV1,

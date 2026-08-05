@@ -164,26 +164,28 @@ pub fn stamp_project_catalog_owner_row(
     })
 }
 
-/// Read one central pin row's stable project id, the VERIFY half of
+/// Read the stable project ids of MANY central pin rows, the VERIFY half of
 /// [`stamp_project_catalog_owner_row`].
 ///
 /// Read-only by construction: the backfill's verify proves that the rows an
 /// applied plan claims to have stamped really carry the project id the ledger
 /// binds them to, and a verify that could write would be proving its own work.
-pub fn read_project_catalog_owner_row(
+/// Batched over the whole requested set, so verifying this owner costs ONE
+/// locked capture and answers every row from ONE durable snapshot.
+pub fn read_project_catalog_owner_rows(
     store_path: &Path,
-    source_row_id: &str,
+    source_row_ids: &std::collections::BTreeSet<String>,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
 ) -> std::result::Result<
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowBatchV1,
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
 > {
     use bbox_corpus_core::project_catalog_snapshot::{
-        read_json_array_row_project_id, read_json_owner_row,
+        read_json_array_rows_project_id, read_json_owner_rows,
     };
 
-    read_json_owner_row(store_path, "pin", "pin:central-json", limits, |bytes| {
-        read_json_array_row_project_id(bytes, "pins", "id", source_row_id)
+    read_json_owner_rows(store_path, "pin", "pin:central-json", limits, |bytes| {
+        read_json_array_rows_project_id(bytes, "pins", "id", source_row_ids)
     })
 }
 

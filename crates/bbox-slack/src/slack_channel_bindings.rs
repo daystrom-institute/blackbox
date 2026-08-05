@@ -133,28 +133,28 @@ pub fn stamp_project_catalog_owner_row(
     )
 }
 
-/// Read one Slack channel binding row's stable project id, the VERIFY half of
-/// [`stamp_project_catalog_owner_row`]. Locates the record exactly as the
-/// stamper does, so the two agree on row identity by construction.
-pub fn read_project_catalog_owner_row(
+/// Read the stable project ids of MANY Slack channel binding rows, the VERIFY
+/// half of [`stamp_project_catalog_owner_row`]. Locates the records exactly as
+/// the stamper does, so the two agree on row identity by construction.
+pub fn read_project_catalog_owner_rows(
     store_dir: &Path,
-    source_row_id: &str,
+    source_row_ids: &std::collections::BTreeSet<String>,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
 ) -> std::result::Result<
-    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowBatchV1,
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
 > {
     use bbox_corpus_core::project_catalog_snapshot::{
-        read_json_map_row_project_id, read_json_owner_row,
+        read_json_map_rows_project_id, read_json_owner_rows,
     };
 
-    read_json_owner_row(
+    read_json_owner_rows(
         &store_dir.join(STORE_FILE),
         "slack_binding",
         "slack_binding:channel-json",
         limits,
         |bytes| {
-            read_json_map_row_project_id(bytes, "bindings", source_row_id, |row| {
+            read_json_map_rows_project_id(bytes, "bindings", source_row_ids, |row| {
                 let team_id = row.get("team_id")?.as_str()?;
                 let channel_id = row.get("channel_id")?.as_str()?;
                 Some(format!("{team_id}:{channel_id}"))
