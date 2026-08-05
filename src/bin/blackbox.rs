@@ -3498,9 +3498,14 @@ fn owner_snapshot_row_commitment(
             project_id,
             target_sha256,
         )),
+        // The member set is deliberately not committed here: this probe asks
+        // whether an owner still REFERENCES the project, which its identity and
+        // selector answer. How many rows one observation stands for is
+        // migration evidence, not a retirement reference.
         OwnerSnapshotRowValueV1::LegacyProjectSelector {
             selector_kind,
             literal_selector,
+            ..
         } => retirement_commitment(&(
             row.stable_row_id.as_str(),
             "legacy_project_selector",

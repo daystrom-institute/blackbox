@@ -710,6 +710,18 @@ pub enum LegacySelectorKindV1 {
     AbsolutePath,
 }
 
+/// One legacy-selector observation: a store, a selector, and the owner rows that
+/// carry it.
+///
+/// `member_row_count` is 1 for the small per-row stores, where an observation IS
+/// a row. It is not for a line-oriented owner: edge lanes hold millions of
+/// `cwd`-bearing rows over a couple of hundred distinct selectors, so that owner
+/// contributes ONE observation per (lane, selector) and carries the evidence the
+/// plan needs as a count plus a canonical ordered commitment over the member row
+/// ids - the same idiom section 6.3 fixed for commit namespaces and project refs.
+/// A per-row expansion could not fit `MAX_PROJECT_CATALOG_ENTRIES` on any real
+/// host, and nothing downstream consumed per-row identity: classification,
+/// planning, and stamping all key on the selector.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyPathObservationV1 {
@@ -718,6 +730,9 @@ pub struct LegacyPathObservationV1 {
     pub stable_row_id: String,
     pub selector_kind: LegacySelectorKindV1,
     pub selector_digest: Sha256ValueV1,
+    pub member_row_count: u64,
+    /// Domain-separated hash over the member row ids in the owner's walk order.
+    pub member_commitment_sha256: Sha256ValueV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1437,6 +1452,11 @@ impl V1ProjectCatalogInventory {
         for row in &self.legacy_path_observations {
             insert_observation(&mut observations, &row.observation_id)?;
             validate_stable_id(&row.stable_row_id, "legacy path row id")?;
+            // An observation standing for no owner rows is evidence of nothing,
+            // and would plan a stamping obligation with nothing to stamp.
+            if row.member_row_count == 0 {
+                return Err(invalid("legacy path observation has no member rows"));
+            }
         }
         for row in &self.legacy_namespace_clusters {
             insert_observation(&mut observations, &row.observation_id)?;
@@ -6425,6 +6445,8 @@ pub(crate) mod tests {
                 stable_row_id: "knowledge_1".to_string(),
                 selector_kind: LegacySelectorKindV1::ProjectAndRelativePath,
                 selector_digest: digest_path("/workspace/acme/alpha/src/Example.java"),
+                member_row_count: 1,
+                member_commitment_sha256: digest_path("knowledge_1"),
             }],
             repo_grouping_proofs: vec![RepoGroupingProofV1::IdenticalCommittedRecordedAuthority {
                 proof_id: "proof_authority".to_string(),

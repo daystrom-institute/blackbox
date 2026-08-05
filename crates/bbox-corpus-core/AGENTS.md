@@ -62,6 +62,17 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   by raising the buffered budget, and never move a buffered owner onto the
   streaming lane casually: the streamed digest is byte-identical to the
   buffered one, but the lanes differ in what they refuse.
+- A legacy-selector observation names a SET of owner rows, not necessarily one.
+  Small stores emit singletons (`legacy_selector`); an owner whose rows
+  outnumber what a canonical inventory can hold emits one observation per
+  (subsource, selector) with a count and an ordered member commitment
+  (`legacy_selector_aggregate` + `LegacySelectorMembersBuilderV1`, folded
+  incrementally so the ids are never held). The commitment is over WALK order,
+  not sorted order, so re-deriving it proves a verify re-read the same rows
+  rather than merely the same set, and it is committed into the row hash so an
+  aggregate whose membership moved cannot present unchanged evidence. An
+  observation with zero members is refused: it would plan an obligation with
+  nothing to apply.
 
 ## Rerank math (search/rerank.rs)
 

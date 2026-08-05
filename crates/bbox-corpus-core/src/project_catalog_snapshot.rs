@@ -80,11 +80,85 @@ pub enum LegacyProjectSelectorKindV1 {
     AbsolutePath,
 }
 
+/// Which owner rows one legacy-selector observation stands for.
+///
+/// Most owners are small stores where an observation IS one row, and the
+/// singleton form says exactly that. Line-oriented owners are different in
+/// kind: an edge-lane host carries millions of rows over a couple of hundred
+/// distinct selectors, and a per-row ledger cannot fit the canonical inventory
+/// at all. Those owners emit ONE observation per (subsource, selector) carrying
+/// the same evidence the plan actually needs - how many rows it stands for, and
+/// a canonical ordered commitment over their ids - so a dropped, duplicated, or
+/// substituted member cannot hide behind an unchanged observation.
+///
+/// The commitment is over member ids in WALK ORDER, not sorted: the order is a
+/// property of the source the owner just read, and re-deriving it is how a
+/// verify proves it re-read the same rows rather than merely the same set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySelectorMembersV1 {
+    pub row_count: u64,
+    pub commitment_sha256: String,
+}
+
+const LEGACY_SELECTOR_MEMBERS_DOMAIN: &[u8] =
+    b"blackbox.project-catalog.legacy-selector-members.v1";
+
+/// Builds a [`LegacySelectorMembersV1`] one member at a time.
+///
+/// Incremental by construction: an owner aggregating millions of lane rows must
+/// never hold their ids, only fold them.
+#[derive(Debug, Clone)]
+pub struct LegacySelectorMembersBuilderV1 {
+    hasher: Sha256,
+    row_count: u64,
+}
+
+impl Default for LegacySelectorMembersBuilderV1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LegacySelectorMembersBuilderV1 {
+    pub fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, LEGACY_SELECTOR_MEMBERS_DOMAIN);
+        Self {
+            hasher,
+            row_count: 0,
+        }
+    }
+
+    pub fn push(&mut self, member_row_id: &str) {
+        hash_field(&mut self.hasher, member_row_id.as_bytes());
+        self.row_count = self.row_count.saturating_add(1);
+    }
+
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    pub fn finish(self) -> LegacySelectorMembersV1 {
+        LegacySelectorMembersV1 {
+            row_count: self.row_count,
+            commitment_sha256: hex::encode(self.hasher.finalize()),
+        }
+    }
+}
+
+/// The member set of an observation that stands for exactly itself.
+pub fn singleton_selector_members(stable_row_id: &str) -> LegacySelectorMembersV1 {
+    let mut builder = LegacySelectorMembersBuilderV1::new();
+    builder.push(stable_row_id);
+    builder.finish()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerSnapshotRowValueV1 {
     LegacyProjectSelector {
         selector_kind: LegacyProjectSelectorKindV1,
         literal_selector: String,
+        members: LegacySelectorMembersV1,
     },
     InventoryTarget {
         project_id: String,
@@ -99,16 +173,38 @@ pub struct OwnerSnapshotRowV1 {
 }
 
 impl OwnerSnapshotRowV1 {
+    /// An observation that stands for exactly ONE owner row: itself.
+    ///
+    /// The shape every small store uses. An owner whose rows outnumber what a
+    /// canonical inventory can hold aggregates instead, through
+    /// [`Self::legacy_selector_aggregate`].
     pub fn legacy_selector(
         stable_row_id: impl Into<String>,
         selector_kind: LegacyProjectSelectorKindV1,
         literal_selector: impl Into<String>,
+    ) -> Self {
+        let stable_row_id = stable_row_id.into();
+        let members = singleton_selector_members(&stable_row_id);
+        Self::legacy_selector_aggregate(stable_row_id, selector_kind, literal_selector, members)
+    }
+
+    /// An observation standing for a SET of owner rows that share one selector.
+    ///
+    /// The observation id is the owner's name for the set, not for any member,
+    /// and the apply side resolves it by re-walking the source rather than by
+    /// looking up one row.
+    pub fn legacy_selector_aggregate(
+        stable_row_id: impl Into<String>,
+        selector_kind: LegacyProjectSelectorKindV1,
+        literal_selector: impl Into<String>,
+        members: LegacySelectorMembersV1,
     ) -> Self {
         Self {
             stable_row_id: stable_row_id.into(),
             value: OwnerSnapshotRowValueV1::LegacyProjectSelector {
                 selector_kind,
                 literal_selector: literal_selector.into(),
+                members,
             },
         }
     }
@@ -1223,7 +1319,77 @@ impl std::error::Error for StreamedOwnerTreeErrorV1 {}
 
 /// How many bytes one read syscall takes. The streaming lane's resident set is
 /// this plus the longest line it has seen, and nothing else.
-const STREAMED_CHUNK_BYTES: usize = 64 * 1024;
+pub const STREAMED_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Splits streamed chunks into complete lines, preserving each line's EXACT
+/// terminator.
+///
+/// The one definition of "where do this owner's lines begin and end", shared by
+/// the capture that reads a lane and the stamp that rewrites it. They must
+/// agree: capture numbers rows by line and the stamp copies every line it did
+/// not change through byte for byte, so a splitter that disagreed with itself
+/// would either renumber rows or corrupt the file.
+///
+/// Reproduces `split_inclusive('\n')` exactly: a trailing terminator does not
+/// mint an empty final line, an unterminated tail IS a line, and `\r` belongs
+/// to the terminator only when a `\n` actually followed it.
+pub struct StreamedLineSplitterV1 {
+    line: Vec<u8>,
+    max_line_bytes: usize,
+}
+
+impl StreamedLineSplitterV1 {
+    pub fn new(max_line_bytes: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            max_line_bytes,
+        }
+    }
+
+    /// Feed one chunk, calling `on_line(content, terminator)` for every line the
+    /// chunk completes.
+    pub fn push_chunk(
+        &mut self,
+        chunk: &[u8],
+        mut on_line: impl FnMut(&[u8], &[u8]) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        let mut rest = chunk;
+        while let Some(position) = rest.iter().position(|byte| *byte == b'\n') {
+            self.line.extend_from_slice(&rest[..position]);
+            self.check_bound()?;
+            let (content, terminator) = if self.line.last() == Some(&b'\r') {
+                (&self.line[..self.line.len() - 1], &b"\r\n"[..])
+            } else {
+                (&self.line[..], &b"\n"[..])
+            };
+            on_line(content, terminator)?;
+            self.line.clear();
+            rest = &rest[position + 1..];
+        }
+        self.line.extend_from_slice(rest);
+        // Checked every chunk, not only at a terminator, so an unterminated
+        // multi-gigabyte "line" is refused instead of buffered.
+        self.check_bound()
+    }
+
+    /// Emit the unterminated tail, if the source had one.
+    pub fn finish(
+        self,
+        on_line: impl FnOnce(&[u8], &[u8]) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        if self.line.is_empty() {
+            return Ok(());
+        }
+        on_line(&self.line, b"")
+    }
+
+    fn check_bound(&self) -> Result<(), &'static str> {
+        if self.line.len() > self.max_line_bytes {
+            return Err("owner_source_line_limit");
+        }
+        Ok(())
+    }
+}
 
 /// Capture a line-oriented owner tree by streaming, with the same two-identical-
 /// scans stability contract [`capture_stable_regular_tree_nofollow`] gives the
@@ -1236,17 +1402,24 @@ const STREAMED_CHUNK_BYTES: usize = 64 * 1024;
 /// all - it only digests - and the rows come from the pass that has to agree
 /// with it.
 ///
-/// `new_lane` builds the owner's per-file decoding state and `decode_line`
-/// advances it. A FRESH state is built for every file in every pass, so a pass
+/// `new_lane` builds the owner's per-file decoding state, `decode_line`
+/// advances it, and `finish_lane` turns the finished state into that file's
+/// rows. A FRESH state is built for every file in every pass, so a pass
 /// abandoned mid-tree can never leak occurrence counters or partial rows into
 /// the retry that replaces it.
+///
+/// Rows come out of `finish_lane` rather than out of `decode_line` because an
+/// owner that AGGREGATES cannot know a row until it has seen the whole file: a
+/// per-line emitter would force it to either buffer members or emit a row it
+/// then has to revise.
 pub fn capture_stable_streamed_tree_nofollow<D>(
     root: &Path,
     source_id: &str,
     limits: OwnerSnapshotLimitsV1,
     include: impl Fn(&Path) -> bool + Copy,
     new_lane: impl Fn(&str) -> D + Copy,
-    decode_line: impl Fn(&mut D, &[u8]) -> Result<Option<OwnerSnapshotRowV1>, &'static str> + Copy,
+    decode_line: impl Fn(&mut D, &[u8]) -> Result<(), &'static str> + Copy,
+    finish_lane: impl Fn(D) -> Result<Vec<OwnerSnapshotRowV1>, &'static str> + Copy,
 ) -> Result<Vec<StreamedOwnerFileV1>, StreamedOwnerTreeErrorV1> {
     validate_limits(limits)?;
     let authority = crate::json_store::NofollowDirectory::open_existing(root)
@@ -1263,13 +1436,19 @@ pub fn capture_stable_streamed_tree_nofollow<D>(
         limits,
         include,
         |_subsource_id: &str| (),
-        |_lane: &mut (), _line: &[u8]| -> Result<Option<OwnerSnapshotRowV1>, &'static str> {
-            Ok(None)
-        },
+        |_lane: &mut (), _line: &[u8]| -> Result<(), &'static str> { Ok(()) },
+        |_lane: ()| -> Result<Vec<OwnerSnapshotRowV1>, &'static str> { Ok(Vec::new()) },
     )?;
     for _ in 0..3 {
-        let current =
-            stream_regular_tree_nofollow(root, source_id, limits, include, new_lane, decode_line)?;
+        let current = stream_regular_tree_nofollow(
+            root,
+            source_id,
+            limits,
+            include,
+            new_lane,
+            decode_line,
+            finish_lane,
+        )?;
         if streamed_states_agree(&prior, &current) {
             authority
                 .ensure_still_current()
@@ -1306,7 +1485,8 @@ fn stream_regular_tree_nofollow<D>(
     limits: OwnerSnapshotLimitsV1,
     include: impl Fn(&Path) -> bool,
     new_lane: impl Fn(&str) -> D,
-    decode_line: impl Fn(&mut D, &[u8]) -> Result<Option<OwnerSnapshotRowV1>, &'static str>,
+    decode_line: impl Fn(&mut D, &[u8]) -> Result<(), &'static str>,
+    finish_lane: impl Fn(D) -> Result<Vec<OwnerSnapshotRowV1>, &'static str>,
 ) -> Result<Vec<StreamedOwnerFileV1>, StreamedOwnerTreeErrorV1> {
     // Per PASS, never across passes: a retried pass re-reads the same tree and
     // must be allowed the same work as the pass it replaces.
@@ -1316,32 +1496,27 @@ fn stream_regular_tree_nofollow<D>(
     for relative in enumerate_regular_tree_nofollow(root, limits, include)? {
         let subsource_id = stable_subsource_id(source_id, &relative);
         let mut lane = new_lane(subsource_id.as_str());
-        let mut rows = Vec::new();
+        let fail = |code: &'static str| StreamedOwnerTreeErrorV1 {
+            code,
+            subsource_id: Some(subsource_id.clone()),
+        };
         let state = stream_regular_file_nofollow(
             &root.join(&relative),
             source_id,
             &subsource_id,
             limits,
             &mut budget,
-            |line| {
-                let Some(row) = decode_line(&mut lane, line)? else {
-                    return Ok(());
-                };
-                rows_seen += 1;
-                // Enforced HERE rather than only in `build_owner_snapshot` so a
-                // pathological tree is refused before its rows are accumulated,
-                // not after.
-                if rows_seen > limits.max_rows {
-                    return Err("owner_row_limit");
-                }
-                rows.push(row);
-                Ok(())
-            },
+            |line| decode_line(&mut lane, line),
         )
-        .map_err(|code| StreamedOwnerTreeErrorV1 {
-            code,
-            subsource_id: Some(subsource_id.clone()),
-        })?;
+        .map_err(fail)?;
+        let rows = finish_lane(lane).map_err(fail)?;
+        rows_seen = rows_seen.saturating_add(rows.len());
+        // Enforced HERE rather than only in `build_owner_snapshot` so a tree
+        // whose rows cannot fit is refused as it is walked, not after the whole
+        // set has been accumulated.
+        if rows_seen > limits.max_rows {
+            return Err(fail("owner_row_limit"));
+        }
         files.push(StreamedOwnerFileV1 {
             relative,
             subsource_id,
@@ -1405,7 +1580,7 @@ fn stream_regular_file_nofollow(
     let mut hasher = Sha256::new();
     let mut byte_len = 0u64;
     let mut chunk = vec![0u8; STREAMED_CHUNK_BYTES];
-    let mut line: Vec<u8> = Vec::new();
+    let mut splitter = StreamedLineSplitterV1::new(limits.max_streamed_line_bytes);
     loop {
         let read = match file.read(&mut chunk) {
             Ok(0) => break,
@@ -1421,32 +1596,9 @@ fn stream_regular_file_nofollow(
             .ok_or("owner_source_byte_limit")?;
         hasher.update(&chunk[..read]);
         byte_len += read as u64;
-
-        let mut rest = &chunk[..read];
-        while let Some(position) = rest.iter().position(|byte| *byte == b'\n') {
-            line.extend_from_slice(&rest[..position]);
-            if line.len() > limits.max_streamed_line_bytes {
-                return Err("owner_source_line_limit");
-            }
-            let content = if line.last() == Some(&b'\r') {
-                &line[..line.len() - 1]
-            } else {
-                &line[..]
-            };
-            on_line(content)?;
-            line.clear();
-            rest = &rest[position + 1..];
-        }
-        line.extend_from_slice(rest);
-        // Checked every chunk, not only at a terminator, so an unterminated
-        // multi-gigabyte "line" is refused instead of buffered.
-        if line.len() > limits.max_streamed_line_bytes {
-            return Err("owner_source_line_limit");
-        }
+        splitter.push_chunk(&chunk[..read], |content, _terminator| on_line(content))?;
     }
-    if !line.is_empty() {
-        on_line(&line)?;
-    }
+    splitter.finish(|content, _terminator| on_line(content))?;
     Ok(OwnerSnapshotStateV1::Present {
         content_sha256: hex::encode(hasher.finalize()),
         byte_len,
@@ -1462,7 +1614,11 @@ fn stream_regular_file_nofollow(
 /// Deliberately returns VISIT order rather than sorted order: the buffered
 /// caller applies a cumulative byte budget while it reads, so the order it sees
 /// files in is part of its observable behavior.
-fn enumerate_regular_tree_nofollow(
+///
+/// Public because the apply half of a streaming owner needs the tree rules
+/// without the reads: it locates the ONE file an obligation names and must
+/// never pay for reading the rest.
+pub fn enumerate_regular_tree_nofollow(
     root: &Path,
     limits: OwnerSnapshotLimitsV1,
     include: impl Fn(&Path) -> bool,
@@ -1622,17 +1778,29 @@ pub fn build_owner_snapshot(
             });
         }
         if let OwnerSnapshotRowValueV1::LegacyProjectSelector {
-            literal_selector, ..
+            literal_selector,
+            members,
+            ..
         } = &row.value
-            && (literal_selector.is_empty()
+        {
+            if literal_selector.is_empty()
                 || literal_selector.len() > limits.max_selector_bytes
                 || literal_selector
                     .bytes()
-                    .any(|byte| byte == 0 || byte.is_ascii_control()))
-        {
-            return Err(OwnerSnapshotError {
-                code: "owner_selector_invalid",
-            });
+                    .any(|byte| byte == 0 || byte.is_ascii_control())
+            {
+                return Err(OwnerSnapshotError {
+                    code: "owner_selector_invalid",
+                });
+            }
+            // An observation standing for NO rows is not evidence of anything.
+            // Refusing it here is what stops an aggregating owner from
+            // reporting an empty selector group as a stamping obligation.
+            if members.row_count == 0 || !valid_sha256(&members.commitment_sha256) {
+                return Err(OwnerSnapshotError {
+                    code: "owner_selector_members_invalid",
+                });
+            }
         }
         if let OwnerSnapshotRowValueV1::InventoryTarget {
             project_id,
@@ -1890,6 +2058,7 @@ fn hash_row(hasher: &mut Sha256, row: &OwnerSnapshotRowV1) {
         OwnerSnapshotRowValueV1::LegacyProjectSelector {
             selector_kind,
             literal_selector,
+            members,
         } => {
             hash_field(hasher, b"legacy_selector");
             hash_field(
@@ -1903,6 +2072,11 @@ fn hash_row(hasher: &mut Sha256, row: &OwnerSnapshotRowV1) {
                 },
             );
             hash_field(hasher, literal_selector.as_bytes());
+            // The member set is EVIDENCE, so it is committed: an aggregate
+            // whose membership changed must not present an unchanged row
+            // commitment to a verify that only compares hashes.
+            hash_field(hasher, &members.row_count.to_be_bytes());
+            hash_field(hasher, members.commitment_sha256.as_bytes());
         }
         OwnerSnapshotRowValueV1::InventoryTarget {
             project_id,
@@ -1928,29 +2102,29 @@ mod streamed_owner_tree {
     /// exact line sequence the walk produced.
     struct LineProbe {
         subsource_id: String,
-        index: usize,
+        rows: Vec<OwnerSnapshotRowV1>,
     }
 
     fn new_probe(subsource_id: &str) -> LineProbe {
         LineProbe {
             subsource_id: subsource_id.to_string(),
-            index: 0,
+            rows: Vec::new(),
         }
     }
 
-    fn probe_line(
-        probe: &mut LineProbe,
-        line: &[u8],
-    ) -> Result<Option<OwnerSnapshotRowV1>, &'static str> {
+    fn probe_line(probe: &mut LineProbe, line: &[u8]) -> Result<(), &'static str> {
         let text = std::str::from_utf8(line).map_err(|_| "probe_line_invalid")?;
-        let row = OwnerSnapshotRowV1::legacy_selector(
-            format!("{}:{}", probe.subsource_id, probe.index),
+        probe.rows.push(OwnerSnapshotRowV1::legacy_selector(
+            format!("{}:{}", probe.subsource_id, probe.rows.len()),
             LegacyProjectSelectorKindV1::AbsolutePath,
             // Bracketed so an empty line is still a legible, non-empty literal.
             format!("[{text}]"),
-        );
-        probe.index += 1;
-        Ok(Some(row))
+        ));
+        Ok(())
+    }
+
+    fn finish_probe(probe: LineProbe) -> Result<Vec<OwnerSnapshotRowV1>, &'static str> {
+        Ok(probe.rows)
     }
 
     fn capture(
@@ -1964,6 +2138,7 @@ mod streamed_owner_tree {
             |relative| relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl"),
             new_probe,
             probe_line,
+            finish_probe,
         )
     }
 
@@ -2069,6 +2244,31 @@ mod streamed_owner_tree {
             capture(&root, limits).unwrap_err().code,
             "owner_source_line_limit"
         );
+    }
+
+    /// The member commitment is ORDERED and count-bearing: a set that lost a
+    /// member, gained one, or saw the same members in another order must not
+    /// present the same evidence.
+    #[test]
+    fn the_member_commitment_moves_with_membership_and_order() {
+        let of = |members: &[&str]| {
+            let mut builder = LegacySelectorMembersBuilderV1::new();
+            for member in members {
+                builder.push(member);
+            }
+            builder.finish()
+        };
+
+        let base = of(&["a", "b", "c"]);
+        assert_eq!(base.row_count, 3);
+        assert_eq!(of(&["a", "b", "c"]), base);
+        assert_ne!(of(&["a", "c", "b"]), base);
+        assert_ne!(of(&["a", "b"]), base);
+        assert_ne!(of(&["a", "b", "c", "c"]), base);
+        // Concatenation cannot be forged across a member boundary: the ids are
+        // length-prefixed, so "ab" + "c" is not "a" + "bc".
+        assert_ne!(of(&["ab", "c"]), of(&["a", "bc"]));
+        assert_eq!(singleton_selector_members("a"), of(&["a"]));
     }
 
     /// Rows are counted as they stream, so a pathological tree is refused
@@ -2208,6 +2408,7 @@ mod tests {
             OwnerSnapshotRowValueV1::LegacyProjectSelector {
                 selector_kind: LegacyProjectSelectorKindV1::AbsolutePath,
                 literal_selector,
+                ..
             } if literal_selector == "/repo/a"
         ));
 
