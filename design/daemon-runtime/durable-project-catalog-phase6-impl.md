@@ -1467,10 +1467,14 @@ disposition (presence for `SeedG1`, D-040 pointer absence for
 `NoPublishedContentAcknowledged`), with first publication reserved for
 the D-040 Establish operation.
 
-Lock discipline: preflight acquires the shared lifetime lock and the store
-mutation lock through `capture_migration_preflight_with`
-(`project_catalog_store.rs:4225-4238`), matching governing section 6.3; apply
-uses exclusive-then-downgrade with point-in-time exclusivity at acquisition
+Lock discipline: the MIGRATION preflight's raw-file capture acquires the
+shared lifetime lock and the store mutation lock through
+`capture_migration_preflight_with` (`project_catalog_store.rs:4225-4238`),
+matching governing section 6.3; NEW-VERB preflights whose capture opens
+the store instead hold the shared lifetime lock directly and rely on the
+store's mutation-locked strict read (amended section 4.1 - the two-lock
+helper self-deadlocks around a store open); apply uses
+exclusive-then-downgrade with point-in-time exclusivity at acquisition
 and the stopped-service window plus four-hash recheck as the real exclusion
 (`open_admin_store` at `src/bin/blackbox.rs:857-882`).
 
