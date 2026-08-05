@@ -43,7 +43,7 @@ use crate::project_catalog_migration::{
     ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogTargetSelectionV1,
     validate_artifact_set, validate_target_selection,
 };
-use crate::project_catalog_store::{ProjectCatalogStore, capture_migration_preflight_with};
+use crate::project_catalog_store::ProjectCatalogStore;
 
 pub const DURABLE_BACKFILL_REPORT_VERSION_V1: u32 = 1;
 pub const DURABLE_BACKFILL_RESOLUTION_VERSION_V1: u32 = 1;
@@ -1240,25 +1240,30 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             .layout
             .accepted_publication_generations_for_backfill();
 
-        let (epoch, catalog_hash, attachment_hash, attachments) = capture_migration_preflight_with(
-            &projects_path,
-            |error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()),
-            || {
-                let store = ProjectCatalogStore::open_existing(&projects_path)
-                    .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
-                let state = store
-                    .snapshot()
-                    .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
-                Ok((
-                    state.epoch(),
-                    Sha256ValueV1::parse(state.catalog_sha256().to_string())
-                        .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?,
-                    Sha256ValueV1::parse(state.attachments_sha256().to_string())
-                        .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?,
-                    (**state.attachments()).clone(),
-                ))
-            },
-        )?;
+        // The capture takes its locks through the STORE OPEN, not through an
+        // outer `capture_migration_preflight_with`. That is required, not a
+        // shortcut: the helper holds the store MUTATION lock across its
+        // closure, and `open_existing` acquires that same mutation lock itself
+        // on a second descriptor, so the open blocks forever on this process's
+        // own exclusive flock. Section 4.1's requirement (preflight runs under
+        // the shared lifetime lock) is satisfied by the open, which holds that
+        // lock for the store's whole lifetime, and the pair read is coherent
+        // because `read_strict_pair_locked` runs under the mutation lock the
+        // open takes for itself. Apply and verify below already open directly
+        // for the same reason; this preflight was the odd one out.
+        let store = ProjectCatalogStore::open_existing(&projects_path)
+            .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
+        let state = store
+            .snapshot()
+            .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
+        let (epoch, catalog_hash, attachment_hash, attachments) = (
+            state.epoch(),
+            Sha256ValueV1::parse(state.catalog_sha256().to_string())
+                .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?,
+            Sha256ValueV1::parse(state.attachments_sha256().to_string())
+                .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?,
+            (**state.attachments()).clone(),
+        );
 
         // A first preflight may create the canonical empty resolution at the
         // explicit path (D-026); a reviewed one already there is honoured.
@@ -1777,6 +1782,104 @@ mod tests {
     use super::*;
 
     use bbox_corpus_core::identity::PublishedScope;
+
+    /// REGRESSION: a preflight that reaches the capture must RETURN.
+    ///
+    /// An earlier revision wrapped the capture in
+    /// `capture_migration_preflight_with`, which holds the store mutation lock
+    /// across its closure, while `ProjectCatalogStore::open_existing` acquires
+    /// that same lock on a second descriptor. The open blocked forever on this
+    /// process's own exclusive flock: a deadlock, not a slow path. No unit test
+    /// caught it because every other test refuses before the capture, and no
+    /// end-to-end driver of this facade existed at all.
+    ///
+    /// The assertion is a BOUNDED WATCHDOG rather than "the test eventually
+    /// passes". A regression here is a hang, so a test that merely called
+    /// preflight would itself hang and depend on the harness hard-kill to
+    /// report - turning a bug into a two-minute gate stall. This fails in
+    /// seconds instead.
+    ///
+    /// What preflight returns is irrelevant here; reaching ANY answer proves
+    /// the capture returned. It refuses, because a store with no migration
+    /// marker has no publisher dispositions to verify.
+    #[test]
+    fn a_preflight_that_reaches_the_capture_returns_rather_than_deadlocking() {
+        use std::sync::mpsc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let projects_path = root.join("live").join("projects.json");
+        std::fs::create_dir_all(projects_path.parent().unwrap()).unwrap();
+        // Dropped immediately: the deadlock is this process re-locking a file
+        // nothing else holds, so the fixture must leave no lock behind or the
+        // test would pass for the wrong reason.
+        drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+
+        let layout = test_layout(&root);
+        let report_path = root.join("review").join("report.json");
+        let resolution_path = root.join("review").join("resolution.json");
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = ProjectCatalogDurableBackfillFacadeV1::preflight(
+                DurableBackfillPreflightRequestV1 {
+                    layout,
+                    target_selection: ProjectCatalogTargetSelectionV1::Configured,
+                    report_path,
+                    resolution_path,
+                    publisher_dispositions: Vec::new(),
+                    stamper: Arc::new(PartialStamper),
+                    generated_at: "2026-08-05T00:00:00Z".to_string(),
+                },
+            );
+            // The VERDICT is irrelevant; returning one at all is the proof.
+            let _ = sender.send(
+                outcome
+                    .map(|receipt| receipt.status)
+                    .map_err(|error| error.code),
+            );
+        });
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect(
+                "durable-backfill preflight deadlocked: its capture must not run inside a helper \
+                 that already holds the store mutation lock, because open_existing re-acquires \
+                 that lock on a second descriptor",
+            );
+    }
+
+    /// Mirrors `project_catalog_rebuild_planning.rs`'s helper of the same name.
+    ///
+    /// `vectors_dir` is explicit and load-bearing: the vector root defaults to
+    /// the PLATFORM state directory (R33F1), so a fixture that omitted it would
+    /// reach the host's real vector store.
+    fn test_layout(root: &Path) -> ProjectCatalogMigrationResolvedLayoutV1 {
+        let _guard = bbox_util::util::test_env_lock();
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+                root.join("live"),
+                root.join("live").join("vectors")
+            ),
+        )
+        .unwrap();
+        let config = bbox_config::config::load_with(bbox_config::config::LoadOptions {
+            config_path: Some(config_path),
+            ..Default::default()
+        })
+        .unwrap();
+        ProjectCatalogMigrationResolvedLayoutV1::from_config(
+            &config,
+            crate::project_catalog_migration::ProjectCatalogMigrationLayoutOverridesV1 {
+                state_dir: Some(root.join("live")),
+                projects_path: Some(root.join("live").join("projects.json")),
+            },
+        )
+        .unwrap()
+    }
 
     fn binding_id(seed: &str) -> LegacyPathBindingId {
         let mut hex = seed.to_string();

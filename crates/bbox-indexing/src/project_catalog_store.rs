@@ -4222,6 +4222,29 @@ pub(crate) fn capture_migration_preflight<T>(
     capture_migration_preflight_with(projects_path, |error| error, capture)
 }
 
+/// Run a read-only preflight capture under the shared lifetime lock AND the
+/// store mutation lock.
+///
+/// PRECONDITION, and it is a deadlock if you break it: the `capture` closure
+/// MUST NOT open a [`ProjectCatalogStore`]. This function holds the store
+/// mutation lock across the closure, and `open_existing` acquires that same
+/// mutation lock itself through a SECOND file descriptor
+/// (`open_existing_with_registry_and_io`), so the open blocks forever on this
+/// process's own exclusive flock. It is a hang with no diagnostic, not an
+/// error.
+///
+/// This hazard class is already named in the codebase for the LIFETIME lock:
+/// `open_admin_store` downgrades its exclusive guard to shared before opening
+/// precisely because, in its own words, "holding exclusive across the open
+/// would deadlock against it" (plan section 4.2). The mutation lock has the
+/// same property and no downgrade to soften it.
+///
+/// So this helper is for captures that read RAW FILES with no store open - the
+/// v1 migration captures, where there is no v2 store to provide inner locking
+/// and this outer mutation lock is the only pair-read coherence there is
+/// (plan section 4.1, scoped to raw-file captures). A caller that wants a
+/// v2 store should open it directly and let the open take both locks itself,
+/// as the backfill and rebuild preflights do.
 pub(crate) fn capture_migration_preflight_with<T, E>(
     projects_path: &Path,
     map_lock_error: impl Fn(ProjectCatalogStoreError) -> E,
