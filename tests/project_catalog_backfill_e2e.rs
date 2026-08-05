@@ -309,7 +309,22 @@ fn write_generation(
     )
 }
 
-fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
+/// `register_history_projects` adds one v1 project, checkout, and `.bbox`
+/// repo_id marker per rebuild namespace.
+///
+/// Without them the four staged namespaces are `Unclaimed` at migration time
+/// and the preflight refuses every one with `unsupported_legacy_namespace`,
+/// which is why the Drift chain stages AFTER the capture instead. Registering
+/// them makes each one `Proved` - exactly one project per repo_id, so no new
+/// scope or activation conflict appears and the existing resolution ceremony
+/// is untouched. The four buckets are then assigned post-migration by
+/// `bind_rebuild_history_records`, where they belong: bucket membership is a
+/// CATALOG fact, not a v1 attribution fact.
+fn prepare_rehearsal(
+    root: &Path,
+    config: &Config,
+    register_history_projects: bool,
+) -> RehearsalFixture {
     let winner_checkout = root.join("checkouts").join("winner-checkout");
     fs::create_dir_all(&winner_checkout).unwrap();
     git(&winner_checkout, &["init", "-q"]);
@@ -361,16 +376,38 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
         initialize_empty_provenance_ref(checkout, config);
     }
 
+    let history_projects: Vec<(ProjectId, &str, PathBuf)> = if register_history_projects {
+        REBUILD_NAMESPACE_STAGING
+            .iter()
+            .map(|(namespace, _)| {
+                let checkout = root.join("checkouts").join(format!("{namespace}-checkout"));
+                fs::create_dir_all(&checkout).unwrap();
+                git(&checkout, &["init", "-q"]);
+                git(&checkout, &["checkout", "-qb", "main"]);
+                write(
+                    &checkout.join(".bbox/config.toml"),
+                    format!("[project]\nrepo_id = \"{namespace}\"\n").as_bytes(),
+                );
+                git(&checkout, &["add", ".bbox"]);
+                git(&checkout, &["commit", "-qm", "seed history namespace"]);
+                initialize_empty_provenance_ref(&checkout, config);
+                (
+                    ProjectId::parse(format!("project-{namespace}")).unwrap(),
+                    *namespace,
+                    checkout,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let state = root.join("state");
     initialize_empty_owner_state(root);
     let winner_project = ProjectId::parse("neutral-winner").unwrap();
     let collision_winner_project = ProjectId::parse("neutral-collision-winner").unwrap();
     let loser_project = ProjectId::parse("neutral-loser").unwrap();
-    write(
-        &state.join("projects.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 1,
-            "projects": [
+    let mut project_rows = serde_json::json!([
                 {
                     "project_id": winner_project,
                     "repo_id": "neutral-repository",
@@ -398,7 +435,26 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
                     "languages": [],
                     "aliases": []
                 }
-            ]
+    ]);
+    for (ordinal, (project_id, repo_id, checkout)) in history_projects.iter().enumerate() {
+        project_rows
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "project_id": project_id,
+                "repo_id": repo_id,
+                "canonical_path": checkout,
+                "registered_at": format!("2026-01-02T03:05:{:02}Z", ordinal),
+                "is_git_repo": true,
+                "languages": [],
+                "aliases": []
+            }));
+    }
+    write(
+        &state.join("projects.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "projects": project_rows,
         }))
         .unwrap()
         .as_slice(),
@@ -480,11 +536,22 @@ fn prepare_rehearsal(root: &Path, config: &Config) -> RehearsalFixture {
 /// with no marker). Hand-installing a marker is also not an option: markers are
 /// journal-bound on every read, so a fabricated one without a matching
 /// transaction journal refuses. The ceremony is the only honest route.
-fn migrated_rehearsal_root(root: &Path) -> (ProjectCatalogMigrationResolvedLayoutV1, Config) {
+///
+/// `stage_legacy_history` stages the four rebuild namespaces into the index
+/// BEFORE the migration captures it, which is the only way an Equality proof is
+/// reachable (Q-F). The recorded source fingerprint folds the index's own commit
+/// rows, so a namespace staged AFTER the capture makes the recomputed
+/// fingerprint differ by construction and lands the rebuild in Drift. Staging
+/// before it also puts every namespace in the asset, which Equality mode then
+/// holds to its recorded count and commitment - the strictness is the point.
+fn migrated_rehearsal_root(
+    root: &Path,
+    stage_legacy_history: bool,
+) -> (ProjectCatalogMigrationResolvedLayoutV1, Config) {
     let config = config(root);
     let rehearsal_root = root.join("rehearsal");
     fs::create_dir_all(&rehearsal_root).unwrap();
-    let fixture = prepare_rehearsal(&rehearsal_root, &config);
+    let fixture = prepare_rehearsal(&rehearsal_root, &config, stage_legacy_history);
     let review = rehearsal_root.join("review");
     fs::create_dir_all(&review).unwrap();
 
@@ -501,6 +568,13 @@ fn migrated_rehearsal_root(root: &Path) -> (ProjectCatalogMigrationResolvedLayou
         },
     )
     .unwrap();
+
+    if stage_legacy_history {
+        let index_root = rehearsal.rebuild_index_paths().index_root;
+        for (namespace, commits) in REBUILD_NAMESPACE_STAGING {
+            stage_commit_documents(&index_root, namespace, *commits);
+        }
+    }
 
     let report_path = review.join("report.json");
     let resolution_path = review.join("resolution.json");
@@ -545,7 +619,8 @@ fn migrated_rehearsal_root(root: &Path) -> (ProjectCatalogMigrationResolvedLayou
     assert_eq!(
         clean.receipt.status,
         ProjectCatalogMigrationStatusV1::Clean,
-        "the fixture's migration preflight must be clean"
+        "the fixture's migration preflight must be clean: {}",
+        String::from_utf8_lossy(&fs::read(&report_path).unwrap())
     );
     ProjectCatalogMigrationFacadeV1::apply_rehearsal(ProjectCatalogMigrationApplyRequestV1 {
         rehearsal_layout: rehearsal.clone(),
@@ -593,9 +668,20 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// The same root with the rebuild's legacy history staged BEFORE the
+    /// migration captured it, so the recorded source fingerprint folds those
+    /// commit rows and an Equality proof becomes reachable (Q-F).
+    fn with_history_staged_before_capture() -> Self {
+        Self::build(true)
+    }
+
+    fn build(stage_legacy_history: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let (layout, _config) = migrated_rehearsal_root(&root);
+        let (layout, _config) = migrated_rehearsal_root(&root, stage_legacy_history);
 
         let owners = layout.stamper_owner_paths();
         // ISOLATION ASSERTION (carried condition): every owner path the
@@ -1075,6 +1161,15 @@ const REBUILD_OUTGOING_SCHEMA: &str = "outgoing-test-schema";
 /// the re-emitted documents do not reproduce it.
 const REBUILD_OUTGOING_HOST_PATH: &str = "/host-checkouts/outgoing-fixture";
 
+/// The staged population, one entry per manifest bucket. Shared by both
+/// staging points so the two chains cover the identical four dispositions.
+const REBUILD_NAMESPACE_STAGING: &[(&str, usize)] = &[
+    (REBUILD_OWNED_NAMESPACE, 3),
+    (REBUILD_COMPAT_NAMESPACE, 2),
+    (REBUILD_AMBIGUOUS_NAMESPACE, 2),
+    (REBUILD_UNCLAIMED_NAMESPACE, 1),
+];
+
 /// A migrated root carrying rebuildable legacy history in all four dispositions.
 struct RebuildFixture {
     fixture: Fixture,
@@ -1095,16 +1190,41 @@ impl RebuildFixture {
     /// 3. the marker is stamped AFTER every index write, because reopening a
     ///    marker-mismatched index triggers the very replacement under test.
     fn new() -> Self {
-        let fixture = Fixture::new();
+        Self::build(true)
+    }
+
+    /// The same root left at the RUNNING `INDEX_SCHEMA_VERSION` (Q-F).
+    ///
+    /// This is the shape a real Phase 6 cut is in, and the shape that made the
+    /// contradiction visible. The migration refuses to capture a
+    /// marker-mismatched index as `Corrupt`, so an index left at the running
+    /// version is the only one whose recomputed source fingerprint can fold the
+    /// same owner state the recorded one did - which is to say, the only one
+    /// that can prove `Equality`. Under the pre-Q-F mismatch-only trigger that
+    /// same index could never be replaced, so "Equality AND Completed" had no
+    /// reachable state at all. The operator cause is what makes it reachable.
+    fn at_current_schema() -> Self {
+        Self::build(false)
+    }
+
+    fn build(stamp_outgoing_marker: bool) -> Self {
+        // The marker decides WHERE the history is staged, because the two
+        // triggers need opposite things from the source fingerprint. The
+        // mismatch chain stages after the capture and lands in Drift by
+        // construction; the operator chain stages before it so the recorded
+        // and recomputed fingerprints can agree. Same four namespaces, same
+        // four buckets, either way.
+        let fixture = if stamp_outgoing_marker {
+            let fixture = Fixture::new();
+            let index_root = fixture.layout.rebuild_index_paths().index_root;
+            for (namespace, commits) in REBUILD_NAMESPACE_STAGING {
+                stage_commit_documents(&index_root, namespace, *commits);
+            }
+            fixture
+        } else {
+            Fixture::with_history_staged_before_capture()
+        };
         let paths = fixture.layout.rebuild_index_paths();
-        for (namespace, commits) in [
-            (REBUILD_OWNED_NAMESPACE, 3),
-            (REBUILD_COMPAT_NAMESPACE, 2),
-            (REBUILD_AMBIGUOUS_NAMESPACE, 2),
-            (REBUILD_UNCLAIMED_NAMESPACE, 1),
-        ] {
-            stage_commit_documents(&paths.index_root, namespace, commits);
-        }
         bind_rebuild_history_records(&fixture.layout);
 
         // The real backfill, whose journal is the rebuild preflight's
@@ -1130,11 +1250,26 @@ impl RebuildFixture {
         );
         write(&owners.thread_store_path, br#"{"version":1,"threads":[]}"#);
 
-        write(
-            &paths.index_root.join("schema_version.txt"),
-            format!("{REBUILD_OUTGOING_SCHEMA}\n").as_bytes(),
-        );
+        if stamp_outgoing_marker {
+            write(
+                &paths.index_root.join("schema_version.txt"),
+                format!("{REBUILD_OUTGOING_SCHEMA}\n").as_bytes(),
+            );
+        }
         Self { fixture }
+    }
+
+    /// The rebuild's own artifact pair, deliberately NOT the backfill's.
+    ///
+    /// They share a directory outside the layout (Q-C confinement refuses
+    /// artifacts inside the target), but reusing the filenames would overwrite
+    /// the backfill journal's bound artifacts and turn the rebuild's
+    /// predecessor binding into a self-reference.
+    fn rebuild_artifacts(&self) -> (PathBuf, PathBuf) {
+        (
+            self.fixture.artifacts.join("rebuild-report.json"),
+            self.fixture.artifacts.join("rebuild-resolution.json"),
+        )
     }
 
     fn index_root(&self) -> PathBuf {
@@ -1220,6 +1355,46 @@ fn bind_rebuild_history_records(layout: &ProjectCatalogMigrationResolvedLayoutV1
     let epoch = store.snapshot().unwrap().epoch();
     store
         .transact(epoch, |catalog, _attachments| {
+            // Retire whatever the MIGRATION bound for these four namespaces
+            // first. In the Equality chain the namespaces are registered v1
+            // repo_ids, so the migration installs an owning record for each and
+            // `validate_catalog` refuses a second record claiming the same
+            // namespace. Bucket membership is what this function assigns, and
+            // it can only assign it from a clean slate. In the Drift chain the
+            // namespaces are post-migration and this removes nothing.
+            let staged = REBUILD_NAMESPACE_STAGING
+                .iter()
+                .map(|(name, _)| namespace(name))
+                .collect::<Vec<_>>();
+            let retired = catalog
+                .repo_histories
+                .iter()
+                .filter(|(_, record)| {
+                    staged.contains(&record.primary_namespace)
+                        || staged
+                            .iter()
+                            .any(|name| record.compatibility_namespaces.contains(name))
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            catalog.repo_histories.retain(|id, _| !retired.contains(id));
+            // A project pointing at a retired record dangles, and the
+            // authority check pairs the two directions, so the project side
+            // has to be cleared in the SAME transaction rather than left for
+            // validation to catch.
+            for project in catalog.projects.values_mut() {
+                if project
+                    .repo_history
+                    .as_ref()
+                    .is_some_and(|id| retired.contains(id))
+                {
+                    project.repo_history = None;
+                }
+            }
+            catalog
+                .ambiguous_namespaces
+                .retain(|name, _| !staged.contains(name));
+
             let owned = RepoHistoryId::parse(format!("rh_{}", "a1".repeat(16))).unwrap();
             catalog.repo_histories.insert(
                 owned.clone(),
@@ -1395,6 +1570,360 @@ fn the_shared_driver_rebuilds_legacy_history_into_every_manifest_bucket() {
     assert_eq!(manifest.prepared.proof_mode, HistoryProofModeV1::Drift);
     let refusal = require_equality_proof_mode(&manifest).unwrap_err();
     assert_eq!(refusal.code, "error.project_catalog_rebuild_proof_mode");
+}
+
+/// D1: the offline apply drives the Q-F operator-triggered replacement all the
+/// way to a COMMITTED manifest, and returns success.
+///
+/// This is the state that did not exist before Q-F. The pre-Q-F trigger was a
+/// marker mismatch, and the migration refuses to capture a mismatched marker as
+/// `Corrupt`; one pinned binary means one marker value, so "the recapture proves
+/// Equality" and "the replacement runs" could not both hold. Every earlier
+/// exercise of this path therefore stopped at a refusal, and the success return
+/// was asserted about nowhere.
+///
+/// What it drives is the REAL entrypoint, not a composition: artifact
+/// authorization, the immediate Equality recapture, recovery classification
+/// before the open, the same guard the daemon injects, the shared driver, the
+/// P3-E committer, and the committed-manifest verifier. The assertions are the
+/// two facts a receipt is allowed to claim: the drive ran (`Completed`, never
+/// `NotRequired`) and verification observed the committed manifest.
+#[test]
+fn the_offline_apply_drives_the_operator_triggered_replacement_to_committed() {
+    use bbox_corpus_index::index::history_generations::{HistoryProofModeV1, HistoryScanLimitsV1};
+    use bbox_indexing::project_catalog_rebuild::{
+        RebuildManifestBucketV1, read_committed_rebuild_manifest, require_equality_proof_mode,
+        verify_manifest_generations,
+    };
+    use bbox_indexing::project_catalog_rebuild_planning::{
+        PathFreeRebuildPreflightRequestV1, PathFreeRebuildStatusV1,
+    };
+    use blackbox::project_catalog_rebuild_admin::{
+        CatalogSchemaReplacementDriveV1, PathFreeRebuildApplyRequestV1,
+    };
+    use std::collections::BTreeSet;
+
+    // Held by THIS binding for the whole test: it owns the tempdir, and moving
+    // it into the watchdog closure destroys the root the instant the worker
+    // finishes, which reads exactly like "the manifest was never written".
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let index_root = fixture.index_root();
+    let (report_path, resolution_path) = fixture.rebuild_artifacts();
+
+    // The read-only half writes the artifacts the apply is authorized by. It
+    // must observe Equality here too: an apply cannot be authorized by a report
+    // that recorded Drift.
+    let preflight = watchdogged("the rebuild preflight", {
+        let handle = fixture.clone();
+        let (report_path, resolution_path) = (report_path.clone(), resolution_path.clone());
+        move || {
+            blackbox::project_catalog_rebuild_admin::preflight(PathFreeRebuildPreflightRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+                generated_at: "2026-08-05T00:00:02Z".to_string(),
+            })
+        }
+    })
+    .expect("the rebuild preflight must succeed against an index at the running schema");
+    assert_eq!(
+        preflight.status,
+        PathFreeRebuildStatusV1::Clean,
+        "a refused report cannot authorize an apply"
+    );
+
+    let receipt = watchdogged("the offline rebuild apply", {
+        let handle = fixture.clone();
+        move || {
+            blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+            })
+        }
+    })
+    .expect("the operator-triggered replacement must reach a committed manifest");
+
+    // `NotRequired` is the failure this receipt exists to exclude: it would
+    // mean the destructive pass never ran and nothing committed the manifest
+    // the verification below claims to have observed.
+    assert_eq!(receipt.drive, CatalogSchemaReplacementDriveV1::Completed);
+
+    let manifest = read_committed_rebuild_manifest(&index_root)
+        .expect("the P3-E pass committed the manifest, not merely prepared it");
+    // The whole point of the operator cause: Equality, on a manifest that a
+    // real destructive pass produced.
+    assert_eq!(manifest.prepared.proof_mode, HistoryProofModeV1::Equality);
+    require_equality_proof_mode(&manifest)
+        .expect("a cut-authorizing rebuild records Equality (D-036)");
+
+    // Every bucket, observed across the same four dispositions the
+    // mismatch-triggered chain covers.
+    let verified = verify_manifest_generations(&index_root, &manifest).unwrap();
+    let buckets = verified
+        .iter()
+        .map(|row| row.bucket)
+        .collect::<BTreeSet<_>>();
+    for bucket in [
+        RebuildManifestBucketV1::Owned,
+        RebuildManifestBucketV1::Compatibility,
+        RebuildManifestBucketV1::Ambiguous,
+        RebuildManifestBucketV1::Unclaimed,
+    ] {
+        assert!(
+            buckets.contains(&bucket),
+            "bucket {bucket:?} carries no verified generation: {verified:?}"
+        );
+    }
+
+    // The marker is published LAST, and it is published: an apply that
+    // returned success having left it withheld would leave the next boot
+    // classifying this store as an interrupted replacement forever.
+    assert_eq!(
+        fs::read_to_string(index_root.join("schema_version.txt"))
+            .unwrap()
+            .trim(),
+        bbox_corpus_index::index::INDEX_SCHEMA_VERSION
+    );
+}
+
+/// D1, second half: with a real Equality manifest in place, the startup gate's
+/// VERIFIED arm is reachable.
+///
+/// The refusal arms were already provable without it; the PASSING arm was not,
+/// for the same Q-F reason the success return was not. A gate that has only
+/// ever been observed refusing is a gate nobody has shown will let a correct
+/// daemon boot.
+#[test]
+fn the_startup_gate_verifies_a_committed_equality_rebuild() {
+    use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+    use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
+    use blackbox::project_catalog_rebuild_admin::{
+        PathFreeRebuildApplyRequestV1, RebuildStartupGateV1,
+    };
+
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let index_root = fixture.index_root();
+    let (report_path, resolution_path) = fixture.rebuild_artifacts();
+    watchdogged("the offline rebuild apply", {
+        let handle = fixture.clone();
+        move || {
+            blackbox::project_catalog_rebuild_admin::preflight(PathFreeRebuildPreflightRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path: report_path.clone(),
+                resolution_path: resolution_path.clone(),
+                scan_limits: HistoryScanLimitsV1::default(),
+                generated_at: "2026-08-05T00:00:02Z".to_string(),
+            })
+            .unwrap();
+            blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+            })
+            .unwrap()
+        }
+    });
+
+    let store = fixture.store();
+    let coverage = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+        &store,
+        &index_root,
+    )
+    .expect("a committed Equality manifest with every generation on disk must pass the gate");
+    let RebuildStartupGateV1::Verified {
+        cut_time_generations,
+        live_refresh_generations,
+        ..
+    } = coverage
+    else {
+        panic!("a migrated store carrying legacy namespaces is not exempt: {coverage:?}");
+    };
+    assert!(
+        cut_time_generations >= 4,
+        "all four manifest buckets are verified through the cut-time tier, got \
+         {cut_time_generations}"
+    );
+    // Nothing has advanced past the cut yet, so the live-refresh tier is
+    // legitimately empty. The tier is exercised on its own below.
+    assert_eq!(live_refresh_generations, 0);
+}
+
+/// D1, third part: a post-cut live history refresh advances `Ready` WITHOUT a
+/// manifest write, and the gate still passes (P6-C task 1, P3-F item 3).
+///
+/// This is the tier that decides whether a routine transaction can make the
+/// daemon unbootable. The manifest is cut-time evidence and is deliberately not
+/// rewritten here; the record is the authority for its own primary namespace,
+/// and the gate verifies the generation the record now names directly.
+#[test]
+fn the_gate_verifies_a_live_refresh_generation_the_manifest_never_named() {
+    use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+    use bbox_indexing::project_catalog_rebuild::read_committed_rebuild_manifest;
+    use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
+    use blackbox::project_catalog_rebuild_admin::{
+        PathFreeRebuildApplyRequestV1, RebuildStartupGateV1,
+    };
+
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let index_root = fixture.index_root();
+    let (report_path, resolution_path) = fixture.rebuild_artifacts();
+    watchdogged("the offline rebuild apply", {
+        let handle = fixture.clone();
+        move || {
+            blackbox::project_catalog_rebuild_admin::preflight(PathFreeRebuildPreflightRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path: report_path.clone(),
+                resolution_path: resolution_path.clone(),
+                scan_limits: HistoryScanLimitsV1::default(),
+                generated_at: "2026-08-05T00:00:02Z".to_string(),
+            })
+            .unwrap();
+            blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+            })
+            .unwrap()
+        }
+    });
+
+    let manifest_before = read_committed_rebuild_manifest(&index_root).unwrap();
+    let refreshed = advance_one_history_record_to_a_fresh_generation(&fixture);
+
+    // The manifest is untouched by the refresh, which is the property under
+    // test: the gate must not require a cut-time artifact to describe
+    // post-cut history.
+    let manifest_after = read_committed_rebuild_manifest(&index_root).unwrap();
+    assert_eq!(manifest_before.rebuild_id, manifest_after.rebuild_id);
+
+    let store = fixture.store();
+    let coverage = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+        &store,
+        &index_root,
+    )
+    .expect("a live-refresh generation is verified against the record, not the manifest");
+    let RebuildStartupGateV1::Verified {
+        live_refresh_generations,
+        ..
+    } = coverage
+    else {
+        panic!("expected the gate to run in full: {coverage:?}");
+    };
+    assert_eq!(
+        live_refresh_generations, 1,
+        "the refreshed record's generation {refreshed} is verified through the live tier"
+    );
+}
+
+/// Advance ONE repo-history record onto a freshly created generation, the way
+/// a post-cut `transact` does, and return the new generation id.
+///
+/// The generation is created through the real store so it carries real
+/// commitments: the gate's live tier verifies by LOADING it, and a fabricated
+/// row would fail for a reason unrelated to what the test is asserting.
+fn advance_one_history_record_to_a_fresh_generation(fixture: &RebuildFixture) -> String {
+    use bbox_corpus_core::project_catalog::{RepoHistoryGenerationId, RepoHistoryMaterialization};
+    use bbox_corpus_index::index::history_generations::{
+        HistoryGenerationInputV1, HistoryGenerationOwnerV1, HistoryGenerationStore,
+    };
+
+    let index_root = fixture.index_root();
+    let generations = HistoryGenerationStore::open_for_index(&index_root).unwrap();
+    let store = fixture.store();
+    let state = store.snapshot().unwrap();
+    let epoch = state.epoch();
+    let (record_id, namespace) = state
+        .catalog()
+        .repo_histories
+        .values()
+        .find(|record| record.primary_namespace.as_str() == REBUILD_OWNED_NAMESPACE)
+        .map(|record| {
+            (
+                record.repo_history_id.clone(),
+                record.primary_namespace.clone(),
+            )
+        })
+        .expect("the fixture bound the owned namespace to a record");
+    drop(state);
+
+    // A second generation over the SAME namespace with DIFFERENT content.
+    // Generation identity is content-addressed, so the differing commit row is
+    // what makes this a new id rather than an idempotent reopen of the one the
+    // manifest already names.
+    let created = generations
+        .create_or_open(HistoryGenerationInputV1 {
+            namespace: namespace.clone(),
+            owner: HistoryGenerationOwnerV1::Owned {
+                repo_history_id: record_id.clone(),
+            },
+            commit_documents: vec![live_refresh_commit_row(namespace.as_str())],
+            vector_inputs: Vec::new(),
+            truncated_message_count: 0,
+            source_schema_version: bbox_corpus_index::index::INDEX_SCHEMA_VERSION.to_string(),
+            source_schema_fingerprint_sha256: "7".repeat(64),
+            source_index_fingerprint_sha256: "8".repeat(64),
+        })
+        .expect("creating a live-refresh generation");
+    let generation_id = created.id.as_str().to_string();
+    assert!(
+        generation_id.starts_with("rhg_"),
+        "an owned live-refresh generation carries a catalog-attributed id: {generation_id}"
+    );
+    let advanced = RepoHistoryGenerationId::parse(generation_id.clone()).unwrap();
+    store
+        .transact(epoch, |catalog, _attachments| {
+            let record = catalog
+                .repo_histories
+                .get_mut(&record_id)
+                .expect("the record survived the rebuild");
+            record.materialization = RepoHistoryMaterialization::Ready {
+                generation_id: advanced.clone(),
+            };
+            Ok(())
+        })
+        .unwrap();
+    generation_id
+}
+
+/// One commit row for the live-refresh generation, distinct from every row the
+/// cut-time pass staged.
+fn live_refresh_commit_row(
+    namespace: &str,
+) -> bbox_corpus_index::index::history_generations::HistoryCommitDocumentV1 {
+    let sha = hex::encode(Sha256::digest(
+        format!("{namespace}:live-refresh").as_bytes(),
+    ))[..40]
+        .to_string();
+    let content = format!("live refresh subject for {namespace}");
+    bbox_corpus_index::index::history_generations::HistoryCommitDocumentV1 {
+        entity_id: format!("commit:{namespace}:{sha}"),
+        doc_type: "commit".into(),
+        chunk_kind: "git_message".into(),
+        repo_id: namespace.into(),
+        commit_sha: sha,
+        content_hash: hex::encode(Sha256::digest(content.as_bytes())),
+        path_tokens: content.clone(),
+        content,
+        parser_version: "test-parser".into(),
+        commit_author_name: "History Fixture".into(),
+        commit_author_email: "fixture@example.invalid".into(),
+        session_id: String::new(),
+        account: "git".into(),
+        role: "commit".into(),
+        byte_offset: 0,
+        is_subagent: 0,
+    }
 }
 
 /// EVERY bucket, including the one a `Ready` walk cannot see.
@@ -1609,7 +2138,10 @@ fn an_absent_marker_refuses_the_sweep_on_a_migrated_origin() {
     // A store open cannot reach this state: it refuses first.
     let open_refusal =
         ProjectCatalogStore::open_existing(fixture.layout.projects_path()).unwrap_err();
-    assert_eq!(open_refusal.code(), "error.project_catalog_migration_incomplete");
+    assert_eq!(
+        open_refusal.code(),
+        "error.project_catalog_migration_incomplete"
+    );
 
     let refusal =
         plan_catalog_gc_exclusions(fixture.layout.projects_path(), &paths.index_root).unwrap_err();
@@ -1624,7 +2156,10 @@ fn a_corrupt_marker_refuses_the_sweep_on_a_migrated_origin() {
 
     let fixture = Fixture::new();
     let paths = fixture.layout.rebuild_index_paths();
-    write(&marker_path(&fixture.layout), b"{\"version\":1,\"truncated\":");
+    write(
+        &marker_path(&fixture.layout),
+        b"{\"version\":1,\"truncated\":",
+    );
 
     let refusal =
         plan_catalog_gc_exclusions(fixture.layout.projects_path(), &paths.index_root).unwrap_err();
