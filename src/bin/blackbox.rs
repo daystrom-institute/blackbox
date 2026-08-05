@@ -6,8 +6,15 @@ use std::process::ExitCode;
 use bbox_config::config::{self, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope, ScopeMigrationKind};
+use bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1;
+use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
 use bbox_corpus_index::index::migration_inventory as corpus_inventory;
 use bbox_indexing::project_catalog_admin;
+use bbox_indexing::project_catalog_backfill::{
+    DurableBackfillApplyRequestV1, DurableBackfillPreflightRequestV1,
+    DurableBackfillVerifyRequestV1, LegacyRowStamperV1, ProjectCatalogDurableBackfillFacadeV1,
+};
+use bbox_indexing::project_catalog_migration::ProjectCatalogTargetSelectionV1;
 use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationApplyConfiguredRequestV1, ProjectCatalogMigrationApplyRequestV1,
     ProjectCatalogMigrationError, ProjectCatalogMigrationFacadeV1,
@@ -16,10 +23,16 @@ use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationVerifyRequestV1,
 };
 use bbox_indexing::project_catalog_migration_lock::ProjectCatalogMigrationLock;
+use bbox_indexing::project_catalog_rebuild::{
+    PathFreeRebuildVerifyRequestV1, ProjectCatalogPathFreeRebuildFacadeV1,
+};
+use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
 use bbox_indexing::project_catalog_store::{ProjectCatalogStore, ProjectCatalogStoreError};
 use bbox_vectors::migration_inventory as vector_inventory;
+use blackbox::project_catalog_rebuild_admin::PathFreeRebuildApplyRequestV1;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde::Serialize;
+use std::sync::Arc;
 
 const ENVELOPE_VERSION: u32 = 1;
 
@@ -48,6 +61,10 @@ enum ProjectCatalogCommand {
     Migrate(MigrateArgs),
     /// Verify exact installed migration state in an isolated root.
     Verify(VerifyArgs),
+    /// Stamp the path-keyed durable-store rows with stable project ids.
+    DurableBackfill(DurableBackfillArgs),
+    /// Replace the on-disk index with the path-free schema.
+    PathFreeRebuild(PathFreeRebuildArgs),
     /// Create a catalog project by authoritative scope or as legacy-local.
     Add(AddArgs),
     /// List every catalog project, including remote-only projects.
@@ -311,6 +328,115 @@ struct MigrateArgs {
     config: ConfigArgs,
 }
 
+/// The new-verb surface (plan section 3.1).
+///
+/// ONE exclusive mode group over the full triple. Verify is a MODE inside the
+/// group, not a separate flag: a group that admitted `--verify` alongside
+/// `--apply` would leave the combination's meaning undefined.
+///
+/// Targets use the same two-layer Q-A mechanism `migrate` uses, for the same
+/// reason. Artifacts are `Option` here rather than clap-required, because
+/// their requirement is per-MODE (preflight and apply need them, verify takes
+/// none) and encoding per-mode requirements as clap conditionals is exactly
+/// the mechanism Q-A found to be wrong.
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("mode")
+        .required(true)
+        .multiple(false)
+        .args(["preflight", "apply", "verify"])
+))]
+#[command(group(
+    ArgGroup::new("target")
+        .required(false)
+        .multiple(false)
+        .args(["rehearsal_root", "configured"])
+))]
+struct DurableBackfillArgs {
+    /// Capture the legacy path ledger and write reviewed artifacts.
+    #[arg(long)]
+    preflight: bool,
+
+    /// Stamp every mappable row from an exact reviewed artifact pair.
+    #[arg(long)]
+    apply: bool,
+
+    /// Verify the applied stamp set against durable state.
+    #[arg(long)]
+    verify: bool,
+
+    /// Report artifact. Output for preflight, input for apply.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+
+    /// Resolution artifact. Output for preflight, input for apply.
+    #[arg(long, value_name = "PATH")]
+    resolution: Option<PathBuf>,
+
+    /// Isolated rehearsal root. One target is required for apply and verify;
+    /// preflight accepts it for the D-026 isolated-bundle preflight.
+    #[arg(long, value_name = "PATH")]
+    rehearsal_root: Option<PathBuf>,
+
+    /// Operate on the REAL configured state. One target is required for apply
+    /// and verify; preflight captures configured state by default and does not
+    /// accept this flag.
+    #[arg(long)]
+    configured: bool,
+
+    #[command(flatten)]
+    config: ConfigArgs,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("mode")
+        .required(true)
+        .multiple(false)
+        .args(["preflight", "apply", "verify"])
+))]
+#[command(group(
+    ArgGroup::new("target")
+        .required(false)
+        .multiple(false)
+        .args(["rehearsal_root", "configured"])
+))]
+struct PathFreeRebuildArgs {
+    /// Scan the source index, prove Equality, and write reviewed artifacts.
+    #[arg(long)]
+    preflight: bool,
+
+    /// Replace the index from an exact reviewed artifact pair.
+    #[arg(long)]
+    apply: bool,
+
+    /// Verify the committed rebuild manifest against durable state.
+    #[arg(long)]
+    verify: bool,
+
+    /// Report artifact. Output for preflight, input for apply.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+
+    /// Resolution artifact. Output for preflight, input for apply.
+    #[arg(long, value_name = "PATH")]
+    resolution: Option<PathBuf>,
+
+    /// Isolated rehearsal root. One target is required for apply and verify;
+    /// preflight accepts it for the D-026 isolated-bundle preflight.
+    #[arg(long, value_name = "PATH")]
+    rehearsal_root: Option<PathBuf>,
+
+    /// Operate on the REAL configured state. One target is required for apply
+    /// and verify; preflight captures configured state by default and does not
+    /// accept this flag.
+    #[arg(long)]
+    configured: bool,
+
+    #[command(flatten)]
+    config: ConfigArgs,
+}
+
 /// Verification selects exactly one target (plan section 3.2).
 ///
 /// `--root` keeps rehearsal verification exactly as shipped.
@@ -434,6 +560,24 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::Verify(_),
         }) => "project_catalog_verify",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::DurableBackfill(args),
+        }) if args.preflight => "project_catalog_durable_backfill_preflight",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::DurableBackfill(args),
+        }) if args.apply => "project_catalog_durable_backfill_apply",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::DurableBackfill(_),
+        }) => "project_catalog_durable_backfill_verify",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::PathFreeRebuild(args),
+        }) if args.preflight => "project_catalog_path_free_rebuild_preflight",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::PathFreeRebuild(args),
+        }) if args.apply => "project_catalog_path_free_rebuild_apply",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::PathFreeRebuild(_),
+        }) => "project_catalog_path_free_rebuild_verify",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(_),
         }) => "project_catalog_add",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
@@ -477,6 +621,12 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Verify(args),
         }) => execute_verify(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::DurableBackfill(args),
+        }) => execute_durable_backfill(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::PathFreeRebuild(args),
+        }) => execute_path_free_rebuild(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(args),
         }) => execute_add(args),
@@ -554,6 +704,344 @@ fn enforce_migrate_target_rules(
             "error.project_catalog_cli_arguments",
             "--apply accepts exactly one target: --rehearsal-root and --configured are exclusive",
         )),
+    }
+}
+
+/// The mode one new-verb invocation runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewVerbModeV1 {
+    Preflight,
+    Apply,
+    Verify,
+}
+
+/// A new verb's resolved mode, target, and artifacts (plan section 3.1).
+///
+/// Produced by layer two BEFORE configuration loading, artifact access, or
+/// any other observable work, so an invocation that names an impossible
+/// combination never reaches the point where it could read or touch state.
+#[derive(Debug)]
+struct NewVerbSelectionV1 {
+    mode: NewVerbModeV1,
+    /// `None` only for a preflight with no target flag, which captures the
+    /// configured state through `ConfigArgs` resolution (D-021).
+    rehearsal_root: Option<PathBuf>,
+    target_selection: ProjectCatalogTargetSelectionV1,
+    /// Present for preflight and apply, absent for verify.
+    artifacts: Option<(PathBuf, PathBuf)>,
+}
+
+fn cli_arguments(message: impl Into<String>) -> CommandFailure {
+    CommandFailure::new("error.project_catalog_cli_arguments", message)
+}
+
+/// Layer two of the Q-A mechanism for the two new verbs (plan section 3.1).
+///
+/// Layer one has already refused BOTH targets at parse time and has already
+/// required exactly one mode. This resolves the per-mode rules layer one
+/// cannot express without the conditional-requirement trap Q-A ruled out.
+fn resolve_new_verb_selection(
+    verb: &str,
+    preflight: bool,
+    apply: bool,
+    verify: bool,
+    report: Option<PathBuf>,
+    resolution: Option<PathBuf>,
+    rehearsal_root: Option<PathBuf>,
+    configured: bool,
+) -> Result<NewVerbSelectionV1, CommandFailure> {
+    let mode = match (preflight, apply, verify) {
+        (true, false, false) => NewVerbModeV1::Preflight,
+        (false, true, false) => NewVerbModeV1::Apply,
+        (false, false, true) => NewVerbModeV1::Verify,
+        // Layer one requires exactly one; the arm keeps the rule total.
+        _ => {
+            return Err(cli_arguments(format!(
+                "{verb} requires exactly one mode: --preflight, --apply, or --verify"
+            )));
+        }
+    };
+
+    let (rehearsal_root, target_selection) = match mode {
+        NewVerbModeV1::Preflight => {
+            if configured {
+                return Err(cli_arguments(format!(
+                    "{verb} --preflight does not accept --configured: preflight already \
+                     captures the configured state through the configuration resolution, \
+                     so naming it would imply a choice that does not exist"
+                )));
+            }
+            match rehearsal_root {
+                // The D-026 isolated-bundle preflight that must precede a
+                // rehearsal apply. The explicit flag names the bundle rather
+                // than smuggling it through configuration resolution.
+                Some(root) => (Some(root), ProjectCatalogTargetSelectionV1::Rehearsal),
+                None => (None, ProjectCatalogTargetSelectionV1::Configured),
+            }
+        }
+        NewVerbModeV1::Apply | NewVerbModeV1::Verify => match (rehearsal_root, configured) {
+            (Some(root), false) => (Some(root), ProjectCatalogTargetSelectionV1::Rehearsal),
+            (None, true) => (None, ProjectCatalogTargetSelectionV1::Configured),
+            (None, false) => {
+                return Err(cli_arguments(format!(
+                    "{verb} requires exactly one target: --rehearsal-root <path> or --configured"
+                )));
+            }
+            // Layer one rejects this pair at parse time.
+            (Some(_), true) => {
+                return Err(cli_arguments(format!(
+                    "{verb} accepts exactly one target: --rehearsal-root and --configured \
+                     are exclusive"
+                )));
+            }
+        },
+    };
+
+    let artifacts = match mode {
+        NewVerbModeV1::Preflight | NewVerbModeV1::Apply => match (report, resolution) {
+            (Some(report), Some(resolution)) => Some((report, resolution)),
+            _ => {
+                return Err(cli_arguments(format!(
+                    "{verb} --{} requires both --report and --resolution",
+                    if mode == NewVerbModeV1::Preflight {
+                        "preflight"
+                    } else {
+                        "apply"
+                    }
+                )));
+            }
+        },
+        // Verify runs fresh verification against durable state, which already
+        // carries the artifact hashes it was applied from (FD-4).
+        NewVerbModeV1::Verify => {
+            if report.is_some() || resolution.is_some() {
+                return Err(cli_arguments(format!(
+                    "{verb} --verify takes no artifacts: it verifies durable state, \
+                     not operator artifacts"
+                )));
+            }
+            None
+        }
+    };
+
+    Ok(NewVerbSelectionV1 {
+        mode,
+        rehearsal_root,
+        target_selection,
+        artifacts,
+    })
+}
+
+/// Resolve the one target layout a new-verb invocation operates on.
+fn new_verb_layout(
+    selection: &NewVerbSelectionV1,
+    config: &config::Config,
+    overrides: ProjectCatalogMigrationLayoutOverridesV1,
+) -> Result<ProjectCatalogMigrationResolvedLayoutV1, CommandFailure> {
+    match &selection.rehearsal_root {
+        Some(root) => {
+            Ok(ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(root.clone(), config)?)
+        }
+        None => Ok(ProjectCatalogMigrationResolvedLayoutV1::from_config(
+            config, overrides,
+        )?),
+    }
+}
+
+/// Build the one production row stamper for a resolved target.
+///
+/// The owner paths come from the layout's own projection, which is derived
+/// through the same function the read-side capture uses, so the stamping pass
+/// cannot write a store the inventory never inspected.
+fn owner_row_stamper(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<Arc<dyn LegacyRowStamperV1>, CommandFailure> {
+    let owners = layout.stamper_owner_paths();
+    let stamper = blackbox::project_catalog_stamper::ProjectCatalogOwnerRowStamperV1::new(
+        blackbox::project_catalog_stamper::ProjectCatalogStamperPathsV1 {
+            knowledge_store_path: owners.knowledge_store_path,
+            gap_store_path: owners.gap_store_path,
+            thread_store_path: owners.thread_store_path,
+            note_store_path: owners.note_store_path,
+            pin_store_path: owners.pin_store_path,
+            roadmap_store_path: owners.roadmap_store_path,
+            packet_root: owners.packet_root,
+            proposal_root: owners.proposal_root,
+            slack_store_root: owners.slack_store_root,
+            whiteboard_root: owners.whiteboard_root,
+            artifact_root: owners.artifact_root,
+            transcript_edge_root: owners.transcript_edge_root,
+        },
+        OwnerSnapshotLimitsV1::default(),
+    )?;
+    Ok(Arc::new(stamper))
+}
+
+fn execute_durable_backfill(
+    args: DurableBackfillArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let selection = resolve_new_verb_selection(
+        "durable-backfill",
+        args.preflight,
+        args.apply,
+        args.verify,
+        args.report,
+        args.resolution,
+        args.rehearsal_root,
+        args.configured,
+    )?;
+    let config = load_config(args.config.config)?;
+    let layout = new_verb_layout(
+        &selection,
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: args.config.projects_path,
+            state_dir: args.config.state_dir,
+        },
+    )?;
+
+    match selection.mode {
+        NewVerbModeV1::Preflight => {
+            let (report_path, resolution_path) = selection
+                .artifacts
+                .expect("preflight artifacts were resolved above");
+            // Preflight acquires the SHARED lifetime lock inside the facade
+            // (section 4.1), which does not exclude a live daemon's own shared
+            // handle, so no claim is taken here.
+            let receipt = ProjectCatalogDurableBackfillFacadeV1::preflight(
+                DurableBackfillPreflightRequestV1 {
+                    target_selection: selection.target_selection,
+                    report_path,
+                    resolution_path,
+                    stamper: owner_row_stamper(&layout)?,
+                    generated_at: offline_timestamp(),
+                    layout,
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Apply => {
+            let (report_path, resolution_path) = selection
+                .artifacts
+                .expect("apply artifacts were resolved above");
+            // A CONFIGURED apply holds the factored claim for the COMPLETE
+            // facade call including the journal fsync (section 4.2); the
+            // facade never takes it itself. A rehearsal apply takes no
+            // configured-store lock (section 4.3).
+            let _claim = match selection.target_selection {
+                ProjectCatalogTargetSelectionV1::Configured => {
+                    Some(acquire_admin_lifetime_claim(layout.projects_path())?)
+                }
+                ProjectCatalogTargetSelectionV1::Rehearsal => None,
+            };
+            let stamper = owner_row_stamper(&layout)?;
+            let receipt =
+                ProjectCatalogDurableBackfillFacadeV1::apply(DurableBackfillApplyRequestV1 {
+                    target_selection: selection.target_selection,
+                    report_path,
+                    resolution_path,
+                    stamper,
+                    completed_at: offline_timestamp(),
+                    layout,
+                })?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Verify => {
+            let receipt =
+                ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
+                    target_selection: selection.target_selection,
+                    layout,
+                })?;
+            serialize_result(&receipt)
+        }
+    }
+}
+
+/// A deterministic timestamp source for offline receipts.
+///
+/// Wall clock, but read in exactly ONE place so the facades stay
+/// clock-independent and a test can drive them with a fixed value.
+fn offline_timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    format!("unix:{seconds}")
+}
+
+fn execute_path_free_rebuild(
+    args: PathFreeRebuildArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let selection = resolve_new_verb_selection(
+        "path-free-rebuild",
+        args.preflight,
+        args.apply,
+        args.verify,
+        args.report,
+        args.resolution,
+        args.rehearsal_root,
+        args.configured,
+    )?;
+    let config = load_config(args.config.config)?;
+    let layout = new_verb_layout(
+        &selection,
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: args.config.projects_path,
+            state_dir: args.config.state_dir,
+        },
+    )?;
+    let scan_limits = HistoryScanLimitsV1::default();
+
+    match selection.mode {
+        NewVerbModeV1::Preflight => {
+            let (report_path, resolution_path) = selection
+                .artifacts
+                .expect("preflight artifacts were resolved above");
+            let receipt = blackbox::project_catalog_rebuild_admin::preflight(
+                PathFreeRebuildPreflightRequestV1 {
+                    layout,
+                    target_selection: selection.target_selection,
+                    report_path,
+                    resolution_path,
+                    scan_limits,
+                    generated_at: offline_timestamp(),
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Apply => {
+            let (report_path, resolution_path) = selection
+                .artifacts
+                .expect("apply artifacts were resolved above");
+            // The claim is the CLI's to hold, not the entry's: it must cover
+            // the destructive replacement AND the committed-manifest
+            // verification that follows it, or the two would sit in separate
+            // exclusion windows (section 4.2).
+            let _claim = match selection.target_selection {
+                ProjectCatalogTargetSelectionV1::Configured => {
+                    Some(acquire_admin_lifetime_claim(layout.projects_path())?)
+                }
+                ProjectCatalogTargetSelectionV1::Rehearsal => None,
+            };
+            let receipt =
+                blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                    layout,
+                    target_selection: selection.target_selection,
+                    report_path,
+                    resolution_path,
+                    scan_limits,
+                })?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Verify => {
+            let receipt =
+                ProjectCatalogPathFreeRebuildFacadeV1::verify(PathFreeRebuildVerifyRequestV1 {
+                    layout,
+                    target_selection: selection.target_selection,
+                })?;
+            serialize_result(&receipt)
+        }
     }
 }
 
@@ -1214,6 +1702,193 @@ mod tests {
         };
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0], rows[1]);
+    }
+
+    /// The six D-020 envelope values for the two new verbs (section 3.1),
+    /// and the documented invocation shape of each mode.
+    #[test]
+    fn parser_selects_each_new_verb_envelope_value() {
+        let cases: [(&str, &[&str], &str); 6] = [
+            (
+                "durable-backfill",
+                &[
+                    "--preflight",
+                    "--report",
+                    "/tmp/r.json",
+                    "--resolution",
+                    "/tmp/s.json",
+                ],
+                "project_catalog_durable_backfill_preflight",
+            ),
+            (
+                "durable-backfill",
+                &[
+                    "--apply",
+                    "--configured",
+                    "--report",
+                    "/tmp/r.json",
+                    "--resolution",
+                    "/tmp/s.json",
+                ],
+                "project_catalog_durable_backfill_apply",
+            ),
+            (
+                "durable-backfill",
+                &["--verify", "--configured"],
+                "project_catalog_durable_backfill_verify",
+            ),
+            (
+                "path-free-rebuild",
+                &[
+                    "--preflight",
+                    "--report",
+                    "/tmp/r.json",
+                    "--resolution",
+                    "/tmp/s.json",
+                ],
+                "project_catalog_path_free_rebuild_preflight",
+            ),
+            (
+                "path-free-rebuild",
+                &[
+                    "--apply",
+                    "--rehearsal-root",
+                    "/tmp/rehearsal",
+                    "--report",
+                    "/tmp/r.json",
+                    "--resolution",
+                    "/tmp/s.json",
+                ],
+                "project_catalog_path_free_rebuild_apply",
+            ),
+            (
+                "path-free-rebuild",
+                &["--verify", "--rehearsal-root", "/tmp/rehearsal"],
+                "project_catalog_path_free_rebuild_verify",
+            ),
+        ];
+        for (verb, flags, expected) in cases {
+            let mut argv = vec!["blackbox", "project-catalog", verb];
+            argv.extend_from_slice(flags);
+            let parsed = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("{verb} {flags:?} must parse: {error}"));
+            assert_eq!(command_name(&parsed), expected);
+        }
+    }
+
+    /// Layer ONE for the new verbs: the mode group is required and exclusive,
+    /// and naming both targets has no possible meaning.
+    #[test]
+    fn parser_refuses_new_verb_mode_and_target_ambiguity() {
+        for verb in ["durable-backfill", "path-free-rebuild"] {
+            // No mode at all.
+            assert!(Cli::try_parse_from(["blackbox", "project-catalog", verb]).is_err());
+            // Two modes.
+            assert!(
+                Cli::try_parse_from([
+                    "blackbox",
+                    "project-catalog",
+                    verb,
+                    "--preflight",
+                    "--verify",
+                ])
+                .is_err()
+            );
+            // Both targets.
+            assert!(
+                Cli::try_parse_from([
+                    "blackbox",
+                    "project-catalog",
+                    verb,
+                    "--verify",
+                    "--configured",
+                    "--rehearsal-root",
+                    "/tmp/rehearsal",
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    /// Layer TWO for the new verbs: the per-mode target and artifact rules are
+    /// TYPED handler refusals, produced before any configuration load.
+    #[test]
+    fn handler_enforces_new_verb_mode_rules() {
+        // Apply with no target.
+        let failure = resolve_new_verb_selection(
+            "durable-backfill",
+            false,
+            true,
+            false,
+            Some(PathBuf::from("/tmp/r.json")),
+            Some(PathBuf::from("/tmp/s.json")),
+            None,
+            false,
+        )
+        .expect_err("apply requires exactly one target");
+        assert_eq!(failure.code, "error.project_catalog_cli_arguments");
+
+        // Preflight naming --configured, which is the default and not a choice.
+        let failure = resolve_new_verb_selection(
+            "path-free-rebuild",
+            true,
+            false,
+            false,
+            Some(PathBuf::from("/tmp/r.json")),
+            Some(PathBuf::from("/tmp/s.json")),
+            None,
+            true,
+        )
+        .expect_err("preflight does not accept --configured");
+        assert_eq!(failure.code, "error.project_catalog_cli_arguments");
+
+        // Preflight missing an artifact.
+        let failure = resolve_new_verb_selection(
+            "durable-backfill",
+            true,
+            false,
+            false,
+            Some(PathBuf::from("/tmp/r.json")),
+            None,
+            None,
+            false,
+        )
+        .expect_err("preflight requires both artifacts");
+        assert_eq!(failure.code, "error.project_catalog_cli_arguments");
+
+        // Verify given artifacts it must not take: verification reads durable
+        // state, not operator artifacts (FD-4).
+        let failure = resolve_new_verb_selection(
+            "path-free-rebuild",
+            false,
+            false,
+            true,
+            Some(PathBuf::from("/tmp/r.json")),
+            Some(PathBuf::from("/tmp/s.json")),
+            None,
+            true,
+        )
+        .expect_err("verify takes no artifacts");
+        assert_eq!(failure.code, "error.project_catalog_cli_arguments");
+
+        // Preflight with an explicit rehearsal root is the D-026 bundle
+        // preflight, and it selects the rehearsal target.
+        let selection = resolve_new_verb_selection(
+            "durable-backfill",
+            true,
+            false,
+            false,
+            Some(PathBuf::from("/tmp/r.json")),
+            Some(PathBuf::from("/tmp/s.json")),
+            Some(PathBuf::from("/tmp/rehearsal")),
+            false,
+        )
+        .expect("an explicit bundle preflight is documented");
+        assert_eq!(selection.mode, NewVerbModeV1::Preflight);
+        assert_eq!(
+            selection.target_selection,
+            ProjectCatalogTargetSelectionV1::Rehearsal
+        );
     }
 }
 
