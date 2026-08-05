@@ -327,6 +327,10 @@ pub struct DurableBackfillReportV1 {
     /// Rows that never belonged to a registered root: counted, never stamped.
     pub unscoped_legacy_counts: BTreeMap<LegacyPathStoreKindV1, u64>,
     pub publisher_verification: Vec<PublisherDispositionVerificationV1>,
+    /// Per-store stamper coverage for every store with planned stamps. A
+    /// `NotImplemented` row refuses the report rather than being omitted, so
+    /// an unstampable owner can never be mistaken for an empty one.
+    pub stamp_coverage: BTreeMap<LegacyPathStoreKindV1, LegacyRowStampCoverageV1>,
     /// Equals `predecessor_catalog_epoch` when the resolution converts nothing:
     /// mappable-row stamping writes durable stores and does NOT bump the pair.
     pub predicted_post_image_catalog_epoch: u64,
@@ -589,12 +593,57 @@ pub enum LegacyRowStampOutcomeV1 {
 /// stamping a row that already carries the same `ProjectId` returns
 /// `AlreadyStamped` and writes nothing.
 pub trait LegacyRowStamperV1: Send + Sync {
+    /// Whether this stamper can write the owner behind `store_kind`.
+    ///
+    /// Deliberately a probe rather than a registry lookup: an implementation
+    /// answers with an exhaustive `match` over the 14-variant owner set, so
+    /// the compiler forces it to answer for every store and polices any
+    /// variant added later. A registry of optional per-store stampers would
+    /// let three-of-fourteen coverage pass as silent absence, which is the
+    /// exact failure this shape exists to make impossible.
+    ///
+    /// Preflight probes every store with planned stamps and records the answer
+    /// per store in the report, refusing the whole report when any planned
+    /// store is `NotImplemented`. An owner whose write-back has not landed is
+    /// therefore a TYPED, per-store, pre-mutation refusal, never a zero that
+    /// reads like "nothing to do".
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1;
+
     fn stamp(
         &self,
         store_kind: LegacyPathStoreKindV1,
         source_row_id: &str,
         project_id: &ProjectId,
     ) -> BackfillResult<LegacyRowStampOutcomeV1>;
+}
+
+/// Whether an owner's durable-store write-back is available to the backfill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyRowStampCoverageV1 {
+    Covered,
+    /// The owner crate exposes no write-back yet. Counted and named per store
+    /// rather than skipped.
+    NotImplemented,
+}
+
+/// The planned stores this stamper cannot write, in owner-token form.
+///
+/// Shared by preflight (which turns a nonempty result into a refused report)
+/// and apply (which turns it into a pre-mutation refusal), so the two can never
+/// disagree about what "covered" means.
+pub fn uncovered_planned_stores(
+    planned_stamps: &BTreeMap<LegacyPathStoreKindV1, u64>,
+    stamper: &dyn LegacyRowStamperV1,
+) -> Vec<&'static str> {
+    planned_stamps
+        .iter()
+        // A store with zero planned stamps needs no write-back: refusing on it
+        // would block a backfill that was never going to touch that owner.
+        .filter(|(_, planned)| **planned > 0)
+        .filter(|(kind, _)| stamper.coverage(**kind) == LegacyRowStampCoverageV1::NotImplemented)
+        .map(|(kind, _)| legacy_store_token(*kind))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1075,9 @@ pub struct DurableBackfillPreflightRequestV1 {
     pub resolution_path: PathBuf,
     /// The migration's reviewed publisher dispositions, verified per branch.
     pub publisher_dispositions: Vec<PublisherBindingDispositionV1>,
+    /// Probed for per-store coverage, never invoked to write. Preflight writes
+    /// no project state.
+    pub stamper: Arc<dyn LegacyRowStamperV1>,
     /// Timestamp source. Passed in rather than read from the clock so the
     /// facade stays deterministic under test.
     pub generated_at: String,
@@ -1062,6 +1114,7 @@ pub struct DurableBackfillPreflightReceiptV1 {
     pub quarantined_total: u64,
     pub unscoped_total: u64,
     pub publisher_defect_count: u64,
+    pub uncovered_store_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1167,7 +1220,18 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         } else {
             epoch.saturating_add(1)
         };
-        let status = if publisher_defect_count > 0 {
+        let stamp_coverage = plan
+            .planned_stamps
+            .keys()
+            .map(|kind| (*kind, request.stamper.coverage(*kind)))
+            .collect::<BTreeMap<_, _>>();
+        let uncovered_store_count =
+            uncovered_planned_stores(&plan.planned_stamps, request.stamper.as_ref()).len() as u64;
+        // An owner with planned stamps and no write-back cannot be backfilled,
+        // so the report refuses instead of publishing a plan that would stamp
+        // a strict subset of what it promises. Apply's existing
+        // refused-report guard then blocks the invocation.
+        let status = if publisher_defect_count > 0 || uncovered_store_count > 0 {
             DurableBackfillStatusV1::Refused
         } else {
             DurableBackfillStatusV1::Clean
@@ -1187,6 +1251,7 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             planned_stamps: plan.planned_stamps.clone(),
             unscoped_legacy_counts: plan.unscoped_legacy_counts.clone(),
             publisher_verification,
+            stamp_coverage,
             predicted_post_image_catalog_epoch,
             completion_journal_relative_path: BACKFILL_COMPLETION_JOURNAL_FILE.to_string(),
         };
@@ -1211,10 +1276,23 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 .sum(),
             unscoped_total: plan.unscoped_legacy_counts.values().sum(),
             publisher_defect_count,
+            uncovered_store_count,
         })
     }
 
     /// Install the reviewed post-image against the selected target.
+    ///
+    /// LOCK PRECONDITION, part of this entry's contract. Against a CONFIGURED
+    /// target the caller must already hold the factored admin lifetime claim
+    /// (`acquire_admin_lifetime_claim`: exclusive probe, then downgrade to
+    /// shared) and must hold it across this ENTIRE call including post-commit
+    /// verification. This facade never acquires that claim itself, because a
+    /// claim taken and released inside one call would leave the pair
+    /// transaction and the journal write in separate exclusion windows. Against
+    /// a REHEARSAL target no configured-store lock is taken and no configured
+    /// fallback exists: the target is whatever layout the caller resolved, and
+    /// the pair transaction's own locks provide correctness inside an isolated
+    /// root (section 4.3).
     ///
     /// Ordering is load-bearing and is what makes a torn apply recoverable:
     ///
@@ -1296,6 +1374,21 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             return Err(refuse(
                 ERROR_ARTIFACT_IDENTITY,
                 "reviewed backfill artifacts disagree with the selected target's current state",
+            ));
+        }
+
+        // Coverage is re-probed here, not merely trusted from the report: the
+        // stamper instance handed to apply need not be the one preflight
+        // probed, and this runs BEFORE the pair transaction so an uncovered
+        // owner refuses with nothing mutated.
+        let uncovered = uncovered_planned_stores(&plan.planned_stamps, request.stamper.as_ref());
+        if !uncovered.is_empty() {
+            return Err(refuse(
+                ERROR_ARTIFACT_IDENTITY,
+                format!(
+                    "the supplied stamper cannot write these planned owners: {}",
+                    uncovered.join(", ")
+                ),
             ));
         }
 
@@ -2244,6 +2337,7 @@ mod tests {
             planned_stamps: BTreeMap::new(),
             unscoped_legacy_counts: BTreeMap::new(),
             publisher_verification: Vec::new(),
+            stamp_coverage: BTreeMap::new(),
             predicted_post_image_catalog_epoch: 7,
             completion_journal_relative_path: BACKFILL_COMPLETION_JOURNAL_FILE.to_string(),
         };
@@ -2283,5 +2377,71 @@ mod tests {
         let text = serde_json::to_string(&plan.rows).unwrap();
         assert!(!text.contains("/host/checkouts/alpha"));
         assert!(text.contains(digest_path("/host/checkouts/alpha").as_str()));
+    }
+
+    /// A stamper answering by exhaustive match over the owner set. A production
+    /// impl has this shape, which is why an added variant breaks the build
+    /// rather than silently defaulting to uncovered.
+    struct PartialStamper;
+
+    impl LegacyRowStamperV1 for PartialStamper {
+        fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+            match store_kind {
+                LegacyPathStoreKindV1::Knowledge | LegacyPathStoreKindV1::Gap => {
+                    LegacyRowStampCoverageV1::Covered
+                }
+                LegacyPathStoreKindV1::Thread
+                | LegacyPathStoreKindV1::Note
+                | LegacyPathStoreKindV1::Pin
+                | LegacyPathStoreKindV1::Roadmap
+                | LegacyPathStoreKindV1::Packet
+                | LegacyPathStoreKindV1::Task
+                | LegacyPathStoreKindV1::Proposal
+                | LegacyPathStoreKindV1::SlackBinding
+                | LegacyPathStoreKindV1::Whiteboard
+                | LegacyPathStoreKindV1::Artifact
+                | LegacyPathStoreKindV1::Provenance
+                | LegacyPathStoreKindV1::TranscriptEdge => LegacyRowStampCoverageV1::NotImplemented,
+            }
+        }
+
+        fn stamp(
+            &self,
+            _store_kind: LegacyPathStoreKindV1,
+            _source_row_id: &str,
+            _project_id: &ProjectId,
+        ) -> BackfillResult<LegacyRowStampOutcomeV1> {
+            Ok(LegacyRowStampOutcomeV1::Stamped)
+        }
+    }
+
+    /// An owner with planned stamps and no write-back is NAMED, not skipped.
+    /// This is the three-of-fourteen failure the coverage probe exists to stop.
+    #[test]
+    fn a_planned_store_without_a_write_back_is_named() {
+        let planned = BTreeMap::from([
+            (LegacyPathStoreKindV1::Knowledge, 2),
+            (LegacyPathStoreKindV1::Thread, 5),
+        ]);
+        let uncovered = uncovered_planned_stores(&planned, &PartialStamper);
+        assert_eq!(uncovered, vec!["thread"]);
+    }
+
+    /// Only stores that are actually covered stay silent.
+    #[test]
+    fn fully_covered_planned_stores_report_nothing_uncovered() {
+        let planned = BTreeMap::from([
+            (LegacyPathStoreKindV1::Knowledge, 1),
+            (LegacyPathStoreKindV1::Gap, 1),
+        ]);
+        assert!(uncovered_planned_stores(&planned, &PartialStamper).is_empty());
+    }
+
+    /// A store with no planned stamps needs no write-back: refusing on it would
+    /// block a backfill that was never going to touch that owner.
+    #[test]
+    fn a_store_with_no_planned_stamps_is_not_required_to_be_covered() {
+        let planned = BTreeMap::from([(LegacyPathStoreKindV1::Thread, 0)]);
+        assert!(uncovered_planned_stores(&planned, &PartialStamper).is_empty());
     }
 }
