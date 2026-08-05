@@ -128,8 +128,8 @@ plan-stated decision with rationale, not an open question.
 and `PathFreeRebuild(PathFreeRebuildArgs)`, spelled as governing section 15
 names the operations. The shipped `Migrate` and `Verify` variants keep their
 current shape: `Migrate` has `ArgGroup("mode")` over `preflight|apply`
-(`src/bin/blackbox.rs:207-212`), and `Verify` is its own variant taking
-`--root` (`src/bin/blackbox.rs:252-258`). New verbs carry a
+(`src/bin/blackbox.rs:249-253`), and `Verify` is its own variant taking
+`--root` (`src/bin/blackbox.rs:294-297`). New verbs carry a
 preflight/apply/verify mode triple internally. The bridge-down proof is
 `verify --require-exclusive-availability`, not a new verb.
 
@@ -180,7 +180,7 @@ never in the report itself.
 exclusive-then-downgrade with point-in-time exclusivity.** See section 4.
 Preflight acquires the shared lifetime lock and the store mutation lock
 through `capture_migration_preflight_with`
-(`project_catalog_store.rs:3901-3912`), matching governing section 6.3's
+(`project_catalog_store.rs:4225-4238`), matching governing section 6.3's
 "Preflight takes a shared/read lock." A shared lock does not exclude the
 daemon's own shared handle, which is why preflight runs while the bridge is
 live and sees a consistent capture. Apply acquires exclusive to prove no
@@ -305,9 +305,9 @@ surface. When `--configured` is selected at apply, the command runs
 **Lock discipline (preflight).** Governing section 6.3 states "preflight
 takes a shared/read lock." This matches the shipped code: preflight capture
 goes through `capture_migration_preflight_with`
-(`project_catalog_store.rs:3901`), which acquires both
-`ProjectCatalogMigrationLock::acquire_shared` (line 3907) and
-`acquire_store_lock_nofollow` (line 3910) before invoking the capture
+(`project_catalog_store.rs:4225`), which acquires both
+`ProjectCatalogMigrationLock::acquire_shared` (line 4231) and
+`acquire_store_lock_nofollow` (line 4234) before invoking the capture
 closure. A shared lifetime lock does not exclude the daemon's own shared
 handle, so preflight runs while the bridge is live and sees a consistent
 snapshot.
@@ -329,8 +329,13 @@ No other changes to the shipped surface. `Add`, `List`, `Get`, `Alias`,
 
 The durable backfill owns the governing 7.3 path-keyed durable-store row
 stamping. No other phase implements it (Phase 2 8.2 deferred store-row
-rewrites). The backfill iterates the `LegacyPathBinding` ledger
-(`legacy_path_bindings` on `AttachmentSnapshotV1`, `project_catalog.rs:628`).
+rewrites). The backfill iterates the legacy path ledger
+(`legacy_path_bindings` on `AttachmentSnapshotV1`, `project_catalog.rs:628`):
+`LegacyPathLedgerEntry` rows keyed by `LegacyPathBindingId` with a typed
+`LegacyPathBindingStatus`. There is no single `LegacyPathBinding` type;
+the report and post-image DTOs are `LegacyPathBindingReportV1`
+(`project_catalog_inventory.rs:1736`) and
+`LegacyPathBindingPostImageInputV1` (`project_catalog_inventory.rs:2843`).
 Each entry names a `historical_path`, `source_store`, `source_row_id`,
 `inventory_epoch`, and typed status (`project_catalog.rs:601-609`). The
 backfill stamps the corresponding durable-store row with the stable
@@ -434,7 +439,10 @@ rematerializing every project's documents from the catalog identity and
 immutable `RepoHistoryGeneration`s. Per D-027, a full replacement
 rematerializes stale, compatibility, and active commit documents from
 referenced immutable generations; ambiguous or unclaimed legacy commit
-namespaces live in immutable `RepoHistoryQuarantineGeneration`s and remain
+namespaces live in immutable quarantine generations (tracked by
+`RepoHistoryQuarantineGenerationId` with
+`RepoHistoryQuarantineMaterialization` state; there is no single
+`RepoHistoryQuarantineGeneration` type) and remain
 rebuild/GC roots until explicit resolution or acknowledged retirement. A
 checkout is never the only rebuild source for retained history.
 
@@ -477,12 +485,12 @@ hash. The rebuild resolution carries the four-hash identity binding.
 ### 4.1. Preflight acquires the shared lifetime lock
 
 Preflight capture goes through `capture_migration_preflight_with`
-(`project_catalog_store.rs:3901-3912`), which acquires both
-`ProjectCatalogMigrationLock::acquire_shared` (line 3907) and
-`acquire_store_lock_nofollow` (line 3910) before invoking the read-only
+(`project_catalog_store.rs:4225-4238`), which acquires both
+`ProjectCatalogMigrationLock::acquire_shared` (line 4231) and
+`acquire_store_lock_nofollow` (line 4234) before invoking the read-only
 capture closure. The callers are
 `project_catalog_inventory_adapters.rs:2230` and `:2281`, and
-`project_catalog_store.rs:3898`.
+the `capture_migration_preflight` wrapper (`project_catalog_store.rs:4218`).
 
 A shared lifetime lock does not exclude the daemon's own shared handle, which
 is why preflight can run while the bridge is live and still see a consistent
@@ -494,7 +502,7 @@ while the v1 daemon remains available."
 ### 4.2. Apply: exclusive-then-downgrade with point-in-time exclusivity
 
 The shipped offline-admin pattern is `open_admin_store`
-(`src/bin/blackbox.rs:620-645`):
+(`src/bin/blackbox.rs:857-882`):
 
 1. `ProjectCatalogMigrationLock::try_acquire_exclusive(projects_path)` proves
    no daemon shares the store at that instant. This returns
@@ -507,7 +515,9 @@ The shipped offline-admin pattern is `open_admin_store`
    comment states: "holding exclusive across the open would deadlock against
    it."
 4. `ProjectCatalogStore::open_existing(projects_path)`, which itself calls
-   `acquire_shared` at `project_catalog_store.rs:621`.
+   `acquire_shared` at `project_catalog_store.rs:942` (reached through
+   `open_existing` at `:497` via `open_existing_with_registry_and_io` at
+   `:935`).
 
 **Exclusivity duration (designed property).** Exclusivity is a point-in-time
 proof at acquisition, not a held guard for the transaction's duration. After
@@ -519,7 +529,7 @@ exclusion (the runbook stops the bridge before apply and does not restart
 until apply and verify complete); the four-hash identity check at apply
 (FD-10) refuses if the predecessor inventory advanced, leaving the service
 stopped; mutation correctness is owned by the pair transaction's
-`mutation_lock` (`project_catalog_store.rs:623`), not the lifetime lock; and a
+`mutation_lock` (`project_catalog_store.rs:1090`), not the lifetime lock; and a
 store-open variant that skips the internal `acquire_shared` would couple the
 store's locking to CLI guard ownership with no additional safety given the
 stopped-service invariant. The failure mode of a concurrent opener is an
@@ -549,7 +559,7 @@ store (`ProjectId`), never from a path hash. There are 15 occurrences across 8
 files, re-derived by grep. Disposition per call site:
 
 - **Convert to catalog resolution** (1 production site):
-  `bbox-mcp-tools/src/mcp_tools/hybrid_search.rs:698` (thread path matching).
+  `bbox-mcp-tools/src/mcp_tools/hybrid_search.rs:676` (thread path matching).
 - **Retain, bridge lane** (2 production sites): `src/tools/scope.rs:292`
   (`resolve_hybrid_project_filter`, gated by `is_bridge()`, FD-8);
   `bbox-indexing/src/projects.rs:174` (`register_path_locked`, mints the v1
@@ -564,13 +574,13 @@ files, re-derived by grep. Disposition per call site:
   for fresh catalog-mode `p_`-shaped ids (degraded lookup; harness-side
   injection removes the limitation in a later phase).
 - **Retain** (11 test/definition sites): `entity_ref.rs:549` (definition),
-  `entity_ref.rs:978`, `search.rs:1968` (test helper), `projects.rs:1016`,
-  `:1020`, `:1102`, `:1106`, `:1121`, `snapshot.rs:946` (test helper),
-  `scope.rs:597`, `src/tools/projects.rs:1422`.
+  `entity_ref.rs:978`, `search.rs:1973` (test helper), `projects.rs:1016`,
+  `:1020`, `:1102`, `:1106`, `:1121`, `snapshot.rs:6447` (test helper),
+  `scope.rs:597`, `src/tools/projects.rs:1593`.
 
 **Retained: file-relative path hash.** `project_files::short_hash`
-(`project_files.rs:2170`) computes an eight-hex hash from file-relative path
-bytes (`rel_path_hash` at `:1753`). These are content-addressed file keys,
+(`project_files.rs:2739`) computes an eight-hex hash from file-relative path
+bytes (`rel_path_hash` computed at `:2324`). These are content-addressed file keys,
 not project identity, and are legitimately retained.
 
 **Out of scope: unrelated eight-hex id generators.** Eight-hex id generators
@@ -580,11 +590,11 @@ ids, not project identity. They are entirely out of scope.
 ### 5.2. `load_project_records` consumer
 
 `load_project_records`
-(`crates/bbox-corpus-core/src/project_record.rs:385`) has exactly one direct
+(`crates/bbox-corpus-core/src/project_record.rs:432`) has exactly one direct
 consumer: `StaticProjectRecordsProvider::from_projects_path`
-(`crates/bbox-corpus-index/src/index/mod.rs:208`), which calls
+(`crates/bbox-corpus-index/src/index/mod.rs:222`), which calls
 `load_project_records` at line 209. This is reached through the legacy
-`open_or_create` path (`index/mod.rs:271`). The bridge identity construction
+`open_or_create` path (`index/mod.rs:295`). The bridge identity construction
 in `from_bridge_records` (`project_record.rs:341`) is RETAINED per FD-8.
 
 ### 5.3. P6-A deletion and test-conversion plan
@@ -593,16 +603,27 @@ P6-A converts the 1 catalog-resolution call site (section 5.1) and deletes
 the direct `load_project_records` consumer. The bridge decode path, the
 retained bridge-lane call site, and file-relative hashes survive.
 
-The deletion of `open_or_create` (`index/mod.rs:271`) affects test and
+The deletion of `open_or_create` (`index/mod.rs:295`) affects test and
 offline callers that construct an index from a `projects.json` path without a
 catalog records provider. Each must be converted to pass a
 `StaticProjectRecordsProvider` constructed from catalog-bridge records, or
-removed. The complete caller set, verified by grep: `index/mod.rs` (test:
-1091, 1135, 1189, 1210, 1278, 1346, 1391, 1435, 1462, 1557, 1652, 1737),
-`search.rs` (test: 1943, 2039), `migration_inventory.rs` (test: 927),
-`edge_index.rs` (test: 899), `store_integration_tests.rs` (15, 125),
-`writer_actor.rs` (test: 1555), `project_catalog_migration_facade.rs` (117),
-`workspace.rs` (1306), `integration_tests.rs` (28).
+removed. The caller set at this revision, verified by grep at `f22c10b9`:
+41 sites across 13 files. `index/mod.rs` (test: 1238, 1283, 1378, 1516,
+1584, 1652, 1697, 1741, 1768, 1869, 1964, 2049), `index/search.rs` (test:
+2001, 2103, 2173, 2295, 2374), `index/project_files.rs` (4007),
+`index/migration_inventory.rs` (test: 1030, 1148),
+`crates/bbox-edge-index/src/edge_index.rs` (test: 983),
+`store_integration_tests.rs` (15, 125), `writer_actor.rs` (test: 2255,
+3545, 3976, 4141), `tests/project_catalog_migration_facade.rs` (119),
+`tests/phase3_exit_gate.rs` (216, 1266), `tests/history_materializer.rs`
+(139, 323), `tests/path_free_replacement_boundary.rs` (8 sites),
+`src/tools/workspace.rs` (1306),
+`src/system_events_runtime/integration_tests.rs` (28).
+
+This inventory drifted from 22 sites to 41 between the plan's first
+authoring and this revision, so it WILL drift again: P6-A task 4 begins by
+re-deriving the set with a fresh grep against the dispatch-time tree, and
+the milestone's done-criterion is the fresh set converted, not this list.
 
 ## 6. Sequencing and replan prohibition
 
@@ -633,12 +654,12 @@ numeric cap; repeated stale recapture leaves the service stopped.
 ### 7.1. Real codes
 
 - `error.project_catalog_cli_lock`: the CLI refusal when the lifetime lock is
-  held. Used in `open_admin_store` (`src/bin/blackbox.rs:631,635,641`).
+  held. Used in `open_admin_store` (`src/bin/blackbox.rs:868,872,878`).
 - `error.project_catalog_migration_artifact_identity`: the four-hash identity
   refusal. Used in the migration facade
-  (`project_catalog_migration.rs:900,906,3727,3776,3787`).
+  (`project_catalog_migration.rs:906,912,3733,3782,3793`, among 14 sites).
 - `error.project_catalog_lifetime_lock_busy`: used by `initialize_empty` when
-  the exclusive lock is unavailable (`project_catalog_store.rs:651`).
+  the exclusive lock is unavailable (`project_catalog_store.rs:972`).
 
 ### 7.2. Staleness suffix family
 
@@ -689,7 +710,7 @@ exercise resets the window.
 The window records a baseline counter snapshot at open and a closing snapshot
 at close, both from the section 9.2 lease-counter surface persisted through
 restart via the roll-forward observation snapshot
-(`src/server/open.rs:188`, `checkout-access-observations.json`).
+(`src/server/open.rs:284`, `checkout-access-observations.json`).
 
 The pass rule: nonzero compatibility-path counters BLOCK the window, except
 where a nonzero reading maps to exactly one section 14 adapter row and one
@@ -709,11 +730,17 @@ captured after a proved stop.
 
 ### 9.2. Narrowed proof scope with accepted index rebuild
 
-The post-cut copy carries the P3-E path-free index schema
+The post-cut copy carries the path-free index schema
 (`INDEX_SCHEMA_VERSION` at `crates/bbox-corpus-index/src/index/mod.rs:16`,
-value `"agentic-corpus-g10-code-source-selectors"`). The retained pre-cut
+value `"agentic-corpus-g11-path-free-project-files"` at this revision).
+The load-bearing property is INEQUALITY, not that literal: the retained
+pre-cut bridge binary is the Phase 0 bridge release and predates P3-E, so
+its compiled `INDEX_SCHEMA_VERSION` differs from any P3-E-or-later value,
+including further bumps between this revision and the cut. The P6-G
+runbook records the actual post-cut value beside the rollback-proof copy
+checksum. The retained pre-cut
 bridge binary reads this as a schema mismatch and triggers
-`reset_index_on_schema_mismatch` (`index/mod.rs:995`), which deletes the index
+`reset_index_on_schema_mismatch` (`index/mod.rs:1112`), which deletes the index
 directory and rebuilds from source.
 
 This plan adopts a narrowed proof scope: the rollback proof accepts the
@@ -734,7 +761,7 @@ parity. Steps:
    NOT recoverable. For attachment-less projects, collected code
    rematerializes through the code-source store's manifest/blob machinery
    (`CodeSourceStore` entries verified by
-   `verify_collected_schema_migration_sources` at `index/mod.rs:1026`).
+   `verify_collected_schema_migration_sources` at `index/mod.rs:1173`).
 4. Prove every project resolves, publisher references match
    `publisher-refs.json`, and collected code rematerializes.
 5. Stop the bridge. Live v2 state remains untouched.
@@ -811,9 +838,11 @@ changes occur after P6-C closes.
 2. Route the 1 catalog-resolution call site (section 5.1) through the catalog
    resolver or remove dead paths.
 3. Delete the direct `load_project_records` consumer
-   (`StaticProjectRecordsProvider::from_projects_path`, `index/mod.rs:208`)
-   and the legacy `open_or_create` path (`index/mod.rs:271`).
-4. Convert every test/offline caller of `open_or_create` (section 5.3) to
+   (`StaticProjectRecordsProvider::from_projects_path`, `index/mod.rs:222`)
+   and the legacy `open_or_create` path (`index/mod.rs:295`).
+4. Re-derive the `open_or_create` caller set with a fresh grep against the
+   dispatch-time tree (section 5.3; the recorded inventory is a snapshot,
+   not the done-criterion), then convert every test/offline caller to
    pass a `StaticProjectRecordsProvider` from catalog-bridge records.
 5. Retain `project_files::short_hash`/`rel_path_hash` (section 5.1) and
    `IdentityOrigin::Bridge`/`from_bridge_records`/bridge compat lane (FD-8).
@@ -1086,10 +1115,10 @@ the D-040 Establish operation.
 
 Lock discipline: preflight acquires the shared lifetime lock and the store
 mutation lock through `capture_migration_preflight_with`
-(`project_catalog_store.rs:3901-3912`), matching governing section 6.3; apply
+(`project_catalog_store.rs:4225-4238`), matching governing section 6.3; apply
 uses exclusive-then-downgrade with point-in-time exclusivity at acquisition
 and the stopped-service window plus four-hash recheck as the real exclusion
-(`open_admin_store` at `src/bin/blackbox.rs:620-645`).
+(`open_admin_store` at `src/bin/blackbox.rs:857-882`).
 
 Startup gate: scoped to `MigratedV1` origins; cut-time generations verified
 against the committed manifest, live-refresh against the record's `Ready`
