@@ -426,10 +426,14 @@ the report and post-image DTOs are `LegacyPathBindingReportV1`
 Each entry names a `historical_path`, `source_store`, `source_row_id`,
 `inventory_epoch`, and typed status (`project_catalog.rs:601-609`). The
 backfill stamps the corresponding durable-store row with the stable
-`project_id` across the exact 14-variant `LegacyPathStoreKindV1` owner set: Knowledge,
+`project_id` across the 14-variant `LegacyPathStoreKindV1` owner set: Knowledge,
 Gap, Thread, Note, Pin, Roadmap, Packet, Task, Proposal, SlackBinding,
 Whiteboard, Artifact, Provenance, TranscriptEdge
-(`project_catalog_inventory.rs:629-644`).
+(`project_catalog_inventory.rs:629-644`). The fourteen variants are the
+CLOSED owner-classification universe, but not every owner necessarily
+emits legacy-selector rows requiring stamping: an owner whose capture
+lane is inventory-target-only is exempt by construction (see the
+owner-specific mechanics below).
 
 Row classification and quarantine posture (governing section 7.3):
 
@@ -507,25 +511,29 @@ newer binary wrote survive. The remaining three have ratified shapes:
   the backfill mutation; a conflicting project id refuses; an unstamped
   task remains backward-compatible; and new writes with known catalog
   authority persist the stable id.
-- **Provenance (Q-E3):** stamping is IMPLEMENTED, not deferred -
-  deferral would leave legitimate migrated inventories unable to
-  produce a clean preflight. The same optional top-level `project_id`
-  goes on `GitProvenanceNote`; row identity derives the document
-  component of `source_row_id` from the note document with `project_id`
-  removed (commit, part/index, occurrence discrimination retained). The
-  transaction holds the repository-wide `blackbox-provenance.lock` but
-  does NOT use the append-only `write_note` (which would preserve the
-  unstamped document and append a duplicate): resolve and retain the
-  exact current notes-ref OID including absence; read and
-  bounded-decode the named note and exact row; `AlreadyStamped` for the
-  same project, refusal for a different one; rewrite only that document
-  preserving order and unrelated documents; build the replacement on a
-  unique temporary notes ref; CAS the real ref
-  (`git update-ref <ref> <new> <expected>`); reopen and verify the
-  published note; delete or recover the temporary ref. A crash before
-  the CAS leaves the authoritative ref unchanged; a crash after it
-  recovers as `AlreadyStamped`. Individual ref transitions are each
-  CAS-bound and never silently merge against a changed predecessor.
+- **Provenance (Q-E3, REVERSED by Q-E3b): EXEMPT BY CONSTRUCTION.**
+  Provenance capture requires a nonempty `project_id`, derives it from
+  the legacy project record/repository association, and emits ONLY
+  `OwnerSnapshotRowV1::InventoryTarget { project_id, .. }` rows
+  (`crates/bbox-provenance/src/lib.rs:439-560`); legacy ledger bindings
+  form exclusively from `LegacyProjectSelector` rows via
+  `legacy_path_observations`, so a legitimate captured migration cannot
+  produce a Provenance stamping obligation, and the legacy project id
+  is preserved into the catalog post-image. Consequences:
+  `LegacyRowStampCoverageV1` gains a third `ExemptByConstruction`
+  variant (NOT `Covered` with a no-op stamper); preflight requires
+  `planned_stamps[Provenance] == 0` and refuses any positive count
+  before mutation; `stamp(Provenance, ..)` stays an unreachable typed
+  refusal; preflight asserts no effective legacy binding carries
+  `source_store == Provenance` and refuses such a binding as an
+  inconsistent predecessor rather than stamping or comparing it. The
+  Q-E3 CAS notes-ref transaction is WITHDRAWN entirely, including for
+  mismatch repair: a mismatch there indicates an invalid capture
+  association, which rewriting Git notes cannot repair. Proof set:
+  nonempty provenance notes yield inventory targets and zero Provenance
+  legacy observations; preflight reports exemption and zero stamps; an
+  injected Provenance legacy binding refuses before mutation; the
+  inventory-target id equals the preserved catalog project id.
 
 The dual-read interaction (governing 7.3, `project_selector.rs:60`): during
 compatibility, path-keyed rows resolve through path-fallback (ledger first,
