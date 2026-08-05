@@ -170,10 +170,11 @@ outside this command.
 **FD-2. Explicit target selection on every mutating apply and every
 verify.** Apply and verify each select exactly one of
 `--rehearsal-root <path>` or `--configured`. This generalizes the shipped
-`--rehearsal-root` gate (`required_if_eq("apply","true")`,
-`conflicts_with = "preflight"` at `src/bin/blackbox.rs:272-278`) so that
+`--rehearsal-root` gate (`src/bin/blackbox.rs:272-278`) so that
 touching or attesting real configured state is always an explicit operator
-opt-in. Preflight accepts an OPTIONAL `--rehearsal-root`, which runs the
+opt-in; the enforcement mechanism is the ratified two-layer shape in
+section 3.1 (parse-level at-most-one group plus handler-level exactly-one
+check), not dual conditional requirements. Preflight accepts an OPTIONAL `--rehearsal-root`, which runs the
 D-026 isolated-bundle preflight that must precede rehearsal apply; without
 it, preflight captures the real configured state through `ConfigArgs`
 resolution (D-021), exactly as governing section 6.3 specifies (section
@@ -261,8 +262,19 @@ blackbox project-catalog path-free-rebuild \
     [--config <path>] [--state-dir <path>] [--projects-path <path>]
 ```
 
-**Target rules per mode.** `--rehearsal-root` and `--configured` are
-`conflicts_with` each other.
+**Target rules per mode, and their enforcement mechanism (mid-milestone
+adjudication Q-A, ratified).** A dual `required_if_eq("apply","true")` on
+both target flags is mechanically wrong: clap evaluates the two
+conditional requirements independently of their conflict, so `--apply`
+demands BOTH flags (proven by regression against the shipped
+`parser_selects_each_documented_command` test). The ratified mechanism is
+two-layer: an at-most-one `ArgGroup("target")` over the pair rejects BOTH
+at parse time, and the command handler enforces the per-mode rules below
+BEFORE configuration loading, artifact access, or any other observable
+work, refusing with the existing `error.project_catalog_cli_arguments`.
+Tests pin the layer split: both targets is a PARSER refusal; a missing or
+mode-incompatible target is a typed HANDLER refusal; every documented
+command parses.
 
 - **Apply and verify require exactly one of them.** Both modes operate on
   a concrete root; an implicit target would let artifacts or verification
@@ -297,6 +309,23 @@ blackbox project-catalog path-free-rebuild \
   store), not against operator artifacts; the durable records already
   carry the artifact hashes they were applied from (FD-4).
 
+**Facade shape for the new verbs (adjudication Q-C, ratified).** Backfill
+and rebuild facades are TARGET-EXPLICIT: each entry takes one explicit
+target layout plus its identity-bound artifacts. They carry no
+rehearsal/protected duality, because unlike migration rehearsal they never
+apply artifacts captured from one authority onto a different authority.
+Binding conditions: the CLI resolves `--rehearsal-root`/`--configured` to
+exactly one target BEFORE facade invocation; the facade itself validates
+the target layout, artifact confinement, exact identity binding,
+predecessor state, transaction recovery, and post-commit verification; a
+rehearsal-selected layout must carry the expected rehearsal-root shape
+and a configured-selected layout must be config-resolved; configured
+apply holds the factored lifetime claim (section 4.2) for the complete
+facade call; rehearsal apply takes no configured-store lock and performs
+no hidden configured fallback; verify is target-explicit under the same
+selection rules; and no second manifest writer, transaction owner, or
+recovery implementation is introduced.
+
 Both new commands produce the D-020 versioned result envelope. The envelope
 `command` values are snake_case, following the shipped shape:
 `project_catalog_durable_backfill_preflight`,
@@ -308,19 +337,43 @@ Both new commands produce the D-020 versioned result envelope. The envelope
 
 ### 3.2. Existing command changes
 
-**`migrate` gains the configured-target capability for apply only.** Add
-`--configured` to `MigrateArgs` as an alternative to `--rehearsal-root`. Both
-carry `required_if_eq("apply","true")` and are `conflicts_with` each other,
-matching the shipped `--rehearsal-root` gate. Preflight requires neither flag:
-live migration preflight captures configured state through `ConfigArgs`
-resolution with no target flag, exactly as governing section 6.3 specifies
-("It can run while the v1 daemon remains available"). The D-026
-isolated-bundle preflight that precedes a `migrate` rehearsal apply keeps
-its shipped shape: `ConfigArgs` (`--projects-path`/`--state-dir`) pointed
-at the bundle, since `--rehearsal-root` conflicts with `--preflight` on
-the shipped `MigrateArgs` and this plan does not change the shipped
-surface. When `--configured` is selected at apply, the command runs
-`open_admin_store` (section 4).
+**`migrate` gains the configured-target capability for apply only
+(adjudication Q-B, ratified shape).** Add `--configured` to `MigrateArgs`
+as an alternative to `--rehearsal-root`, enforced by the section 3.1
+two-layer mechanism. Preflight requires neither flag: live migration
+preflight captures configured state through `ConfigArgs` resolution with
+no target flag, exactly as governing section 6.3 specifies ("It can run
+while the v1 daemon remains available"). The D-026 isolated-bundle
+preflight that precedes a `migrate` rehearsal apply keeps its shipped
+shape: `ConfigArgs` (`--projects-path`/`--state-dir`) pointed at the
+bundle, since `--rehearsal-root` conflicts with `--preflight` on the
+shipped `MigrateArgs` and this plan does not change the shipped surface.
+
+Configured apply is NOT a CLI-layer flag over the shipped facade path:
+`FacadeCoreV1::apply_rehearsal` calls `validate_rehearsal_separation`,
+which by design refuses any target not isolated from the protected
+layout, and under `--configured` the two ARE the same layout. The
+ratified shape keeps `apply_rehearsal` untouched and introduces a
+distinct configured entry (`apply_configured` or equivalent) whose
+request carries one `target_layout`, `report_path`, and
+`resolution_path`. Its path validates the target layout, runs
+`validate_artifact_set` and `validate_artifact_target` against that
+target, decodes the exact artifacts, and retains every four-hash,
+report-status, resolution, recapture, transaction,
+mutation-disposition, and post-commit verification check, omitting ONLY
+`validate_rehearsal_separation` because configured target equality is the
+operation's definition. Both entries share a private apply-to-target
+core so they cannot drift transactionally. The dual-layout
+`ProjectCatalogMigrationApplyRequestV1` keeps its rehearsal meaning
+unchanged; it is never conditionally overloaded.
+
+Lock acquisition for configured apply uses the factored claim helper of
+section 4.2 (`acquire_admin_lifetime_claim`), NOT `open_admin_store`:
+the shipped `open_admin_store` strict-opens a v2 store, which correctly
+refuses the still-version-1 configured store that exists before the
+migration transaction runs. The CLI acquires the claim before any target
+read or mutation and holds it through the entire facade call and
+post-commit verification.
 
 **Lock discipline (preflight).** Governing section 6.3 states "preflight
 takes a shared/read lock." This matches the shipped code: preflight capture
@@ -332,7 +385,8 @@ closure. A shared lifetime lock does not exclude the daemon's own shared
 handle, so preflight runs while the bridge is live and sees a consistent
 snapshot.
 
-**`verify` gains the exclusive-availability proof mode.** Add
+**`verify` gains the exclusive-availability proof mode AND a
+configured-target verification entry (adjudication Q-B).** Add
 `--require-exclusive-availability` to `VerifyArgs`. When set, the command
 attempts `ProjectCatalogMigrationLock::try_acquire_exclusive` against the
 configured projects path. If it returns `Ok(Some(_))`, the bridge is down; the
@@ -341,6 +395,19 @@ command exits nonzero with `error.project_catalog_cli_lock` and a message
 stating the lifetime lock is shared (bridge is live). This replaces a proposed
 `lock-status` verb: it reuses the existing `Verify` variant and result
 envelope.
+
+The availability probe alone is not P6-F's configured verification: the
+shipped `VerifyArgs` requires `--root` and the verification facade
+rejects layouts without a rehearsal root, so the configured store cannot
+be verified as shipped. The ratified shape: plain `verify --root ...`
+retains rehearsal verification unchanged;
+`verify --require-exclusive-availability --config ...` selects the
+CONFIGURED layout (`--require-exclusive-availability` conflicts with
+`--root`), performs the availability probe, and invokes a
+configured-target verification entry that does not require a rehearsal
+root. Every existing invocation remains valid. The probe primitive
+shipped at `4b995c63` is retained as-is; the configured-target
+verification entry completes it.
 
 No other changes to the shipped surface. `Add`, `List`, `Get`, `Alias`,
 `ScopeMigrate`, and `Retire` are untouched.
@@ -554,6 +621,27 @@ store-open variant that skips the internal `acquire_shared` would couple the
 store's locking to CLI guard ownership with no additional safety given the
 stopped-service invariant. The failure mode of a concurrent opener is an
 aborted apply, not corruption.
+
+**The factored lifetime claim (adjudication Q-B).** `open_admin_store`
+composes two things: the exclusive-then-downgrade lock acquisition
+(steps 1 through 3) and a strict `ProjectCatalogStore::open_existing`
+(step 4). The strict open correctly refuses a version-1 store, so
+`open_admin_store` CANNOT be called unchanged before the configured
+migration has run - exactly the moment configured apply needs the lock.
+The acquisition portion is factored into a lock-only helper:
+
+```text
+acquire_admin_lifetime_claim(projects_path)
+    -> exclusive probe (Ok(None) = error.project_catalog_cli_lock)
+    -> downgrade to shared
+    -> return guard
+```
+
+The CLI acquires the claim before any target read or mutation and holds
+it through the entire facade call and post-commit verification.
+`open_admin_store` continues to use the helper and then strict-opens, for
+operations whose target is already version 2 (the new verbs' configured
+applies, which run after migration).
 
 ### 4.3. Rehearsal apply needs no exclusive lock
 
@@ -887,9 +975,16 @@ removed.
    the section 3.1 mode rules: exactly one of
    `--rehearsal-root`/`--configured` for apply and verify, optional
    `--rehearsal-root` for preflight (D-026 bundle preflight).
-2. Add `--configured` to `MigrateArgs` with `required_if_eq("apply","true")`
-   and `conflicts_with = "rehearsal_root"`. Preflight requires neither.
-3. Add `--require-exclusive-availability` to `VerifyArgs`.
+2. Add `--configured` to `MigrateArgs` via the section 3.1 two-layer
+   mechanism (at-most-one target group + handler exactly-one check).
+   Preflight requires neither flag. Implement the distinct
+   `apply_configured` facade entry and the configured-target verification
+   entry per the ratified section 3.2 shape, sharing the private
+   apply-to-target core with rehearsal apply.
+3. Add `--require-exclusive-availability` to `VerifyArgs` (probe shipped
+   at `4b995c63`) and the configured-target verification entry it selects
+   (section 3.2: conflicts with `--root`, verifies the configured layout
+   without requiring a rehearsal root).
 4. Implement the durable-backfill facade method: capture the legacy path
    ledger from the applied migration post-image, classify rows as
    mappable/ambiguous/unscoped (section 3.3), plan stamp operations, verify
@@ -911,9 +1006,10 @@ removed.
    `HistoryProofModeV1::Equality` with matching source fingerprints
    (D-036, section 3.4).
 7. Wire `command_name()` for the six new envelope values (section 3.1).
-8. Both new apply paths use `open_admin_store` (section 4.2) for
-   `--configured`; both preflight paths acquire the shared lifetime lock
-   (section 4.1).
+8. Both new configured apply paths hold the factored
+   `acquire_admin_lifetime_claim` for the complete facade call (section
+   4.2); both preflight paths acquire the shared lifetime lock
+   (section 4.1); rehearsal applies take no configured-store lock (4.3).
 9. Add the new error codes (section 7.3).
 
 **Exit gate:** Both commands produce the D-020 versioned envelope with
@@ -1056,11 +1152,14 @@ exclusive lock.
 4. Bridge-down proof: `verify --require-exclusive-availability` returns
    `Ok(Some(_))`.
 5. Configured migration apply: `migrate --apply --configured --report <path>
-   --resolution <path>`. Uses `open_admin_store` (section 4.2), verifies
+   --resolution <path>`. Holds `acquire_admin_lifetime_claim` through the
+   `apply_configured` facade call (sections 3.2 and 4.2), verifies
    four-hash identity, installs post-image.
 6. If apply reports stale inventory, leave stopped, run new preflight, review
    new exact artifacts, invoke apply again (section 6.2).
-7. Verify: `verify --require-exclusive-availability --config <path>`.
+7. Verify: `verify --require-exclusive-availability --config <path>`
+   (the configured-target verification entry of section 3.2, not the
+   rehearsal `--root` form).
    Migration verification receipt confirms exact installed state.
 
 **Exit gate:** Configured migration applied and verified. Service stopped with
