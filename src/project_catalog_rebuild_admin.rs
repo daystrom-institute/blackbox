@@ -26,6 +26,11 @@
 
 use anyhow::{Context, Result};
 use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
+use bbox_indexing::project_catalog_migration::ProjectCatalogMigrationError;
+use bbox_indexing::project_catalog_rebuild_planning::{
+    PathFreeRebuildPreflightReceiptV1, PathFreeRebuildPreflightRequestV1,
+    ProjectCatalogPathFreeRebuildPlanningFacadeV1,
+};
 
 use crate::index::{IndexWriterActor, TranscriptIndex};
 
@@ -96,6 +101,28 @@ pub fn drive_catalog_schema_replacement(
     idx.complete_schema_migration()
         .context("committing schema-migration version marker failed")?;
     Ok(CatalogSchemaReplacementDriveV1::Completed)
+}
+
+/// The offline `path-free-rebuild --preflight` entrypoint (P6-B task 5).
+///
+/// The root crate owns the rebuild's entrypoints because it owns the
+/// executable composition (Q-D). Preflight is the read-only half, so this
+/// entry is deliberately thin: it resolves nothing the CLI has not already
+/// resolved and adds no authority of its own. It exists here rather than in
+/// the CLI so that offline preflight and offline apply are reached through
+/// ONE module, and so the apply entry beside it cannot quietly acquire a
+/// different set of preconditions than the preflight that authorized it.
+///
+/// STRICTLY READ-ONLY. It scans, proves Equality (D-036), consumes
+/// `BackfillCompletionJournalV1` as its predecessor binding, and writes the
+/// two reviewed artifacts. It never invokes the replacement guard, writes a
+/// prepared manifest, creates a generation, or opens the destructive
+/// replacement path; the shared lifetime lock it takes does not exclude a
+/// live daemon's own shared handle (section 4.1).
+pub fn preflight(
+    request: PathFreeRebuildPreflightRequestV1,
+) -> Result<PathFreeRebuildPreflightReceiptV1, ProjectCatalogMigrationError> {
+    ProjectCatalogPathFreeRebuildPlanningFacadeV1::preflight(request)
 }
 
 #[cfg(test)]

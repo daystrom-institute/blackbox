@@ -5991,7 +5991,7 @@ fn read_artifact_required(
     })
 }
 
-fn read_artifact_optional(
+pub(crate) fn read_artifact_optional(
     path: &Path,
     max_bytes: usize,
     label: &'static str,
@@ -6030,13 +6030,27 @@ fn write_artifact_atomic(
     write_artifact(path, bytes, max_bytes, label, true)
 }
 
-fn write_artifact_if_absent(
+pub(crate) fn write_artifact_if_absent(
     path: &Path,
     bytes: &[u8],
     max_bytes: usize,
     label: &'static str,
 ) -> Result<(), ProjectCatalogMigrationError> {
     write_artifact(path, bytes, max_bytes, label, false)
+}
+
+/// Write an artifact, replacing any existing file at the path.
+///
+/// Preflight OWNS its report: rerunning it against fresh state must produce a
+/// fresh report, so the report writer replaces while the resolution writer
+/// does not (an existing reviewed resolution is authoritative, D-026).
+pub(crate) fn write_artifact_replacing(
+    path: &Path,
+    bytes: &[u8],
+    max_bytes: usize,
+    label: &'static str,
+) -> Result<(), ProjectCatalogMigrationError> {
+    write_artifact(path, bytes, max_bytes, label, true)
 }
 
 fn write_artifact(

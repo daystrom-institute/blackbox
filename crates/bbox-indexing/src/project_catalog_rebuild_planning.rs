@@ -25,16 +25,23 @@ use bbox_corpus_index::index::history_generations::{
 };
 
 use crate::index::history_materializer::{HistoryMaterializerRequestV1, prove_source_index};
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::project_catalog_inventory::{
+    MAX_PROJECT_CATALOG_REPORT_BYTES, MAX_PROJECT_CATALOG_RESOLUTION_BYTES,
+};
 use crate::project_catalog_inventory::{OperatorResolutionNoteV1, Sha256ValueV1};
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationError, ProjectCatalogMigrationResolvedLayoutV1,
-    load_legacy_commit_namespace_inventory_asset,
+    ProjectCatalogTargetSelectionV1, load_legacy_commit_namespace_inventory_asset,
+    read_artifact_optional, validate_artifact_set, validate_target_selection,
+    write_artifact_if_absent, write_artifact_replacing,
 };
 use crate::project_catalog_rebuild::ERROR_REBUILD_PROOF_MODE;
-use crate::project_catalog_store::ProjectCatalogStore;
+use crate::project_catalog_store::{ProjectCatalogStore, capture_migration_preflight_with};
 
 type PlanningResult<T> = Result<T, ProjectCatalogMigrationError>;
 
@@ -534,6 +541,155 @@ pub fn plan_path_free_rebuild(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Preflight facade
+// ---------------------------------------------------------------------------
+
+/// Preflight against ONE explicit target layout (section 3.1).
+///
+/// Target-explicit, with no rehearsal/protected duality: unlike migration
+/// rehearsal, a rebuild never applies artifacts captured from one authority
+/// onto a different one, so isolation is the CALLER's responsibility expressed
+/// by which layout it hands in (adjudication Q-C).
+pub struct PathFreeRebuildPreflightRequestV1 {
+    pub layout: ProjectCatalogMigrationResolvedLayoutV1,
+    /// Which target the CLI resolved. Bound to the layout's actual shape
+    /// before any other observable work (Q-C).
+    pub target_selection: ProjectCatalogTargetSelectionV1,
+    /// OUTPUT path. Preflight writes the report here, replacing any prior one.
+    pub report_path: PathBuf,
+    /// OUTPUT path. A first preflight creates the canonical empty resolution
+    /// here; an existing reviewed resolution is read and honoured (D-026).
+    pub resolution_path: PathBuf,
+    pub scan_limits: HistoryScanLimitsV1,
+    /// Timestamp source. Passed in rather than read from the clock so the
+    /// facade stays deterministic under test.
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PathFreeRebuildPreflightReceiptV1 {
+    pub version: u32,
+    pub status: PathFreeRebuildStatusV1,
+    pub inventory_hash: Sha256ValueV1,
+    pub plan_hash: Sha256ValueV1,
+    pub report_artifact_hash: Sha256ValueV1,
+    pub resolution_artifact_hash: Sha256ValueV1,
+    pub predecessor_catalog_epoch: u64,
+    pub proof_mode: HistoryProofModeV1,
+    pub planned_namespace_count: u64,
+    pub planned_commit_document_total: u64,
+}
+
+/// The read-only path-free-rebuild planning authority.
+pub struct ProjectCatalogPathFreeRebuildPlanningFacadeV1;
+
+impl ProjectCatalogPathFreeRebuildPlanningFacadeV1 {
+    /// Capture the predecessor under the SHARED lifetime lock and plan.
+    ///
+    /// Writes NO project state. The only bytes it writes are the two reviewed
+    /// artifacts at the operator-named paths, which `validate_artifact_set`
+    /// has already proved lie outside every owner root.
+    ///
+    /// The shared lifetime lock does not exclude the daemon's own shared
+    /// handle (section 4.1), which is why this can run against configured
+    /// state and still see a consistent capture.
+    pub fn preflight(
+        request: PathFreeRebuildPreflightRequestV1,
+    ) -> PlanningResult<PathFreeRebuildPreflightReceiptV1> {
+        // Q-C binding conditions, both BEFORE any store read or artifact
+        // access: the selected target must match the layout's real shape, and
+        // the artifacts must be confined outside that target's owners.
+        validate_target_selection(&request.layout, request.target_selection)?;
+        validate_artifact_set(
+            &request.layout,
+            &request.report_path,
+            &request.resolution_path,
+            None,
+        )?;
+
+        let projects_path = request.layout.projects_path().to_path_buf();
+        let plan = capture_migration_preflight_with(
+            &projects_path,
+            |error| refuse(ERROR_REBUILD_STALE_PREDECESSOR, error.to_string()),
+            || plan_path_free_rebuild(&request.layout, request.scan_limits),
+        )?;
+
+        // An existing reviewed resolution is AUTHORITATIVE (D-026): a rerun
+        // must not overwrite what the operator reviewed. Only a first
+        // preflight creates the canonical empty one.
+        let existing = read_artifact_optional(
+            &request.resolution_path,
+            MAX_PROJECT_CATALOG_RESOLUTION_BYTES,
+            "resolution",
+        )?;
+        let resolution_bytes = match existing {
+            Some(bytes) => {
+                let decoded: PathFreeRebuildResolutionV1 =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        refuse(
+                            ERROR_REBUILD_STALE_PREDECESSOR,
+                            format!("resolution artifact is not a strict v1 document: {error}"),
+                        )
+                    })?;
+                if decoded.inventory_hash != plan.inventory_hash {
+                    return Err(refuse(
+                        ERROR_REBUILD_STALE_PREDECESSOR,
+                        "the reviewed resolution is bound to a different predecessor \
+                         inventory: capture a fresh preflight rather than reusing it",
+                    ));
+                }
+                bytes
+            }
+            None => {
+                let bytes = serde_json::to_vec(&PathFreeRebuildResolutionV1::empty(
+                    plan.inventory_hash.clone(),
+                ))
+                .map_err(|error| {
+                    refuse(
+                        ERROR_REBUILD_STALE_PREDECESSOR,
+                        format!("resolution artifact cannot be encoded: {error}"),
+                    )
+                })?;
+                write_artifact_if_absent(
+                    &request.resolution_path,
+                    &bytes,
+                    MAX_PROJECT_CATALOG_RESOLUTION_BYTES,
+                    "resolution",
+                )?;
+                bytes
+            }
+        };
+
+        let report = plan.report(request.generated_at, &resolution_bytes);
+        let report_bytes = serde_json::to_vec(&report).map_err(|error| {
+            refuse(
+                ERROR_REBUILD_STALE_PREDECESSOR,
+                format!("report artifact cannot be encoded: {error}"),
+            )
+        })?;
+        write_artifact_replacing(
+            &request.report_path,
+            &report_bytes,
+            MAX_PROJECT_CATALOG_REPORT_BYTES,
+            "report",
+        )?;
+
+        Ok(PathFreeRebuildPreflightReceiptV1 {
+            version: PATH_FREE_REBUILD_REPORT_VERSION_V1,
+            status: report.status,
+            inventory_hash: plan.inventory_hash,
+            plan_hash: plan.plan_hash,
+            report_artifact_hash: Sha256ValueV1::digest(&report_bytes),
+            resolution_artifact_hash: Sha256ValueV1::digest(&resolution_bytes),
+            predecessor_catalog_epoch: plan.predecessor.observed_catalog_epoch,
+            proof_mode: plan.source_binding.proof_mode,
+            planned_namespace_count: plan.source_binding.namespace_dispositions.len() as u64,
+            planned_commit_document_total: plan.source_binding.commit_document_total(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,5 +1033,85 @@ mod tests {
                  belongs to history_materializer, never to a second copy"
             );
         }
+    }
+
+    fn preflight_request(
+        layout: ProjectCatalogMigrationResolvedLayoutV1,
+        target_selection: ProjectCatalogTargetSelectionV1,
+        report_path: PathBuf,
+        resolution_path: PathBuf,
+    ) -> PathFreeRebuildPreflightRequestV1 {
+        PathFreeRebuildPreflightRequestV1 {
+            layout,
+            target_selection,
+            report_path,
+            resolution_path,
+            scan_limits: HistoryScanLimitsV1::default(),
+            generated_at: "2026-08-04T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Artifacts must sit OUTSIDE the target layout, and the refusal must
+    /// come BEFORE any store read.
+    ///
+    /// The store is never created in this fixture, so a run that reached the
+    /// capture would fail on the missing store instead. Getting the
+    /// confinement refusal proves the ordering, not just the rule.
+    #[test]
+    fn artifacts_inside_the_target_layout_are_refused_before_any_store_read() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let layout = test_layout(&root);
+        assert!(
+            !root.join("live").join("projects.json").exists(),
+            "the fixture deliberately has no store"
+        );
+
+        let refused = ProjectCatalogPathFreeRebuildPlanningFacadeV1::preflight(preflight_request(
+            layout.clone(),
+            ProjectCatalogTargetSelectionV1::Configured,
+            // Inside the index root, an owner DIRECTORY root.
+            root.join("live").join("index").join("report.json"),
+            root.join("review").join("resolution.json"),
+        ))
+        .expect_err("an artifact inside the target layout must be refused");
+        assert_eq!(
+            refused.code, "error.project_catalog_migration_unsafe_layout",
+            "confinement must refuse before the capture, not after"
+        );
+
+        // The resolution is confined by the same rule.
+        let refused = ProjectCatalogPathFreeRebuildPlanningFacadeV1::preflight(preflight_request(
+            layout,
+            ProjectCatalogTargetSelectionV1::Configured,
+            root.join("review").join("report.json"),
+            // Exactly an owner FILE path, the other confinement arm.
+            root.join("live").join("projects.json"),
+        ))
+        .expect_err("a resolution at an owner path must be refused");
+        assert_eq!(
+            refused.code,
+            "error.project_catalog_migration_unsafe_layout"
+        );
+    }
+
+    /// Q-C: the selected target must match the layout's actual shape. A
+    /// config-resolved layout running under a Rehearsal selection would let a
+    /// rehearsal-labelled invocation read real configured state.
+    #[test]
+    fn a_configured_layout_under_a_rehearsal_selection_is_refused() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let refused = ProjectCatalogPathFreeRebuildPlanningFacadeV1::preflight(preflight_request(
+            test_layout(&root),
+            ProjectCatalogTargetSelectionV1::Rehearsal,
+            root.join("review").join("report.json"),
+            root.join("review").join("resolution.json"),
+        ))
+        .expect_err("a configured layout may not run under a rehearsal selection");
+        assert_eq!(
+            refused.code,
+            "error.project_catalog_migration_unsafe_layout"
+        );
     }
 }
