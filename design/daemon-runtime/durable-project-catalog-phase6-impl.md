@@ -134,11 +134,18 @@ preflight/apply/verify mode triple internally. The bridge-down proof is
 `verify --require-exclusive-availability`, not a new verb.
 
 `durable-backfill` stamps and rewrites path-keyed durable-store rows across
-the 14-variant `LegacyPathStoreKindV1` owner set, using the `LegacyPathBinding`
+the 14-variant `LegacyPathStoreKindV1` owner set, using the legacy path
 ledger from the migration inventory (governing section 7.3). Publisher
-bindings, accepted publication pointers, and G1 content references are already
-installed by the migration transaction itself (governing section 13.2, D-006,
-D-014); durable-backfill verifies their presence but does not seed them.
+bindings, accepted publication pointers, and G1 content references are
+installed by the migration transaction itself (governing section 13.2,
+D-006, D-014); durable-backfill verifies them per publisher disposition and
+never seeds either branch. For a `SeedG1` disposition it verifies the
+pointer and G1 generation evidence are present and hash-consistent. For a
+`NoPublishedContentAcknowledged` disposition it verifies pointer ABSENCE:
+D-040 requires such a project to have no accepted-publication pointer until
+an explicit Establish, so a pointer found there is a defect refusal, not a
+gap to fill. First publication remains the D-040 Establish operation,
+outside this command.
 
 **FD-2. Explicit target selection on every mutating apply and every
 verify.** Apply and verify each select exactly one of
@@ -409,13 +416,16 @@ conversions that landed in the committed pair are visible in the new
 predecessor and are not re-stamped.
 
 The backfill report carries: the predecessor catalog epoch and snapshot hash;
-the complete `LegacyPathBinding` ledger with row classification counts by store
+the complete legacy path ledger with row classification counts by store
 and status; planned stamp operations (per-store mappable/ambiguous/unscoped
-counts); publisher/G1 verification result (every project expected to publish
-has a seeded generation, any missing named); the predicted post-image catalog
-epoch (equals predecessor when no pair mutation; bumped when quarantine
-conversions land); and the `BackfillCompletionJournalV1` path for the rebuild
-preflight's four-hash chain.
+counts); the per-disposition publisher verification result (every `SeedG1`
+project's pointer and G1 generation present and hash-consistent, any
+missing named; every `NoPublishedContentAcknowledged` project's pointer
+confirmed ABSENT, any unexpectedly present named as a defect); the
+predicted post-image catalog epoch (equals predecessor when no pair
+mutation; bumped when quarantine conversions land); and the
+`BackfillCompletionJournalV1` path for the rebuild preflight's four-hash
+chain.
 
 ### 3.4. `path-free-rebuild` semantics
 
@@ -831,10 +841,12 @@ removed.
 2. Add `--configured` to `MigrateArgs` with `required_if_eq("apply","true")`
    and `conflicts_with = "rehearsal_root"`. Preflight requires neither.
 3. Add `--require-exclusive-availability` to `VerifyArgs`.
-4. Implement the durable-backfill facade method: capture the `LegacyPathBinding`
+4. Implement the durable-backfill facade method: capture the legacy path
    ledger from the applied migration post-image, classify rows as
    mappable/ambiguous/unscoped (section 3.3), plan stamp operations, verify
-   publisher/G1 coverage, and produce the report and resolution. Apply stamps
+   publisher/G1 evidence per disposition (presence and hash-consistency
+   for `SeedG1`, pointer absence for `NoPublishedContentAcknowledged`;
+   D-040, section 3.3), and produce the report and resolution. Apply stamps
    all mappable rows idempotently under exclusive lock; unresolved quarantined
    rows ride forward as counted quarantine (section 3.3).
 5. Implement the path-free-rebuild facade as a thin caller of the Phase 3
@@ -859,8 +871,9 @@ removed.
 snake_case `command` values. Preflight acquires the shared lifetime lock.
 Apply uses
 exclusive-then-downgrade. The artifact hash graph is acyclic (FD-4). Backfill
-stamps `LegacyPathStoreKindV1` rows and verifies publisher/G1 coverage without
-seeding.
+stamps `LegacyPathStoreKindV1` rows and verifies publisher/G1 evidence per
+disposition (pointer presence for `SeedG1`, pointer absence for
+`NoPublishedContentAcknowledged`) without seeding either branch.
 
 ### P6-C (code-only): validation, verification, recovery
 
@@ -1008,9 +1021,9 @@ proof copy.
 **Tasks:**
 
 1. Backfill preflight: capture the applied migration post-image. Review the
-   `LegacyPathBinding` ledger classification and publisher/G1 verification.
-   Quarantined rows without an explicit disposition ride forward as counted
-   quarantine (section 3.3).
+   legacy path ledger classification and the per-disposition publisher/G1
+   verification. Quarantined rows without an explicit disposition ride
+   forward as counted quarantine (section 3.3).
 2. Backfill apply: `durable-backfill --apply --configured --report <path>
    --resolution <path>`. Stamps all mappable `LegacyPathStoreKindV1` rows
    idempotently; unresolved quarantine rides forward.
@@ -1066,7 +1079,10 @@ defines durable-backfill and path-free-rebuild as versioned
 exclusive-lock exact-root preflight/apply/verify conventions, and the existing
 receipt vocabulary (D-028). Durable-backfill owns the governing 7.3 row
 stamping; publisher/G1 seeding remains the migration transaction's
-responsibility (governing 13.2, D-006, D-014).
+responsibility (governing 13.2, D-006, D-014), verified by backfill per
+disposition (presence for `SeedG1`, D-040 pointer absence for
+`NoPublishedContentAcknowledged`), with first publication reserved for
+the D-040 Establish operation.
 
 Lock discipline: preflight acquires the shared lifetime lock and the store
 mutation lock through `capture_migration_preflight_with`
