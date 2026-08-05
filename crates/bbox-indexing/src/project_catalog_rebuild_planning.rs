@@ -41,7 +41,7 @@ use crate::project_catalog_migration::{
     write_artifact_if_absent, write_artifact_replacing,
 };
 use crate::project_catalog_rebuild::ERROR_REBUILD_PROOF_MODE;
-use crate::project_catalog_store::{ProjectCatalogStore, capture_migration_preflight_with};
+use crate::project_catalog_store::ProjectCatalogStore;
 
 type PlanningResult<T> = Result<T, ProjectCatalogMigrationError>;
 
@@ -608,12 +608,16 @@ impl ProjectCatalogPathFreeRebuildPlanningFacadeV1 {
             None,
         )?;
 
-        let projects_path = request.layout.projects_path().to_path_buf();
-        let plan = capture_migration_preflight_with(
-            &projects_path,
-            |error| refuse(ERROR_REBUILD_STALE_PREDECESSOR, error.to_string()),
-            || plan_path_free_rebuild(&request.layout, request.scan_limits),
-        )?;
+        // The capture takes its locks through the STORE OPEN inside
+        // `plan_path_free_rebuild`, not through an outer
+        // `capture_migration_preflight_with`. That is not a shortcut, it is
+        // required: `open_existing` acquires the shared lifetime lock AND the
+        // store mutation lock itself, so wrapping it in a helper that already
+        // holds the mutation lock deadlocks the process against its own
+        // exclusive flock on a second descriptor. Section 4.1's requirement
+        // (preflight runs under the shared lifetime lock) is satisfied by the
+        // open, which holds that lock for the store's whole lifetime.
+        let plan = plan_path_free_rebuild(&request.layout, request.scan_limits)?;
 
         // An existing reviewed resolution is AUTHORITATIVE (D-026): a rerun
         // must not overwrite what the operator reviewed. Only a first
@@ -1113,5 +1117,37 @@ mod tests {
             refused.code,
             "error.project_catalog_migration_unsafe_layout"
         );
+    }
+
+    /// REGRESSION: a preflight that reaches the capture must COMPLETE.
+    ///
+    /// `ProjectCatalogStore::open_existing` acquires the shared lifetime lock
+    /// and the store mutation lock itself. An earlier revision wrapped the
+    /// plan in `capture_migration_preflight_with`, which holds the mutation
+    /// lock across its closure, so the open blocked forever on the process's
+    /// own exclusive flock taken through a second descriptor. It was a
+    /// deadlock, not a slow path, and no unit test caught it because every
+    /// other test refuses before the capture.
+    ///
+    /// This store is FreshV2, so the run refuses on the absent backfill
+    /// journal. That refusal is the point: reaching it at all proves the
+    /// capture returned.
+    #[test]
+    fn a_preflight_that_reaches_the_capture_returns_rather_than_deadlocking() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let layout = test_layout(&root);
+        let projects_path = root.join("live").join("projects.json");
+        fs::create_dir_all(projects_path.parent().unwrap()).unwrap();
+        drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+
+        let refused = ProjectCatalogPathFreeRebuildPlanningFacadeV1::preflight(preflight_request(
+            layout,
+            ProjectCatalogTargetSelectionV1::Configured,
+            root.join("review").join("report.json"),
+            root.join("review").join("resolution.json"),
+        ))
+        .expect_err("a fresh-v2 store has no backfill journal to chain");
+        assert_eq!(refused.code, ERROR_REBUILD_STALE_PREDECESSOR);
     }
 }
