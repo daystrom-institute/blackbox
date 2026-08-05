@@ -617,14 +617,57 @@ second implementation would fork the crash and recovery semantics P3-D owns. The
 requires the manifest in the `Committed` state for migrated origins before the
 daemon may bind any route.
 
-**Placement (adjudication Q-D, ratified).** The executable replacement
-sequence is composed by the ROOT crate (guard injection at index open,
-prepared-manifest materialization, the destructive full pass, the sole
-P3-D committer, and the synchronous post-reset drive), so the rebuild
-preflight and apply entrypoints live in a root-crate administration
-module (`project_catalog_rebuild_admin`) sharing ONE
-`drive_catalog_schema_replacement` function with daemon startup -
-refactored out of the daemon open path, never copied. `bbox-indexing`
+**Placement (adjudication Q-D, ratified; scope refined by Q-F).** The
+executable replacement sequence is composed by the ROOT crate (guard
+injection at index open, prepared-manifest materialization, the
+destructive full pass, the sole P3-D committer, and the synchronous
+post-reset drive), so the rebuild preflight and apply entrypoints live
+in a root-crate administration module (`project_catalog_rebuild_admin`)
+sharing ONE `drive_catalog_schema_replacement` function with daemon
+startup - refactored out of the daemon open path, never copied. Per
+Q-F, that shared component is a GENERAL catalog index-replacement
+driver, not exclusively a post-schema-reset driver: it consumes a typed
+drive state (`FreshReplacement { cause }` with cause
+`SchemaMismatch` | `OperatorPathFreeRebuild`, `ResumePrepared`,
+`FinalizeCommitted`, `NotRequired`).
+
+**Trigger (adjudication Q-F, ratified - the marker contradiction).**
+Execution proved "Equality AND Completed" unreachable under a
+marker-mismatch-only trigger: the replacement ran only after
+`reset_index_on_schema_mismatch`, the migration refuses a mismatched
+marker as Corrupt, and one pinned binary means the marker can never do
+both. The Phase 6 replacement is therefore OPERATOR-TRIGGERED with an
+UNCHANGED current marker: offline `path-free-rebuild --apply` selects
+`OperatorPathFreeRebuild` only after artifact authorization and the
+immediate Equality recapture succeed, with observed and target schema
+versions intentionally equal; schema mismatch remains the separate
+daemon-upgrade trigger, and daemon startup remains `SchemaMismatch`
+only. The forced path goes THROUGH the guard, not around it: it
+requires the outgoing marker to EQUAL the running `INDEX_SCHEMA_VERSION`
+(missing or mismatched refuses as a stale predecessor), invokes the
+existing `catalog_schema_replacement_guard`, requires the guard to
+durably publish the Prepared manifest BEFORE deletion, deletes the
+outgoing index only after that authorization, opens the replacement
+index with the schema marker WITHHELD, runs the shared
+reindex/re-emission path, lets the existing P3-E committer exclusively
+promote Prepared to Committed, publishes the marker LAST, and runs the
+committed-manifest verifier. `SchemaRebuildResume::Resume` is never
+manufactured to initiate a fresh operation - Resume remains evidence
+derived exclusively from a durable Prepared manifest observed after the
+destructive boundary. Recovery classification is honored at the
+open/replacement boundary: NoManifest/RolledBack + offline apply starts
+the forced replacement; ResumePrepared re-emits from pinned generations
+without rerunning the guard or minting a second manifest;
+AlreadyCommitted validates the replacement index, restores the marker
+if the prior process died before publication, and verifies - never
+dropping the index or replacing a Committed manifest with a fresh
+Prepared one; daemon startup after a pre-drop operator crash rolls back
+and serves the intact source, never silently restarting an operator
+command. For a nonempty Phase 6 rebuild, fresh offline apply REJECTS
+`NotRequired`; success is Completed or an idempotently recovered
+Committed state. D-036 is unchanged: live daemon schema upgrades may
+still produce Drift; only the stopped-service Phase 6 command requires
+Equality. `bbox-indexing`
 retains the shared DTOs, the read-only preflight planner consuming
 `BackfillCompletionJournalV1`, artifact decoding and recapture
 validation, the D-036 Equality facts, the existing replacement guard and
@@ -1124,7 +1167,10 @@ removed.
    explicit target and exact artifact identity, recomputes the source
    fingerprint and requires `HistoryProofModeV1::Equality` immediately
    before mutation, classifies existing rebuild recovery before opening
-   the index, invokes the same replacement guard the daemon open uses,
+   the index, enters the OPERATOR-FORCED same-schema replacement through
+   the existing guard per the Q-F trigger contract in section 3.4
+   (`OperatorPathFreeRebuild` cause, typed drive state, current marker
+   required equal, marker withheld until last),
    drives the existing synchronous schema-migration reindex to
    completion, lets the existing P3-E pass commit the manifest after its
    index commit, runs the bbox-indexing verifier, and returns success
@@ -1218,10 +1264,20 @@ after this milestone.
    one coherent state. Inject a torn rebuild transaction and prove recovery.
    Inject a stale artifact at apply time and prove the four-hash identity
    refusal. Exercise the SHARED `drive_catalog_schema_replacement` driver
-   at its crash points (Q-D): crash at PREPARED, after the index drop,
-   after the index commit, and before the manifest commit - each
-   recovering exclusively through the existing P3-D/P3-E recovery path,
-   from both the daemon-open caller and the offline-apply caller.
+   at its crash points (Q-D, states refined by Q-F) for BOTH trigger
+   classes (SchemaMismatch and OperatorPathFreeRebuild) and from both
+   callers (daemon open and offline apply): (1) after Prepared before
+   drop - source intact, recovery rolls Prepared back, a later offline
+   retry reauthorizes Equality and starts a fresh forced operation;
+   (2) after drop - Prepared + absent/incoming marker yields
+   ResumePrepared, re-emitting from pinned generations without rerunning
+   the guard; (3) after index commit before manifest commit - Prepared
+   remains, marker still withheld, recovery reruns the idempotent pass
+   and commits; (4) manifest Committed but marker not published -
+   recovery validates the replacement index, publishes the marker, and
+   verifies, never dropping the index or replacing the Committed
+   manifest with a fresh Prepared one. Only offline apply initiates the
+   same-schema force.
 5. Cluster verification: pin one immutable ref and one binary. Run the full
    P6-A through P6-C test suite.
 
@@ -1294,6 +1350,10 @@ exclusive lock.
 
 **Tasks:**
 
+0. Marker discipline for the whole stopped-service sequence (Q-F): the
+   migration runs with the CURRENT schema marker and stamps no outgoing
+   marker; the same binary and the same marker remain in force through
+   P6-G. The rebuild does not depend on a marker change at any point.
 1. Run the live migration preflight while the bridge is live (preflight
    acquires the shared lifetime lock, section 4.1). Review the report and resolution.
 2. Coordinate the bridge stop per the runbook (shared-service approval).
@@ -1332,11 +1392,14 @@ proof copy.
 4. Rebuild preflight: capture the backfill post-image. Review report and
    resolution.
 5. Rebuild apply: `path-free-rebuild --apply --configured --report <path>
-   --resolution <path>`. Drives the Phase 3 materializer through the
-   shared root driver to a COMMITTED `RepoHistoryRebuildManifestV1`
-   (Phase 3 P3-D); the command returns only after the synchronous
-   replacement completes and the committed-manifest verification
-   observes every bucket (Q-D apply contract).
+   --resolution <path>`. Deliberately invokes the
+   `OperatorPathFreeRebuild` replacement cause after Equality
+   authorization, with observed and target schema markers IDENTICAL
+   (Q-F), driving the Phase 3 materializer through the shared root
+   driver to a COMMITTED `RepoHistoryRebuildManifestV1` (Phase 3 P3-D);
+   the command returns only after the synchronous replacement completes
+   and the committed-manifest verification observes every bucket (Q-D
+   apply contract).
 6. Rebuild verify.
 7. Capture the quiescent post-cut rollback-proof copy (section 9.1).
 
