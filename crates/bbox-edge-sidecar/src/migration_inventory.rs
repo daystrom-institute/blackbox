@@ -887,7 +887,7 @@ fn capture_locked(
             };
         if !optional_token(&manifest.repo_id)
             || !optional_token(&manifest.active_snapshot_id)
-            || !optional_token(&manifest.active_dirty_overlay_id)
+            || !optional_overlay_selector(&manifest.active_dirty_overlay_id)
             || !optional_relative_path(&entry.active_snapshot)
             || !optional_relative_path(&entry.dirty_overlay)
             || !optional_relative_path(&entry.repo_materialization)
@@ -1142,6 +1142,19 @@ fn valid_token(value: &str) -> bool {
 
 fn optional_token(value: &Option<String>) -> bool {
     value.as_deref().is_none_or(valid_token)
+}
+
+/// The manifest writer records `active_dirty_overlay_id` as the overlay's
+/// EDGES-RELATIVE PATH (`write_workspace_manifest` passes `dirty_overlay_rel`
+/// straight through), so every historical dirty-overlay manifest carries a
+/// slash-bearing value the plain token grammar refuses. Accept both shapes:
+/// a bare token and a strict relative path. Tightening this to token-only
+/// would classify every workspace with a live dirty overlay as corrupt and
+/// block migration on exactly the hosts that were mid-work when captured.
+fn optional_overlay_selector(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_none_or(|value| valid_token(value) || strict_relative_path(Path::new(value)))
 }
 
 fn optional_relative_path(value: &Option<String>) -> bool {
@@ -1682,6 +1695,76 @@ mod tests {
             oversized.state,
             EdgeMigrationSourceStateV1::Corrupt {
                 diagnostic_code: "edge_manifest_source_byte_limit"
+            }
+        ));
+    }
+
+    /// The manifest writer records the dirty overlay's edges-relative PATH in
+    /// `active_dirty_overlay_id` (`write_workspace_manifest` passes
+    /// `dirty_overlay_rel` through unchanged), so a workspace captured while
+    /// its checkout was dirty carries a slash-bearing value there. The
+    /// migration snapshot must classify that production shape Present; the
+    /// certified token-only grammar refused it as `edge_workspace_selector_invalid`
+    /// and blocked migration on the first host with a live dirty overlay.
+    #[test]
+    fn a_dirty_overlay_workspace_captures_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let manifest = WorkspaceManifest {
+            version: MANIFEST_VERSION,
+            project_id: "project-a".to_string(),
+            repo_id: Some("repo-one".to_string()),
+            canonical_path: None,
+            git_common_dir: None,
+            git_worktree_dir: None,
+            branch: Some("main".to_string()),
+            head_sha: Some("86b2cbf5e1109545ce3c20513c6a5b068e10679c".to_string()),
+            dirty: true,
+            dirty_fingerprint: Some("3e1ce6f83889bb938fed501594abb6395ece955c".to_string()),
+            active_snapshot_id: Some("head-86b2cbf5e110-1c65cfa04b22e7c6".to_string()),
+            active_dirty_overlay_id: Some("workspace/project-a/dirty-current".to_string()),
+            updated_at: None,
+        };
+        WorkspaceManifest::write_to(&root, &manifest).unwrap();
+        let mut index = ManifestIndex::new();
+        index.workspaces.insert(
+            "project-a".to_string(),
+            WorkspaceIndexEntry {
+                manifest: "workspace/project-a/manifest.json".to_string(),
+                active_snapshot: Some(
+                    "workspace/project-a/snapshots/head-86b2cbf5e110-1c65cfa04b22e7c6".to_string(),
+                ),
+                dirty_overlay: Some("workspace/project-a/dirty-current".to_string()),
+                repo_materialization: None,
+                code_source_selector: None,
+                code_source_generation: None,
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        index.write_atomic(&root).unwrap();
+
+        let snapshot =
+            capture_migration_snapshot_no_create(&root, EdgeMigrationSnapshotLimitsV1::default());
+        assert!(matches!(
+            snapshot.state,
+            EdgeMigrationSourceStateV1::Present
+        ));
+        assert_eq!(snapshot.workspaces.len(), 1);
+
+        // Traversal stays refused: the relaxed grammar admits strict
+        // relative paths, never an escaping selector.
+        let escaping = WorkspaceManifest {
+            active_dirty_overlay_id: Some("../outside".to_string()),
+            ..manifest
+        };
+        WorkspaceManifest::write_to(&root, &escaping).unwrap();
+        let refused =
+            capture_migration_snapshot_no_create(&root, EdgeMigrationSnapshotLimitsV1::default());
+        assert!(matches!(
+            refused.state,
+            EdgeMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "edge_workspace_selector_invalid"
             }
         ));
     }
