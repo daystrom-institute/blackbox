@@ -101,6 +101,23 @@ Phase 6 does not retire the bridge lane. Retirement is a later phase requiring
 zero non-intentional checkout observations, cutback proven, rollback proven,
 no prepared journals, verified GC roots, and operator approval.
 
+**Deletion boundary against the Phase 5 handoff (plan-entry review ruling,
+R1).** The handoff inventory
+([`durable-project-catalog-phase6-handoff.md`](durable-project-catalog-phase6-handoff.md))
+uses "the cut" for the bridge-lane DELETION campaign; this plan uses "the
+cut" for the P6-F live migration of configured state. They are different
+events. Phase 6 implements only this plan's section 5 deletion surface (the
+path-derived project-id function, the direct `load_project_records`
+consumer, and the legacy `open_or_create` lane). The handoff's section 5
+steps 2 through 5 (legacy publisher lane, bridge carriers,
+`ProjectRegistry`/`ProjectRecord`, compatibility projection) and its
+section 3.7 parity-fixture deletion are LATER retirement-phase inventory.
+Every bridge implementation, the compatibility reader, and the bridge
+parity fixture survive through P6-H: the parity harness must stay blocking
+through the whole phase because it is the instrument that proves the code
+milestones changed nothing observable, and the retained bridge code is a
+named rollback asset (FD-8, section 10.1).
+
 ## 2. Fixed decisions
 
 This section states every binding decision the plan implements. Each is a
@@ -726,7 +743,12 @@ changes occur after P6-C closes.
 
 1. Verify every Phase 5 exit gate has landed (Phase 5 section 16). Consume the
    P5-H handoff inventory by name: remaining bridge `ProjectRecord` uses and
-   legacy source lanes drive the deletion surface in tasks 2 and 3.
+   legacy source lanes drive the deletion surface in tasks 2 and 3. The
+   handoff is consumed for THIS section-5 surface, the compatibility
+   observation counters (P6-D), and the parity/ratchet discipline only; its
+   wider deletion campaign (handoff section 5 steps 2 through 5, parity
+   fixture) is retirement-phase inventory outside Phase 6 (section 1
+   deletion boundary).
 2. Route the 1 catalog-resolution call site (section 5.1) through the catalog
    resolver or remove dead paths.
 3. Delete the direct `load_project_records` consumer

@@ -21,10 +21,22 @@ NOT delete the version-1 bridge; [D-002](../../DECISION_LEDGER.md#d-002)
 keeps the production authority switch prohibited, so both authorities still
 ship.
 
-This is the inventory Phase 6 consumes: what remains, why each thing is
-still here, and the order the cut has to happen in. It is deliberately
-paired with a machine-checked counterpart so it cannot rot into prose that
-disagrees with the tree.
+This is the inventory Phase 6 and the later retirement phase consume: what
+remains, why each thing is still here, and the order the eventual
+bridge-lane deletion has to happen in. It is deliberately paired with a
+machine-checked counterpart so it cannot rot into prose that disagrees with
+the tree.
+
+**Terminology and scope boundary (Phase 6 plan-entry review ruling, R1).**
+This document's "cut" is the bridge-lane DELETION campaign; the Phase 6
+plan's "cut" is the P6-F live migration of configured operator state to
+strict catalog mode. They are different events. Phase 6 deletes only the
+plan's section 5 surface (path-derived project identity, the direct
+`load_project_records` consumer, the legacy `open_or_create` lane) and
+performs the operational migration; sections 3.1 through 3.5 and section 5
+steps 2 through 5 below are RETIREMENT-PHASE deletion inventory, gated on
+the retirement criteria in the plan's section 10.3. Nothing in this
+document licenses deleting bridge code during Phase 6.
 
 ## 2. The machine-checked half
 `scripts/catalog-ownership-baseline.txt` is a per-SITE evidence inventory:
@@ -55,8 +67,10 @@ two ratchet changes.
 | `watcher_selected_carrier` | Delete. Catalog registrations are `ArtifactWatchAttachment::AttachmentId`; `Selected` is bridge-only. |
 | `repo_io_selected_target` | Delete the `Selected` and `Checkout` variants of `RepoCarrierTarget`, leaving `Attachment` as the only target. |
 
-A shrinking inventory is the Phase 6 progress metric. When every row is
-gone except the compatibility projection, the bridge is cut.
+A shrinking inventory is the deletion campaign's progress metric. Phase 6
+moves it only by the plan's narrow section 5 surface; the retirement phase
+drives it the rest of the way. When every row is gone except the
+compatibility projection, the bridge is cut.
 
 **Baseline diffs are review artifacts, and this is the procedure.**
 Regeneration is a deliberate act. `--write-baseline` preserves reasons by
@@ -144,9 +158,11 @@ debt is outstanding at the Phase 5 exit gate.
 ### 3.7 Bridge parity fixture inventory
 `src/server/bridge_parity.rs` and `tests/fixtures/bridge-parity/bridge-parity.json`
 pin the bridge's exact responses. Both are bridge-only and both are deleted
-AT the cut, not before: the harness is the instrument that proves every
-earlier step in section 5 changed nothing observable, so deleting it early
-removes the evidence that the cut was safe.
+AT the retirement-phase bridge cut, not before: the harness is the
+instrument that proves every earlier step in section 5 changed nothing
+observable, so deleting it early removes the evidence that the cut was
+safe. Through ALL of Phase 6, including after the P6-F live migration, the
+harness stays blocking and untouched.
 
 Each row names the bridge surface it pins and what happens to that row:
 
@@ -205,15 +221,25 @@ milestone.
 - **Bridge capability asymmetry** ([D-032](../../DECISION_LEDGER.md#d-032)): version-1 records carry no capability bits and cannot truthfully derive them. Resolves when the v1 lane goes.
 
 ## 5. Ordering constraint
-The cut is not a single commit. The safe order:
-1. Convert or delete the remaining v1-shaped consumers, watching the ratchet counts fall.
-2. Delete the legacy publisher lane (no catalog caller).
-3. Delete the bridge carriers, watcher and repository I/O.
-4. Delete `ProjectRegistry` and `ProjectRecord`.
-5. Delete the compatibility projection LAST, then the compatibility observation lanes.
+The bridge-lane deletion is not a single commit, and it is not Phase 6
+work past step 1's narrow slice. The safe order:
+1. Convert or delete the remaining v1-shaped consumers, watching the
+   ratchet counts fall. Phase 6 performs exactly the plan's section 5
+   slice of this step (path-derived project identity, the direct
+   `load_project_records` consumer, the `open_or_create` lane); the rest
+   of step 1 and all of steps 2 through 5 are retirement-phase.
+2. Delete the legacy publisher lane (no catalog caller). RETIREMENT PHASE.
+3. Delete the bridge carriers, watcher and repository I/O. RETIREMENT PHASE.
+4. Delete `ProjectRegistry` and `ProjectRecord`. RETIREMENT PHASE.
+5. Delete the compatibility projection LAST, then the compatibility
+   observation lanes. RETIREMENT PHASE.
 
-Reversing 4 and 5 breaks the cut: the projection is what keeps v1-shaped
-consumers alive while they are being converted.
+Reversing 4 and 5 breaks the deletion campaign: the projection is what
+keeps v1-shaped consumers alive while they are being converted. Entry into
+steps 2 through 5 is gated on the retirement criteria (plan section 10.3):
+zero non-intentional checkout observations across the closeout window,
+cutback proven, rollback proof completed, no prepared journals, verified GC
+roots, and explicit operator approval.
 
 ## 6. Status of this document
 `lifecycle: complete`. Both P5-H deliverables this document was waiting on
