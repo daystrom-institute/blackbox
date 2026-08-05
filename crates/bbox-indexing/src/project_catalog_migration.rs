@@ -200,6 +200,28 @@ pub fn project_catalog_migration_store_limits(config: &Config) -> StoreLimits {
     }
 }
 
+/// The resolved inputs the ROOT crate needs to open the outgoing index for a
+/// path-free rebuild.
+///
+/// Public for the same reason `stamper_owner_paths` is: adjudication Q-D puts
+/// the executable replacement composition in the root crate (guard injection
+/// at index open, the destructive pass, the shared driver), and the root
+/// cannot reach these paths otherwise. A narrow read-only projection, not a
+/// general path getter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCatalogRebuildIndexPathsV1 {
+    pub index_root: PathBuf,
+    pub projects_path: PathBuf,
+    pub code_source_root: PathBuf,
+    pub knowledge_path: PathBuf,
+    pub threads_path: PathBuf,
+    pub roadmap_path: PathBuf,
+    /// The RESOLVED vector root (R33F1). The Equality proof recomputes a
+    /// fingerprint over exactly this store, so a caller that derived it
+    /// elsewhere would compare against a different store.
+    pub vector_root: PathBuf,
+}
+
 /// The eleven durable owner locations a Phase 6 backfill stamper writes.
 ///
 /// A read-only projection of the resolved layout, handed to the root crate so
@@ -334,6 +356,20 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
             // inventory looked at, or the row ids it was handed name rows in a
             // different tree.
             transcript_edge_root: inventory.edge_root,
+        }
+    }
+
+    /// The resolved inputs the root crate's rebuild apply opens the index
+    /// with (adjudication Q-D).
+    pub fn rebuild_index_paths(&self) -> ProjectCatalogRebuildIndexPathsV1 {
+        ProjectCatalogRebuildIndexPathsV1 {
+            index_root: self.index_root.clone(),
+            projects_path: self.projects_path.clone(),
+            code_source_root: self.code_source_root.clone(),
+            knowledge_path: self.knowledge_path.clone(),
+            threads_path: self.threads_path.clone(),
+            roadmap_path: self.roadmap_path.clone(),
+            vector_root: self.vector_root.clone(),
         }
     }
 
