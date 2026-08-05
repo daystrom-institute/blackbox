@@ -40,7 +40,8 @@ use crate::project_catalog_inventory::{
 };
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationError, ProjectCatalogMigrationMutationDispositionV1,
-    ProjectCatalogMigrationResolvedLayoutV1,
+    ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogTargetSelectionV1,
+    validate_artifact_set, validate_target_selection,
 };
 use crate::project_catalog_store::{ProjectCatalogStore, capture_migration_preflight_with};
 
@@ -1068,6 +1069,9 @@ pub fn verify_publisher_dispositions(
 /// inside that root (section 4.3).
 pub struct DurableBackfillPreflightRequestV1 {
     pub layout: ProjectCatalogMigrationResolvedLayoutV1,
+    /// Which target the CLI resolved. Bound to `layout`'s actual shape before
+    /// any other observable work (adjudication Q-C).
+    pub target_selection: ProjectCatalogTargetSelectionV1,
     /// OUTPUT path. Preflight writes the report here.
     pub report_path: PathBuf,
     /// OUTPUT path. A first preflight may create the canonical empty
@@ -1085,6 +1089,9 @@ pub struct DurableBackfillPreflightRequestV1 {
 
 pub struct DurableBackfillApplyRequestV1 {
     pub layout: ProjectCatalogMigrationResolvedLayoutV1,
+    /// Which target the CLI resolved. Bound to `layout`'s actual shape before
+    /// any other observable work (adjudication Q-C).
+    pub target_selection: ProjectCatalogTargetSelectionV1,
     /// INPUT path: the exact reviewed report.
     pub report_path: PathBuf,
     /// INPUT path: the exact reviewed resolution.
@@ -1098,6 +1105,9 @@ pub struct DurableBackfillApplyRequestV1 {
 /// from.
 pub struct DurableBackfillVerifyRequestV1 {
     pub layout: ProjectCatalogMigrationResolvedLayoutV1,
+    /// Which target the CLI resolved. Verify is target-explicit under the same
+    /// selection rules as apply (section 3.1).
+    pub target_selection: ProjectCatalogTargetSelectionV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1156,6 +1166,16 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
     pub fn preflight(
         request: DurableBackfillPreflightRequestV1,
     ) -> BackfillResult<DurableBackfillPreflightReceiptV1> {
+        // Q-C binding conditions, both BEFORE any artifact access or store
+        // read: the selected target must match the layout's real shape, and
+        // the artifacts must be confined to that target.
+        validate_target_selection(&request.layout, request.target_selection)?;
+        validate_artifact_set(
+            &request.layout,
+            &request.report_path,
+            &request.resolution_path,
+            None,
+        )?;
         let projects_path = request.layout.projects_path().to_path_buf();
         let pointers_root = request.layout.accepted_publication_pointers_for_backfill();
         let generations_root = request
@@ -1311,6 +1331,17 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
     pub fn apply(
         request: DurableBackfillApplyRequestV1,
     ) -> BackfillResult<DurableBackfillApplyReceiptV1> {
+        // Q-C binding conditions, both BEFORE the artifacts are read: an apply
+        // whose artifacts live inside the target it is about to mutate, or
+        // whose selection disagrees with the layout, is refused with nothing
+        // touched.
+        validate_target_selection(&request.layout, request.target_selection)?;
+        validate_artifact_set(
+            &request.layout,
+            &request.report_path,
+            &request.resolution_path,
+            None,
+        )?;
         let projects_path = request.layout.projects_path().to_path_buf();
         let state_dir = request.layout.state_dir_for_backfill().to_path_buf();
 
@@ -1478,6 +1509,8 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
     pub fn verify(
         request: DurableBackfillVerifyRequestV1,
     ) -> BackfillResult<DurableBackfillVerifyReceiptV1> {
+        // Verify takes no artifacts, so only the selection condition applies.
+        validate_target_selection(&request.layout, request.target_selection)?;
         let projects_path = request.layout.projects_path().to_path_buf();
         let state_dir = request.layout.state_dir_for_backfill().to_path_buf();
         let Some(journal) = read_backfill_completion_journal(&state_dir)? else {

@@ -33,6 +33,7 @@ use serde::Serialize;
 
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationError, ProjectCatalogMigrationResolvedLayoutV1,
+    ProjectCatalogTargetSelectionV1, validate_target_selection,
 };
 
 /// The plan's NEW proof-mode refusal (section 7.3). Raised by rebuild
@@ -115,6 +116,9 @@ pub struct PathFreeRebuildVerifyRequestV1 {
     /// expressed by which layout it hands in; the facade runs no
     /// rehearsal-versus-protected separation check.
     pub layout: ProjectCatalogMigrationResolvedLayoutV1,
+    /// Which target the CLI resolved. Verify is target-explicit under the same
+    /// selection rules as apply (section 3.1).
+    pub target_selection: ProjectCatalogTargetSelectionV1,
 }
 
 /// Read the committed rebuild manifest for an index root.
@@ -273,6 +277,10 @@ impl ProjectCatalogPathFreeRebuildFacadeV1 {
     pub fn verify(
         request: PathFreeRebuildVerifyRequestV1,
     ) -> RebuildResult<PathFreeRebuildVerifyReceiptV1> {
+        // Q-C binding condition. Verify takes no artifacts, so only the
+        // selection condition applies: the selected target must match the
+        // layout's real shape before any durable record is read.
+        validate_target_selection(&request.layout, request.target_selection)?;
         let index_path = request.layout.index_root_for_rebuild().to_path_buf();
         let manifest = read_committed_rebuild_manifest(&index_path)?;
         require_equality_proof_mode(&manifest)?;

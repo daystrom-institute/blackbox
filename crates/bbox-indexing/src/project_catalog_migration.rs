@@ -5547,7 +5547,70 @@ fn verification_receipt_observations_match(receipt: &MigrationVerificationReceip
         && receipt.predicted_marker_hash == receipt.observed_marker_hash
 }
 
-fn validate_artifact_set(
+/// Which target the CLI selected before invoking a facade (adjudication Q-C).
+///
+/// The CLI resolves `--rehearsal-root`/`--configured` to exactly one target
+/// BEFORE facade invocation, but a resolved layout does not otherwise record
+/// which resolution produced it: both arrive as the same type. Passing the
+/// selection lets the facade bind it to the layout's actual shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCatalogTargetSelectionV1 {
+    /// Derived from an operator-created isolated root.
+    Rehearsal,
+    /// Resolved from real configuration.
+    Configured,
+}
+
+/// Bind the selected target to the layout's actual shape (adjudication Q-C).
+///
+/// Without this check the two selections are interchangeable at the facade
+/// boundary: a configured layout could run under a rehearsal selection and
+/// mutate the real state a rehearsal must never touch, or a rehearsal layout
+/// could run under a configured selection and silently verify an isolated
+/// bundle while reporting on production.
+pub(crate) fn validate_target_selection(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    selection: ProjectCatalogTargetSelectionV1,
+) -> Result<(), ProjectCatalogMigrationError> {
+    match selection {
+        ProjectCatalogTargetSelectionV1::Rehearsal => {
+            let root = layout.rehearsal_root.as_ref().ok_or_else(|| {
+                unsafe_layout("rehearsal-selected target requires a rehearsal-root layout")
+            })?;
+            let metadata = std::fs::symlink_metadata(root)
+                .map_err(|_| unsafe_layout("rehearsal root must be an existing directory"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(unsafe_layout(
+                    "rehearsal root must be a real directory, not a symlink",
+                ));
+            }
+            // Every participant path must live under the isolated root. That is
+            // what makes the selection mean anything: a layout that merely
+            // CARRIES a rehearsal root while pointing at configured stores
+            // would rehearse against production.
+            if layout
+                .all_paths()
+                .into_iter()
+                .any(|path| !path.starts_with(root))
+            {
+                return Err(unsafe_layout(
+                    "rehearsal-selected layout has a participant path outside its rehearsal root",
+                ));
+            }
+            Ok(())
+        }
+        ProjectCatalogTargetSelectionV1::Configured => {
+            if layout.rehearsal_root.is_some() {
+                return Err(unsafe_layout(
+                    "configured-selected target requires a config-resolved layout",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn validate_artifact_set(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
     report_path: &Path,
     resolution_path: &Path,
@@ -5571,7 +5634,7 @@ fn validate_artifact_set(
     Ok(())
 }
 
-fn validate_artifact_target(
+pub(crate) fn validate_artifact_target(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
     path: &Path,
 ) -> Result<(), ProjectCatalogMigrationError> {
@@ -6710,5 +6773,135 @@ mod tests {
             &accepted_commit,
         )
         .unwrap();
+    }
+
+    // ── Q-C target-selection binding conditions (P6-B task A) ──────────
+
+    /// A rehearsal SELECTION over a config-resolved layout is the dangerous
+    /// direction: it would rehearse against real state.
+    #[test]
+    fn rehearsal_selection_refuses_a_config_resolved_layout() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = test_config(&root);
+        let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+            &config,
+            ProjectCatalogMigrationLayoutOverridesV1::default(),
+        )
+        .unwrap();
+
+        let error = validate_target_selection(&layout, ProjectCatalogTargetSelectionV1::Rehearsal)
+            .unwrap_err();
+        assert!(
+            error.message.contains("rehearsal-root layout"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    /// The other direction: a configured selection over a rehearsal layout
+    /// would verify an isolated bundle while reporting on production.
+    #[test]
+    fn configured_selection_refuses_a_rehearsal_layout() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = test_config(&root);
+        let rehearsal = root.join("rehearsal");
+        std::fs::create_dir_all(&rehearsal).unwrap();
+        let layout =
+            ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal, &config)
+                .unwrap();
+
+        let error = validate_target_selection(&layout, ProjectCatalogTargetSelectionV1::Configured)
+            .unwrap_err();
+        assert!(
+            error.message.contains("config-resolved layout"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    /// The matching pairs are accepted, so the condition discriminates rather
+    /// than simply refusing.
+    #[test]
+    fn each_selection_accepts_its_own_layout_shape() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = test_config(&root);
+        let rehearsal = root.join("rehearsal");
+        std::fs::create_dir_all(&rehearsal).unwrap();
+
+        let rehearsal_layout =
+            ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal, &config)
+                .unwrap();
+        validate_target_selection(
+            &rehearsal_layout,
+            ProjectCatalogTargetSelectionV1::Rehearsal,
+        )
+        .unwrap();
+
+        let configured_layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+            &config,
+            ProjectCatalogMigrationLayoutOverridesV1::default(),
+        )
+        .unwrap();
+        validate_target_selection(
+            &configured_layout,
+            ProjectCatalogTargetSelectionV1::Configured,
+        )
+        .unwrap();
+    }
+
+    /// A layout that merely CARRIES a rehearsal root while a participant path
+    /// points outside it is not a rehearsal at all.
+    #[test]
+    fn rehearsal_selection_refuses_a_participant_path_outside_the_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = test_config(&root);
+        let rehearsal = root.join("rehearsal");
+        std::fs::create_dir_all(&rehearsal).unwrap();
+        let mut layout =
+            ProjectCatalogMigrationResolvedLayoutV1::from_rehearsal_root(&rehearsal, &config)
+                .unwrap();
+        layout.projects_path = root.join("outside").join("projects.json");
+
+        let error = validate_target_selection(&layout, ProjectCatalogTargetSelectionV1::Rehearsal)
+            .unwrap_err();
+        assert!(
+            error.message.contains("outside its rehearsal root"),
+            "unexpected message: {}",
+            error.message
+        );
+    }
+
+    /// Artifact confinement on the new facades' request paths: an artifact
+    /// written inside the target it describes would be captured by the very
+    /// state it is meant to authorize changes to.
+    #[test]
+    fn artifact_confinement_refuses_a_path_inside_the_target() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = test_config(&root);
+        let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+            &config,
+            ProjectCatalogMigrationLayoutOverridesV1::default(),
+        )
+        .unwrap();
+
+        // Two distinct ways to be "inside": under an owner directory root,
+        // and exactly equal to a participant path.
+        let under_owner_root = layout.artifacts_dir.join("report.json");
+        let participant_path = layout.projects_path.clone();
+        let outside = root.join("review").join("report.json");
+        let resolution = root.join("review").join("resolution.json");
+
+        assert!(validate_artifact_set(&layout, &under_owner_root, &resolution, None).is_err());
+        assert!(validate_artifact_set(&layout, &outside, &under_owner_root, None).is_err());
+        assert!(validate_artifact_set(&layout, &participant_path, &resolution, None).is_err());
+        // A confined pair passes, so the check discriminates.
+        validate_artifact_set(&layout, &outside, &resolution, None).unwrap();
+        // And the pair must be two distinct paths.
+        assert!(validate_artifact_set(&layout, &outside, &outside, None).is_err());
     }
 }
