@@ -454,6 +454,24 @@ pub struct OwnerSubsourceEvidenceV1 {
     pub row_set_sha256: Sha256ValueV1,
 }
 
+impl ImmutableInventoryOwnerKindV1 {
+    /// Whether an ABSENT source for this owner is a legitimate
+    /// never-provisioned state rather than broken evidence.
+    ///
+    /// The Slack stores exist only after the Slack bridge first writes a
+    /// binding, and the provenance notes ref exists only after an explicit
+    /// `bbox_provenance_export`; a host that never used either surface has
+    /// nothing to observe, which is vacuously complete coverage, not a gap
+    /// in it. Every other owner is provisioned by daemon startup or by the
+    /// stores the daemon always writes, so absence there stays a hard
+    /// refusal. An EMPTY-but-present source was already `Present` with zero
+    /// rows for all owners; this only aligns the absent case for the two
+    /// lazily-provisioned surfaces with that reading.
+    pub fn missing_is_vacuous(self) -> bool {
+        matches!(self, Self::SlackBinding | Self::Provenance)
+    }
+}
+
 impl ImmutableInventoryLaneEvidenceV1 {
     pub fn from_owner_subsources(
         lane_kind: ImmutableInventoryLaneKindV1,
@@ -5073,10 +5091,10 @@ fn lane_completeness(
         .any(|source| matches!(&source.source_state, InventorySourceStateV1::Corrupt { .. }))
     {
         ImmutableInventoryLaneCompletenessV1::Corrupt
-    } else if owner_subsources
-        .iter()
-        .any(|source| matches!(&source.source_state, InventorySourceStateV1::Missing { .. }))
-    {
+    } else if owner_subsources.iter().any(|source| {
+        matches!(&source.source_state, InventorySourceStateV1::Missing { .. })
+            && !source.owner_kind.missing_is_vacuous()
+    }) {
         ImmutableInventoryLaneCompletenessV1::Missing
     } else {
         ImmutableInventoryLaneCompletenessV1::Complete

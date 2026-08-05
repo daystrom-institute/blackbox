@@ -2960,9 +2960,16 @@ fn lane_capture<T>(
     )>,
     mut rows: Vec<T>,
 ) -> AdapterResult<ImmutableLaneCaptureV1<T>> {
-    let complete = owners
-        .iter()
-        .all(|(_, _, state, _)| matches!(state, InventorySourceStateV1::Present { .. }));
+    // A vacuously-missing owner (never-provisioned optional surface, see
+    // `ImmutableInventoryOwnerKindV1::missing_is_vacuous`) contributes zero
+    // rows of its own and must not discard the other owners' rows: clearing
+    // the whole lane because Slack was never configured would silently drop
+    // every knowledge/thread/note/task/edge observation from the inventory.
+    let complete = owners.iter().all(|(kind, _, state, _)| match state {
+        InventorySourceStateV1::Present { .. } => true,
+        InventorySourceStateV1::Missing { .. } => kind.missing_is_vacuous(),
+        InventorySourceStateV1::Corrupt { .. } => false,
+    });
     if !complete {
         rows.clear();
         for (_, _, _, row_ids) in &mut owners {
@@ -5188,6 +5195,59 @@ mod tests {
             omitted.code(),
             "error.project_catalog_inventory_adapter_source"
         );
+    }
+
+    /// A host that never provisioned an optional surface (no Slack store
+    /// files, no provenance notes ref) has nothing to observe there: its
+    /// absence is vacuously complete coverage, and the OTHER owners' rows
+    /// must survive. The certified behavior cleared every row in the lane
+    /// and hard-refused the whole preflight, which made migration
+    /// impossible on any host that never used Slack or provenance export.
+    #[test]
+    fn a_vacuously_missing_optional_owner_keeps_the_lane_complete_with_rows() {
+        let project = ProjectId::parse("project-a").unwrap();
+        let observation_id = stable_observation_id_v1(
+            "inventory-target",
+            &[b"artifact", b"artifact_1"],
+        )
+        .unwrap();
+        let lane = lane_capture(
+            ImmutableInventoryLaneKindV1::InventoryTargets,
+            "inventory-targets",
+            vec![
+                (
+                    ImmutableInventoryOwnerKindV1::Artifact,
+                    "artifact".to_string(),
+                    present_owner_state("artifact"),
+                    BTreeSet::from([observation_id.clone()]),
+                ),
+                (
+                    ImmutableInventoryOwnerKindV1::Provenance,
+                    "provenance".to_string(),
+                    InventorySourceStateV1::Missing {
+                        fingerprint: Sha256ValueV1::digest(b"missing"),
+                    },
+                    BTreeSet::new(),
+                ),
+            ],
+            vec![InventoryTargetObservationV1 {
+                observation_id,
+                target_kind:
+                    crate::project_catalog_inventory::InventoryTargetKindV1::ProjectArtifact,
+                project_id: project,
+                stable_target_id: "artifact_1".to_string(),
+                target_hash: Sha256ValueV1::digest(b"artifact"),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            lane.evidence.completeness,
+            crate::project_catalog_inventory::ImmutableInventoryLaneCompletenessV1::Complete
+        );
+        assert_eq!(lane.rows.len(), 1);
+        // Strictness stays intact for owners provisioned by the daemon
+        // itself: the ProjectScopedRefs Missing arm in the test above still
+        // pins a Missing tantivy owner to a Missing lane.
     }
 
     fn namespace_legacy_capture() -> LegacyProjectsCaptureV1 {
