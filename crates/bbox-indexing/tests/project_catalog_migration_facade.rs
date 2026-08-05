@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,8 +23,9 @@ use bbox_corpus_core::project_catalog::{
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::project_catalog_inventory::{
-    ProjectCatalogMigrationStatusV1, QuarantineCollectedV1, SelectedScopeOwnerV1,
-    decode_migration_report_v1, decode_migration_resolution_v1, encode_migration_resolution_v1,
+    LegacyProjectPathStatusV1, ProjectCatalogMigrationStatusV1, QuarantineCollectedV1,
+    SelectedScopeOwnerV1, decode_migration_report_v1, decode_migration_resolution_v1, digest_path,
+    encode_migration_resolution_v1,
 };
 use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationApplyConfiguredRequestV1, ProjectCatalogMigrationApplyOutcomeV1,
@@ -1548,6 +1550,301 @@ fn configured_apply_installs_the_reviewed_post_image_on_the_configured_layout() 
     assert_eq!(
         reapplied.receipt.outcome,
         ProjectCatalogMigrationApplyOutcomeV1::AlreadyApplied
+    );
+}
+
+struct ConfiguredHostFixture {
+    alpha_checkout: PathBuf,
+    beta_checkout: PathBuf,
+    alpha_project: ProjectId,
+    beta_project: ProjectId,
+    detached_project: Option<ProjectId>,
+}
+
+/// A CONFIGURED-shape host: no rehearsal root, no replica tree, and the
+/// registered canonical paths ARE the canonical checkout roots (plan section
+/// 6.3).
+///
+/// The rehearsal fixtures populate `<root>/checkouts/`, so they never exercise
+/// the layout a live host actually presents. Git ingest cursors are seeded for
+/// each present project because those are the rows the git-metadata lane must
+/// find represented: a preflight that discovers no checkout root leaves every
+/// cursor unrepresented and classifies the lane corrupt.
+///
+/// `register_missing_path` additionally registers a record whose path does not
+/// exist, the shape a host reaches when a registered checkout is deleted out
+/// from under the registry.
+fn prepare_configured_host(
+    root: &Path,
+    config: &Config,
+    register_missing_path: bool,
+) -> ConfiguredHostFixture {
+    let alpha_checkout = root.join("host").join("alpha");
+    let beta_checkout = root.join("host").join("beta");
+    for (checkout, repo_id) in [
+        (&alpha_checkout, "neutral-alpha"),
+        (&beta_checkout, "neutral-beta"),
+    ] {
+        fs::create_dir_all(checkout).unwrap();
+        git(checkout, &["init", "-q"]);
+        git(checkout, &["checkout", "-qb", "main"]);
+        write(
+            &checkout.join(".bbox/config.toml"),
+            format!("[project]\nrepo_id = \"{repo_id}\"\n").as_bytes(),
+        );
+        git(checkout, &["add", ".bbox"]);
+        git(checkout, &["commit", "-qm", "seed configured fixture"]);
+        initialize_empty_provenance_ref(checkout, config);
+    }
+    let alpha_head = git(&alpha_checkout, &["rev-parse", "HEAD"]);
+    let beta_head = git(&beta_checkout, &["rev-parse", "HEAD"]);
+
+    let state = root.join("state");
+    initialize_empty_owner_state(root);
+    let alpha_project = ProjectId::parse("neutral-alpha-project").unwrap();
+    let beta_project = ProjectId::parse("neutral-beta-project").unwrap();
+    let detached_project =
+        register_missing_path.then(|| ProjectId::parse("neutral-detached-project").unwrap());
+    let mut records = vec![
+        serde_json::json!({
+            "project_id": alpha_project,
+            "repo_id": "neutral-alpha",
+            "canonical_path": alpha_checkout,
+            "registered_at": "2026-01-02T03:04:05Z",
+            "is_git_repo": true,
+            "languages": [],
+            "aliases": []
+        }),
+        serde_json::json!({
+            "project_id": beta_project,
+            "repo_id": "neutral-beta",
+            "canonical_path": beta_checkout,
+            "registered_at": "2026-01-02T03:04:06Z",
+            "is_git_repo": true,
+            "languages": [],
+            "aliases": []
+        }),
+    ];
+    if let Some(detached) = &detached_project {
+        records.push(serde_json::json!({
+            "project_id": detached,
+            "repo_id": "neutral-detached",
+            "canonical_path": root.join("host").join("detached"),
+            "registered_at": "2026-01-02T03:04:07Z",
+            "is_git_repo": false,
+            "languages": [],
+            "aliases": []
+        }));
+    }
+    write(
+        &state.join("projects.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "projects": records
+        }))
+        .unwrap()
+        .as_slice(),
+    );
+
+    let code_sources = CodeSourceStore::open(
+        state.join("code-sources"),
+        project_catalog_migration_store_limits(config),
+    )
+    .unwrap();
+    let paths = CodeSourceStorePaths::new(code_sources.root()).unwrap();
+    let alpha_scope = PublishedScope::try_new("neutral-alpha", ".").unwrap();
+    let beta_scope = PublishedScope::try_new("neutral-beta", ".").unwrap();
+    let (_, alpha_selection) = write_generation(
+        &paths,
+        &alpha_project,
+        &alpha_scope,
+        "alpha",
+        &alpha_head,
+        1,
+    );
+    let (_, beta_selection) =
+        write_generation(&paths, &beta_project, &beta_scope, "beta", &beta_head, 2);
+    let mut selections = vec![alpha_selection, beta_selection];
+    selections.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    write(
+        &paths.anchor(),
+        &encode_migration_effective_source_manifest_v1(&MigrationEffectiveSourceManifestV1 {
+            version: 1,
+            selections,
+        })
+        .unwrap(),
+    );
+
+    for (project, head) in [(&alpha_project, &alpha_head), (&beta_project, &beta_head)] {
+        write(
+            &state
+                .join("git_meta")
+                .join(format!("{}.json", project.as_str())),
+            serde_json::to_vec(&serde_json::json!({ "last_ingested_sha": head }))
+                .unwrap()
+                .as_slice(),
+        );
+    }
+
+    ConfiguredHostFixture {
+        alpha_checkout,
+        beta_checkout,
+        alpha_project,
+        beta_project,
+        detached_project,
+    }
+}
+
+fn configured_layout(root: &Path, config: &Config) -> ProjectCatalogMigrationResolvedLayoutV1 {
+    ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: None,
+            state_dir: Some(root.join("state")),
+        },
+    )
+    .unwrap()
+}
+
+/// A configured preflight derives its canonical checkout roots from the v1
+/// store (plan section 6.3).
+///
+/// The regression this pins: a configured layout carries no replica root, so
+/// discovery used to return an empty root set. Nothing was captured as a
+/// checkout, the legacy-project x checkout cross product produced no
+/// attachment candidate, and the git-metadata lane then found every cursor row
+/// unrepresented and classified corrupt, which withheld the whole plan.
+#[test]
+fn configured_preflight_derives_checkout_roots_from_the_registered_paths() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config = config(&root);
+    let fixture = prepare_configured_host(&root, &config, false);
+    let layout = configured_layout(&root, &config);
+    let report_path = root.join("review/report.json");
+
+    let preflight =
+        ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
+            layout,
+            report_path: report_path.clone(),
+            resolution_path: root.join("review/resolution.json"),
+            sensitive_report_path: None,
+        })
+        .unwrap();
+    let report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
+
+    assert!(
+        !report
+            .refusals
+            .iter()
+            .any(|refusal| refusal.diagnostic_code == "immutable_lane_corrupt"),
+        "no lane may classify corrupt on a host whose cursors are all represented: {:?}",
+        report.refusals
+    );
+    assert_eq!(
+        preflight.receipt.status,
+        ProjectCatalogMigrationStatusV1::Clean,
+        "refusals: {:?}, required resolutions: {:?}",
+        report.refusals,
+        report.required_resolutions
+    );
+    assert_eq!(
+        report
+            .attachments
+            .iter()
+            .map(|row| row.project_id.clone())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([fixture.alpha_project.clone(), fixture.beta_project.clone()]),
+        "each registered checkout must yield an attachment candidate"
+    );
+    assert_eq!(preflight.receipt.attached_project_count, 2);
+    assert_eq!(
+        report
+            .checkout_identity_actions
+            .iter()
+            .map(|row| row.canonical_root_digest.clone())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            digest_path(fixture.alpha_checkout.to_str().unwrap()),
+            digest_path(fixture.beta_checkout.to_str().unwrap()),
+        ]),
+        "checkout-id inventory covers each canonical checkout root exactly once"
+    );
+    assert_eq!(preflight.receipt.checkout_action_count, 2);
+}
+
+/// A registered path that is absent stays a classified missing-path record and
+/// does not become a checkout root.
+///
+/// This is the other half of the derivation contract: absence is skipped
+/// during discovery rather than refused, so one deleted checkout cannot
+/// withhold the migration of every other project on the host.
+#[test]
+fn configured_preflight_keeps_a_missing_registered_path_out_of_the_checkout_roots() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config = config(&root);
+    let fixture = prepare_configured_host(&root, &config, true);
+    let detached = fixture
+        .detached_project
+        .clone()
+        .expect("the fixture registers a missing path");
+    let layout = configured_layout(&root, &config);
+    let report_path = root.join("review/report.json");
+
+    let preflight =
+        ProjectCatalogMigrationFacadeV1::preflight(ProjectCatalogMigrationPreflightRequestV1 {
+            layout,
+            report_path: report_path.clone(),
+            resolution_path: root.join("review/resolution.json"),
+            sensitive_report_path: None,
+        })
+        .unwrap();
+    let report = decode_migration_report_v1(&fs::read(&report_path).unwrap()).unwrap();
+
+    assert_eq!(
+        preflight.receipt.status,
+        ProjectCatalogMigrationStatusV1::Clean,
+        "refusals: {:?}, required resolutions: {:?}",
+        report.refusals,
+        report.required_resolutions
+    );
+    assert_eq!(
+        report.projects.len(),
+        3,
+        "the missing-path record stays in the inventory"
+    );
+    assert_eq!(
+        report
+            .projects
+            .iter()
+            .find(|row| row.project_id == detached)
+            .expect("the missing-path record is reported")
+            .path_status,
+        LegacyProjectPathStatusV1::Missing
+    );
+    assert_eq!(
+        report
+            .missing_paths
+            .iter()
+            .map(|row| row.project_id.clone())
+            .collect::<Vec<_>>(),
+        vec![detached],
+        "exactly the absent registration is reported as a missing path"
+    );
+    assert_eq!(
+        report.checkout_identity_actions.len(),
+        2,
+        "only the two existing checkouts become checkout roots"
+    );
+    assert_eq!(
+        report
+            .attachments
+            .iter()
+            .map(|row| row.project_id.clone())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([fixture.alpha_project.clone(), fixture.beta_project.clone()]),
+        "the absent registration attaches to nothing"
     );
 }
 

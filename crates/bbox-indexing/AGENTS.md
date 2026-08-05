@@ -65,3 +65,12 @@
   inode. Missing or empty markers may be atomically filled, and any different
   or unsafe marker refuses the migration. A successfully installed ID is
   monotonic and is not rolled back with catalog participants.
+- Canonical checkout roots have two sources, and only one of them is a
+  directory listing. A rehearsal enumerates its replica tree; a CONFIGURED
+  layout has no replica tree, so its roots are the canonical paths the v1
+  store registers, decoded through the same bounded no-follow reader that
+  observes those records. Registered paths that are absent are skipped, not
+  refused, and stay missing-path records. Discovery is unlocked by necessity
+  (installed verification already holds the mutation lock when it asks) and
+  is therefore advisory: the locked capture re-reads the store, and a root
+  set that no longer matches it fails closed there.
