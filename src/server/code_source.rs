@@ -10464,7 +10464,13 @@ mod tests {
 
     /// F3: pre-bind validation runs BEFORE schema rebuild. The
     /// pre_bind_catalog_recovery call must appear before the schema
-    /// rebuild block in open.rs.
+    /// rebuild drive in open.rs.
+    ///
+    /// The anchor is the DRIVE CALL, not `schema_was_reset`. P6-B task 5
+    /// refactored the replacement sequence out of `open.rs` into the shared
+    /// `drive_catalog_schema_replacement`, so the predicate literal no longer
+    /// appears here; the invariant this test protects is unchanged, and
+    /// anchoring on the call site is what keeps it protected after the move.
     #[test]
     fn f3_pre_bind_runs_before_schema_rebuild() {
         let open_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/open.rs");
@@ -10474,12 +10480,38 @@ mod tests {
             .find("pre_bind_catalog_recovery")
             .expect("pre_bind_catalog_recovery must be called in open.rs");
         let schema_rebuild_pos = src
-            .find("schema_was_reset")
-            .expect("schema rebuild must exist in open.rs");
+            .find("drive_catalog_schema_replacement")
+            .expect("the shared schema-replacement drive must be called in open.rs");
         assert!(
             pre_bind_pos < schema_rebuild_pos,
             "pre_bind_catalog_recovery must run BEFORE schema rebuild (F3 fix)"
         );
+    }
+
+    /// P6-B task 5: the daemon open path holds NO copy of the replacement
+    /// sequence. A copy would fork exactly the ordering a torn replacement
+    /// recovers through, and the two copies would then disagree only in the
+    /// crash cases nobody exercises by hand.
+    #[test]
+    fn open_drives_the_shared_replacement_and_keeps_no_copy() {
+        let open_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/open.rs");
+        let src = std::fs::read_to_string(&open_path)
+            .unwrap_or_else(|_| panic!("failed to read {}", open_path.display()));
+        assert!(
+            src.contains("drive_catalog_schema_replacement"),
+            "open.rs must call the shared replacement driver"
+        );
+        for copied in [
+            "run_reindex_pass_for_schema_migration",
+            "complete_schema_migration",
+            "schema_was_reset",
+        ] {
+            assert!(
+                !src.contains(copied),
+                "open.rs must not restate `{copied}`: the replacement sequence \
+                 belongs to the shared driver, never to a second copy"
+            );
+        }
     }
 
     // ---- Activation-record preservation regression tests ----

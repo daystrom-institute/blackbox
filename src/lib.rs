@@ -74,6 +74,7 @@ use bbox_stores::pins;
 /// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.
 pub use bro_transcript as parser;
 mod pollers;
+pub mod project_catalog_rebuild_admin;
 pub mod project_catalog_stamper;
 use bbox_indexing::projects;
 use bbox_providers::providers;

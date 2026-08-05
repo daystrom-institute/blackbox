@@ -650,39 +650,15 @@ pub(super) fn open_shared_state(
     // planner's assignment view is installed here rather than passed to
     // `spawn` (same shape as the post-commit searcher hook).
     index_writer.set_producer_assignment_source(code_sources.clone());
-    // The resume arm forces the same synchronous rebuild a fresh mismatch does.
-    // After a crash that already dropped the index there is no marker left to
-    // mismatch against, so `schema_was_reset` is false and the prepared
-    // manifest is the only surviving evidence that a replacement is half done.
-    let resume_interrupted_rebuild = matches!(
-        rebuild_resume,
-        bbox_indexing::index::schema_rebuild::SchemaRebuildResume::Resume { .. }
-    );
-    if idx.schema_was_reset() || resume_interrupted_rebuild {
-        tracing::info!(
-            schema = crate::index::INDEX_SCHEMA_VERSION,
-            resume_interrupted_rebuild,
-            "running synchronous full rebuild after index schema migration"
-        );
-        // Explicit cause, not `run_reindex_pass(true, true)`: this pass runs
-        // against the index the replacement guard just authorized emptying, so
-        // the preservation gates must not verify against it. Re-staging from the
-        // proved sources is the authority here (`FullRebuildCause`).
-        index_writer
-            .run_reindex_pass_for_schema_migration()
-            .context("synchronous schema-migration rebuild failed")?;
-        idx.reader_reload_for_test();
-        // Re-read the selector map from the edge-sidecar manifest. The paired
-        // INDEXER_VERSION bump changes every collected selector's
-        // materialization suffix, so the rebuild above may have migrated one or
-        // more projects onto a new selector and flipped the manifest; the map
-        // seeded at open still names the outgoing one, and the read view built
-        // below would filter out exactly the documents the rebuild just staged.
-        idx.refresh_active_code_selectors()
-            .context("refreshing active code selectors after the schema-migration rebuild")?;
-        idx.complete_schema_migration()
-            .context("committing schema-migration version marker failed")?;
-    }
+    // THE shared replacement driver (P6-B task 5, adjudication Q-D). Daemon
+    // startup and the offline `path-free-rebuild --apply` call this same
+    // function; its ordering, its resume arm, and its reasons all live in
+    // `project_catalog_rebuild_admin` rather than being restated here.
+    crate::project_catalog_rebuild_admin::drive_catalog_schema_replacement(
+        &idx,
+        &index_writer,
+        &rebuild_resume,
+    )?;
 
     // Shared reindex trigger. Initialized `true` so the first background pass
     // runs once after startup and indexes repo-owned `.bbox/knowledge` that may
