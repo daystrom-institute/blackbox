@@ -40,6 +40,7 @@ use crate::project_catalog_migration::{
     read_artifact_optional, validate_artifact_set, validate_target_selection,
     write_artifact_if_absent, write_artifact_replacing,
 };
+use crate::project_catalog_migration_lock::ProjectCatalogMigrationLock;
 use crate::project_catalog_rebuild::ERROR_REBUILD_PROOF_MODE;
 use crate::project_catalog_store::ProjectCatalogStore;
 
@@ -608,15 +609,27 @@ impl ProjectCatalogPathFreeRebuildPlanningFacadeV1 {
             None,
         )?;
 
-        // The capture takes its locks through the STORE OPEN inside
-        // `plan_path_free_rebuild`, not through an outer
-        // `capture_migration_preflight_with`. That is not a shortcut, it is
-        // required: `open_existing` acquires the shared lifetime lock AND the
-        // store mutation lock itself, so wrapping it in a helper that already
-        // holds the mutation lock deadlocks the process against its own
-        // exclusive flock on a second descriptor. Section 4.1's requirement
-        // (preflight runs under the shared lifetime lock) is satisfied by the
-        // open, which holds that lock for the store's whole lifetime.
+        // Section 4.1 as amended by the deadlock finding: a capture that
+        // OPENS the v2 store takes the shared lifetime lock DIRECTLY and must
+        // NOT run inside `capture_migration_preflight_with`. That helper also
+        // holds the store mutation lock, and `open_existing` re-acquires the
+        // same lock file on a second descriptor, which flock self-deadlocks
+        // deterministically. The two-lock helper stays correct for the
+        // migration's raw-file capture, which opens no store.
+        //
+        // Held for the WHOLE preflight, not just the plan: the store is
+        // dropped when planning returns, so a lock taken only inside it would
+        // leave the artifact writes below uncovered. Pair coherence comes
+        // from the store's own mutation-locked strict read.
+        let _lifetime_lock = ProjectCatalogMigrationLock::acquire_shared(
+            request.layout.projects_path(),
+        )
+        .map_err(|error| {
+            refuse(
+                ERROR_REBUILD_STALE_PREDECESSOR,
+                format!("cannot acquire the shared lifetime lock: {error:#}"),
+            )
+        })?;
         let plan = plan_path_free_rebuild(&request.layout, request.scan_limits)?;
 
         // An existing reviewed resolution is AUTHORITATIVE (D-026): a rerun
@@ -1119,35 +1132,64 @@ mod tests {
         );
     }
 
-    /// REGRESSION: a preflight that reaches the capture must COMPLETE.
+    /// REGRESSION, with a BOUNDED WATCHDOG: a preflight that reaches the
+    /// capture must COMPLETE, and must be seen to complete within seconds.
     ///
-    /// `ProjectCatalogStore::open_existing` acquires the shared lifetime lock
-    /// and the store mutation lock itself. An earlier revision wrapped the
-    /// plan in `capture_migration_preflight_with`, which holds the mutation
-    /// lock across its closure, so the open blocked forever on the process's
-    /// own exclusive flock taken through a second descriptor. It was a
-    /// deadlock, not a slow path, and no unit test caught it because every
-    /// other test refuses before the capture.
+    /// The watchdog is the point, not decoration. This class of defect is a
+    /// flock self-deadlock: the call does not fail, it never returns. A plain
+    /// `#[test]` would hang until the harness killed the whole run, which
+    /// reports as a timeout rather than as this test's failure and tells a
+    /// reader nothing about which call blocked. Bounding it here turns an
+    /// indefinite hang into a named assertion.
+    ///
+    /// Shape tests provably do not catch this: every other test in this
+    /// module refuses BEFORE the capture, so none of them ever opens a store.
+    /// The defect lived exactly in the gap between "refuses correctly" and
+    /// "returns at all".
     ///
     /// This store is FreshV2, so the run refuses on the absent backfill
     /// journal. That refusal is the point: reaching it at all proves the
-    /// capture returned.
+    /// capture returned rather than blocking on its own lock.
     #[test]
     fn a_preflight_that_reaches_the_capture_returns_rather_than_deadlocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
         let directory = tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let layout = test_layout(&root);
         let projects_path = root.join("live").join("projects.json");
         fs::create_dir_all(projects_path.parent().unwrap()).unwrap();
         drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
-
-        let refused = ProjectCatalogPathFreeRebuildPlanningFacadeV1::preflight(preflight_request(
+        let request = preflight_request(
             layout,
             ProjectCatalogTargetSelectionV1::Configured,
             root.join("review").join("report.json"),
             root.join("review").join("resolution.json"),
-        ))
-        .expect_err("a fresh-v2 store has no backfill journal to chain");
-        assert_eq!(refused.code, ERROR_REBUILD_STALE_PREDECESSOR);
+        );
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                ProjectCatalogPathFreeRebuildPlanningFacadeV1::preflight(request)
+                    .map(|receipt| receipt.status)
+                    .map_err(|error| error.code),
+            );
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the rebuild preflight did not return within 30s: it is blocked, \
+                 almost certainly re-acquiring the store mutation lock it already holds"
+                )
+            });
+        assert_eq!(
+            outcome,
+            Err(ERROR_REBUILD_STALE_PREDECESSOR),
+            "a fresh-v2 store has no backfill journal to chain"
+        );
+        // The directory must outlive the worker thread's borrow of its paths.
+        drop(directory);
     }
 }
