@@ -123,15 +123,19 @@ named rollback asset (FD-8, section 10.1).
 This section states every binding decision the plan implements. Each is a
 plan-stated decision with rationale, not an open question.
 
-**FD-1. Two new verbs only; existing surface untouched.** The only new
-`ProjectCatalogCommand` variants are `DurableBackfill(DurableBackfillArgs)`
-and `PathFreeRebuild(PathFreeRebuildArgs)`, spelled as governing section 15
-names the operations. The shipped `Migrate` and `Verify` variants keep their
-current shape: `Migrate` has `ArgGroup("mode")` over `preflight|apply`
+**FD-1. Two new verbs only; existing variant topology retained, with
+exactly two additive flags.** The only new `ProjectCatalogCommand`
+variants are `DurableBackfill(DurableBackfillArgs)` and
+`PathFreeRebuild(PathFreeRebuildArgs)`, spelled as governing section 15
+names the operations. The shipped `Migrate` and `Verify` variants keep
+their topology: `Migrate` has `ArgGroup("mode")` over `preflight|apply`
 (`src/bin/blackbox.rs:249-253`), and `Verify` is its own variant taking
-`--root` (`src/bin/blackbox.rs:294-297`). New verbs carry a
-preflight/apply/verify mode triple internally. The bridge-down proof is
-`verify --require-exclusive-availability`, not a new verb.
+`--root` (`src/bin/blackbox.rs:294-297`). Exactly two additive flags
+extend them, both defined in section 3.2 and neither changing existing
+invocations: `--configured` on `MigrateArgs` (apply-target selection) and
+`--require-exclusive-availability` on `VerifyArgs` (the bridge-down
+proof, not a new verb). New verbs carry a preflight/apply/verify mode
+triple internally (section 3.1).
 
 `durable-backfill` stamps and rewrites path-keyed durable-store rows across
 the 14-variant `LegacyPathStoreKindV1` owner set, using the legacy path
@@ -1104,9 +1108,11 @@ and GC-protected. Evidence bundle published.
 
 This plan implements governing section 15 Phase 6 items 1 through 7. It
 defines durable-backfill and path-free-rebuild as versioned
-`blackbox project-catalog` subcommands using the v1 result envelope (D-020),
-exclusive-lock exact-root preflight/apply/verify conventions, and the existing
-receipt vocabulary (D-028). Durable-backfill owns the governing 7.3 row
+`blackbox project-catalog` subcommands using the v1 result envelope (D-020)
+and the existing receipt vocabulary (D-028), with shared-lifetime-lock
+preflight capture, apply on an explicit target under the
+exclusive-then-downgrade availability proof, and fresh verification
+against an explicit target root (section 3.1 mode rules). Durable-backfill owns the governing 7.3 row
 stamping; publisher/G1 seeding remains the migration transaction's
 responsibility (governing 13.2, D-006, D-014), verified by backfill per
 disposition (presence for `SeedG1`, D-040 pointer absence for
