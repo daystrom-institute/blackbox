@@ -545,6 +545,24 @@ second implementation would fork the crash and recovery semantics P3-D owns. The
 requires the manifest in the `Committed` state for migrated origins before the
 daemon may bind any route.
 
+**Placement (adjudication Q-D, ratified).** The executable replacement
+sequence is composed by the ROOT crate (guard injection at index open,
+prepared-manifest materialization, the destructive full pass, the sole
+P3-D committer, and the synchronous post-reset drive), so the rebuild
+preflight and apply entrypoints live in a root-crate administration
+module (`project_catalog_rebuild_admin`) sharing ONE
+`drive_catalog_schema_replacement` function with daemon startup -
+refactored out of the daemon open path, never copied. `bbox-indexing`
+retains the shared DTOs, the read-only preflight planner consuming
+`BackfillCompletionJournalV1`, artifact decoding and recapture
+validation, the D-036 Equality facts, the existing replacement guard and
+recovery classification, and the committed-manifest verifier. No
+writable store implementation, alternative manifest encoder, commit
+callback, or parallel recovery state machine crosses the boundary. A
+successful offline apply means COMMITTED (P6-B task 5 states the full
+contract); the configured lifetime claim (section 4.2) is held across
+the complete root apply call including the final verification.
+
 **Equality proof mode is mandatory (D-036).** The Phase 6 offline rebuild
 runs `prove_against_inventory` and requires
 `HistoryProofModeV1::Equality`: the recorded capture-recipe source
@@ -993,18 +1011,45 @@ removed.
    D-040, section 3.3), and produce the report and resolution. Apply stamps
    all mappable rows idempotently under exclusive lock; unresolved quarantined
    rows ride forward as counted quarantine (section 3.3).
-5. Implement the path-free-rebuild facade as a thin caller of the Phase 3
-   materializer and `RepoHistoryRebuildManifestV1` creation path (P3-D):
-   capture the backfill post-image, drive the materializer to produce the
-   report and resolution, install under exclusive lock. No parallel manifest
-   writer.
+5. Implement the path-free-rebuild preflight and apply entrypoints in the
+   ROOT crate, in a reusable administration module
+   (`project_catalog_rebuild_admin`: preflight, apply,
+   `drive_catalog_schema_replacement`), per the ratified Q-D placement in
+   section 3.4. `src/bin/blackbox.rs` owns only parsing, target selection,
+   and the lifetime claim. Refactor the daemon's replacement sequence
+   (`src/server/open.rs` guard injection and synchronous drive) into the
+   shared `drive_catalog_schema_replacement`; daemon startup and offline
+   apply call the SAME function - never copy its ordering. Success
+   postcondition is COMMITTED, never merely Prepared: apply validates the
+   explicit target and exact artifact identity, recomputes the source
+   fingerprint and requires `HistoryProofModeV1::Equality` immediately
+   before mutation, classifies existing rebuild recovery before opening
+   the index, invokes the same replacement guard the daemon open uses,
+   drives the existing synchronous schema-migration reindex to
+   completion, lets the existing P3-E pass commit the manifest after its
+   index commit, runs the bbox-indexing verifier, and returns success
+   only when verification observes the exact committed manifest across
+   all buckets. A crash leaving Prepared is not a successful apply and
+   recovers exclusively through the existing P3-D/P3-E recovery path.
+   Preflight stays read-only: it scans, proves Equality, consumes
+   `BackfillCompletionJournalV1` as its predecessor binding, and predicts
+   identities, but never invokes the replacement guard, writes a prepared
+   manifest, creates generations, or opens the destructive replacement
+   path. The preflight report binds the Finding-2
+   `RebuildSourceBindingV1` (source index fingerprints, namespace
+   disposition set, proof mode); verify proves the committed manifest
+   consistent with that binding, reaching verify as durable state or an
+   explicitly optional bound (never a required artifact path - section
+   3.1 verify takes no artifacts).
 6. Implement verify mode for both verbs: backfill verify checks that the
    applied stamp set matches `BackfillCompletionJournalV1` and the ledger is
    consistent under the supersession rule (section 3.3); rebuild verify checks
    that every named generation is present and hash-verified, the manifest
    is committed, and the committed manifest records
    `HistoryProofModeV1::Equality` with matching source fingerprints
-   (D-036, section 3.4).
+   (D-036, section 3.4). Rebuild verification REMAINS in `bbox-indexing`
+   (landed as `ProjectCatalogPathFreeRebuildFacadeV1::verify`); the root
+   admin module calls it as its final apply step.
 7. Wire `command_name()` for the six new envelope values (section 3.1).
 8. Both new configured apply paths hold the factored
    `acquire_admin_lifetime_claim` for the complete facade call (section
@@ -1072,7 +1117,11 @@ after this milestone.
 4. Fault injection: inject a torn backfill transaction and prove recovery to
    one coherent state. Inject a torn rebuild transaction and prove recovery.
    Inject a stale artifact at apply time and prove the four-hash identity
-   refusal.
+   refusal. Exercise the SHARED `drive_catalog_schema_replacement` driver
+   at its crash points (Q-D): crash at PREPARED, after the index drop,
+   after the index commit, and before the manifest commit - each
+   recovering exclusively through the existing P3-D/P3-E recovery path,
+   from both the daemon-open caller and the offline-apply caller.
 5. Cluster verification: pin one immutable ref and one binary. Run the full
    P6-A through P6-C test suite.
 
@@ -1183,8 +1232,11 @@ proof copy.
 4. Rebuild preflight: capture the backfill post-image. Review report and
    resolution.
 5. Rebuild apply: `path-free-rebuild --apply --configured --report <path>
-   --resolution <path>`. Drives the Phase 3 materializer to produce a
-   committed `RepoHistoryRebuildManifestV1` (Phase 3 P3-D).
+   --resolution <path>`. Drives the Phase 3 materializer through the
+   shared root driver to a COMMITTED `RepoHistoryRebuildManifestV1`
+   (Phase 3 P3-D); the command returns only after the synchronous
+   replacement completes and the committed-manifest verification
+   observes every bucket (Q-D apply contract).
 6. Rebuild verify.
 7. Capture the quiescent post-cut rollback-proof copy (section 9.1).
 
