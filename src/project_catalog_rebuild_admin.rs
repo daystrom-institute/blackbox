@@ -287,6 +287,153 @@ pub fn apply(
     })
 }
 
+/// Why the startup gate let this boot proceed, or what it covered.
+///
+/// Returned rather than logged because "the gate passed" and "the gate did not
+/// apply" are different facts an operator has to be able to tell apart: the
+/// second is correct for a fresh-v2 store and would be a silent skip on a
+/// migrated one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RebuildStartupGateV1 {
+    /// A `FreshV2` origin. It has no legacy commit documents and no rollback
+    /// assets, so it requires no manifest (D-011, D-030).
+    ExemptFreshOrigin,
+    /// A `MigratedV1` origin carrying no legacy commit namespace at all.
+    /// There is nothing for a cut-time manifest to cover.
+    ExemptZeroLegacyNamespaces,
+    /// The gate ran in full.
+    Verified {
+        rebuild_id: String,
+        /// Generations verified through the manifest's own buckets. This is
+        /// the cut-time tier.
+        cut_time_generations: u64,
+        /// Generations verified through a record's current `Ready` field that
+        /// the cut-time manifest does not name. This is the live-refresh
+        /// tier: history advanced by ordinary `transact` after the cut
+        /// (P3-F item 3), which the manifest is not required to describe.
+        live_refresh_generations: u64,
+    },
+}
+
+/// The P6-C startup validation gate: refuse to bind a v2 route over a migrated
+/// store whose rebuilt history cannot be verified (plan P6-C task 1).
+///
+/// **Scoped to `MigratedV1` origins.** A `FreshV2` store never ran a migration,
+/// carries no legacy commit documents, and legitimately has no manifest
+/// (D-011); gating it would make a correct store unbootable. A migrated store
+/// with no legacy commit namespace at all is exempt for the same reason at a
+/// finer grain: there is nothing a cut-time manifest could cover.
+///
+/// **Two tiers, and the split is the whole design.**
+///
+/// - **Cut-time generations** are the ones the committed
+///   `RepoHistoryRebuildManifestV1` names. They are verified against the
+///   MANIFEST, through its own four buckets. The compatibility bucket is why
+///   this cannot be a walk of catalog `Ready` requirements: a
+///   compatibility-namespace generation has no catalog record naming it
+///   (D-037), so a `Ready`-driven walk would report success having skipped a
+///   whole bucket, and the manifest is that bucket's only GC root.
+/// - **Live-refresh generations** are advanced through ordinary `transact`
+///   after the cut (P3-F item 3). The manifest is cut-time EVIDENCE, not a
+///   live-coverage authority, so it is not required to name these; here the
+///   RECORD is the authority, and only for its PRIMARY namespace. Compatibility
+///   is never inferred from `Ready`, and quarantine records are deliberately
+///   not walked here: they carry
+///   `RepoHistoryQuarantineMaterialization`, a distinct state, and their
+///   generations are covered by the manifest's quarantine buckets above.
+///
+/// A routine `transact` that advances the epoch, including a live history
+/// refresh, therefore does NOT make the daemon unbootable: it adds a
+/// live-refresh generation the gate verifies directly rather than invalidating
+/// the manifest.
+///
+/// Read-only. It opens no writer, drives nothing, and repairs nothing: a
+/// refusal here means the operator investigates, because the alternative is a
+/// daemon serving history it cannot prove it still has.
+pub fn validate_rebuild_coverage_before_bind(
+    store: &ProjectCatalogStore,
+    index_path: &std::path::Path,
+) -> Result<RebuildStartupGateV1, ProjectCatalogMigrationError> {
+    use bbox_corpus_core::project_catalog::RepoHistoryMaterialization;
+    use bbox_corpus_index::index::history_generations::{
+        HistoryGenerationIdV1, HistoryGenerationStore,
+    };
+    use bbox_indexing::project_catalog_rebuild::{
+        read_committed_rebuild_manifest, require_equality_proof_mode, verify_manifest_generations,
+    };
+
+    let state = store
+        .snapshot()
+        .map_err(|error| gate_failure(ERROR_REBUILD_MANIFEST_MISSING, error.to_string()))?;
+    let catalog = state.catalog();
+    if matches!(
+        catalog.origin,
+        bbox_corpus_core::project_catalog::CatalogOriginV2::FreshV2 {}
+    ) {
+        return Ok(RebuildStartupGateV1::ExemptFreshOrigin);
+    }
+    if catalog.repo_histories.is_empty() && catalog.ambiguous_namespaces.is_empty() {
+        return Ok(RebuildStartupGateV1::ExemptZeroLegacyNamespaces);
+    }
+
+    // Cut-time tier. Each of the three steps raises its own plan code, so a
+    // refusal names which property failed rather than a single opaque one:
+    // absent or merely prepared, non-Equality, or unverifiable generations.
+    let manifest = read_committed_rebuild_manifest(index_path)?;
+    require_equality_proof_mode(&manifest)?;
+    let verified = verify_manifest_generations(index_path, &manifest)?;
+    let cut_time_ids = verified
+        .iter()
+        .map(|row| row.generation_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // Live-refresh tier. Only the record's own `Ready` generation, and only
+    // when the manifest does not already cover it.
+    let generations = HistoryGenerationStore::open_for_index(index_path)
+        .map_err(|error| gate_failure(ERROR_REBUILD_GENERATION_UNVERIFIED, error.to_string()))?;
+    let mut live_refresh = 0u64;
+    for record in catalog.repo_histories.values() {
+        let RepoHistoryMaterialization::Ready { generation_id } = &record.materialization else {
+            continue;
+        };
+        if cut_time_ids.contains(generation_id.as_str()) {
+            continue;
+        }
+        let id = HistoryGenerationIdV1::parse(generation_id.as_str()).map_err(|error| {
+            gate_failure(ERROR_REBUILD_GENERATION_UNVERIFIED, error.to_string())
+        })?;
+        // `load` re-derives the record's own commitments and refuses a
+        // mismatch, so loading IS the hash verification.
+        generations.load(&id).map_err(|error| {
+            gate_failure(
+                ERROR_REBUILD_GENERATION_UNVERIFIED,
+                format!(
+                    "repo history {} is Ready at generation {generation_id}, which cannot be \
+                     verified: {error}",
+                    record.repo_history_id
+                ),
+            )
+        })?;
+        live_refresh += 1;
+    }
+
+    Ok(RebuildStartupGateV1::Verified {
+        rebuild_id: manifest.rebuild_id.clone(),
+        cut_time_generations: verified.len() as u64,
+        live_refresh_generations: live_refresh,
+    })
+}
+
+/// Startup-gate refusals.
+///
+/// `NoDurableMutation`, unlike the apply-side helper: the gate is read-only and
+/// runs before any route binds, so nothing has been mutated and claiming
+/// otherwise would send an operator looking for damage that does not exist.
+fn gate_failure(code: &'static str, message: impl Into<String>) -> ProjectCatalogMigrationError {
+    ProjectCatalogMigrationError::no_mutation(code, message)
+}
+
 /// Refusals raised after the authorization gate.
 ///
 /// Typed as `RecoveredToOldState` rather than `NoDurableMutation`: past the

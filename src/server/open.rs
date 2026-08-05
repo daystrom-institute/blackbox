@@ -660,6 +660,32 @@ pub(super) fn open_shared_state(
         &rebuild_resume,
     )?;
 
+    // THE P6-C STARTUP VALIDATION GATE, before any v2 route binds.
+    //
+    // It runs AFTER the driver on purpose. On the boot that performs the
+    // replacement, the committed manifest does not exist until the drive
+    // above finishes, so a gate placed before it would refuse the very boot
+    // that produces the evidence it wants. On every later boot the drive is a
+    // no-op and the ordering is immaterial.
+    //
+    // Bridge mode has no catalog store and therefore no origin to scope the
+    // gate to; the gate is a catalog-mode contract and does not apply.
+    if let Some(store) = &catalog_store {
+        let coverage = crate::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+            store,
+            &index_path,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{}: {} (rebuilt history cannot be verified, so this daemon must not \
+                     serve it)",
+                error.code,
+                error.message
+            )
+        })?;
+        tracing::info!(?coverage, "rebuild coverage gate");
+    }
+
     // Shared reindex trigger. Initialized `true` so the first background pass
     // runs once after startup and indexes repo-owned `.bbox/knowledge` that may
     // have changed while the daemon was down (no watcher event fires for those,
