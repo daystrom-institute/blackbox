@@ -297,6 +297,46 @@ pub fn capture_project_catalog_owner_snapshot(
     finalize_owner_snapshot("artifact", "artifact:root", subsources, rows, limits)
 }
 
+/// Stamp one artifact metadata record with its stable project id, the
+/// write-back inverse of [`capture_project_catalog_owner_snapshot`].
+///
+/// The artifact row id is derived from the record's PATH rather than a field
+/// inside the document, so `row_id_of` reconstructs it from the subsource id
+/// exactly as capture does.
+pub fn stamp_project_catalog_owner_row(
+    root: &Path,
+    source_row_id: &str,
+    project_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampOutcomeV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::stamp_json_tree_row;
+
+    stamp_json_tree_row(
+        root,
+        "artifact",
+        limits,
+        |relative| {
+            !relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::Normal(value)
+                        if value.to_string_lossy().starts_with(".retiring-")
+                )
+            }) && (relative.file_name().and_then(|name| name.to_str()) == Some("metadata.json")
+                || relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".metadata.json")))
+        },
+        |subsource_id, _document| Some(format!("{subsource_id}:legacy-path")),
+        source_row_id,
+        project_id,
+    )
+}
+
 /// Remove every artifact row owned by one project using the catalog metadata
 /// format. Directories are first renamed out of the live tree, then removed.
 pub fn discharge_project_catalog_rows(
@@ -4388,5 +4428,179 @@ mod tests {
                 .exists()
         );
         assert!(artifact.with_extension("json").exists());
+    }
+}
+
+// ── Project-catalog row stamping (P6-B) ─────────────────────────
+
+#[cfg(test)]
+mod owner_row_stamping {
+    use super::*;
+    use bbox_corpus_core::project_catalog_snapshot::{
+        OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OwnerRowStampOutcomeV1,
+        OwnerSnapshotLimitsV1, stable_subsource_id,
+    };
+
+    struct Fixture {
+        root: std::path::PathBuf,
+        row_a: String,
+        row_b: String,
+        path_a: std::path::PathBuf,
+        path_b: std::path::PathBuf,
+    }
+
+    fn document(selector: &str, extra: bool) -> Vec<u8> {
+        let future = if extra {
+            r#", "future_field": {"kept": true}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"kind": "agent", "name": "n", "version": "1", "source": "fixture", "installed_at": "2026-01-01T00:00:00Z", "project_path": "{selector}"{future}}}
+"#
+        )
+        .into_bytes()
+    }
+
+    /// The artifact row id is derived from the record's PATH, so the test
+    /// reconstructs it exactly as capture does.
+    fn row_id(relative: &str) -> String {
+        format!(
+            "{}:legacy-path",
+            stable_subsource_id("artifact", std::path::Path::new(relative))
+        )
+    }
+
+    fn write_fixture(dir: &tempfile::TempDir) -> Fixture {
+        let root = dir.path().canonicalize().unwrap().join("artifacts");
+        let dir_a = root.join("one");
+        let dir_b = root.join("two");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let path_a = dir_a.join("metadata.json");
+        let path_b = dir_b.join("metadata.json");
+        std::fs::write(&path_a, document("/legacy/path/one", true)).unwrap();
+        std::fs::write(&path_b, document("/legacy/path/two", false)).unwrap();
+        Fixture {
+            root,
+            row_a: row_id("one/metadata.json"),
+            row_b: row_id("two/metadata.json"),
+            path_a,
+            path_b,
+        }
+    }
+
+    fn path_of(fixture: &Fixture, row: &str) -> std::path::PathBuf {
+        if row == fixture.row_a {
+            fixture.path_a.clone()
+        } else {
+            fixture.path_b.clone()
+        }
+    }
+
+    fn read_bytes(fixture: &Fixture, row: &str) -> Vec<u8> {
+        std::fs::read(path_of(fixture, row)).unwrap()
+    }
+
+    fn read_row(fixture: &Fixture, row: &str) -> serde_json::Value {
+        serde_json::from_slice(&read_bytes(fixture, row)).unwrap()
+    }
+
+    fn stamp(
+        fixture: &Fixture,
+        row: &str,
+        project_id: &str,
+    ) -> std::result::Result<
+        OwnerRowStampOutcomeV1,
+        bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+    > {
+        stamp_project_catalog_owner_row(
+            &fixture.root,
+            row,
+            project_id,
+            OwnerSnapshotLimitsV1::default(),
+        )
+    }
+
+    #[test]
+    fn a_fresh_row_takes_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        assert_eq!(
+            stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap(),
+            OwnerRowStampOutcomeV1::Stamped
+        );
+
+        let row = read_row(&fixture, &fixture.row_a);
+        assert_eq!(row["project_id"], "a1b2c3d4");
+        // The legacy selector is RETAINED for dual-read.
+        assert_eq!(row["project_path"], "/legacy/path/one");
+        // A field this binary does not model survives the write-back.
+        assert_eq!(row["future_field"]["kept"], true);
+        // Stamping one record must not touch its neighbours.
+        assert!(
+            read_row(&fixture, &fixture.row_b)
+                .get("project_id")
+                .is_none()
+        );
+    }
+
+    /// Re-applying a torn backfill must complete, not double-write.
+    #[test]
+    fn restamping_the_same_id_is_an_idempotent_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap();
+        let after_first = read_bytes(&fixture, &fixture.row_a);
+
+        assert_eq!(
+            stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap(),
+            OwnerRowStampOutcomeV1::AlreadyStamped
+        );
+        assert_eq!(read_bytes(&fixture, &fixture.row_a), after_first);
+    }
+
+    /// Never a silent overwrite.
+    #[test]
+    fn a_conflicting_id_refuses_and_leaves_the_row_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap();
+        let before = read_bytes(&fixture, &fixture.row_a);
+
+        let error = stamp(&fixture, &fixture.row_a, "99998888").unwrap_err();
+        assert_eq!(error.code, OWNER_ROW_PROJECT_ID_CONFLICT);
+        assert_eq!(read_row(&fixture, &fixture.row_a)["project_id"], "a1b2c3d4");
+        assert_eq!(read_bytes(&fixture, &fixture.row_a), before);
+    }
+
+    /// Absence is a refusal, never a success.
+    #[test]
+    fn an_absent_row_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        let error = stamp(&fixture, "artifact:deadbeef:legacy-path", "a1b2c3d4").unwrap_err();
+        assert_eq!(error.code, OWNER_ROW_ABSENT);
+    }
+
+    /// An absent SOURCE is likewise a refusal, and must not create it.
+    #[test]
+    fn an_absent_source_refuses_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("artifacts");
+        let fixture = Fixture {
+            row_a: row_id("one/metadata.json"),
+            row_b: row_id("two/metadata.json"),
+            path_a: root.join("one/metadata.json"),
+            path_b: root.join("two/metadata.json"),
+            root,
+        };
+
+        assert!(stamp(&fixture, &fixture.row_a, "a1b2c3d4").is_err());
+        assert!(!fixture.root.exists());
     }
 }

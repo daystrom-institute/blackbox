@@ -149,6 +149,35 @@ pub fn capture_project_catalog_owner_snapshot(
     )
 }
 
+/// Stamp one Slack proposal link with its stable project id, the write-back
+/// inverse of [`capture_project_catalog_owner_snapshot`].
+pub fn stamp_project_catalog_owner_row(
+    store_dir: &Path,
+    source_row_id: &str,
+    project_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampOutcomeV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{stamp_json_map_row, stamp_json_owner_row};
+
+    stamp_json_owner_row(
+        &store_dir.join(STORE_FILE),
+        "slack_binding_proposal_link",
+        "slack_binding_proposal_link:central-json",
+        limits,
+        |bytes| {
+            stamp_json_map_row(bytes, "links", source_row_id, project_id, |row| {
+                let team_id = row.get("team_id")?.as_str()?;
+                let channel_id = row.get("channel_id")?.as_str()?;
+                let msg_ts = row.get("msg_ts")?.as_str()?;
+                Some(format!("{team_id}:{channel_id}:{msg_ts}"))
+            })
+        },
+    )
+}
+
 #[derive(Debug)]
 pub struct SlackProposalLinks {
     path: PathBuf,
@@ -720,5 +749,147 @@ mod tests {
                 .is_none()
         );
         assert!(store.lookup_by_msg("T01", "C01", "ts-other").is_some());
+    }
+}
+
+// ── Project-catalog row stamping (P6-B) ─────────────────────────
+
+#[cfg(test)]
+mod owner_row_stamping {
+    use super::*;
+    use bbox_corpus_core::project_catalog_snapshot::{
+        OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MISSING,
+        OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
+    };
+
+    const ROW_A: &str = "T1:C1:1.1";
+    const ROW_B: &str = "T1:C2:2.2";
+
+    fn write_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let store_dir = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            store_dir.join(STORE_FILE),
+            br#"{
+  "order": ["k1", "k2"],
+  "by_proposal": {},
+  "links": {
+    "k1": {"team_id": "T1", "channel_id": "C1", "msg_ts": "1.1", "project_dir": "/legacy/path/one", "future_field": {"kept": true}},
+    "k2": {"team_id": "T1", "channel_id": "C2", "msg_ts": "2.2", "project_dir": "/legacy/path/two"}
+  }
+}
+"#,
+        )
+        .unwrap();
+        store_dir
+    }
+
+    fn read_bytes(store_dir: &std::path::Path) -> Vec<u8> {
+        std::fs::read(store_dir.join(STORE_FILE)).unwrap()
+    }
+
+    fn read_row(store_dir: &std::path::Path, row: &str) -> serde_json::Value {
+        let document: serde_json::Value = serde_json::from_slice(&read_bytes(store_dir)).unwrap();
+        document["links"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|value| {
+                format!(
+                    "{}:{}:{}",
+                    value["team_id"].as_str().unwrap(),
+                    value["channel_id"].as_str().unwrap(),
+                    value["msg_ts"].as_str().unwrap()
+                ) == row
+            })
+            .cloned()
+            .unwrap()
+    }
+
+    fn stamp(
+        store_dir: &std::path::Path,
+        row: &str,
+        project_id: &str,
+    ) -> std::result::Result<
+        OwnerRowStampOutcomeV1,
+        bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+    > {
+        stamp_project_catalog_owner_row(
+            store_dir,
+            row,
+            project_id,
+            OwnerSnapshotLimitsV1::default(),
+        )
+    }
+
+    #[test]
+    fn a_fresh_row_takes_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = write_fixture(&dir);
+
+        assert_eq!(
+            stamp(&store_dir, ROW_A, "a1b2c3d4").unwrap(),
+            OwnerRowStampOutcomeV1::Stamped
+        );
+
+        let row = read_row(&store_dir, ROW_A);
+        assert_eq!(row["project_id"], "a1b2c3d4");
+        // The legacy selector is RETAINED for dual-read.
+        assert_eq!(row["project_dir"], "/legacy/path/one");
+        // A field this binary does not model survives the write-back.
+        assert_eq!(row["future_field"]["kept"], true);
+        // Stamping one row must not touch its neighbours.
+        assert!(read_row(&store_dir, ROW_B).get("project_id").is_none());
+    }
+
+    /// Re-applying a torn backfill must complete, not double-write.
+    #[test]
+    fn restamping_the_same_id_is_an_idempotent_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = write_fixture(&dir);
+
+        stamp(&store_dir, ROW_A, "a1b2c3d4").unwrap();
+        let after_first = read_bytes(&store_dir);
+
+        assert_eq!(
+            stamp(&store_dir, ROW_A, "a1b2c3d4").unwrap(),
+            OwnerRowStampOutcomeV1::AlreadyStamped
+        );
+        assert_eq!(read_bytes(&store_dir), after_first);
+    }
+
+    /// Never a silent overwrite.
+    #[test]
+    fn a_conflicting_id_refuses_and_leaves_the_row_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = write_fixture(&dir);
+
+        stamp(&store_dir, ROW_A, "a1b2c3d4").unwrap();
+        let before = read_bytes(&store_dir);
+
+        let error = stamp(&store_dir, ROW_A, "99998888").unwrap_err();
+        assert_eq!(error.code, OWNER_ROW_PROJECT_ID_CONFLICT);
+        assert_eq!(read_row(&store_dir, ROW_A)["project_id"], "a1b2c3d4");
+        assert_eq!(read_bytes(&store_dir), before);
+    }
+
+    /// Absence is a refusal, never a success.
+    #[test]
+    fn an_absent_row_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = write_fixture(&dir);
+
+        let error = stamp(&store_dir, "T9:C9:9.9", "a1b2c3d4").unwrap_err();
+        assert_eq!(error.code, OWNER_ROW_ABSENT);
+    }
+
+    /// An absent SOURCE is likewise a refusal, and must not create it.
+    #[test]
+    fn an_absent_source_refuses_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().canonicalize().unwrap().join("absent");
+
+        let error = stamp(&store_dir, ROW_A, "a1b2c3d4").unwrap_err();
+        assert_eq!(error.code, OWNER_SOURCE_MISSING);
+        assert!(!store_dir.join(STORE_FILE).exists());
     }
 }

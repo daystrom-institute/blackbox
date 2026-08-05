@@ -522,6 +522,54 @@ pub fn stamp_json_document_row(
     }
 }
 
+/// Stamp one row of an owner whose source is a TREE of JSON documents, one
+/// record per file (the packet, whiteboard, artifact-metadata, and proposal
+/// shape). Mirrors [`capture_stable_regular_tree_nofollow`] on the read side.
+///
+/// `row_id_of` reconstructs the backfill's stable row id from a document and
+/// its subsource id, exactly as the owner's capture does. That id is
+/// deliberately recomputed a SECOND time under the file lock: the walk that
+/// locates the file is unlocked, so re-verifying before writing is what stops a
+/// concurrent edit from redirecting the stamp onto a different record.
+pub fn stamp_json_tree_row(
+    root: &Path,
+    source_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    include: impl Fn(&Path) -> bool + Copy,
+    row_id_of: impl Fn(&str, &serde_json::Value) -> Option<String>,
+    source_row_id: &str,
+    project_id: &str,
+) -> Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
+    let captures = capture_stable_regular_tree_nofollow(root, source_id, limits, include)
+        .map_err(|error| OwnerRowStampError::new(error.code))?;
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id(source_id, &relative);
+        let Some(bytes) = captured.bytes else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if row_id_of(&subsource_id, &document).as_deref() != Some(source_row_id) {
+            continue;
+        }
+        return stamp_json_owner_row(
+            &root.join(&relative),
+            source_id,
+            &subsource_id,
+            limits,
+            |bytes| {
+                let document: serde_json::Value = decode_owner_source(bytes)?;
+                if row_id_of(&subsource_id, &document).as_deref() != Some(source_row_id) {
+                    return Err(OwnerRowStampError::new(OWNER_ROW_ABSENT));
+                }
+                stamp_json_document_row(bytes, None, project_id)
+            },
+        );
+    }
+    Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
+}
+
 /// Minimal dependency-safe projection of the root daemon's persisted
 /// `tasks.json` schema. The orchestration cwd is the only field that is a
 /// legacy path selector; all other task payload remains owned by the root
@@ -655,6 +703,35 @@ pub fn capture_legacy_proposal_owner_snapshot(
         rows.extend(subsource_rows);
     }
     finalize_owner_snapshot("proposal", "proposal:root", subsources, rows, limits)
+}
+
+/// Stamp one legacy proposal record with its stable project id, the write-back
+/// inverse of [`capture_legacy_proposal_owner_snapshot`].
+pub fn stamp_legacy_proposal_owner_row(
+    proposals_root: &Path,
+    source_row_id: &str,
+    project_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
+    stamp_json_tree_row(
+        proposals_root,
+        "proposal",
+        limits,
+        |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        },
+        |subsource_id, document| {
+            document
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| format!("{subsource_id}:{id}"))
+        },
+        source_row_id,
+        project_id,
+    )
 }
 
 pub fn capture_stable_regular_tree_nofollow(
@@ -1332,5 +1409,166 @@ mod tests {
                 ..
             } if literal_selector == "/repo/legacy"
         ));
+    }
+}
+
+// ── Project-catalog row stamping (P6-B) ─────────────────────────────────────
+
+#[cfg(test)]
+mod proposal_owner_row_stamping {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        row_a: String,
+        row_b: String,
+        path_a: PathBuf,
+        path_b: PathBuf,
+    }
+
+    fn document(id: &str, selector: &str, extra: bool) -> Vec<u8> {
+        let future = if extra {
+            r#", "future_field": {"kept": true}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"id": "{id}", "project_dir": "{selector}"{future}}}
+"#
+        )
+        .into_bytes()
+    }
+
+    /// The proposal row id combines the record's path-derived subsource id with
+    /// its own id, so the test reconstructs it exactly as capture does.
+    fn row_id(relative: &str, id: &str) -> String {
+        format!(
+            "{}:{id}",
+            stable_subsource_id("proposal", Path::new(relative))
+        )
+    }
+
+    fn write_fixture(dir: &tempfile::TempDir) -> Fixture {
+        let root = dir.path().canonicalize().unwrap().join("proposals");
+        std::fs::create_dir_all(&root).unwrap();
+        let path_a = root.join("one.json");
+        let path_b = root.join("two.json");
+        std::fs::write(&path_a, document("pr1", "/legacy/path/one", true)).unwrap();
+        std::fs::write(&path_b, document("pr2", "/legacy/path/two", false)).unwrap();
+        Fixture {
+            root,
+            row_a: row_id("one.json", "pr1"),
+            row_b: row_id("two.json", "pr2"),
+            path_a,
+            path_b,
+        }
+    }
+
+    fn read_bytes(fixture: &Fixture, row: &str) -> Vec<u8> {
+        let path = if row == fixture.row_a {
+            &fixture.path_a
+        } else {
+            &fixture.path_b
+        };
+        std::fs::read(path).unwrap()
+    }
+
+    fn read_row(fixture: &Fixture, row: &str) -> serde_json::Value {
+        serde_json::from_slice(&read_bytes(fixture, row)).unwrap()
+    }
+
+    fn stamp(
+        fixture: &Fixture,
+        row: &str,
+        project_id: &str,
+    ) -> Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
+        stamp_legacy_proposal_owner_row(
+            &fixture.root,
+            row,
+            project_id,
+            OwnerSnapshotLimitsV1::default(),
+        )
+    }
+
+    #[test]
+    fn a_fresh_row_takes_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        assert_eq!(
+            stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap(),
+            OwnerRowStampOutcomeV1::Stamped
+        );
+
+        let row = read_row(&fixture, &fixture.row_a);
+        assert_eq!(row["project_id"], "a1b2c3d4");
+        // The legacy selector is RETAINED for dual-read.
+        assert_eq!(row["project_dir"], "/legacy/path/one");
+        // A field this binary does not model survives the write-back.
+        assert_eq!(row["future_field"]["kept"], true);
+        // Stamping one record must not touch its neighbours.
+        assert!(
+            read_row(&fixture, &fixture.row_b)
+                .get("project_id")
+                .is_none()
+        );
+    }
+
+    /// Re-applying a torn backfill must complete, not double-write.
+    #[test]
+    fn restamping_the_same_id_is_an_idempotent_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap();
+        let after_first = read_bytes(&fixture, &fixture.row_a);
+
+        assert_eq!(
+            stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap(),
+            OwnerRowStampOutcomeV1::AlreadyStamped
+        );
+        assert_eq!(read_bytes(&fixture, &fixture.row_a), after_first);
+    }
+
+    /// Never a silent overwrite.
+    #[test]
+    fn a_conflicting_id_refuses_and_leaves_the_row_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        stamp(&fixture, &fixture.row_a, "a1b2c3d4").unwrap();
+        let before = read_bytes(&fixture, &fixture.row_a);
+
+        let error = stamp(&fixture, &fixture.row_a, "99998888").unwrap_err();
+        assert_eq!(error.code, OWNER_ROW_PROJECT_ID_CONFLICT);
+        assert_eq!(read_row(&fixture, &fixture.row_a)["project_id"], "a1b2c3d4");
+        assert_eq!(read_bytes(&fixture, &fixture.row_a), before);
+    }
+
+    /// Absence is a refusal, never a success.
+    #[test]
+    fn an_absent_row_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = write_fixture(&dir);
+
+        let error = stamp(&fixture, "proposal:deadbeef:pr9", "a1b2c3d4").unwrap_err();
+        assert_eq!(error.code, OWNER_ROW_ABSENT);
+    }
+
+    /// An absent SOURCE is likewise a refusal, and must not create it.
+    #[test]
+    fn an_absent_source_refuses_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("proposals");
+        let fixture = Fixture {
+            row_a: row_id("one.json", "pr1"),
+            row_b: row_id("two.json", "pr2"),
+            path_a: root.join("one.json"),
+            path_b: root.join("two.json"),
+            root,
+        };
+
+        assert!(stamp(&fixture, &fixture.row_a, "a1b2c3d4").is_err());
+        assert!(!fixture.root.exists());
     }
 }
