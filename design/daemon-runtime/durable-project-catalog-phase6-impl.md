@@ -1267,8 +1267,15 @@ after this milestone.
    at its crash points (Q-D, states refined by Q-F) for BOTH trigger
    classes (SchemaMismatch and OperatorPathFreeRebuild) and from both
    callers (daemon open and offline apply): (1) after Prepared before
-   drop - source intact, recovery rolls Prepared back, a later offline
-   retry reauthorizes Equality and starts a fresh forced operation;
+   drop - source intact, recovery rolls Prepared back; NOTE, proven by
+   execution: a later offline retry does NOT simply reauthorize and
+   restart, because the guard's namespace materialization advanced the
+   catalog epoch before the crash, so the retry's predecessor binding is
+   stale and section 6.2 blocks it with
+   `error.project_catalog_inventory_stale_post_image` - recovering the
+   CUT requires re-running the durable backfill to rebind the
+   predecessor, then a fresh rebuild preflight and apply (the
+   sequencing discipline working correctly, pinned as a passing test);
    (2) after drop - Prepared + absent/incoming marker yields
    ResumePrepared, re-emitting from pinned generations without rerunning
    the guard; (3) after index commit before manifest commit - Prepared
@@ -1401,7 +1408,14 @@ proof copy.
    and the committed-manifest verification observes every bucket (Q-D
    apply contract).
 6. Rebuild verify.
-7. Capture the quiescent post-cut rollback-proof copy (section 9.1).
+7. RUNBOOK, pre-drop crash recovery (P6-C crash-matrix finding): if the
+   rebuild apply crashes after Prepared but before the index drop, the
+   daemon-side state is safe (rollback, intact source) but the CUT is
+   not resumable by re-running `path-free-rebuild --apply` alone - the
+   guard's materialization advanced the epoch, so the retry refuses as
+   stale. Re-run the durable backfill (fresh preflight and apply, which
+   rebinds the predecessor), then a fresh rebuild preflight and apply.
+8. Capture the quiescent post-cut rollback-proof copy (section 9.1).
 
 **Exit gate:** Backfill and rebuild applied and verified in sequence. Rebuild
 manifest committed with full coverage.
