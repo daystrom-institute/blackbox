@@ -570,6 +570,15 @@ predecessor epoch and four-hash identity are re-validated. Quarantine
 conversions that landed in the committed pair are visible in the new
 predecessor and are not re-stamped.
 
+**Disposition source (implementation ruling).** The publisher dispositions
+the backfill verifies are read from the installed migration MARKER
+(`ProjectCatalogMigrationMarkerV1.publisher_dispositions`, written at
+migration apply and validated on install/rollback/verify), never supplied
+by the caller: a caller-supplied disposition set could disagree with what
+the migration actually committed and nothing would catch it, and the
+marker evidence carries exactly the fields the verification consumes.
+Marker-sourcing makes that disagreement unrepresentable.
+
 The backfill report carries: the predecessor catalog epoch and snapshot hash;
 the complete legacy path ledger with row classification counts by store
 and status; planned stamp operations (per-store mappable/ambiguous/unscoped
