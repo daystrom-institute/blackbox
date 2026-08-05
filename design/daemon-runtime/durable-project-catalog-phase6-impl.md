@@ -411,11 +411,27 @@ second implementation would fork the crash and recovery semantics P3-D owns. The
 requires the manifest in the `Committed` state for migrated origins before the
 daemon may bind any route.
 
+**Equality proof mode is mandatory (D-036).** The Phase 6 offline rebuild
+runs `prove_against_inventory` and requires
+`HistoryProofModeV1::Equality`: the recorded capture-recipe source
+fingerprint must match the fingerprint recomputed over the index the
+rebuild consumes. A Drift-mode outcome proves only non-loss, which is
+insufficient for a cut-authorizing rebuild; the rebuild REFUSES it with
+`error.project_catalog_rebuild_proof_mode` (NEW, section 7.3). The proof
+mode and both fingerprints are already recorded in the outcome and the
+committed manifest (`proof_mode` on `RepoHistoryRebuildManifestV1`,
+`history_generations.rs`); rebuild verify revalidates that the committed
+manifest records Equality with matching fingerprints. The service is
+stopped across the sequence (section 6.1), so the index cannot drift
+between backfill apply and rebuild preflight; a Drift-mode outcome during
+the cut therefore indicates an inconsistent capture and blocks for
+diagnosis per section 6.2.
+
 The rebuild report carries the predecessor catalog epoch, the backfill
 post-image epoch, the planned history-generation materialization set with
-complete-count/hash proofs, planned quarantine dispositions, and the predicted
-post-image rebuild manifest hash. The rebuild resolution carries the four-hash
-identity binding.
+complete-count/hash proofs, planned quarantine dispositions, the proof
+mode with both fingerprints, and the predicted post-image rebuild manifest
+hash. The rebuild resolution carries the four-hash identity binding.
 
 ## 4. Lock discipline
 
@@ -607,6 +623,10 @@ Codes introduced by this plan are marked NEW and conform to the
   backfill resolution names a disposition inconsistent with the predecessor
   inventory (e.g., mapping or superseding a non-quarantined binding, or any
   delete disposition).
+- `error.project_catalog_rebuild_proof_mode` (NEW): the rebuild's
+  `prove_against_inventory` outcome, or the committed manifest's recorded
+  `proof_mode`, is not `HistoryProofModeV1::Equality` (D-036). Raised by
+  rebuild apply/verify and by the P6-C startup gate on cut-time manifests.
 
 No invented codes like `error.project_catalog_bridge_still_running` or bare
 `error.project_catalog_inventory_stale` appear in this plan.
@@ -793,8 +813,10 @@ removed.
 6. Implement verify mode for both verbs: backfill verify checks that the
    applied stamp set matches `BackfillCompletionJournalV1` and the ledger is
    consistent under the supersession rule (section 3.3); rebuild verify checks
-   that every named generation is present and hash-verified and the manifest
-   is committed.
+   that every named generation is present and hash-verified, the manifest
+   is committed, and the committed manifest records
+   `HistoryProofModeV1::Equality` with matching source fingerprints
+   (D-036, section 3.4).
 7. Wire `command_name()` for the six new envelope values (section 3.1).
 8. Both new apply paths use `open_admin_store` (section 4.2) for
    `--configured`; both preflight paths acquire the shared lifetime lock
@@ -824,19 +846,31 @@ after this milestone.
    - **MigratedV1** stores (`project_catalog.rs:480`) with materialized legacy
      commit documents: two tiers.
      - **Cut-time generations** (named in the committed
-       `RepoHistoryRebuildManifestV1`): require the manifest `Committed` and
-       every named generation present on disk, hash-verified.
+       `RepoHistoryRebuildManifestV1`): require the manifest `Committed`,
+       recording `HistoryProofModeV1::Equality` (D-036, section 3.4), and
+       every generation in EVERY manifest bucket present on disk and
+       count/commitment/hash-verified: the primary owned set, the
+       `compatibility_generation_ids` bucket, and the ambiguous/unclaimed
+       quarantine set. Compatibility-namespace generations have no catalog
+       `Ready` owner and are reachable only through the manifest bucket
+       (D-037); the gate must NEVER infer them from record `Ready`, and a
+       gate that walked only `Ready` requirements would silently skip them.
      - **Live-refresh generations** (advanced through regular `transact` after
        the cut, per P3-F item 3): the manifest is NOT required to name these.
-       The gate treats the RECORD as authority: the generation the record's
-       current `RepoHistoryMaterialization::Ready { generation_id }` names must
-       be present on disk and hash-verified. The manifest is cut-time evidence,
+       The gate treats the RECORD as authority for the PRIMARY namespace
+       only: the generation the record's current
+       `RepoHistoryMaterialization::Ready { generation_id }` names must
+       be present on disk and hash-verified. Quarantine records carry their
+       own `RepoHistoryQuarantineMaterialization` state, distinct from
+       `RepoHistoryMaterialization`. The manifest is cut-time evidence,
        not a live-coverage authority.
    Zero-legacy-namespace stores are exempt. Routine `transact` epoch advances
    (including P3-F live history refresh) are tolerated. A missing cut-time
    manifest refuses with `error.project_catalog_rebuild_manifest_missing`
-   (NEW). An absent or hash-mismatched generation refuses with
-   `error.project_catalog_rebuild_generation_unverified` (NEW).
+   (NEW). An absent or hash-mismatched generation in any bucket refuses with
+   `error.project_catalog_rebuild_generation_unverified` (NEW). A cut-time
+   manifest recording a non-Equality proof mode refuses with
+   `error.project_catalog_rebuild_proof_mode` (NEW).
 2. GC roots: the committed migration marker's named inventory drives exclusion
    (section 10.2). Marker-driven refusal applies to `MigratedV1` origins only;
    `FreshV2` stores are exempt.
@@ -853,12 +887,16 @@ after this milestone.
    P6-A through P6-C test suite.
 
 **Exit gate:** The startup gate refuses a missing or unverified rebuild
-generation for cut-time generations on migrated origins. Live-refresh
-generations (advanced through P3-F transact without a manifest) are verified
-against the record's `Ready` field, not the manifest. Fresh-v2 and
-zero-legacy-namespace stores boot without the gate. A post-cut routine
-transaction or live history refresh that advances the epoch does not make the
-daemon unbootable. No code changes after this milestone.
+generation in ANY manifest bucket (primary, compatibility, quarantine) for
+cut-time generations on migrated origins, and refuses a cut-time manifest
+whose recorded proof mode is not Equality. Live-refresh generations
+(advanced through P3-F transact without a manifest) are verified
+against the record's `Ready` field, not the manifest; compatibility
+generations are verified from the manifest bucket, never inferred from
+`Ready`. Fresh-v2 and zero-legacy-namespace stores boot without the gate.
+A post-cut routine transaction or live history refresh that advances the
+epoch does not make the daemon unbootable. No code changes after this
+milestone.
 
 ### P6-D (operational, non-cut): closeout window and cutback exercise
 
@@ -890,11 +928,16 @@ exact copied inventory.
 2. Run migrate preflight and apply against the copy.
 3. Run backfill preflight and apply (after migration apply).
 4. Run rebuild preflight and apply (after backfill apply).
-5. Verify every ambiguous or unclaimed namespace materializes into a
-   `RepoHistoryQuarantineGeneration` with complete ordered document
-   commitments (D-027).
-6. Run exact post-image verification: every named generation verifies, the
-   manifest covers every `Ready` requirement.
+5. Verify every ambiguous or unclaimed namespace materializes into an
+   immutable quarantine generation (an `rhg_`-id'd generation tracked by
+   `RepoHistoryQuarantineGenerationId` with
+   `RepoHistoryQuarantineMaterialization` state) with complete ordered
+   document commitments (D-027).
+6. Run exact post-image verification: every generation in every manifest
+   bucket verifies (primary, `compatibility_generation_ids`, quarantine;
+   D-037), the manifest covers every `Ready` requirement, and the
+   committed manifest records `HistoryProofModeV1::Equality` with
+   matching source fingerprints (D-036).
 7. Run the v2 daemon and verify catalog-only queries resolve, cutback
    completes, and adapter surfaces degrade per the section 14 table.
 
@@ -960,7 +1003,8 @@ copy, and publish the evidence bundle.
 
 1. Start the exact v2 binary pinned in P6-C.
 2. Startup validation gate passes for the `MigratedV1` origin: rebuild
-   manifest committed, every `Ready` requirement covered (P6-C).
+   manifest committed in Equality proof mode, every manifest bucket and
+   every `Ready` requirement covered (P6-C).
 3. Catalog-only live check: every corpus-only query resolves with an empty
    attachment store.
 4. Cutback live check: auth swap completes and resume converges exactly once.
