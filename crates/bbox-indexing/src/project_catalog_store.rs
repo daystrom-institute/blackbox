@@ -490,6 +490,193 @@ pub(crate) fn legacy_commit_namespace_inventory_asset_location(
 pub(crate) const LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_MAX_BYTES: usize =
     MAX_LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_BYTES;
 
+/// One durable root or file an external sweep must not delete.
+///
+/// The role is carried beside the path because an operator reading a refusal
+/// or an exclusion list needs to know WHY a path is protected; a bare path
+/// list invites someone to decide one entry looks prunable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogGcProtectedRootV1 {
+    pub role: &'static str,
+    pub path: PathBuf,
+}
+
+/// What an external sweep is allowed to do against a projects store
+/// (Phase 6 plan section 10.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CatalogGcExclusionsV1 {
+    /// Not a version-2 catalog store at all. Section 10.2 is a catalog-mode
+    /// contract, so a bridge or absent store carries none of these roots.
+    ExemptNonCatalogStore,
+    /// A `FreshV2` origin. It legitimately carries no migration marker
+    /// (D-011) and no rollback assets, so the marker-absence refusal
+    /// deliberately does NOT fire here: refusing would make a correct store
+    /// unsweepable rather than protecting anything.
+    ExemptFreshOrigin,
+    /// A `MigratedV1` origin whose committed marker authorized the exclusion
+    /// set below.
+    MarkerDriven {
+        transaction_id: ProjectCatalogTransactionId,
+        /// Named immutable assets the marker itself enumerates. Counted
+        /// separately from `roots` so a caller can tell a marker that named
+        /// nothing from one whose assets are all protected.
+        named_immutable_assets: u64,
+        roots: Vec<CatalogGcProtectedRootV1>,
+    },
+}
+
+impl CatalogGcExclusionsV1 {
+    /// Whether `path` sits inside, or exactly at, a protected root.
+    ///
+    /// Prefix comparison on components, not on strings: a string prefix test
+    /// would treat `.../history-generations-old` as protected by
+    /// `.../history-generations`, and, worse, would let a sweeper that
+    /// normalized differently conclude the opposite.
+    pub fn protects(&self, path: &Path) -> bool {
+        let Self::MarkerDriven { roots, .. } = self else {
+            return false;
+        };
+        roots.iter().any(|root| path.starts_with(&root.path))
+    }
+}
+
+/// Plan the GC exclusion set for a projects store, or refuse to sweep
+/// (Phase 6 plan section 10.2, milestone P6-C task 2).
+///
+/// **Why this reads the marker DIRECTLY rather than through an opened store.**
+/// `open_existing` already validates the marker on every open, so a planner
+/// that composed on an opened store could never observe an absent, corrupt, or
+/// incomplete marker: the open would have refused first, and the refusal this
+/// function exists to raise would be unreachable by construction. An exclusion
+/// gate that cannot fail is not a gate. Reading the marker here also matches
+/// the caller this is for: an EXTERNAL sweep has no store open, and requiring
+/// one would mean the sweep either takes the store's locks or skips the check.
+///
+/// **Marker-driven, not a path glob.** The five roots below are the section
+/// 10.2 set (transaction stage, history-rebuild stage, backup, G1, quarantine
+/// - quarantine generations live under the history-generations root), but they
+/// are only returned once the committed marker has authorized them, and the
+/// marker's own named immutable assets are protected individually by name. A
+/// glob would keep "protecting" paths after the evidence that made them
+/// meaningful was gone.
+///
+/// Refusals all carry `error.project_catalog_migration_incomplete`, the code
+/// the store already raises for marker problems; this introduces none of its
+/// own.
+pub fn plan_catalog_gc_exclusions(
+    projects_path: &Path,
+    index_root: &Path,
+) -> ProjectCatalogStoreResult<CatalogGcExclusionsV1> {
+    if probe_project_store_mode(projects_path)? != ProjectStoreProbe::CatalogV2 {
+        return Ok(CatalogGcExclusionsV1::ExemptNonCatalogStore);
+    }
+    let paths = ProjectCatalogPaths::derive(projects_path)?;
+
+    // The origin, read WITHOUT the marker binding check. A partial probe
+    // rather than a full snapshot decode: this needs one field, and a full
+    // decode would couple sweep planning to every future catalog field.
+    let Some(raw) =
+        RealCatalogStoreIo.read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?
+    else {
+        return Err(ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_snapshot",
+            "projects store disappeared between probe and origin read",
+        ));
+    };
+    #[derive(Deserialize)]
+    struct OriginProbe {
+        origin: CatalogOriginV2,
+    }
+    let probe: OriginProbe = serde_json::from_slice(&raw).map_err(|error| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_invalid_snapshot",
+            format!("catalog origin probe failed: {error}"),
+        )
+    })?;
+    let transaction_id = match probe.origin {
+        CatalogOriginV2::FreshV2 {} => return Ok(CatalogGcExclusionsV1::ExemptFreshOrigin),
+        CatalogOriginV2::MigratedV1 { transaction_id } => transaction_id,
+    };
+
+    let incomplete = |detail: &str| {
+        ProjectCatalogStoreError::new("error.project_catalog_migration_incomplete", detail)
+    };
+    let Some(marker_bytes) =
+        RealCatalogStoreIo.read_regular_nofollow(&paths.migration_marker, MAX_MARKER_BYTES)?
+    else {
+        return Err(incomplete(
+            "migrated catalog has no committed migration marker; refusing to sweep rather \
+             than deleting rollback assets nothing can vouch for",
+        ));
+    };
+    let marker: ProjectCatalogMigrationMarkerV1 =
+        decode_bounded_json(&marker_bytes, MAX_MARKER_BYTES, "migration marker")
+            .map_err(|error| incomplete(&format!("migration marker is corrupt: {error}")))?;
+    marker.validate()?;
+    if marker.transaction_id != transaction_id {
+        return Err(incomplete(
+            "migration marker transaction does not match catalog origin; refusing to sweep",
+        ));
+    }
+
+    let accepted = AcceptedPublicationStorePaths::derive(projects_path).map_err(|error| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_unsafe_path",
+            format!("accepted-publication root cannot be derived: {error}"),
+        )
+    })?;
+    let history_generations =
+        bbox_corpus_index::index::history_generations::generations_root_for_index(index_root)
+            .map_err(|error| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_unsafe_path",
+                    format!("history-generations root cannot be derived: {error}"),
+                )
+            })?;
+
+    let mut roots = vec![
+        CatalogGcProtectedRootV1 {
+            role: "transaction_stage",
+            path: paths.stage_dir.clone(),
+        },
+        CatalogGcProtectedRootV1 {
+            role: "catalog_backup",
+            path: paths.backup_dir.clone(),
+        },
+        CatalogGcProtectedRootV1 {
+            role: "migration_immutable_assets",
+            path: paths.migration_assets_dir.clone(),
+        },
+        CatalogGcProtectedRootV1 {
+            role: "accepted_publication_generations",
+            path: accepted.generations().to_path_buf(),
+        },
+        // Both the history-rebuild stage and the quarantine generations live
+        // here: quarantine generations are `rhq_`-id'd entries in the same
+        // store, and the rebuild manifest is their only durable owner.
+        CatalogGcProtectedRootV1 {
+            role: "history_generations",
+            path: history_generations,
+        },
+    ];
+    // The marker's OWN named inventory, protected by name. This is what makes
+    // the exclusion marker-driven: these files are named by the committed
+    // evidence, not discovered by walking a directory.
+    for asset in &marker.immutable_assets {
+        roots.push(CatalogGcProtectedRootV1 {
+            role: "migration_immutable_asset",
+            path: paths.migration_assets_dir.join(asset.validated_name.as_str()),
+        });
+    }
+
+    Ok(CatalogGcExclusionsV1::MarkerDriven {
+        transaction_id,
+        named_immutable_assets: marker.immutable_assets.len() as u64,
+        roots,
+    })
+}
+
 impl ProjectCatalogStore {
     /// Open an already initialized strict v2 pair.
     ///

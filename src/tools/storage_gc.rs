@@ -190,8 +190,48 @@ impl BlackboxServer {
                 },
             };
 
+            // Marker-driven GC exclusion (Phase 6 plan section 10.2). It runs
+            // BEFORE any candidate is planned, because its migrated-origin arm
+            // is a refusal to sweep at all, not a filter: a marker that is
+            // absent, corrupt, or incomplete means nothing can vouch for the
+            // rollback assets, and reporting candidates first would invite an
+            // operator to act on a list this store had no authority to
+            // produce. Fresh-v2 and non-catalog stores pass through exempt.
+            let (projects_path, index_path) = {
+                let config = server.state.config.read();
+                (
+                    config.paths.projects_path.clone(),
+                    config.paths.index_path.clone(),
+                )
+            };
+            let exclusions = bbox_indexing::project_catalog_store::plan_catalog_gc_exclusions(
+                &projects_path,
+                &index_path,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error} (refusing to sweep a migrated store whose rollback inventory \
+                     cannot be authorized)"
+                )
+            })?;
+
             let candidates =
                 storage_health::plan_gc_with_policy(&edges_dir, &registered, &gc_params, &policy)?;
+
+            // The protected-root filter is a SECOND line, deliberately kept
+            // even though today's candidates are edge-sidecar paths that do
+            // not normally fall under these roots. The roots are retention
+            // inventory (section 10.1) and the cost of the check is one prefix
+            // comparison; the cost of omitting it is discovering, after a
+            // future planner learns a new candidate class, that the sweep
+            // deleted a rebuild generation.
+            let candidates: Vec<storage_health::GcCandidate> = candidates
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.path.is_empty()
+                        || !exclusions.protects(std::path::Path::new(&candidate.path))
+                })
+                .collect();
 
             let deletable: Vec<&storage_health::GcCandidate> = candidates
                 .iter()
@@ -230,6 +270,10 @@ impl BlackboxServer {
             let mut out = serde_json::json!({
                 "status": if p.dry_run { "dry_run" } else { "applied" },
                 "result": result,
+                // Reported, not merely applied: an external sweep is the real
+                // consumer of section 10.2, and it can only honour the
+                // exclusion set if this surface publishes it.
+                "catalog_gc_exclusions": exclusions,
             });
             if let Some(report) = packet_gc {
                 out["packet_gc"] = serde_json::to_value(&report)?;

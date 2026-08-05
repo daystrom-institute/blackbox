@@ -1525,3 +1525,150 @@ fn a_fresh_v2_store_boots_without_the_gate() {
     .expect("a fresh-v2 origin is exempt");
     assert_eq!(coverage, RebuildStartupGateV1::ExemptFreshOrigin);
 }
+
+// ---------------------------------------------------------------------------
+// Marker-driven GC exclusion (P6-C task 3, plan section 10.2)
+// ---------------------------------------------------------------------------
+
+/// A migrated origin publishes the section 10.2 protected roots, authorized by
+/// its committed marker's named inventory.
+#[test]
+fn a_migrated_origin_publishes_marker_driven_gc_roots() {
+    use bbox_indexing::project_catalog_store::{CatalogGcExclusionsV1, plan_catalog_gc_exclusions};
+
+    let fixture = Fixture::new();
+    let paths = fixture.layout.rebuild_index_paths();
+    let exclusions =
+        plan_catalog_gc_exclusions(fixture.layout.projects_path(), &paths.index_root).unwrap();
+
+    let CatalogGcExclusionsV1::MarkerDriven {
+        named_immutable_assets,
+        roots,
+        ..
+    } = &exclusions
+    else {
+        panic!("a migrated origin is marker-driven, not exempt: {exclusions:?}");
+    };
+    // The section 10.2 set: transaction stage, history-rebuild stage, backup,
+    // G1, and quarantine (quarantine generations live under the
+    // history-generations root).
+    for role in [
+        "transaction_stage",
+        "catalog_backup",
+        "migration_immutable_assets",
+        "accepted_publication_generations",
+        "history_generations",
+    ] {
+        assert!(
+            roots.iter().any(|root| root.role == role),
+            "protected root {role} is missing: {roots:?}"
+        );
+    }
+    // Marker-DRIVEN, not a glob: the real migration installed named immutable
+    // assets, and each is protected individually by the name the marker
+    // records.
+    assert!(
+        *named_immutable_assets > 0,
+        "the fixture's migration installed named immutable assets"
+    );
+    assert_eq!(
+        roots
+            .iter()
+            .filter(|root| root.role == "migration_immutable_asset")
+            .count() as u64,
+        *named_immutable_assets
+    );
+
+    // The predicate an external sweep actually calls.
+    let generations = roots
+        .iter()
+        .find(|root| root.role == "history_generations")
+        .unwrap();
+    assert!(exclusions.protects(&generations.path.join("rhg_whatever")));
+    assert!(!exclusions.protects(Path::new("/tmp/somewhere-else")));
+}
+
+/// THE REACHABILITY PROOF for reading the marker directly.
+///
+/// This is why the planner does not compose on an opened store.
+/// `open_existing` validates the marker on every open, so a planner that went
+/// through a store could never observe an absent one: the open would refuse
+/// first and this refusal would be unreachable by construction. The assertion
+/// pair below is the evidence - the store refuses to open, AND the planner
+/// still produces its own refusal from the same damaged state.
+#[test]
+fn an_absent_marker_refuses_the_sweep_on_a_migrated_origin() {
+    use bbox_indexing::project_catalog_store::plan_catalog_gc_exclusions;
+
+    let fixture = Fixture::new();
+    let paths = fixture.layout.rebuild_index_paths();
+    let marker = marker_path(&fixture.layout);
+    assert!(marker.exists(), "the real migration installed a marker");
+    fs::remove_file(&marker).unwrap();
+
+    // A store open cannot reach this state: it refuses first.
+    let open_refusal =
+        ProjectCatalogStore::open_existing(fixture.layout.projects_path()).unwrap_err();
+    assert_eq!(open_refusal.code(), "error.project_catalog_migration_incomplete");
+
+    let refusal =
+        plan_catalog_gc_exclusions(fixture.layout.projects_path(), &paths.index_root).unwrap_err();
+    assert_eq!(refusal.code(), "error.project_catalog_migration_incomplete");
+}
+
+/// A corrupt marker refuses too, and for the same reason: nothing can vouch
+/// for the rollback inventory, so sweeping is worse than stopping.
+#[test]
+fn a_corrupt_marker_refuses_the_sweep_on_a_migrated_origin() {
+    use bbox_indexing::project_catalog_store::plan_catalog_gc_exclusions;
+
+    let fixture = Fixture::new();
+    let paths = fixture.layout.rebuild_index_paths();
+    write(&marker_path(&fixture.layout), b"{\"version\":1,\"truncated\":");
+
+    let refusal =
+        plan_catalog_gc_exclusions(fixture.layout.projects_path(), &paths.index_root).unwrap_err();
+    assert_eq!(refusal.code(), "error.project_catalog_migration_incomplete");
+}
+
+/// Fresh-v2 is EXEMPT, not refused.
+///
+/// The negative direction is the one that matters here: D-011 says a fresh-v2
+/// origin does not require a marker, so a refusal would make a correct store
+/// permanently unsweepable while protecting nothing, since it carries no
+/// rollback assets at all.
+#[test]
+fn a_fresh_v2_origin_is_exempt_from_the_marker_refusal() {
+    use bbox_indexing::project_catalog_store::{CatalogGcExclusionsV1, plan_catalog_gc_exclusions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let projects_path = root.join("projects.json");
+    drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+
+    let exclusions = plan_catalog_gc_exclusions(&projects_path, &root.join("index")).unwrap();
+    assert_eq!(exclusions, CatalogGcExclusionsV1::ExemptFreshOrigin);
+    assert!(!exclusions.protects(&root.join("index")));
+}
+
+/// A store that is not a version-2 catalog carries none of these roots, so it
+/// is exempt rather than refused: section 10.2 is a catalog-mode contract.
+#[test]
+fn a_non_catalog_store_is_exempt_from_the_marker_refusal() {
+    use bbox_indexing::project_catalog_store::{CatalogGcExclusionsV1, plan_catalog_gc_exclusions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let exclusions =
+        plan_catalog_gc_exclusions(&root.join("projects.json"), &root.join("index")).unwrap();
+    assert_eq!(exclusions, CatalogGcExclusionsV1::ExemptNonCatalogStore);
+}
+
+/// The committed migration marker's path for a layout.
+fn marker_path(layout: &ProjectCatalogMigrationResolvedLayoutV1) -> PathBuf {
+    let projects_path = layout.projects_path();
+    projects_path
+        .parent()
+        .unwrap()
+        .join("project-catalog-migration.json")
+}
