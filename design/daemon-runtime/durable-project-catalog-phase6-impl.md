@@ -472,6 +472,61 @@ resolve, and neither status here is `Mapped`). This plan drops
 tombstone is unmandated new substrate, and deleting legacy rows during the cut
 is destructive discretion Phase 6 should refuse.
 
+**Owner-specific stamping mechanics (adjudication Q-E, ratified).** Eleven
+of the fourteen owners already carry `project_id: Option<String>`
+("stamped on write") and stamp through `serde_json::Value` so fields a
+newer binary wrote survive. The remaining three have ratified shapes:
+
+- **TranscriptEdge (Q-E1):** a typed top-level
+  `project_id: Option<String>` (serde default, skip-if-none) on
+  `bbox_edge_sidecar::Edge` - NOT a metadata key; project ownership is
+  authority, not incidental metadata. The physical rewrite is an atomic
+  whole-file JSONL replacement: transform the one matching row through
+  `Value`, stream the complete lane file to a unique sibling temporary
+  preserving every unrelated line and unknown field, fsync the
+  temporary, atomically replace, fsync the parent; never overwrite in
+  place, never append a superseding duplicate. BINDING: the source row
+  id hashes the original line, so capture and stamping share ONE stable
+  row-identity function derived from the complete JSON value WITH
+  `project_id` REMOVED (plus the existing subsource and occurrence
+  discriminators); the identity is unchanged before and after stamping,
+  or crash retry cannot find an already-stamped row. The rewrite runs
+  under the edge owner's writer/coordinator discipline or an equivalent
+  descriptor-confined source-identity recheck immediately before
+  replacement.
+- **Task (Q-E2):** `project_id: Option<String>` (serde default,
+  skip-if-none) on `PersistedTask` AND a corresponding field on
+  `TaskInner`, propagated end to end through load, runtime retention,
+  and `serialize_snapshot` - a persisted-only field would be erased by
+  the first daemon load-then-persist cycle. New tasks populate it only
+  from authoritative project identity already available to the dispatch
+  path, never by hashing or reconstructing `cwd`; otherwise it stays
+  `None`. Owned by the completion dispatch as a dedicated root-schema
+  commit. Task coverage becomes `Covered` only after: a stamped legacy
+  task survives load and subsequent persistence; unknown fields survive
+  the backfill mutation; a conflicting project id refuses; an unstamped
+  task remains backward-compatible; and new writes with known catalog
+  authority persist the stable id.
+- **Provenance (Q-E3):** stamping is IMPLEMENTED, not deferred -
+  deferral would leave legitimate migrated inventories unable to
+  produce a clean preflight. The same optional top-level `project_id`
+  goes on `GitProvenanceNote`; row identity derives the document
+  component of `source_row_id` from the note document with `project_id`
+  removed (commit, part/index, occurrence discrimination retained). The
+  transaction holds the repository-wide `blackbox-provenance.lock` but
+  does NOT use the append-only `write_note` (which would preserve the
+  unstamped document and append a duplicate): resolve and retain the
+  exact current notes-ref OID including absence; read and
+  bounded-decode the named note and exact row; `AlreadyStamped` for the
+  same project, refusal for a different one; rewrite only that document
+  preserving order and unrelated documents; build the replacement on a
+  unique temporary notes ref; CAS the real ref
+  (`git update-ref <ref> <new> <expected>`); reopen and verify the
+  published note; delete or recover the temporary ref. A crash before
+  the CAS leaves the authoritative ref unchanged; a crash after it
+  recovers as `AlreadyStamped`. Individual ref transitions are each
+  CAS-bound and never silently merge against a changed predecessor.
+
 The dual-read interaction (governing 7.3, `project_selector.rs:60`): during
 compatibility, path-keyed rows resolve through path-fallback (ledger first,
 catalog resolver second). After stamping, the catalog resolver becomes
@@ -793,6 +848,20 @@ Staleness is a SUFFIXED family in `project_catalog_inventory.rs`:
 `error.project_catalog_inventory_stale_report` (line 2104),
 `stale_post_image` (2919), `stale_plan_input` (3193),
 `stale_resolution` (3240). New commands conform.
+
+**Apply-time owner-row divergence is staleness, not artifact invalidity
+(adjudication Q-E4).** A durable-store row that was valid at preflight
+but is absent, or bound to a DIFFERENT project, when apply reaches the
+owner is current-state divergence and maps to
+`error.project_catalog_inventory_stale_post_image`, carrying the owner
+token, row id, and underlying diagnostic (`owner_row_absent`,
+`owner_row_project_id_conflict`) in the bounded message, with the
+stamping mutation disposition preserved so a refusal after earlier
+stamps truthfully reports partial mutation and remains retryable.
+`error.project_catalog_durable_backfill_resolution_invalid` remains
+scoped to artifacts semantically invalid against the predecessor they
+name (duplicate or impossible dispositions, a non-quarantined binding,
+an unsupported owner, malformed resolution bytes). No new code.
 
 ### 7.3. New codes
 
