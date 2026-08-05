@@ -25,7 +25,7 @@ use bbox_corpus_index::index::history_generations::{
 };
 
 use crate::index::history_materializer::{HistoryMaterializerRequestV1, prove_source_index};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -539,6 +539,129 @@ pub fn plan_path_free_rebuild(
         },
         inventory_hash,
         plan_hash,
+    })
+}
+
+/// The artifact-identity refusal, conforming to the shipped family
+/// (section 7.1).
+pub const ERROR_REBUILD_ARTIFACT_IDENTITY: &str =
+    "error.project_catalog_migration_artifact_identity";
+
+/// The reviewed artifacts an apply is authorized by, proved against the
+/// target's CURRENT state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedRebuildApplyV1 {
+    pub identity: RebuildArtifactIdentityV1,
+    pub report: PathFreeRebuildReportV1,
+    pub plan: PathFreeRebuildPlanV1,
+}
+
+/// Steps 1 and 2 of the apply contract: validate the explicit target and the
+/// exact artifact identity, and require Equality immediately before mutation.
+///
+/// RECAPTURES rather than trusting the report. The plan is re-derived against
+/// the target's CURRENT state and the four hashes must match the reviewed
+/// artifacts exactly. This is the cross-root guard section 3.1 relies on: a
+/// report captured against one root cannot authorize an apply against
+/// another, because the recaptured inventory hash will not match.
+///
+/// Apply NEVER replans (FD-10). A mismatch refuses for diagnosis; it does not
+/// substitute the fresh plan for the reviewed one. Section 6.2 makes recovery
+/// an operator loop: leave the service stopped, run a new preflight, review
+/// the new exact artifacts, invoke apply again. There is no retry here and no
+/// numeric cap, deliberately.
+///
+/// The Equality requirement is re-proved HERE, immediately before the caller
+/// mutates, not merely inherited from the report. The report proves what was
+/// true at review time; D-036 requires it to be true at mutation time.
+pub fn authorize_rebuild_apply(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+    target_selection: ProjectCatalogTargetSelectionV1,
+    report_path: &Path,
+    resolution_path: &Path,
+    scan_limits: HistoryScanLimitsV1,
+) -> PlanningResult<AuthorizedRebuildApplyV1> {
+    // Q-C binding conditions BEFORE the artifacts are read: an apply whose
+    // artifacts live inside the target it is about to mutate, or whose
+    // selection disagrees with the layout, is refused with nothing touched.
+    validate_target_selection(layout, target_selection)?;
+    validate_artifact_set(layout, report_path, resolution_path, None)?;
+
+    let report_bytes = read_artifact_required_v1(report_path, "report")?;
+    let resolution_bytes = read_artifact_required_v1(resolution_path, "resolution")?;
+    let report: PathFreeRebuildReportV1 =
+        serde_json::from_slice(&report_bytes).map_err(|error| {
+            refuse(
+                ERROR_REBUILD_ARTIFACT_IDENTITY,
+                format!("report artifact is not a strict v1 document: {error}"),
+            )
+        })?;
+    let resolution: PathFreeRebuildResolutionV1 = serde_json::from_slice(&resolution_bytes)
+        .map_err(|error| {
+            refuse(
+                ERROR_REBUILD_ARTIFACT_IDENTITY,
+                format!("resolution artifact is not a strict v1 document: {error}"),
+            )
+        })?;
+    if report.status != PathFreeRebuildStatusV1::Clean {
+        return Err(refuse(
+            ERROR_REBUILD_ARTIFACT_IDENTITY,
+            "rebuild report records a refused status and cannot authorize an apply",
+        ));
+    }
+    // Artifact-to-artifact binding, checked before the recapture so a
+    // mismatched PAIR is named as such rather than as staleness.
+    if report.resolution_artifact_hash != Sha256ValueV1::digest(&resolution_bytes) {
+        return Err(refuse(
+            ERROR_REBUILD_ARTIFACT_IDENTITY,
+            "report is bound to different resolution artifact bytes",
+        ));
+    }
+    if resolution.inventory_hash != report.inventory_hash {
+        return Err(refuse(
+            ERROR_REBUILD_ARTIFACT_IDENTITY,
+            "report and resolution are bound to different predecessor inventories",
+        ));
+    }
+
+    let plan = plan_path_free_rebuild(layout, scan_limits)?;
+    if plan.inventory_hash != report.inventory_hash {
+        return Err(refuse(
+            ERROR_REBUILD_ARTIFACT_IDENTITY,
+            "the recaptured predecessor does not match the reviewed report: the target \
+             advanced or the artifacts describe a different root, so this apply blocks \
+             for diagnosis rather than replanning",
+        ));
+    }
+    if plan.plan_hash != report.plan_hash {
+        return Err(refuse(
+            ERROR_REBUILD_ARTIFACT_IDENTITY,
+            "the recaptured plan does not match the reviewed report: the source index \
+             changed since review, so this apply blocks for diagnosis rather than \
+             replanning",
+        ));
+    }
+    // D-036 re-proved immediately before mutation, not inherited from review.
+    require_equality_proof(&plan.source_binding)?;
+
+    Ok(AuthorizedRebuildApplyV1 {
+        identity: RebuildArtifactIdentityV1 {
+            inventory_hash: plan.inventory_hash.clone(),
+            plan_hash: plan.plan_hash.clone(),
+            report_artifact_hash: Sha256ValueV1::digest(&report_bytes),
+            resolution_artifact_hash: Sha256ValueV1::digest(&resolution_bytes),
+        },
+        report,
+        plan,
+    })
+}
+
+fn read_artifact_required_v1(path: &Path, label: &'static str) -> PlanningResult<Vec<u8>> {
+    read_artifact_optional(path, MAX_PROJECT_CATALOG_REPORT_BYTES, label)?.ok_or_else(|| {
+        refuse(
+            ERROR_REBUILD_ARTIFACT_IDENTITY,
+            format!("{label} artifact is required for apply but is absent"),
+        )
     })
 }
 
@@ -1191,5 +1314,110 @@ mod tests {
         );
         // The directory must outlive the worker thread's borrow of its paths.
         drop(directory);
+    }
+
+    /// Apply must refuse artifacts that do not bind to each other, and it
+    /// must do so BEFORE recapturing, so a mismatched pair is reported as an
+    /// identity failure rather than as staleness.
+    #[test]
+    fn apply_refuses_artifacts_that_do_not_bind_to_each_other() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let layout = test_layout(&root);
+        let review = root.join("review");
+        fs::create_dir_all(&review).unwrap();
+        let report_path = review.join("report.json");
+        let resolution_path = review.join("resolution.json");
+
+        let inventory = rebuild_inventory_hash(&predecessor(7));
+        let plan = PathFreeRebuildPlanV1 {
+            predecessor: predecessor(7),
+            source_binding: equality_binding(),
+            catalog_transaction_id: None,
+            inventory_hash: inventory.clone(),
+            plan_hash: rebuild_plan_hash(&inventory, &equality_binding()),
+        };
+        let resolution = PathFreeRebuildResolutionV1::empty(inventory.clone());
+        let resolution_bytes = serde_json::to_vec(&resolution).unwrap();
+        let report = plan.report("2026-08-04T00:00:00Z".to_string(), &resolution_bytes);
+        fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+
+        // A resolution the report was never bound to.
+        let foreign = PathFreeRebuildResolutionV1::empty(hash(0xfe));
+        fs::write(&resolution_path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let refused = authorize_rebuild_apply(
+            &layout,
+            ProjectCatalogTargetSelectionV1::Configured,
+            &report_path,
+            &resolution_path,
+            HistoryScanLimitsV1::default(),
+        )
+        .expect_err("a report bound to different resolution bytes cannot authorize");
+        assert_eq!(refused.code, ERROR_REBUILD_ARTIFACT_IDENTITY);
+        assert!(
+            !root.join("live").join("projects.json").exists(),
+            "the refusal must land before anything opens or creates the target"
+        );
+
+        // A refused report cannot authorize even when the pair binds.
+        fs::write(&resolution_path, &resolution_bytes).unwrap();
+        let mut refused_report = report.clone();
+        refused_report.status = PathFreeRebuildStatusV1::Refused;
+        fs::write(&report_path, serde_json::to_vec(&refused_report).unwrap()).unwrap();
+        let refused = authorize_rebuild_apply(
+            &layout,
+            ProjectCatalogTargetSelectionV1::Configured,
+            &report_path,
+            &resolution_path,
+            HistoryScanLimitsV1::default(),
+        )
+        .expect_err("a refused report cannot authorize an apply");
+        assert_eq!(refused.code, ERROR_REBUILD_ARTIFACT_IDENTITY);
+    }
+
+    /// The cross-root guard (section 3.1): artifacts captured against one
+    /// root cannot authorize an apply against another, because the
+    /// recaptured predecessor will not match. Here the target has no
+    /// backfill journal at all, so the recapture cannot reproduce the
+    /// reviewed inventory.
+    #[test]
+    fn apply_refuses_when_the_recapture_cannot_reproduce_the_reviewed_predecessor() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let layout = test_layout(&root);
+        let projects_path = root.join("live").join("projects.json");
+        fs::create_dir_all(projects_path.parent().unwrap()).unwrap();
+        drop(ProjectCatalogStore::initialize_empty(&projects_path).unwrap());
+
+        let review = root.join("review");
+        fs::create_dir_all(&review).unwrap();
+        let report_path = review.join("report.json");
+        let resolution_path = review.join("resolution.json");
+
+        let inventory = rebuild_inventory_hash(&predecessor(7));
+        let plan = PathFreeRebuildPlanV1 {
+            predecessor: predecessor(7),
+            source_binding: equality_binding(),
+            catalog_transaction_id: None,
+            inventory_hash: inventory.clone(),
+            plan_hash: rebuild_plan_hash(&inventory, &equality_binding()),
+        };
+        let resolution_bytes =
+            serde_json::to_vec(&PathFreeRebuildResolutionV1::empty(inventory)).unwrap();
+        let report = plan.report("2026-08-04T00:00:00Z".to_string(), &resolution_bytes);
+        fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+        fs::write(&resolution_path, &resolution_bytes).unwrap();
+
+        let refused = authorize_rebuild_apply(
+            &layout,
+            ProjectCatalogTargetSelectionV1::Configured,
+            &report_path,
+            &resolution_path,
+            HistoryScanLimitsV1::default(),
+        )
+        .expect_err("artifacts from another root must not authorize this one");
+        // The recapture refuses on its own predecessor binding before any
+        // identity comparison, which is the same block-for-diagnosis outcome.
+        assert_eq!(refused.code, ERROR_REBUILD_STALE_PREDECESSOR);
     }
 }
