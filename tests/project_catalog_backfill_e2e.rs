@@ -658,6 +658,9 @@ enum Owner {
 /// resolves, mapped to a project the catalog really contains.
 struct Fixture {
     _dir: tempfile::TempDir,
+    /// The canonicalized fixture root. Retained so a bootsmoke can point the
+    /// real CLI at this fixture's config instead of the host's.
+    root: PathBuf,
     layout: ProjectCatalogMigrationResolvedLayoutV1,
     /// Artifact paths live OUTSIDE the rehearsal root: inside it, the Q-C
     /// artifact-confinement condition refuses them.
@@ -786,6 +789,7 @@ impl Fixture {
             note_path: owners.note_store_path.clone(),
             project: project_for_fixture,
             _dir: dir,
+            root,
             layout,
             artifacts,
         }
@@ -2869,5 +2873,242 @@ fn the_forced_replacement_refuses_a_stale_predecessor_marker() {
         REBUILD_OWNED_NAMESPACE,
         3,
         "a refused force leaves the source untouched",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D4: bootsmokes (P6-C task 3, the D-030 pattern)
+// ---------------------------------------------------------------------------
+//
+// D-030's shape is: a facade-driving test PRODUCES a real catalog-mode root,
+// and the CLI the operator will actually run VERIFIES it. The value is in the
+// seam. A facade test proves the engine; only the CLI proves that the envelope,
+// the layout resolution, and the target flags reach that engine at all, and
+// those are exactly the parts a parser test cannot reach and a live smoke finds
+// at the worst possible moment.
+
+/// Run the real `blackbox` binary against one fixture's config.
+///
+/// The env is scrubbed for the same reason `project_catalog_cli` scrubs it: an
+/// inherited `BLACKBOX_STATE_DIR` or index path would point the command at the
+/// HOST's real state, and the command would then succeed or fail for reasons
+/// having nothing to do with this fixture.
+fn run_cli_against(fixture: &Fixture, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_blackbox"));
+    command
+        .args(args)
+        .env_remove("BLACKBOX_STATE_DIR")
+        .env_remove("BLACKBOX_VECTORS_PATH")
+        .env_remove("TRANSCRIPT_SEARCH_INDEX_PATH")
+        .env("BLACKBOX_CONFIG", fixture.root.join("config.toml"));
+    command.output().unwrap()
+}
+
+/// The CLI verifies the smoke root both new verbs produced.
+///
+/// One root, both verbs, in the order the cut runs them: the backfill's
+/// completion journal is the rebuild's predecessor binding, so verifying them
+/// against the same root is the only way to catch an envelope that resolved a
+/// different layout for the second command than the first.
+#[test]
+fn the_cli_verifies_the_smoke_root_for_both_new_verbs() {
+    use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+    use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
+    use blackbox::project_catalog_rebuild_admin::PathFreeRebuildApplyRequestV1;
+
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let (report_path, resolution_path) = fixture.rebuild_artifacts();
+    watchdogged("producing the P6 smoke root", {
+        let handle = fixture.clone();
+        move || {
+            blackbox::project_catalog_rebuild_admin::preflight(PathFreeRebuildPreflightRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path: report_path.clone(),
+                resolution_path: resolution_path.clone(),
+                scan_limits: HistoryScanLimitsV1::default(),
+                generated_at: "2026-08-05T00:00:04Z".to_string(),
+            })
+            .unwrap();
+            blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+            })
+            .unwrap()
+        }
+    });
+
+    let rehearsal_root = fixture.fixture.root.join("rehearsal");
+    let rehearsal_root = rehearsal_root.to_str().unwrap();
+    for verb in ["durable-backfill", "path-free-rebuild"] {
+        let output = run_cli_against(
+            &fixture.fixture,
+            &[
+                "project-catalog",
+                verb,
+                "--verify",
+                "--rehearsal-root",
+                rehearsal_root,
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "the CLI must verify the smoke root for {verb}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// A fresh-v2 root boots with NO manifest anywhere, through a restart-shaped
+/// reopen and the pre-bind gate (D-011, D-030).
+///
+/// The negative direction is the whole assertion. A gate that fired here would
+/// make a correct, never-migrated store permanently unbootable, and a fresh
+/// store has no legacy commit documents and no rollback assets to verify. The
+/// reopen is included because a gate is only half the boot path: an open that
+/// tried to replace this index would be just as fatal as a gate that refused it.
+#[test]
+fn a_fresh_v2_root_boots_twice_without_a_manifest() {
+    use bbox_indexing::index::schema_rebuild::recover_rebuild_manifest_before_open;
+    use blackbox::project_catalog_rebuild_admin::RebuildStartupGateV1;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let index_root = root.join("index");
+    let projects_path = root.join("projects.json");
+    let store = ProjectCatalogStore::initialize_empty(&projects_path).unwrap();
+
+    for pass in 0..2 {
+        let resume = recover_rebuild_manifest_before_open(&index_root).unwrap();
+        let intent =
+            blackbox::project_catalog_rebuild_admin::replacement_intent_for(&resume, false);
+        let index = TranscriptIndex::open_or_create_at_replacement_boundary(
+            &index_root,
+            Vec::new(),
+            None,
+            projects_path.clone(),
+            root.join("code-sources"),
+            root.join("blackbox-knowledge.json"),
+            root.join("blackbox-threads.json"),
+            root.join("blackbox-roadmap.json"),
+            Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
+            None,
+            intent,
+        )
+        .unwrap_or_else(|error| panic!("pass {pass}: a fresh-v2 root must open: {error:#}"));
+        // No guard is injected above, so a replacement attempt would have
+        // refused outright. Reaching here already proves none was attempted;
+        // this pins WHY rather than leaving it to the absent guard.
+        assert!(!index.schema_was_reset(), "pass {pass}");
+        assert!(!index.schema_marker_withheld(), "pass {pass}");
+        drop(index);
+
+        let coverage =
+            blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+                &store,
+                &index_root,
+            )
+            .unwrap_or_else(|error| panic!("pass {pass}: a fresh-v2 origin is exempt: {error:?}"));
+        assert_eq!(
+            coverage,
+            RebuildStartupGateV1::ExemptFreshOrigin,
+            "pass {pass}"
+        );
+        assert!(
+            !rebuild_manifest_path(&index_root).exists(),
+            "pass {pass}: no manifest is written by a fresh-v2 boot"
+        );
+    }
+}
+
+/// A post-cut live history refresh advances `Ready` with NO manifest write, and
+/// the daemon RESTARTS over it (P6-C task 3, P3-F item 3).
+///
+/// This is the tier that decides whether ordinary post-cut traffic can brick a
+/// daemon. The refresh writes no manifest deliberately, so a restart that
+/// demanded one, or that read the marker-and-manifest state as an interrupted
+/// replacement, would refuse to boot a store that is entirely correct.
+#[test]
+fn a_post_cut_live_refresh_survives_a_restart() {
+    use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
+    use bbox_indexing::project_catalog_rebuild::read_committed_rebuild_manifest;
+    use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
+    use blackbox::project_catalog_rebuild_admin::{
+        CatalogSchemaReplacementDriveV1, PathFreeRebuildApplyRequestV1, RebuildStartupGateV1,
+    };
+
+    let fixture = Arc::new(RebuildFixture::at_current_schema());
+    let index_root = fixture.index_root();
+    let (report_path, resolution_path) = fixture.rebuild_artifacts();
+    watchdogged("the cut", {
+        let handle = fixture.clone();
+        move || {
+            blackbox::project_catalog_rebuild_admin::preflight(PathFreeRebuildPreflightRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path: report_path.clone(),
+                resolution_path: resolution_path.clone(),
+                scan_limits: HistoryScanLimitsV1::default(),
+                generated_at: "2026-08-05T00:00:05Z".to_string(),
+            })
+            .unwrap();
+            blackbox::project_catalog_rebuild_admin::apply(PathFreeRebuildApplyRequestV1 {
+                layout: handle.fixture.layout.clone(),
+                target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+                report_path,
+                resolution_path,
+                scan_limits: HistoryScanLimitsV1::default(),
+            })
+            .unwrap()
+        }
+    });
+    let manifest_before = read_committed_rebuild_manifest(&index_root).unwrap();
+    let manifest_bytes_before = fs::read(rebuild_manifest_path(&index_root)).unwrap();
+
+    let refreshed = advance_one_history_record_to_a_fresh_generation(&fixture);
+
+    // THE RESTART. Same composition daemon startup runs, over a store whose
+    // epoch moved after the cut.
+    let (resume, drive) = watchdogged("the post-refresh restart", {
+        let handle = fixture.clone();
+        move || handle.drive_as_daemon_open()
+    });
+    assert_eq!(
+        resume,
+        SchemaRebuildResume::AlreadyCommitted,
+        "the committed cut manifest is observed, not re-prepared"
+    );
+    assert_eq!(
+        drive,
+        CatalogSchemaReplacementDriveV1::NotRequired,
+        "a post-cut restart drives nothing: the marker is published and the index is intact"
+    );
+    assert_eq!(
+        fs::read(rebuild_manifest_path(&index_root)).unwrap(),
+        manifest_bytes_before,
+        "the live refresh and the restart both left the cut-time manifest byte-identical"
+    );
+
+    let coverage = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+        &fixture.store(),
+        &index_root,
+    )
+    .expect("a restarted post-cut store binds");
+    let RebuildStartupGateV1::Verified {
+        rebuild_id,
+        live_refresh_generations,
+        ..
+    } = coverage
+    else {
+        panic!("expected the gate to run in full: {coverage:?}");
+    };
+    assert_eq!(rebuild_id, manifest_before.rebuild_id);
+    assert_eq!(
+        live_refresh_generations, 1,
+        "generation {refreshed} is verified through the record, which the manifest never named"
     );
 }
