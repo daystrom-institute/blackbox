@@ -26,6 +26,7 @@
 //! evidence to save duplication. `tests/` is never scanned, so this copy costs
 //! visible, inert lines instead. The trade was ruled deliberately.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -53,7 +54,8 @@ use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
 use bbox_indexing::project_catalog_backfill::{
     DurableBackfillApplyOutcomeV1, DurableBackfillApplyRequestV1,
-    DurableBackfillPreflightRequestV1, DurableBackfillStatusV1, DurableBackfillVerifyRequestV1,
+    DurableBackfillPreflightRequestV1, DurableBackfillStatusV1, DurableBackfillVerifyReceiptV1,
+    DurableBackfillVerifyRequestV1, LegacyRowObservationV1, LegacyRowOwnerReaderV1,
     LegacyRowStampCoverageV1, LegacyRowStampOutcomeV1, LegacyRowStamperV1,
     ProjectCatalogDurableBackfillFacadeV1,
 };
@@ -72,7 +74,7 @@ use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 use bbox_indexing::publisher::PublisherRefStore;
 use bbox_vectors::VectorStore;
 use blackbox::project_catalog_stamper::{
-    ProjectCatalogOwnerRowStamperV1, ProjectCatalogStamperPathsV1,
+    ProjectCatalogOwnerRowReaderV1, ProjectCatalogOwnerRowStamperV1, ProjectCatalogStamperPathsV1,
 };
 use sha2::{Digest, Sha256};
 
@@ -634,14 +636,25 @@ fn migrated_rehearsal_root(
     (rehearsal, config)
 }
 
-fn write_owner(path: &Path, array_field: &str, row_id: &str) {
+/// Write one owner store holding a single row that is VALID for that owner's
+/// typed schema.
+///
+/// Validity is load-bearing rather than tidiness. An owner store is loaded and
+/// re-persisted by ordinary daemon and rebuild paths, and a row that fails its
+/// typed decode does not survive that round trip: the store loads empty and the
+/// next save drops the row. A stub row therefore produces a root whose ledger
+/// binds an owner row that quietly stopped existing, which is exactly the
+/// inconsistency the durable owner verifier now refuses. Fixtures that mean to
+/// represent a coherent migrated root must be coherent under a reload.
+fn write_owner(path: &Path, array_field: &str, row: serde_json::Value) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         path,
-        format!(
-            r#"{{"version": 1, "{array_field}": [{{"id": "{row_id}", "project": "/legacy/one"}}]}}
-"#
-        ),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            array_field: [row],
+        }))
+        .unwrap(),
     )
     .unwrap();
 }
@@ -718,14 +731,54 @@ impl Fixture {
 
         // Two DIFFERENT owner stores, so the run proves cross-store dispatch
         // rather than one store exercised twice.
-        write_owner(&owners.knowledge_store_path, "entries", "kb1");
-        write_owner(&owners.thread_store_path, "threads", "th1");
+        write_owner(
+            &owners.knowledge_store_path,
+            "entries",
+            serde_json::json!({
+                "id": "kb1",
+                "title": "fixture entry",
+                "content": "fixture content",
+                "category": "convention",
+                "scope": "project",
+                "project": "/legacy/one",
+                "priority": "standard",
+                "status": "active",
+                "approval": "user_confirmed",
+                "source": "fixture",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }),
+        );
+        write_owner(
+            &owners.thread_store_path,
+            "threads",
+            serde_json::json!({
+                "id": "th1",
+                "topic": "fixture thread",
+                "project": "/legacy/one",
+                "status": "open",
+                "sessions": [],
+                "created_at": "2026-01-01T00:00:00Z",
+                "last_activity": "2026-01-01T00:00:00Z",
+            }),
+        );
         // A third row behind a QUARANTINED binding. Converting it is what makes
         // apply mutate the catalog pair, which is the precondition for the
         // section 3.3 recovery sequencing: stamping alone writes owner stores
         // and leaves the pair (and so the four-hash identity) untouched, so a
         // conversion-free re-apply is merely idempotent rather than stale.
-        write_owner(&owners.note_store_path, "notes", "nt1");
+        write_owner(
+            &owners.note_store_path,
+            "notes",
+            serde_json::json!({
+                "id": "nt1",
+                "kind": "learned",
+                "body": "fixture note",
+                "project": "/legacy/one",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }),
+        );
 
         let projects_path = layout.projects_path().to_path_buf();
         let store = ProjectCatalogStore::open_existing(&projects_path).unwrap();
@@ -818,6 +871,41 @@ impl Fixture {
             )
             .unwrap(),
         )
+    }
+
+    /// The production owner-row READER over the same owner paths the stamper
+    /// writes, so a verify proves the rows this fixture's apply really touched.
+    fn production_owner_reader(&self) -> Arc<ProjectCatalogOwnerRowReaderV1> {
+        let owners = self.layout.stamper_owner_paths();
+        Arc::new(
+            ProjectCatalogOwnerRowReaderV1::new(
+                ProjectCatalogStamperPathsV1 {
+                    knowledge_store_path: owners.knowledge_store_path,
+                    gap_store_path: owners.gap_store_path,
+                    thread_store_path: owners.thread_store_path,
+                    note_store_path: owners.note_store_path,
+                    pin_store_path: owners.pin_store_path,
+                    roadmap_store_path: owners.roadmap_store_path,
+                    packet_root: owners.packet_root,
+                    proposal_root: owners.proposal_root,
+                    slack_store_root: owners.slack_store_root,
+                    whiteboard_root: owners.whiteboard_root,
+                    artifact_root: owners.artifact_root,
+                    transcript_edge_root: owners.transcript_edge_root,
+                    task_store_path: owners.task_store_path,
+                },
+                Default::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn verify(&self) -> Result<DurableBackfillVerifyReceiptV1, ProjectCatalogMigrationError> {
+        ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
+            layout: self.layout.clone(),
+            target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+            owner_reader: self.production_owner_reader(),
+        })
     }
 
     fn report_path(&self) -> PathBuf {
@@ -953,11 +1041,7 @@ fn the_production_stamper_backfills_two_stores_end_to_end() {
         Some(stamped.as_str())
     );
 
-    let verify = ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
-        layout: fixture.layout.clone(),
-        target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
-    })
-    .unwrap();
+    let verify = fixture.verify().unwrap();
     assert_eq!(verify.journal_stamp_total, 2);
     assert_eq!(verify.observed_mappable_total, 2);
 }
@@ -1073,6 +1157,219 @@ fn a_torn_stamping_pass_refuses_a_stale_reapply_then_completes_after_fresh_prefl
     }
 }
 
+/// A stamper that reports every row STAMPED and writes nothing.
+///
+/// This is the shape F2 exists for: apply succeeds, the completion journal
+/// records a full stamp set, and not one durable owner row has moved. A verify
+/// that compares the journal against the catalog ledger cannot tell the
+/// difference, because both records agree with each other and neither is the
+/// owner store.
+struct NoOpStamper {
+    inner: Arc<dyn LegacyRowStamperV1>,
+}
+
+impl LegacyRowStamperV1 for NoOpStamper {
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+        self.inner.coverage(store_kind)
+    }
+
+    fn stamp(
+        &self,
+        _store_kind: LegacyPathStoreKindV1,
+        _source_row_id: &str,
+        _project_id: &ProjectId,
+    ) -> Result<LegacyRowStampOutcomeV1, ProjectCatalogMigrationError> {
+        Ok(LegacyRowStampOutcomeV1::Stamped)
+    }
+}
+
+/// A reader that claims one owner has no durable read-back.
+struct UncoveredReader {
+    inner: Arc<dyn LegacyRowOwnerReaderV1>,
+    uncovered: LegacyPathStoreKindV1,
+}
+
+impl LegacyRowOwnerReaderV1 for UncoveredReader {
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+        if store_kind == self.uncovered {
+            LegacyRowStampCoverageV1::NotImplemented
+        } else {
+            self.inner.coverage(store_kind)
+        }
+    }
+
+    fn observe(
+        &self,
+        store_kind: LegacyPathStoreKindV1,
+        source_row_ids: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
+        self.inner.observe(store_kind, source_row_ids)
+    }
+}
+
+/// Rewrite one owner store's first row through `edit`.
+fn edit_owner_row(path: &Path, array_field: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut document: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    edit(&mut document[array_field][0]);
+    fs::write(path, serde_json::to_vec(&document).unwrap()).unwrap();
+}
+
+/// A NO-OP stamper produces a backfill that applies and then FAILS to verify.
+///
+/// Verify previously compared the journal's stamp counts against the catalog
+/// ledger's mappable counts and never opened an owner store, so this exact
+/// apply verified perfectly while every owner row was still unstamped.
+#[test]
+fn a_no_op_stamper_applies_but_cannot_verify() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture
+            .apply(Arc::new(NoOpStamper {
+                inner: fixture.production_stamper()
+            }))
+            .unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied,
+        "a stamper that reports success is believed by apply, which is why \
+         verify has to read the owners"
+    );
+    assert_eq!(
+        fixture.stamped(Owner::Knowledge),
+        None,
+        "the fixture must genuinely have unstamped rows for this to mean anything"
+    );
+
+    let error = fixture
+        .verify()
+        .expect_err("an unstamped owner row cannot verify");
+    assert_eq!(
+        error.code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+}
+
+/// The durable rows must EXIST and must carry the EXACT project id the ledger
+/// binds them to. Both directions of the counterexample, plus the owner whose
+/// read-back is missing entirely.
+#[test]
+fn verify_fails_on_missing_conflicting_or_unverifiable_owner_rows() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    fixture.verify().expect("the applied backfill verifies");
+
+    // CONFLICTING: the row is stamped, but with another project.
+    let stamped = fixture.stamped(Owner::Knowledge).unwrap();
+    let mut elsewhere = stamped.clone();
+    elsewhere.pop();
+    elsewhere.push(if stamped.ends_with('a') { 'b' } else { 'a' });
+    assert_ne!(elsewhere, stamped);
+    edit_owner_row(&fixture.knowledge_path, "entries", |row| {
+        row["project_id"] = serde_json::Value::String(elsewhere.clone());
+    });
+    assert_eq!(
+        fixture
+            .verify()
+            .expect_err("a row bound to another project cannot verify")
+            .code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+
+    // UNSTAMPED: the stamp was reverted after apply.
+    edit_owner_row(&fixture.knowledge_path, "entries", |row| {
+        row.as_object_mut().unwrap().remove("project_id");
+    });
+    assert_eq!(
+        fixture
+            .verify()
+            .expect_err("an unstamped row cannot verify")
+            .code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+
+    // MISSING: the row the mapped binding names is gone.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.knowledge_path).unwrap()).unwrap();
+    document["entries"] = serde_json::json!([]);
+    fs::write(
+        &fixture.knowledge_path,
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture
+            .verify()
+            .expect_err("an absent row cannot verify")
+            .code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+
+    // UNVERIFIABLE: an owner carrying mapped bindings whose read-back does not
+    // exist is refused by name, never passed over in silence.
+    let error = ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
+        layout: fixture.layout.clone(),
+        target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+        owner_reader: Arc::new(UncoveredReader {
+            inner: fixture.production_owner_reader(),
+            uncovered: LegacyPathStoreKindV1::Knowledge,
+        }),
+    })
+    .expect_err("an owner with no read-back cannot be verified");
+    assert!(
+        error.message.contains("knowledge"),
+        "the refusal must name the owner: {}",
+        error.message
+    );
+}
+
+/// The journal's COMPLETE per-store classification is checked, not just its
+/// stamp total: a journal that misreports its mappable count for one store
+/// fails even though the total still adds up against the ledger.
+#[test]
+fn verify_fails_when_the_journal_misreports_one_stores_classification() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    fixture.verify().expect("the applied backfill verifies");
+
+    let journal_path = fixture
+        .layout
+        .projects_path()
+        .parent()
+        .unwrap()
+        .join("backfill-completion.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    // Claim one more mappable row than the ledger holds, while leaving the
+    // stamped count that the old check compared exactly as it was.
+    let counts = &mut journal["stamp_counts"]["knowledge"];
+    counts["mappable"] = serde_json::json!(counts["mappable"].as_u64().unwrap() + 1);
+    fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+    assert_eq!(
+        fixture
+            .verify()
+            .expect_err("a journal that misreports a store cannot verify")
+            .code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+}
+
 /// The accepted-publication pointer root under a fixture's layout.
 ///
 /// Rebuilt from the projects path the same way `AcceptedPublicationStorePaths`
@@ -1161,19 +1458,15 @@ fn a_publication_that_moves_after_apply_refuses_the_verify() {
         fixture.apply(fixture.production_stamper()).unwrap(),
         DurableBackfillApplyOutcomeV1::Applied
     );
-    ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
-        layout: fixture.layout.clone(),
-        target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
-    })
-    .expect("a freshly applied backfill verifies");
+    fixture
+        .verify()
+        .expect("a freshly applied backfill verifies");
 
     move_the_accepted_publication_state(&fixture);
 
-    let error = ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
-        layout: fixture.layout.clone(),
-        target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
-    })
-    .expect_err("a moved publication state must refuse the verify");
+    let error = fixture
+        .verify()
+        .expect_err("a moved publication state must refuse the verify");
     assert_eq!(
         error.code,
         "error.project_catalog_inventory_stale_post_image"
@@ -1468,22 +1761,15 @@ impl RebuildFixture {
         fixture.preflight(stamper.clone()).unwrap();
         fixture.apply(stamper).unwrap();
 
-        // Restore the knowledge and thread stores to their valid EMPTY form.
-        //
-        // The backfill fixture writes deliberately minimal owner rows: enough
-        // for the stamper to find and stamp, and no more. The rebuild's drive
-        // runs the real full reindex pass, which parses those stores properly
-        // and rejects a row missing required fields. The stamping is already
-        // proven by the backfill tests above and is not this chain's subject,
-        // so the rows are retired here rather than being grown into full
-        // documents that would make the backfill fixture harder to read for a
-        // property it does not test.
-        let owners = fixture.layout.stamper_owner_paths();
-        write(
-            &owners.knowledge_store_path,
-            br#"{"version":1,"entries":[]}"#,
-        );
-        write(&owners.thread_store_path, br#"{"version":1,"threads":[]}"#);
+        // The stamped owner rows are KEPT, and that is the point of writing
+        // schema-valid fixture rows. An earlier revision emptied the knowledge
+        // and thread stores here, because the minimal stub rows the fixture
+        // then wrote could not survive the rebuild's real reindex pass. That
+        // retirement left a root whose ledger bound owner rows that no longer
+        // existed - invisible while verify only compared the journal against
+        // the ledger, and refused the moment verify started reading the owners.
+        // The rows are full documents now, so the reindex parses them and the
+        // smoke root stays coherent across BOTH verbs.
 
         if stamp_outgoing_marker {
             write(

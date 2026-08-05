@@ -378,6 +378,39 @@ pub fn stamp_project_catalog_owner_row(
     )
 }
 
+/// Read one packet row's stable project id, the VERIFY half of
+/// [`stamp_project_catalog_owner_row`]. Locates the record exactly as the
+/// stamper does, so the two agree on row identity by construction.
+pub fn read_project_catalog_owner_row(
+    packets_dir: &Path,
+    source_row_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::read_json_tree_row_project_id;
+
+    read_json_tree_row_project_id(
+        packets_dir,
+        "packet",
+        limits,
+        |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        },
+        |_subsource_id, document| {
+            document
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        },
+        source_row_id,
+    )
+}
+
 /// Remove packet files owned by one project through the packet codec.
 /// Missing stores are empty and malformed files refuse retirement.
 pub fn discharge_project_catalog_rows(

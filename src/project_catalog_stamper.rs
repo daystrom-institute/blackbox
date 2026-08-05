@@ -10,22 +10,30 @@
 //! LegacyRowStamperV1>` seam exists precisely so the implementation can sit
 //! here while the contract stays in the indexing crate.
 //!
-//! The read half (`capture_project_catalog_owner_snapshot`, fanned out by
-//! `bbox-indexing`'s inventory adapters) and this write half must agree on the
-//! stable row ids the backfill ledger keys on. They are separated by the
-//! dependency direction, not by choice, so that agreement is a maintenance
-//! obligation: change one owner's row identity and you must change both.
+//! The owner contract has THREE faces, and all three must agree on the stable
+//! row ids the backfill ledger keys on: the capture half
+//! (`capture_project_catalog_owner_snapshot`, fanned out by `bbox-indexing`'s
+//! inventory adapters), the write half here, and the read half here
+//! ([`ProjectCatalogOwnerRowReaderV1`], which backfill verify proves the
+//! durable stamps through). The reader lives beside the stamper for the same
+//! placement reason and shares its owner-path type and its single coverage
+//! verdict; it is a SEPARATE trait so that a verify cannot write. They are
+//! separated from capture by the dependency direction, not by choice, so that
+//! agreement is a maintenance obligation: change one owner's row identity and
+//! you must change all three.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_core::project_catalog_snapshot::{
-    OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MOVED, OwnerRowStampError,
-    OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
+    OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MOVED, OwnerRowProjectIdV1,
+    OwnerRowStampError, OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
 };
 use bbox_indexing::project_catalog_backfill::{
-    ERROR_RESOLUTION_INVALID, ERROR_STALE_POST_IMAGE, LegacyRowStampCoverageV1,
-    LegacyRowStampOutcomeV1, LegacyRowStamperV1, legacy_store_token,
+    ERROR_RESOLUTION_INVALID, ERROR_STALE_POST_IMAGE, LegacyRowObservationV1,
+    LegacyRowOwnerReaderV1, LegacyRowStampCoverageV1, LegacyRowStampOutcomeV1, LegacyRowStamperV1,
+    legacy_store_token,
 };
 use bbox_indexing::project_catalog_inventory::LegacyPathStoreKindV1;
 use bbox_indexing::project_catalog_migration::ProjectCatalogMigrationError;
@@ -202,12 +210,18 @@ fn stamp_refusal(detail: impl Into<String>) -> ProjectCatalogMigrationError {
     )
 }
 
-impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
+impl ProjectCatalogOwnerRowStamperV1 {
     /// Exhaustive by construction. The single `match` over all 14 variants is
     /// the point: a store added to `LegacyPathStoreKindV1` breaks this build
     /// until someone answers for it, which a registry of optional per-store
     /// stampers could never enforce.
-    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+    ///
+    /// An associated function rather than a method because the READ side
+    /// answers with it too. One owner has one verdict: an owner whose
+    /// write-back landed has a read-back, and provenance is exempt on both
+    /// sides for a single reason. Two independent matches could drift into
+    /// claiming an owner is writable but not verifiable.
+    pub(crate) fn coverage_verdict(store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
         match store_kind {
             LegacyPathStoreKindV1::Knowledge
             | LegacyPathStoreKindV1::Gap
@@ -236,6 +250,12 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
             // capture association, which rewriting Git notes cannot repair.
             LegacyPathStoreKindV1::Provenance => LegacyRowStampCoverageV1::ExemptByConstruction,
         }
+    }
+}
+
+impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+        Self::coverage_verdict(store_kind)
     }
 
     fn stamp(
@@ -432,6 +452,287 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                 "{} has no durable write-back",
                 legacy_store_token(store_kind)
             ))),
+        }
+    }
+}
+
+/// The one production [`LegacyRowOwnerReaderV1`]: the backfill verify's proof
+/// that the durable owner rows really carry the ids the ledger binds them to.
+///
+/// It sits beside the stamper, shares its path type, and dispatches through the
+/// same fourteen-arm match, because the three halves of the owner contract -
+/// capture, stamp, and read - must agree on ONE row identity. Separated from
+/// the stamper as a distinct trait rather than added to it so that a verify
+/// cannot write: the type system, not a convention, is what stops a verifier
+/// from proving its own work.
+pub struct ProjectCatalogOwnerRowReaderV1 {
+    paths: ProjectCatalogStamperPathsV1,
+    limits: OwnerSnapshotLimitsV1,
+}
+
+impl ProjectCatalogOwnerRowReaderV1 {
+    pub fn new(
+        paths: ProjectCatalogStamperPathsV1,
+        limits: OwnerSnapshotLimitsV1,
+    ) -> Result<Self, ProjectCatalogMigrationError> {
+        for path in [
+            &paths.knowledge_store_path,
+            &paths.gap_store_path,
+            &paths.thread_store_path,
+            &paths.note_store_path,
+            &paths.pin_store_path,
+            &paths.roadmap_store_path,
+            &paths.packet_root,
+            &paths.proposal_root,
+            &paths.slack_store_root,
+            &paths.whiteboard_root,
+            &paths.artifact_root,
+            &paths.transcript_edge_root,
+            &paths.task_store_path,
+        ] {
+            validate_owner_path(path)?;
+        }
+        Ok(Self { paths, limits })
+    }
+
+    /// Re-prove the path is safe, then read. Same discipline as the write side,
+    /// for the same reason: the proof belongs immediately before the access.
+    fn read_owner_path(
+        &self,
+        store_kind: LegacyPathStoreKindV1,
+        source_row_id: &str,
+        path: &Path,
+        read: impl FnOnce(&Path) -> std::result::Result<OwnerRowProjectIdV1, OwnerRowStampError>,
+    ) -> Result<LegacyRowObservationV1, ProjectCatalogMigrationError> {
+        validate_owner_path(path)?;
+        map_read_outcome(store_kind, source_row_id, read(path))
+    }
+}
+
+/// Translate an owner-crate read result into the backfill's vocabulary.
+///
+/// An ABSENT row is an observation, not a refusal: verify's job is to REPORT
+/// that a mapped binding names a row the owner no longer holds, and it names
+/// the store and the row while doing so. Every other failure - an undecodable
+/// source, a corrupt row, an unsafe path - is a refusal, because a verifier
+/// that could not read a store must never answer "not stamped".
+fn map_read_outcome(
+    store_kind: LegacyPathStoreKindV1,
+    source_row_id: &str,
+    outcome: std::result::Result<OwnerRowProjectIdV1, OwnerRowStampError>,
+) -> Result<LegacyRowObservationV1, ProjectCatalogMigrationError> {
+    match outcome {
+        Ok(OwnerRowProjectIdV1::Stamped(project_id)) => ProjectId::parse(project_id)
+            .map(LegacyRowObservationV1::StampedWith)
+            .map_err(|_| {
+                ProjectCatalogMigrationError::no_mutation(
+                    ERROR_STALE_POST_IMAGE,
+                    format!(
+                        "legacy row read refused: store {} row {source_row_id}: the row \
+                         carries a malformed project id",
+                        legacy_store_token(store_kind)
+                    ),
+                )
+            }),
+        Ok(OwnerRowProjectIdV1::Unstamped) => Ok(LegacyRowObservationV1::Unstamped),
+        Err(error) if error.code == OWNER_ROW_ABSENT => Ok(LegacyRowObservationV1::Absent),
+        Err(error) => Err(ProjectCatalogMigrationError::no_mutation(
+            ERROR_STALE_POST_IMAGE,
+            format!(
+                "legacy row read refused: store {} row {source_row_id}: {}",
+                legacy_store_token(store_kind),
+                error.code
+            ),
+        )),
+    }
+}
+
+impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
+    /// The SAME verdicts the stamper gives, delegated rather than restated: an
+    /// owner whose write-back exists has a read-back too, and provenance is
+    /// exempt on both sides for one reason.
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+        ProjectCatalogOwnerRowStamperV1::coverage_verdict(store_kind)
+    }
+
+    fn observe(
+        &self,
+        store_kind: LegacyPathStoreKindV1,
+        source_row_ids: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
+        let mut observations = BTreeMap::new();
+        for source_row_id in source_row_ids {
+            observations.insert(
+                source_row_id.clone(),
+                self.observe_one(store_kind, source_row_id)?,
+            );
+        }
+        Ok(observations)
+    }
+}
+
+impl ProjectCatalogOwnerRowReaderV1 {
+    fn observe_one(
+        &self,
+        store_kind: LegacyPathStoreKindV1,
+        source_row_id: &str,
+    ) -> Result<LegacyRowObservationV1, ProjectCatalogMigrationError> {
+        let limits = self.limits;
+        match store_kind {
+            LegacyPathStoreKindV1::Knowledge => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.knowledge_store_path,
+                |path| {
+                    bbox_knowledge::knowledge::read_project_catalog_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            LegacyPathStoreKindV1::Gap => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.gap_store_path,
+                |path| bbox_gaps::gaps::read_project_catalog_owner_row(path, source_row_id, limits),
+            ),
+            LegacyPathStoreKindV1::Thread => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.thread_store_path,
+                |path| {
+                    bbox_threads::threads::read_project_catalog_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            LegacyPathStoreKindV1::Note => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.note_store_path,
+                |path| {
+                    bbox_threads::notes::read_project_catalog_owner_row(path, source_row_id, limits)
+                },
+            ),
+            LegacyPathStoreKindV1::Pin => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.pin_store_path,
+                |path| {
+                    bbox_stores::pins::read_project_catalog_owner_row(path, source_row_id, limits)
+                },
+            ),
+            LegacyPathStoreKindV1::Roadmap => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.roadmap_store_path,
+                |path| {
+                    bbox_stores::roadmap::read_project_catalog_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            LegacyPathStoreKindV1::Packet => {
+                self.read_owner_path(store_kind, source_row_id, &self.paths.packet_root, |path| {
+                    bbox_packets::read_project_catalog_owner_row(path, source_row_id, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Proposal => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.proposal_root,
+                |path| {
+                    bbox_corpus_core::project_catalog_snapshot::read_legacy_proposal_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            // One store kind, two sources, resolved in the SAME order the
+            // stamper resolves them: channel bindings first, proposal links
+            // only on a row-absent answer.
+            LegacyPathStoreKindV1::SlackBinding => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.slack_store_root,
+                |path| match bbox_slack::slack_channel_bindings::read_project_catalog_owner_row(
+                    path,
+                    source_row_id,
+                    limits,
+                ) {
+                    Err(error) if error.code == OWNER_ROW_ABSENT => {
+                        bbox_slack::slack_proposal_links::read_project_catalog_owner_row(
+                            path,
+                            source_row_id,
+                            limits,
+                        )
+                    }
+                    other => other,
+                },
+            ),
+            LegacyPathStoreKindV1::Whiteboard => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.whiteboard_root,
+                |path| {
+                    bbox_whiteboards::whiteboards::read_project_catalog_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            LegacyPathStoreKindV1::Artifact => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.artifact_root,
+                |path| {
+                    bbox_artifacts::artifacts::read_project_catalog_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            LegacyPathStoreKindV1::TranscriptEdge => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.transcript_edge_root,
+                |path| {
+                    bbox_edge_sidecar::edge_sidecar::read_project_catalog_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            LegacyPathStoreKindV1::Task => self.read_owner_path(
+                store_kind,
+                source_row_id,
+                &self.paths.task_store_path,
+                |path| {
+                    bbox_corpus_core::project_catalog_snapshot::read_legacy_task_owner_row(
+                        path,
+                        source_row_id,
+                        limits,
+                    )
+                },
+            ),
+            // Unreachable behind verify's own coverage refusal, and a typed
+            // refusal rather than a silent "absent" if it were reached.
+            LegacyPathStoreKindV1::Provenance => Err(ProjectCatalogMigrationError::no_mutation(
+                ERROR_STALE_POST_IMAGE,
+                format!(
+                    "{} has no durable read-back",
+                    legacy_store_token(store_kind)
+                ),
+            )),
         }
     }
 }

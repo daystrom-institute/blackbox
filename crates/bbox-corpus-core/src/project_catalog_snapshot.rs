@@ -579,6 +579,192 @@ pub fn stamp_json_tree_row(
     Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
 }
 
+// ---------------------------------------------------------------------------
+// Row reading: the verify half of the owner snapshot contract
+// ---------------------------------------------------------------------------
+//
+// Capture answers "which rows still carry a legacy path selector" and stamping
+// writes the stable id onto one of them. Neither answers the question the
+// backfill's VERIFY has to answer: does the row an applied plan claims to have
+// stamped actually exist, and does it actually carry that exact project id?
+//
+// Nothing already here can answer it. Capture emits selector rows and never
+// reports a row's `project_id`, so a stamped row and an unstamped one look
+// identical to it; and the stamp path answers only by WRITING, which a verify
+// must not do. These helpers are the third face of the same contract, sharing
+// the owners' row identity, their nofollow reads, and their error vocabulary.
+
+/// What one durable owner row carries. An ABSENT row is not a variant: it is
+/// `Err(OWNER_ROW_ABSENT)`, exactly as on the stamping side, because
+/// absence-as-success is how a partial backfill would report itself complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerRowProjectIdV1 {
+    /// The row carries this stable project id.
+    Stamped(String),
+    /// The row exists and carries no stable project id.
+    Unstamped,
+}
+
+/// Read one row of a JSON owner source, mirroring [`stamp_json_owner_row`].
+///
+/// The exclusive store lock is held for the read for the same reason the write
+/// half holds it: a verify that raced a concurrent writer could observe a row
+/// mid-replacement and report a defect that never existed.
+pub fn read_json_owner_row(
+    store_path: &Path,
+    source_id: &str,
+    subsource_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    locate: impl FnOnce(&[u8]) -> Result<OwnerRowProjectIdV1, OwnerRowStampError>,
+) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    validate_limits(limits).map_err(|error| OwnerRowStampError::new(error.code))?;
+    crate::json_store::with_store_lock(store_path, || {
+        let captured = capture_regular_file_nofollow(
+            store_path,
+            source_id,
+            subsource_id,
+            limits.max_source_bytes,
+        );
+        let Some(bytes) = captured.bytes else {
+            let code = match captured.state {
+                OwnerSnapshotStateV1::Missing { .. } => OWNER_SOURCE_MISSING,
+                _ => OWNER_SOURCE_UNREADABLE,
+            };
+            return Ok(Err(OwnerRowStampError::new(code)));
+        };
+        Ok(locate(&bytes))
+    })
+    .unwrap_or_else(|_| Err(OwnerRowStampError::new(OWNER_SOURCE_UNREADABLE)))
+}
+
+/// Read one row object's stable project id.
+///
+/// Deliberately the exact inverse of [`stamp_row_object`], down to the
+/// treatment of a blank string as unstamped (which is what
+/// [`decide_row_stamp`] does) and of a non-string value as a CORRUPT row rather
+/// than an unstamped one.
+pub fn read_row_object_project_id(
+    row: &serde_json::Value,
+) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    let object = row
+        .as_object()
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_INVALID))?;
+    match object.get(OWNER_ROW_PROJECT_ID_FIELD) {
+        None | Some(serde_json::Value::Null) => Ok(OwnerRowProjectIdV1::Unstamped),
+        Some(serde_json::Value::String(existing)) if existing.trim().is_empty() => {
+            Ok(OwnerRowProjectIdV1::Unstamped)
+        }
+        Some(serde_json::Value::String(existing)) => {
+            Ok(OwnerRowProjectIdV1::Stamped(existing.clone()))
+        }
+        Some(_) => Err(OwnerRowStampError::new(OWNER_SOURCE_INVALID)),
+    }
+}
+
+/// Read half of [`stamp_json_array_row`].
+pub fn read_json_array_row_project_id(
+    bytes: &[u8],
+    array_field: &str,
+    id_field: &str,
+    source_row_id: &str,
+) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    let mut document: serde_json::Value = decode_owner_source(bytes)?;
+    let row = find_json_array_row_mut(&mut document, array_field, id_field, source_row_id)
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+    read_row_object_project_id(row)
+}
+
+/// Read half of [`stamp_json_map_row`].
+pub fn read_json_map_row_project_id(
+    bytes: &[u8],
+    map_field: &str,
+    source_row_id: &str,
+    row_id_of: impl Fn(&serde_json::Value) -> Option<String>,
+) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    let document: serde_json::Value = decode_owner_source(bytes)?;
+    let rows = document
+        .get(map_field)
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+    let row = rows
+        .values()
+        .find(|row| row_id_of(row).as_deref() == Some(source_row_id))
+        .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+    read_row_object_project_id(row)
+}
+
+/// Read half of [`stamp_json_tree_row`], locating the record the same way.
+pub fn read_json_tree_row_project_id(
+    root: &Path,
+    source_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+    include: impl Fn(&Path) -> bool + Copy,
+    row_id_of: impl Fn(&str, &serde_json::Value) -> Option<String>,
+    source_row_id: &str,
+) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    let captures = capture_stable_regular_tree_nofollow(root, source_id, limits, include)
+        .map_err(|error| OwnerRowStampError::new(error.code))?;
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id(source_id, &relative);
+        let Some(bytes) = captured.bytes else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if row_id_of(&subsource_id, &document).as_deref() != Some(source_row_id) {
+            continue;
+        }
+        return read_row_object_project_id(&document);
+    }
+    Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
+}
+
+/// Read half of [`stamp_legacy_task_owner_row`]. `tasks.json` is a top-level
+/// array, so it locates its row the same non-shared way the stamper does.
+pub fn read_legacy_task_owner_row(
+    tasks_path: &Path,
+    source_row_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    read_json_owner_row(tasks_path, "task", "task:central-json", limits, |bytes| {
+        let document: serde_json::Value = decode_owner_source(bytes)?;
+        let row = document
+            .as_array()
+            .ok_or_else(|| OwnerRowStampError::new(OWNER_SOURCE_INVALID))?
+            .iter()
+            .find(|row| row.get("id").and_then(serde_json::Value::as_str) == Some(source_row_id))
+            .ok_or_else(|| OwnerRowStampError::new(OWNER_ROW_ABSENT))?;
+        read_row_object_project_id(row)
+    })
+}
+
+/// Read half of [`stamp_legacy_proposal_owner_row`].
+pub fn read_legacy_proposal_owner_row(
+    proposals_root: &Path,
+    source_row_id: &str,
+    limits: OwnerSnapshotLimitsV1,
+) -> Result<OwnerRowProjectIdV1, OwnerRowStampError> {
+    read_json_tree_row_project_id(
+        proposals_root,
+        "proposal",
+        limits,
+        |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        },
+        |subsource_id, document| {
+            document
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| format!("{subsource_id}:{id}"))
+        },
+        source_row_id,
+    )
+}
+
 /// Minimal dependency-safe projection of the root daemon's persisted
 /// `tasks.json` schema. The orchestration cwd is the only field that is a
 /// legacy path selector; all other task payload remains owned by the root

@@ -337,6 +337,41 @@ pub fn stamp_project_catalog_owner_row(
     )
 }
 
+/// Read one artifact metadata row's stable project id, the VERIFY half of
+/// [`stamp_project_catalog_owner_row`]. Locates the record exactly as the
+/// stamper does, so the two agree on row identity by construction.
+pub fn read_project_catalog_owner_row(
+    root: &Path,
+    source_row_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::read_json_tree_row_project_id;
+
+    read_json_tree_row_project_id(
+        root,
+        "artifact",
+        limits,
+        |relative| {
+            !relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::Normal(value)
+                        if value.to_string_lossy().starts_with(".retiring-")
+                )
+            }) && (relative.file_name().and_then(|name| name.to_str()) == Some("metadata.json")
+                || relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".metadata.json")))
+        },
+        |subsource_id, _document| Some(format!("{subsource_id}:legacy-path")),
+        source_row_id,
+    )
+}
+
 /// Remove every artifact row owned by one project using the catalog metadata
 /// format. Directories are first renamed out of the live tree, then removed.
 pub fn discharge_project_catalog_rows(

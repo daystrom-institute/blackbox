@@ -12,7 +12,8 @@ use bbox_corpus_index::index::migration_inventory as corpus_inventory;
 use bbox_indexing::project_catalog_admin;
 use bbox_indexing::project_catalog_backfill::{
     DurableBackfillApplyRequestV1, DurableBackfillPreflightRequestV1,
-    DurableBackfillVerifyRequestV1, LegacyRowStamperV1, ProjectCatalogDurableBackfillFacadeV1,
+    DurableBackfillVerifyRequestV1, LegacyRowOwnerReaderV1, LegacyRowStamperV1,
+    ProjectCatalogDurableBackfillFacadeV1,
 };
 use bbox_indexing::project_catalog_migration::ProjectCatalogTargetSelectionV1;
 use bbox_indexing::project_catalog_migration::{
@@ -848,31 +849,50 @@ fn new_verb_layout(
     }
 }
 
-/// Build the one production row stamper for a resolved target.
+/// The owner store paths for a resolved target.
 ///
-/// The owner paths come from the layout's own projection, which is derived
-/// through the same function the read-side capture uses, so the stamping pass
-/// cannot write a store the inventory never inspected.
+/// They come from the layout's own projection, which is derived through the
+/// same function the read-side capture uses, so neither the stamping pass nor
+/// the verify read can reach a store the inventory never inspected.
+fn owner_store_paths(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> blackbox::project_catalog_stamper::ProjectCatalogStamperPathsV1 {
+    let owners = layout.stamper_owner_paths();
+    blackbox::project_catalog_stamper::ProjectCatalogStamperPathsV1 {
+        knowledge_store_path: owners.knowledge_store_path,
+        gap_store_path: owners.gap_store_path,
+        thread_store_path: owners.thread_store_path,
+        note_store_path: owners.note_store_path,
+        pin_store_path: owners.pin_store_path,
+        roadmap_store_path: owners.roadmap_store_path,
+        packet_root: owners.packet_root,
+        proposal_root: owners.proposal_root,
+        slack_store_root: owners.slack_store_root,
+        whiteboard_root: owners.whiteboard_root,
+        artifact_root: owners.artifact_root,
+        transcript_edge_root: owners.transcript_edge_root,
+        task_store_path: owners.task_store_path,
+    }
+}
+
+/// Build the one production owner-row READER, which backfill verify proves the
+/// durable stamps through. Read-only by type: it cannot write an owner.
+fn owner_row_reader(
+    layout: &ProjectCatalogMigrationResolvedLayoutV1,
+) -> Result<Arc<dyn LegacyRowOwnerReaderV1>, CommandFailure> {
+    let reader = blackbox::project_catalog_stamper::ProjectCatalogOwnerRowReaderV1::new(
+        owner_store_paths(layout),
+        OwnerSnapshotLimitsV1::default(),
+    )?;
+    Ok(Arc::new(reader))
+}
+
+/// Build the one production row stamper for a resolved target.
 fn owner_row_stamper(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> Result<Arc<dyn LegacyRowStamperV1>, CommandFailure> {
-    let owners = layout.stamper_owner_paths();
     let stamper = blackbox::project_catalog_stamper::ProjectCatalogOwnerRowStamperV1::new(
-        blackbox::project_catalog_stamper::ProjectCatalogStamperPathsV1 {
-            knowledge_store_path: owners.knowledge_store_path,
-            gap_store_path: owners.gap_store_path,
-            thread_store_path: owners.thread_store_path,
-            note_store_path: owners.note_store_path,
-            pin_store_path: owners.pin_store_path,
-            roadmap_store_path: owners.roadmap_store_path,
-            packet_root: owners.packet_root,
-            proposal_root: owners.proposal_root,
-            slack_store_root: owners.slack_store_root,
-            whiteboard_root: owners.whiteboard_root,
-            artifact_root: owners.artifact_root,
-            transcript_edge_root: owners.transcript_edge_root,
-            task_store_path: owners.task_store_path,
-        },
+        owner_store_paths(layout),
         OwnerSnapshotLimitsV1::default(),
     )?;
     Ok(Arc::new(stamper))
@@ -951,6 +971,7 @@ fn execute_durable_backfill(
             let receipt =
                 ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
                     target_selection: selection.target_selection,
+                    owner_reader: owner_row_reader(&layout)?,
                     layout,
                 })?;
             serialize_result(&receipt)

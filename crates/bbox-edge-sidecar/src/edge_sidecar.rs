@@ -387,6 +387,58 @@ pub fn stamp_project_catalog_owner_row(
     Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
 }
 
+/// Read one transcript-edge row's stable project id, the VERIFY half of
+/// [`stamp_project_catalog_owner_row`].
+///
+/// Locates the row by rebuilding every lane's row ids through the same shared
+/// walk the stamper uses, for the same reason: subsource ids are opaque hashes
+/// and splitting the composite id would be a second, weaker identity
+/// implementation.
+pub fn read_project_catalog_owner_row(
+    edges_dir: &Path,
+    source_row_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        OWNER_ROW_ABSENT, OwnerRowStampError, capture_stable_regular_tree_nofollow,
+        read_row_object_project_id, stable_subsource_id,
+    };
+
+    let captures =
+        capture_stable_regular_tree_nofollow(edges_dir, "transcript_edge", limits, |relative| {
+            relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        })
+        .map_err(|error| OwnerRowStampError::new(error.code))?;
+
+    for (relative, captured) in captures {
+        let subsource_id = stable_subsource_id("transcript_edge", &relative);
+        let Some(bytes) = captured.bytes else {
+            continue;
+        };
+        let Ok(body) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(lane_rows) = transcript_edge_lane_rows(body) else {
+            continue;
+        };
+        let Some(row) = lane_rows
+            .iter()
+            .find(|row| row.stable_row_id(&subsource_id) == source_row_id)
+        else {
+            continue;
+        };
+        let segments: Vec<(&str, &str)> = transcript_edge_segments(body).collect();
+        let (content, _terminator) = segments[row.segment_index];
+        let value: serde_json::Value = serde_json::from_str(content)
+            .map_err(|_| OwnerRowStampError::new("transcript_edge_invalid"))?;
+        return read_row_object_project_id(&value);
+    }
+    Err(OwnerRowStampError::new(OWNER_ROW_ABSENT))
+}
+
 /// Write `rewritten` over `path` atomically, refusing if the lane changed since
 /// `expected` was read.
 // The backfill stamper is an offline admin path, not a tool handler.

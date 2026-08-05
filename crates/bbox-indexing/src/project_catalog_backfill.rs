@@ -708,6 +708,48 @@ pub trait LegacyRowStamperV1: Send + Sync {
     ) -> BackfillResult<LegacyRowStampOutcomeV1>;
 }
 
+/// What a read-side probe observed about one durable owner row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyRowObservationV1 {
+    /// The row exists and carries exactly this stable project id.
+    StampedWith(ProjectId),
+    /// The row exists and carries no stable project id.
+    Unstamped,
+    /// The owner holds no such row.
+    Absent,
+}
+
+/// The durable-store READ seam the backfill verifies through.
+///
+/// Symmetric to [`LegacyRowStamperV1`] and separate from it on purpose. Verify
+/// must never be able to write: an owner verifier that could stamp would be
+/// proving its own work. It also cannot be answered from the owners' capture
+/// lane, which reports which rows still carry a legacy selector and says
+/// nothing about the `project_id` a row now holds - the very field the backfill
+/// wrote.
+///
+/// Without this, verify compared the completion journal's stamp counts against
+/// the catalog ledger's mappable counts and never opened a single owner store,
+/// so a stamper that returned `Stamped` without writing anything produced a
+/// journal that verified perfectly against rows that had never been touched.
+///
+/// Implementations answer `coverage` by exhaustive `match` over the 14-variant
+/// owner set, for the reason spelled out on [`LegacyRowStamperV1::coverage`].
+pub trait LegacyRowOwnerReaderV1: Send + Sync {
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1;
+
+    /// Observe every named row of ONE owner.
+    ///
+    /// Batched per owner rather than per row because several owners are trees
+    /// or lane sets whose row lookup is a full walk; a per-row call would make
+    /// verifying an owner quadratic in its rows.
+    fn observe(
+        &self,
+        store_kind: LegacyPathStoreKindV1,
+        source_row_ids: &BTreeSet<String>,
+    ) -> BackfillResult<BTreeMap<String, LegacyRowObservationV1>>;
+}
+
 /// Whether an owner's durable-store write-back is available to the backfill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1498,6 +1540,10 @@ pub struct DurableBackfillVerifyRequestV1 {
     /// Which target the CLI resolved. Verify is target-explicit under the same
     /// selection rules as apply (section 3.1).
     pub target_selection: ProjectCatalogTargetSelectionV1,
+    /// Reads the durable owner rows the applied plan claims to have stamped.
+    /// Injected for the same reason the stamper is: the fourteen owners live in
+    /// their own crates and only the root crate sees them all.
+    pub owner_reader: Arc<dyn LegacyRowOwnerReaderV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2041,6 +2087,9 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         let mut quarantined_total = 0u64;
         let mut unscoped_total = 0u64;
         let mut observed_per_store: BTreeMap<LegacyPathStoreKindV1, u64> = BTreeMap::new();
+        let mut observed_unscoped_per_store: BTreeMap<LegacyPathStoreKindV1, u64> = BTreeMap::new();
+        let mut expected_rows: BTreeMap<LegacyPathStoreKindV1, BTreeMap<String, ProjectId>> =
+            BTreeMap::new();
         for binding in effective.values() {
             let Some(kind) = legacy_store_kind_from_token(&binding.effective.source_store) else {
                 return Err(refuse(
@@ -2048,13 +2097,28 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                     "legacy path ledger names a store outside the owner set",
                 ));
             };
-            match binding.effective.status {
-                LegacyPathBindingStatus::Mapped { .. } => {
+            match &binding.effective.status {
+                LegacyPathBindingStatus::Mapped { project_id, .. } => {
                     observed_mappable_total += 1;
                     *observed_per_store.entry(kind).or_default() += 1;
+                    // The row this binding claims, and the id it must carry.
+                    if expected_rows
+                        .entry(kind)
+                        .or_default()
+                        .insert(binding.effective.source_row_id.clone(), project_id.clone())
+                        .is_some()
+                    {
+                        return Err(refuse(
+                            ERROR_STALE_POST_IMAGE,
+                            "one owner row is bound by two effective mapped bindings",
+                        ));
+                    }
                 }
                 LegacyPathBindingStatus::Quarantined {} => quarantined_total += 1,
-                LegacyPathBindingStatus::Unscoped {} => unscoped_total += 1,
+                LegacyPathBindingStatus::Unscoped {} => {
+                    unscoped_total += 1;
+                    *observed_unscoped_per_store.entry(kind).or_default() += 1;
+                }
             }
         }
         // The stamp set the journal records must be exactly the mappable set
@@ -2083,12 +2147,135 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 ));
             }
         }
+        // The journal's COMPLETE per-store classification, not just its stamp
+        // total. Each of these was recorded by apply and none of them was ever
+        // checked, so a journal could disagree with the ledger in three
+        // different ways and still verify.
+        for (kind, counts) in &journal.stamp_counts {
+            if counts.mappable != observed_per_store.get(kind).copied().unwrap_or_default() {
+                return Err(refuse(
+                    ERROR_STALE_POST_IMAGE,
+                    "journal mappable counts disagree with the ledger's mappable set",
+                ));
+            }
+            // Every mappable row must be accounted for as stamped or
+            // already-stamped: a journal that recorded fewer describes a pass
+            // that did not finish.
+            if counts.stamped + counts.already_stamped != counts.mappable {
+                return Err(refuse(
+                    ERROR_STALE_POST_IMAGE,
+                    "journal stamp counts do not account for every mappable row",
+                ));
+            }
+            if counts.unscoped
+                != observed_unscoped_per_store
+                    .get(kind)
+                    .copied()
+                    .unwrap_or_default()
+            {
+                return Err(refuse(
+                    ERROR_STALE_POST_IMAGE,
+                    "journal unscoped counts disagree with the ledger's unscoped set",
+                ));
+            }
+            // A conversion appended a superseding binding, so it can only have
+            // produced a row that now resolves mappable or unscoped.
+            if counts.converted > counts.mappable + counts.unscoped {
+                return Err(refuse(
+                    ERROR_STALE_POST_IMAGE,
+                    "journal records more conversions than the store has converted rows",
+                ));
+            }
+        }
+        // Conversions are exactly what moves the pair, so the epoch and the
+        // converted total must agree in both directions.
+        let converted_total: u64 = journal
+            .stamp_counts
+            .values()
+            .map(|counts| counts.converted)
+            .sum();
+        if (converted_total > 0)
+            != (journal.post_image_catalog_epoch != journal.predecessor_catalog_epoch)
+        {
+            return Err(refuse(
+                ERROR_STALE_POST_IMAGE,
+                "journal conversions disagree with the epoch the pair moved to",
+            ));
+        }
         if journal.post_image_catalog_epoch > state.epoch() {
             return Err(refuse(
                 ERROR_STALE_POST_IMAGE,
                 "journal post-image epoch is ahead of the target's current epoch",
             ));
         }
+
+        // THE DURABLE OWNER PROOF. Everything above compares one record against
+        // another; this is the only part that opens the stores the backfill
+        // actually wrote and asks whether the rows are really stamped.
+        for (kind, rows) in &expected_rows {
+            match request.owner_reader.coverage(*kind) {
+                LegacyRowStampCoverageV1::Covered => {}
+                LegacyRowStampCoverageV1::NotImplemented => {
+                    return Err(refuse(
+                        ERROR_STALE_POST_IMAGE,
+                        format!(
+                            "{} carries mapped bindings but has no durable read-back to \
+                             verify them",
+                            legacy_store_token(*kind)
+                        ),
+                    ));
+                }
+                LegacyRowStampCoverageV1::ExemptByConstruction => {
+                    return Err(refuse(
+                        ERROR_STALE_POST_IMAGE,
+                        format!(
+                            "{} is exempt by construction yet carries mapped bindings",
+                            legacy_store_token(*kind)
+                        ),
+                    ));
+                }
+            }
+            let observed = request
+                .owner_reader
+                .observe(*kind, &rows.keys().cloned().collect())?;
+            for (source_row_id, project_id) in rows {
+                match observed.get(source_row_id) {
+                    Some(LegacyRowObservationV1::StampedWith(observed_project_id))
+                        if observed_project_id == project_id => {}
+                    Some(LegacyRowObservationV1::StampedWith(_)) => {
+                        return Err(refuse(
+                            ERROR_STALE_POST_IMAGE,
+                            format!(
+                                "a {} row is stamped with a different project than its \
+                                 effective mapped binding",
+                                legacy_store_token(*kind)
+                            ),
+                        ));
+                    }
+                    Some(LegacyRowObservationV1::Unstamped) => {
+                        return Err(refuse(
+                            ERROR_STALE_POST_IMAGE,
+                            format!(
+                                "a {} row the journal reports stamped carries no stable \
+                                 project id",
+                                legacy_store_token(*kind)
+                            ),
+                        ));
+                    }
+                    Some(LegacyRowObservationV1::Absent) | None => {
+                        return Err(refuse(
+                            ERROR_STALE_POST_IMAGE,
+                            format!(
+                                "a {} row named by an effective mapped binding is absent \
+                                 from its owner",
+                                legacy_store_token(*kind)
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
         // The publisher/G1 disposition is proved FRESH here too, against the
         // same marker-sourced population. Verify exists to answer "is this
         // target's applied backfill still sound", and a D-040 defect that

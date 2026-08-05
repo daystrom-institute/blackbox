@@ -1355,6 +1355,33 @@ pub fn stamp_project_catalog_owner_row(
     )
 }
 
+/// Read one central knowledge row's stable project id, the VERIFY half of
+/// [`stamp_project_catalog_owner_row`].
+///
+/// Read-only by construction: the backfill's verify proves that the rows an
+/// applied plan claims to have stamped really carry the project id the ledger
+/// binds them to, and a verify that could write would be proving its own work.
+pub fn read_project_catalog_owner_row(
+    store_path: &Path,
+    source_row_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::{
+        read_json_array_row_project_id, read_json_owner_row,
+    };
+
+    read_json_owner_row(
+        store_path,
+        "knowledge",
+        "knowledge:central-json",
+        limits,
+        |bytes| read_json_array_row_project_id(bytes, "entries", "id", source_row_id),
+    )
+}
+
 impl StoreSnapshot for Knowledge {
     type Snapshot = KnowledgeStore;
 

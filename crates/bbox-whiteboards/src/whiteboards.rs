@@ -816,6 +816,39 @@ pub fn stamp_project_catalog_owner_row(
     )
 }
 
+/// Read one whiteboard row's stable project id, the VERIFY half of
+/// [`stamp_project_catalog_owner_row`]. Locates the record exactly as the
+/// stamper does, so the two agree on row identity by construction.
+pub fn read_project_catalog_owner_row(
+    storage_dir: &std::path::Path,
+    source_row_id: &str,
+    limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
+) -> std::result::Result<
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowProjectIdV1,
+    bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
+> {
+    use bbox_corpus_core::project_catalog_snapshot::read_json_tree_row_project_id;
+
+    read_json_tree_row_project_id(
+        storage_dir,
+        "whiteboard",
+        limits,
+        |relative| {
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        },
+        |_subsource_id, document| {
+            document
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        },
+        source_row_id,
+    )
+}
+
 /// Remove persisted boards owned by one project. Missing stores are empty;
 /// malformed or unsafe entries refuse instead of being treated as absent.
 pub fn discharge_project_catalog_rows(
