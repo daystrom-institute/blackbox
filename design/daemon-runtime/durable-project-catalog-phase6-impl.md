@@ -671,10 +671,22 @@ the `capture_migration_preflight` wrapper (`project_catalog_store.rs:4218`).
 
 A shared lifetime lock does not exclude the daemon's own shared handle, which
 is why preflight can run while the bridge is live and still see a consistent
-capture. The new verbs follow the same pattern. This matches governing
+capture. This matches governing
 section 6.3: "Preflight takes a shared/read lock, reads live v1 state, writes
 no project state, and emits a complete machine-readable report. It can run
 while the v1 daemon remains available."
+
+**The two-lock pattern is for raw-file captures only (deadlock finding,
+P6-B unit 4).** The migration capture reads raw version-1 files with no
+store open, so the helper's exclusive store mutation lock is its only
+pair-read coherence. A capture that OPENS the v2 store must NOT run
+inside that helper: `open_existing` acquires the same mutation lock file
+on a second descriptor, and flock self-deadlocks - deterministically, as
+the first real execution of the backfill preflight proved. New-verb
+preflights whose capture opens the store therefore take the shared
+lifetime lock directly and let the store's own mutation-locked strict
+read provide pair coherence, exactly as the backfill apply and verify
+entries already do.
 
 ### 4.2. Apply: exclusive-then-downgrade with point-in-time exclusivity
 
