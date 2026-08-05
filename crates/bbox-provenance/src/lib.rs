@@ -1127,6 +1127,102 @@ mod tests {
         ));
     }
 
+    /// Q-E3b proof 1 and 4, the load-bearing half of the exemption argument.
+    ///
+    /// A NONEMPTY provenance corpus yields inventory-target rows and ZERO
+    /// legacy-selector rows, and the target's project id is the one the caller
+    /// supplied (which the migration preserves into the catalog post-image).
+    ///
+    /// This is what makes the exemption checkable rather than asserted. Ledger
+    /// bindings form exclusively from legacy-selector observations, so an owner
+    /// that structurally cannot emit one cannot produce a stamping obligation.
+    /// If this test ever fails, the exemption in
+    /// `LegacyRowStampCoverageV1::ExemptByConstruction` has lost its premise and
+    /// the Q-E3b ruling has to be revisited.
+    #[test]
+    fn nonempty_provenance_yields_only_inventory_targets_carrying_the_project_id() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1,
+        };
+
+        let (_dir, root, commit) = init_repo("repo-a");
+        // Two documents on one commit, so the corpus is genuinely nonempty and
+        // multi-row rather than a degenerate single note.
+        apply_export_page(&root, &page(&root, "repo-a", "project1", &commit)).unwrap();
+        append_note_documents_dedup(
+            &root,
+            "refs/notes/bbox/provenance",
+            &commit,
+            &[serialize_note(&GitProvenanceNote::new_v2(
+                commit.clone(),
+                ProducedBy::default(),
+                vec![NoteToolCall {
+                    tool: "bbox_search".into(),
+                    edge_kind: None,
+                    source_ref: None,
+                    target_ref: None,
+                    file: None,
+                    byte_range: None,
+                    turn: Some(2),
+                }],
+                Vec::new(),
+            ))
+            .unwrap()],
+        )
+        .unwrap();
+
+        let snapshot = capture_project_catalog_owner_snapshot(
+            &root,
+            "refs/notes/bbox/provenance",
+            "project1",
+            OwnerSnapshotLimitsV1::default(),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.row_count, 2, "expected a nonempty two-row corpus");
+        for row in &snapshot.rows {
+            match &row.value {
+                // Proof 4: the id on the target IS the supplied project id.
+                OwnerSnapshotRowValueV1::InventoryTarget { project_id, .. } => {
+                    assert_eq!(project_id, "project1");
+                }
+                // Proof 1: not one legacy selector, at any row.
+                OwnerSnapshotRowValueV1::LegacyProjectSelector { .. } => {
+                    panic!(
+                        "provenance emitted a legacy selector, which would create a \
+                         ledger binding and break the Q-E3b exemption"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The capture is project-PARAMETERIZED: it refuses rather than inventing an
+    /// association when no project id is supplied. This is why a provenance row
+    /// can never be an unresolved path-keyed row needing a stamp.
+    #[test]
+    fn provenance_capture_requires_a_project_id() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OwnerSnapshotLimitsV1, OwnerSnapshotStateV1,
+        };
+
+        let (_dir, root, commit) = init_repo("repo-a");
+        apply_export_page(&root, &page(&root, "repo-a", "project1", &commit)).unwrap();
+
+        let snapshot = capture_project_catalog_owner_snapshot(
+            &root,
+            "refs/notes/bbox/provenance",
+            "   ",
+            OwnerSnapshotLimitsV1::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            snapshot.state,
+            OwnerSnapshotStateV1::Corrupt { .. }
+        ));
+    }
+
     #[test]
     fn concurrent_page_application_serializes_and_stays_idempotent() {
         let (_dir, root, commit) = init_repo("repo-a");

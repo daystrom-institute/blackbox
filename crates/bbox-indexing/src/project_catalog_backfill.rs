@@ -636,6 +636,18 @@ pub enum LegacyRowStampCoverageV1 {
     /// The owner crate exposes no write-back yet. Counted and named per store
     /// rather than skipped.
     NotImplemented,
+    /// The owner cannot produce a stamping obligation at all, so there is
+    /// nothing to write and nothing missing (adjudication Q-E3b).
+    ///
+    /// Distinct from `Covered` with a no-op stamper, and the distinction is the
+    /// point. `Covered` asserts "I can write this owner", which invites a
+    /// silent zero when a real obligation appears; this asserts the stronger
+    /// and checkable "a legitimate predecessor cannot ASK me to write this
+    /// owner", which preflight then enforces by refusing any positive planned
+    /// count and any effective ledger binding naming the owner. An exemption
+    /// that stopped being true would therefore fail loudly instead of stamping
+    /// nothing and reporting success.
+    ExemptByConstruction,
 }
 
 /// The planned stores this stamper cannot write, in owner-token form.
@@ -653,6 +665,28 @@ pub fn uncovered_planned_stores(
         // would block a backfill that was never going to touch that owner.
         .filter(|(_, planned)| **planned > 0)
         .filter(|(kind, _)| stamper.coverage(**kind) == LegacyRowStampCoverageV1::NotImplemented)
+        .map(|(kind, _)| legacy_store_token(*kind))
+        .collect()
+}
+
+/// Planned stores whose owner is exempt by construction, in owner-token form.
+///
+/// A NONEMPTY result means the exemption's premise has failed: something
+/// produced a stamping obligation for an owner that, by the argument in
+/// [`LegacyRowStampCoverageV1::ExemptByConstruction`], cannot have one. That is
+/// an inconsistent predecessor, not work to do, so preflight and apply both
+/// refuse on it before any mutation rather than stamping it or quietly
+/// counting zero (adjudication Q-E3b).
+pub fn exempt_stores_with_planned_stamps(
+    planned_stamps: &BTreeMap<LegacyPathStoreKindV1, u64>,
+    stamper: &dyn LegacyRowStamperV1,
+) -> Vec<&'static str> {
+    planned_stamps
+        .iter()
+        .filter(|(_, planned)| **planned > 0)
+        .filter(|(kind, _)| {
+            stamper.coverage(**kind) == LegacyRowStampCoverageV1::ExemptByConstruction
+        })
         .map(|(kind, _)| legacy_store_token(*kind))
         .collect()
 }
@@ -947,6 +981,20 @@ fn plan_backfill(
                 "legacy path ledger names a store outside the owner set",
             ));
         };
+        // Q-E3b: the Provenance owner is exempt by construction. Its capture is
+        // project-parameterized and emits only inventory-target rows, so it
+        // cannot produce a legacy-selector observation and therefore cannot
+        // produce a ledger binding. One appearing here means the predecessor
+        // inventory is inconsistent - most likely an invalid capture
+        // association - and neither stamping the row nor comparing it could
+        // repair that, so the plan refuses before anything is written.
+        if store_kind == LegacyPathStoreKindV1::Provenance {
+            return Err(refuse(
+                ERROR_RESOLUTION_INVALID,
+                "legacy path ledger carries a provenance binding, which the \
+                 exempt-by-construction provenance owner cannot produce",
+            ));
+        }
         let classification = LegacyRowClassificationV1::of(&entry.status);
         let counts = classification_counts.entry(store_kind).or_default();
         counts.superseded += binding.superseded.len() as u64;
@@ -1250,18 +1298,31 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         } else {
             epoch.saturating_add(1)
         };
-        let stamp_coverage = plan
-            .planned_stamps
-            .keys()
-            .map(|kind| (*kind, request.stamper.coverage(*kind)))
+        // Every owner, not just the planned ones. An exempt owner has zero
+        // planned stamps by definition, so keying this by planned stores would
+        // omit precisely the verdict the operator needs recorded (Q-E3b), and
+        // an owner silently absent from the report reads as "not considered"
+        // rather than "considered and exempt".
+        let stamp_coverage = LegacyPathStoreKindV1::all()
+            .into_iter()
+            .map(|kind| (kind, request.stamper.coverage(kind)))
             .collect::<BTreeMap<_, _>>();
         let uncovered_store_count =
             uncovered_planned_stores(&plan.planned_stamps, request.stamper.as_ref()).len() as u64;
+        // An exempt owner with a positive planned count is the exemption's
+        // premise failing (Q-E3b). Counted into the same refusal so a broken
+        // exemption can never publish a Clean report.
+        let exempt_with_stamps_count =
+            exempt_stores_with_planned_stamps(&plan.planned_stamps, request.stamper.as_ref()).len()
+                as u64;
         // An owner with planned stamps and no write-back cannot be backfilled,
         // so the report refuses instead of publishing a plan that would stamp
         // a strict subset of what it promises. Apply's existing
         // refused-report guard then blocks the invocation.
-        let status = if publisher_defect_count > 0 || uncovered_store_count > 0 {
+        let status = if publisher_defect_count > 0
+            || uncovered_store_count > 0
+            || exempt_with_stamps_count > 0
+        {
             DurableBackfillStatusV1::Refused
         } else {
             DurableBackfillStatusV1::Clean
@@ -1429,6 +1490,20 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 format!(
                     "the supplied stamper cannot write these planned owners: {}",
                     uncovered.join(", ")
+                ),
+            ));
+        }
+        // Same placement, same reason (Q-E3b): re-probed against THIS stamper
+        // and before the pair transaction, so a failed exemption refuses with
+        // nothing mutated rather than part-way through.
+        let exempt_with_stamps =
+            exempt_stores_with_planned_stamps(&plan.planned_stamps, request.stamper.as_ref());
+        if !exempt_with_stamps.is_empty() {
+            return Err(refuse(
+                ERROR_ARTIFACT_IDENTITY,
+                format!(
+                    "these owners are exempt by construction yet the plan stamps them: {}",
+                    exempt_with_stamps.join(", ")
                 ),
             ));
         }
@@ -2456,6 +2531,142 @@ mod tests {
         ) -> BackfillResult<LegacyRowStampOutcomeV1> {
             Ok(LegacyRowStampOutcomeV1::Stamped)
         }
+    }
+
+    /// A stamper shaped like production for the Q-E3b question: provenance is
+    /// EXEMPT, not unimplemented.
+    struct ExemptProvenanceStamper;
+
+    impl LegacyRowStamperV1 for ExemptProvenanceStamper {
+        fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+            match store_kind {
+                LegacyPathStoreKindV1::Provenance => LegacyRowStampCoverageV1::ExemptByConstruction,
+                LegacyPathStoreKindV1::Task => LegacyRowStampCoverageV1::NotImplemented,
+                _ => LegacyRowStampCoverageV1::Covered,
+            }
+        }
+
+        fn stamp(
+            &self,
+            _store_kind: LegacyPathStoreKindV1,
+            _source_row_id: &str,
+            _project_id: &ProjectId,
+        ) -> BackfillResult<LegacyRowStampOutcomeV1> {
+            Ok(LegacyRowStampOutcomeV1::Stamped)
+        }
+    }
+
+    /// Q-E3b proof 2: a legitimate predecessor plans ZERO provenance stamps, and
+    /// exemption is not mistaken for a missing write-back.
+    ///
+    /// The distinction matters: `uncovered_planned_stores` must NOT name an
+    /// exempt owner, or every backfill would refuse forever on an owner that
+    /// correctly has nothing to do.
+    #[test]
+    fn an_exempt_owner_with_no_planned_stamps_is_clean_and_not_uncovered() {
+        let attachments = attachments_with(vec![entry("a1", 1, mapped(project('a')), "knowledge")]);
+        let effective = effective_legacy_bindings(&attachments.legacy_path_bindings).unwrap();
+        let inventory_hash = backfill_inventory_hash(7, &hash(1), &hash(2), &effective);
+        let plan = plan_backfill(
+            &attachments,
+            7,
+            &hash(1),
+            &hash(2),
+            &DurableBackfillResolutionV1::empty(inventory_hash),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.planned_stamps
+                .get(&LegacyPathStoreKindV1::Provenance)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "a legitimate predecessor cannot plan a provenance stamp"
+        );
+        assert!(
+            uncovered_planned_stores(&plan.planned_stamps, &ExemptProvenanceStamper).is_empty(),
+            "an exempt owner must not be reported as a missing write-back"
+        );
+        assert!(
+            exempt_stores_with_planned_stamps(&plan.planned_stamps, &ExemptProvenanceStamper)
+                .is_empty()
+        );
+        assert_eq!(
+            ExemptProvenanceStamper.coverage(LegacyPathStoreKindV1::Provenance),
+            LegacyRowStampCoverageV1::ExemptByConstruction,
+            "exemption is its own verdict, not Covered with a no-op stamper"
+        );
+
+        // And the verdict is RECORDED, for every owner in the closed universe.
+        // Keyed by planned stores this map would omit provenance entirely,
+        // which reads as "not considered" rather than "considered and exempt".
+        let stamp_coverage = LegacyPathStoreKindV1::all()
+            .into_iter()
+            .map(|kind| (kind, ExemptProvenanceStamper.coverage(kind)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(stamp_coverage.len(), 14, "every owner gets a verdict");
+        assert_eq!(
+            stamp_coverage.get(&LegacyPathStoreKindV1::Provenance),
+            Some(&LegacyRowStampCoverageV1::ExemptByConstruction)
+        );
+    }
+
+    /// Q-E3b proof 3: an injected provenance ledger binding refuses BEFORE any
+    /// mutation.
+    ///
+    /// Planning is where the refusal lands, which is upstream of both the pair
+    /// transaction and the first stamp, so an inconsistent predecessor cannot
+    /// reach durable state at all. Neither stamping the row nor comparing it
+    /// would be a repair: a provenance binding means the capture association
+    /// itself is invalid.
+    #[test]
+    fn an_injected_provenance_binding_refuses_before_any_mutation() {
+        let attachments = attachments_with(vec![
+            entry("a1", 1, mapped(project('a')), "knowledge"),
+            entry("a2", 1, mapped(project('a')), "provenance"),
+        ]);
+        let effective = effective_legacy_bindings(&attachments.legacy_path_bindings).unwrap();
+        let inventory_hash = backfill_inventory_hash(7, &hash(1), &hash(2), &effective);
+
+        let error = plan_backfill(
+            &attachments,
+            7,
+            &hash(1),
+            &hash(2),
+            &DurableBackfillResolutionV1::empty(inventory_hash),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ERROR_RESOLUTION_INVALID);
+        assert!(
+            error.message.contains("provenance"),
+            "refusal must name the owner: {}",
+            error.message
+        );
+        assert_eq!(
+            error.mutation_disposition,
+            ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation,
+            "planning refuses before anything is written"
+        );
+    }
+
+    /// The exemption is CHECKED, not asserted: if some future change did plan a
+    /// provenance stamp, the coverage probe turns it into a refusal instead of
+    /// silently stamping nothing and reporting success.
+    #[test]
+    fn an_exempt_owner_with_planned_stamps_is_named_as_a_broken_premise() {
+        let planned = BTreeMap::from([
+            (LegacyPathStoreKindV1::Knowledge, 2),
+            (LegacyPathStoreKindV1::Provenance, 1),
+        ]);
+
+        let exempt = exempt_stores_with_planned_stamps(&planned, &ExemptProvenanceStamper);
+
+        assert_eq!(exempt, vec!["provenance"]);
+        // And it is NOT laundered through the missing-write-back channel, which
+        // would report the wrong cause.
+        assert!(uncovered_planned_stores(&planned, &ExemptProvenanceStamper).is_empty());
     }
 
     /// An owner with planned stamps and no write-back is NAMED, not skipped.

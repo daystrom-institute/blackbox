@@ -644,7 +644,14 @@ pub enum LegacyPathStoreKindV1 {
 }
 
 impl LegacyPathStoreKindV1 {
-    fn all() -> BTreeSet<Self> {
+    /// The CLOSED owner-classification universe (plan section 3.3).
+    ///
+    /// Public so the backfill report can state a coverage verdict for EVERY
+    /// owner rather than only the ones with planned stamps. An owner that is
+    /// exempt by construction has zero planned stamps by definition, so a
+    /// planned-keyed map would silently omit exactly the owners whose exemption
+    /// the operator most needs to see recorded (adjudication Q-E3b).
+    pub fn all() -> BTreeSet<Self> {
         BTreeSet::from([
             Self::Knowledge,
             Self::Gap,

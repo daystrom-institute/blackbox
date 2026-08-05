@@ -217,9 +217,15 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
             // Task: the persisted record has no project id field at all, only
             // an orchestration cwd, and it is owned by the root crate. Its
             // schema change is a separate dedicated commit (Q-E2).
-            LegacyPathStoreKindV1::Task | LegacyPathStoreKindV1::Provenance => {
-                LegacyRowStampCoverageV1::NotImplemented
-            }
+            LegacyPathStoreKindV1::Task => LegacyRowStampCoverageV1::NotImplemented,
+            // Provenance (Q-E3b): not unimplemented, EXEMPT. Its capture
+            // requires a nonempty project id, derives it from the legacy
+            // project record, and emits only inventory-target rows, so it never
+            // produces the legacy-selector observation a ledger binding forms
+            // from. There is no obligation to write, and the Q-E3 notes-ref CAS
+            // transaction is withdrawn: a mismatch here would mean an invalid
+            // capture association, which rewriting Git notes cannot repair.
+            LegacyPathStoreKindV1::Provenance => LegacyRowStampCoverageV1::ExemptByConstruction,
         }
     }
 
@@ -413,6 +419,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
 #[cfg(test)]
 mod owner_row_stamper_dispatch {
     use super::*;
+    use LegacyRowStampCoverageV1::{Covered, ExemptByConstruction, NotImplemented};
 
     /// Every path the stamper may touch is rooted in one tempdir, so a test
     /// that reaches the wrong owner writes somewhere observable instead of
@@ -677,40 +684,34 @@ mod owner_row_stamper_dispatch {
         assert_eq!(error.code, ERROR_RESOLUTION_INVALID);
     }
 
-    /// The three owners without a durable write-back are NAMED as uncovered,
-    /// and the other eleven are covered. Pinning the whole 14-variant answer
-    /// means adding a store cannot quietly inherit either verdict.
+    /// The whole 14-variant answer, pinned owner by owner across all THREE
+    /// verdicts, so adding a store cannot quietly inherit any of them and a
+    /// verdict cannot change without a test saying so.
+    ///
+    /// The Task/Provenance split is the Q-E3b distinction: Task has work nobody
+    /// has done yet, Provenance has no work that can exist.
     #[test]
     fn coverage_answers_for_every_owner() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let stamper = stamper(&root);
 
-        let uncovered = [
-            LegacyPathStoreKindV1::Task,
-            LegacyPathStoreKindV1::Provenance,
-        ];
-        for kind in [
-            LegacyPathStoreKindV1::Knowledge,
-            LegacyPathStoreKindV1::Gap,
-            LegacyPathStoreKindV1::Thread,
-            LegacyPathStoreKindV1::Note,
-            LegacyPathStoreKindV1::Pin,
-            LegacyPathStoreKindV1::Roadmap,
-            LegacyPathStoreKindV1::Packet,
-            LegacyPathStoreKindV1::Task,
-            LegacyPathStoreKindV1::Proposal,
-            LegacyPathStoreKindV1::SlackBinding,
-            LegacyPathStoreKindV1::Whiteboard,
-            LegacyPathStoreKindV1::Artifact,
-            LegacyPathStoreKindV1::Provenance,
-            LegacyPathStoreKindV1::TranscriptEdge,
+        for (kind, expected) in [
+            (LegacyPathStoreKindV1::Knowledge, Covered),
+            (LegacyPathStoreKindV1::Gap, Covered),
+            (LegacyPathStoreKindV1::Thread, Covered),
+            (LegacyPathStoreKindV1::Note, Covered),
+            (LegacyPathStoreKindV1::Pin, Covered),
+            (LegacyPathStoreKindV1::Roadmap, Covered),
+            (LegacyPathStoreKindV1::Packet, Covered),
+            (LegacyPathStoreKindV1::Proposal, Covered),
+            (LegacyPathStoreKindV1::SlackBinding, Covered),
+            (LegacyPathStoreKindV1::Whiteboard, Covered),
+            (LegacyPathStoreKindV1::Artifact, Covered),
+            (LegacyPathStoreKindV1::TranscriptEdge, Covered),
+            (LegacyPathStoreKindV1::Task, NotImplemented),
+            (LegacyPathStoreKindV1::Provenance, ExemptByConstruction),
         ] {
-            let expected = if uncovered.contains(&kind) {
-                LegacyRowStampCoverageV1::NotImplemented
-            } else {
-                LegacyRowStampCoverageV1::Covered
-            };
             assert_eq!(
                 stamper.coverage(kind),
                 expected,
