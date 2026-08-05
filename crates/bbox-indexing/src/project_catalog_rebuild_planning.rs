@@ -917,6 +917,10 @@ mod tests {
                 report_artifact_hash: hash(0x55),
                 resolution_artifact_hash: hash(0x66),
             },
+            // Opaque here: the rebuild preflight reads the journal as its
+            // predecessor binding and never re-proves the backfill's publisher
+            // observation, which is the durable-backfill verify's job.
+            publisher_verification_digest: hash(0x77),
         };
         fs::write(
             backfill_completion_journal_path(state_dir),

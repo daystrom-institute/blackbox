@@ -501,6 +501,15 @@ pub struct BackfillCompletionJournalV1 {
     pub post_image_catalog_epoch: u64,
     pub stamp_counts: BTreeMap<LegacyPathStoreKindV1, BackfillStoreStampCountsV1>,
     pub identity: BackfillArtifactIdentityV1,
+    /// The publisher/G1 disposition set apply committed against, digested at its
+    /// FINAL publication boundary.
+    ///
+    /// Accepted-publication state sits outside the four-hash identity, so this
+    /// is the only durable record of what the applied backfill actually
+    /// observed. Verify re-proves the dispositions and compares this digest, so
+    /// "the publication state moved since apply" is a distinct, checkable
+    /// answer rather than an unnoticed one.
+    pub publisher_verification_digest: Sha256ValueV1,
 }
 
 impl BackfillCompletionJournalV1 {
@@ -1219,6 +1228,59 @@ fn backfill_publisher_dispositions(
         .collect())
 }
 
+/// One accepted-publication artifact's byte bound. A pointer and a generation
+/// record are small JSON documents; the bound is what keeps an unbounded or
+/// adversarial file a refusal rather than a read.
+const MAX_ACCEPTED_PUBLICATION_PROBE_BYTES: usize = 1024 * 1024;
+
+/// What a CONFINED probe of one accepted-publication artifact observed.
+///
+/// The two-way split is fail-closed by construction, and that is the whole
+/// point. `Path::is_file()` collapses "it is not there" and "I could not tell"
+/// into one `false`: a permission failure, an ENOTDIR, a symlink loop, or an
+/// I/O error all read as PROVEN ABSENCE. On the
+/// `NoPublishedContentAcknowledged` branch that turned an unreadable pointer
+/// into `PointerAbsentAsRequired`, i.e. a D-040 proof passed on the strength of
+/// an error. Here only an ENOENT - of the artifact, or of the directory that
+/// would contain it - is absence; everything else refuses.
+enum PublicationProbeV1 {
+    /// The artifact is a regular file, opened NOFOLLOW and read bounded.
+    Present(Vec<u8>),
+    /// The artifact is EXACTLY absent.
+    Absent,
+}
+
+/// Probe one accepted-publication artifact under `root`, failing closed on
+/// anything that is not an exact absence.
+///
+/// The bytes come back from the SAME open that proved presence, so a `SeedG1`
+/// hash check reads what it just proved rather than re-resolving the path.
+fn probe_publication_artifact(
+    root: &Path,
+    name: &str,
+    label: &'static str,
+) -> BackfillResult<PublicationProbeV1> {
+    let directory = NofollowDirectory::open_existing(root).map_err(|_| {
+        refuse(
+            ERROR_STALE_POST_IMAGE,
+            format!("the {label} root is unsafe or unreadable"),
+        )
+    })?;
+    // An absent containing directory IS an exact absence of everything under
+    // it: the open distinguishes ENOENT from every other failure.
+    let Some(directory) = directory else {
+        return Ok(PublicationProbeV1::Absent);
+    };
+    match directory.read_regular(name, MAX_ACCEPTED_PUBLICATION_PROBE_BYTES, label) {
+        Ok(Some(bytes)) => Ok(PublicationProbeV1::Present(bytes)),
+        Ok(None) => Ok(PublicationProbeV1::Absent),
+        Err(_) => Err(refuse(
+            ERROR_STALE_POST_IMAGE,
+            format!("the {label} is unsafe, oversize, or unreadable"),
+        )),
+    }
+}
+
 pub fn verify_publisher_dispositions(
     dispositions: &[BackfillPublisherDispositionV1],
     pointers_root: &Path,
@@ -1227,8 +1289,11 @@ pub fn verify_publisher_dispositions(
     let mut rows = Vec::new();
     for disposition in dispositions {
         let project_id = disposition.project_id().clone();
-        let pointer_path = pointers_root.join(format!("{}.json", project_id.as_str()));
-        let pointer_present = pointer_path.is_file();
+        let pointer = probe_publication_artifact(
+            pointers_root,
+            &format!("{}.json", project_id.as_str()),
+            "accepted-publication pointer",
+        )?;
         let expected_scope_digest = digest_published_scope(disposition.expected_scope())
             .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
         let full_ref_digest = digest_publisher_full_ref(disposition.full_ref())
@@ -1248,20 +1313,24 @@ pub fn verify_publisher_dispositions(
                 // than called because that helper needs the whole paths struct
                 // and a typed id; the test below pins the two shapes together
                 // so this copy cannot drift from the store's own layout.
-                let generation_path = generations_root
-                    .join(project_id.as_str())
-                    .join(format!("{generation_id}.json"));
-                let outcome = if !pointer_present {
-                    PublisherVerificationOutcomeV1::PointerMissing
-                } else if !generation_path.exists() {
-                    PublisherVerificationOutcomeV1::GenerationMissing
-                } else {
-                    match std::fs::read(&pointer_path) {
-                        Ok(bytes) if &Sha256ValueV1::digest(&bytes) == pointer_sha256 => {
+                let generation = probe_publication_artifact(
+                    &generations_root.join(project_id.as_str()),
+                    &format!("{generation_id}.json"),
+                    "accepted-publication generation",
+                )?;
+                let outcome = match (&pointer, &generation) {
+                    (PublicationProbeV1::Absent, _) => {
+                        PublisherVerificationOutcomeV1::PointerMissing
+                    }
+                    (_, PublicationProbeV1::Absent) => {
+                        PublisherVerificationOutcomeV1::GenerationMissing
+                    }
+                    (PublicationProbeV1::Present(bytes), PublicationProbeV1::Present(_)) => {
+                        if &Sha256ValueV1::digest(bytes) == pointer_sha256 {
                             PublisherVerificationOutcomeV1::PointerPresentAndConsistent
+                        } else {
+                            PublisherVerificationOutcomeV1::PointerHashMismatch
                         }
-                        Ok(_) => PublisherVerificationOutcomeV1::PointerHashMismatch,
-                        Err(_) => PublisherVerificationOutcomeV1::PointerMissing,
                     }
                 };
                 (PublisherDispositionKindV1::SeedG1, outcome)
@@ -1270,10 +1339,13 @@ pub fn verify_publisher_dispositions(
                 // D-040: such a project must have NO accepted-publication
                 // pointer until an explicit Establish. A pointer found here is
                 // a defect, not a gap this command may fill.
-                let outcome = if pointer_present {
-                    PublisherVerificationOutcomeV1::PointerUnexpectedlyPresent
-                } else {
-                    PublisherVerificationOutcomeV1::PointerAbsentAsRequired
+                let outcome = match pointer {
+                    PublicationProbeV1::Present(_) => {
+                        PublisherVerificationOutcomeV1::PointerUnexpectedlyPresent
+                    }
+                    PublicationProbeV1::Absent => {
+                        PublisherVerificationOutcomeV1::PointerAbsentAsRequired
+                    }
                 };
                 (
                     PublisherDispositionKindV1::NoPublishedContentAcknowledged,
@@ -1291,6 +1363,88 @@ pub fn verify_publisher_dispositions(
     }
     rows.sort_by(|left, right| left.project_id.as_str().cmp(right.project_id.as_str()));
     Ok(rows)
+}
+
+fn publisher_outcome_token(outcome: PublisherVerificationOutcomeV1) -> &'static str {
+    match outcome {
+        PublisherVerificationOutcomeV1::PointerPresentAndConsistent => "pointer-present",
+        PublisherVerificationOutcomeV1::PointerMissing => "pointer-missing",
+        PublisherVerificationOutcomeV1::PointerHashMismatch => "pointer-hash-mismatch",
+        PublisherVerificationOutcomeV1::GenerationMissing => "generation-missing",
+        PublisherVerificationOutcomeV1::PointerAbsentAsRequired => "pointer-absent",
+        PublisherVerificationOutcomeV1::PointerUnexpectedlyPresent => "pointer-unexpected",
+    }
+}
+
+/// Canonical digest over a COMPLETE publisher verification.
+///
+/// This is the stable stamp that closes the preflight/apply race. Accepted
+/// publication state is not part of the four-hash inventory - the inventory
+/// hashes the ledger and the pair, which a publisher Establish does not touch -
+/// so nothing in the four-hash identity would notice a publication appearing or
+/// vanishing between preflight and apply. Apply therefore re-proves the whole
+/// disposition set against the target and refuses on any difference from the
+/// reviewed report, and records THIS digest in the completion journal so a later
+/// verify proves the state it observes is the state apply committed against
+/// rather than merely a state that happens to be defect-free.
+fn publisher_verification_digest(rows: &[PublisherDispositionVerificationV1]) -> Sha256ValueV1 {
+    let mut hasher = Sha256::new();
+    field(
+        &mut hasher,
+        b"blackbox.project-catalog.backfill-publisher-verification.v1",
+    );
+    hasher.update((rows.len() as u64).to_be_bytes());
+    for row in rows {
+        field(&mut hasher, row.project_id.as_str().as_bytes());
+        field(
+            &mut hasher,
+            match row.kind {
+                PublisherDispositionKindV1::SeedG1 => b"seed-g1".as_slice(),
+                PublisherDispositionKindV1::NoPublishedContentAcknowledged => {
+                    b"no-published-content-acknowledged".as_slice()
+                }
+            },
+        );
+        field(&mut hasher, row.expected_scope_digest.as_str().as_bytes());
+        field(&mut hasher, row.full_ref_digest.as_str().as_bytes());
+        field(&mut hasher, publisher_outcome_token(row.outcome).as_bytes());
+    }
+    Sha256ValueV1::parse(hex::encode(hasher.finalize())).expect("code-owned digest is valid")
+}
+
+/// Re-prove the COMPLETE publisher/G1 disposition against the target's live
+/// accepted-publication state, and bind it to the reviewed report.
+///
+/// Called at BOTH of apply's publication boundaries and, without a report, by
+/// verify. Preflight's verdict alone cannot authorize an apply: the check reads
+/// files outside the catalog pair, so a publisher Establish or advance landing
+/// between the two commands is invisible to every hash the report carries.
+fn revalidate_publisher_dispositions(
+    store: &ProjectCatalogStore,
+    pointers_root: &Path,
+    generations_root: &Path,
+    report: &DurableBackfillReportV1,
+) -> BackfillResult<Vec<PublisherDispositionVerificationV1>> {
+    let dispositions = backfill_publisher_dispositions(store)?;
+    let observed = verify_publisher_dispositions(&dispositions, pointers_root, generations_root)?;
+    if observed.iter().any(|row| row.outcome.is_defect()) {
+        return Err(refuse(
+            ERROR_STALE_POST_IMAGE,
+            "the target's accepted-publication evidence no longer satisfies its \
+             migration publisher dispositions",
+        ));
+    }
+    // Equality over the COMPLETE set, not merely absence of defects: a
+    // disposition that changed kind, scope, or ref between preflight and apply
+    // is a different population from the one the operator reviewed even when
+    // both verify cleanly.
+    if observed != report.publisher_verification {
+        return Err(refuse(
+            ERROR_STALE_POST_IMAGE,
+            "the accepted-publication state moved after the reviewed report was captured",
+        ));
+    }
+    Ok(observed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,6 +1789,10 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         )?;
         let projects_path = request.layout.projects_path().to_path_buf();
         let state_dir = request.layout.state_dir_for_backfill().to_path_buf();
+        let pointers_root = request.layout.accepted_publication_pointers_for_backfill();
+        let generations_root = request
+            .layout
+            .accepted_publication_generations_for_backfill();
 
         let report_bytes = read_backfill_artifact_required(&request.report_path, REPORT_LABEL)?;
         let resolution_bytes =
@@ -1751,6 +1909,14 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             ));
         }
 
+        // The publisher/G1 disposition is re-proved against the TARGET before
+        // anything is mutated. Preflight's verdict is not carried forward on
+        // trust: it reads accepted-publication files that no hash in the report
+        // covers, so an Establish or advance landing between the two commands
+        // would otherwise go unnoticed. Refusing here costs nothing - the pair
+        // transaction has not run.
+        revalidate_publisher_dispositions(&store, &pointers_root, &generations_root, &report)?;
+
         // Step 2: the pair moves only for appended supersessions.
         let mut converted: BTreeMap<LegacyPathStoreKindV1, u64> = BTreeMap::new();
         let post_image_catalog_epoch = if plan.appended.is_empty() {
@@ -1804,6 +1970,15 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             stamp_counts.entry(*kind).or_default().unscoped += count;
         }
 
+        // THE FINAL PUBLICATION BOUNDARY. The set is proved once more, after the
+        // last stamp and immediately before the journal is published, so the
+        // digest the journal records is an observation of the state this apply
+        // actually finished against rather than of the state it started from.
+        // A refusal here is post-mutation by construction.
+        let publisher_verification =
+            revalidate_publisher_dispositions(&store, &pointers_root, &generations_root, &report)
+                .map_err(|error| post_mutation_refusal(error.code, error.message))?;
+
         // Step 4: the journal, fsynced before apply returns.
         let journal = BackfillCompletionJournalV1 {
             version: BACKFILL_COMPLETION_JOURNAL_VERSION_V1,
@@ -1819,6 +1994,7 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                 report_artifact_hash,
                 resolution_artifact_hash,
             },
+            publisher_verification_digest: publisher_verification_digest(&publisher_verification),
         };
         write_backfill_completion_journal(&state_dir, &journal)?;
         Ok(DurableBackfillApplyReceiptV1 {
@@ -1841,6 +2017,10 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         validate_target_selection(&request.layout, request.target_selection)?;
         let projects_path = request.layout.projects_path().to_path_buf();
         let state_dir = request.layout.state_dir_for_backfill().to_path_buf();
+        let pointers_root = request.layout.accepted_publication_pointers_for_backfill();
+        let generations_root = request
+            .layout
+            .accepted_publication_generations_for_backfill();
         let Some(journal) = read_backfill_completion_journal(&state_dir)? else {
             return Err(refuse(
                 ERROR_STALE_POST_IMAGE,
@@ -1907,6 +2087,38 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             return Err(refuse(
                 ERROR_STALE_POST_IMAGE,
                 "journal post-image epoch is ahead of the target's current epoch",
+            ));
+        }
+        // The publisher/G1 disposition is proved FRESH here too, against the
+        // same marker-sourced population. Verify exists to answer "is this
+        // target's applied backfill still sound", and a D-040 defect that
+        // appeared after apply makes it unsound; a journal that recorded a
+        // clean set says nothing about now.
+        let publisher_dispositions = backfill_publisher_dispositions(&store)?;
+        let observed_publisher_verification = verify_publisher_dispositions(
+            &publisher_dispositions,
+            &pointers_root,
+            &generations_root,
+        )?;
+        if observed_publisher_verification
+            .iter()
+            .any(|row| row.outcome.is_defect())
+        {
+            return Err(refuse(
+                ERROR_STALE_POST_IMAGE,
+                "the target's accepted-publication evidence no longer satisfies its \
+                 migration publisher dispositions",
+            ));
+        }
+        // And it must be the SAME set apply committed against. Without the
+        // journal's stamp this could only ask "is it clean now", which a
+        // publication that appeared and was corrected would answer yes.
+        if publisher_verification_digest(&observed_publisher_verification)
+            != journal.publisher_verification_digest
+        {
+            return Err(refuse(
+                ERROR_STALE_POST_IMAGE,
+                "the accepted-publication state changed after the backfill was applied",
             ));
         }
         Ok(DurableBackfillVerifyReceiptV1 {
@@ -2810,6 +3022,166 @@ mod tests {
         assert!(!rows[0].outcome.is_defect());
     }
 
+    /// F1's core: an accepted-publication artifact that cannot be READ is never
+    /// PROVEN ABSENT.
+    ///
+    /// Every shape below made `Path::is_file()` answer `false` while the truth
+    /// was "I could not tell", and on the acknowledged branch `false` was the
+    /// PASS - so a D-040 proof that a project publishes nothing was satisfied by
+    /// an I/O error. Each now refuses.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_pointer_is_never_proven_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let generations = root.join("generations");
+        let pointers = root.join("pointers");
+        std::fs::create_dir_all(&generations).unwrap();
+        std::fs::create_dir_all(&pointers).unwrap();
+        let project_id = project('c');
+        let name = format!("{}.json", project_id.as_str());
+        let probe = |pointers: &Path| {
+            verify_publisher_dispositions(
+                &[acknowledged(project_id.clone())],
+                pointers,
+                &generations,
+            )
+        };
+
+        // ENOTDIR: the pointers root is not a directory at all.
+        let not_a_directory = root.join("pointers-file");
+        std::fs::write(&not_a_directory, b"{}").unwrap();
+        assert_eq!(
+            probe(&not_a_directory)
+                .expect_err("an unreadable pointer root is not proof of absence")
+                .code,
+            ERROR_STALE_POST_IMAGE
+        );
+
+        // The pointer name exists but is a DIRECTORY: present, unreadable as a
+        // pointer, and emphatically not absent.
+        std::fs::create_dir(pointers.join(&name)).unwrap();
+        assert_eq!(
+            probe(&pointers)
+                .expect_err("a non-regular pointer is not proof of absence")
+                .code,
+            ERROR_STALE_POST_IMAGE
+        );
+        std::fs::remove_dir(pointers.join(&name)).unwrap();
+
+        // A SYMLINK: `is_file()` follows it and answers about a file outside the
+        // root; the confined probe refuses to resolve it at all.
+        std::fs::write(root.join("elsewhere.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere.json"), pointers.join(&name)).unwrap();
+        assert_eq!(
+            probe(&pointers)
+                .expect_err("a symlinked pointer is not the target's pointer")
+                .code,
+            ERROR_STALE_POST_IMAGE
+        );
+        std::fs::remove_file(pointers.join(&name)).unwrap();
+
+        // A pointer this process may not open: the permission failure that made
+        // the finding a HIGH rather than a nicety.
+        std::fs::write(pointers.join(&name), b"{}").unwrap();
+        std::fs::set_permissions(&pointers, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::read(pointers.join(&name)).is_err();
+        let observed = probe(&pointers);
+        // Restore first: a failed assertion must not leave an unremovable
+        // directory behind for the harness to trip on.
+        std::fs::set_permissions(&pointers, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if denied {
+            assert_eq!(
+                observed
+                    .expect_err("a permission failure is not proof of absence")
+                    .code,
+                ERROR_STALE_POST_IMAGE
+            );
+        }
+        // When the process CAN read through mode 0 (a privileged runner), the
+        // three shapes above already carry the property; nothing is asserted
+        // about a probe that genuinely succeeded.
+    }
+
+    /// The SeedG1 branch is confined too: a symlinked pointer is refused rather
+    /// than followed, so bytes from OUTSIDE the pointers root can never satisfy
+    /// a hash-consistency proof.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_pointer_cannot_satisfy_the_seed_g1_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let pointers = root.join("pointers");
+        let generations = root.join("generations");
+        let project_id = project('e');
+        std::fs::create_dir_all(&pointers).unwrap();
+        std::fs::create_dir_all(generations.join(project_id.as_str())).unwrap();
+        std::fs::write(
+            generations.join(project_id.as_str()).join("g1.json"),
+            b"generation-bytes",
+        )
+        .unwrap();
+
+        // Bytes that WOULD satisfy the proof, sitting outside the root.
+        let pointer_bytes = b"pointer-bytes";
+        std::fs::write(root.join("outside.json"), pointer_bytes).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("outside.json"),
+            pointers.join(format!("{}.json", project_id.as_str())),
+        )
+        .unwrap();
+
+        let error = verify_publisher_dispositions(
+            &[seed_g1(
+                project_id,
+                "g1",
+                Sha256ValueV1::digest(pointer_bytes),
+            )],
+            &pointers,
+            &generations,
+        )
+        .expect_err("a link out of the pointers root is not the target's evidence");
+        assert_eq!(error.code, ERROR_STALE_POST_IMAGE);
+    }
+
+    /// The stamp the journal carries is a function of the COMPLETE verification,
+    /// so any change to the observed set changes it.
+    #[test]
+    fn the_publisher_verification_digest_binds_the_complete_set() {
+        let root = tempfile::tempdir().unwrap();
+        let pointers = root.path().join("pointers");
+        let generations = root.path().join("generations");
+        std::fs::create_dir_all(&pointers).unwrap();
+        std::fs::create_dir_all(&generations).unwrap();
+
+        let before =
+            verify_publisher_dispositions(&[acknowledged(project('d'))], &pointers, &generations)
+                .unwrap();
+        let empty = publisher_verification_digest(&[]);
+        assert_ne!(
+            publisher_verification_digest(&before),
+            empty,
+            "an observed disposition must not digest like an empty set"
+        );
+
+        // The same project, now unexpectedly publishing: same population, one
+        // different outcome, and the stamp must move.
+        std::fs::write(
+            pointers.join(format!("{}.json", project('d').as_str())),
+            b"{}",
+        )
+        .unwrap();
+        let after =
+            verify_publisher_dispositions(&[acknowledged(project('d'))], &pointers, &generations)
+                .unwrap();
+        assert_ne!(
+            publisher_verification_digest(&before),
+            publisher_verification_digest(&after)
+        );
+    }
+
     /// SeedG1 proves the opposite: pointer AND generation present, and the
     /// pointer bytes hash-consistent with the reviewed disposition.
     #[test]
@@ -2934,6 +3306,7 @@ mod tests {
                 report_artifact_hash: hash(5),
                 resolution_artifact_hash: hash(6),
             },
+            publisher_verification_digest: publisher_verification_digest(&[]),
         };
         write_backfill_completion_journal(&state_dir, &journal).unwrap();
         let read_back = read_backfill_completion_journal(&state_dir)
@@ -2965,6 +3338,7 @@ mod tests {
                 report_artifact_hash: hash(5),
                 resolution_artifact_hash: hash(6),
             },
+            publisher_verification_digest: publisher_verification_digest(&[]),
         }
     }
 

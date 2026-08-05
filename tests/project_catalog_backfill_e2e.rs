@@ -1073,6 +1073,113 @@ fn a_torn_stamping_pass_refuses_a_stale_reapply_then_completes_after_fresh_prefl
     }
 }
 
+/// The accepted-publication pointer root under a fixture's layout.
+///
+/// Rebuilt from the projects path the same way `AcceptedPublicationStorePaths`
+/// derives it, because that helper is crate-private to `bbox-indexing`. The unit
+/// test `the_generation_probe_uses_the_stores_own_path_shape` pins the shape
+/// against the store's own, so this reconstruction cannot drift silently.
+fn publication_pointers_root(fixture: &Fixture) -> PathBuf {
+    fixture
+        .layout
+        .projects_path()
+        .parent()
+        .expect("the projects path has a parent")
+        .join("accepted-publications")
+        .join("pointers")
+}
+
+/// Move the target's accepted-publication state exactly as a publisher
+/// Establish (or the loss of a seeded publication) between two commands would,
+/// driven by the disposition set the REPORT recorded so the mutation is always
+/// the one that flips a verdict.
+fn move_the_accepted_publication_state(fixture: &Fixture) {
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).unwrap()).unwrap();
+    let rows = report["publisher_verification"].as_array().unwrap();
+    assert!(
+        !rows.is_empty(),
+        "the fixture must carry publisher dispositions for this proof to mean anything"
+    );
+    let pointers = publication_pointers_root(fixture);
+    let project_id = rows[0]["project_id"].as_str().unwrap();
+    let pointer = pointers.join(format!("{project_id}.json"));
+    match rows[0]["kind"].as_str().unwrap() {
+        // D-040 says this project must have no pointer until an explicit
+        // Establish. Plant one: the disposition now fails.
+        "no_published_content_acknowledged" => {
+            fs::create_dir_all(&pointers).unwrap();
+            fs::write(&pointer, b"{}").unwrap();
+        }
+        // The mirror image: the seeded pointer the migration installed goes
+        // away.
+        "seed_g1" => fs::remove_file(&pointer).unwrap(),
+        other => panic!("unexpected publisher disposition kind {other}"),
+    }
+}
+
+/// THE PREFLIGHT/APPLY RACE. Accepted-publication state is outside the
+/// four-hash inventory, so a publication appearing or vanishing between the two
+/// commands moves no hash the report carries. Apply must re-prove the complete
+/// disposition set against the target rather than trusting preflight's verdict.
+#[test]
+fn a_publication_that_moves_after_preflight_refuses_the_apply() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+
+    move_the_accepted_publication_state(&fixture);
+
+    let error = fixture
+        .apply(fixture.production_stamper())
+        .expect_err("a moved publication state must refuse the reviewed apply");
+    assert_eq!(
+        error.code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+    assert_eq!(
+        fixture.stamped(Owner::Knowledge),
+        None,
+        "the pre-transaction boundary refuses before anything is stamped"
+    );
+}
+
+/// The same property on the other side of the cut: verify re-proves the
+/// dispositions and compares them against the stamp the journal recorded, so a
+/// publication that moved AFTER a clean apply is reported rather than passing on
+/// the strength of the journal's own numbers.
+#[test]
+fn a_publication_that_moves_after_apply_refuses_the_verify() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
+        layout: fixture.layout.clone(),
+        target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+    })
+    .expect("a freshly applied backfill verifies");
+
+    move_the_accepted_publication_state(&fixture);
+
+    let error = ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
+        layout: fixture.layout.clone(),
+        target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+    })
+    .expect_err("a moved publication state must refuse the verify");
+    assert_eq!(
+        error.code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+}
+
 /// D-026: an existing reviewed resolution is HONOURED, never rewritten, and the
 /// hash the report carries is taken over the bytes the operator actually
 /// reviewed.
