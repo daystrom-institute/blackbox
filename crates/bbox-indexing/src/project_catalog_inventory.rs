@@ -5828,10 +5828,19 @@ fn validate_collision_lifecycle(
     )
 }
 
+/// A source's `byte_len` is evidence METADATA (one u64 in the inventory),
+/// not bytes the inventory stores, so it must not be capped at the canonical
+/// inventory's own serialized-size bound: streamed owners legitimately
+/// observe multi-GB sources (real transcript-edge lane trees exceed 3 GB).
+/// The ceiling here only rejects nonsense a corrupted capture could mint;
+/// `MAX_PROJECT_CATALOG_INVENTORY_BYTES` still bounds the serialized
+/// inventory itself at encode time.
+const MAX_INVENTORY_SOURCE_BYTE_LEN: u64 = 1024 * 1024 * 1024 * 1024;
+
 fn validate_inventory_source_state(state: &InventorySourceStateV1) -> InventoryResult<()> {
     match state {
         InventorySourceStateV1::Present { byte_len, .. } => {
-            if *byte_len > MAX_PROJECT_CATALOG_INVENTORY_BYTES as u64 {
+            if *byte_len > MAX_INVENTORY_SOURCE_BYTE_LEN {
                 return Err(limit("inventory source bytes"));
             }
         }
