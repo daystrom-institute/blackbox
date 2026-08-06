@@ -336,12 +336,22 @@ exactly one target BEFORE facade invocation; the facade itself validates
 the target layout, artifact confinement, exact identity binding,
 predecessor state, transaction recovery, and post-commit verification; a
 rehearsal-selected layout must carry the expected rehearsal-root shape
-and a configured-selected layout must be config-resolved; configured
-apply holds the factored lifetime claim (section 4.2) for the complete
-facade call; rehearsal apply takes no configured-store lock and performs
-no hidden configured fallback; verify is target-explicit under the same
-selection rules; and no second manifest writer, transaction owner, or
-recovery implementation is introduced.
+and a configured-selected layout must be config-resolved; the configured
+MIGRATE apply takes the factored lifetime claim (section 4.2) as a
+PROBE and releases it before the facade call (amended during the
+operational-cut repair arc: the migration transaction re-acquires the
+same advisory lock exclusively on its own descriptor, which cannot
+coexist with any claim this process still holds - the section 4.1
+flock self-conflict class - so held coverage made every configured
+apply refuse lifetime_lock_busy against itself; the transaction's own
+exclusive acquisition is the runbook-ordering enforcement and the
+stopped-service window is the exclusion, exactly as section 4.2's
+claim-helper contract states); the NEW-VERB applies keep the held-claim
+caller precondition because their facades do not re-acquire; rehearsal
+apply takes no configured-store lock and performs no hidden configured
+fallback; verify is target-explicit under the same selection rules; and
+no second manifest writer, transaction owner, or recovery
+implementation is introduced.
 
 Both new commands produce the D-020 versioned result envelope. The envelope
 `command` values are snake_case, following the shipped shape:

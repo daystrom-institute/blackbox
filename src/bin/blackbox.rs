@@ -1091,13 +1091,21 @@ fn execute_migrate(args: MigrateArgs) -> Result<serde_json::Value, CommandFailur
 
     let rehearsal_root = match target {
         MigrateTargetSelectionV1::Configured => {
-            // The configured apply is the P6-F cut. The lifetime claim is
-            // taken BEFORE any target read or mutation and held across the
-            // complete facade call including its post-commit verification
-            // (plan sections 3.2 and 4.2). It is the factored claim, not
-            // `open_admin_store`: the configured store is still version 1 at
-            // this instant, so a strict open would refuse it.
-            let _claim = acquire_admin_lifetime_claim(source_layout.projects_path())?;
+            // The configured apply is the P6-F cut. The lifetime claim is a
+            // PROBE here, not held coverage: the migration transaction
+            // inside the facade re-acquires the same advisory lock
+            // EXCLUSIVELY on its own descriptor, which cannot coexist with
+            // any concurrently held claim from this process (the flock
+            // self-conflict class plan section 4.1 records; holding the
+            // claim made every configured apply refuse lifetime_lock_busy
+            // against itself). Probing proves no daemon holds the store at
+            // this instant with the operator-actionable refusal; the
+            // transaction's own exclusive acquisition is the enforcement,
+            // and the stopped-service window is the exclusion for
+            // everything after it. It is the factored claim, not
+            // `open_admin_store`: the configured store is still version 1
+            // at this instant, so a strict open would refuse it.
+            drop(acquire_admin_lifetime_claim(source_layout.projects_path())?);
             let result = ProjectCatalogMigrationFacadeV1::apply_configured(
                 ProjectCatalogMigrationApplyConfiguredRequestV1 {
                     target_layout: source_layout,
