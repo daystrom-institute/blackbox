@@ -5623,6 +5623,13 @@ fn verify_installed_optional(
     ))
 }
 
+/// Carries the adapter's bounded diagnostic detail into the operator-facing
+/// error DELIBERATELY. The detail reaches only the CLI's stderr/stdout error
+/// envelope on the operator's own host; canonical inventory bytes, report
+/// artifacts, and resolution artifacts stay path-redacted as before. The
+/// alternative (a bare "contract failed") made every real-host refusal
+/// undiagnosable without a patched binary, which is how the first production
+/// preflight burned hours on a one-line answer.
 fn adapter_error(
     error: crate::project_catalog_inventory_adapters::InventoryAdapterError,
 ) -> ProjectCatalogMigrationError {
