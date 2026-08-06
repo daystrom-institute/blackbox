@@ -1962,6 +1962,12 @@ pub struct ProjectCatalogMigrationReportV1 {
     /// surfaced so the operator reviews what the post-cut rebuild will
     /// drop before authorizing apply.
     pub pre_existing_orphans: Vec<PreExistingOrphanEvidenceV1>,
+    /// Zero-document unclaimed namespaces carrying residual vector keys:
+    /// the exact content an UnclaimedNamespace acknowledgement must bind
+    /// (namespace token and key count), surfaced so the operator writes
+    /// consent from the report rather than reconstructing counts from the
+    /// stores.
+    pub unclaimed_namespace_residue: Vec<UnclaimedNamespaceResidueV1>,
     pub predicted_catalog_hash: Sha256ValueV1,
     pub predicted_attachment_hash: Sha256ValueV1,
     pub predicted_participant_hashes: BTreeMap<String, Sha256ValueV1>,
@@ -2670,6 +2676,16 @@ pub struct QuarantineCollectedV1 {
 pub struct MissingOptionalOwnerAcknowledgementV1 {
     pub resolution_id: String,
     pub owner_source_id: String,
+}
+
+/// One zero-document unclaimed namespace with residual vector keys, as the
+/// report surfaces it for the operator's acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnclaimedNamespaceResidueV1 {
+    pub observation_id: String,
+    pub namespace: String,
+    pub vector_key_count: u64,
 }
 
 /// Operator acknowledgement that a zero-document unclaimed namespace's
@@ -6870,6 +6886,7 @@ pub(crate) mod tests {
             required_resolutions: Vec::new(),
             refusals: Vec::new(),
             pre_existing_orphans: Vec::new(),
+            unclaimed_namespace_residue: Vec::new(),
             predicted_catalog_hash: post_image.predicted_hashes.catalog_hash.clone(),
             predicted_attachment_hash: post_image.predicted_hashes.attachment_hash.clone(),
             predicted_participant_hashes: post_image.predicted_hashes.participant_hashes.clone(),

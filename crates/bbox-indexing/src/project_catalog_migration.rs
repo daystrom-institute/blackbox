@@ -3961,6 +3961,24 @@ fn build_migration_report(
         .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
     let refusals = assessment.refusals.clone();
     let pre_existing_orphans = inventory.pre_existing_orphans.clone();
+    let unclaimed_namespace_residue = inventory
+        .legacy_commit_namespaces
+        .iter()
+        .filter(|namespace| {
+            matches!(
+                namespace.attribution,
+                crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Unclaimed
+            ) && namespace.commit_document_count == 0
+                && namespace.vector_key_count > 0
+        })
+        .map(
+            |namespace| crate::project_catalog_inventory::UnclaimedNamespaceResidueV1 {
+                observation_id: namespace.observation_id.clone(),
+                namespace: namespace.namespace.as_str().to_string(),
+                vector_key_count: namespace.vector_key_count,
+            },
+        )
+        .collect::<Vec<_>>();
     let report = ProjectCatalogMigrationReportV1 {
         version: 1,
         transaction_id: identities.transaction_id.clone(),
@@ -3994,6 +4012,7 @@ fn build_migration_report(
         required_resolutions: assessment.required_resolutions.clone(),
         refusals,
         pre_existing_orphans,
+        unclaimed_namespace_residue,
         predicted_catalog_hash: predicted.catalog_hash.clone(),
         predicted_attachment_hash: predicted.attachment_hash.clone(),
         predicted_participant_hashes: predicted.participant_hashes.clone(),
