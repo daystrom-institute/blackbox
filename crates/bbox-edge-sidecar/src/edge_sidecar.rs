@@ -73,6 +73,29 @@ pub struct EdgeKey {
 /// anything wrong with it. Digesting incrementally and decoding line by line
 /// keeps this capture's memory independent of lane size, and leaves
 /// `owner_source_unreadable` to mean what it says.
+/// The DURABLE lane predicate, shared by capture and the stamper's lane
+/// enumeration so the two halves cannot disagree about the owner's
+/// population. Top-level lanes and `observed/` are the durable rows the
+/// backfill owns; `derived/` and `materialized/` are rebuildable caches the
+/// daemon regenerates at will (a working host carries over a hundred
+/// gigabytes there), and treating them as owner evidence both blew the
+/// streaming pass budget and made every re-materialization read as the
+/// owner moving.
+fn durable_lane(relative: &Path) -> bool {
+    if relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("jsonl")
+    {
+        return false;
+    }
+    !matches!(
+        relative.components().next(),
+        Some(std::path::Component::Normal(first))
+            if first == "derived" || first == "materialized"
+    )
+}
+
 pub fn capture_project_catalog_owner_snapshot(
     edges_dir: &Path,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
@@ -104,12 +127,7 @@ pub fn capture_project_catalog_owner_snapshot(
         edges_dir,
         "transcript_edge",
         limits,
-        |relative| {
-            relative
-                .extension()
-                .and_then(|extension| extension.to_str())
-                == Some("jsonl")
-        },
+        durable_lane,
         |subsource_id: &str| TranscriptEdgeLaneDecoder::new(subsource_id, limits.max_rows),
         // The SAME row walk the stamper uses, so the two halves cannot disagree
         // about which rows exist or what they are called.
@@ -453,16 +471,14 @@ fn transcript_edge_lane_set(
         return Err(OWNER_SOURCE_MISSING);
     }
     Ok(
-        enumerate_regular_tree_nofollow(edges_dir, limits, |relative| {
-            relative.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-        })
-        .map_err(|error| error.code)?
-        .into_iter()
-        .map(|relative| {
-            let subsource_id = stable_subsource_id("transcript_edge", &relative);
-            (relative, subsource_id)
-        })
-        .collect(),
+        enumerate_regular_tree_nofollow(edges_dir, limits, durable_lane)
+            .map_err(|error| error.code)?
+            .into_iter()
+            .map(|relative| {
+                let subsource_id = stable_subsource_id("transcript_edge", &relative);
+                (relative, subsource_id)
+            })
+            .collect(),
     )
 }
 
@@ -2727,4 +2743,21 @@ mod project_catalog_snapshot_tests {
         assert!(error.contains("validating edge sidecar project id"));
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel\n");
     }
+}
+
+/// Capture and stamping share ONE durable-lane population: top-level
+/// lanes and observed/ are owner rows, derived/ and materialized/ are
+/// rebuildable caches that must be INVISIBLE here, or a working host's
+/// hundred-gigabyte cache tree blows the streaming budget and every
+/// re-materialization reads as the owner moving.
+#[test]
+fn derived_and_materialized_caches_are_not_owner_lanes() {
+    use std::path::Path;
+    assert!(durable_lane(Path::new("01c2a342.jsonl")));
+    assert!(durable_lane(Path::new("observed/01c2a342.jsonl")));
+    assert!(!durable_lane(Path::new("derived/01c2a342.jsonl")));
+    assert!(!durable_lane(Path::new(
+        "materialized/workspace/x/edges.jsonl"
+    )));
+    assert!(!durable_lane(Path::new("manifest-index.json")));
 }
