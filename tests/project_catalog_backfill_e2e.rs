@@ -1033,7 +1033,11 @@ impl Fixture {
         let project = self.project.clone();
         store
             .transact(epoch, |_catalog, attachments| {
-                let attachment_id = "att_44444444444444444444444444444444";
+                // The supersession key includes source_row_id: each minted
+                // relocation names its own attachment so two test bindings
+                // never collide as duplicate inventory source rows.
+                let attachment_id = format!("att_{binding_index:032x}");
+                let attachment_id = attachment_id.as_str();
                 let entry = LegacyPathLedgerEntry {
                     legacy_path_binding_id: LegacyPathBindingId::parse(format!(
                         "lpb_{binding_index:032x}"
@@ -1230,12 +1234,24 @@ fn a_relocation_minted_after_preflight_refuses_the_apply_and_not_the_verify() {
     let stale = fixture
         .apply(fixture.production_stamper())
         .expect_err("the predecessor moved under the reviewed artifacts");
-    assert_eq!(
-        stale.code,
-        "error.project_catalog_migration_artifact_identity"
-    );
+    // The report-staleness gate runs before the four-hash identity gate and
+    // catches the moved predecessor first; both are staleness-class
+    // refusals whose remedy is a fresh preflight. What this pin protects is
+    // that the apply REFUSES, not which of the two ordered gates names it.
+    assert_eq!(stale.code, "error.project_catalog_inventory_stale_report");
 
-    // The remedy: preflight again against the moved predecessor, then apply.
+    // The remedy is an EXPLICIT fresh preflight: the stale artifacts are the
+    // operator's to discard, never silently clobbered by a re-run, so a
+    // preflight reusing them refuses too.
+    let reused = fixture
+        .preflight(fixture.production_stamper())
+        .expect_err("stale artifacts must not be silently replaced");
+    assert_eq!(
+        reused.code,
+        "error.project_catalog_inventory_stale_resolution"
+    );
+    fs::remove_file(fixture.report_path()).unwrap();
+    fs::remove_file(fixture.resolution_path()).unwrap();
     assert_eq!(
         fixture.preflight(fixture.production_stamper()).unwrap(),
         DurableBackfillStatusV1::Clean
