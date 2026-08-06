@@ -1275,7 +1275,17 @@ struct MigrationRuntimeBindingsViewV1 {
     legacy_project_paths: BTreeMap<String, PathBuf>,
     checkout_paths: BTreeMap<String, PathBuf>,
     checkout_repositories: BTreeMap<String, StableGitRepository>,
-    legacy_selectors: BTreeMap<String, String>,
+    legacy_selectors: BTreeMap<String, LegacySelectorBindingViewV1>,
+}
+
+/// The host-local preimages of one legacy-selector observation: the literal the
+/// classifier matches on, and the owner row id the apply half must hand back to
+/// the owner. Neither can come from the canonical inventory, which holds only
+/// their digests.
+#[derive(Debug, Clone)]
+struct LegacySelectorBindingViewV1 {
+    literal: String,
+    source_row_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1295,6 +1305,12 @@ struct ClassifiedLegacyPathV1 {
     observation_id: String,
     planned_binding_id: LegacyPathBindingId,
     literal_selector: String,
+    /// The OWNER's row id, carried from the runtime binding to the ledger.
+    ///
+    /// The canonical inventory's `stable_row_id` is a one-way hash of this, so
+    /// it cannot be the thing handed back to an owner: the owner resolves ids it
+    /// minted itself, and no owner can invert a hash of one.
+    source_row_id: String,
     relationship: LegacyPathRelationshipV1,
     mapped_project_id: Option<ProjectId>,
 }
@@ -2277,10 +2293,15 @@ fn classify_legacy_paths(
     let mut unscoped_counts = BTreeMap::new();
     let mut refusals = Vec::new();
     for observed in &inventory.legacy_path_observations {
-        let literal = runtime
+        // A missing binding is a REFUSAL, never a skip. Without the binding this
+        // observation has no literal to classify and no owner row id to stamp,
+        // and quietly dropping it would report a complete migration that had
+        // silently abandoned an obligation.
+        let binding = runtime
             .legacy_selectors
             .get(&observed.observation_id)
             .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
+        let literal = &binding.literal;
         let literal_path = Path::new(literal);
         let selector_is_unsafe = !literal_path.is_absolute()
             || literal_path.components().any(|component| {
@@ -2303,6 +2324,7 @@ fn classify_legacy_paths(
                 observation_id: observed.observation_id.clone(),
                 planned_binding_id: planned_binding_id.clone(),
                 literal_selector: literal.clone(),
+                source_row_id: binding.source_row_id.clone(),
                 relationship: LegacyPathRelationshipV1::UnsafeSelector,
                 mapped_project_id: None,
             });
@@ -2439,6 +2461,7 @@ fn classify_legacy_paths(
             observation_id: observed.observation_id.clone(),
             planned_binding_id: planned_binding_id.clone(),
             literal_selector: literal.clone(),
+            source_row_id: binding.source_row_id.clone(),
             relationship,
             mapped_project_id,
         });
@@ -2959,7 +2982,13 @@ fn build_base_post_images(
                 legacy_path_binding_id: classified.planned_binding_id.clone(),
                 historical_path: classified.literal_selector.clone(),
                 source_store: legacy_store_kind_token(source.store_kind).to_string(),
-                source_row_id: source.stable_row_id.clone(),
+                // The OWNER's id, not the inventory's hash of it. The backfill
+                // hands this straight to the owner's stamp and read seams, and
+                // an owner can only resolve an id it minted: the canonical
+                // `stable_row_id` is a one-way hash, so writing it here made
+                // every obligation unresolvable and every live apply fail on its
+                // first stamp.
+                source_row_id: classified.source_row_id.clone(),
                 inventory_epoch: 1,
                 status: ledger_status,
             },
@@ -4468,7 +4497,15 @@ fn prepare_closed_migration(
         legacy_selectors: captured
             .runtime_bindings()
             .legacy_selectors()
-            .map(|(id, value)| (id.to_string(), value.to_string()))
+            .map(|(id, literal, source_row_id)| {
+                (
+                    id.to_string(),
+                    LegacySelectorBindingViewV1 {
+                        literal: literal.to_string(),
+                        source_row_id: source_row_id.to_string(),
+                    },
+                )
+            })
             .collect(),
     };
     let inventory = &captured.inventory;
@@ -6280,6 +6317,61 @@ mod tests {
 
     use super::*;
 
+    /// One runtime selector binding: the host-local literal plus the owner row
+    /// id the apply half will hand back to the owner. The fixture inventory's
+    /// single observation belongs to the knowledge owner, whose row ids are its
+    /// entry ids.
+    fn selector_view(literal: &str) -> LegacySelectorBindingViewV1 {
+        LegacySelectorBindingViewV1 {
+            literal: literal.to_string(),
+            source_row_id: "knowledge_1".to_string(),
+        }
+    }
+
+    /// F10: an observation whose runtime binding is gone is a REFUSAL, never a
+    /// skip.
+    ///
+    /// The binding is the only home of both host-local preimages: the literal
+    /// this classification matches on, and the owner row id the apply half must
+    /// hand back. Skipping the observation would drop a stamping obligation
+    /// silently and let the migration report itself complete with a row that
+    /// stays unstamped forever.
+    #[test]
+    fn a_lost_selector_binding_refuses_the_classification() {
+        let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+        let identities = build_persisted_identity_plan(
+            &inventory,
+            &assessment.resolved_project_scopes,
+            &assessment.retained_attachment_ids,
+            None,
+        )
+        .unwrap();
+        let mut runtime = MigrationRuntimeBindingsViewV1 {
+            legacy_project_store_bytes: Vec::new(),
+            legacy_project_store_was_missing: false,
+            legacy_project_paths: BTreeMap::new(),
+            checkout_paths: BTreeMap::new(),
+            checkout_repositories: BTreeMap::new(),
+            legacy_selectors: BTreeMap::from([(
+                "legacy_path_alpha".to_string(),
+                selector_view("/workspace/acme/alpha/src/Example.java"),
+            )]),
+        };
+        assert!(classify_legacy_paths(&inventory, &runtime, &identities).is_ok());
+
+        runtime.legacy_selectors.clear();
+        let error = classify_legacy_paths(&inventory, &runtime, &identities).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy selector runtime binding is missing"),
+            "unexpected refusal: {error}"
+        );
+    }
+
     fn run_git(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -6637,7 +6729,7 @@ mod tests {
             checkout_repositories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
-                "/workspace/acme/alpha/src/Example.java".to_string(),
+                selector_view("/workspace/acme/alpha/src/Example.java"),
             )]),
         };
 
@@ -6734,7 +6826,7 @@ mod tests {
             checkout_repositories: BTreeMap::new(),
             legacy_selectors: BTreeMap::from([(
                 "legacy_path_alpha".to_string(),
-                "/workspace/acme/services/alpha/src/Example.java".to_string(),
+                selector_view("/workspace/acme/services/alpha/src/Example.java"),
             )]),
         };
 
@@ -6753,6 +6845,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(base.legacy_binding_report, contained.report_rows);
+
+        // F10: the ledger carries the OWNER's row id, not the inventory's
+        // one-way hash of it. The backfill hands this straight to the owner's
+        // stamp seam, and an owner can only resolve an id it minted.
+        let ledger = base
+            .attachments
+            .legacy_path_bindings
+            .values()
+            .next()
+            .expect("the mapped path produced a ledger binding");
+        assert_eq!(ledger.source_row_id, "knowledge_1");
+        assert_ne!(
+            ledger.source_row_id,
+            inventory.legacy_path_observations[0].stable_row_id
+        );
 
         let mut refused_assessment = assessment.clone();
         refused_assessment.refusals.push(semantic_refusal(
@@ -6773,7 +6880,7 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/services/alpha".to_string(),
+            selector_view("/workspace/acme/services/alpha"),
         );
         let mut exact_inventory = inventory.clone();
         exact_inventory.legacy_path_observations[0].selector_digest =
@@ -6787,7 +6894,7 @@ mod tests {
         );
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/outside/unscoped".to_string(),
+            selector_view("/outside/unscoped"),
         );
         let mut unscoped_inventory = inventory.clone();
         unscoped_inventory.legacy_path_observations[0].selector_digest =
@@ -6806,7 +6913,7 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/services/alpha/src/Example.java".to_string(),
+            selector_view("/workspace/acme/services/alpha/src/Example.java"),
         );
         let mut missing_inventory = inventory.clone();
         missing_inventory.legacy_projects[0].path_status =
@@ -6831,7 +6938,7 @@ mod tests {
 
         runtime.legacy_selectors.insert(
             "legacy_path_alpha".to_string(),
-            "/workspace/acme/services/alpha/../beta".to_string(),
+            selector_view("/workspace/acme/services/alpha/../beta"),
         );
         let mut unsafe_inventory = inventory.clone();
         unsafe_inventory.legacy_path_observations[0].selector_digest =
