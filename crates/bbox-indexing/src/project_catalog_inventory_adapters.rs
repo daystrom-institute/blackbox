@@ -3971,18 +3971,28 @@ fn empty_set_commitment(domain: &[u8]) -> Sha256ValueV1 {
     Sha256ValueV1::digest(domain)
 }
 
+/// The most history a cursor-lineage reachability walk will enumerate
+/// before declaring the proof out of bounds (which reads as UNPROVED, never
+/// as attribution).
+const MAX_LINEAGE_REACHABILITY_COMMITS: usize = 250_000;
+
 /// MEMBERSHIP proof for the cursor-lineage attribution class: every commit
-/// sha the index holds under the namespace must resolve in the candidate
-/// repository. One resolving cursor alone is not enough evidence, because a
-/// canonical path reused by an unrelated later repo re-mints the same
-/// path-fallback token while the namespace still holds the earlier repo's
-/// history (reviewer finding S2); a namespace whose entire membership
-/// resolves cannot be carrying history the repository does not have. An
-/// absent or empty namespace proves nothing.
+/// sha the index holds under the namespace must be REACHABLE from the
+/// candidate checkout's captured verified head. One resolving cursor alone
+/// is not enough evidence, because a canonical path reused by an unrelated
+/// later repo re-mints the same path-fallback token while the namespace
+/// still holds the earlier repo's history (reviewer finding S2); and raw
+/// object-database existence is not enough either, because a briefly
+/// fetched then deleted ref or an alternate object store leaves the earlier
+/// repo's commits ADDRESSABLE without being part of this repository's
+/// authoritative history (round-2 finding R2-3). Ancestry from the captured
+/// head is the lineage claim itself. An absent or empty namespace, an
+/// unwalkable history, or an over-bound walk proves nothing.
 fn namespace_membership_proven(
     corpus: &CorpusOwnerMigrationSnapshotV1,
     namespace_token: &str,
     repository: &StableGitRepository,
+    head_oid: &str,
 ) -> bool {
     let Some(namespace) = corpus
         .index
@@ -3995,9 +4005,15 @@ fn namespace_membership_proven(
     if namespace.commit_shas.is_empty() {
         return false;
     }
-    namespace.commit_shas.iter().all(
-        |sha| matches!(repository.resolve_commit_oid(sha), Ok(Some(resolved)) if resolved == *sha),
-    )
+    let Ok(Some(reachable)) =
+        repository.reachable_commit_set(head_oid, MAX_LINEAGE_REACHABILITY_COMMITS)
+    else {
+        return false;
+    };
+    namespace
+        .commit_shas
+        .iter()
+        .all(|sha| reachable.contains(sha))
 }
 
 fn namespace_attribution(
@@ -4199,9 +4215,10 @@ fn capture_git_metadata_lane(
         let Some(repository) = checkout.repository.as_ref() else {
             continue;
         };
-        if let Ok(Some(head)) = repository.verified_head()
-            && let Ok(Some(first_commit)) = repository.first_commit_oid(head.oid())
-        {
+        let Ok(Some(head)) = repository.verified_head() else {
+            continue;
+        };
+        if let Ok(Some(first_commit)) = repository.first_commit_oid(head.oid()) {
             first_commit_repo_ids
                 .entry(bbox_corpus_core::entity_ref::repo_id_for_first_commit(
                     &first_commit,
@@ -4212,7 +4229,7 @@ fn capture_git_metadata_lane(
         if let Some(repo_token) = record_repo_id_by_project.get(attachment.project_id.as_str())
             && let Some(cursor_sha) = ingest_cursor_by_project.get(attachment.project_id.as_str())
             && matches!(repository.resolve_commit_oid(cursor_sha), Ok(Some(_)))
-            && namespace_membership_proven(corpus, repo_token, repository)
+            && namespace_membership_proven(corpus, repo_token, repository, head.oid())
         {
             first_commit_repo_ids
                 .entry((*repo_token).to_string())
@@ -5191,10 +5208,13 @@ mod tests {
     }
 
     /// Cursor-lineage attribution requires the WHOLE namespace membership to
-    /// resolve in the candidate repository. A reused canonical path re-mints
-    /// the same path-fallback token for an unrelated later repo, and its
-    /// cursor resolves there; the earlier repo's history in the namespace
-    /// must keep the attribution unproven (reviewer finding S2).
+    /// be REACHABLE from the captured head of the candidate repository. A
+    /// reused canonical path re-mints the same path-fallback token for an
+    /// unrelated later repo (reviewer finding S2), and raw object-database
+    /// existence is satisfied by a briefly fetched then deleted ref whose
+    /// objects remain addressable without being part of the repository's
+    /// authoritative history (round-2 finding R2-3): both must keep the
+    /// attribution unproven.
     #[test]
     fn namespace_membership_requires_every_sha_to_resolve() {
         let directory = tempfile::tempdir().unwrap();
@@ -5211,10 +5231,27 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>();
         assert_eq!(shas.len(), 2);
+        // The R2-3 shape: a commit on a side branch whose ref is deleted
+        // stays ADDRESSABLE in the object database while being unreachable
+        // from the authoritative head.
+        run_git(&root, &["checkout", "--quiet", "-b", "ephemeral"]);
+        std::fs::write(root.join("c.txt"), "c").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "--quiet", "-m", "ephemeral"]);
+        let unreachable = run_git(&root, &["rev-parse", "HEAD"]);
+        run_git(&root, &["checkout", "--quiet", "-"]);
+        run_git(&root, &["branch", "--quiet", "-D", "ephemeral"]);
         let caller = bbox_corpus_core::json_store::NofollowDirectory::open_existing(&root)
             .unwrap()
             .unwrap();
         let repository = open_stable_git_repository(&caller).unwrap().unwrap();
+        let head = repository.verified_head().unwrap().unwrap();
+        // Addressable but unreachable: the raw existence probe succeeds,
+        // which is exactly why existence must not prove.
+        assert!(matches!(
+            repository.resolve_commit_oid(&unreachable),
+            Ok(Some(resolved)) if resolved == unreachable
+        ));
 
         let snapshot_with = |commit_shas: Vec<String>| {
             use bbox_corpus_index::index::migration_inventory::CorpusCommitNamespaceV1;
@@ -5232,7 +5269,8 @@ mod tests {
         assert!(namespace_membership_proven(
             &complete,
             "feedface",
-            &repository
+            &repository,
+            head.oid()
         ));
 
         let mut foreign = shas.clone();
@@ -5241,20 +5279,33 @@ mod tests {
         assert!(!namespace_membership_proven(
             &mixed,
             "feedface",
-            &repository
+            &repository,
+            head.oid()
+        ));
+
+        let mut addressable = shas.clone();
+        addressable.push(unreachable.clone());
+        let dangling = snapshot_with(addressable);
+        assert!(!namespace_membership_proven(
+            &dangling,
+            "feedface",
+            &repository,
+            head.oid()
         ));
 
         let empty = snapshot_with(Vec::new());
         assert!(!namespace_membership_proven(
             &empty,
             "feedface",
-            &repository
+            &repository,
+            head.oid()
         ));
 
         assert!(!namespace_membership_proven(
             &complete,
             "0badf00d",
-            &repository
+            &repository,
+            head.oid()
         ));
     }
 

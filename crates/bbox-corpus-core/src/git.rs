@@ -176,6 +176,58 @@ impl StableGitRepository {
         }
     }
 
+    /// Every commit reachable from `from_oid`, or `None` when the history
+    /// exceeds `max_commits` and reachability therefore cannot be proved
+    /// within bounds. Callers using this as attribution evidence must treat
+    /// `None` as UNPROVED, never as error or as proof: raw object-database
+    /// existence (`resolve_commit_oid`) is satisfied by unreachable fetched
+    /// objects and alternates, so lineage claims need ancestry from a
+    /// captured authoritative ref, not addressability.
+    pub fn reachable_commit_set(
+        &self,
+        from_oid: &str,
+        max_commits: usize,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        validate_full_object_id(from_oid)?;
+        #[cfg(not(unix))]
+        {
+            let _ = max_commits;
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            // One line per commit: 40 hex + newline; one extra commit's worth
+            // detects overflow without an unbounded read.
+            let bound = max_commits
+                .saturating_add(1)
+                .saturating_mul(41)
+                .min(64 * 1024 * 1024);
+            let bytes = run_stable_repository_stdout_bounded(
+                &self.authority,
+                &["rev-list", from_oid],
+                "walking reachable commits",
+                bound,
+            )?;
+            let mut commits = std::collections::BTreeSet::new();
+            for line in bytes.split(|byte| *byte == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(line) = std::str::from_utf8(line) else {
+                    return Ok(None);
+                };
+                if validate_full_object_id(line).is_err() {
+                    return Ok(None);
+                }
+                commits.insert(line.to_string());
+                if commits.len() > max_commits {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(commits))
+        }
+    }
+
     pub fn first_commit_oid(&self, head_oid: &str) -> Result<Option<String>> {
         validate_full_object_id(head_oid)?;
         #[cfg(not(unix))]
