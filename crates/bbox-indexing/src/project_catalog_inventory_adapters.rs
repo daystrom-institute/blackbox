@@ -67,9 +67,8 @@ use crate::project_catalog_inventory::{
     MutableInventorySourceEvidenceV1, MutableInventorySourceKindV1,
     MutableInventorySourceLocatorV1, OwnerSubsourceEvidenceV1,
     PROJECT_CATALOG_INVENTORY_VERSION_V1, PreExistingOrphanEvidenceV1,
-    ProjectScopedRefObservationV1,
-    ProjectScopedRefStoreKindV1, PublisherPinObservationV1, QuarantinedGenerationObservationV1,
-    RecordedAuthorityEvidenceMemberV1, RepoGroupingProofV1,
+    ProjectScopedRefObservationV1, ProjectScopedRefStoreKindV1, PublisherPinObservationV1,
+    QuarantinedGenerationObservationV1, RecordedAuthorityEvidenceMemberV1, RepoGroupingProofV1,
     RetainedGenerationOwnerResolutionObservationV1, Sha256ValueV1,
     UnboundPublisherPinObservationV1, UnboundPublisherPinReasonV1, V1ProjectCatalogInventory,
     digest_path, mutable_source_row_set_hash,
@@ -3307,11 +3306,14 @@ fn capture_project_scoped_refs_lane(
         // is independent of the snapshot's emission order.
         let mut per_project: BTreeMap<String, BTreeSet<(&str, &str, &str)>> = BTreeMap::new();
         for row in &vectors.project_scoped_refs {
-            per_project.entry(row.project_id.clone()).or_default().insert((
-                row.route.as_str(),
-                row.entity_ref.as_str(),
-                row.content_hash.as_str(),
-            ));
+            per_project
+                .entry(row.project_id.clone())
+                .or_default()
+                .insert((
+                    row.route.as_str(),
+                    row.entity_ref.as_str(),
+                    row.content_hash.as_str(),
+                ));
         }
         for (project, entries) in per_project {
             let project_id = ProjectId::parse(project.clone())
@@ -5745,11 +5747,8 @@ mod tests {
     #[test]
     fn a_vacuously_missing_optional_owner_keeps_the_lane_complete_with_rows() {
         let project = ProjectId::parse("project-a").unwrap();
-        let observation_id = stable_observation_id_v1(
-            "inventory-target",
-            &[b"artifact", b"artifact_1"],
-        )
-        .unwrap();
+        let observation_id =
+            stable_observation_id_v1("inventory-target", &[b"artifact", b"artifact_1"]).unwrap();
         let lane = lane_capture(
             ImmutableInventoryLaneKindV1::InventoryTargets,
             "inventory-targets",
@@ -5824,8 +5823,7 @@ mod tests {
         ]);
         let mut orphans = Vec::new();
         let lane =
-            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
-                .unwrap();
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans).unwrap();
         let tantivy_rows: Vec<_> = lane
             .rows
             .iter()
@@ -5843,13 +5841,11 @@ mod tests {
         // with multiplicity, so a dropped or duplicated document cannot
         // hide behind an unchanged row.
         let replay =
-            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
-                .unwrap();
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans).unwrap();
         assert_eq!(lane.rows, replay.rows);
         corpus.index.project_scoped_refs[0].document_count = 100_002;
         let moved =
-            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
-                .unwrap();
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans).unwrap();
         let moved_alpha = moved
             .rows
             .iter()
@@ -5889,8 +5885,7 @@ mod tests {
         let registered = BTreeSet::from([ProjectId::parse("project-a").unwrap()]);
         let mut orphans = Vec::new();
         let lane =
-            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans)
-                .unwrap();
+            capture_project_scoped_refs_lane(&corpus, &vectors, &registered, &mut orphans).unwrap();
         assert_eq!(
             lane.rows
                 .iter()
@@ -5900,7 +5895,10 @@ mod tests {
         );
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].project_id.as_str(), "project-gone");
-        assert_eq!(orphans[0].owner_kind, ImmutableInventoryOwnerKindV1::Tantivy);
+        assert_eq!(
+            orphans[0].owner_kind,
+            ImmutableInventoryOwnerKindV1::Tantivy
+        );
         assert_eq!(orphans[0].row_count, 7);
     }
 

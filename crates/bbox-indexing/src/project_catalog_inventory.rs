@@ -6453,12 +6453,11 @@ pub(crate) mod tests {
                 store_kind: LegacyPathStoreKindV1::Knowledge,
                 // The commitment production mints: the one-way hash of the
                 // owner's own row id, which travels host-local (F10).
-                stable_row_id:
-                    crate::project_catalog_inventory_adapters::legacy_row_stable_id(
-                        LegacyPathStoreKindV1::Knowledge,
-                        "knowledge_1",
-                    )
-                    .unwrap(),
+                stable_row_id: crate::project_catalog_inventory_adapters::legacy_row_stable_id(
+                    LegacyPathStoreKindV1::Knowledge,
+                    "knowledge_1",
+                )
+                .unwrap(),
                 selector_kind: LegacySelectorKindV1::ProjectAndRelativePath,
                 selector_digest: digest_path("/workspace/acme/alpha/src/Example.java"),
                 member_row_count: 1,

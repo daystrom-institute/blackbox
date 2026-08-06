@@ -316,18 +316,15 @@ fn capture_code_metadata(
     // foreign version next to a current-schema index is an inconsistency the
     // inventory refuses; the fixtures only ever held the bare pre-P3-E shape,
     // which is why the envelope refused on the first real host.
-    let metadata: BTreeMap<String, FileMeta> =
-        match super::passes::decode_versioned_meta(&bytes) {
-            super::passes::VersionedFileMetaDecodeV1::Current(rows) => {
-                rows.into_iter().collect()
-            }
-            super::passes::VersionedFileMetaDecodeV1::ForeignVersion(_) => {
-                return corrupt_code_metadata("code_index_metadata_version_foreign");
-            }
-            super::passes::VersionedFileMetaDecodeV1::Unversioned => {
-                return corrupt_code_metadata("code_index_metadata_decode_failed");
-            }
-        };
+    let metadata: BTreeMap<String, FileMeta> = match super::passes::decode_versioned_meta(&bytes) {
+        super::passes::VersionedFileMetaDecodeV1::Current(rows) => rows.into_iter().collect(),
+        super::passes::VersionedFileMetaDecodeV1::ForeignVersion(_) => {
+            return corrupt_code_metadata("code_index_metadata_version_foreign");
+        }
+        super::passes::VersionedFileMetaDecodeV1::Unversioned => {
+            return corrupt_code_metadata("code_index_metadata_decode_failed");
+        }
+    };
     if metadata.len() > limits.max_code_metadata_rows {
         return corrupt_code_metadata("code_index_metadata_row_limit");
     }
@@ -1222,18 +1219,11 @@ mod tests {
         let mut activation_doc = TantivyDocument::new();
         activation_doc.add_text(fields.doc_type, "code_source_activation");
         activation_doc.add_text(fields.project_id, "project-a");
-        activation_doc.add_text(
-            fields.entity_id,
-            local_activation_marker("project-a"),
-        );
+        activation_doc.add_text(fields.entity_id, local_activation_marker("project-a"));
         writer.add_document(activation_doc).unwrap();
         writer.commit().unwrap();
         index.reader_reload_for_test();
-        fs::write(
-            index_path.join("_meta.json"),
-            br#"{"version":2,"rows":{}}"#,
-        )
-        .unwrap();
+        fs::write(index_path.join("_meta.json"), br#"{"version":2,"rows":{}}"#).unwrap();
         drop(writer);
         drop(index);
 
@@ -1274,18 +1264,11 @@ mod tests {
         let mut activation_doc = TantivyDocument::new();
         activation_doc.add_text(fields.doc_type, "code_source_activation");
         activation_doc.add_text(fields.project_id, "project-a");
-        activation_doc.add_text(
-            fields.entity_id,
-            local_activation_marker("project-b"),
-        );
+        activation_doc.add_text(fields.entity_id, local_activation_marker("project-b"));
         writer.add_document(activation_doc).unwrap();
         writer.commit().unwrap();
         index.reader_reload_for_test();
-        fs::write(
-            index_path.join("_meta.json"),
-            br#"{"version":2,"rows":{}}"#,
-        )
-        .unwrap();
+        fs::write(index_path.join("_meta.json"), br#"{"version":2,"rows":{}}"#).unwrap();
         drop(writer);
         drop(index);
 
@@ -1363,13 +1346,12 @@ mod tests {
             discharge_project_rows(&index_path, &git, "project-a", &["shared-selector".into()])
                 .unwrap();
         assert_eq!(removed, 1);
-        let remaining =
-            match super::super::passes::decode_versioned_meta(
-                &fs::read(index_path.join("_meta.json")).unwrap(),
-            ) {
-                super::super::passes::VersionedFileMetaDecodeV1::Current(rows) => rows,
-                _ => panic!("discharge must rewrite the current envelope"),
-            };
+        let remaining = match super::super::passes::decode_versioned_meta(
+            &fs::read(index_path.join("_meta.json")).unwrap(),
+        ) {
+            super::super::passes::VersionedFileMetaDecodeV1::Current(rows) => rows,
+            _ => panic!("discharge must rewrite the current envelope"),
+        };
         assert!(remaining.contains_key("retained"));
         assert!(!remaining.contains_key("owned"));
     }
