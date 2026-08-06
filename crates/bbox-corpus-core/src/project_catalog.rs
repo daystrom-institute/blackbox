@@ -1412,16 +1412,15 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
             // reaches it by predating the evidence entirely, and NOTHING short
             // of the owner's own walk can supply what it is missing.
             if !legacy_ledger_evidence_is_reconstructable(&binding.source_store) {
+                // The detail is capped by `bounded_detail`; the remedy
+                // sentence leads so no truncation can eat it.
                 return Err(ProjectCatalogError::new(
                     "error.project_catalog_legacy_evidence_unreconstructable",
                     format!(
-                        "legacy path binding {key} names source {} and carries no usable member \
-                         evidence. That source stands for a GROUP of owner rows whose size only \
-                         the owner's own confined walk can know, so it cannot be reconstructed \
-                         here and inventing one would refuse every later stamp forever. Discard \
-                         this migrated catalog pair and re-run the project-catalog migration from \
-                         its v1 predecessor, which recaptures every owner's evidence at capture \
-                         time.",
+                        "re-run the project-catalog migration from the v1 predecessor after \
+                         discarding this migrated pair: binding {key} names group source {} \
+                         with no member evidence, which only the owner's own walk can supply; \
+                         inventing it would refuse every later stamp forever.",
                         binding.source_store
                     ),
                 ));
