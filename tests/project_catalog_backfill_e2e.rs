@@ -56,7 +56,7 @@ use bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
 use bbox_indexing::project_catalog_backfill::{
-    DurableBackfillApplyOutcomeV1, DurableBackfillApplyRequestV1,
+    ATTACHMENT_RELOCATION_SOURCE, DurableBackfillApplyOutcomeV1, DurableBackfillApplyRequestV1,
     DurableBackfillPreflightRequestV1, DurableBackfillStatusV1, DurableBackfillVerifyReceiptV1,
     DurableBackfillVerifyRequestV1, LegacyRowObservationV1, LegacyRowOwnerReaderV1,
     LegacyRowStampCoverageV1, LegacyRowStampOutcomeV1, LegacyRowStamperV1,
@@ -1022,6 +1022,43 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Append the ledger binding an attachment RELOCATION mints, byte for byte
+    /// as `project_catalog_admin` writes one when a checkout moves.
+    ///
+    /// It is Mapped, like an owner obligation, and it names an attachment id in
+    /// `source_row_id`, which no owner holds and none ever will.
+    fn add_relocation_binding(&self, binding_index: u128) {
+        let store = ProjectCatalogStore::open_existing(self.layout.projects_path()).unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        let project = self.project.clone();
+        store
+            .transact(epoch, |_catalog, attachments| {
+                let attachment_id = "att_44444444444444444444444444444444";
+                let entry = LegacyPathLedgerEntry {
+                    legacy_path_binding_id: LegacyPathBindingId::parse(format!(
+                        "lpb_{binding_index:032x}"
+                    ))
+                    .unwrap(),
+                    historical_path: format!("/host/checkouts/relocated{binding_index}"),
+                    source_store: ATTACHMENT_RELOCATION_SOURCE.to_string(),
+                    source_row_id: attachment_id.to_string(),
+                    member_row_count: 1,
+                    member_commitment_sha256: singleton_selector_members(attachment_id)
+                        .commitment_sha256,
+                    inventory_epoch: 1,
+                    status: LegacyPathBindingStatus::Mapped {
+                        project_id: project.clone(),
+                        relationship: LegacyPathRelationship::Root,
+                    },
+                };
+                attachments
+                    .legacy_path_bindings
+                    .insert(entry.legacy_path_binding_id.clone(), entry);
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// The completion journal this fixture's apply published, as raw JSON.
     fn journal_path(&self) -> PathBuf {
         self.layout
@@ -1115,6 +1152,99 @@ fn the_production_stamper_backfills_two_stores_end_to_end() {
         Some(stamped.as_str())
     );
 
+    let verify = fixture.verify().unwrap();
+    assert_eq!(verify.journal_stamp_total, 2);
+    assert_eq!(verify.observed_mappable_total, 2);
+}
+
+/// R2-2. A host that has ever RELOCATED an attachment can still run its
+/// backfill, end to end.
+///
+/// Production mints a mapped ledger binding whose `source_store` is
+/// `attachment-relocation` whenever a checkout moves, so path-only rows keep
+/// resolving at the old path. It is not an owner row and never can be: no owner
+/// holds it, so nothing can stamp it and nothing can be asked about it. Treating
+/// every non-owner token as a defect meant the mere existence of one refused
+/// planning and refused verification, on a record that carries no obligation.
+///
+/// It rides through instead: retained, hashed into the predecessor the plan is
+/// bound to, and counted in NEITHER the mappable population nor the quarantine.
+#[test]
+fn a_relocation_binding_rides_through_preflight_apply_and_verify() {
+    let fixture = Fixture::new();
+    fixture.add_relocation_binding(9);
+
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    fixture.apply(fixture.production_stamper()).unwrap();
+
+    let verify = fixture.verify().unwrap();
+    // EXACTLY the counts of the fixture without the relocation binding: the two
+    // mapped owner rows. A relocation counted as mappable would have demanded a
+    // stamp no owner could perform; counted as unmappable it would have grown a
+    // quarantine that no disposition could ever clear.
+    assert_eq!(verify.journal_stamp_total, 2);
+    assert_eq!(verify.observed_mappable_total, 2);
+    assert_eq!(
+        fixture.stamped(Owner::Knowledge).as_deref(),
+        Some(fixture.project.as_str())
+    );
+
+    // And it is still in the ledger afterwards, exactly as read: the backfill
+    // excludes it from the owner population without editing it away.
+    let store = ProjectCatalogStore::open_existing(fixture.layout.projects_path()).unwrap();
+    let state = store.snapshot().unwrap();
+    let binding = state
+        .attachments()
+        .legacy_path_bindings
+        .get(&LegacyPathBindingId::parse(format!("lpb_{:032x}", 9)).unwrap())
+        .expect("the relocation binding survives the backfill unchanged");
+    assert_eq!(binding.source_store, ATTACHMENT_RELOCATION_SOURCE);
+}
+
+/// A relocation minted BETWEEN preflight and apply is refused as stale, and
+/// that is correct.
+///
+/// The refusal is not about relocations. The backfill's whole safety story is
+/// that a reviewed plan may only be applied against the exact predecessor pair
+/// it was computed from, and the four-hash identity gate enforces it over the
+/// WHOLE attachment snapshot. Excluding relocation bindings from that hash to
+/// make this case pass would mean a concurrent relocation could land unnoticed
+/// between review and mutation, which is the opposite of the property the gate
+/// exists for. The remedy is the ordinary one: re-run preflight.
+///
+/// After apply, the same binding is harmless: verify reads the durable ledger
+/// rather than an artifact, and a record carrying no obligation changes no
+/// count it compares.
+#[test]
+fn a_relocation_minted_after_preflight_refuses_the_apply_and_not_the_verify() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+
+    fixture.add_relocation_binding(9);
+    let stale = fixture
+        .apply(fixture.production_stamper())
+        .expect_err("the predecessor moved under the reviewed artifacts");
+    assert_eq!(
+        stale.code,
+        "error.project_catalog_migration_artifact_identity"
+    );
+
+    // The remedy: preflight again against the moved predecessor, then apply.
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    fixture.apply(fixture.production_stamper()).unwrap();
+
+    // A relocation minted AFTER the apply is not a verify problem: it carries
+    // no obligation, so it moves none of the counts verify compares.
+    fixture.add_relocation_binding(10);
     let verify = fixture.verify().unwrap();
     assert_eq!(verify.journal_stamp_total, 2);
     assert_eq!(verify.observed_mappable_total, 2);

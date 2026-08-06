@@ -596,8 +596,7 @@ pub enum LegacyPathBindingStatus {
     Quarantined {},
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct LegacyPathLedgerEntry {
     pub legacy_path_binding_id: LegacyPathBindingId,
     pub historical_path: String,
@@ -619,6 +618,71 @@ pub struct LegacyPathLedgerEntry {
     pub member_commitment_sha256: String,
     pub inventory_epoch: u64,
     pub status: LegacyPathBindingStatus,
+}
+
+/// Decode a ledger entry written by ANY version of this schema.
+///
+/// The member evidence is required in everything this binary writes, but it did
+/// not exist before, and a host that has ever relocated an attachment already
+/// has a nonempty ledger. A strict derive would refuse to decode that host's
+/// attachment snapshot outright, before a migration or backfill could run at
+/// all, which turns an additive field into an unopenable store.
+///
+/// Absence is therefore read as the SINGLETON evidence the entry always
+/// implied: one row, committed over its own `source_row_id`. That is exactly
+/// what every pre-existing binding meant, because per-row obligations were the
+/// only shape that existed when they were written.
+///
+/// Absence is distinguished from a written zero on purpose. Normalization
+/// applies ONLY when both halves are missing; a partially written or
+/// explicitly zeroed pair is left as read and refused by
+/// [`AttachmentSnapshotV1::validate`], so a corrupt or truncated entry cannot
+/// be laundered into valid-looking evidence. Serialization always emits both
+/// fields, so nothing this binary writes is ever ambiguous.
+impl<'de> Deserialize<'de> for LegacyPathLedgerEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OnDisk {
+            legacy_path_binding_id: LegacyPathBindingId,
+            historical_path: String,
+            source_store: String,
+            source_row_id: String,
+            #[serde(default)]
+            member_row_count: Option<u64>,
+            #[serde(default)]
+            member_commitment_sha256: Option<String>,
+            inventory_epoch: u64,
+            status: LegacyPathBindingStatus,
+        }
+
+        let entry = OnDisk::deserialize(deserializer)?;
+        let (member_row_count, member_commitment_sha256) =
+            match (entry.member_row_count, entry.member_commitment_sha256) {
+                (None, None) => {
+                    let members = crate::project_catalog_snapshot::singleton_selector_members(
+                        &entry.source_row_id,
+                    );
+                    (members.row_count, members.commitment_sha256)
+                }
+                // Anything else is taken as written. A missing half becomes the
+                // invalid value it already is, and validation names it.
+                (count, commitment) => (count.unwrap_or_default(), commitment.unwrap_or_default()),
+            };
+        Ok(Self {
+            legacy_path_binding_id: entry.legacy_path_binding_id,
+            historical_path: entry.historical_path,
+            source_store: entry.source_store,
+            source_row_id: entry.source_row_id,
+            member_row_count,
+            member_commitment_sha256,
+            inventory_epoch: entry.inventory_epoch,
+            status: entry.status,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1294,7 +1358,12 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
         {
             return Err(ProjectCatalogError::new(
                 "error.project_catalog_invalid_field",
-                format!("legacy path binding {key} member evidence is invalid"),
+                format!(
+                    "legacy path binding {key} member evidence is invalid: an entry written \
+                     before this evidence existed must omit BOTH fields, which decode fills \
+                     with singleton evidence; a partial or zeroed pair cannot be reconstructed \
+                     and must be repaired at the source"
+                ),
             ));
         }
         if binding.inventory_epoch == 0 {
@@ -3577,5 +3646,118 @@ mod tests {
             catalog.validate().unwrap_err().code(),
             "error.project_catalog_invalid_ambiguity"
         );
+    }
+
+    /// One attachment snapshot exactly as a host wrote it BEFORE the member
+    /// evidence existed: a relocation binding an ordinary checkout move minted,
+    /// and an owner-row binding from the Phase 5 era.
+    fn pre_evidence_attachment_snapshot() -> String {
+        r#"{
+  "version": 1,
+  "epoch": 4,
+  "attachments": {},
+  "scope_migration_proofs": {},
+  "legacy_path_bindings": {
+    "lpb_11111111111111111111111111111111": {
+      "legacy_path_binding_id": "lpb_11111111111111111111111111111111",
+      "historical_path": "/host/checkouts/alpha",
+      "source_store": "attachment-relocation",
+      "source_row_id": "att_44444444444444444444444444444444",
+      "inventory_epoch": 3,
+      "status": {
+        "kind": "mapped",
+        "project_id": "a1b2c3d4",
+        "relationship": "root"
+      }
+    },
+    "lpb_22222222222222222222222222222222": {
+      "legacy_path_binding_id": "lpb_22222222222222222222222222222222",
+      "historical_path": "/host/checkouts/beta",
+      "source_store": "knowledge",
+      "source_row_id": "kb1",
+      "inventory_epoch": 3,
+      "status": {
+        "kind": "unscoped"
+      }
+    }
+  }
+}
+"#
+        .to_string()
+    }
+
+    /// R2-1. A snapshot written before the member evidence existed must still
+    /// OPEN.
+    ///
+    /// The evidence is required in everything this binary writes, but any host
+    /// that has ever relocated an attachment already has a nonempty ledger, and
+    /// a strict decode would refuse that host's attachment store outright,
+    /// before a migration or a backfill could run at all. Absence is read as
+    /// the singleton evidence the entry always implied: one row, committed over
+    /// its own `source_row_id`.
+    #[test]
+    fn a_pre_evidence_snapshot_decodes_with_derived_singleton_evidence() {
+        let snapshot =
+            decode_attachment_snapshot(pre_evidence_attachment_snapshot().as_bytes()).unwrap();
+        assert_eq!(snapshot.legacy_path_bindings.len(), 2);
+
+        for (source_row_id, binding_id) in [
+            (
+                "att_44444444444444444444444444444444",
+                "lpb_11111111111111111111111111111111",
+            ),
+            ("kb1", "lpb_22222222222222222222222222222222"),
+        ] {
+            let binding = snapshot
+                .legacy_path_bindings
+                .get(&LegacyPathBindingId::parse(binding_id).unwrap())
+                .expect("both legacy bindings survive the decode");
+            let derived =
+                crate::project_catalog_snapshot::singleton_selector_members(source_row_id);
+            assert_eq!(binding.member_row_count, 1);
+            assert_eq!(binding.member_commitment_sha256, derived.commitment_sha256);
+        }
+
+        // And what we write back is unambiguous: both fields are emitted, so a
+        // re-read never has to guess again.
+        let encoded = String::from_utf8(encode_attachment_snapshot(&snapshot).unwrap()).unwrap();
+        assert_eq!(encoded.matches("\"member_row_count\"").count(), 2);
+        assert_eq!(encoded.matches("\"member_commitment_sha256\"").count(), 2);
+        assert_eq!(
+            decode_attachment_snapshot(encoded.as_bytes()).unwrap(),
+            snapshot,
+            "the normalized snapshot round-trips unchanged"
+        );
+    }
+
+    /// The normalization is for ABSENCE, never for a written value. A zeroed or
+    /// half-written pair cannot be reconstructed, so it is refused rather than
+    /// laundered into valid-looking evidence.
+    #[test]
+    fn written_member_evidence_is_never_normalized_away() {
+        for injected in [
+            r#""member_row_count": 0,"#,
+            r#""member_row_count": 0,
+      "member_commitment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+            r#""member_commitment_sha256": "not-a-digest","#,
+            // A count without its commitment is exactly as unreconstructable as
+            // a commitment without its count.
+            r#""member_row_count": 2,"#,
+        ] {
+            let raw = pre_evidence_attachment_snapshot().replace(
+                r#"      "source_row_id": "kb1","#,
+                &format!("      \"source_row_id\": \"kb1\",\n      {injected}"),
+            );
+            let error = decode_attachment_snapshot(raw.as_bytes()).unwrap_err();
+            assert_eq!(
+                error.code(),
+                "error.project_catalog_invalid_field",
+                "unexpected refusal for {injected}: {error}"
+            );
+            assert!(
+                error.to_string().contains("member evidence is invalid"),
+                "the refusal must name the remediation: {error}"
+            );
+        }
     }
 }

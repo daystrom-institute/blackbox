@@ -59,6 +59,19 @@
   legacy v1 bytes, half-pairs, mismatched epochs, and invalid cross-store
   references. A fresh v2 origin forbids a migration marker; a migrated origin
   requires the committed marker for its exact transaction.
+- The legacy path LEDGER is wider than the fourteen-owner set. Every binding's
+  `source_store` classifies as either a durable owner row (stampable,
+  verifiable) or a typed non-owner source: an attachment RELOCATION mints one
+  whenever a checkout moves, and it names an attachment, not a row any owner
+  holds. Non-owner sources are retained and hashed exactly as read (they are
+  part of the predecessor a plan is bound to) and excluded from the owner
+  population everywhere: no stamp, no read-back, and counted as neither
+  mappable nor quarantined nor unscoped. Plan and verify must classify through
+  the same function and skip in the same place, or every count verify compares
+  against the journal is off by the non-owner bindings. Treating an
+  unrecognized token as a defect is still right; treating a RECOGNIZED
+  non-owner one that way refused the backfill of any host that had ever
+  relocated a checkout.
 - Migration checkout-ID actions share the `.bbox/local` directory lock with
   `ensure_checkout_id`. The owner holds a component-no-follow directory
   descriptor and performs marker and gitignore I/O relative to that exact

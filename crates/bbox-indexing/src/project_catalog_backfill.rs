@@ -247,6 +247,44 @@ pub fn legacy_store_kind_from_token(token: &str) -> Option<LegacyPathStoreKindV1
     })
 }
 
+/// The ledger source token an attachment RELOCATION mints
+/// (`project_catalog_admin`, plan section 8.4).
+///
+/// Host-local by construction: relocating a checkout appends a binding so
+/// path-only rows keep resolving at the old path, and that binding names an
+/// attachment, not a durable owner row.
+pub const ATTACHMENT_RELOCATION_SOURCE: &str = "attachment-relocation";
+
+/// What one ledger binding's `source_store` names.
+///
+/// The fourteen owners are the STAMPABLE universe, but they were never the
+/// whole ledger. Treating every non-owner token as a defect meant that any host
+/// which had ever relocated an attachment refused its own backfill, in
+/// planning and again in verification, over a record that carries no obligation
+/// at all and never could: no owner holds the row, so no owner can be asked
+/// about it or told to stamp it.
+///
+/// A relocation binding is therefore retained and hashed exactly as read (it is
+/// part of the predecessor the plan is bound to), and excluded from the owner
+/// population: no classification count, no stamp, no read-back, and never
+/// counted as unmappable or quarantined, because it is none of those things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyLedgerSourceV1 {
+    /// A durable owner row: the stampable, verifiable population.
+    Owner(LegacyPathStoreKindV1),
+    /// A host-local attachment relocation record.
+    AttachmentRelocation,
+}
+
+/// Classify a ledger `source_store` token. `None` is a token no version of this
+/// system mints, which is a ledger the backfill cannot act on.
+pub fn classify_legacy_ledger_source(token: &str) -> Option<LegacyLedgerSourceV1> {
+    if token == ATTACHMENT_RELOCATION_SOURCE {
+        return Some(LegacyLedgerSourceV1::AttachmentRelocation);
+    }
+    legacy_store_kind_from_token(token).map(LegacyLedgerSourceV1::Owner)
+}
+
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
@@ -1157,11 +1195,19 @@ fn plan_backfill(
     let mut stamps = Vec::new();
     for binding in projected_effective.values() {
         let entry = &binding.effective;
-        let Some(store_kind) = legacy_store_kind_from_token(&entry.source_store) else {
-            return Err(refuse(
-                ERROR_RESOLUTION_INVALID,
-                "legacy path ledger names a store outside the owner set",
-            ));
+        let store_kind = match classify_legacy_ledger_source(&entry.source_store) {
+            Some(LegacyLedgerSourceV1::Owner(store_kind)) => store_kind,
+            // Retained and hashed as read (it is part of the predecessor this
+            // plan is bound to), but it names no owner row, so it plans
+            // nothing: no stamp, no classification count, and emphatically not
+            // an unmappable one.
+            Some(LegacyLedgerSourceV1::AttachmentRelocation) => continue,
+            None => {
+                return Err(refuse(
+                    ERROR_RESOLUTION_INVALID,
+                    "legacy path ledger names a store outside the owner set",
+                ));
+            }
         };
         // Q-E3b: the Provenance owner is exempt by construction. Its capture is
         // project-parameterized and emits only inventory-target rows, so it
@@ -2174,11 +2220,19 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             BTreeMap<String, (ProjectId, LegacySelectorMembersV1)>,
         > = BTreeMap::new();
         for binding in effective.values() {
-            let Some(kind) = legacy_store_kind_from_token(&binding.effective.source_store) else {
-                return Err(refuse(
-                    ERROR_STALE_POST_IMAGE,
-                    "legacy path ledger names a store outside the owner set",
-                ));
+            let kind = match classify_legacy_ledger_source(&binding.effective.source_store) {
+                Some(LegacyLedgerSourceV1::Owner(kind)) => kind,
+                // The same exclusion the plan applies, for the same reason and
+                // in the same order. If these two disagreed about which
+                // bindings are obligations, every count verify compares against
+                // the journal would be off by the relocations.
+                Some(LegacyLedgerSourceV1::AttachmentRelocation) => continue,
+                None => {
+                    return Err(refuse(
+                        ERROR_STALE_POST_IMAGE,
+                        "legacy path ledger names a store outside the owner set",
+                    ));
+                }
             };
             match &binding.effective.status {
                 LegacyPathBindingStatus::Mapped { project_id, .. } => {
@@ -2237,11 +2291,25 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                     "the journal names a conversion the ledger does not resolve as effective",
                 ));
             };
-            let Some(kind) = legacy_store_kind_from_token(&binding.effective.source_store) else {
-                return Err(refuse(
-                    ERROR_STALE_POST_IMAGE,
-                    "legacy path ledger names a store outside the owner set",
-                ));
+            let kind = match classify_legacy_ledger_source(&binding.effective.source_store) {
+                Some(LegacyLedgerSourceV1::Owner(kind)) => kind,
+                // A relocation record is never a conversion: conversions come
+                // from operator dispositions over QUARANTINED owner rows, and a
+                // relocation is neither owned nor quarantinable. A journal
+                // naming one describes a state this system cannot produce.
+                Some(LegacyLedgerSourceV1::AttachmentRelocation) => {
+                    return Err(refuse(
+                        ERROR_STALE_POST_IMAGE,
+                        "the journal names a conversion whose binding is a host-local \
+                         relocation record",
+                    ));
+                }
+                None => {
+                    return Err(refuse(
+                        ERROR_STALE_POST_IMAGE,
+                        "legacy path ledger names a store outside the owner set",
+                    ));
+                }
             };
             // A conversion appended a superseding binding over a QUARANTINED
             // predecessor at the same key, and resolved it to mapped or
@@ -3231,6 +3299,59 @@ mod tests {
             );
         }
         assert_eq!(legacy_store_kind_from_token("not-an-owner"), None);
+
+        // The ledger is wider than the owner set: a relocation record is a
+        // RECOGNIZED source that is not an owner, which is a different thing
+        // from a token nothing mints.
+        assert_eq!(
+            classify_legacy_ledger_source(ATTACHMENT_RELOCATION_SOURCE),
+            Some(LegacyLedgerSourceV1::AttachmentRelocation)
+        );
+        assert_eq!(
+            classify_legacy_ledger_source("knowledge"),
+            Some(LegacyLedgerSourceV1::Owner(
+                LegacyPathStoreKindV1::Knowledge
+            ))
+        );
+        assert_eq!(classify_legacy_ledger_source("not-an-owner"), None);
+    }
+
+    /// A relocation binding plans NOTHING: no stamp, no classification count,
+    /// and above all not an unmappable one, which is what a naive "unknown
+    /// token" reading would have made of it.
+    #[test]
+    fn a_relocation_binding_plans_no_obligation() {
+        let attachments = attachments_with(vec![
+            entry("a1", 1, mapped(project('a')), "knowledge"),
+            entry("a2", 1, mapped(project('a')), ATTACHMENT_RELOCATION_SOURCE),
+        ]);
+        let effective = effective_legacy_bindings(&attachments.legacy_path_bindings).unwrap();
+        let inventory_hash = backfill_inventory_hash(7, &hash(1), &hash(2), &effective);
+        let plan = plan_backfill(
+            &attachments,
+            7,
+            &hash(1),
+            &hash(2),
+            &DurableBackfillResolutionV1::empty(inventory_hash),
+        )
+        .unwrap();
+
+        assert_eq!(plan.stamps.len(), 1);
+        assert_eq!(
+            plan.stamps[0].store_kind,
+            LegacyPathStoreKindV1::Knowledge,
+            "only the owner row is an obligation"
+        );
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(
+            plan.planned_stamps.values().sum::<u64>(),
+            1,
+            "the relocation adds no planned stamp"
+        );
+        assert!(
+            plan.unscoped_legacy_counts.is_empty(),
+            "and it is not unscoped either"
+        );
     }
 
     /// A ledger naming a store outside the owner set refuses rather than
