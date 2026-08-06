@@ -5778,9 +5778,11 @@ fn verify_installed_optional(
         .map_err(adapter_error)
         .map_err(|error| error.with_mutation_disposition(bootstrap_disposition))?;
     let opened = session.finish_open(&checkout_bindings).map_err(|failure| {
+        // Bounded, path-free store diagnostics; the same deliberate scoping
+        // as adapter_error.
         ProjectCatalogMigrationError::new(
             failure.error.code(),
-            "migration store recovery or open failed",
+            format!("migration store recovery or open failed: {}", failure.error),
             facade_mutation_disposition(failure.disposition),
         )
     })?;

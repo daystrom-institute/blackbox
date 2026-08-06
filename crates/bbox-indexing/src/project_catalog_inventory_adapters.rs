@@ -2288,10 +2288,18 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
         let store_path = AuthorizedInventoryPath::new(legacy_project_store_path)?;
         let observed = capture_legacy_projects_source(&store_path)?;
         if matches!(observed, DecodedSourceObservationV1::Invalid { .. }) {
-            // Bytes that do not decode carry no trustworthy roots. The locked
-            // capture classifies the store itself as corrupt evidence, and
-            // refusing here would replace that classified inventory with an
-            // opaque discovery error.
+            // Bytes that do not decode as v1 are either an INSTALLED v2
+            // catalog, whose authoritative checkout roots live in the paired
+            // attachment snapshot (installed verification opens through this
+            // discovery and refused with every attachment root absent when
+            // this returned empty), or genuinely corrupt bytes, which carry
+            // no trustworthy roots and stay classified by the locked capture
+            // rather than becoming an opaque discovery error here.
+            if let Some(roots) =
+                Self::discover_installed_attachment_checkout_roots(legacy_project_store_path)?
+            {
+                return Ok(roots);
+            }
             return Ok(Vec::new());
         }
         let source = accept_missing_legacy_projects_source(observed)?;
@@ -2320,6 +2328,58 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
             }
         }
         Ok(roots.into_iter().collect())
+    }
+
+    /// Checkout roots for an INSTALLED v2 store: the attachment snapshot is
+    /// the authoritative source of checkout directories after migration,
+    /// exactly as the v1 record paths were before it. Returns `Ok(None)`
+    /// when the bytes are not a valid v2 pair, so genuinely corrupt stores
+    /// keep their classified-empty behavior.
+    fn discover_installed_attachment_checkout_roots(
+        projects_path: &Path,
+    ) -> Result<Option<Vec<PathBuf>>, InventoryAdapterError> {
+        let Ok(catalog_bytes) = std::fs::read(projects_path) else {
+            return Ok(None);
+        };
+        let Ok(catalog) =
+            bbox_corpus_core::project_catalog::decode_catalog_snapshot(&catalog_bytes)
+        else {
+            return Ok(None);
+        };
+        let Some(parent) = projects_path.parent() else {
+            return Ok(None);
+        };
+        let Ok(attachment_bytes) = std::fs::read(parent.join("project-attachments.json")) else {
+            return Ok(None);
+        };
+        let Ok(attachments) =
+            bbox_corpus_core::project_catalog::decode_attachment_snapshot(&attachment_bytes)
+        else {
+            return Ok(None);
+        };
+        if bbox_corpus_core::project_catalog::validate_catalog_attachments(&catalog, &attachments)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let mut roots = BTreeSet::new();
+        for attachment in attachments.attachments.values() {
+            let root = AuthorizedInventoryPath::new(Path::new(&attachment.checkout_dir))?;
+            if !matches!(inspect_path(root.as_path()), InspectedPath::Directory) {
+                // A detached or since-removed checkout cannot host an
+                // observation; installed verification classifies it through
+                // the attachment status rather than a discovery error.
+                continue;
+            }
+            root.ensure_authority()?;
+            roots.insert(root.as_path().to_path_buf());
+            if roots.len() > MAX_PROJECT_CATALOG_ENTRIES {
+                return Err(invalid_input(
+                    "configured checkout roots exceed their cardinality limit",
+                ));
+            }
+        }
+        Ok(Some(roots.into_iter().collect()))
     }
 
     pub(crate) fn discover_attachment_candidate_keys(
