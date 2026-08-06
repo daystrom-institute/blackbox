@@ -52,6 +52,7 @@ use bbox_vectors::migration_inventory::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::project_catalog_backfill::legacy_store_token;
 use crate::project_catalog_inventory::{
     AttachmentCandidateObservationV1, CheckoutMarkerStateV1, CheckoutObservationV1,
     CodeSourceObservationV1, CollectedEvidenceMemberV1, CollectedGenerationObservationV1,
@@ -2330,6 +2331,26 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
         Ok(roots.into_iter().collect())
     }
 
+    /// One v2 pair participant, read through the module's confined
+    /// no-follow reader with the strict store's own byte cap, never a raw
+    /// `fs::read`: an oversized, symlinked, non-regular, or unreadable
+    /// participant is not a valid installed pair and keeps the
+    /// classified-empty `None` behavior instead of allocating its bytes.
+    fn read_installed_pair_file(path: &Path) -> Result<Option<Vec<u8>>, InventoryAdapterError> {
+        let Ok(authorized) = AuthorizedInventoryPath::new(path) else {
+            return Ok(None);
+        };
+        match read_authorized_file(
+            &authorized,
+            bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_BYTES,
+        )? {
+            AuthorizedFileObservationV1::Present(source) => Ok(Some(source.bytes)),
+            AuthorizedFileObservationV1::NotFound | AuthorizedFileObservationV1::Invalid { .. } => {
+                Ok(None)
+            }
+        }
+    }
+
     /// Checkout roots for an INSTALLED v2 store: the attachment snapshot is
     /// the authoritative source of checkout directories after migration,
     /// exactly as the v1 record paths were before it. Returns `Ok(None)`
@@ -2338,7 +2359,7 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
     fn discover_installed_attachment_checkout_roots(
         projects_path: &Path,
     ) -> Result<Option<Vec<PathBuf>>, InventoryAdapterError> {
-        let Ok(catalog_bytes) = std::fs::read(projects_path) else {
+        let Some(catalog_bytes) = Self::read_installed_pair_file(projects_path)? else {
             return Ok(None);
         };
         let Ok(catalog) =
@@ -2349,7 +2370,9 @@ impl ProjectCatalogMigrationInventoryFacadeV1 {
         let Some(parent) = projects_path.parent() else {
             return Ok(None);
         };
-        let Ok(attachment_bytes) = std::fs::read(parent.join("project-attachments.json")) else {
+        let Some(attachment_bytes) =
+            Self::read_installed_pair_file(&parent.join("project-attachments.json"))?
+        else {
             return Ok(None);
         };
         let Ok(attachments) =
@@ -3763,25 +3786,6 @@ fn owner_kind_token(kind: ImmutableInventoryOwnerKindV1) -> &'static str {
         ImmutableInventoryOwnerKindV1::TranscriptEdge => "transcript-edge",
         ImmutableInventoryOwnerKindV1::DerivedRepoGrouping => "derived-repo",
         ImmutableInventoryOwnerKindV1::DerivedLegacyNamespaceClusters => "derived-namespace",
-    }
-}
-
-pub(crate) fn legacy_store_token(kind: LegacyPathStoreKindV1) -> &'static str {
-    match kind {
-        LegacyPathStoreKindV1::Knowledge => "knowledge",
-        LegacyPathStoreKindV1::Gap => "gap",
-        LegacyPathStoreKindV1::Thread => "thread",
-        LegacyPathStoreKindV1::Note => "note",
-        LegacyPathStoreKindV1::Pin => "pin",
-        LegacyPathStoreKindV1::Roadmap => "roadmap",
-        LegacyPathStoreKindV1::Packet => "packet",
-        LegacyPathStoreKindV1::Task => "task",
-        LegacyPathStoreKindV1::Proposal => "proposal",
-        LegacyPathStoreKindV1::SlackBinding => "slack",
-        LegacyPathStoreKindV1::Whiteboard => "whiteboard",
-        LegacyPathStoreKindV1::Artifact => "artifact",
-        LegacyPathStoreKindV1::Provenance => "provenance",
-        LegacyPathStoreKindV1::TranscriptEdge => "transcript-edge",
     }
 }
 
@@ -5885,6 +5889,56 @@ mod tests {
             AuthorizedFileObservationV1::Invalid { diagnostic_code }
                 if diagnostic_code == "source_path_changed"
         ));
+    }
+
+    /// Installed-pair discovery reads through the confined reader with the
+    /// strict store's byte cap. A participant the strict store could never
+    /// have written (oversized, symlinked, non-regular, unreadable) is not
+    /// a valid installed pair: discovery returns the classified-empty
+    /// `None` without allocating the file's bytes, never a raw `fs::read`.
+    #[test]
+    fn installed_pair_discovery_stays_bounded_and_classified_empty() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let projects = root.join("projects.json");
+        let discover = |path: &Path| {
+            ProjectCatalogMigrationInventoryFacadeV1::discover_installed_attachment_checkout_roots(
+                path,
+            )
+            .unwrap()
+        };
+
+        // Oversized participant: one byte over the strict store's cap.
+        write(
+            &projects,
+            &vec![b' '; bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_BYTES + 1],
+        );
+        assert_eq!(discover(&projects), None);
+
+        // Symlinked participant.
+        fs::remove_file(&projects).unwrap();
+        let real = root.join("real.json");
+        write(&real, b"{}");
+        symlink(&real, &projects).unwrap();
+        assert_eq!(discover(&projects), None);
+
+        // Non-regular participant.
+        fs::remove_file(&projects).unwrap();
+        fs::create_dir(&projects).unwrap();
+        assert_eq!(discover(&projects), None);
+
+        // Unreadable participant.
+        fs::remove_dir(&projects).unwrap();
+        write(&projects, b"{}");
+        let mut permissions = fs::metadata(&projects).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o000);
+        fs::set_permissions(&projects, permissions.clone()).unwrap();
+        assert_eq!(discover(&projects), None);
+        permissions.set_mode(0o644);
+        fs::set_permissions(&projects, permissions).unwrap();
     }
 
     #[test]

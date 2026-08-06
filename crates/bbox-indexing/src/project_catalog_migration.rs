@@ -3125,7 +3125,7 @@ fn build_base_post_images(
             LegacyPathLedgerEntry {
                 legacy_path_binding_id: classified.planned_binding_id.clone(),
                 historical_path: classified.literal_selector.clone(),
-                source_store: crate::project_catalog_inventory_adapters::legacy_store_token(
+                source_store: crate::project_catalog_backfill::legacy_store_token(
                     source.store_kind,
                 )
                 .to_string(),

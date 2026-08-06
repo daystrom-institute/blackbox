@@ -991,8 +991,12 @@ fn backfill_plan_hash(
     Sha256ValueV1::parse(hex::encode(hasher.finalize())).expect("code-owned digest is valid")
 }
 
-/// The owner token for a store kind. Inverse of
+/// THE owner token vocabulary: the single tokenizer for capture, ledger
+/// mint, stamp dispatch, and read-back. Inverse of
 /// [`legacy_store_kind_from_token`]; both must stay exhaustive together.
+/// No other module may define its own kind-to-token mapping; a second copy
+/// is exactly how the mint once drifted to `transcript_edge` while the
+/// backfill read `transcript-edge` and refused its own ledger.
 pub fn legacy_store_token(kind: LegacyPathStoreKindV1) -> &'static str {
     match kind {
         LegacyPathStoreKindV1::Knowledge => "knowledge",
