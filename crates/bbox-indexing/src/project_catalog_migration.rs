@@ -2102,6 +2102,12 @@ fn assess_migration_semantics(
             ));
         }
     }
+    let acknowledged_unclaimed_namespaces = resolution
+        .unclaimed_namespace_acknowledgements
+        .iter()
+        .map(|row| (row.resolution_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_unclaimed_namespace_ids = BTreeSet::new();
     for namespace in &inventory.legacy_commit_namespaces {
         use crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1 as Attribution;
         let supported = match &namespace.attribution {
@@ -2120,15 +2126,53 @@ fn assess_migration_semantics(
         // Vector keys count as history: they are namespace-scoped, so the
         // project-keyed orphan evidence cannot cover them, and the rebuild's
         // survival check never reaches a namespace no commit document names,
-        // which would silently drop them (reviewer finding S1). A namespace
-        // carrying EITHER documents or vector keys still refuses without
-        // attribution.
-        if !supported && (namespace.commit_document_count > 0 || namespace.vector_key_count > 0) {
+        // which would silently drop them (reviewer finding S1).
+        //
+        // A namespace with real commit DOCUMENTS keeps the hard refusal:
+        // migrated stores start with full attribution and no acknowledgement
+        // can wave commit history through. A ZERO-document namespace whose
+        // only content is residual vector keys (a deleted repo's leavings;
+        // attribution is impossible by construction) is instead an operator
+        // decision through the resolution channel, with the exact count
+        // bound into the acknowledgement so consent written against
+        // different content refuses.
+        if !supported && namespace.commit_document_count > 0 {
             refusals.push(semantic_refusal(
                 "unsupported_legacy_namespace",
                 [namespace.observation_id.clone()],
             ));
+        } else if !supported && namespace.vector_key_count > 0 {
+            let resolution_id =
+                stable_conflict_id("unclaimed_namespace", &namespace.observation_id)?;
+            required_resolutions.push(RequiredResolutionV1 {
+                resolution_id: resolution_id.clone(),
+                kind: RequiredResolutionKindV1::UnclaimedNamespace,
+                candidate_record_ids: BTreeSet::from([namespace.observation_id.clone()]),
+            });
+            expected_unclaimed_namespace_ids.insert(resolution_id.clone());
+            match acknowledged_unclaimed_namespaces.get(resolution_id.as_str()) {
+                None => {
+                    unresolved_resolution_ids.insert(resolution_id);
+                }
+                Some(acknowledgement)
+                    if acknowledgement.namespace != namespace.namespace.as_str()
+                        || acknowledgement.vector_key_count != namespace.vector_key_count =>
+                {
+                    return Err(invalid_resolution_artifact(
+                        "unclaimed namespace acknowledgement does not match its namespace",
+                    ));
+                }
+                Some(_) => {}
+            }
         }
+    }
+    if acknowledged_unclaimed_namespaces
+        .keys()
+        .any(|resolution_id| !expected_unclaimed_namespace_ids.contains(*resolution_id))
+    {
+        return Err(invalid_resolution_artifact(
+            "resolution acknowledges a namespace that is not unclaimed residue",
+        ));
     }
     namespace_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
     scope_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
@@ -6594,10 +6638,9 @@ mod tests {
                 .any(|refusal| refusal.diagnostic_code == "unsupported_legacy_namespace")
         );
 
-        // Vector keys are namespace-scoped history the survival check never
-        // reaches once documents are gone (S1): they refuse exactly like
-        // documents do.
-        for (documents, vectors) in [(7u64, 0u64), (0, 286), (7, 286)] {
+        // Real commit documents keep the hard refusal regardless of vector
+        // keys (S1): no acknowledgement can wave history through.
+        for (documents, vectors) in [(7u64, 0u64), (7, 286)] {
             let inventory = with_namespace(documents, vectors);
             let resolution =
                 ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
@@ -6610,6 +6653,50 @@ mod tests {
                 "{documents} documents / {vectors} vectors must refuse"
             );
         }
+
+        // A zero-document namespace whose only content is vector residue is
+        // an operator decision: unacknowledged it stays resolution-required,
+        // an exact acknowledgement clears it, and one written against
+        // different content refuses the artifact.
+        use crate::project_catalog_inventory::UnclaimedNamespaceAcknowledgementV1;
+        let inventory = with_namespace(0, 286);
+        let unacknowledged =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let assessment = assess_migration_semantics(&inventory, &unacknowledged).unwrap();
+        assert!(
+            !assessment
+                .refusals
+                .iter()
+                .any(|refusal| refusal.diagnostic_code == "unsupported_legacy_namespace")
+        );
+        let requirement = assessment
+            .required_resolutions
+            .iter()
+            .find(|resolution| resolution.kind == RequiredResolutionKindV1::UnclaimedNamespace)
+            .expect("vector residue must demand resolution");
+        assert!(!assessment.unresolved_resolution_ids.is_empty());
+
+        let mut acknowledged = unacknowledged.clone();
+        acknowledged.unclaimed_namespace_acknowledgements =
+            vec![UnclaimedNamespaceAcknowledgementV1 {
+                resolution_id: requirement.resolution_id.clone(),
+                namespace: "deadbeef".to_string(),
+                vector_key_count: 286,
+            }];
+        let assessment = assess_migration_semantics(&inventory, &acknowledged).unwrap();
+        assert!(assessment.unresolved_resolution_ids.is_empty());
+
+        let mut mismatched = acknowledged.clone();
+        mismatched.unclaimed_namespace_acknowledgements[0].vector_key_count = 285;
+        let error = assess_migration_semantics(&inventory, &mismatched).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("unclaimed namespace acknowledgement does not match"),
+            "unexpected: {}",
+            error.message
+        );
+
         let inventory = with_namespace(7, 0);
         let resolution =
             ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());

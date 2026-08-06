@@ -1894,6 +1894,14 @@ pub enum RequiredResolutionKindV1 {
     /// acknowledge each absence before the plan is clean (reviewer
     /// finding S4).
     MissingOptionalOwner,
+    /// An unclaimed namespace with ZERO commit documents but residual
+    /// vector keys: attribution is impossible (typically a deleted repo's
+    /// residue) and there is no history to protect, but the vector keys are
+    /// namespace-scoped evidence the rebuild will drop, so leaving them
+    /// behind is an operator decision with the exact counts bound into the
+    /// acknowledgement. A namespace holding real commit documents never
+    /// gets this channel; it keeps the hard refusal.
+    UnclaimedNamespace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2664,6 +2672,18 @@ pub struct MissingOptionalOwnerAcknowledgementV1 {
     pub owner_source_id: String,
 }
 
+/// Operator acknowledgement that a zero-document unclaimed namespace's
+/// residual vector keys are knowingly left behind (and dropped at the
+/// post-cut rebuild). The counts are bound in so an acknowledgement written
+/// against different content refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnclaimedNamespaceAcknowledgementV1 {
+    pub resolution_id: String,
+    pub namespace: String,
+    pub vector_key_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationPayloadHashesV1 {
@@ -2736,6 +2756,7 @@ pub struct ProjectCatalogMigrationResolutionV1 {
     pub quarantine_collected: Vec<QuarantineCollectedV1>,
     pub publisher_binding_dispositions: Vec<PublisherBindingDispositionV1>,
     pub missing_optional_owner_acknowledgements: Vec<MissingOptionalOwnerAcknowledgementV1>,
+    pub unclaimed_namespace_acknowledgements: Vec<UnclaimedNamespaceAcknowledgementV1>,
     pub operator_notes: Vec<OperatorResolutionNoteV1>,
 }
 
@@ -2751,6 +2772,7 @@ impl ProjectCatalogMigrationResolutionV1 {
             quarantine_collected: Vec::new(),
             publisher_binding_dispositions: Vec::new(),
             missing_optional_owner_acknowledgements: Vec::new(),
+            unclaimed_namespace_acknowledgements: Vec::new(),
             operator_notes: Vec::new(),
         }
     }
@@ -2914,6 +2936,16 @@ impl ProjectCatalogMigrationResolutionV1 {
             validate_stable_id(&row.owner_source_id, "missing owner source id")?;
         }
         validate_unique_by(
+            self.unclaimed_namespace_acknowledgements
+                .iter()
+                .map(|row| row.resolution_id.as_str()),
+            "unclaimed namespace acknowledgement",
+        )?;
+        for row in &self.unclaimed_namespace_acknowledgements {
+            validate_stable_id(&row.resolution_id, "unclaimed namespace resolution id")?;
+            validate_token(&row.namespace, "acknowledged namespace")?;
+        }
+        validate_unique_by(
             self.operator_notes.iter().map(|row| row.note_id.as_str()),
             "operator note",
         )?;
@@ -2939,6 +2971,8 @@ impl ProjectCatalogMigrationResolutionV1 {
         self.excluded_attachments
             .sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
         self.missing_optional_owner_acknowledgements
+            .sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
+        self.unclaimed_namespace_acknowledgements
             .sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
         self.quarantine_collected
             .sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
