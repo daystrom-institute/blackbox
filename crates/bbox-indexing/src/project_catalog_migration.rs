@@ -2109,17 +2109,7 @@ fn assess_migration_semantics(
         .collect::<BTreeMap<_, _>>();
     let mut expected_unclaimed_namespace_ids = BTreeSet::new();
     for namespace in &inventory.legacy_commit_namespaces {
-        use crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1 as Attribution;
-        let supported = match &namespace.attribution {
-            Attribution::Proved { .. } => true,
-            Attribution::Ambiguous {
-                candidate_project_ids,
-            } => inventory.legacy_namespace_clusters.iter().any(|cluster| {
-                cluster.materialized_namespace == namespace.namespace.as_str()
-                    && &cluster.project_ids == candidate_project_ids
-            }),
-            Attribution::Unclaimed => false,
-        };
+        let supported = namespace_attribution_supported(namespace, inventory);
         // An EMPTY unclaimed namespace protects nothing: the refusal exists
         // so commit history cannot be dropped without attribution, and a
         // namespace with neither documents nor vector keys has none to drop.
@@ -3961,14 +3951,14 @@ fn build_migration_report(
         .collect::<Result<Vec<_>, ProjectCatalogMigrationError>>()?;
     let refusals = assessment.refusals.clone();
     let pre_existing_orphans = inventory.pre_existing_orphans.clone();
+    // Derived from the SAME predicate the assessment uses to demand the
+    // acknowledgements, so every requirement has a report row to bind.
     let unclaimed_namespace_residue = inventory
         .legacy_commit_namespaces
         .iter()
         .filter(|namespace| {
-            matches!(
-                namespace.attribution,
-                crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Unclaimed
-            ) && namespace.commit_document_count == 0
+            !namespace_attribution_supported(namespace, inventory)
+                && namespace.commit_document_count == 0
                 && namespace.vector_key_count > 0
         })
         .map(
@@ -4204,6 +4194,30 @@ fn mint_checkout_id() -> String {
         .strip_prefix("pct_")
         .expect("minted transaction id has its code-owned prefix")
         .to_string()
+}
+
+/// ONE definition of "this namespace's attribution supports migration",
+/// shared by the semantic assessment (which demands acknowledgements for
+/// unsupported vector-only namespaces) and the report's residue derivation
+/// (which surfaces what those acknowledgements must bind). Deriving the two
+/// from different predicates let the assessment demand consent the report
+/// could not represent (round-3 finding R3-2: an Ambiguous attribution with
+/// no matching cluster is unsupported but is not literally Unclaimed).
+fn namespace_attribution_supported(
+    namespace: &crate::project_catalog_inventory::LegacyCommitNamespaceInventoryV1,
+    inventory: &V1ProjectCatalogInventory,
+) -> bool {
+    use crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1 as Attribution;
+    match &namespace.attribution {
+        Attribution::Proved { .. } => true,
+        Attribution::Ambiguous {
+            candidate_project_ids,
+        } => inventory.legacy_namespace_clusters.iter().any(|cluster| {
+            cluster.materialized_namespace == namespace.namespace.as_str()
+                && &cluster.project_ids == candidate_project_ids
+        }),
+        Attribution::Unclaimed => false,
+    }
 }
 
 fn stable_conflict_id(
@@ -6721,6 +6735,37 @@ mod tests {
                 .contains("unclaimed namespace acknowledgement does not match"),
             "unexpected: {}",
             error.message
+        );
+
+        // R3-2: an Ambiguous attribution with no matching cluster is
+        // unsupported without being literally Unclaimed; it must demand the
+        // same acknowledgement (and, through the shared predicate, surface
+        // the same report residue) rather than minting a requirement no
+        // resolution artifact can satisfy.
+        let mut inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let mut ambiguous = empty_namespace(0, 286);
+        ambiguous.attribution = LegacyCommitNamespaceAttributionV1::Ambiguous {
+            candidate_project_ids: std::collections::BTreeSet::from([
+                bbox_corpus_core::project_catalog::ProjectId::parse("alpha").unwrap(),
+                bbox_corpus_core::project_catalog::ProjectId::parse("beta").unwrap(),
+            ]),
+        };
+        inventory.legacy_commit_namespaces.push(ambiguous);
+        for evidence in &mut inventory.immutable_lane_evidence {
+            if evidence.lane_kind
+                == crate::project_catalog_inventory::ImmutableInventoryLaneKindV1::GitMetadata
+            {
+                evidence.row_count += 1;
+            }
+        }
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+        assert!(
+            assessment.required_resolutions.iter().any(|resolution| {
+                resolution.kind == RequiredResolutionKindV1::UnclaimedNamespace
+            }),
+            "unsupported ambiguous vector residue must demand acknowledgement"
         );
 
         let inventory = with_namespace(7, 0);
