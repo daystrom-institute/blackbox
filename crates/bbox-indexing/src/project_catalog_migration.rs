@@ -2064,6 +2064,16 @@ fn assess_migration_semantics(
             Attribution::Unclaimed => false,
         };
         if !supported {
+            eprintln!(
+                "DIAG unsupported namespace={} attribution={:?} count={}",
+                namespace.namespace,
+                match &namespace.attribution {
+                    crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Proved { .. } => "proved",
+                    crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Ambiguous { .. } => "ambiguous",
+                    crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Unclaimed => "unclaimed",
+                },
+                namespace.commit_document_count,
+            );
             refusals.push(semantic_refusal(
                 "unsupported_legacy_namespace",
                 [namespace.observation_id.clone()],
@@ -2303,6 +2313,53 @@ fn classify_legacy_paths(
             .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
         let literal = &binding.literal;
         let literal_path = Path::new(literal);
+        // A bare v1 NAME selector: one normal component, no separator, not
+        // absolute. Early note rows were keyed by project name through the
+        // resolver rather than by path; a name cannot participate in
+        // deepest-root geometry, and resolving names against the current
+        // alias set at migration time would mint bindings from guesswork.
+        // Such rows classify Unscoped-preserved: they keep no project
+        // binding, stay readable, and are never stamped, exactly like every
+        // other row no root contains. Anything path-shaped but relative or
+        // dotted still refuses below: those literals DO claim path scoping
+        // that geometry cannot verify.
+        let is_bare_name_selector = !literal_path.is_absolute()
+            && !literal.contains(['/', '\\'])
+            && matches!(
+                literal_path.components().collect::<Vec<_>>().as_slice(),
+                [Component::Normal(_)]
+            );
+        if is_bare_name_selector {
+            *unscoped_counts.entry(observed.store_kind).or_default() += 1;
+            let planned_binding_id = identities
+                .legacy_path_binding_ids
+                .get(&observed.observation_id)
+                .ok_or_else(|| planner_error("legacy path binding identity is missing"))?
+                .clone();
+            paths.push(ClassifiedLegacyPathV1 {
+                observation_id: observed.observation_id.clone(),
+                planned_binding_id: planned_binding_id.clone(),
+                literal_selector: literal.clone(),
+                source_row_id: binding.source_row_id.clone(),
+                relationship: LegacyPathRelationshipV1::Unscoped,
+                mapped_project_id: None,
+            });
+            report_rows.push(LegacyPathBindingReportV1 {
+                observation_id: observed.observation_id.clone(),
+                planned_binding_id,
+                store_kind: observed.store_kind,
+                relationship: LegacyPathRelationshipV1::Unscoped,
+                status: LegacyPathBindingStatusV1::UnscopedPreserved,
+                path_digest: digest_path(literal),
+            });
+            sensitive_rows.push(SensitiveLocalPathRowV1 {
+                observation_id: observed.observation_id.clone(),
+                store_kind: observed.store_kind,
+                stable_row_id: observed.stable_row_id.clone(),
+                literal_selector: literal.clone(),
+            });
+            continue;
+        }
         let selector_is_unsafe = !literal_path.is_absolute()
             || literal_path.components().any(|component| {
                 matches!(
@@ -6370,6 +6427,73 @@ mod tests {
                 .contains("legacy selector runtime binding is missing"),
             "unexpected refusal: {error}"
         );
+    }
+
+    /// Early note rows were keyed by bare project NAME through the resolver
+    /// ("transcript-search", not a path); real hosts carry dozens. A name
+    /// cannot participate in deepest-root geometry, so it classifies
+    /// Unscoped-preserved, never a refusal that blocks the migration and
+    /// never a guessed mapping against the current alias set. Anything
+    /// path-shaped but relative or dotted still refuses: those literals DO
+    /// claim path scoping that geometry cannot verify.
+    #[test]
+    fn a_bare_name_selector_classifies_unscoped_and_relative_paths_still_refuse() {
+        let classify_with = |literal: &str| {
+            let mut inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+            inventory.legacy_path_observations[0].selector_digest =
+                crate::project_catalog_inventory::digest_path(literal);
+            let resolution =
+                ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+            let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+            let identities = build_persisted_identity_plan(
+                &inventory,
+                &assessment.resolved_project_scopes,
+                &assessment.retained_attachment_ids,
+                None,
+            )
+            .unwrap();
+            let runtime = MigrationRuntimeBindingsViewV1 {
+                legacy_project_store_bytes: Vec::new(),
+                legacy_project_store_was_missing: false,
+                legacy_project_paths: BTreeMap::new(),
+                checkout_paths: BTreeMap::new(),
+                checkout_repositories: BTreeMap::new(),
+                legacy_selectors: BTreeMap::from([(
+                    "legacy_path_alpha".to_string(),
+                    selector_view(literal),
+                )]),
+            };
+            classify_legacy_paths(&inventory, &runtime, &identities).unwrap()
+        };
+
+        let named = classify_with("transcript-search");
+        assert!(named.refusals.is_empty());
+        assert_eq!(
+            named.report_rows[0].status,
+            crate::project_catalog_inventory::LegacyPathBindingStatusV1::UnscopedPreserved
+        );
+        assert_eq!(
+            named.report_rows[0].relationship,
+            crate::project_catalog_inventory::LegacyPathRelationshipV1::Unscoped
+        );
+        assert_eq!(
+            named.unscoped_counts
+                [&crate::project_catalog_inventory::LegacyPathStoreKindV1::Knowledge],
+            1
+        );
+
+        for relative in ["src/lib.rs", "../escape", "./here"] {
+            let classified = classify_with(relative);
+            assert_eq!(
+                classified.refusals.len(),
+                1,
+                "{relative} must stay refused"
+            );
+            assert_eq!(
+                classified.report_rows[0].relationship,
+                crate::project_catalog_inventory::LegacyPathRelationshipV1::UnsafeSelector
+            );
+        }
     }
 
     fn run_git(root: &Path, args: &[&str]) -> String {
