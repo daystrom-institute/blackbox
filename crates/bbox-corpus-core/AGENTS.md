@@ -91,6 +91,16 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   both halves are missing - a partial or zeroed pair is refused rather than
   laundered into valid-looking evidence, and what we write always emits both
   fields so the next read never has to guess.
+- Reconstruction is gated by an ALLOW-LIST of ledger sources
+  (`legacy_ledger_evidence_is_reconstructable`), never a deny-list. It may only
+  run where the answer is knowable without asking the owner, which excludes any
+  GROUP-shaped source: deriving a singleton for one would write evidence no
+  refold can reproduce, so every later stamp refuses forever and no fresh
+  preflight can repair an already-durable record. Those refuse at decode with
+  `error.project_catalog_legacy_evidence_unreconstructable`, whose remedy is
+  remigration from the v1 predecessor. A source added later is absent from the
+  list and therefore refuses rather than being guessed at; a test in
+  bbox-indexing walks the owner set and pins the two lists together.
 
 ## Rerank math (search/rerank.rs)
 

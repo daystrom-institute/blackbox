@@ -3316,6 +3316,34 @@ mod tests {
         assert_eq!(classify_legacy_ledger_source("not-an-owner"), None);
     }
 
+    /// THE CROSS-CRATE DRIFT GUARD for R3-1.
+    ///
+    /// The compatibility decoder in `bbox-corpus-core` decides which
+    /// pre-evidence bindings it may reconstruct from a list of tokens it cannot
+    /// import from here, because the dependency runs the other way. This walks
+    /// the owner set and pins the two definitions together, so an owner added
+    /// or renamed later cannot leave the decoder silently guessing at it: a new
+    /// token is absent from the allow-list, which fails CLOSED, and this test
+    /// says so out loud.
+    #[test]
+    fn every_owner_token_declares_its_pre_evidence_shape() {
+        use bbox_corpus_core::project_catalog::legacy_ledger_evidence_is_reconstructable;
+
+        for kind in LegacyPathStoreKindV1::all() {
+            let token = legacy_store_token(kind);
+            assert_eq!(
+                legacy_ledger_evidence_is_reconstructable(token),
+                kind != LegacyPathStoreKindV1::TranscriptEdge,
+                "{token} disagrees with the decoder about whether one pre-evidence binding \
+                 meant one row"
+            );
+        }
+        assert!(legacy_ledger_evidence_is_reconstructable(
+            ATTACHMENT_RELOCATION_SOURCE
+        ));
+        assert!(!legacy_ledger_evidence_is_reconstructable("not-an-owner"));
+    }
+
     /// A relocation binding plans NOTHING: no stamp, no classification count,
     /// and above all not an unmappable one, which is what a naive "unknown
     /// token" reading would have made of it.
