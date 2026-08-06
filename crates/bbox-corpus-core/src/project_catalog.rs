@@ -2824,6 +2824,8 @@ mod tests {
             historical_path: "transcript-search".into(),
             source_store: "note".into(),
             source_row_id: "note-1".into(),
+            member_row_count: 1,
+            member_commitment_sha256: "a".repeat(64),
             inventory_epoch: 1,
             status: LegacyPathBindingStatus::Unscoped {},
         };

@@ -1312,7 +1312,12 @@ mod owner_row_stamper_dispatch {
         let stamper = stamper(&root);
 
         let error = stamper
-            .stamp(LegacyPathStoreKindV1::Provenance, "any-row", &project())
+            .stamp(
+                LegacyPathStoreKindV1::Provenance,
+                "any-row",
+                &bbox_corpus_core::project_catalog_snapshot::singleton_selector_members("any-row"),
+                &project(),
+            )
             .unwrap_err();
         assert_eq!(error.code, ERROR_RESOLUTION_INVALID);
     }
@@ -1366,7 +1371,18 @@ mod owner_row_stamper_dispatch {
             LegacyPathStoreKindV1::Task,
             LegacyPathStoreKindV1::Provenance,
         ] {
-            assert!(stamper.stamp(kind, "any-row", &project()).is_err());
+            assert!(
+                stamper
+                    .stamp(
+                        kind,
+                        "any-row",
+                        &bbox_corpus_core::project_catalog_snapshot::singleton_selector_members(
+                            "any-row"
+                        ),
+                        &project(),
+                    )
+                    .is_err()
+            );
         }
     }
 }
