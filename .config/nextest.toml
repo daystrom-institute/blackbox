@@ -11,7 +11,9 @@
 #             pinned by the 80s index/search agentic test).
 #
 # Quarantined tests (each >45s of single-test wall-clock; together they pin
-# the suite's critical path — baseline 2026-06-10: next-slowest test is 5.2s):
+# the suite's critical path — criterion re-checked 2026-08-06: the
+# unquarantined tail now holds a ~30-60s slow band from the catalog e2e
+# suites, named by the slow flags and green under the 120s kill):
 #   - index::search::agentic_project_file_tests::registered_project_markdown_and_rust_source_are_searchable
 #   - system_events::store::tests::compact_caps_at_ten_thousand_keeping_newest
 #   - lsp_rename_cell::cell_renames_cross_file_via_lsp_authority (~30s: cold
