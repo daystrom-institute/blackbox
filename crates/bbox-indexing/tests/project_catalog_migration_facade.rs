@@ -779,9 +779,10 @@ fn external_consumer_runs_exact_review_apply_fresh_verify_and_reapply() {
             .iter()
             .find(|action| &action.observation_id == observation_id)
             .unwrap();
+        // Installed markers carry the runtime producer's bare shape.
         assert_eq!(
             fs::read_to_string(checkout.join(".bbox/local/checkout-id")).unwrap(),
-            format!("{}\n", action.planned_checkout_id)
+            action.planned_checkout_id
         );
     }
     let effective = decode_migration_effective_source_manifest_v1(

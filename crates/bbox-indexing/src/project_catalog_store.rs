@@ -4545,6 +4545,17 @@ impl MigrationAttemptFailureV1 {
     }
 }
 
+/// The checkout-id marker has TWO producer dialects: the runtime's
+/// `ensure_checkout_id` writes the bare id, while migration installs
+/// historically wrote a trailing newline; both readers trim. A byte-exact
+/// comparison against either single dialect refuses the other producer's
+/// legitimate marker (the rehearsal hit exactly that against a
+/// daemon-written marker), so every migration-side comparison accepts both
+/// shapes while installs write the runtime's bare shape.
+fn checkout_marker_bytes_match(bytes: &[u8], id: &str) -> bool {
+    bytes == id.as_bytes() || bytes.strip_suffix(b"\n") == Some(id.as_bytes())
+}
+
 fn transact_migration_attempt_with_io(
     projects_path: &Path,
     plan: ValidatedMigrationPlanV1,
@@ -4815,10 +4826,9 @@ impl ProjectCatalogTransactionOwner {
                 .expect("validated checkout binding has an attachment");
             let actual = self.io.read_regular_nofollow(target, 128)?;
             if let Some(action) = actions.get(observation_id.as_str()) {
-                let expected = format!("{}\n", action.planned_id);
                 match actual.as_deref() {
                     None | Some([]) => {}
-                    Some(bytes) if bytes == expected.as_bytes() => {}
+                    Some(bytes) if checkout_marker_bytes_match(bytes, &action.planned_id) => {}
                     Some(_) => {
                         return Err(ProjectCatalogStoreError::new(
                             "error.project_catalog_migration_inventory_stale",
@@ -4827,8 +4837,10 @@ impl ProjectCatalogTransactionOwner {
                     }
                 }
             } else {
-                let expected = format!("{checkout_id}\n");
-                if actual.as_deref() != Some(expected.as_bytes()) {
+                if !actual
+                    .as_deref()
+                    .is_some_and(|bytes| checkout_marker_bytes_match(bytes, checkout_id))
+                {
                     return Err(ProjectCatalogStoreError::new(
                         "error.project_catalog_migration_inventory_stale",
                         "existing checkout identity disagrees with the attachment snapshot",
@@ -7773,10 +7785,11 @@ impl ProjectCatalogTransactionOwner {
                     "checkout identity target has no parent",
                 )
             })?;
-            let expected = format!("{}\n", action.planned_id);
             match self.io.read_regular_nofollow(&target, 128)? {
                 None => {}
-                Some(bytes) if bytes.is_empty() || bytes == expected.as_bytes() => {}
+                Some(bytes)
+                    if bytes.is_empty()
+                        || checkout_marker_bytes_match(&bytes, &action.planned_id) => {}
                 Some(_) => {
                     return Err(ProjectCatalogStoreError::new(
                         "error.project_catalog_recovery_incomplete",
@@ -7815,10 +7828,11 @@ impl ProjectCatalogTransactionOwner {
                     )
                 })?;
             let lane = checkout_lock_for(&target, locks)?;
-            let expected = format!("{}\n", action.planned_id);
             match lane.read_regular("checkout-id", 128)? {
                 None => {}
-                Some(bytes) if bytes.is_empty() || bytes == expected.as_bytes() => {}
+                Some(bytes)
+                    if bytes.is_empty()
+                        || checkout_marker_bytes_match(&bytes, &action.planned_id) => {}
                 Some(bytes) if valid_checkout_identity_bytes(&bytes) => {
                     state = CheckoutActionRecoveryState::ConflictingValid;
                 }
@@ -7858,10 +7872,11 @@ impl ProjectCatalogTransactionOwner {
                     )
                 })?;
             let lane = checkout_lock_for(&target, locks)?;
-            let expected = format!("{}\n", action.planned_id);
             match lane.read_regular("checkout-id", 128)? {
                 None => {}
-                Some(bytes) if bytes.is_empty() || bytes == expected.as_bytes() => {}
+                Some(bytes)
+                    if bytes.is_empty()
+                        || checkout_marker_bytes_match(&bytes, &action.planned_id) => {}
                 Some(_) => {
                     return Err(ProjectCatalogStoreError::new(
                         "error.project_catalog_recovery_incomplete",
@@ -7985,15 +8000,14 @@ impl ProjectCatalogTransactionOwner {
                 })?;
             let lane = checkout_lock_for(&target, locks)?;
             self.ensure_checkout_local_gitignore(lane)?;
-            let expected = format!("{}\n", action.planned_id);
             match lane.read_regular("checkout-id", 128)? {
                 None => {
-                    lane.atomic_replace("checkout-id", expected.as_bytes())?;
+                    lane.atomic_replace("checkout-id", action.planned_id.as_bytes())?;
                 }
                 Some(bytes) if bytes.is_empty() => {
-                    lane.atomic_replace("checkout-id", expected.as_bytes())?;
+                    lane.atomic_replace("checkout-id", action.planned_id.as_bytes())?;
                 }
-                Some(bytes) if bytes == expected.as_bytes() => {}
+                Some(bytes) if checkout_marker_bytes_match(&bytes, &action.planned_id) => {}
                 Some(_) => {
                     return Err(ProjectCatalogStoreError::new(
                         "error.project_catalog_recovery_incomplete",
@@ -8001,7 +8015,11 @@ impl ProjectCatalogTransactionOwner {
                     ));
                 }
             }
-            if lane.read_regular("checkout-id", 128)?.as_deref() != Some(expected.as_bytes()) {
+            if !lane
+                .read_regular("checkout-id", 128)?
+                .as_deref()
+                .is_some_and(|bytes| checkout_marker_bytes_match(bytes, &action.planned_id))
+            {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_recovery_incomplete",
                     "checkout identity marker changed during journaled installation",
@@ -13700,7 +13718,7 @@ mod tests {
         transact_migration(&path, plan).unwrap();
         assert_eq!(
             fs::read_to_string(marker).unwrap(),
-            "66666666666666666666666666666666\n"
+            "66666666666666666666666666666666"
         );
     }
 
@@ -13731,9 +13749,11 @@ mod tests {
         assert!(paths.journal.exists());
         assert!(local.exists());
         recover_migration_with_io(&path, registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        // Installed markers carry the runtime producer's bare shape, the
+        // same bytes ensure_checkout_id writes.
         assert_eq!(
             fs::read_to_string(local.join("checkout-id")).unwrap(),
-            "66666666666666666666666666666666\n"
+            "66666666666666666666666666666666"
         );
     }
 
@@ -14476,7 +14496,7 @@ mod tests {
         let root = path.parent().unwrap();
         assert_eq!(
             fs::read_to_string(root.join("checkout/.bbox/local/checkout-id")).unwrap(),
-            "66666666666666666666666666666666\n"
+            "66666666666666666666666666666666"
         );
         assert_eq!(
             fs::read(root.join("checkout/.bbox/local/.gitignore")).unwrap(),
