@@ -2566,6 +2566,92 @@ mod project_catalog_snapshot_tests {
         );
     }
 
+    /// R3-1, from the owner's side: a REAL group of three lane rows, and what
+    /// its pre-evidence ledger record can and cannot say about them.
+    ///
+    /// The compatibility decoder reconstructs absent member evidence as a
+    /// singleton, which is right for every owner whose binding was one row. It
+    /// is wrong here and only here: this binding names a selector group, the
+    /// group has three members, and nothing in the record says so. Writing
+    /// "one row" into the migrated ledger would make every later refold
+    /// disagree with it forever, on a record that is already durable, so the
+    /// decode refuses instead. The second half shows the record that DOES work,
+    /// and that its evidence is exactly what a fresh walk refolds.
+    #[test]
+    fn a_pre_evidence_ledger_record_for_a_three_row_group_cannot_be_reconstructed() {
+        use bbox_corpus_core::project_catalog::decode_attachment_snapshot;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir_all(&root).unwrap();
+        // Six rows alternating two selectors: THREE of them carry /repo/one.
+        write_selector_lane(&root.join("tool.jsonl"), &["/repo/one", "/repo/two"], 6);
+        let limits = OwnerSnapshotLimitsV1::default();
+        let row_id = only_row_id(&root, "/repo/one");
+        let captured = captured_members(&root, &row_id, limits);
+        assert_eq!(
+            captured.row_count, 3,
+            "the fixture must be a genuine multi-row group"
+        );
+
+        let ledger_snapshot = |evidence: &str| {
+            format!(
+                r#"{{
+  "version": 1,
+  "epoch": 4,
+  "attachments": {{}},
+  "scope_migration_proofs": {{}},
+  "legacy_path_bindings": {{
+    "lpb_11111111111111111111111111111111": {{
+      "legacy_path_binding_id": "lpb_11111111111111111111111111111111",
+      "historical_path": "/repo/one",
+      "source_store": "transcript-edge",
+      "source_row_id": "{row_id}",
+{evidence}      "inventory_epoch": 3,
+      "status": {{
+        "kind": "unscoped"
+      }}
+    }}
+  }}
+}}
+"#
+            )
+        };
+
+        // Pre-evidence: the record predates the count and the commitment, and
+        // no rule outside the owner's own walk can supply them.
+        let error = decode_attachment_snapshot(ledger_snapshot("").as_bytes()).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_legacy_evidence_unreconstructable"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("re-run the project-catalog migration"),
+            "the refusal must name a repair that works: {error}"
+        );
+
+        // The record a current capture writes: it decodes, and the evidence it
+        // carries is exactly what a fresh walk of the same lane refolds, which
+        // is the property the whole ledger round trip rests on.
+        let written = ledger_snapshot(&format!(
+            "      \"member_row_count\": {},\n      \"member_commitment_sha256\": \"{}\",\n",
+            captured.row_count, captured.commitment_sha256
+        ));
+        let snapshot = decode_attachment_snapshot(written.as_bytes()).unwrap();
+        let binding = snapshot
+            .legacy_path_bindings
+            .values()
+            .next()
+            .expect("the written record decodes");
+        assert_eq!(binding.member_row_count, 3);
+        assert_eq!(
+            binding.member_commitment_sha256,
+            captured_members(&root, &row_id, limits).commitment_sha256
+        );
+    }
+
     /// THE CRASH SHAPE. A temporary left behind by an interrupted stamp is not a
     /// lane: capture must not read it, and the next apply must not trip on it.
     ///

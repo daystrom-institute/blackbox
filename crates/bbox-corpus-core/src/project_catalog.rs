@@ -620,6 +620,52 @@ pub struct LegacyPathLedgerEntry {
     pub status: LegacyPathBindingStatus,
 }
 
+/// Ledger sources whose PRE-EVIDENCE bindings can have their member evidence
+/// reconstructed at decode, because in that schema one binding was one row.
+///
+/// An ALLOW-LIST, not a deny-list, and that direction is the whole safety
+/// property. Reconstruction invents evidence, so it may only be applied where
+/// the answer is knowable without asking the owner. Anything absent from this
+/// list - a group-shaped owner, or a token this version does not recognize -
+/// refuses rather than being guessed at, so a source added later cannot be
+/// silently mis-reconstructed by an older rule.
+///
+/// The tokens mirror `bbox_indexing::project_catalog_backfill::legacy_store_token`
+/// across a crate boundary that cannot be imported the other way; a test there
+/// walks the owner set and pins the two lists together.
+const RECONSTRUCTABLE_LEDGER_SOURCES: &[&str] = &[
+    "knowledge",
+    "gap",
+    "thread",
+    "note",
+    "pin",
+    "roadmap",
+    "packet",
+    "task",
+    "proposal",
+    "slack",
+    "whiteboard",
+    "artifact",
+    // Cannot produce a legacy-selector binding at all (exempt by construction);
+    // listed so that if one somehow exists it refuses at the backfill's own
+    // exemption check, with that diagnostic, rather than here with a shape one.
+    "provenance",
+    // Host-local relocation records name exactly the attachment they carry.
+    "attachment-relocation",
+];
+
+/// Whether a pre-evidence binding of this source can have its member evidence
+/// derived from its `source_row_id` alone.
+///
+/// `false` for the transcript-edge owner, whose binding names a SELECTOR GROUP
+/// standing for an unknown number of physical lane rows. Deriving a singleton
+/// there would embed evidence that no refold can ever reproduce, so the stamp
+/// and the verify would refuse that binding forever and no fresh preflight
+/// could repair it: a durable dead end dressed up as a compatibility path.
+pub fn legacy_ledger_evidence_is_reconstructable(source_store: &str) -> bool {
+    RECONSTRUCTABLE_LEDGER_SOURCES.contains(&source_store)
+}
+
 /// Decode a ledger entry written by ANY version of this schema.
 ///
 /// The member evidence is required in everything this binary writes, but it did
@@ -629,9 +675,12 @@ pub struct LegacyPathLedgerEntry {
 /// all, which turns an additive field into an unopenable store.
 ///
 /// Absence is therefore read as the SINGLETON evidence the entry always
-/// implied: one row, committed over its own `source_row_id`. That is exactly
-/// what every pre-existing binding meant, because per-row obligations were the
-/// only shape that existed when they were written.
+/// implied: one row, committed over its own `source_row_id` - but ONLY for the
+/// sources where that is true (see
+/// [`legacy_ledger_evidence_is_reconstructable`]). A group-shaped source keeps
+/// its absent evidence and is refused by validation, because inventing a count
+/// there is worse than refusing: it cannot be detected later and it cannot be
+/// repaired.
 ///
 /// Absence is distinguished from a written zero on purpose. Normalization
 /// applies ONLY when both halves are missing; a partially written or
@@ -662,7 +711,7 @@ impl<'de> Deserialize<'de> for LegacyPathLedgerEntry {
         let entry = OnDisk::deserialize(deserializer)?;
         let (member_row_count, member_commitment_sha256) =
             match (entry.member_row_count, entry.member_commitment_sha256) {
-                (None, None) => {
+                (None, None) if legacy_ledger_evidence_is_reconstructable(&entry.source_store) => {
                     let members = crate::project_catalog_snapshot::singleton_selector_members(
                         &entry.source_row_id,
                     );
@@ -1337,6 +1386,27 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
+            // Two different failures wear the same shape here, and they need
+            // opposite remediations, so they get different codes. A
+            // reconstructable source can only reach this by carrying a broken
+            // pair, which is a defect in the record. An unreconstructable one
+            // reaches it by predating the evidence entirely, and NOTHING short
+            // of the owner's own walk can supply what it is missing.
+            if !legacy_ledger_evidence_is_reconstructable(&binding.source_store) {
+                return Err(ProjectCatalogError::new(
+                    "error.project_catalog_legacy_evidence_unreconstructable",
+                    format!(
+                        "legacy path binding {key} names source {} and carries no usable member \
+                         evidence. That source stands for a GROUP of owner rows whose size only \
+                         the owner's own confined walk can know, so it cannot be reconstructed \
+                         here and inventing one would refuse every later stamp forever. Discard \
+                         this migrated catalog pair and re-run the project-catalog migration from \
+                         its v1 predecessor, which recaptures every owner's evidence at capture \
+                         time.",
+                        binding.source_store
+                    ),
+                ));
+            }
             return Err(ProjectCatalogError::new(
                 "error.project_catalog_invalid_field",
                 format!(
@@ -3671,6 +3741,98 @@ mod tests {
             decode_attachment_snapshot(encoded.as_bytes()).unwrap(),
             snapshot,
             "the normalized snapshot round-trips unchanged"
+        );
+    }
+
+    /// R3-1. Reconstruction is only legal where the answer is KNOWABLE without
+    /// asking the owner, and for a group-shaped source it is not.
+    ///
+    /// A transcript-edge binding names a selector group standing for an unknown
+    /// number of physical lane rows - three, in the fixture this stands in for.
+    /// Deriving a singleton would write "one row" into the migrated ledger, the
+    /// backfill's refold would then disagree with it on every future run, and no
+    /// fresh preflight could repair a record that is already durable. That is a
+    /// dead end, so decode refuses instead, with its own code and a remedy that
+    /// actually works: remigrate from the v1 predecessor, where every owner's
+    /// evidence is captured rather than guessed.
+    #[test]
+    fn a_pre_evidence_group_shaped_binding_refuses_instead_of_being_invented() {
+        let raw = pre_evidence_attachment_snapshot().replace(
+            r#"      "source_store": "knowledge",
+      "source_row_id": "kb1","#,
+            r#"      "source_store": "transcript-edge",
+      "source_row_id": "transcript_edge:1111111111111111111111111111111111111111111111111111111111111111:selector:2222222222222222222222222222222222222222222222222222222222222222","#,
+        );
+        assert!(
+            raw.contains("transcript-edge"),
+            "the fixture substitution must have applied"
+        );
+
+        let error = decode_attachment_snapshot(raw.as_bytes()).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_legacy_evidence_unreconstructable"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("re-run the project-catalog migration"),
+            "the refusal must name a repair that works: {error}"
+        );
+        // And it is NOT the generic invalid-field refusal, which would send the
+        // operator to repair a record that is not broken, only old.
+        assert_ne!(error.code(), "error.project_catalog_invalid_field");
+
+        // The same binding WITH captured evidence opens normally: the refusal is
+        // about absent evidence for a group, not about the owner.
+        let repaired = raw.replace(
+            r#"      "inventory_epoch": 3,
+      "status": {
+        "kind": "unscoped"
+      }"#,
+            &format!(
+                r#"      "member_row_count": 3,
+      "member_commitment_sha256": "{}",
+      "inventory_epoch": 3,
+      "status": {{
+        "kind": "unscoped"
+      }}"#,
+                "b".repeat(64)
+            ),
+        );
+        let snapshot = decode_attachment_snapshot(repaired.as_bytes()).unwrap();
+        let binding = snapshot
+            .legacy_path_bindings
+            .get(&LegacyPathBindingId::parse("lpb_22222222222222222222222222222222").unwrap())
+            .unwrap();
+        assert_eq!(binding.member_row_count, 3);
+    }
+
+    /// The reconstructable set is an ALLOW-LIST: a token this version does not
+    /// know is refused rather than guessed at, so a source added later cannot be
+    /// silently mis-reconstructed by an older rule.
+    #[test]
+    fn an_unrecognized_pre_evidence_source_is_not_reconstructed() {
+        assert!(legacy_ledger_evidence_is_reconstructable("knowledge"));
+        assert!(legacy_ledger_evidence_is_reconstructable(
+            "attachment-relocation"
+        ));
+        assert!(!legacy_ledger_evidence_is_reconstructable(
+            "transcript-edge"
+        ));
+        assert!(!legacy_ledger_evidence_is_reconstructable(
+            "a-source-this-version-never-minted"
+        ));
+
+        let raw = pre_evidence_attachment_snapshot().replace(
+            r#""source_store": "knowledge","#,
+            r#""source_store": "a-source-this-version-never-minted","#,
+        );
+        assert_eq!(
+            decode_attachment_snapshot(raw.as_bytes())
+                .unwrap_err()
+                .code(),
+            "error.project_catalog_legacy_evidence_unreconstructable"
         );
     }
 
