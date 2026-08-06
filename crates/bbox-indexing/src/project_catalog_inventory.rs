@@ -3883,6 +3883,46 @@ pub fn validate_supported_resolution(
 
     validate_publisher_disposition_set(inventory, report, resolution, post_image, &mut satisfied)?;
 
+    // The two acknowledgement kinds satisfy their requirements by exact
+    // identity: the missing-owner acknowledgement names the owner source the
+    // requirement covers, and the namespace acknowledgement re-binds the
+    // token and key count the report surfaced. The deeper content checks
+    // (the state actually being missing, the counts actually matching the
+    // inventory) already ran in the semantic assessment; this validator only
+    // proves the operator answered every question exactly once.
+    for row in &resolution.missing_optional_owner_acknowledgements {
+        require_resolution_kind(
+            &requirements,
+            &mut satisfied,
+            &row.resolution_id,
+            RequiredResolutionKindV1::MissingOptionalOwner,
+        )?;
+        let requirement = requirements[row.resolution_id.as_str()];
+        if requirement.candidate_record_ids != BTreeSet::from([row.owner_source_id.clone()]) {
+            return Err(invalid(
+                "missing owner acknowledgement does not name its requirement's owner",
+            ));
+        }
+    }
+    for row in &resolution.unclaimed_namespace_acknowledgements {
+        require_resolution_kind(
+            &requirements,
+            &mut satisfied,
+            &row.resolution_id,
+            RequiredResolutionKindV1::UnclaimedNamespace,
+        )?;
+        let requirement = requirements[row.resolution_id.as_str()];
+        if !report.unclaimed_namespace_residue.iter().any(|residue| {
+            requirement.candidate_record_ids == BTreeSet::from([residue.observation_id.clone()])
+                && residue.namespace == row.namespace
+                && residue.vector_key_count == row.vector_key_count
+        }) {
+            return Err(invalid(
+                "unclaimed namespace acknowledgement does not match the reported residue",
+            ));
+        }
+    }
+
     let expected_nonpublisher = report
         .required_resolutions
         .iter()
