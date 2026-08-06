@@ -2026,10 +2026,27 @@ pub(crate) struct InventoryRuntimeBindingsV1 {
     legacy_selectors: BTreeMap<String, RuntimeLiteralBindingV1>,
 }
 
+/// The host-local half of one legacy-selector observation.
+///
+/// The canonical inventory commits to DIGESTS: the selector's digest, and a
+/// one-way hash of the owner's own row id. Neither preimage may enter canonical
+/// bytes, and for the same reason in both cases - an owner row id is not a
+/// bounded, path-free token by construction (a whiteboard board id is chosen by
+/// whoever opened the board, and the task and proposal ids come from schemas
+/// this repo does not mint), so carrying it in canonical bytes could publish a
+/// literal path fragment exactly as carrying the selector would.
+///
+/// So the preimages live here, beside the literal selector this set already
+/// held, and the apply half resolves an obligation through this binding. The
+/// canonical hash stops being a broken pointer and becomes a COMMITMENT: a
+/// binding that does not hash back to the observation is refused, so a swapped
+/// or corrupted binding cannot redirect a stamp onto another row.
 #[derive(Clone)]
 struct RuntimeLiteralBindingV1 {
     digest: Sha256ValueV1,
     literal: String,
+    /// The owner's OWN row id, which only the owner can resolve.
+    source_row_id: String,
 }
 
 impl fmt::Debug for InventoryRuntimeBindingsV1 {
@@ -2087,10 +2104,16 @@ impl InventoryRuntimeBindingsV1 {
             .map(|(id, repository)| (id.as_str(), repository))
     }
 
-    pub(crate) fn legacy_selectors(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.legacy_selectors
-            .iter()
-            .map(|(id, binding)| (id.as_str(), binding.literal.as_str()))
+    /// `(observation id, literal selector, owner row id)`. The last two are
+    /// host-local preimages of what the canonical inventory commits to.
+    pub(crate) fn legacy_selectors(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.legacy_selectors.iter().map(|(id, binding)| {
+            (
+                id.as_str(),
+                binding.literal.as_str(),
+                binding.source_row_id.as_str(),
+            )
+        })
     }
 
     fn validate_pairing(&self, inventory: &V1ProjectCatalogInventory) -> AdapterResult<()> {
@@ -2138,27 +2161,48 @@ impl InventoryRuntimeBindingsV1 {
             .collect::<BTreeMap<_, _>>();
         validate_authorized_path_bindings(&self.git_common_directories, &git_digests)?;
 
-        let selector_digests = inventory
+        let selector_rows = inventory
             .legacy_path_observations
             .iter()
-            .map(|row| (row.observation_id.as_str(), &row.selector_digest))
+            .map(|row| (row.observation_id.as_str(), row))
             .collect::<BTreeMap<_, _>>();
-        if self.legacy_selectors.len() != selector_digests.len() {
+        if self.legacy_selectors.len() != selector_rows.len() {
             return Err(invalid_source(
                 "runtime selector binding coverage is incomplete",
             ));
         }
-        for (observation_id, expected) in selector_digests {
+        for (observation_id, observed) in selector_rows {
             let binding = self
                 .legacy_selectors
                 .get(observation_id)
                 .ok_or_else(|| invalid_source("runtime selector binding is missing"))?;
-            if &binding.digest != expected || digest_path(&binding.literal) != *expected {
-                return Err(invalid_source("runtime selector binding digest mismatch"));
-            }
+            validate_selector_binding(observed, binding)?;
         }
         Ok(())
     }
+}
+
+/// Both host-local preimages of one observation must reproduce what the
+/// canonical inventory committed to.
+///
+/// The selector half has always been checked this way. The row-id half is what
+/// makes the binding trustable enough to STAMP through: a binding carrying some
+/// other owner's row id is refused here rather than writing a project id onto
+/// whatever row it happens to name.
+fn validate_selector_binding(
+    observed: &LegacyPathObservationV1,
+    binding: &RuntimeLiteralBindingV1,
+) -> AdapterResult<()> {
+    if binding.digest != observed.selector_digest
+        || digest_path(&binding.literal) != observed.selector_digest
+    {
+        return Err(invalid_source("runtime selector binding digest mismatch"));
+    }
+    if legacy_row_stable_id(observed.store_kind, &binding.source_row_id)? != observed.stable_row_id
+    {
+        return Err(invalid_source("runtime selector binding row id mismatch"));
+    }
+    Ok(())
 }
 
 fn validate_authorized_path_bindings(
@@ -3530,6 +3574,26 @@ fn selector_kind(kind: LegacyProjectSelectorKindV1) -> LegacySelectorKindV1 {
     }
 }
 
+/// What the DURABLE legacy path ledger will accept as a `source_row_id`
+/// (`bbox_corpus_core::project_catalog`). Mirrored here so preflight refuses an
+/// owner id the ledger could not hold, before anything is written.
+const MAX_LEGACY_SOURCE_ROW_ID_BYTES: usize = 256;
+
+/// The ONE derivation of an observation's canonical row id from the owner's own
+/// row id.
+///
+/// One-way on purpose: an owner row id is not a bounded, path-free token by
+/// construction, so publishing it in canonical inventory bytes could leak a
+/// literal path fragment. Capture commits to this hash and the host-local
+/// runtime binding carries the preimage; both sides derive it here, so the
+/// commitment and the check cannot drift.
+fn legacy_row_stable_id(kind: LegacyPathStoreKindV1, owner_row_id: &str) -> AdapterResult<String> {
+    stable_observation_id_v1(
+        "legacy-row",
+        &[legacy_store_token(kind).as_bytes(), owner_row_id.as_bytes()],
+    )
+}
+
 fn capture_legacy_path_observations_lane(
     durable: &DurableOwnerSnapshotsV1,
 ) -> AdapterResult<(
@@ -3570,13 +3634,7 @@ fn capture_legacy_path_observations_lane(
                     else {
                         continue;
                     };
-                    let stable_row_id = stable_observation_id_v1(
-                        "legacy-row",
-                        &[
-                            legacy_store_token(kind).as_bytes(),
-                            raw.stable_row_id.as_bytes(),
-                        ],
-                    )?;
+                    let stable_row_id = legacy_row_stable_id(kind, &raw.stable_row_id)?;
                     let observation_id = stable_observation_id_v1(
                         "legacy-path",
                         &[
@@ -3585,12 +3643,25 @@ fn capture_legacy_path_observations_lane(
                         ],
                     )?;
                     let digest = digest_path(literal_selector);
+                    // The owner id must satisfy the DURABLE ledger's contract
+                    // here, at preflight, rather than at the first stamp: the
+                    // ledger is where it lands, and an owner minting an id the
+                    // ledger cannot hold is a refusal to surface before any
+                    // mutation, not halfway through one.
+                    if raw.stable_row_id.is_empty()
+                        || raw.stable_row_id.len() > MAX_LEGACY_SOURCE_ROW_ID_BYTES
+                        || raw.stable_row_id.trim() != raw.stable_row_id
+                        || raw.stable_row_id.chars().any(char::is_control)
+                    {
+                        return Err(invalid_source("legacy_path_source_row_id_invalid"));
+                    }
                     if bindings
                         .insert(
                             observation_id.clone(),
                             RuntimeLiteralBindingV1 {
                                 digest: digest.clone(),
                                 literal: literal_selector.clone(),
+                                source_row_id: raw.stable_row_id.clone(),
                             },
                         )
                         .is_some()
@@ -4495,6 +4566,246 @@ mod tests {
     fn write(path: &Path, bytes: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
+    }
+
+    fn no_durable_owner_snapshots() -> DurableOwnerSnapshotsV1 {
+        DurableOwnerSnapshotsV1 {
+            knowledge: Vec::new(),
+            gap: Vec::new(),
+            thread: Vec::new(),
+            note: Vec::new(),
+            pin: Vec::new(),
+            roadmap: Vec::new(),
+            packet: Vec::new(),
+            task: Vec::new(),
+            proposal: Vec::new(),
+            slack_binding: Vec::new(),
+            whiteboard: Vec::new(),
+            artifact: Vec::new(),
+            provenance: Vec::new(),
+            transcript_edge: Vec::new(),
+        }
+    }
+
+    /// THE F10 INVARIANT. Every obligation the plan carries must name a row the
+    /// OWNER can resolve.
+    ///
+    /// The canonical inventory commits to a one-way hash of the owner's row id,
+    /// which is right (an owner row id is not a bounded, path-free token by
+    /// construction) but makes the canonical id useless as a lookup key: no
+    /// owner can invert it. Before this, the ledger carried that hash, so every
+    /// apply refused its first stamp with `owner_row_absent` on a row that was
+    /// sitting right there. The preimage now travels in the host-local runtime
+    /// binding beside the literal selector, and THIS is the test that the thing
+    /// travelling there is the thing the owner answers to.
+    ///
+    /// Driven through three owners with structurally different id shapes: a JSON
+    /// store keyed by document id, the legacy task array, and the edge lane
+    /// aggregates whose ids name a (lane, selector) pair rather than a row.
+    #[test]
+    fn runtime_bindings_carry_owner_resolvable_row_ids() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            OWNER_ROW_ABSENT, OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let limits = OwnerSnapshotLimitsV1::default();
+
+        let knowledge_path = root.join("blackbox-knowledge.json");
+        write(
+            &knowledge_path,
+            br#"{"version":1,"entries":[{"id":"central1","title":"x","content":"y","category":"convention","scope":"project","project":"/repo/one","priority":"standard","weight":100,"status":"active","approval":"user_confirmed","render":true,"decay":true,"source":"user","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","recall_count":0}]}"#,
+        );
+        let tasks_path = root.join("tasks.json");
+        write(&tasks_path, br#"[{"id":"task-1","cwd":"/repo/two"}]"#);
+        let edges_dir = root.join("edges");
+        write(
+            &edges_dir.join("tool.jsonl"),
+            concat!(
+                r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","#,
+                r#""target":{"type":"task","task_id":"two"},"provenance":"explicit","#,
+                r#""confidence":"exact","metadata":{"cwd":"/repo/three"}}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+
+        let mut durable = no_durable_owner_snapshots();
+        durable.knowledge = vec![
+            bbox_knowledge::knowledge::capture_project_catalog_owner_snapshot(
+                &knowledge_path,
+                limits,
+            )
+            .unwrap(),
+        ];
+        durable.task = vec![capture_legacy_task_owner_snapshot(&tasks_path, limits).unwrap()];
+        durable.transcript_edge = vec![
+            bbox_edge_sidecar::edge_sidecar::capture_project_catalog_owner_snapshot(
+                &edges_dir, limits,
+            )
+            .unwrap(),
+        ];
+
+        let (lane, bindings) = capture_legacy_path_observations_lane(&durable).unwrap();
+        assert_eq!(lane.rows.len(), 3);
+
+        for row in &lane.rows {
+            let binding = bindings
+                .get(&row.observation_id)
+                .expect("every observation carries its host-local binding");
+            // The canonical id is a COMMITMENT to the owner id, so the binding
+            // is checkable rather than merely trusted.
+            assert_eq!(
+                legacy_row_stable_id(row.store_kind, &binding.source_row_id).unwrap(),
+                row.stable_row_id
+            );
+
+            // And the owner really resolves it. The second half of each pair is
+            // the regression: the canonical id, which is what the ledger used to
+            // carry, is absent from the owner.
+            let (stamped, absent) = match row.store_kind {
+                LegacyPathStoreKindV1::Knowledge => (
+                    bbox_knowledge::knowledge::stamp_project_catalog_owner_row(
+                        &knowledge_path,
+                        &binding.source_row_id,
+                        "a1b2c3d4",
+                        limits,
+                    ),
+                    bbox_knowledge::knowledge::stamp_project_catalog_owner_row(
+                        &knowledge_path,
+                        &row.stable_row_id,
+                        "a1b2c3d4",
+                        limits,
+                    ),
+                ),
+                LegacyPathStoreKindV1::Task => (
+                    bbox_corpus_core::project_catalog_snapshot::stamp_legacy_task_owner_row(
+                        &tasks_path,
+                        &binding.source_row_id,
+                        "a1b2c3d4",
+                        limits,
+                    ),
+                    bbox_corpus_core::project_catalog_snapshot::stamp_legacy_task_owner_row(
+                        &tasks_path,
+                        &row.stable_row_id,
+                        "a1b2c3d4",
+                        limits,
+                    ),
+                ),
+                LegacyPathStoreKindV1::TranscriptEdge => (
+                    bbox_edge_sidecar::edge_sidecar::stamp_project_catalog_owner_row(
+                        &edges_dir,
+                        &binding.source_row_id,
+                        "a1b2c3d4",
+                        limits,
+                    ),
+                    bbox_edge_sidecar::edge_sidecar::stamp_project_catalog_owner_row(
+                        &edges_dir,
+                        &row.stable_row_id,
+                        "a1b2c3d4",
+                        limits,
+                    ),
+                ),
+                other => panic!("unexpected owner in this fixture: {other:?}"),
+            };
+            assert_eq!(
+                stamped.unwrap(),
+                OwnerRowStampOutcomeV1::Stamped,
+                "{:?} did not resolve the id the binding carries",
+                row.store_kind
+            );
+            assert_eq!(
+                absent.unwrap_err().code,
+                OWNER_ROW_ABSENT,
+                "{:?} resolved the canonical hash, so this test no longer \
+                 reproduces the defect",
+                row.store_kind
+            );
+        }
+    }
+
+    /// A binding that does not hash back to the observation it claims is
+    /// refused. Without this the host-local half could redirect a stamp onto a
+    /// row the canonical inventory never named.
+    #[test]
+    fn a_selector_binding_naming_another_row_is_refused() {
+        use bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let tasks_path = root.join("tasks.json");
+        write(&tasks_path, br#"[{"id":"task-1","cwd":"/repo/two"}]"#);
+
+        let mut durable = no_durable_owner_snapshots();
+        durable.task = vec![
+            capture_legacy_task_owner_snapshot(&tasks_path, OwnerSnapshotLimitsV1::default())
+                .unwrap(),
+        ];
+        let (lane, bindings) = capture_legacy_path_observations_lane(&durable).unwrap();
+        let observed = &lane.rows[0];
+        let binding = bindings.get(&observed.observation_id).unwrap();
+        validate_selector_binding(observed, binding).expect("the captured pair agrees");
+
+        let mut tampered = binding.clone();
+        tampered.source_row_id = "task-9".to_string();
+        let error = validate_selector_binding(observed, &tampered).unwrap_err();
+        assert_eq!(error.code, "error.project_catalog_inventory_adapter_source");
+        assert!(
+            error.to_string().contains("row id mismatch"),
+            "unexpected refusal: {error}"
+        );
+
+        // The selector half still refuses on its own, so widening the check did
+        // not swallow the older one.
+        let mut relabelled = binding.clone();
+        relabelled.literal = "/repo/elsewhere".to_string();
+        assert!(validate_selector_binding(observed, &relabelled).is_err());
+    }
+
+    /// An owner id the durable ledger could not hold is refused at PREFLIGHT,
+    /// before anything is written, rather than at the first stamp.
+    ///
+    /// Owner row ids are not length- or charset-bounded at the owner boundary
+    /// (a whiteboard board id is whatever the caller passed), so the boundary
+    /// that will have to store one checks it here.
+    #[test]
+    fn an_owner_row_id_the_ledger_cannot_hold_refuses_at_capture() {
+        use bbox_corpus_core::project_catalog_snapshot::{
+            LegacyProjectSelectorKindV1, OwnerSnapshotLimitsV1, OwnerSnapshotRowV1,
+            build_owner_snapshot, owner_subsource,
+        };
+
+        let oversized = "t".repeat(MAX_LEGACY_SOURCE_ROW_ID_BYTES + 1);
+        let rows = vec![OwnerSnapshotRowV1::legacy_selector(
+            oversized,
+            LegacyProjectSelectorKindV1::AbsolutePath,
+            "/repo/two",
+        )];
+        let snapshot = build_owner_snapshot(
+            "task",
+            vec![owner_subsource(
+                "task:central-json",
+                bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotStateV1::Present {
+                    content_sha256: bbox_corpus_core::project_catalog_snapshot::sha256_hex(b"x"),
+                    byte_len: 1,
+                },
+                &rows,
+            )],
+            rows,
+            OwnerSnapshotLimitsV1::default(),
+        )
+        .unwrap();
+
+        let mut durable = no_durable_owner_snapshots();
+        durable.task = vec![snapshot];
+        let error = capture_legacy_path_observations_lane(&durable).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy_path_source_row_id_invalid"),
+            "unexpected refusal: {error}"
+        );
     }
 
     fn run_git(root: &Path, args: &[&str]) -> String {
