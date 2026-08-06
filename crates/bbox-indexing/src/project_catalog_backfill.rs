@@ -3344,6 +3344,26 @@ mod tests {
         assert!(!legacy_ledger_evidence_is_reconstructable("not-an-owner"));
     }
 
+    /// ONE token vocabulary end to end: the token the migration's ledger
+    /// mint writes must be the token the backfill inverse reads back to the
+    /// same kind. A second vocabulary for the same enum minted
+    /// transcript_edge and slack_binding into every migrated ledger while
+    /// everything downstream spoke transcript-edge and slack, and the first
+    /// production-shaped backfill preflight refused its own migration's
+    /// ledger as outside the owner set.
+    #[test]
+    fn every_owner_token_round_trips_through_the_ledger_inverse() {
+        for kind in LegacyPathStoreKindV1::all() {
+            let token = legacy_store_token(kind);
+            assert_eq!(
+                legacy_store_kind_from_token(token),
+                Some(kind),
+                "{token} does not round-trip"
+            );
+        }
+        assert!(legacy_store_kind_from_token(ATTACHMENT_RELOCATION_SOURCE).is_none());
+    }
+
     /// A relocation binding plans NOTHING: no stamp, no classification count,
     /// and above all not an unmappable one, which is what a naive "unknown
     /// token" reading would have made of it.

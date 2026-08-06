@@ -3766,7 +3766,7 @@ fn owner_kind_token(kind: ImmutableInventoryOwnerKindV1) -> &'static str {
     }
 }
 
-fn legacy_store_token(kind: LegacyPathStoreKindV1) -> &'static str {
+pub(crate) fn legacy_store_token(kind: LegacyPathStoreKindV1) -> &'static str {
     match kind {
         LegacyPathStoreKindV1::Knowledge => "knowledge",
         LegacyPathStoreKindV1::Gap => "gap",

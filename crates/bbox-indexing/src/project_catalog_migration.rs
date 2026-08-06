@@ -3125,7 +3125,10 @@ fn build_base_post_images(
             LegacyPathLedgerEntry {
                 legacy_path_binding_id: classified.planned_binding_id.clone(),
                 historical_path: classified.literal_selector.clone(),
-                source_store: legacy_store_kind_token(source.store_kind).to_string(),
+                source_store: crate::project_catalog_inventory_adapters::legacy_store_token(
+                    source.store_kind,
+                )
+                .to_string(),
                 // The OWNER's id, not the inventory's hash of it. The backfill
                 // hands this straight to the owner's stamp and read seams, and
                 // an owner can only resolve an id it minted: the canonical
@@ -3175,27 +3178,12 @@ fn build_base_post_images(
     })
 }
 
-fn legacy_store_kind_token(
-    kind: crate::project_catalog_inventory::LegacyPathStoreKindV1,
-) -> &'static str {
-    use crate::project_catalog_inventory::LegacyPathStoreKindV1 as Kind;
-    match kind {
-        Kind::Knowledge => "knowledge",
-        Kind::Gap => "gap",
-        Kind::Thread => "thread",
-        Kind::Note => "note",
-        Kind::Pin => "pin",
-        Kind::Roadmap => "roadmap",
-        Kind::Packet => "packet",
-        Kind::Task => "task",
-        Kind::Proposal => "proposal",
-        Kind::SlackBinding => "slack_binding",
-        Kind::Whiteboard => "whiteboard",
-        Kind::Artifact => "artifact",
-        Kind::Provenance => "provenance",
-        Kind::TranscriptEdge => "transcript_edge",
-    }
-}
+// The ledger mint shares `legacy_store_token` with the capture and the
+// backfill inverse: a second token vocabulary for the same enum minted
+// `transcript_edge` and `slack_binding` into every migrated ledger while
+// everything downstream speaks `transcript-edge` and `slack`, and the first
+// real backfill preflight refused its own migration's ledger as outside the
+// owner set.
 
 fn prepare_publisher_plan(
     inventory: &V1ProjectCatalogInventory,
