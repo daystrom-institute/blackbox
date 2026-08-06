@@ -1244,10 +1244,29 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
                 format!("legacy path key disagrees with binding {}", key),
             ));
         }
-        validate_normalized_absolute_path(
-            &binding.historical_path,
-            &format!("legacy path binding {} historical_path", key),
-        )?;
+        // Only a MAPPED binding's historical path is consumed as a path:
+        // dual-read resolves through it, so it must be normalized absolute.
+        // Unscoped and quarantined bindings carry whatever literal the v1
+        // store actually held, including bare resolver NAMES from early note
+        // rows; demanding path shape there would refuse the migration for
+        // rows that deliberately keep no path binding at all. The literal
+        // stays bounded and control-free, and the supersession key still
+        // works over it byte-for-byte.
+        match &binding.status {
+            LegacyPathBindingStatus::Mapped { .. } => {
+                validate_normalized_absolute_path(
+                    &binding.historical_path,
+                    &format!("legacy path binding {} historical_path", key),
+                )?;
+            }
+            LegacyPathBindingStatus::Unscoped {} | LegacyPathBindingStatus::Quarantined {} => {
+                validate_bounded_text(
+                    &binding.historical_path,
+                    MAX_PATH_BYTES,
+                    "legacy path binding historical_path literal",
+                )?;
+            }
+        }
         validate_bounded_text(&binding.source_store, 128, "legacy path source_store")?;
         validate_bounded_text(&binding.source_row_id, 256, "legacy path source_row_id")?;
         if binding.inventory_epoch == 0 {
@@ -2756,6 +2775,41 @@ mod tests {
         assert_eq!(
             snapshot.validate().unwrap_err().code(),
             "error.project_attachments_duplicate_legacy_source"
+        );
+    }
+
+    /// Only MAPPED bindings' historical paths are consumed as paths by
+    /// dual-read; unscoped and quarantined bindings carry the v1 store's
+    /// actual literal, including bare resolver names from early note rows.
+    /// A path-shape demand on those refused the migration of every host
+    /// carrying name-keyed rows.
+    #[test]
+    fn unscoped_bindings_accept_name_literals_and_mapped_bindings_do_not() {
+        let binding_id =
+            LegacyPathBindingId::parse("lpb_33333333333333333333333333333333").unwrap();
+        let named = LegacyPathLedgerEntry {
+            legacy_path_binding_id: binding_id.clone(),
+            historical_path: "transcript-search".into(),
+            source_store: "note".into(),
+            source_row_id: "note-1".into(),
+            inventory_epoch: 1,
+            status: LegacyPathBindingStatus::Unscoped {},
+        };
+        let mut snapshot = AttachmentSnapshotV1::empty(1).unwrap();
+        snapshot
+            .legacy_path_bindings
+            .insert(binding_id.clone(), named.clone());
+        snapshot.validate().unwrap();
+
+        let mut mapped = named;
+        mapped.status = LegacyPathBindingStatus::Mapped {
+            project_id: ProjectId::parse("aaaaaaaa").unwrap(),
+            relationship: LegacyPathRelationship::ContainedSubdirectory,
+        };
+        snapshot.legacy_path_bindings.insert(binding_id, mapped);
+        assert_eq!(
+            snapshot.validate().unwrap_err().code(),
+            "error.project_attachments_invalid_path"
         );
     }
 
