@@ -568,6 +568,17 @@ pub fn repo_id_for_root(git_root: &Path) -> io::Result<String> {
     Ok(hash_path(git_root))
 }
 
+/// The repo id a first commit derives to, exactly as [`repo_id_for_root`]
+/// derives it for a repository whose history is reachable. Exposed so the
+/// project-catalog migration can re-derive a v1-era repo-id commit namespace
+/// from a live checkout's captured first commit: matching through the
+/// derivation is first-commit evidence, where matching the token by string
+/// equality alone would be the weak-namespace shortcut the migration design
+/// forbids.
+pub fn repo_id_for_first_commit(first_commit: &str) -> String {
+    hash_string(first_commit)
+}
+
 pub fn realpath_hash(path: impl AsRef<Path>) -> io::Result<String> {
     canonical_input_path(path).map(|path| hash_path(&path))
 }

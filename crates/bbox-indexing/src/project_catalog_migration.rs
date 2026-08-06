@@ -2063,17 +2063,12 @@ fn assess_migration_semantics(
             }),
             Attribution::Unclaimed => false,
         };
-        if !supported {
-            eprintln!(
-                "DIAG unsupported namespace={} attribution={:?} count={}",
-                namespace.namespace,
-                match &namespace.attribution {
-                    crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Proved { .. } => "proved",
-                    crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Ambiguous { .. } => "ambiguous",
-                    crate::project_catalog_inventory::LegacyCommitNamespaceAttributionV1::Unclaimed => "unclaimed",
-                },
-                namespace.commit_document_count,
-            );
+        // A zero-document unclaimed namespace protects nothing: the refusal
+        // exists so commit HISTORY cannot be dropped without attribution, and
+        // an empty namespace has none to drop (its stray vector keys are
+        // already ledgered through the orphan evidence). Real history under
+        // an unattributable namespace still refuses.
+        if !supported && namespace.commit_document_count > 0 {
             refusals.push(semantic_refusal(
                 "unsupported_legacy_namespace",
                 [namespace.observation_id.clone()],
@@ -6394,6 +6389,70 @@ mod tests {
     /// silently and let the migration report itself complete with a row that
     /// stays unstamped forever.
     #[test]
+    /// The unsupported-namespace refusal protects commit HISTORY from losing
+    /// attribution; an unclaimed namespace with zero commit documents has
+    /// none to protect and must not block the migration (its stray vector
+    /// keys are ledgered through orphan evidence). Real history under an
+    /// unattributable namespace still refuses.
+    #[test]
+    fn a_zero_document_unclaimed_namespace_does_not_refuse() {
+        use crate::project_catalog_inventory::{
+            LegacyCommitNamespaceAttributionV1, LegacyCommitNamespaceInventoryV1,
+        };
+        let empty_namespace = |count: u64| LegacyCommitNamespaceInventoryV1 {
+            observation_id: "namespace_orphan".to_string(),
+            namespace: bbox_corpus_core::project_catalog::CommitNamespace::parse(
+                "deadbeef".to_string(),
+            )
+            .unwrap(),
+            commit_document_count: count,
+            commit_document_set_sha256: crate::project_catalog_inventory::digest_path("empty"),
+            vector_key_count: 286,
+            vector_key_set_sha256: crate::project_catalog_inventory::digest_path("vectors"),
+            attribution: LegacyCommitNamespaceAttributionV1::Unclaimed,
+        };
+
+        // The git-metadata lane's row count binds git rows + namespaces, so
+        // adding a namespace row must also bump that lane's evidence.
+        let with_namespace = |count: u64| {
+            let mut inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+            inventory
+                .legacy_commit_namespaces
+                .push(empty_namespace(count));
+            for evidence in &mut inventory.immutable_lane_evidence {
+                if evidence.lane_kind
+                    == crate::project_catalog_inventory::ImmutableInventoryLaneKindV1::GitMetadata
+                {
+                    evidence.row_count += 1;
+                }
+            }
+            inventory
+        };
+
+        let inventory = with_namespace(0);
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+        assert!(
+            !assessment
+                .refusals
+                .iter()
+                .any(|refusal| refusal.diagnostic_code == "unsupported_legacy_namespace")
+        );
+
+        let inventory = with_namespace(7);
+        let resolution =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+        assert!(
+            assessment
+                .refusals
+                .iter()
+                .any(|refusal| refusal.diagnostic_code == "unsupported_legacy_namespace")
+        );
+    }
+
+    #[test]
     fn a_lost_selector_binding_refuses_the_classification() {
         let inventory = crate::project_catalog_inventory::tests::fixture_inventory();
         let resolution =
@@ -6484,11 +6543,7 @@ mod tests {
 
         for relative in ["src/lib.rs", "../escape", "./here"] {
             let classified = classify_with(relative);
-            assert_eq!(
-                classified.refusals.len(),
-                1,
-                "{relative} must stay refused"
-            );
+            assert_eq!(classified.refusals.len(), 1, "{relative} must stay refused");
             assert_eq!(
                 classified.report_rows[0].relationship,
                 crate::project_catalog_inventory::LegacyPathRelationshipV1::UnsafeSelector

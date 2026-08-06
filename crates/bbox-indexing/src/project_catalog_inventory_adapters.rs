@@ -3974,6 +3974,7 @@ fn empty_set_commitment(domain: &[u8]) -> Sha256ValueV1 {
 fn namespace_attribution(
     namespace: &str,
     legacy: &LegacyProjectsCaptureV1,
+    first_commit_repo_ids: &BTreeMap<String, BTreeSet<ProjectId>>,
 ) -> LegacyCommitNamespaceAttributionV1 {
     let proved = legacy
         .observations
@@ -3988,6 +3989,19 @@ fn namespace_attribution(
     if !proved.is_empty() {
         return LegacyCommitNamespaceAttributionV1::Proved {
             project_ids: proved,
+        };
+    }
+    // A v1-era commit namespace is the checkout's derived repo id (the hash
+    // of its first commit). Re-deriving the token from the LIVE checkout's
+    // captured first commit and matching through the derivation is
+    // first-commit evidence per the grouping rules; matching the registry's
+    // recorded repo_id string alone (below) is the weak-namespace shortcut
+    // the design forbids for proof and is kept only to surface ambiguity.
+    if let Some(project_ids) = first_commit_repo_ids.get(namespace)
+        && !project_ids.is_empty()
+    {
+        return LegacyCommitNamespaceAttributionV1::Proved {
+            project_ids: project_ids.clone(),
         };
     }
     let candidates = legacy
@@ -4019,6 +4033,7 @@ fn capture_commit_namespaces(
     corpus: &CorpusOwnerMigrationSnapshotV1,
     vectors: &VectorMigrationSnapshotV1,
     legacy: &LegacyProjectsCaptureV1,
+    first_commit_repo_ids: &BTreeMap<String, BTreeSet<ProjectId>>,
 ) -> AdapterResult<Vec<LegacyCommitNamespaceInventoryV1>> {
     let corpus_rows = corpus
         .index
@@ -4063,7 +4078,7 @@ fn capture_commit_namespaces(
                 .transpose()
                 .map_err(|_| invalid_source("vector_key_commitment_invalid"))?
                 .unwrap_or_else(|| empty_set_commitment(b"blackbox.vectors.commit-namespace.v1\0")),
-            attribution: namespace_attribution(namespace, legacy),
+            attribution: namespace_attribution(namespace, legacy, first_commit_repo_ids),
         });
     }
     rows.sort_by(|left, right| left.namespace.cmp(&right.namespace));
@@ -4101,6 +4116,39 @@ fn capture_git_metadata_lane(
         &corpus.git_cursors.state,
         corpus.git_cursors.source_fingerprint_sha256.as_deref(),
     );
+    let checkout_by_id = checkout_captures
+        .iter()
+        .map(|capture| (capture.observation.observation_id.as_str(), capture))
+        .collect::<BTreeMap<_, _>>();
+    // First-commit evidence for v1-era repo-id namespaces: re-derive each
+    // attached checkout's repo id from its captured first commit. Absent
+    // evidence (no repository, unreadable head, no first commit) simply
+    // leaves a namespace unclaimed; only the per-attachment loop below
+    // decides whether that absence is corrupt for the git owner itself.
+    let mut first_commit_repo_ids: BTreeMap<String, BTreeSet<ProjectId>> = BTreeMap::new();
+    for attachment in attachment_candidates {
+        let Some(checkout) = checkout_by_id
+            .get(attachment.checkout_observation_id.as_str())
+            .copied()
+        else {
+            continue;
+        };
+        let Some(repository) = checkout.repository.as_ref() else {
+            continue;
+        };
+        let Ok(Some(head)) = repository.verified_head() else {
+            continue;
+        };
+        let Ok(Some(first_commit)) = repository.first_commit_oid(head.oid()) else {
+            continue;
+        };
+        first_commit_repo_ids
+            .entry(bbox_corpus_core::entity_ref::repo_id_for_first_commit(
+                &first_commit,
+            ))
+            .or_default()
+            .insert(attachment.project_id.clone());
+    }
     let legacy_commit_namespaces = if matches!(
         (&tantivy_state, &vector_state),
         (
@@ -4108,7 +4156,7 @@ fn capture_git_metadata_lane(
             InventorySourceStateV1::Present { .. }
         )
     ) {
-        capture_commit_namespaces(corpus, vectors, legacy)?
+        capture_commit_namespaces(corpus, vectors, legacy, &first_commit_repo_ids)?
     } else {
         Vec::new()
     };
@@ -4126,10 +4174,6 @@ fn capture_git_metadata_lane(
         .rows
         .iter()
         .map(|row| (row.project_id.as_str(), row.last_ingested_sha.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let checkout_by_id = checkout_captures
-        .iter()
-        .map(|capture| (capture.observation.observation_id.as_str(), capture))
         .collect::<BTreeMap<_, _>>();
     let legacy_by_project = legacy
         .observations
@@ -5902,6 +5946,33 @@ mod tests {
         assert_eq!(orphans[0].row_count, 7);
     }
 
+    /// A v1-era commit namespace is the checkout's derived repo id. Live
+    /// first-commit re-derivation proves it (first-commit evidence class);
+    /// the registry's recorded repo_id STRING matching alone must keep the
+    /// namespace unclaimed, because namespace equality is the weak shortcut
+    /// the grouping rules forbid. Every real host carries one such namespace
+    /// per repo from the pre-path-free era, all of which refused migration.
+    #[test]
+    fn a_repo_id_namespace_proves_through_first_commit_rederivation() {
+        let mut legacy = namespace_legacy_capture();
+        // Strip the committed authority so only the recorded repo_id string
+        // matches: string equality alone must NOT prove.
+        legacy.observations[0].committed_authority = None;
+        let unproven = namespace_attribution("repo-one", &legacy, &BTreeMap::new());
+        assert_eq!(unproven, LegacyCommitNamespaceAttributionV1::Unclaimed);
+
+        let project = ProjectId::parse("project-a").unwrap();
+        let evidence =
+            BTreeMap::from([("repo-one".to_string(), BTreeSet::from([project.clone()]))]);
+        let proven = namespace_attribution("repo-one", &legacy, &evidence);
+        assert_eq!(
+            proven,
+            LegacyCommitNamespaceAttributionV1::Proved {
+                project_ids: BTreeSet::from([project]),
+            }
+        );
+    }
+
     fn namespace_legacy_capture() -> LegacyProjectsCaptureV1 {
         let project_id = ProjectId::parse("project-a").unwrap();
         LegacyProjectsCaptureV1 {
@@ -6391,7 +6462,8 @@ mod tests {
         let legacy = namespace_legacy_capture();
         let corpus = namespace_corpus_snapshot();
         let vectors = namespace_vector_snapshot();
-        let joined = capture_commit_namespaces(&corpus, &vectors, &legacy).unwrap();
+        let joined =
+            capture_commit_namespaces(&corpus, &vectors, &legacy, &BTreeMap::new()).unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].commit_document_count, 2);
         assert_eq!(joined[0].vector_key_count, 2);
@@ -6404,12 +6476,15 @@ mod tests {
         changed_corpus.index.commit_namespaces[0].commit_document_count = 3;
         changed_corpus.index.commit_namespaces[0].commit_document_commitment_sha256 =
             "f".repeat(64);
-        let changed = capture_commit_namespaces(&changed_corpus, &vectors, &legacy).unwrap();
+        let changed =
+            capture_commit_namespaces(&changed_corpus, &vectors, &legacy, &BTreeMap::new())
+                .unwrap();
         assert_ne!(changed, joined);
 
         let mut omitted_vector = vectors.clone();
         omitted_vector.commit_namespaces.clear();
-        let omitted = capture_commit_namespaces(&corpus, &omitted_vector, &legacy).unwrap();
+        let omitted =
+            capture_commit_namespaces(&corpus, &omitted_vector, &legacy, &BTreeMap::new()).unwrap();
         assert_eq!(omitted.len(), 1);
         assert_eq!(omitted[0].vector_key_count, 0);
         assert_ne!(
@@ -6421,7 +6496,7 @@ mod tests {
         omitted_corpus.index.commit_namespaces.clear();
         omitted_vector.commit_namespaces.clear();
         assert!(
-            capture_commit_namespaces(&omitted_corpus, &omitted_vector, &legacy)
+            capture_commit_namespaces(&omitted_corpus, &omitted_vector, &legacy, &BTreeMap::new())
                 .unwrap()
                 .is_empty()
         );
