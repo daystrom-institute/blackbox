@@ -126,6 +126,17 @@ pub fn catalog_schema_replacement_guard(
         let manifest = generation_store
             .write_prepared_rebuild_manifest(prepared)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if !outcome.dropped_vector_residue.is_empty() {
+            // Not a refusal: recorded vector keys beyond the document-derived
+            // inputs are store residue for pruned documents, and the
+            // replacement drops them. Named to the operator here (the offline
+            // CLI installs a stderr subscriber) and carried structurally on
+            // the outcome.
+            tracing::warn!(
+                residue = ?outcome.dropped_vector_residue,
+                "recorded vector keys exceed the document-derived inputs; the excess is dropped with the replacement"
+            );
+        }
         if !outcome.namespaces_with_truncated_messages.is_empty() {
             // Not a refusal: re-emitted vector keys for these namespaces hash
             // the truncated text the index carried, so the legacy key is

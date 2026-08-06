@@ -251,6 +251,12 @@ pub struct HistoryMaterializationOutcomeV1 {
     /// reproduced, and this set is how a caller observes that instead of
     /// discovering it as silent vector churn.
     pub namespaces_with_truncated_messages: BTreeSet<CommitNamespace>,
+    /// Recorded vector keys in excess of the document-derived inputs, per
+    /// namespace: store residue for pruned documents, dropped with the
+    /// replacement (see `prove_against_inventory`). Structured here so the
+    /// loss is operator-observable in the outcome, not only a log line.
+    /// Empty when no namespace carried residue.
+    pub dropped_vector_residue: BTreeMap<CommitNamespace, u64>,
     /// Which asset proof ran. `Equality` only when a comparable source
     /// fingerprint was recomputed and matched the asset's; every other
     /// outcome, including "no comparable value", is `Drift`.
@@ -331,6 +337,7 @@ pub fn materialize_history_generations_with_io(
             namespaces: Vec::new(),
             catalog_epoch_after: None,
             namespaces_with_truncated_messages: BTreeSet::new(),
+            dropped_vector_residue: BTreeMap::new(),
             proof_mode: HistoryProofModeV1::Drift,
             recorded_source_index_fingerprint: None,
             observed_source_index_fingerprint: None,
@@ -348,6 +355,7 @@ pub fn materialize_history_generations_with_io(
 
     let mut namespaces = Vec::new();
     let mut truncated = BTreeSet::new();
+    let mut dropped_vector_residue = BTreeMap::new();
     for capture in scan.namespaces.values() {
         let namespace = CommitNamespace::parse(capture.namespace.clone()).map_err(|error| {
             HistoryMaterializerError::new(
@@ -359,7 +367,10 @@ pub fn materialize_history_generations_with_io(
             )
         })?;
         if let Some(asset) = asset.as_ref() {
-            prove_against_inventory(asset, proof_mode, &namespace, capture)?;
+            let residue = prove_against_inventory(asset, proof_mode, &namespace, capture)?;
+            if residue > 0 {
+                dropped_vector_residue.insert(namespace.clone(), residue);
+            }
         }
         if capture.truncated_message_count > 0 {
             truncated.insert(namespace.clone());
@@ -393,6 +404,7 @@ pub fn materialize_history_generations_with_io(
         namespaces,
         catalog_epoch_after,
         namespaces_with_truncated_messages: truncated,
+        dropped_vector_residue,
         proof_mode,
         recorded_source_index_fingerprint: recorded_fingerprint,
         observed_source_index_fingerprint: observed_fingerprint,
@@ -555,11 +567,12 @@ fn load_inventory_asset(
 /// 2. count or document-set commitment disagreement:
 ///    `history_commitment_mismatch`. This arm is exact, because
 ///    `hash_commit_rows` is the very function Phase 1 committed with;
-/// 3. vector-side completeness, as a COVERAGE check
-///    (`vector_input_count >= vector_key_count`) rather than an equality.
-///    Vector enqueue is asynchronous, so the vector store legitimately lags
-///    the index, but it can never legitimately hold keys for commit
-///    documents the generation does not carry.
+/// 3. the vector side is NOT a refusal arm in either direction. Inputs
+///    derive deterministically from the commit documents pinned above, so
+///    recorded keys in excess of them are store residue for pruned
+///    documents: counted, returned to the caller, and dropped with the
+///    replacement, never refused (vector stores do not GC synchronously
+///    with index prunes).
 ///
 /// DRIFT MODE (fingerprints differ, index live-indexed since migration):
 ///
@@ -576,8 +589,8 @@ fn load_inventory_asset(
 ///    legitimately grown namespace. This is a deliberate weakening, which is
 ///    exactly why the mode is recorded in the outcome and the rebuild
 ///    manifest instead of being decided silently;
-/// 4. the vector-side coverage check is likewise a lower bound and holds
-///    unchanged, since it was already a `>=` rather than an equality.
+/// 4. the vector side behaves exactly as in equality mode: recorded-key
+///    excess is named residue carried in the return value, not a refusal.
 ///
 /// The cross-namespace arm (a recorded namespace that vanished entirely)
 /// lives in `prove_recorded_namespaces_survive`, because a per-namespace
@@ -595,14 +608,14 @@ fn prove_against_inventory(
     mode: HistoryProofModeV1,
     namespace: &CommitNamespace,
     capture: &HistoryNamespaceCaptureV1,
-) -> HistoryMaterializerResult<()> {
+) -> HistoryMaterializerResult<u64> {
     let row = asset.rows.iter().find(|row| &row.namespace == namespace);
     let row = match (row, mode) {
         (Some(row), _) => row,
         (None, HistoryProofModeV1::Drift) => {
             // Post-migration history. The catalog, not the asset, is the
             // authority on who owns it.
-            return Ok(());
+            return Ok(0);
         }
         (None, HistoryProofModeV1::Equality) => {
             return Err(HistoryMaterializerError::commitment_mismatch(format!(
@@ -648,18 +661,19 @@ fn prove_against_inventory(
     // rebuild at all, while carrying it is impossible by construction. The
     // residue is NAMED, never silent.
     let vector_inputs = capture.vector_inputs.len() as u64;
-    if vector_inputs < row.vector_key_count {
+    let dropped_residue_keys = row.vector_key_count.saturating_sub(vector_inputs);
+    if dropped_residue_keys > 0 {
         tracing::warn!(
             namespace = %namespace,
             vector_inputs,
             recorded_vector_keys = row.vector_key_count,
-            dropped_residue_keys = row.vector_key_count - vector_inputs,
+            dropped_residue_keys,
             "recorded vector keys exceed the document-derived inputs; the \
              excess is store residue for pruned documents and is dropped \
              with the replacement"
         );
     }
-    Ok(())
+    Ok(dropped_residue_keys)
 }
 
 /// Advance `NotBuilt -> Ready` for every proved and ambiguous namespace in
@@ -1200,13 +1214,16 @@ mod tests {
         // host with ordinary drift unable to rebuild; the residue is named
         // in the log and dropped with the replacement.
         let asset = asset_for(&capture, 4);
-        prove_against_inventory(
+        let dropped = prove_against_inventory(
             &asset,
             HistoryProofModeV1::Equality,
             &namespace("ns"),
             &capture,
         )
         .unwrap();
+        // Named means COUNTED: the caller receives the exact loss, not a
+        // bare success it would have to take on faith.
+        assert_eq!(dropped, 1);
     }
 
     #[test]
@@ -1334,13 +1351,14 @@ mod tests {
         // residue in every mode.
         let observed = capture("ns", 3, 0);
         let asset = asset_for(&observed, 9);
-        prove_against_inventory(
+        let dropped = prove_against_inventory(
             &asset,
             HistoryProofModeV1::Drift,
             &namespace("ns"),
             &observed,
         )
         .unwrap();
+        assert_eq!(dropped, 6);
     }
 
     fn scan_of(captures: Vec<HistoryNamespaceCaptureV1>) -> HistoryIndexScanV1 {

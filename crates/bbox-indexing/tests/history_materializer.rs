@@ -1325,6 +1325,9 @@ fn a_migrated_root_proves_its_namespace_against_the_persisted_asset() {
         NamespaceClassificationV1::Owned { .. }
     ));
     assert_eq!(entry.generation.manifest.body.commit_document_count, 2);
+    // An unchanged-since-migration index derives exactly the recorded vector
+    // keys, so the structured residue report is empty, not merely unlogged.
+    assert!(outcome.dropped_vector_residue.is_empty());
     assert_eq!(outcome.catalog_epoch_after, Some(before + 1));
 
     let state = fixture.store.snapshot().unwrap();

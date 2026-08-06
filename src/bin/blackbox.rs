@@ -517,6 +517,15 @@ struct ErrorBody {
 }
 
 fn main() -> ExitCode {
+    // Operational warnings (dropped vector residue, truncated-message
+    // supersession) are emitted through `tracing` by the libraries this
+    // binary drives. Without a subscriber they are silently dropped, which
+    // turned destructive-but-legal actions invisible. Stderr only: stdout
+    // stays reserved for the single JSON envelope.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
     let cli = Cli::parse();
     let command = command_name(&cli);
     match execute(cli) {
