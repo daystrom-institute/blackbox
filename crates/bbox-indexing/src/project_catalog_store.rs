@@ -5505,16 +5505,20 @@ impl ProjectCatalogTransactionOwner {
                         "terminal rollback checkout action is unregistered",
                     )
                 })?;
-            let bytes = self
-                .io
-                .read_regular_nofollow(&target, 128)?
-                .ok_or_else(|| {
-                    ProjectCatalogStoreError::new(
-                        "error.project_catalog_recovery_incomplete",
-                        "terminal rollback lost its monotonic checkout identity",
-                    )
-                })?;
-            if !valid_checkout_identity_bytes(&bytes) {
+            // Monotonicity binds only AFTER installation: a rolled-back
+            // attempt that failed before its marker installs leaves the
+            // journaled action with no marker on disk, and that absence is
+            // exactly the legitimate corrected-attempt state (the rehearsal
+            // hit this after an earlier apply refused pre-install and its
+            // terminal journal blocked every retry). An installed-then-lost
+            // marker is indistinguishable from never-installed here, and the
+            // corrected attempt re-plans identity for absent markers either
+            // way. Only a marker that EXISTS in a malformed shape is
+            // evidence of damage this supersede must refuse.
+            let Some(bytes) = self.io.read_regular_nofollow(&target, 128)? else {
+                continue;
+            };
+            if !bytes.is_empty() && !valid_checkout_identity_bytes(&bytes) {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_recovery_incomplete",
                     "terminal rollback checkout identity is malformed",
@@ -13721,6 +13725,59 @@ mod tests {
         transact_migration(&path, plan).unwrap();
         assert_eq!(
             fs::read_to_string(marker).unwrap(),
+            "66666666666666666666666666666666"
+        );
+    }
+
+    /// A rolled-back attempt that refused BEFORE installing its markers
+    /// leaves a terminal journal whose checkout actions have no marker on
+    /// disk; monotonicity binds only after installation, so that absence is
+    /// the legitimate corrected-attempt state and must not block the
+    /// supersede (the rehearsal's corrected apply was refused exactly here
+    /// after an earlier marker-conflict rollback). A marker that EXISTS
+    /// malformed still refuses.
+    #[test]
+    fn a_rollback_without_installed_markers_can_be_superseded() {
+        let (_directory, path) = projects_path();
+        let legacy_bytes = b"{\"version\":1,\"projects\":[]}\n".to_vec();
+        fs::write(&path, &legacy_bytes).unwrap();
+        let marker = path
+            .parent()
+            .unwrap()
+            .join("checkout/.bbox/local/checkout-id");
+
+        let (registry, draft, _) = basic_migration_draft(&path, &legacy_bytes);
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        let recovery_registry = plan.registry.clone();
+        let failing = Arc::new(TracingIo::failing_points([FaultPoint::ParticipantInstall]));
+        let error = transact_migration_with_io(&path, plan, failing).unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_injected_fault");
+        // Empty the stage so recovery cannot complete forward and must
+        // restore the whole old set, publishing a terminal rollback.
+        let stage_dir = ProjectCatalogPaths::derive(&path).unwrap().stage_dir;
+        for entry in fs::read_dir(&stage_dir).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        recover_migration_with_io(&path, recovery_registry, Arc::new(RealCatalogStoreIo)).unwrap();
+        let journal: ProjectCatalogTransactionJournalV1 = decode_bounded_json(
+            &fs::read(ProjectCatalogPaths::derive(&path).unwrap().journal).unwrap(),
+            MAX_JOURNAL_BYTES,
+            "transaction journal",
+        )
+        .unwrap();
+        assert_eq!(journal.outcome, Some(TransactionOutcomeV1::RolledBack));
+
+        // The journaled action's marker is ABSENT at the corrected attempt:
+        // never-installed and installed-then-lost are indistinguishable
+        // here, and the corrected attempt re-plans identity either way.
+        if marker.exists() {
+            fs::remove_file(&marker).unwrap();
+        }
+        let (registry, draft, _) = basic_migration_draft(&path, &legacy_bytes);
+        let plan = validate_migration_plan(&path, registry, draft).unwrap();
+        transact_migration(&path, plan).unwrap();
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
             "66666666666666666666666666666666"
         );
     }
