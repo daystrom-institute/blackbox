@@ -401,7 +401,11 @@ pub fn apply(
         Some(guard),
         intent,
     )
-    .map_err(|error| rebuild_failure(ERROR_REBUILD_GENERATION_UNVERIFIED, error.to_string()))?;
+    .map_err(|error| {
+        // The full anyhow chain: the guard wraps the materializer, and the
+        // top context alone says only that the guard refused.
+        rebuild_failure(ERROR_REBUILD_GENERATION_UNVERIFIED, format!("{error:#}"))
+    })?;
 
     // Steps 5 and 6: the SHARED driver, the same function daemon startup
     // calls. The P3-E pass inside it commits the manifest.

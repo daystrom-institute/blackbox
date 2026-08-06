@@ -639,13 +639,25 @@ fn prove_against_inventory(
             }
         }
     }
+    // Vector inputs derive deterministically from the commit documents the
+    // proof above just pinned, so they are exactly the RECONSTRUCTIBLE key
+    // set; recorded keys beyond them are store residue for documents that no
+    // longer exist (vector stores do not GC synchronously with index
+    // prunes), unreachable from any document by pigeonhole. Refusing on that
+    // residue made any host with ordinary vector-store drift unable to
+    // rebuild at all, while carrying it is impossible by construction. The
+    // residue is NAMED, never silent.
     let vector_inputs = capture.vector_inputs.len() as u64;
     if vector_inputs < row.vector_key_count {
-        return Err(HistoryMaterializerError::commitment_mismatch(format!(
-            "namespace {namespace} would carry {vector_inputs} vector inputs but the recorded \
-             inventory holds {} vector keys",
-            row.vector_key_count
-        )));
+        tracing::warn!(
+            namespace = %namespace,
+            vector_inputs,
+            recorded_vector_keys = row.vector_key_count,
+            dropped_residue_keys = row.vector_key_count - vector_inputs,
+            "recorded vector keys exceed the document-derived inputs; the \
+             excess is store residue for pruned documents and is dropped \
+             with the replacement"
+        );
     }
     Ok(())
 }
@@ -1178,20 +1190,23 @@ mod tests {
     }
 
     #[test]
-    fn equality_mode_vector_side_completeness_refuses_a_short_input_set() {
+    fn equality_mode_vector_side_residue_is_named_not_refused() {
         let capture = capture("ns", 3, 0);
-        // The vector store holds keys for four commits; a generation that
-        // carries only three would silently drop one entity's embedding
-        // input across the replacement.
+        // The vector store recorded keys for four commits while the proved
+        // document set derives three inputs: with document equality pinned
+        // above this check, the fourth key is residue for a pruned document,
+        // unreachable from any document by pigeonhole. Vector stores do not
+        // GC synchronously with index prunes, so refusing here made any
+        // host with ordinary drift unable to rebuild; the residue is named
+        // in the log and dropped with the replacement.
         let asset = asset_for(&capture, 4);
-        let error = prove_against_inventory(
+        prove_against_inventory(
             &asset,
             HistoryProofModeV1::Equality,
             &namespace("ns"),
             &capture,
         )
-        .unwrap_err();
-        assert_eq!(error.code(), "error.history_commitment_mismatch");
+        .unwrap();
     }
 
     #[test]
@@ -1313,19 +1328,19 @@ mod tests {
     }
 
     #[test]
-    fn drift_mode_still_enforces_vector_side_coverage() {
-        // The vector arm was already a lower bound, so it is unweakened by
-        // drift mode.
+    fn drift_mode_names_vector_residue_the_same_way() {
+        // Same pigeonhole as equality mode: inputs derive from the observed
+        // documents, and recorded keys beyond them are pruned-document
+        // residue in every mode.
         let observed = capture("ns", 3, 0);
         let asset = asset_for(&observed, 9);
-        let error = prove_against_inventory(
+        prove_against_inventory(
             &asset,
             HistoryProofModeV1::Drift,
             &namespace("ns"),
             &observed,
         )
-        .unwrap_err();
-        assert_eq!(error.code(), "error.history_commitment_mismatch");
+        .unwrap();
     }
 
     fn scan_of(captures: Vec<HistoryNamespaceCaptureV1>) -> HistoryIndexScanV1 {
