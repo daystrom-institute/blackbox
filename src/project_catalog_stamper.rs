@@ -22,13 +22,15 @@
 //! agreement is a maintenance obligation: change one owner's row identity and
 //! you must change all three.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_corpus_core::project_catalog_snapshot::{
-    OWNER_ROW_ABSENT, OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MOVED, OwnerRowBatchV1,
-    OwnerRowProjectIdV1, OwnerRowStampError, OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
+    LegacySelectorMembersV1, OWNER_ROW_ABSENT, OWNER_ROW_MEMBERS_MOVED,
+    OWNER_ROW_PROJECT_ID_CONFLICT, OWNER_SOURCE_MOVED, OwnerRowBatchV1, OwnerRowProjectIdV1,
+    OwnerRowRequestV1, OwnerRowStampError, OwnerRowStampOutcomeV1, OwnerSnapshotLimitsV1,
+    singleton_selector_members,
 };
 use bbox_indexing::project_catalog_backfill::{
     ERROR_RESOLUTION_INVALID, ERROR_STALE_POST_IMAGE, LegacyRowObservationV1,
@@ -186,9 +188,10 @@ fn row_stamp_refusal(
         // replacement. Q-E4 enumerated the first two because they were the
         // cases then known; its PRINCIPLE (state divergence, not artifact
         // invalidity) governs the third identically.
-        OWNER_ROW_ABSENT | OWNER_ROW_PROJECT_ID_CONFLICT | OWNER_SOURCE_MOVED => {
-            ERROR_STALE_POST_IMAGE
-        }
+        OWNER_ROW_ABSENT
+        | OWNER_ROW_PROJECT_ID_CONFLICT
+        | OWNER_SOURCE_MOVED
+        | OWNER_ROW_MEMBERS_MOVED => ERROR_STALE_POST_IMAGE,
         _ => ERROR_RESOLUTION_INVALID,
     };
     ProjectCatalogMigrationError::no_mutation(
@@ -262,6 +265,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
         &self,
         store_kind: LegacyPathStoreKindV1,
         source_row_id: &str,
+        expected_members: &LegacySelectorMembersV1,
         project_id: &ProjectId,
     ) -> Result<LegacyRowStampOutcomeV1, ProjectCatalogMigrationError> {
         let limits = self.limits;
@@ -275,6 +279,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_knowledge::knowledge::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -288,6 +293,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_gaps::gaps::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -301,6 +307,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_threads::threads::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -314,6 +321,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_threads::notes::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -327,6 +335,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_stores::pins::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -340,6 +349,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_stores::roadmap::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -350,6 +360,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_packets::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -363,6 +374,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_corpus_core::project_catalog_snapshot::stamp_legacy_proposal_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -380,6 +392,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                 |path| match bbox_slack::slack_channel_bindings::stamp_project_catalog_owner_row(
                     path,
                     source_row_id,
+                    expected_members,
                     project_id,
                     limits,
                 ) {
@@ -387,6 +400,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                         bbox_slack::slack_proposal_links::stamp_project_catalog_owner_row(
                             path,
                             source_row_id,
+                            expected_members,
                             project_id,
                             limits,
                         )
@@ -402,6 +416,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_whiteboards::whiteboards::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -415,6 +430,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_artifacts::artifacts::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -428,6 +444,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_edge_sidecar::edge_sidecar::stamp_project_catalog_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -441,6 +458,7 @@ impl LegacyRowStamperV1 for ProjectCatalogOwnerRowStamperV1 {
                     bbox_corpus_core::project_catalog_snapshot::stamp_legacy_task_owner_row(
                         path,
                         source_row_id,
+                        expected_members,
                         project_id,
                         limits,
                     )
@@ -501,12 +519,12 @@ impl ProjectCatalogOwnerRowReaderV1 {
     fn read_owner_path(
         &self,
         store_kind: LegacyPathStoreKindV1,
-        source_row_ids: &BTreeSet<String>,
+        rows: &OwnerRowRequestV1,
         path: &Path,
         read: impl FnOnce(&Path) -> std::result::Result<OwnerRowBatchV1, OwnerRowStampError>,
     ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
         validate_owner_path(path)?;
-        map_read_batch(store_kind, source_row_ids, read(path))
+        map_read_batch(store_kind, rows, read(path))
     }
 }
 
@@ -520,7 +538,7 @@ impl ProjectCatalogOwnerRowReaderV1 {
 /// answer "not stamped" for any row in it.
 fn map_read_batch(
     store_kind: LegacyPathStoreKindV1,
-    source_row_ids: &BTreeSet<String>,
+    rows: &OwnerRowRequestV1,
     outcome: std::result::Result<OwnerRowBatchV1, OwnerRowStampError>,
 ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
     let batch = outcome.map_err(|error| {
@@ -534,7 +552,7 @@ fn map_read_batch(
         )
     })?;
     let mut observations = BTreeMap::new();
-    for source_row_id in source_row_ids {
+    for source_row_id in rows.keys() {
         let observation = match batch.get(source_row_id) {
             None => LegacyRowObservationV1::Absent,
             Some(OwnerRowProjectIdV1::Unstamped) => LegacyRowObservationV1::Unstamped,
@@ -577,92 +595,52 @@ impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
     fn observe(
         &self,
         store_kind: LegacyPathStoreKindV1,
-        source_row_ids: &BTreeSet<String>,
+        rows: &OwnerRowRequestV1,
     ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
         let limits = self.limits;
         match store_kind {
-            LegacyPathStoreKindV1::Knowledge => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.knowledge_store_path,
-                |path| {
-                    bbox_knowledge::knowledge::read_project_catalog_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
-                    )
-                },
-            ),
-            LegacyPathStoreKindV1::Gap => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.gap_store_path,
-                |path| {
-                    bbox_gaps::gaps::read_project_catalog_owner_rows(path, source_row_ids, limits)
-                },
-            ),
-            LegacyPathStoreKindV1::Thread => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.thread_store_path,
-                |path| {
-                    bbox_threads::threads::read_project_catalog_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
-                    )
-                },
-            ),
-            LegacyPathStoreKindV1::Note => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.note_store_path,
-                |path| {
-                    bbox_threads::notes::read_project_catalog_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
-                    )
-                },
-            ),
-            LegacyPathStoreKindV1::Pin => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.pin_store_path,
-                |path| {
-                    bbox_stores::pins::read_project_catalog_owner_rows(path, source_row_ids, limits)
-                },
-            ),
-            LegacyPathStoreKindV1::Roadmap => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.roadmap_store_path,
-                |path| {
-                    bbox_stores::roadmap::read_project_catalog_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
-                    )
-                },
-            ),
-            LegacyPathStoreKindV1::Packet => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.packet_root,
-                |path| bbox_packets::read_project_catalog_owner_rows(path, source_row_ids, limits),
-            ),
-            LegacyPathStoreKindV1::Proposal => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.proposal_root,
-                |path| {
+            LegacyPathStoreKindV1::Knowledge => {
+                self.read_owner_path(store_kind, rows, &self.paths.knowledge_store_path, |path| {
+                    bbox_knowledge::knowledge::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Gap => {
+                self.read_owner_path(store_kind, rows, &self.paths.gap_store_path, |path| {
+                    bbox_gaps::gaps::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Thread => {
+                self.read_owner_path(store_kind, rows, &self.paths.thread_store_path, |path| {
+                    bbox_threads::threads::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Note => {
+                self.read_owner_path(store_kind, rows, &self.paths.note_store_path, |path| {
+                    bbox_threads::notes::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Pin => {
+                self.read_owner_path(store_kind, rows, &self.paths.pin_store_path, |path| {
+                    bbox_stores::pins::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Roadmap => {
+                self.read_owner_path(store_kind, rows, &self.paths.roadmap_store_path, |path| {
+                    bbox_stores::roadmap::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Packet => {
+                self.read_owner_path(store_kind, rows, &self.paths.packet_root, |path| {
+                    bbox_packets::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::Proposal => {
+                self.read_owner_path(store_kind, rows, &self.paths.proposal_root, |path| {
                     bbox_corpus_core::project_catalog_snapshot::read_legacy_proposal_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
+                        path, rows, limits,
                     )
-                },
-            ),
+                })
+            }
             // One store kind, TWO sources. The channel bindings source answers
             // first and the proposal links source is asked only for the ids it
             // did not hold, which is the batched form of the stamper's
@@ -674,16 +652,14 @@ impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
                 let path = &self.paths.slack_store_root;
                 validate_owner_path(path)?;
                 let mut batch = bbox_slack::slack_channel_bindings::read_project_catalog_owner_rows(
-                    path,
-                    source_row_ids,
-                    limits,
+                    path, rows, limits,
                 );
                 if let Ok(bound) = &batch {
-                    let unresolved = source_row_ids
+                    let unresolved = rows
                         .iter()
-                        .filter(|source_row_id| !bound.contains_key(*source_row_id))
-                        .cloned()
-                        .collect::<BTreeSet<_>>();
+                        .filter(|(source_row_id, _)| !bound.contains_key(*source_row_id))
+                        .map(|(source_row_id, members)| (source_row_id.clone(), members.clone()))
+                        .collect::<OwnerRowRequestV1>();
                     if !unresolved.is_empty() {
                         batch = bbox_slack::slack_proposal_links::read_project_catalog_owner_rows(
                             path,
@@ -697,56 +673,34 @@ impl LegacyRowOwnerReaderV1 for ProjectCatalogOwnerRowReaderV1 {
                         });
                     }
                 }
-                map_read_batch(store_kind, source_row_ids, batch)
+                map_read_batch(store_kind, rows, batch)
             }
-            LegacyPathStoreKindV1::Whiteboard => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.whiteboard_root,
-                |path| {
+            LegacyPathStoreKindV1::Whiteboard => {
+                self.read_owner_path(store_kind, rows, &self.paths.whiteboard_root, |path| {
                     bbox_whiteboards::whiteboards::read_project_catalog_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
+                        path, rows, limits,
                     )
-                },
-            ),
-            LegacyPathStoreKindV1::Artifact => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.artifact_root,
-                |path| {
-                    bbox_artifacts::artifacts::read_project_catalog_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
-                    )
-                },
-            ),
-            LegacyPathStoreKindV1::TranscriptEdge => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.transcript_edge_root,
-                |path| {
+                })
+            }
+            LegacyPathStoreKindV1::Artifact => {
+                self.read_owner_path(store_kind, rows, &self.paths.artifact_root, |path| {
+                    bbox_artifacts::artifacts::read_project_catalog_owner_rows(path, rows, limits)
+                })
+            }
+            LegacyPathStoreKindV1::TranscriptEdge => {
+                self.read_owner_path(store_kind, rows, &self.paths.transcript_edge_root, |path| {
                     bbox_edge_sidecar::edge_sidecar::read_project_catalog_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
+                        path, rows, limits,
                     )
-                },
-            ),
-            LegacyPathStoreKindV1::Task => self.read_owner_path(
-                store_kind,
-                source_row_ids,
-                &self.paths.task_store_path,
-                |path| {
+                })
+            }
+            LegacyPathStoreKindV1::Task => {
+                self.read_owner_path(store_kind, rows, &self.paths.task_store_path, |path| {
                     bbox_corpus_core::project_catalog_snapshot::read_legacy_task_owner_rows(
-                        path,
-                        source_row_ids,
-                        limits,
+                        path, rows, limits,
                     )
-                },
-            ),
+                })
+            }
             // Unreachable behind verify's own coverage refusal, and a typed
             // refusal rather than a silent "absent" if it were reached.
             LegacyPathStoreKindV1::Provenance => Err(ProjectCatalogMigrationError::no_mutation(
@@ -765,7 +719,7 @@ mod owner_row_stamper_dispatch {
     use super::*;
     use LegacyRowStampCoverageV1::{Covered, ExemptByConstruction};
     use bbox_corpus_core::project_catalog_snapshot::{
-        owner_row_read_captures, reset_owner_row_read_captures,
+        OwnerSnapshotRowValueV1, owner_row_read_captures, reset_owner_row_read_captures,
     };
 
     /// Every path the stamper may touch is rooted in one tempdir, so a test
@@ -838,7 +792,12 @@ mod owner_row_stamper_dispatch {
 
         assert_eq!(
             stamper
-                .stamp(LegacyPathStoreKindV1::Knowledge, "kb1", &project())
+                .stamp(
+                    LegacyPathStoreKindV1::Knowledge,
+                    "kb1",
+                    &singleton_selector_members("kb1"),
+                    &project(),
+                )
                 .unwrap(),
             LegacyRowStampOutcomeV1::Stamped
         );
@@ -847,7 +806,12 @@ mod owner_row_stamper_dispatch {
 
         assert_eq!(
             stamper
-                .stamp(LegacyPathStoreKindV1::Thread, "th1", &project())
+                .stamp(
+                    LegacyPathStoreKindV1::Thread,
+                    "th1",
+                    &singleton_selector_members("th1"),
+                    &project(),
+                )
                 .unwrap(),
             LegacyRowStampOutcomeV1::Stamped
         );
@@ -880,24 +844,44 @@ mod owner_row_stamper_dispatch {
         )
         .unwrap();
 
-        let row_id = bbox_edge_sidecar::edge_sidecar::capture_project_catalog_owner_snapshot(
+        // The edge owner's obligation is a SELECTOR GROUP, so its member
+        // evidence comes from the capture rather than from the id: the members
+        // are lane rows, and the observation id names the group, not a row.
+        let observation = bbox_edge_sidecar::edge_sidecar::capture_project_catalog_owner_snapshot(
             &root.join("edges"),
             OwnerSnapshotLimitsV1::default(),
         )
         .unwrap()
         .rows[0]
-            .stable_row_id
             .clone();
+        let row_id = observation.stable_row_id.clone();
+        let OwnerSnapshotRowValueV1::LegacyProjectSelector { members, .. } = observation.value
+        else {
+            panic!("the transcript-edge owner emits legacy selectors");
+        };
 
         assert_eq!(
             stamper
-                .stamp(LegacyPathStoreKindV1::TranscriptEdge, &row_id, &project())
+                .stamp(
+                    LegacyPathStoreKindV1::TranscriptEdge,
+                    &row_id,
+                    &members,
+                    &project(),
+                )
                 .unwrap(),
             LegacyRowStampOutcomeV1::Stamped
         );
+        // The retry is idempotent AND still agrees with the evidence: stamping
+        // does not move a member id, so a completed obligation refolds to the
+        // same commitment.
         assert_eq!(
             stamper
-                .stamp(LegacyPathStoreKindV1::TranscriptEdge, &row_id, &project())
+                .stamp(
+                    LegacyPathStoreKindV1::TranscriptEdge,
+                    &row_id,
+                    &members,
+                    &project(),
+                )
                 .unwrap(),
             LegacyRowStampOutcomeV1::AlreadyStamped
         );
@@ -937,8 +921,12 @@ mod owner_row_stamper_dispatch {
         .unwrap()
     }
 
-    fn row_ids(ids: &[&str]) -> BTreeSet<String> {
-        ids.iter().map(|id| (*id).to_string()).collect()
+    /// The requested rows of a batched read, each carrying the singleton
+    /// member evidence a small JSON owner records for one row.
+    fn row_ids(ids: &[&str]) -> OwnerRowRequestV1 {
+        ids.iter()
+            .map(|id| ((*id).to_string(), singleton_selector_members(id)))
+            .collect()
     }
 
     /// A MULTI-ROW read of a central-JSON owner captures that owner ONCE.
@@ -1086,7 +1074,12 @@ mod owner_row_stamper_dispatch {
         // Stamp it through the production dispatch.
         assert_eq!(
             stamper
-                .stamp(LegacyPathStoreKindV1::Task, "t1", &project())
+                .stamp(
+                    LegacyPathStoreKindV1::Task,
+                    "t1",
+                    &singleton_selector_members("t1"),
+                    &project(),
+                )
                 .unwrap(),
             LegacyRowStampOutcomeV1::Stamped
         );
@@ -1127,6 +1120,7 @@ mod owner_row_stamper_dispatch {
             .stamp(
                 LegacyPathStoreKindV1::Task,
                 "t1",
+                &singleton_selector_members("t1"),
                 &ProjectId::parse("99999999".to_string()).unwrap(),
             )
             .unwrap_err();
@@ -1156,13 +1150,23 @@ mod owner_row_stamper_dispatch {
         let stamper = stamper(&root);
 
         stamper
-            .stamp(LegacyPathStoreKindV1::Knowledge, "kb1", &project())
+            .stamp(
+                LegacyPathStoreKindV1::Knowledge,
+                "kb1",
+                &singleton_selector_members("kb1"),
+                &project(),
+            )
             .unwrap();
         let after_first = std::fs::read(root.join("knowledge.json")).unwrap();
 
         assert_eq!(
             stamper
-                .stamp(LegacyPathStoreKindV1::Knowledge, "kb1", &project())
+                .stamp(
+                    LegacyPathStoreKindV1::Knowledge,
+                    "kb1",
+                    &singleton_selector_members("kb1"),
+                    &project(),
+                )
                 .unwrap(),
             LegacyRowStampOutcomeV1::AlreadyStamped
         );
@@ -1185,7 +1189,12 @@ mod owner_row_stamper_dispatch {
         let stamper = stamper(&root);
 
         let error = stamper
-            .stamp(LegacyPathStoreKindV1::Knowledge, "absent", &project())
+            .stamp(
+                LegacyPathStoreKindV1::Knowledge,
+                "absent",
+                &singleton_selector_members("absent"),
+                &project(),
+            )
             .unwrap_err();
         assert_eq!(error.code, ERROR_STALE_POST_IMAGE);
         // The owner token, the row id, and the owner's own diagnostic all
@@ -1214,7 +1223,12 @@ mod owner_row_stamper_dispatch {
         let stamper = stamper(&root);
 
         let error = stamper
-            .stamp(LegacyPathStoreKindV1::Knowledge, "kb1", &project())
+            .stamp(
+                LegacyPathStoreKindV1::Knowledge,
+                "kb1",
+                &singleton_selector_members("kb1"),
+                &project(),
+            )
             .unwrap_err();
         assert_eq!(error.code, ERROR_STALE_POST_IMAGE);
         assert!(
@@ -1265,10 +1279,20 @@ mod owner_row_stamper_dispatch {
         let stamper = stamper(&root);
 
         let artifact_defect = stamper
-            .stamp(LegacyPathStoreKindV1::Knowledge, "corrupt", &project())
+            .stamp(
+                LegacyPathStoreKindV1::Knowledge,
+                "corrupt",
+                &singleton_selector_members("corrupt"),
+                &project(),
+            )
             .unwrap_err();
         let state_drift = stamper
-            .stamp(LegacyPathStoreKindV1::Knowledge, "vanished", &project())
+            .stamp(
+                LegacyPathStoreKindV1::Knowledge,
+                "vanished",
+                &singleton_selector_members("vanished"),
+                &project(),
+            )
             .unwrap_err();
 
         assert_eq!(artifact_defect.code, ERROR_RESOLUTION_INVALID);

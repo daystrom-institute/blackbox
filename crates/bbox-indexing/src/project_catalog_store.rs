@@ -10642,6 +10642,8 @@ mod tests {
                 historical_path: "/tmp/legacy-example".into(),
                 source_store: "synthetic".into(),
                 source_row_id: "row-1".into(),
+                member_row_count: 1,
+                member_commitment_sha256: "a".repeat(64),
                 inventory_epoch: 1,
                 status: LegacyPathBindingStatus::Unscoped {},
             },

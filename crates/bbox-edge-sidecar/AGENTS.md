@@ -45,6 +45,15 @@ Consequences a future change must preserve:
 - Verify answers per group: stamped only when EVERY member carries the same
   project id. A partially stamped group must not read as stamped, or a torn
   apply would verify as complete.
+- The stamp and the verify REFOLD the member count and commitment from the
+  same walk that writes or answers, and refuse with `owner_row_members_moved`
+  before writing when they disagree with the ledger. The refold is free: the
+  walk is already visiting every matching row. Removing it would make the
+  recorded evidence inert, because a removed, duplicated, or substituted member
+  leaves the survivors uniformly stamped. Stamping cannot itself move the
+  evidence: identity excludes `project_id` and the rewrite replaces a line in
+  place, so a completed obligation still refolds to what it was planned
+  against, which is what keeps a crash retry idempotent.
 - The stamp temporary is deliberately not a `.jsonl` file. A crash between its
   creation and its rename leaves a half-written copy of a lane on disk, and
   capture must not read it as a lane.

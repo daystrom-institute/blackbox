@@ -3099,6 +3099,12 @@ fn build_base_post_images(
                 // every obligation unresolvable and every live apply fail on its
                 // first stamp.
                 source_row_id: classified.source_row_id.clone(),
+                // The member evidence travels with the obligation so the apply
+                // and the verify can rederive it. Recording it only in the
+                // inventory would leave both halves unable to tell a group
+                // whose rows changed from the group that was reviewed.
+                member_row_count: source.member_row_count,
+                member_commitment_sha256: source.member_commitment_sha256.to_string(),
                 inventory_epoch: 1,
                 status: ledger_status,
             },

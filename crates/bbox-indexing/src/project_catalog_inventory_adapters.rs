@@ -4999,6 +4999,14 @@ mod tests {
                 row.stable_row_id
             );
 
+            // The evidence the ledger will carry, taken from the inventory row
+            // exactly as the post-image build takes it. Every owner rederives
+            // it before writing, so a wrong value here would refuse the stamp.
+            let members = bbox_corpus_core::project_catalog_snapshot::LegacySelectorMembersV1 {
+                row_count: row.member_row_count,
+                commitment_sha256: row.member_commitment_sha256.to_string(),
+            };
+
             // And the owner really resolves it. The second half of each pair is
             // the regression: the canonical id, which is what the ledger used to
             // carry, is absent from the owner.
@@ -5007,12 +5015,16 @@ mod tests {
                     bbox_knowledge::knowledge::stamp_project_catalog_owner_row(
                         &knowledge_path,
                         &binding.source_row_id,
+                        &members,
                         "a1b2c3d4",
                         limits,
                     ),
                     bbox_knowledge::knowledge::stamp_project_catalog_owner_row(
                         &knowledge_path,
                         &row.stable_row_id,
+                        &bbox_corpus_core::project_catalog_snapshot::singleton_selector_members(
+                            &row.stable_row_id,
+                        ),
                         "a1b2c3d4",
                         limits,
                     ),
@@ -5021,12 +5033,16 @@ mod tests {
                     bbox_corpus_core::project_catalog_snapshot::stamp_legacy_task_owner_row(
                         &tasks_path,
                         &binding.source_row_id,
+                        &members,
                         "a1b2c3d4",
                         limits,
                     ),
                     bbox_corpus_core::project_catalog_snapshot::stamp_legacy_task_owner_row(
                         &tasks_path,
                         &row.stable_row_id,
+                        &bbox_corpus_core::project_catalog_snapshot::singleton_selector_members(
+                            &row.stable_row_id,
+                        ),
                         "a1b2c3d4",
                         limits,
                     ),
@@ -5035,12 +5051,16 @@ mod tests {
                     bbox_edge_sidecar::edge_sidecar::stamp_project_catalog_owner_row(
                         &edges_dir,
                         &binding.source_row_id,
+                        &members,
                         "a1b2c3d4",
                         limits,
                     ),
                     bbox_edge_sidecar::edge_sidecar::stamp_project_catalog_owner_row(
                         &edges_dir,
                         &row.stable_row_id,
+                        &bbox_corpus_core::project_catalog_snapshot::singleton_selector_members(
+                            &row.stable_row_id,
+                        ),
                         "a1b2c3d4",
                         limits,
                     ),

@@ -94,7 +94,7 @@ pub enum LegacyProjectSelectorKindV1 {
 /// The commitment is over member ids in WALK ORDER, not sorted: the order is a
 /// property of the source the owner just read, and re-deriving it is how a
 /// verify proves it re-read the same rows rather than merely the same set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LegacySelectorMembersV1 {
     pub row_count: u64,
     pub commitment_sha256: String,
@@ -423,6 +423,57 @@ pub const OWNER_SOURCE_UNWRITABLE: &str = "owner_source_unwritable";
 pub const OWNER_SOURCE_MOVED: &str = "owner_source_moved";
 /// The caller supplied an empty or whitespace-only project id.
 pub const OWNER_PROJECT_ID_INVALID: &str = "owner_project_id_invalid";
+/// The rows this obligation stands for are no longer the rows it was planned
+/// against: one was removed, duplicated, or substituted since capture.
+///
+/// STALENESS class, deliberately alongside [`OWNER_SOURCE_MOVED`] rather than
+/// alongside the invalidity codes. Nothing here says the owner is corrupt; it
+/// says the artifact describes a state the store has since left, and the
+/// operator response is the same one a moved source calls for: re-run preflight
+/// against the current state.
+///
+/// Capture records a member count and an ordered commitment precisely so a
+/// dropped, duplicated, or substituted member is detectable. That evidence is
+/// worth nothing unless something REDERIVES it at the moment of writing, which
+/// is what this code exists to report: a group whose members changed while
+/// remaining uniformly stamped would otherwise pass verification unchanged.
+pub const OWNER_ROW_MEMBERS_MOVED: &str = "owner_row_members_moved";
+
+/// Refuse unless the member evidence a plan was built from still describes the
+/// rows the owner just walked.
+pub fn ensure_selector_members_unchanged(
+    expected: &LegacySelectorMembersV1,
+    observed: &LegacySelectorMembersV1,
+) -> Result<(), OwnerRowStampError> {
+    if expected == observed {
+        return Ok(());
+    }
+    Err(OwnerRowStampError::new(OWNER_ROW_MEMBERS_MOVED))
+}
+
+/// The singleton-owner form of [`ensure_selector_members_unchanged`].
+///
+/// An owner whose observation IS one row has a member set that is a pure
+/// function of the row id, so "rederive the member set" is exactly "the plan
+/// expected this one row, and the lookup that follows proves it is still
+/// there". Shared by all twelve singleton owners so the rule has one
+/// definition rather than twelve.
+pub fn ensure_singleton_member_evidence(
+    source_row_id: &str,
+    expected: &LegacySelectorMembersV1,
+) -> Result<(), OwnerRowStampError> {
+    ensure_selector_members_unchanged(expected, &singleton_selector_members(source_row_id))
+}
+
+/// [`ensure_singleton_member_evidence`] for a batched read.
+pub fn ensure_singleton_member_evidence_batch(
+    rows: &std::collections::BTreeMap<String, LegacySelectorMembersV1>,
+) -> Result<(), OwnerRowStampError> {
+    for (source_row_id, expected) in rows {
+        ensure_singleton_member_evidence(source_row_id, expected)?;
+    }
+    Ok(())
+}
 
 /// Whether a row needs a write, decided from its CURRENT project id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,6 +788,15 @@ pub enum OwnerRowProjectIdV1 {
 /// re-derive row identity to read an answer back.
 pub type OwnerRowBatchV1 = std::collections::BTreeMap<String, OwnerRowProjectIdV1>;
 
+/// What a batched read ASKS an owner: which rows, and the member evidence each
+/// obligation was planned against.
+///
+/// The evidence travels with the request rather than being looked up later
+/// because only the owner can rederive it, and it must be rederived from the
+/// same walk that answers the read. A verify that compared counts afterwards
+/// would be comparing two different reads of a live store.
+pub type OwnerRowRequestV1 = std::collections::BTreeMap<String, LegacySelectorMembersV1>;
+
 // ---------------------------------------------------------------------------
 // Capture instrumentation
 // ---------------------------------------------------------------------------
@@ -950,9 +1010,11 @@ pub fn read_json_tree_rows_project_id(
 /// array, so it locates its rows the same non-shared way the stamper does.
 pub fn read_legacy_task_owner_rows(
     tasks_path: &Path,
-    source_row_ids: &BTreeSet<String>,
+    rows: &OwnerRowRequestV1,
     limits: OwnerSnapshotLimitsV1,
 ) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
+    ensure_singleton_member_evidence_batch(rows)?;
+    let source_row_ids = &rows.keys().cloned().collect::<BTreeSet<_>>();
     read_json_owner_rows(tasks_path, "task", "task:central-json", limits, |bytes| {
         let document: serde_json::Value = decode_owner_source(bytes)?;
         let rows = document
@@ -969,9 +1031,11 @@ pub fn read_legacy_task_owner_rows(
 /// Read half of [`stamp_legacy_proposal_owner_row`].
 pub fn read_legacy_proposal_owner_rows(
     proposals_root: &Path,
-    source_row_ids: &BTreeSet<String>,
+    rows: &OwnerRowRequestV1,
     limits: OwnerSnapshotLimitsV1,
 ) -> Result<OwnerRowBatchV1, OwnerRowStampError> {
+    ensure_singleton_member_evidence_batch(rows)?;
+    let source_row_ids = &rows.keys().cloned().collect::<BTreeSet<_>>();
     read_json_tree_rows_project_id(
         proposals_root,
         "proposal",
@@ -1041,9 +1105,11 @@ pub fn capture_legacy_task_owner_snapshot(
 pub fn stamp_legacy_task_owner_row(
     tasks_path: &Path,
     source_row_id: &str,
+    expected_members: &LegacySelectorMembersV1,
     project_id: &str,
     limits: OwnerSnapshotLimitsV1,
 ) -> Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
+    ensure_singleton_member_evidence(source_row_id, expected_members)?;
     stamp_json_owner_row(tasks_path, "task", "task:central-json", limits, |bytes| {
         let mut document: serde_json::Value = decode_owner_source(bytes)?;
         let row = document
@@ -1166,9 +1232,11 @@ pub fn capture_legacy_proposal_owner_snapshot(
 pub fn stamp_legacy_proposal_owner_row(
     proposals_root: &Path,
     source_row_id: &str,
+    expected_members: &LegacySelectorMembersV1,
     project_id: &str,
     limits: OwnerSnapshotLimitsV1,
 ) -> Result<OwnerRowStampOutcomeV1, OwnerRowStampError> {
+    ensure_singleton_member_evidence(source_row_id, expected_members)?;
     stamp_json_tree_row(
         proposals_root,
         "proposal",
@@ -2528,6 +2596,7 @@ mod proposal_owner_row_stamping {
         stamp_legacy_proposal_owner_row(
             &fixture.root,
             row,
+            &singleton_selector_members(row),
             project_id,
             OwnerSnapshotLimitsV1::default(),
         )

@@ -603,6 +603,20 @@ pub struct LegacyPathLedgerEntry {
     pub historical_path: String,
     pub source_store: String,
     pub source_row_id: String,
+    /// How many owner rows the obligation stood for when it was reviewed, and a
+    /// canonical ordered commitment over their ids.
+    ///
+    /// Persisted, not merely inventoried, because the ONLY thing that makes the
+    /// evidence worth recording is something rederiving it at the moment of
+    /// writing and again at verification. Without it here, a member removed,
+    /// duplicated, or substituted after review leaves the survivors uniformly
+    /// stamped, and both halves report success over a set nobody approved.
+    ///
+    /// Every owner carries both: the small stores are singletons (count 1, a
+    /// commitment over their one row id), so the shape is uniform across the
+    /// owner set rather than special-cased for the line-oriented one.
+    pub member_row_count: u64,
+    pub member_commitment_sha256: String,
     pub inventory_epoch: u64,
     pub status: LegacyPathBindingStatus,
 }
@@ -1269,6 +1283,20 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
         }
         validate_bounded_text(&binding.source_store, 128, "legacy path source_store")?;
         validate_bounded_text(&binding.source_row_id, 256, "legacy path source_row_id")?;
+        // A binding standing for no rows is not evidence of anything, and a
+        // commitment that is not a sha256 could not have come from a capture.
+        if binding.member_row_count == 0
+            || binding.member_commitment_sha256.len() != 64
+            || !binding
+                .member_commitment_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ProjectCatalogError::new(
+                "error.project_catalog_invalid_field",
+                format!("legacy path binding {key} member evidence is invalid"),
+            ));
+        }
         if binding.inventory_epoch == 0 {
             return Err(ProjectCatalogError::new(
                 "error.project_attachments_invalid_inventory_epoch",
@@ -2224,6 +2252,8 @@ mod tests {
             historical_path: "/tmp/old".into(),
             source_store: "knowledge".into(),
             source_row_id: "row-1".into(),
+            member_row_count: 1,
+            member_commitment_sha256: "a".repeat(64),
             inventory_epoch: 1,
             status: LegacyPathBindingStatus::Unscoped {},
         };
@@ -2763,6 +2793,8 @@ mod tests {
             historical_path: "/tmp/old".into(),
             source_store: "knowledge".into(),
             source_row_id: "row-1".into(),
+            member_row_count: 1,
+            member_commitment_sha256: "a".repeat(64),
             inventory_epoch: 1,
             status: LegacyPathBindingStatus::Unscoped {},
         };
@@ -2881,6 +2913,8 @@ mod tests {
             historical_path: "/tmp/old".into(),
             source_store: "knowledge".into(),
             source_row_id: "row-1".into(),
+            member_row_count: 1,
+            member_commitment_sha256: "a".repeat(64),
             inventory_epoch: 1,
             status: LegacyPathBindingStatus::Mapped {
                 project_id: id("missing"),

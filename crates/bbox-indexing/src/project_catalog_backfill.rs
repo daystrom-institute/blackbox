@@ -32,6 +32,7 @@ use bbox_corpus_core::project_catalog::{
     AttachmentSnapshotV1, LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry,
     LegacyPathRelationship, ProjectId,
 };
+use bbox_corpus_core::project_catalog_snapshot::{LegacySelectorMembersV1, OwnerRowRequestV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -714,10 +715,16 @@ pub trait LegacyRowStamperV1: Send + Sync {
     /// reads like "nothing to do".
     fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1;
 
+    /// `expected_members` is the evidence the plan was reviewed against, and
+    /// implementations MUST rederive it from the state they are about to write
+    /// and refuse when it no longer matches. A group whose rows changed while
+    /// staying uniformly stamped is otherwise indistinguishable from the
+    /// reviewed one, in both halves of the backfill.
     fn stamp(
         &self,
         store_kind: LegacyPathStoreKindV1,
         source_row_id: &str,
+        expected_members: &LegacySelectorMembersV1,
         project_id: &ProjectId,
     ) -> BackfillResult<LegacyRowStampOutcomeV1>;
 }
@@ -769,10 +776,15 @@ pub trait LegacyRowOwnerReaderV1: Send + Sync {
     /// held to this by
     /// `bbox_corpus_core::project_catalog_snapshot::owner_row_read_captures`,
     /// which counts the captures a batch actually performs.
+    /// Each requested row carries the member evidence its obligation was
+    /// planned against, and implementations MUST recompute it from the same
+    /// walk that answers the read and refuse on mismatch. Reporting a group as
+    /// stamped while its membership has moved is exactly the hole this argument
+    /// closes: the surviving members would still carry a uniform project id.
     fn observe(
         &self,
         store_kind: LegacyPathStoreKindV1,
-        source_row_ids: &BTreeSet<String>,
+        rows: &OwnerRowRequestV1,
     ) -> BackfillResult<BTreeMap<String, LegacyRowObservationV1>>;
 }
 
@@ -903,17 +915,22 @@ fn backfill_inventory_hash(
 /// appended supersessions, in a deterministic order.
 fn backfill_plan_hash(
     inventory_hash: &Sha256ValueV1,
-    stamps: &[(LegacyPathStoreKindV1, String, ProjectId)],
+    stamps: &[PlannedStampV1],
     appended: &[LegacyPathLedgerEntry],
 ) -> Sha256ValueV1 {
     let mut hasher = Sha256::new();
     field(&mut hasher, b"blackbox.project-catalog.backfill-plan.v1");
     field(&mut hasher, inventory_hash.as_str().as_bytes());
     hasher.update((stamps.len() as u64).to_be_bytes());
-    for (kind, row_id, project_id) in stamps {
-        field(&mut hasher, legacy_store_token(*kind).as_bytes());
-        field(&mut hasher, row_id.as_bytes());
-        field(&mut hasher, project_id.as_str().as_bytes());
+    for stamp in stamps {
+        field(&mut hasher, legacy_store_token(stamp.store_kind).as_bytes());
+        field(&mut hasher, stamp.source_row_id.as_bytes());
+        // The evidence is part of what the operator reviewed, so the plan hash
+        // commits to it: a replan against a changed member set is a different
+        // plan even when it names the same rows and the same projects.
+        hasher.update(stamp.members.row_count.to_be_bytes());
+        field(&mut hasher, stamp.members.commitment_sha256.as_bytes());
+        field(&mut hasher, stamp.project_id.as_str().as_bytes());
     }
     hasher.update((appended.len() as u64).to_be_bytes());
     for entry in appended {
@@ -1002,8 +1019,23 @@ struct BackfillPlanV1 {
     classification_counts: BTreeMap<LegacyPathStoreKindV1, LegacyStoreClassificationCountsV1>,
     planned_stamps: BTreeMap<LegacyPathStoreKindV1, u64>,
     unscoped_legacy_counts: BTreeMap<LegacyPathStoreKindV1, u64>,
-    stamps: Vec<(LegacyPathStoreKindV1, String, ProjectId)>,
+    stamps: Vec<PlannedStampV1>,
     appended: Vec<LegacyPathLedgerEntry>,
+}
+
+/// One planned stamp: which owner, which row, the MEMBER EVIDENCE the plan was
+/// reviewed against, and the id to write.
+///
+/// The evidence rides with the obligation rather than being looked up at apply
+/// time, because the owner has to rederive it from the same walk that performs
+/// the write. Carrying it here is what lets a stamp refuse when the rows it is
+/// about to write are no longer the rows the operator reviewed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlannedStampV1 {
+    store_kind: LegacyPathStoreKindV1,
+    source_row_id: String,
+    members: LegacySelectorMembersV1,
+    project_id: ProjectId,
 }
 
 /// Build the deterministic plan from a predecessor pair and a resolution.
@@ -1097,6 +1129,8 @@ fn plan_backfill(
             historical_path: entry.historical_path.clone(),
             source_store: entry.source_store.clone(),
             source_row_id: entry.source_row_id.clone(),
+            member_row_count: entry.member_row_count,
+            member_commitment_sha256: entry.member_commitment_sha256.clone(),
             inventory_epoch: next_epoch,
             status,
         });
@@ -1150,7 +1184,15 @@ fn plan_backfill(
             LegacyPathBindingStatus::Mapped { project_id, .. } => {
                 counts.mappable += 1;
                 *planned_stamps.entry(store_kind).or_default() += 1;
-                stamps.push((store_kind, entry.source_row_id.clone(), project_id.clone()));
+                stamps.push(PlannedStampV1 {
+                    store_kind,
+                    source_row_id: entry.source_row_id.clone(),
+                    members: LegacySelectorMembersV1 {
+                        row_count: entry.member_row_count,
+                        commitment_sha256: entry.member_commitment_sha256.clone(),
+                    },
+                    project_id: project_id.clone(),
+                });
                 Some(project_id.clone())
             }
             LegacyPathBindingStatus::Quarantined {} => {
@@ -2028,12 +2070,17 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         // stamped set completes without duplication.
         let mut stamp_counts: BTreeMap<LegacyPathStoreKindV1, BackfillStoreStampCountsV1> =
             BTreeMap::new();
-        for (kind, row_id, project_id) in &plan.stamps {
-            let counts = stamp_counts.entry(*kind).or_default();
+        for stamp in &plan.stamps {
+            let counts = stamp_counts.entry(stamp.store_kind).or_default();
             counts.mappable += 1;
             match request
                 .stamper
-                .stamp(*kind, row_id, project_id)
+                .stamp(
+                    stamp.store_kind,
+                    &stamp.source_row_id,
+                    &stamp.members,
+                    &stamp.project_id,
+                )
                 .map_err(|error| error.with_backfill_stamping_disposition())?
             {
                 LegacyRowStampOutcomeV1::Stamped => counts.stamped += 1,
@@ -2120,8 +2167,12 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         let mut unscoped_total = 0u64;
         let mut observed_per_store: BTreeMap<LegacyPathStoreKindV1, u64> = BTreeMap::new();
         let mut observed_unscoped_per_store: BTreeMap<LegacyPathStoreKindV1, u64> = BTreeMap::new();
-        let mut expected_rows: BTreeMap<LegacyPathStoreKindV1, BTreeMap<String, ProjectId>> =
-            BTreeMap::new();
+        // Per owner: which rows the ledger claims, the id each must carry, and
+        // the member evidence the obligation was reviewed against.
+        let mut expected_rows: BTreeMap<
+            LegacyPathStoreKindV1,
+            BTreeMap<String, (ProjectId, LegacySelectorMembersV1)>,
+        > = BTreeMap::new();
         for binding in effective.values() {
             let Some(kind) = legacy_store_kind_from_token(&binding.effective.source_store) else {
                 return Err(refuse(
@@ -2137,7 +2188,19 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                     if expected_rows
                         .entry(kind)
                         .or_default()
-                        .insert(binding.effective.source_row_id.clone(), project_id.clone())
+                        .insert(
+                            binding.effective.source_row_id.clone(),
+                            (
+                                project_id.clone(),
+                                LegacySelectorMembersV1 {
+                                    row_count: binding.effective.member_row_count,
+                                    commitment_sha256: binding
+                                        .effective
+                                        .member_commitment_sha256
+                                        .clone(),
+                                },
+                            ),
+                        )
                         .is_some()
                     {
                         return Err(refuse(
@@ -2314,10 +2377,17 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
                     ));
                 }
             }
-            let observed = request
-                .owner_reader
-                .observe(*kind, &rows.keys().cloned().collect())?;
-            for (source_row_id, project_id) in rows {
+            // The evidence travels INTO the read: the owner recomputes it from
+            // the same walk that answers, and refuses when the group it just
+            // walked is no longer the group the ledger describes.
+            let observed = request.owner_reader.observe(
+                *kind,
+                &rows
+                    .iter()
+                    .map(|(source_row_id, (_, members))| (source_row_id.clone(), members.clone()))
+                    .collect(),
+            )?;
+            for (source_row_id, (project_id, _)) in rows {
                 match observed.get(source_row_id) {
                     Some(LegacyRowObservationV1::StampedWith(observed_project_id))
                         if observed_project_id == project_id => {}
@@ -2757,6 +2827,10 @@ mod tests {
             historical_path: "/host/checkouts/alpha".to_string(),
             source_store: store.to_string(),
             source_row_id: "row-alpha".to_string(),
+            member_row_count: 1,
+            member_commitment_sha256:
+                bbox_corpus_core::project_catalog_snapshot::singleton_selector_members("row-alpha")
+                    .commitment_sha256,
             inventory_epoch: epoch,
             status,
         }
@@ -2943,7 +3017,7 @@ mod tests {
         // The converted row now stamps, proving the plan classifies from the
         // POST-resolution ledger rather than the predecessor.
         assert_eq!(plan.stamps.len(), 1);
-        assert_eq!(plan.stamps[0].2, project('b'));
+        assert_eq!(plan.stamps[0].project_id, project('b'));
     }
 
     /// classify-unscoped-by-appended-supersession appends `Unscoped {}` and
@@ -3856,6 +3930,7 @@ mod tests {
             &self,
             _store_kind: LegacyPathStoreKindV1,
             _source_row_id: &str,
+            _expected_members: &LegacySelectorMembersV1,
             _project_id: &ProjectId,
         ) -> BackfillResult<LegacyRowStampOutcomeV1> {
             Ok(LegacyRowStampOutcomeV1::Stamped)
@@ -3879,6 +3954,7 @@ mod tests {
             &self,
             _store_kind: LegacyPathStoreKindV1,
             _source_row_id: &str,
+            _expected_members: &LegacySelectorMembersV1,
             _project_id: &ProjectId,
         ) -> BackfillResult<LegacyRowStampOutcomeV1> {
             Ok(LegacyRowStampOutcomeV1::Stamped)
