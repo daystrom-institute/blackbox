@@ -398,9 +398,11 @@ Lock acquisition for configured apply uses the factored claim helper of
 section 4.2 (`acquire_admin_lifetime_claim`), NOT `open_admin_store`:
 the shipped `open_admin_store` strict-opens a v2 store, which correctly
 refuses the still-version-1 configured store that exists before the
-migration transaction runs. The CLI acquires the claim before any target
-read or mutation and holds it through the entire facade call and
-post-commit verification.
+migration transaction runs. The CLI takes the claim as a PROBE before
+any target read or mutation and releases it before the facade call
+(amended during the operational-cut repair arc; the transaction's own
+exclusive acquisition is the enforcement, per the section-4.2 note
+below).
 
 **Lock discipline (preflight).** Governing section 6.3 states "preflight
 takes a shared/read lock." This matches the shipped code: preflight capture
@@ -849,11 +851,21 @@ acquire_admin_lifetime_claim(projects_path)
     -> return guard
 ```
 
-The CLI acquires the claim before any target read or mutation and holds
-it through the entire facade call and post-commit verification.
-`open_admin_store` continues to use the helper and then strict-opens, for
-operations whose target is already version 2 (the new verbs' configured
-applies, which run after migration).
+The CLI takes the claim as a PROBE before any target read or mutation,
+then RELEASES it before the facade call (amended during the
+operational-cut repair arc): the migration transaction re-acquires the
+same advisory lock exclusively on its own descriptor, which cannot
+coexist with any claim this process still holds, so held coverage made
+every configured apply refuse lifetime_lock_busy against itself. The
+probe proves no daemon holds the store at that instant with the
+operator-actionable refusal; the transaction's own exclusive
+acquisition, taken before recovery, mutation-lock acquisition, or
+publication, is the runbook-ordering enforcement, and a daemon entering
+the probe-release window makes the transaction refuse with no durable
+mutation. `open_admin_store` continues to use the helper and then
+strict-opens, for operations whose target is already version 2 (the new
+verbs' configured applies, which run after migration, and whose facades
+do not re-acquire, so their held-claim caller precondition stands).
 
 ### 4.3. Rehearsal apply needs no exclusive lock
 

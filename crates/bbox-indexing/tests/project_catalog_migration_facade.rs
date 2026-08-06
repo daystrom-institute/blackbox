@@ -35,6 +35,7 @@ use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationVerifyConfiguredRequestV1, ProjectCatalogMigrationVerifyRequestV1,
     project_catalog_migration_store_limits,
 };
+use bbox_indexing::project_catalog_migration_lock::ProjectCatalogMigrationLock;
 use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 use bbox_indexing::publisher::PublisherRefStore;
 use bbox_vectors::VectorStore;
@@ -1516,6 +1517,39 @@ fn configured_apply_installs_the_reviewed_post_image_on_the_configured_layout() 
             .exists()
     );
     fs::write(&report_path, &reviewed_report_bytes).unwrap();
+
+    // F18's distinguishing regression: a process still HOLDING its shared
+    // lifetime claim cannot apply, because the migration transaction
+    // re-acquires the same advisory lock exclusively on its own descriptor
+    // (the section 4.1 flock self-conflict class). This is the exact defect
+    // the certified CLI shipped: holding the claim through the facade call
+    // made every configured apply refuse itself. The CLI's contract is
+    // probe, RELEASE, then transaction-owned exclusive acquisition.
+    let held_claim = ProjectCatalogMigrationLock::try_acquire_exclusive(configured.projects_path())
+        .unwrap()
+        .expect("no daemon shares the fixture store")
+        .downgrade_to_shared()
+        .unwrap();
+    let self_conflict = ProjectCatalogMigrationFacadeV1::apply_configured(
+        ProjectCatalogMigrationApplyConfiguredRequestV1 {
+            target_layout: configured.clone(),
+            report_path: report_path.clone(),
+            resolution_path: resolution_path.clone(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        self_conflict.code,
+        "error.project_catalog_lifetime_lock_busy"
+    );
+    assert_eq!(
+        self_conflict.mutation_disposition,
+        ProjectCatalogMigrationMutationDispositionV1::NoDurableMutation
+    );
+    // Probe-and-release: dropping the claim is what lets the transaction's
+    // exclusive acquisition succeed, and the SAME artifacts then reach
+    // Applied below.
+    drop(held_claim);
 
     let applied = ProjectCatalogMigrationFacadeV1::apply_configured(
         ProjectCatalogMigrationApplyConfiguredRequestV1 {

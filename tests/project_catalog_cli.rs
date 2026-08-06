@@ -1626,15 +1626,22 @@ fn retire_refuses_on_a_slack_channel_binding() {
     assert!(bindings["bindings"].as_object().unwrap().is_empty());
 }
 
-/// Plan sections 3.2 and 4.2: configured apply holds the FACTORED lifetime
-/// claim, acquired before any target read or mutation. It cannot use
-/// `open_admin_store`, whose strict open would refuse the still-version-1
-/// configured store that exists at exactly this moment.
+/// Plan sections 3.2 and 4.2, as amended during the operational-cut repair
+/// arc: configured apply takes the lifetime claim as a PROBE before any
+/// target read or mutation, then RELEASES it so the migration transaction
+/// can perform its own exclusive acquisition (the flock self-conflict
+/// class: a second same-process descriptor can never take the lock
+/// exclusively while any claim is held). It cannot use `open_admin_store`,
+/// whose strict open would refuse the still-version-1 configured store that
+/// exists at exactly this moment.
 ///
-/// Both halves are asserted. Without them the test would pass against an
-/// implementation that always refused (or never did): the first half pins
-/// that the refusal is caused by the held lock rather than by the rest of
-/// the invocation, and the second pins the refusal itself.
+/// This test pins the probe's ORDERING and its refusal against an external
+/// shared holder (exactly what a live daemon looks like). The success half
+/// of the contract, that the SAME artifacts reach `Applied` once no claim
+/// is held anywhere, is pinned at the facade layer in
+/// `configured_apply_installs_the_reviewed_post_image_on_the_configured_layout`
+/// (bbox-indexing), which also pins the self-conflict refusal a HELD claim
+/// produces from the transaction itself.
 #[test]
 fn migrate_apply_configured_takes_the_lifetime_claim_before_touching_the_target() {
     let directory = tempdir().unwrap();
