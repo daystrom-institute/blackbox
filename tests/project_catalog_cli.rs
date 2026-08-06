@@ -1635,13 +1635,14 @@ fn retire_refuses_on_a_slack_channel_binding() {
 /// whose strict open would refuse the still-version-1 configured store that
 /// exists at exactly this moment.
 ///
-/// This test pins the probe's ORDERING and its refusal against an external
-/// shared holder (exactly what a live daemon looks like). The success half
-/// of the contract, that the SAME artifacts reach `Applied` once no claim
-/// is held anywhere, is pinned at the facade layer in
+/// This test pins the probe's ORDERING with missing artifacts. The full
+/// production binding, real artifacts driven through this same CLI to
+/// `Applied` under a free lock and refused under an external shared
+/// holder, is `migrate_apply_configured_reaches_applied_through_the_released_probe`
+/// below; the transaction-level self-conflict half lives at the facade
+/// layer in
 /// `configured_apply_installs_the_reviewed_post_image_on_the_configured_layout`
-/// (bbox-indexing), which also pins the self-conflict refusal a HELD claim
-/// produces from the transaction itself.
+/// (bbox-indexing).
 #[test]
 fn migrate_apply_configured_takes_the_lifetime_claim_before_touching_the_target() {
     let directory = tempdir().unwrap();
@@ -1680,6 +1681,95 @@ fn migrate_apply_configured_takes_the_lifetime_claim_before_touching_the_target(
     let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
     drop(held);
+}
+
+/// The production binding of the probe-release contract: the REAL CLI, real
+/// reviewed artifacts, real target. The facade pin proves the transaction
+/// half; this proves `execute_migrate`'s own claim handling, which is where
+/// the certified defect lived (the CLI held its shared claim across the
+/// facade call and every configured apply self-refused with
+/// `lifetime_lock_busy`).
+///
+/// Order matters: the external-holder refusal runs FIRST, while the target
+/// is still v1 and the artifacts valid, proving the probe runs before any
+/// target access. Then the same artifacts reach `Applied` under a free
+/// lock, which is exactly the assertion that fails if the held-claim
+/// behavior is ever restored.
+#[test]
+fn migrate_apply_configured_reaches_applied_through_the_released_probe() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config_path = root.join("config.toml");
+    write(
+        &config_path,
+        format!(
+            "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+            root.join("state"),
+            root.join("state").join("vectors")
+        )
+        .as_bytes(),
+    );
+    initialize_empty_owner_state(&root, &config_path);
+    let projects_path = root.join("state/projects.json");
+    // Configured mode resolves the corpus index from env/platform, not
+    // state_dir: pin it inside the fixture or the preflight walks the
+    // host's real index.
+    let index_path = root.join("state/index");
+    let report = root.join("review/report.json");
+    let resolution = root.join("review/resolution.json");
+
+    let preflight = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "migrate",
+            "--preflight",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--resolution",
+            resolution.to_str().unwrap(),
+        ],
+        &index_path,
+    ));
+    assert_eq!(preflight["result"]["status"], "clean");
+
+    let apply = |()| {
+        run_with_isolated_index(
+            &[
+                "project-catalog",
+                "migrate",
+                "--apply",
+                "--configured",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--resolution",
+                resolution.to_str().unwrap(),
+            ],
+            &index_path,
+        )
+    };
+
+    // An external shared holder (what a live daemon looks like): the probe
+    // refuses before any target access, and the artifacts stay consumable.
+    let held = ProjectCatalogMigrationLock::acquire_shared(&projects_path).unwrap();
+    let refused = apply(());
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
+    drop(held);
+
+    // Free lock: the probe releases and the transaction's own exclusive
+    // acquisition succeeds. A CLI that held its claim across the facade
+    // call fails HERE with error.project_catalog_lifetime_lock_busy.
+    let applied = success_json(&apply(()));
+    assert_eq!(applied["result"]["outcome"], "applied");
+
+    // And the same shared core keeps re-apply idempotent through the CLI.
+    let reapplied = success_json(&apply(()));
+    assert_eq!(reapplied["result"]["outcome"], "already_applied");
 }
 
 /// A missing or mode-incompatible `migrate` target is a TYPED handler
