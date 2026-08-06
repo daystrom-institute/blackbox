@@ -441,7 +441,21 @@ the report and post-image DTOs are `LegacyPathBindingReportV1`
 (`project_catalog_inventory.rs:1736`) and
 `LegacyPathBindingPostImageInputV1` (`project_catalog_inventory.rs:2843`).
 Each entry names a `historical_path`, `source_store`, `source_row_id`,
-`inventory_epoch`, and typed status (`project_catalog.rs:601-609`). The
+`inventory_epoch`, and typed status (`project_catalog.rs:601-609`).
+`source_row_id` is the OWNER's own row id, not the inventory's
+`stable_row_id` (amended during the operational-cut repair arc). The
+canonical inventory commits to a one-way hash of the owner id, because an
+owner row id is not a bounded, path-free token by construction (a
+whiteboard board id is chosen by the caller; the task and proposal ids
+come from foreign schemas), so publishing raw ids in canonical bytes could
+leak a literal path fragment. The preimage therefore travels host-local in
+the runtime selector binding beside the literal selector, and the ledger
+carries it. The canonical hash is a COMMITMENT to it: a binding whose
+owner id does not hash back to its observation is refused, and a missing
+binding refuses the classification rather than skipping the obligation.
+Owner ids are additionally held to the ledger's own `source_row_id`
+contract at preflight, so an owner minting an id the ledger cannot hold
+refuses before any mutation. The
 backfill stamps the corresponding durable-store row with the stable
 `project_id` across the 14-variant `LegacyPathStoreKindV1` owner set: Knowledge,
 Gap, Thread, Note, Pin, Roadmap, Packet, Task, Proposal, SlackBinding,
@@ -498,23 +512,49 @@ of the fourteen owners already carry `project_id: Option<String>`
 ("stamped on write") and stamp through `serde_json::Value` so fields a
 newer binary wrote survive. The remaining three have ratified shapes:
 
-- **TranscriptEdge (Q-E1):** a typed top-level
-  `project_id: Option<String>` (serde default, skip-if-none) on
-  `bbox_edge_sidecar::Edge` - NOT a metadata key; project ownership is
-  authority, not incidental metadata. The physical rewrite is an atomic
-  whole-file JSONL replacement: transform the one matching row through
-  `Value`, stream the complete lane file to a unique sibling temporary
-  preserving every unrelated line and unknown field, fsync the
-  temporary, atomically replace, fsync the parent; never overwrite in
-  place, never append a superseding duplicate. BINDING: the source row
-  id hashes the original line, so capture and stamping share ONE stable
-  row-identity function derived from the complete JSON value WITH
-  `project_id` REMOVED (plus the existing subsource and occurrence
-  discriminators); the identity is unchanged before and after stamping,
-  or crash retry cannot find an already-stamped row. The rewrite runs
-  under the edge owner's writer/coordinator discipline or an equivalent
-  descriptor-confined source-identity recheck immediately before
-  replacement.
+- **TranscriptEdge (Q-E1, amended during the operational-cut repair
+  arc):** a typed top-level `project_id: Option<String>` (serde
+  default, skip-if-none) on `bbox_edge_sidecar::Edge` - NOT a metadata
+  key; project ownership is authority, not incidental metadata. This
+  owner is the only one whose sources are unbounded by design
+  (gigabytes of lanes, individual lanes above 1 GiB, millions of
+  `cwd`-bearing rows over a couple of hundred distinct selectors), and
+  both halves are consequently STREAMED: capture digests incrementally
+  and decodes line by line, and the rewrite reads through one
+  descriptor and copies every unrelated line through byte for byte, so
+  memory is O(chunk + line) whatever the lane weighs.
+  - **Obligations are SELECTOR-keyed, not row-keyed.** A per-row
+    ledger of this owner cannot fit the canonical inventory, and
+    nothing consumed per-row identity: classification, planning, and
+    stamping all key on the selector. The owner contributes ONE
+    observation per (lane subsource, selector) carrying a member row
+    count and a domain-separated ordered commitment over the member
+    row ids, following the section 6.3 idiom (counts and commitments,
+    never the members). Stamping applies an obligation by re-walking
+    the lane its id names and stamping EVERY row whose selector digest
+    matches; verify answers per group and reports stamped only when
+    every member carries the same project id.
+  - Because a group never spans lanes, applying one obligation is
+    exactly ONE atomic whole-file replacement, so an obligation cannot
+    be half applied. The temporary is deliberately not a `.jsonl`
+    file, so a crash between its creation and its rename leaves
+    nothing capture will read as a lane.
+  - BINDING (amended): capture and stamping still share ONE stable
+    row-identity function derived from the complete JSON value WITH
+    `project_id` REMOVED, and the identity is still unchanged before
+    and after stamping. The member discriminator is now the row's LINE
+    ORDINAL within the lane rather than an occurrence counter over
+    same-content rows: both discriminate duplicates and both are
+    stable across a stamp (a stamp rewrites a line in place and never
+    adds, removes, or reorders one), but a same-content counter
+    requires a live map of every identity in the lane, which on a
+    working host is millions of entries and defeats the streaming this
+    owner requires.
+  - The rewrite runs under the edge owner's writer/coordinator
+    discipline or an equivalent descriptor-confined source-identity
+    recheck immediately before replacement; with a streamed rewrite
+    that recheck is a re-digest of the source compared against the
+    digest taken during the read.
 - **Task (Q-E2):** `project_id: Option<String>` (serde default,
   skip-if-none) on `PersistedTask` AND a corresponding field on
   `TaskInner`, propagated end to end through load, runtime retention,
