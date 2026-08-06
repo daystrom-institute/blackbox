@@ -66,22 +66,55 @@ pub fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
         return Ok(HashMap::new());
     }
     let raw = fs::read_to_string(path)?;
-    // A bare map is the pre-P3-E format: absolute-keyed and unversioned.
-    match serde_json::from_str::<FileMetaFile>(&raw) {
-        Ok(file) if file.version == FILE_META_VERSION_V2 => Ok(file.rows),
-        Ok(file) => {
+    match decode_versioned_meta(raw.as_bytes()) {
+        VersionedFileMetaDecodeV1::Current(rows) => Ok(rows),
+        VersionedFileMetaDecodeV1::ForeignVersion(stored_version) => {
             tracing::info!(
-                stored_version = file.version,
+                stored_version,
                 expected_version = FILE_META_VERSION_V2,
                 "discarding index freshness rows written under a different meta version"
             );
             Ok(HashMap::new())
         }
-        Err(_) => {
+        VersionedFileMetaDecodeV1::Unversioned => {
             tracing::info!("discarding unversioned (pre-path-free) index freshness rows");
             Ok(HashMap::new())
         }
     }
+}
+
+/// The one decode of the persisted freshness file, shared by the runtime
+/// loader above and the migration inventory scan so the two can never
+/// disagree about what the on-disk envelope means. The runtime discards
+/// non-current rows (the paired schema bump already dropped the index they
+/// described); the migration scan instead classifies them corrupt, because
+/// a current-schema marker alongside a non-current freshness file is an
+/// inconsistency the inventory must refuse rather than silently empty.
+pub enum VersionedFileMetaDecodeV1 {
+    Current(HashMap<String, FileMeta>),
+    ForeignVersion(u32),
+    Unversioned,
+}
+
+pub fn decode_versioned_meta(bytes: &[u8]) -> VersionedFileMetaDecodeV1 {
+    // A bare map is the pre-P3-E format: absolute-keyed and unversioned.
+    match serde_json::from_slice::<FileMetaFile>(bytes) {
+        Ok(file) if file.version == FILE_META_VERSION_V2 => {
+            VersionedFileMetaDecodeV1::Current(file.rows)
+        }
+        Ok(file) => VersionedFileMetaDecodeV1::ForeignVersion(file.version),
+        Err(_) => VersionedFileMetaDecodeV1::Unversioned,
+    }
+}
+
+/// Encode freshness rows under the current envelope. Every writer of
+/// `_meta.json` goes through this or [`save_meta`]; a bare-map write would
+/// reintroduce the pre-P3-E shape the decoders refuse.
+pub fn encode_versioned_meta(rows: &HashMap<String, FileMeta>) -> Result<String> {
+    Ok(serde_json::to_string(&FileMetaFileRef {
+        version: FILE_META_VERSION_V2,
+        rows,
+    })?)
 }
 
 pub fn save_meta(path: &Path, meta: &HashMap<String, FileMeta>) -> Result<()> {

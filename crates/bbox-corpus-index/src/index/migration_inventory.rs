@@ -229,8 +229,17 @@ pub fn discharge_project_rows(
     let metadata_path = index_path.join("_meta.json");
     let mut metadata_removed = 0usize;
     if metadata_path.exists() {
-        let mut metadata: BTreeMap<String, FileMeta> =
-            serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        // The same envelope discipline as the capture: a discharge must not
+        // reinterpret or rewrite a non-current freshness file.
+        let mut metadata = match super::passes::decode_versioned_meta(&fs::read(&metadata_path)?) {
+            super::passes::VersionedFileMetaDecodeV1::Current(rows) => rows,
+            super::passes::VersionedFileMetaDecodeV1::ForeignVersion(version) => {
+                anyhow::bail!("index freshness file carries foreign version {version}")
+            }
+            super::passes::VersionedFileMetaDecodeV1::Unversioned => {
+                anyhow::bail!("index freshness file is unversioned (pre-path-free)")
+            }
+        };
         metadata.retain(|_, row| {
             let owned = match &row.source {
                 FileMetaSource::LegacyFilesystem => false,
@@ -253,7 +262,7 @@ pub fn discharge_project_rows(
         });
         let temporary = index_path.join("_meta.json.retire.tmp");
         let mut file = fs::File::create(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, &metadata)?;
+        file.write_all(super::passes::encode_versioned_meta(&metadata)?.as_bytes())?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
@@ -302,10 +311,23 @@ fn capture_code_metadata(
         Err(CaptureReadFailure::Corrupt(code)) => return corrupt_code_metadata(code),
         Err(CaptureReadFailure::Unavailable(code)) => return unavailable_code_metadata(code),
     };
-    let metadata: BTreeMap<String, FileMeta> = match serde_json::from_slice(&bytes) {
-        Ok(metadata) => metadata,
-        Err(_) => return corrupt_code_metadata("code_index_metadata_decode_failed"),
-    };
+    // The freshness file is the P3-E versioned envelope, decoded through the
+    // same function the runtime loader uses. A pre-path-free bare map or a
+    // foreign version next to a current-schema index is an inconsistency the
+    // inventory refuses; the fixtures only ever held the bare pre-P3-E shape,
+    // which is why the envelope refused on the first real host.
+    let metadata: BTreeMap<String, FileMeta> =
+        match super::passes::decode_versioned_meta(&bytes) {
+            super::passes::VersionedFileMetaDecodeV1::Current(rows) => {
+                rows.into_iter().collect()
+            }
+            super::passes::VersionedFileMetaDecodeV1::ForeignVersion(_) => {
+                return corrupt_code_metadata("code_index_metadata_version_foreign");
+            }
+            super::passes::VersionedFileMetaDecodeV1::Unversioned => {
+                return corrupt_code_metadata("code_index_metadata_decode_failed");
+            }
+        };
     if metadata.len() > limits.max_code_metadata_rows {
         return corrupt_code_metadata("code_index_metadata_row_limit");
     }
@@ -1092,6 +1114,8 @@ mod tests {
         fs::write(
             index_path.join("_meta.json"),
             serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "rows": {
                 "local:project-a:src/lib.rs": {
                     "mtime": 1,
                     "size": 42,
@@ -1103,6 +1127,7 @@ mod tests {
                         "relative_path": "src/lib.rs",
                         "entry_key": "src/lib.rs"
                     }
+                }
                 }
             }))
             .unwrap(),
@@ -1204,7 +1229,11 @@ mod tests {
         writer.add_document(activation_doc).unwrap();
         writer.commit().unwrap();
         index.reader_reload_for_test();
-        fs::write(index_path.join("_meta.json"), b"{}").unwrap();
+        fs::write(
+            index_path.join("_meta.json"),
+            br#"{"version":2,"rows":{}}"#,
+        )
+        .unwrap();
         drop(writer);
         drop(index);
 
@@ -1252,7 +1281,11 @@ mod tests {
         writer.add_document(activation_doc).unwrap();
         writer.commit().unwrap();
         index.reader_reload_for_test();
-        fs::write(index_path.join("_meta.json"), b"{}").unwrap();
+        fs::write(
+            index_path.join("_meta.json"),
+            br#"{"version":2,"rows":{}}"#,
+        )
+        .unwrap();
         drop(writer);
         drop(index);
 
@@ -1321,7 +1354,7 @@ mod tests {
         ]);
         fs::write(
             index_path.join("_meta.json"),
-            serde_json::to_vec(&metadata).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"version": 2, "rows": metadata})).unwrap(),
         )
         .unwrap();
         let git = root.join("git");
@@ -1330,8 +1363,13 @@ mod tests {
             discharge_project_rows(&index_path, &git, "project-a", &["shared-selector".into()])
                 .unwrap();
         assert_eq!(removed, 1);
-        let remaining: BTreeMap<String, FileMeta> =
-            serde_json::from_slice(&fs::read(index_path.join("_meta.json")).unwrap()).unwrap();
+        let remaining =
+            match super::super::passes::decode_versioned_meta(
+                &fs::read(index_path.join("_meta.json")).unwrap(),
+            ) {
+                super::super::passes::VersionedFileMetaDecodeV1::Current(rows) => rows,
+                _ => panic!("discharge must rewrite the current envelope"),
+            };
         assert!(remaining.contains_key("retained"));
         assert!(!remaining.contains_key("owned"));
     }

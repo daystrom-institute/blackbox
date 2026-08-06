@@ -225,7 +225,10 @@ fn initialize_empty_owner_state(root: &Path) {
     )
     .unwrap();
     drop(index);
-    write(&index_path.join("_meta.json"), b"{}");
+    write(
+        &index_path.join("_meta.json"),
+        br#"{"version":2,"rows":{}}"#,
+    );
 
     VectorStore::open(state.join("vectors")).unwrap();
     ManifestIndex::new()
