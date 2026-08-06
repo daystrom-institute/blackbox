@@ -3787,7 +3787,10 @@ const MAX_LEGACY_SOURCE_ROW_ID_BYTES: usize = 256;
 /// literal path fragment. Capture commits to this hash and the host-local
 /// runtime binding carries the preimage; both sides derive it here, so the
 /// commitment and the check cannot drift.
-fn legacy_row_stable_id(kind: LegacyPathStoreKindV1, owner_row_id: &str) -> AdapterResult<String> {
+pub(crate) fn legacy_row_stable_id(
+    kind: LegacyPathStoreKindV1,
+    owner_row_id: &str,
+) -> AdapterResult<String> {
     stable_observation_id_v1(
         "legacy-row",
         &[legacy_store_token(kind).as_bytes(), owner_row_id.as_bytes()],
@@ -5017,7 +5020,12 @@ mod tests {
 
         let mut durable = no_durable_owner_snapshots();
         durable.task = vec![snapshot];
-        let error = capture_legacy_path_observations_lane(&durable).unwrap_err();
+        // Not unwrap_err: the Ok side carries the literal-bearing runtime
+        // binding set, which deliberately does not implement Debug.
+        let error = match capture_legacy_path_observations_lane(&durable) {
+            Err(error) => error,
+            Ok(_) => panic!("an owner row id the ledger cannot hold must refuse"),
+        };
         assert!(
             error
                 .to_string()

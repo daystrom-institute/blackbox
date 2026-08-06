@@ -6451,7 +6451,14 @@ pub(crate) mod tests {
             legacy_path_observations: vec![LegacyPathObservationV1 {
                 observation_id: "legacy_path_alpha".to_string(),
                 store_kind: LegacyPathStoreKindV1::Knowledge,
-                stable_row_id: "knowledge_1".to_string(),
+                // The commitment production mints: the one-way hash of the
+                // owner's own row id, which travels host-local (F10).
+                stable_row_id:
+                    crate::project_catalog_inventory_adapters::legacy_row_stable_id(
+                        LegacyPathStoreKindV1::Knowledge,
+                        "knowledge_1",
+                    )
+                    .unwrap(),
                 selector_kind: LegacySelectorKindV1::ProjectAndRelativePath,
                 selector_digest: digest_path("/workspace/acme/alpha/src/Example.java"),
                 member_row_count: 1,
@@ -7571,7 +7578,7 @@ pub(crate) mod tests {
             vec![SensitiveLocalPathRowV1 {
                 observation_id: "legacy_path_alpha".to_string(),
                 store_kind: LegacyPathStoreKindV1::Knowledge,
-                stable_row_id: "knowledge_1".to_string(),
+                stable_row_id: inventory.legacy_path_observations[0].stable_row_id.clone(),
                 literal_selector: "/workspace/acme/alpha/src/Example.java".to_string(),
             }],
         )
