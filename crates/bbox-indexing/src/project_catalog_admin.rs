@@ -762,7 +762,8 @@ fn apply_scope_migration(
                 LegacyPathLedgerEntry {
                     legacy_path_binding_id: binding_id,
                     historical_path,
-                    source_store: "attachment-relocation".into(),
+                    source_store: crate::project_catalog_backfill::ATTACHMENT_RELOCATION_SOURCE
+                        .to_string(),
                     source_row_id: id.as_str().to_string(),
                     // A relocation binding stands for exactly the attachment it
                     // names, so it carries the same singleton evidence every
@@ -1610,7 +1611,8 @@ pub fn relocate_attachment(
             LegacyPathLedgerEntry {
                 legacy_path_binding_id: binding_id,
                 historical_path,
-                source_store: "attachment-relocation".into(),
+                source_store: crate::project_catalog_backfill::ATTACHMENT_RELOCATION_SOURCE
+                    .to_string(),
                 source_row_id: attachment_id.as_str().to_string(),
                 member_row_count: 1,
                 member_commitment_sha256:

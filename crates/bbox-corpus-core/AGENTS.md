@@ -83,6 +83,14 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   row id. Never add an owner seam that accepts a row id without its evidence -
   a group whose rows changed while staying uniformly stamped is otherwise
   indistinguishable from the reviewed one.
+- The durable attachment snapshot is a store real hosts already have, so any
+  field added to `LegacyPathLedgerEntry` needs a read path for bytes written
+  before it existed: a strict decode turns an additive field into an unopenable
+  store, before a migration or backfill can run at all. The member evidence
+  reads absence as the singleton it always implied, and normalizes ONLY when
+  both halves are missing - a partial or zeroed pair is refused rather than
+  laundered into valid-looking evidence, and what we write always emits both
+  fields so the next read never has to guess.
 
 ## Rerank math (search/rerank.rs)
 
