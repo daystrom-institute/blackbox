@@ -7961,8 +7961,11 @@ impl ProjectCatalogTransactionOwner {
                     )
                 })?;
             let lane = checkout_lock_for(target, locks)?;
-            let expected = format!("{checkout_id}\n");
-            if lane.read_regular("checkout-id", 128)?.as_deref() != Some(expected.as_bytes()) {
+            if !lane
+                .read_regular("checkout-id", 128)?
+                .as_deref()
+                .is_some_and(|bytes| checkout_marker_bytes_match(bytes, checkout_id))
+            {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_recovery_incomplete",
                     "existing checkout identity disagrees with attachment evidence",
