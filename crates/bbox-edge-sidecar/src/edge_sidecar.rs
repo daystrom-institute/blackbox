@@ -75,13 +75,25 @@ pub struct EdgeKey {
 /// `owner_source_unreadable` to mean what it says.
 /// The DURABLE lane predicate, shared by capture and the stamper's lane
 /// enumeration so the two halves cannot disagree about the owner's
-/// population. Top-level lanes and `observed/` are the durable rows the
-/// backfill owns; `derived/` and `materialized/` are rebuildable caches the
-/// daemon regenerates at will (a working host carries over a hundred
-/// gigabytes there), and treating them as owner evidence both blew the
-/// streaming pass budget and made every re-materialization read as the
-/// owner moving.
+/// population.
+///
+/// An explicit ALLOW-list of the live lane layouts the edge store writes:
+/// the top-level legacy combined lane `<project>.jsonl` and the split lanes
+/// `explicit/<project>.jsonl` / `observed/<project>.jsonl`. Everything else
+/// under the edges tree is not owner evidence, each for its own reason:
+/// `derived/` and `materialized/` are rebuildable caches the daemon
+/// regenerates at will (a working host carries over a hundred gigabytes
+/// there; treating them as owner rows blew the streaming budget and made
+/// every re-materialization read as the owner moving);
+/// `quarantine/<project>/<ts>.jsonl` holds `QuarantineLine` records, not
+/// edges, so decoding one as an edge lane marked the whole owner corrupt;
+/// and `migrations/<id>/staging/*.jsonl` are retained point-in-time
+/// migration artifacts, not live rows the backfill may count or rewrite.
+/// A deny-list here silently promoted every future artifact family to
+/// owner evidence; new LIVE lane layouts must opt in by name.
 fn durable_lane(relative: &Path) -> bool {
+    use std::path::Component;
+
     if relative
         .extension()
         .and_then(|extension| extension.to_str())
@@ -89,11 +101,16 @@ fn durable_lane(relative: &Path) -> bool {
     {
         return false;
     }
-    !matches!(
-        relative.components().next(),
-        Some(std::path::Component::Normal(first))
-            if first == "derived" || first == "materialized"
-    )
+    let mut components = relative.components();
+    match (components.next(), components.next(), components.next()) {
+        // Top-level legacy combined lane: <project>.jsonl
+        (Some(Component::Normal(_)), None, None) => true,
+        // Active split lanes: explicit/<project>.jsonl, observed/<project>.jsonl
+        (Some(Component::Normal(first)), Some(Component::Normal(_)), None) => {
+            first == "explicit" || first == "observed"
+        }
+        _ => false,
+    }
 }
 
 pub fn capture_project_catalog_owner_snapshot(
@@ -2751,13 +2768,85 @@ mod project_catalog_snapshot_tests {
 /// hundred-gigabyte cache tree blows the streaming budget and every
 /// re-materialization reads as the owner moving.
 #[test]
-fn derived_and_materialized_caches_are_not_owner_lanes() {
+fn durable_lanes_are_an_allow_list_not_a_deny_list() {
     use std::path::Path;
+    // The three live lane layouts the edge store writes.
     assert!(durable_lane(Path::new("01c2a342.jsonl")));
     assert!(durable_lane(Path::new("observed/01c2a342.jsonl")));
+    assert!(durable_lane(Path::new("explicit/01c2a342.jsonl")));
+    // Rebuildable caches.
     assert!(!durable_lane(Path::new("derived/01c2a342.jsonl")));
     assert!(!durable_lane(Path::new(
         "materialized/workspace/x/edges.jsonl"
     )));
+    // Quarantine records are QuarantineLine rows, not edges: decoding one as
+    // a lane marked the whole owner corrupt.
+    assert!(!durable_lane(Path::new(
+        "quarantine/01c2a342/1700000000.jsonl"
+    )));
+    // Retained migration staging artifacts parse as edges but are
+    // point-in-time records, not live rows to count or rewrite.
+    assert!(!durable_lane(Path::new(
+        "migrations/mig-1/staging/explicit.jsonl"
+    )));
+    assert!(!durable_lane(Path::new(
+        "migrations/mig-1/staging/observed.jsonl"
+    )));
+    // A future family must opt in by name, not inherit owner status.
+    assert!(!durable_lane(Path::new("some-new-family/01c2a342.jsonl")));
+    assert!(!durable_lane(Path::new("observed/deeper/01c2a342.jsonl")));
     assert!(!durable_lane(Path::new("manifest-index.json")));
+}
+
+/// The tree-level half of the allow-list pin: a tree carrying an ordinary
+/// sidecar-migration state (quarantine records plus retained staging
+/// artifacts, both decodable trouble if read as lanes) captures and
+/// enumerates exactly the live lane through BOTH halves of the shared
+/// predicate.
+#[test]
+fn quarantine_and_migration_staging_are_invisible_to_capture_and_stamping() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap().join("edges");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("tool.jsonl"),
+        concat!(
+            r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"exact","metadata":{"cwd":"/repo/one"}}"#,
+            "
+"
+        ),
+    )
+    .unwrap();
+    let limits = OwnerSnapshotLimitsV1::default();
+    let before = capture_project_catalog_owner_snapshot(&root, limits).unwrap();
+    let lanes_before = transcript_edge_lane_set(&root, limits).unwrap();
+
+    // A quarantined row: QuarantineLine shape, not an edge.
+    std::fs::create_dir_all(root.join("quarantine/01c2a342")).unwrap();
+    std::fs::write(
+        root.join("quarantine/01c2a342/1700000000.jsonl"),
+        concat!(
+            r#"{"line":"{not-an-edge","error":"decode failure","offset":7}"#,
+            "
+"
+        ),
+    )
+    .unwrap();
+    // Retained migration staging: rows that DO parse as edges.
+    std::fs::create_dir_all(root.join("migrations/mig-1/staging")).unwrap();
+    std::fs::write(
+        root.join("migrations/mig-1/staging/explicit.jsonl"),
+        concat!(
+            r#"{"source":{"type":"task","task_id":"one"},"kind":"RAN_BASH","target":{"type":"task","task_id":"two"},"provenance":"explicit","confidence":"exact","metadata":{"cwd":"/repo/one"}}"#,
+            "
+"
+        ),
+    )
+    .unwrap();
+
+    let after = capture_project_catalog_owner_snapshot(&root, limits).unwrap();
+    assert_eq!(after.rows, before.rows);
+    assert_eq!(after.canonical_sha256, before.canonical_sha256);
+    let lanes_after = transcript_edge_lane_set(&root, limits).unwrap();
+    assert_eq!(lanes_after, lanes_before);
 }
