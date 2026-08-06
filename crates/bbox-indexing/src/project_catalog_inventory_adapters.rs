@@ -3971,6 +3971,35 @@ fn empty_set_commitment(domain: &[u8]) -> Sha256ValueV1 {
     Sha256ValueV1::digest(domain)
 }
 
+/// MEMBERSHIP proof for the cursor-lineage attribution class: every commit
+/// sha the index holds under the namespace must resolve in the candidate
+/// repository. One resolving cursor alone is not enough evidence, because a
+/// canonical path reused by an unrelated later repo re-mints the same
+/// path-fallback token while the namespace still holds the earlier repo's
+/// history (reviewer finding S2); a namespace whose entire membership
+/// resolves cannot be carrying history the repository does not have. An
+/// absent or empty namespace proves nothing.
+fn namespace_membership_proven(
+    corpus: &CorpusOwnerMigrationSnapshotV1,
+    namespace_token: &str,
+    repository: &StableGitRepository,
+) -> bool {
+    let Some(namespace) = corpus
+        .index
+        .commit_namespaces
+        .iter()
+        .find(|namespace| namespace.namespace == namespace_token)
+    else {
+        return false;
+    };
+    if namespace.commit_shas.is_empty() {
+        return false;
+    }
+    namespace.commit_shas.iter().all(
+        |sha| matches!(repository.resolve_commit_oid(sha), Ok(Some(resolved)) if resolved == *sha),
+    )
+}
+
 fn namespace_attribution(
     namespace: &str,
     legacy: &LegacyProjectsCaptureV1,
@@ -4183,6 +4212,7 @@ fn capture_git_metadata_lane(
         if let Some(repo_token) = record_repo_id_by_project.get(attachment.project_id.as_str())
             && let Some(cursor_sha) = ingest_cursor_by_project.get(attachment.project_id.as_str())
             && matches!(repository.resolve_commit_oid(cursor_sha), Ok(Some(_)))
+            && namespace_membership_proven(corpus, repo_token, repository)
         {
             first_commit_repo_ids
                 .entry((*repo_token).to_string())
@@ -5140,6 +5170,74 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    /// Cursor-lineage attribution requires the WHOLE namespace membership to
+    /// resolve in the candidate repository. A reused canonical path re-mints
+    /// the same path-fallback token for an unrelated later repo, and its
+    /// cursor resolves there; the earlier repo's history in the namespace
+    /// must keep the attribution unproven (reviewer finding S2).
+    #[test]
+    fn namespace_membership_requires_every_sha_to_resolve() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        run_git(&root, &["init", "--quiet"]);
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "--quiet", "-m", "first"]);
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "--quiet", "-m", "second"]);
+        let shas = run_git(&root, &["rev-list", "HEAD"])
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(shas.len(), 2);
+        let caller = bbox_corpus_core::json_store::NofollowDirectory::open_existing(&root)
+            .unwrap()
+            .unwrap();
+        let repository = open_stable_git_repository(&caller).unwrap().unwrap();
+
+        let snapshot_with = |commit_shas: Vec<String>| {
+            use bbox_corpus_index::index::migration_inventory::CorpusCommitNamespaceV1;
+            let mut corpus = namespace_corpus_snapshot();
+            corpus.index.commit_namespaces = vec![CorpusCommitNamespaceV1 {
+                namespace: "feedface".to_string(),
+                commit_document_count: commit_shas.len() as u64,
+                commit_document_commitment_sha256: "4".repeat(64),
+                commit_shas,
+            }];
+            corpus
+        };
+
+        let complete = snapshot_with(shas.clone());
+        assert!(namespace_membership_proven(
+            &complete,
+            "feedface",
+            &repository
+        ));
+
+        let mut foreign = shas.clone();
+        foreign.push("f".repeat(40));
+        let mixed = snapshot_with(foreign);
+        assert!(!namespace_membership_proven(
+            &mixed,
+            "feedface",
+            &repository
+        ));
+
+        let empty = snapshot_with(Vec::new());
+        assert!(!namespace_membership_proven(
+            &empty,
+            "feedface",
+            &repository
+        ));
+
+        assert!(!namespace_membership_proven(
+            &complete,
+            "0badf00d",
+            &repository
+        ));
+    }
+
     #[test]
     fn publisher_adapter_uses_the_owner_codec() {
         let directory = tempfile::tempdir().unwrap();
@@ -6067,6 +6165,7 @@ mod tests {
                     namespace: "repo-one".to_string(),
                     commit_document_count: 2,
                     commit_document_commitment_sha256: "4".repeat(64),
+                    commit_shas: vec!["1".repeat(40), "2".repeat(40)],
                 }],
             },
             code_metadata: CodeIndexMetadataMigrationSnapshotV1 {

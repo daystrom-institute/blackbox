@@ -1888,6 +1888,12 @@ pub enum RequiredResolutionKindV1 {
     ExcludeAttachment,
     QuarantineCollected,
     PublisherBindingDisposition,
+    /// An optional owner store (Slack, provenance) is ABSENT. Vacuous
+    /// non-use and deletion of a formerly populated store are
+    /// indistinguishable from the bytes alone, so the operator must
+    /// acknowledge each absence before the plan is clean (reviewer
+    /// finding S4).
+    MissingOptionalOwner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2649,6 +2655,15 @@ pub struct QuarantineCollectedV1 {
     pub generation_id: String,
 }
 
+/// Operator acknowledgement that an optional owner store is legitimately
+/// absent (never provisioned), not deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissingOptionalOwnerAcknowledgementV1 {
+    pub resolution_id: String,
+    pub owner_source_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationPayloadHashesV1 {
@@ -2720,6 +2735,7 @@ pub struct ProjectCatalogMigrationResolutionV1 {
     pub excluded_attachments: Vec<ExcludedAttachmentV1>,
     pub quarantine_collected: Vec<QuarantineCollectedV1>,
     pub publisher_binding_dispositions: Vec<PublisherBindingDispositionV1>,
+    pub missing_optional_owner_acknowledgements: Vec<MissingOptionalOwnerAcknowledgementV1>,
     pub operator_notes: Vec<OperatorResolutionNoteV1>,
 }
 
@@ -2734,6 +2750,7 @@ impl ProjectCatalogMigrationResolutionV1 {
             excluded_attachments: Vec::new(),
             quarantine_collected: Vec::new(),
             publisher_binding_dispositions: Vec::new(),
+            missing_optional_owner_acknowledgements: Vec::new(),
             operator_notes: Vec::new(),
         }
     }
@@ -2887,6 +2904,16 @@ impl ProjectCatalogMigrationResolutionV1 {
             }
         }
         validate_unique_by(
+            self.missing_optional_owner_acknowledgements
+                .iter()
+                .map(|row| row.resolution_id.as_str()),
+            "missing optional owner acknowledgement",
+        )?;
+        for row in &self.missing_optional_owner_acknowledgements {
+            validate_stable_id(&row.resolution_id, "missing owner resolution id")?;
+            validate_stable_id(&row.owner_source_id, "missing owner source id")?;
+        }
+        validate_unique_by(
             self.operator_notes.iter().map(|row| row.note_id.as_str()),
             "operator note",
         )?;
@@ -2910,6 +2937,8 @@ impl ProjectCatalogMigrationResolutionV1 {
                 .sort_by(|left, right| left.target_group_id.cmp(&right.target_group_id));
         }
         self.excluded_attachments
+            .sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
+        self.missing_optional_owner_acknowledgements
             .sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));
         self.quarantine_collected
             .sort_by(|left, right| left.resolution_id.cmp(&right.resolution_id));

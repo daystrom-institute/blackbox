@@ -1880,6 +1880,57 @@ fn assess_migration_semantics(
         ));
     }
 
+    // An ABSENT optional owner store is either genuine non-use or a deleted
+    // store; the bytes cannot distinguish them, so each absence is an
+    // operator decision, not an automatic acceptance (reviewer finding S4).
+    // The owner evidence still records Missing with its fingerprint; the
+    // acknowledgement binds the operator's reading of it into the plan.
+    let acknowledged_missing_owners = resolution
+        .missing_optional_owner_acknowledgements
+        .iter()
+        .map(|row| (row.resolution_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_missing_owner_ids = BTreeSet::new();
+    for lane in &inventory.immutable_lane_evidence {
+        for owner in &lane.owner_subsources {
+            if !matches!(
+                owner.source_state,
+                crate::project_catalog_inventory::InventorySourceStateV1::Missing { .. }
+            ) || !owner.owner_kind.missing_is_vacuous()
+            {
+                continue;
+            }
+            let resolution_id = stable_conflict_id("missing_optional_owner", &owner.source_id)?;
+            if !expected_missing_owner_ids.insert(resolution_id.clone()) {
+                continue;
+            }
+            required_resolutions.push(RequiredResolutionV1 {
+                resolution_id: resolution_id.clone(),
+                kind: RequiredResolutionKindV1::MissingOptionalOwner,
+                candidate_record_ids: BTreeSet::from([owner.source_id.clone()]),
+            });
+            match acknowledged_missing_owners.get(resolution_id.as_str()) {
+                None => {
+                    unresolved_resolution_ids.insert(resolution_id);
+                }
+                Some(acknowledgement) if acknowledgement.owner_source_id != owner.source_id => {
+                    return Err(invalid_resolution_artifact(
+                        "missing owner acknowledgement does not match its owner source",
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    if acknowledged_missing_owners
+        .keys()
+        .any(|resolution_id| !expected_missing_owner_ids.contains(*resolution_id))
+    {
+        return Err(invalid_resolution_artifact(
+            "resolution acknowledges an owner that is not missing",
+        ));
+    }
+
     let resolution_publishers = resolution
         .publisher_binding_dispositions
         .iter()
@@ -2063,12 +2114,16 @@ fn assess_migration_semantics(
             }),
             Attribution::Unclaimed => false,
         };
-        // A zero-document unclaimed namespace protects nothing: the refusal
-        // exists so commit HISTORY cannot be dropped without attribution, and
-        // an empty namespace has none to drop (its stray vector keys are
-        // already ledgered through the orphan evidence). Real history under
-        // an unattributable namespace still refuses.
-        if !supported && namespace.commit_document_count > 0 {
+        // An EMPTY unclaimed namespace protects nothing: the refusal exists
+        // so commit history cannot be dropped without attribution, and a
+        // namespace with neither documents nor vector keys has none to drop.
+        // Vector keys count as history: they are namespace-scoped, so the
+        // project-keyed orphan evidence cannot cover them, and the rebuild's
+        // survival check never reaches a namespace no commit document names,
+        // which would silently drop them (reviewer finding S1). A namespace
+        // carrying EITHER documents or vector keys still refuses without
+        // attribution.
+        if !supported && (namespace.commit_document_count > 0 || namespace.vector_key_count > 0) {
             refusals.push(semantic_refusal(
                 "unsupported_legacy_namespace",
                 [namespace.observation_id.clone()],
@@ -2308,22 +2363,25 @@ fn classify_legacy_paths(
             .ok_or_else(|| planner_error("legacy selector runtime binding is missing"))?;
         let literal = &binding.literal;
         let literal_path = Path::new(literal);
-        // A bare v1 NAME selector: one normal component, no separator, not
-        // absolute. Early note rows were keyed by project name through the
-        // resolver rather than by path; a name cannot participate in
-        // deepest-root geometry, and resolving names against the current
-        // alias set at migration time would mint bindings from guesswork.
-        // Such rows classify Unscoped-preserved: they keep no project
-        // binding, stay readable, and are never stamped, exactly like every
-        // other row no root contains. Anything path-shaped but relative or
-        // dotted still refuses below: those literals DO claim path scoping
-        // that geometry cannot verify.
-        let is_bare_name_selector = !literal_path.is_absolute()
-            && !literal.contains(['/', '\\'])
-            && matches!(
-                literal_path.components().collect::<Vec<_>>().as_slice(),
-                [Component::Normal(_)]
-            );
+        // A bare v1 NAME selector. Early note rows were keyed by project
+        // name through the resolver rather than by path; a name cannot
+        // participate in deepest-root geometry, and resolving names against
+        // the current alias set at migration time would mint bindings from
+        // guesswork. Such rows classify Unscoped-preserved: they keep no
+        // project binding, stay readable, and are never stamped, exactly
+        // like every other row no root contains.
+        //
+        // The grammar is the resolver-name alphabet and nothing more:
+        // alphanumerics, hyphen, underscore (reviewer finding S5). A dotted
+        // or extension-bearing single component ("repo.git", ".hidden",
+        // "notes.db") is indistinguishable from a path fragment and still
+        // refuses below, as does anything with a separator: those literals
+        // claim path scoping that geometry cannot verify.
+        let is_bare_name_selector = !literal.is_empty()
+            && literal.len() <= 128
+            && literal
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
         if is_bare_name_selector {
             *unscoped_counts.entry(observed.store_kind).or_default() += 1;
             let planned_binding_id = identities
@@ -3056,8 +3114,15 @@ fn build_base_post_images(
         legacy_path_bindings,
         default_attachments: BTreeMap::new(),
     };
-    validate_catalog_attachments(&catalog, &attachments)
-        .map_err(|_| planner_error("catalog and attachment post-images are inconsistent"))?;
+    // The inner code and message are bounded, path-free diagnostics; the
+    // operator-local error names WHICH consistency rule failed, following
+    // the same deliberate scoping as `adapter_error`.
+    validate_catalog_attachments(&catalog, &attachments).map_err(|error| {
+        ProjectCatalogMigrationError::no_mutation(
+            "error.project_catalog_migration_planner",
+            format!("catalog and attachment post-images are inconsistent: {error}"),
+        )
+    })?;
     Ok(MigrationBasePostImagesV1 {
         catalog,
         attachments,
@@ -6389,6 +6454,89 @@ mod tests {
     /// silently and let the migration report itself complete with a row that
     /// stays unstamped forever.
     #[test]
+    /// An absent optional owner store is an operator decision, never an
+    /// automatic acceptance: genuine non-use and deletion of a formerly
+    /// populated store are indistinguishable from the bytes alone (reviewer
+    /// finding S4). Unacknowledged absence demands resolution; a matching
+    /// acknowledgement clears it; an acknowledgement naming the wrong owner
+    /// source refuses the artifact.
+    #[test]
+    fn a_missing_optional_owner_requires_operator_acknowledgement() {
+        use crate::project_catalog_inventory::{
+            ImmutableInventoryLaneEvidenceV1, ImmutableInventoryLaneKindV1, InventorySourceStateV1,
+            MissingOptionalOwnerAcknowledgementV1, Sha256ValueV1,
+        };
+
+        let mut inventory = crate::project_catalog_inventory::tests::fixture_inventory();
+        let lane = inventory
+            .immutable_lane_evidence
+            .iter_mut()
+            .find(|lane| lane.lane_kind == ImmutableInventoryLaneKindV1::InventoryTargets)
+            .expect("fixture carries the inventory-targets lane");
+        let mut owners = lane.owner_subsources.clone();
+        let provenance = owners
+            .iter_mut()
+            .find(|owner| {
+                owner.owner_kind
+                    == crate::project_catalog_inventory::ImmutableInventoryOwnerKindV1::Provenance
+            })
+            .expect("fixture carries the provenance owner");
+        provenance.source_state = InventorySourceStateV1::Missing {
+            fingerprint: Sha256ValueV1::digest(b"missing"),
+        };
+        provenance.row_observation_ids.clear();
+        let owner_source_id = provenance.source_id.clone();
+        let rebuilt = ImmutableInventoryLaneEvidenceV1::from_owner_subsources(
+            lane.lane_kind,
+            lane.source_id.clone(),
+            lane.row_count,
+            owners
+                .into_iter()
+                .map(|owner| {
+                    crate::project_catalog_inventory::OwnerSubsourceEvidenceV1::new(
+                        owner.owner_kind,
+                        owner.source_id,
+                        owner.source_state,
+                        owner.row_observation_ids,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        *lane = rebuilt;
+
+        let unacknowledged =
+            ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+        let assessment = assess_migration_semantics(&inventory, &unacknowledged).unwrap();
+        let requirement = assessment
+            .required_resolutions
+            .iter()
+            .find(|resolution| resolution.kind == RequiredResolutionKindV1::MissingOptionalOwner)
+            .expect("absence must demand resolution");
+        assert!(!assessment.unresolved_resolution_ids.is_empty());
+
+        let mut acknowledged = unacknowledged.clone();
+        acknowledged.missing_optional_owner_acknowledgements =
+            vec![MissingOptionalOwnerAcknowledgementV1 {
+                resolution_id: requirement.resolution_id.clone(),
+                owner_source_id: owner_source_id.clone(),
+            }];
+        let assessment = assess_migration_semantics(&inventory, &acknowledged).unwrap();
+        assert!(assessment.unresolved_resolution_ids.is_empty());
+
+        let mut mismatched = acknowledged.clone();
+        mismatched.missing_optional_owner_acknowledgements[0].owner_source_id =
+            "lane_targets_owner_0".to_string();
+        let error = assess_migration_semantics(&inventory, &mismatched).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("missing owner acknowledgement does not match"),
+            "unexpected: {}",
+            error.message
+        );
+    }
+
     /// The unsupported-namespace refusal protects commit HISTORY from losing
     /// attribution; an unclaimed namespace with zero commit documents has
     /// none to protect and must not block the migration (its stray vector
@@ -6399,7 +6547,7 @@ mod tests {
         use crate::project_catalog_inventory::{
             LegacyCommitNamespaceAttributionV1, LegacyCommitNamespaceInventoryV1,
         };
-        let empty_namespace = |count: u64| LegacyCommitNamespaceInventoryV1 {
+        let empty_namespace = |count: u64, vectors: u64| LegacyCommitNamespaceInventoryV1 {
             observation_id: "namespace_orphan".to_string(),
             namespace: bbox_corpus_core::project_catalog::CommitNamespace::parse(
                 "deadbeef".to_string(),
@@ -6407,18 +6555,18 @@ mod tests {
             .unwrap(),
             commit_document_count: count,
             commit_document_set_sha256: crate::project_catalog_inventory::digest_path("empty"),
-            vector_key_count: 286,
+            vector_key_count: vectors,
             vector_key_set_sha256: crate::project_catalog_inventory::digest_path("vectors"),
             attribution: LegacyCommitNamespaceAttributionV1::Unclaimed,
         };
 
         // The git-metadata lane's row count binds git rows + namespaces, so
         // adding a namespace row must also bump that lane's evidence.
-        let with_namespace = |count: u64| {
+        let with_namespace = |count: u64, vectors: u64| {
             let mut inventory = crate::project_catalog_inventory::tests::fixture_inventory();
             inventory
                 .legacy_commit_namespaces
-                .push(empty_namespace(count));
+                .push(empty_namespace(count, vectors));
             for evidence in &mut inventory.immutable_lane_evidence {
                 if evidence.lane_kind
                     == crate::project_catalog_inventory::ImmutableInventoryLaneKindV1::GitMetadata
@@ -6429,7 +6577,7 @@ mod tests {
             inventory
         };
 
-        let inventory = with_namespace(0);
+        let inventory = with_namespace(0, 0);
         let resolution =
             ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
         let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
@@ -6440,7 +6588,23 @@ mod tests {
                 .any(|refusal| refusal.diagnostic_code == "unsupported_legacy_namespace")
         );
 
-        let inventory = with_namespace(7);
+        // Vector keys are namespace-scoped history the survival check never
+        // reaches once documents are gone (S1): they refuse exactly like
+        // documents do.
+        for (documents, vectors) in [(7u64, 0u64), (0, 286), (7, 286)] {
+            let inventory = with_namespace(documents, vectors);
+            let resolution =
+                ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
+            let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
+            assert!(
+                assessment
+                    .refusals
+                    .iter()
+                    .any(|refusal| refusal.diagnostic_code == "unsupported_legacy_namespace"),
+                "{documents} documents / {vectors} vectors must refuse"
+            );
+        }
+        let inventory = with_namespace(7, 0);
         let resolution =
             ProjectCatalogMigrationResolutionV1::empty(inventory.inventory_hash().unwrap());
         let assessment = assess_migration_semantics(&inventory, &resolution).unwrap();
@@ -6541,7 +6705,14 @@ mod tests {
             1
         );
 
-        for relative in ["src/lib.rs", "../escape", "./here"] {
+        for relative in [
+            "src/lib.rs",
+            "../escape",
+            "./here",
+            "repo.git",
+            ".hidden",
+            "notes.db",
+        ] {
             let classified = classify_with(relative);
             assert_eq!(classified.refusals.len(), 1, "{relative} must stay refused");
             assert_eq!(

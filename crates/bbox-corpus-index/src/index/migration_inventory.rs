@@ -79,6 +79,14 @@ pub struct CorpusCommitNamespaceV1 {
     pub namespace: String,
     pub commit_document_count: u64,
     pub commit_document_commitment_sha256: String,
+    /// The namespace's committed shas, deduplicated and sorted. Carried so
+    /// the migration's cursor-lineage attribution can prove namespace
+    /// MEMBERSHIP against a live repository (every sha must resolve) rather
+    /// than trusting one resolving cursor, which a reused canonical path
+    /// could satisfy for a namespace holding another repo's history
+    /// (reviewer finding S2). Snapshot-internal: never serialized into
+    /// canonical inventory bytes.
+    pub commit_shas: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -657,10 +665,19 @@ fn capture_index(
     }
     let commit_namespaces = commits_by_namespace
         .into_iter()
-        .map(|(namespace, rows)| CorpusCommitNamespaceV1 {
-            namespace,
-            commit_document_count: rows.len() as u64,
-            commit_document_commitment_sha256: hash_commit_rows(&rows),
+        .map(|(namespace, rows)| {
+            let mut commit_shas = rows
+                .iter()
+                .map(|row| row.commit_sha.clone())
+                .collect::<Vec<_>>();
+            commit_shas.sort();
+            commit_shas.dedup();
+            CorpusCommitNamespaceV1 {
+                namespace,
+                commit_document_count: rows.len() as u64,
+                commit_document_commitment_sha256: hash_commit_rows(&rows),
+                commit_shas,
+            }
         })
         .collect::<Vec<_>>();
 
