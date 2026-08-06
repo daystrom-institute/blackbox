@@ -73,6 +73,16 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   aggregate whose membership moved cannot present unchanged evidence. An
   observation with zero members is refused: it would plan an obligation with
   nothing to apply.
+- The member evidence is worth nothing unless it is REDERIVED at the moment of
+  writing and again at verification, so it travels all the way into the durable
+  ledger and back out through the stamp and read seams, and both refuse with
+  `owner_row_members_moved` (a staleness-class code, sibling of
+  `owner_source_moved`) when the group they just walked is not the group the
+  plan reviewed. Singleton owners get the same check for free through
+  `ensure_singleton_member_evidence`: their member set is a pure function of the
+  row id. Never add an owner seam that accepts a row id without its evidence -
+  a group whose rows changed while staying uniformly stamped is otherwise
+  indistinguishable from the reviewed one.
 
 ## Rerank math (search/rerank.rs)
 

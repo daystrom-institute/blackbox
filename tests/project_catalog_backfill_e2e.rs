@@ -48,6 +48,9 @@ use bbox_corpus_core::project_catalog::{
     LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyPathRelationship,
     ProjectId,
 };
+use bbox_corpus_core::project_catalog_snapshot::{
+    LegacySelectorMembersV1, OwnerRowRequestV1, singleton_selector_members,
+};
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause;
 use bbox_edge_sidecar::manifest::ManifestIndex;
@@ -815,6 +818,9 @@ impl Fixture {
                         historical_path: format!("/host/checkouts/alpha{index}"),
                         source_store: store_token.to_string(),
                         source_row_id: row_id.to_string(),
+                        member_row_count: 1,
+                        member_commitment_sha256: singleton_selector_members(row_id)
+                            .commitment_sha256,
                         inventory_epoch: 1,
                         status: if quarantined {
                             LegacyPathBindingStatus::Quarantined {}
@@ -1000,6 +1006,8 @@ impl Fixture {
                     historical_path: "/host/checkouts/unscoped".to_string(),
                     source_store: "pin".to_string(),
                     source_row_id: "pn1".to_string(),
+                    member_row_count: 1,
+                    member_commitment_sha256: singleton_selector_members("pn1").commitment_sha256,
                     inventory_epoch: 1,
                     status: LegacyPathBindingStatus::Unscoped {},
                 };
@@ -1061,6 +1069,7 @@ impl LegacyRowStamperV1 for TornStamper {
         &self,
         store_kind: LegacyPathStoreKindV1,
         source_row_id: &str,
+        expected_members: &LegacySelectorMembersV1,
         project_id: &ProjectId,
     ) -> Result<LegacyRowStampOutcomeV1, ProjectCatalogMigrationError> {
         if self.remaining.fetch_sub(1, Ordering::SeqCst) == 0 {
@@ -1069,7 +1078,8 @@ impl LegacyRowStamperV1 for TornStamper {
                 "injected torn-stamper fault",
             ));
         }
-        self.inner.stamp(store_kind, source_row_id, project_id)
+        self.inner
+            .stamp(store_kind, source_row_id, expected_members, project_id)
     }
 }
 
@@ -1238,6 +1248,7 @@ impl LegacyRowStamperV1 for NoOpStamper {
         &self,
         _store_kind: LegacyPathStoreKindV1,
         _source_row_id: &str,
+        _expected_members: &LegacySelectorMembersV1,
         _project_id: &ProjectId,
     ) -> Result<LegacyRowStampOutcomeV1, ProjectCatalogMigrationError> {
         Ok(LegacyRowStampOutcomeV1::Stamped)
@@ -1262,9 +1273,9 @@ impl LegacyRowOwnerReaderV1 for UncoveredReader {
     fn observe(
         &self,
         store_kind: LegacyPathStoreKindV1,
-        source_row_ids: &BTreeSet<String>,
+        rows: &OwnerRowRequestV1,
     ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
-        self.inner.observe(store_kind, source_row_ids)
+        self.inner.observe(store_kind, rows)
     }
 }
 

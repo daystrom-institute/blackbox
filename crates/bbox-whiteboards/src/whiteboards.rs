@@ -787,12 +787,17 @@ pub fn capture_project_catalog_owner_snapshot(
 pub fn stamp_project_catalog_owner_row(
     storage_dir: &std::path::Path,
     source_row_id: &str,
+    expected_members: &bbox_corpus_core::project_catalog_snapshot::LegacySelectorMembersV1,
     project_id: &str,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
 ) -> std::result::Result<
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampOutcomeV1,
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
 > {
+    bbox_corpus_core::project_catalog_snapshot::ensure_singleton_member_evidence(
+        source_row_id,
+        expected_members,
+    )?;
     use bbox_corpus_core::project_catalog_snapshot::stamp_json_tree_row;
 
     stamp_json_tree_row(
@@ -824,12 +829,17 @@ pub fn stamp_project_catalog_owner_row(
 /// caller walks every board file once per row.
 pub fn read_project_catalog_owner_rows(
     storage_dir: &std::path::Path,
-    source_row_ids: &std::collections::BTreeSet<String>,
+    rows: &bbox_corpus_core::project_catalog_snapshot::OwnerRowRequestV1,
     limits: bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1,
 ) -> std::result::Result<
     bbox_corpus_core::project_catalog_snapshot::OwnerRowBatchV1,
     bbox_corpus_core::project_catalog_snapshot::OwnerRowStampError,
 > {
+    bbox_corpus_core::project_catalog_snapshot::ensure_singleton_member_evidence_batch(rows)?;
+    let source_row_ids = &rows
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     use bbox_corpus_core::project_catalog_snapshot::read_json_tree_rows_project_id;
 
     read_json_tree_rows_project_id(
@@ -2644,6 +2654,7 @@ mod owner_row_stamping {
         stamp_project_catalog_owner_row(
             &fixture.root,
             row,
+            &bbox_corpus_core::project_catalog_snapshot::singleton_selector_members(row),
             project_id,
             OwnerSnapshotLimitsV1::default(),
         )

@@ -764,6 +764,15 @@ fn apply_scope_migration(
                     historical_path,
                     source_store: "attachment-relocation".into(),
                     source_row_id: id.as_str().to_string(),
+                    // A relocation binding stands for exactly the attachment it
+                    // names, so it carries the same singleton evidence every
+                    // small owner does.
+                    member_row_count: 1,
+                    member_commitment_sha256:
+                        bbox_corpus_core::project_catalog_snapshot::singleton_selector_members(
+                            id.as_str(),
+                        )
+                        .commitment_sha256,
                     inventory_epoch: new_epoch,
                     status: LegacyPathBindingStatus::Mapped {
                         project_id: request.project_id.clone(),
@@ -1603,6 +1612,12 @@ pub fn relocate_attachment(
                 historical_path,
                 source_store: "attachment-relocation".into(),
                 source_row_id: attachment_id.as_str().to_string(),
+                member_row_count: 1,
+                member_commitment_sha256:
+                    bbox_corpus_core::project_catalog_snapshot::singleton_selector_members(
+                        attachment_id.as_str(),
+                    )
+                    .commitment_sha256,
                 inventory_epoch: new_epoch,
                 status: LegacyPathBindingStatus::Mapped {
                     project_id,

@@ -1008,6 +1008,8 @@ mod catalog_tests {
                             historical_path: historical.clone(),
                             source_store: "knowledge".into(),
                             source_row_id: "row-1".into(),
+                            member_row_count: 1,
+                            member_commitment_sha256: "a".repeat(64),
                             inventory_epoch: 1,
                             status: LegacyPathBindingStatus::Mapped {
                                 project_id: project_id.clone(),
