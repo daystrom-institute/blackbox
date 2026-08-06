@@ -1,2 +1,6 @@
 [project]
 aliases = ["blackbox"]
+# Durable repo identity: full first-commit SHA (slice-1a identity contract).
+# Required committed at the accepted commit by the publisher establish/advance
+# probe (publisher_publish_probe) and proved by promotion.
+repo_id = "f7925891af6e018c10d09d31dffdda7b69c6cb0f"
