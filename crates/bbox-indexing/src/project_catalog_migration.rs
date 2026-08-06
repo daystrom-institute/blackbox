@@ -4302,9 +4302,16 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
             )
         })?;
         transact_migration_classified(&layout.projects_path, plan).map_err(|failure| {
+            // The store's staleness and contract messages are bounded,
+            // path-free diagnostics; carrying them names WHICH transaction
+            // check refused, following the same deliberate scoping as
+            // `adapter_error`.
             ProjectCatalogMigrationError::new(
                 failure.error.code(),
-                "migration transaction failed after exact-plan validation",
+                format!(
+                    "migration transaction failed after exact-plan validation: {}",
+                    failure.error
+                ),
                 facade_mutation_disposition(failure.disposition),
             )
         })?;
