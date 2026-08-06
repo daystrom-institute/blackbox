@@ -4120,11 +4120,45 @@ fn capture_git_metadata_lane(
         .iter()
         .map(|capture| (capture.observation.observation_id.as_str(), capture))
         .collect::<BTreeMap<_, _>>();
-    // First-commit evidence for v1-era repo-id namespaces: re-derive each
-    // attached checkout's repo id from its captured first commit. Absent
-    // evidence (no repository, unreadable head, no first commit) simply
-    // leaves a namespace unclaimed; only the per-attachment loop below
-    // decides whether that absence is corrupt for the git owner itself.
+    // Live evidence for v1-era repo-id namespaces. Two classes, both proven
+    // against the attached checkout rather than by token string equality:
+    //
+    // 1. FIRST-COMMIT REDERIVATION: the namespace token re-derives from the
+    //    checkout's captured first commit through the registration
+    //    derivation.
+    // 2. CURSOR LINEAGE: the token equals the record's own recorded repo id
+    //    AND the project's git ingest cursor (the position that wrote the
+    //    namespace's commit documents) resolves in the attached checkout. A
+    //    repo registered while EMPTY records the path-hash fallback as its
+    //    repo id, mints its namespace from that token once commits arrive,
+    //    and can never re-derive it from any first commit; the resolving
+    //    cursor proves the ingest lineage instead.
+    //
+    // Absent evidence (no repository, unreadable head, no first commit, no
+    // cursor) simply leaves a namespace unclaimed; only the per-attachment
+    // loop below decides whether that absence is corrupt for the git owner
+    // itself.
+    let record_repo_id_by_project = legacy
+        .observations
+        .iter()
+        .filter_map(|project| {
+            project
+                .record
+                .repo_id
+                .as_ref()
+                .map(|repo_id| (project.record.project_id.as_str(), repo_id.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let ingest_cursor_by_project = corpus
+        .git_cursors
+        .rows
+        .iter()
+        .filter_map(|row| {
+            row.last_ingested_sha
+                .as_deref()
+                .map(|sha| (row.project_id.as_str(), sha))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut first_commit_repo_ids: BTreeMap<String, BTreeSet<ProjectId>> = BTreeMap::new();
     for attachment in attachment_candidates {
         let Some(checkout) = checkout_by_id
@@ -4136,18 +4170,25 @@ fn capture_git_metadata_lane(
         let Some(repository) = checkout.repository.as_ref() else {
             continue;
         };
-        let Ok(Some(head)) = repository.verified_head() else {
-            continue;
-        };
-        let Ok(Some(first_commit)) = repository.first_commit_oid(head.oid()) else {
-            continue;
-        };
-        first_commit_repo_ids
-            .entry(bbox_corpus_core::entity_ref::repo_id_for_first_commit(
-                &first_commit,
-            ))
-            .or_default()
-            .insert(attachment.project_id.clone());
+        if let Ok(Some(head)) = repository.verified_head()
+            && let Ok(Some(first_commit)) = repository.first_commit_oid(head.oid())
+        {
+            first_commit_repo_ids
+                .entry(bbox_corpus_core::entity_ref::repo_id_for_first_commit(
+                    &first_commit,
+                ))
+                .or_default()
+                .insert(attachment.project_id.clone());
+        }
+        if let Some(repo_token) = record_repo_id_by_project.get(attachment.project_id.as_str())
+            && let Some(cursor_sha) = ingest_cursor_by_project.get(attachment.project_id.as_str())
+            && matches!(repository.resolve_commit_oid(cursor_sha), Ok(Some(_)))
+        {
+            first_commit_repo_ids
+                .entry((*repo_token).to_string())
+                .or_default()
+                .insert(attachment.project_id.clone());
+        }
     }
     let legacy_commit_namespaces = if matches!(
         (&tantivy_state, &vector_state),
