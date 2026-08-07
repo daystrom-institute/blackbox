@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use ordered_float::NotNan;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,14 @@ pub struct HnswIndex {
     graph: Vec<Vec<Vec<usize>>>,
     entry_point: Option<usize>,
     max_level: isize,
+    /// Derived active-only lookup. Historical tombstoned duplicate ids stay in
+    /// `ids`, but at most one active ordinal may exist for an id.
+    #[serde(skip)]
+    active_ordinal_by_id: HashMap<String, usize>,
+    /// False after snapshot deserialization; rebuilt and validated before the
+    /// first id-based mutation. Skipped so the snapshot wire shape is stable.
+    #[serde(skip)]
+    active_index_built: bool,
 }
 
 impl HnswIndex {
@@ -91,6 +100,8 @@ impl HnswIndex {
             graph: Vec::new(),
             entry_point: None,
             max_level: -1,
+            active_ordinal_by_id: HashMap::new(),
+            active_index_built: true,
         })
     }
 
@@ -112,6 +123,15 @@ impl HnswIndex {
         index.levels = vec![0; count];
         index.active = vec![true; count];
         index.graph = vec![vec![Vec::new(); index.options.max_layers]; count];
+        for (ordinal, id) in index.ids.iter().enumerate() {
+            if index
+                .active_ordinal_by_id
+                .insert(id.clone(), ordinal)
+                .is_some()
+            {
+                return Err(format!("duplicate active HNSW id: {id}"));
+            }
+        }
 
         let mut ordered = (0..count)
             .map(|ordinal| (ordinal, index.deterministic_level(&index.ids[ordinal])))
@@ -153,25 +173,42 @@ impl HnswIndex {
             .collect()
     }
 
-    pub fn metrics(&self) -> HnswMetrics {
-        let active_nodes = self.active.iter().filter(|active| **active).count();
-        let neighbor_refs = self
-            .graph
-            .iter()
-            .enumerate()
-            .filter(|(ordinal, _)| self.active[*ordinal])
-            .flat_map(|(_, layers)| layers.iter())
-            .map(|neighbors| {
-                neighbors
+    /// Full graph diagnostics. This walks graph connectivity and must never be
+    /// used for mutation bookkeeping, checkpointing, or cheap status.
+    pub fn diagnostics(&self) -> HnswMetrics {
+        self.diagnostics_checked(None)
+            .expect("unbounded HNSW diagnostics cannot time out")
+    }
+
+    /// Full graph diagnostics with a hard cooperative deadline. Each linear
+    /// graph pass checks the deadline at bounded intervals so an explicit
+    /// diagnostic request cannot monopolize the daemon indefinitely.
+    pub fn diagnostics_before(&self, deadline: Instant) -> Result<HnswMetrics, String> {
+        self.diagnostics_checked(Some(deadline))
+    }
+
+    fn diagnostics_checked(&self, deadline: Option<Instant>) -> Result<HnswMetrics, String> {
+        let mut active_nodes = 0usize;
+        let mut deleted_nodes = 0usize;
+        let mut neighbor_refs = 0usize;
+        for (ordinal, layers) in self.graph.iter().enumerate() {
+            Self::check_diagnostic_deadline(deadline, ordinal)?;
+            if !self.active[ordinal] {
+                deleted_nodes += 1;
+                continue;
+            }
+            active_nodes += 1;
+            for neighbors in layers {
+                neighbor_refs += neighbors
                     .iter()
                     .filter(|neighbor| self.active[**neighbor])
-                    .count()
-            })
-            .sum::<usize>();
-        HnswMetrics {
+                    .count();
+            }
+        }
+        Ok(HnswMetrics {
             total_nodes: self.ids.len(),
             active_nodes,
-            deleted_nodes: self.active.iter().filter(|active| !**active).count(),
+            deleted_nodes,
             dimensions: self.vectors.dimensions,
             max_level: self.max_level,
             entry_point: self.entry_point,
@@ -181,19 +218,29 @@ impl HnswIndex {
             } else {
                 neighbor_refs as f64 / active_nodes as f64
             },
-            layer_distribution: self.layer_distribution(),
-            disconnected_nodes: self.disconnected_nodes(),
-            zero_in_degree_nodes: self.zero_in_degree_nodes(),
-        }
+            layer_distribution: self.layer_distribution(deadline)?,
+            disconnected_nodes: self.disconnected_nodes(deadline)?,
+            zero_in_degree_nodes: self.zero_in_degree_nodes(deadline)?,
+        })
     }
 
-    fn zero_in_degree_nodes(&self) -> usize {
+    fn check_diagnostic_deadline(deadline: Option<Instant>, progress: usize) -> Result<(), String> {
+        if progress.is_multiple_of(1024)
+            && deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err("HNSW diagnostic deadline exceeded".to_string());
+        }
+        Ok(())
+    }
+
+    fn zero_in_degree_nodes(&self, deadline: Option<Instant>) -> Result<usize, String> {
         let mut has_inbound = vec![false; self.ids.len()];
         if let Some(entry_point) = self.entry_point {
             // The entry point is reachable by definition.
             has_inbound[entry_point] = true;
         }
         for (ordinal, layers) in self.graph.iter().enumerate() {
+            Self::check_diagnostic_deadline(deadline, ordinal)?;
             if !self.active[ordinal] {
                 continue;
             }
@@ -203,11 +250,12 @@ impl HnswIndex {
                 }
             }
         }
-        self.active
+        Ok(self
+            .active
             .iter()
             .zip(has_inbound.iter())
             .filter(|(active, inbound)| **active && !**inbound)
-            .count()
+            .count())
     }
 
     /// Sampled self-recall: search every `sample_every`-th active vector and
@@ -243,31 +291,112 @@ impl HnswIndex {
         if vector.len() != self.vectors.dimensions {
             return Err("dimension mismatch".to_string());
         }
-        self.delete(&id);
+        self.ensure_active_index()?;
+        let deleted_entry_point = self
+            .active_ordinal_by_id
+            .remove(&id)
+            .map(|ordinal| {
+                self.active[ordinal] = false;
+                self.entry_point == Some(ordinal)
+            })
+            .unwrap_or(false);
+        if deleted_entry_point {
+            self.repair_entry_point();
+        }
         let ordinal = self.ids.len();
         self.vectors.data.extend(vector);
-        self.ids.push(id);
+        self.ids.push(id.clone());
         self.levels.push(0);
         self.active.push(true);
         self.graph.push(vec![Vec::new(); self.options.max_layers]);
         self.insert_internal(ordinal);
+        self.active_ordinal_by_id.insert(id, ordinal);
         Ok(())
     }
 
-    pub fn delete(&mut self, id: &str) -> bool {
+    pub fn delete(&mut self, id: &str) -> Result<bool, String> {
+        self.ensure_active_index()?;
+        let Some(ordinal) = self.active_ordinal_by_id.remove(id) else {
+            return Ok(false);
+        };
+        self.active[ordinal] = false;
+        let deleted_entry_point = self.entry_point == Some(ordinal);
+        if deleted_entry_point {
+            self.repair_entry_point();
+        }
+        Ok(true)
+    }
+
+    /// Tombstone active ids in O(requested ids), repairing the graph entry
+    /// point once after the batch rather than once per entity.
+    pub fn delete_many(&mut self, ids: &[String]) -> Result<usize, String> {
+        self.ensure_active_index()?;
+        let mut deleted = 0usize;
         let mut deleted_entry_point = false;
-        let mut deleted = false;
-        for (ordinal, existing) in self.ids.iter().enumerate() {
-            if self.active[ordinal] && existing == id {
-                self.active[ordinal] = false;
-                deleted = true;
-                deleted_entry_point |= self.entry_point == Some(ordinal);
+        let mut seen = HashSet::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                continue;
             }
+            let Some(ordinal) = self.active_ordinal_by_id.remove(id) else {
+                continue;
+            };
+            self.active[ordinal] = false;
+            deleted += 1;
+            deleted_entry_point |= self.entry_point == Some(ordinal);
         }
         if deleted_entry_point {
             self.repair_entry_point();
         }
-        deleted
+        Ok(deleted)
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active.iter().filter(|active| **active).count()
+    }
+
+    pub fn deleted_count(&self) -> usize {
+        self.active.len().saturating_sub(self.active_count())
+    }
+
+    pub fn dimensions(&self) -> usize {
+        self.vectors.dimensions
+    }
+
+    /// Rebuild derived id lookup after snapshot deserialization and refuse an
+    /// impossible snapshot containing more than one active ordinal per id.
+    pub fn rebuild_active_index(&mut self) -> Result<(), String> {
+        if self.ids.len() != self.active.len()
+            || self.ids.len() != self.levels.len()
+            || self.ids.len() != self.graph.len()
+            || self.ids.len().checked_mul(self.vectors.dimensions) != Some(self.vectors.data.len())
+        {
+            self.active_index_built = false;
+            return Err("inconsistent HNSW snapshot vector lengths".to_string());
+        }
+        self.active_ordinal_by_id.clear();
+        for (ordinal, id) in self.ids.iter().enumerate() {
+            if !self.active[ordinal] {
+                continue;
+            }
+            if self
+                .active_ordinal_by_id
+                .insert(id.clone(), ordinal)
+                .is_some()
+            {
+                self.active_index_built = false;
+                return Err(format!("duplicate active HNSW id: {id}"));
+            }
+        }
+        self.active_index_built = true;
+        Ok(())
+    }
+
+    fn ensure_active_index(&mut self) -> Result<(), String> {
+        if !self.active_index_built {
+            self.rebuild_active_index()?;
+        }
+        Ok(())
     }
 
     fn repair_entry_point(&mut self) {
@@ -287,27 +416,31 @@ impl HnswIndex {
         self.max_level = level as isize;
     }
 
-    fn layer_distribution(&self) -> Vec<usize> {
+    fn layer_distribution(&self, deadline: Option<Instant>) -> Result<Vec<usize>, String> {
         let mut by_layer = vec![0usize; self.options.max_layers];
         for (ordinal, level) in self.levels.iter().copied().enumerate() {
+            Self::check_diagnostic_deadline(deadline, ordinal)?;
             if !self.active[ordinal] {
                 continue;
             }
             by_layer[level.min(self.options.max_layers - 1)] += 1;
         }
-        by_layer
+        Ok(by_layer)
     }
 
-    fn disconnected_nodes(&self) -> usize {
+    fn disconnected_nodes(&self, deadline: Option<Instant>) -> Result<usize, String> {
         let Some(entry_point) = self.entry_point else {
-            return 0;
+            return Ok(0);
         };
         let mut frontier = VecDeque::new();
         let mut visited = vec![false; self.ids.len()];
         visited[entry_point] = true;
         frontier.push_back(entry_point);
 
+        let mut visited_count = 0usize;
         while let Some(current) = frontier.pop_front() {
+            Self::check_diagnostic_deadline(deadline, visited_count)?;
+            visited_count += 1;
             for neighbors in &self.graph[current] {
                 for &neighbor in neighbors {
                     if !self.active[neighbor] || visited[neighbor] {
@@ -318,11 +451,12 @@ impl HnswIndex {
                 }
             }
         }
-        self.active
+        Ok(self
+            .active
             .iter()
             .zip(visited.iter())
             .filter(|(active, visited)| **active && !**visited)
-            .count()
+            .count())
     }
 
     fn insert_internal(&mut self, ordinal: usize) {
@@ -654,7 +788,7 @@ mod tests {
         )
         .unwrap();
 
-        let metrics = index.metrics();
+        let metrics = index.diagnostics();
         assert_eq!(metrics.total_nodes, 3);
         assert_eq!(metrics.active_nodes, 3);
         assert_eq!(metrics.deleted_nodes, 0);
@@ -686,7 +820,7 @@ mod tests {
         }
         index.entry_point = Some(0);
         index.max_level = 0;
-        assert_eq!(index.metrics().disconnected_nodes, 1);
+        assert_eq!(index.diagnostics().disconnected_nodes, 1);
     }
 
     /// gap-2eabd96d regression: near-duplicate clusters much larger than
@@ -716,7 +850,7 @@ mod tests {
             index.push(id.clone(), vector.clone()).unwrap();
         }
 
-        let metrics = index.metrics();
+        let metrics = index.diagnostics();
         let disconnected_ratio = metrics.disconnected_nodes as f64 / metrics.active_nodes as f64;
         assert!(
             disconnected_ratio < 0.01,
@@ -727,6 +861,98 @@ mod tests {
         );
         let self_recall = index.self_recall_probe(5, 10);
         assert!(self_recall >= 0.98, "self-recall {self_recall}");
+    }
+
+    #[test]
+    fn duplicate_active_ids_are_refused_at_build() {
+        let error = HnswIndex::build(
+            vec![
+                ("same".to_string(), vec![1.0, 0.0]),
+                ("same".to_string(), vec![0.0, 1.0]),
+            ],
+            HnswOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate active HNSW id"));
+    }
+
+    #[test]
+    fn batch_delete_uses_active_lookup_and_repairs_entry_once() {
+        let mut index = HnswIndex::build(
+            vec![
+                ("a".to_string(), vec![1.0, 0.0]),
+                ("b".to_string(), vec![0.0, 1.0]),
+                ("c".to_string(), vec![0.7, 0.3]),
+            ],
+            HnswOptions::default(),
+        )
+        .unwrap();
+        let deleted = index
+            .delete_many(&[
+                "a".to_string(),
+                "missing".to_string(),
+                "a".to_string(),
+                "c".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(index.active_count(), 1);
+        assert_eq!(index.deleted_count(), 2);
+        assert!(!index.delete("a").unwrap());
+        assert!(index.delete("b").unwrap());
+        assert_eq!(index.entry_point, None);
+    }
+
+    #[test]
+    fn large_partition_delete_resolves_only_requested_active_ids() {
+        const TOTAL: usize = 50_000;
+        let mut index = HnswIndex::empty(1, HnswOptions::default()).unwrap();
+        index.ids = (0..TOTAL).map(|ordinal| format!("id-{ordinal}")).collect();
+        index.vectors.data = vec![1.0; TOTAL];
+        index.levels = vec![0; TOTAL];
+        index.active = vec![true; TOTAL];
+        index.graph = vec![vec![Vec::new(); index.options.max_layers]; TOTAL];
+        index.active_ordinal_by_id = index
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(ordinal, id)| (id.clone(), ordinal))
+            .collect();
+        index.entry_point = Some(0);
+        index.max_level = 0;
+
+        let deleted = index
+            .delete_many(&[
+                "id-1".to_string(),
+                "id-25000".to_string(),
+                "id-49999".to_string(),
+                "missing".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(index.active_ordinal_by_id.len(), TOTAL - 3);
+        assert!(!index.active[1]);
+        assert!(!index.active[25_000]);
+        assert!(!index.active[49_999]);
+        assert!(index.active[2]);
+    }
+
+    #[test]
+    fn deserialized_index_rebuilds_active_lookup_before_mutation() {
+        let index = HnswIndex::build(
+            vec![
+                ("a".to_string(), vec![1.0, 0.0]),
+                ("b".to_string(), vec![0.0, 1.0]),
+            ],
+            HnswOptions::default(),
+        )
+        .unwrap();
+        let bytes = bincode::serialize(&index).unwrap();
+        let mut restored: HnswIndex = bincode::deserialize(&bytes).unwrap();
+        assert!(!restored.active_index_built);
+        assert!(restored.delete("a").unwrap());
+        assert_eq!(restored.active_count(), 1);
+        assert_eq!(restored.active_ordinal_by_id.get("b"), Some(&1));
     }
 
     #[test]

@@ -1886,14 +1886,45 @@ fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
         }
         let vectors = bbox_vectors::try_global()
             .ok_or_else(|| anyhow::Error::new(IndexWriterRetryableError::VectorStoreWarming))?;
+        let mut entity_ids = Vec::with_capacity(count);
         for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
             let document = searcher.doc::<tantivy::TantivyDocument>(address)?;
             if let Some(tantivy::schema::OwnedValue::Str(entity_id)) =
                 document.get_first(ctx.fields.entity_id)
             {
-                vectors.delete_entity_all_routes(entity_id)?;
+                entity_ids.push(entity_id.clone());
             }
         }
+        let vector_delete = vectors
+            .delete_entities_all_routes(&entity_ids)
+            .map_err(|failure| {
+                tracing::warn!(
+                    selector,
+                    requested_entities = failure.requested_entities,
+                    completed_entity_route_ops = failure.entity_route_ops_completed,
+                    remaining_entity_route_ops = failure.entity_route_ops_remaining,
+                    failing_route = %failure.route,
+                    failing_chunk = failure.chunk_index,
+                    "selector-retirement vector batch stopped after a partial durable prefix"
+                );
+                anyhow::Error::new(failure)
+            })?;
+        tracing::info!(
+            selector,
+            requested_entities = vector_delete.requested_entities,
+            completed_routes = vector_delete.routes.len(),
+            tombstones_appended = vector_delete
+                .routes
+                .iter()
+                .map(|route| route.tombstones_appended)
+                .sum::<usize>(),
+            active_removed = vector_delete
+                .routes
+                .iter()
+                .map(|route| route.active_removed)
+                .sum::<usize>(),
+            "selector-retirement vector batch completed"
+        );
         let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
         writer.delete_term(Term::from_field_text(
             ctx.fields.code_source_selector,

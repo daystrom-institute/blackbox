@@ -242,9 +242,11 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_embed_status",
         category: ToolCategory::Transcripts,
-        summary: "Return route embedding health and health_reason. recall_probe_route runs a sampled HNSW self-recall probe against that vector partition (vector-recall diagnostic, seconds on large partitions).",
-        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, capped_count (enqueues rejected at the queue cap — residue the sweeper will refill, not a drop), dropped_count (permanently un-embeddable poison), and sanitized error. health=`stalled` means coverage is under threshold with an idle queue; the background residue sweeper converges it automatically, or run bbox_reembed(route=…) to kick it now. Transcripts report coverage_state instead of a coverage ratio (guarded heavy scan). Pass recall_probe_route (a vector partition, e.g. \"voyage-1024\") for a sampled HNSW self-recall probe — the connectivity diagnostic for reverse-edge orphaning; ~1.0 is healthy. O(sample x search): seconds on large partitions, errors \"busy\" mid-rebuild.",
-        example: Some("bbox_embed_status(recall_probe_route=\"voyage-1024\")"),
+        summary: "Return cheap route embedding health and health_reason. include_diagnostics explicitly requests deadline-bounded HNSW graph diagnostics; recall_probe_route runs a sampled self-recall probe (both can be expensive).",
+        when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, capped_count (enqueues rejected at the queue cap — residue the sweeper will refill, not a drop), dropped_count (permanently un-embeddable poison), and sanitized error. health=`stalled` means coverage is under threshold with an idle queue; the background residue sweeper converges it automatically, or run bbox_reembed(route=…) to kick it now. Transcripts report coverage_state instead of a coverage ratio (guarded heavy scan). Cheap status never walks HNSW. Pass include_diagnostics=true with an optional bounded diagnostic_routes list for deadline-bounded connectivity diagnostics; unavailable is reported separately from healthy. Pass recall_probe_route for sampled self-recall; both explicit probes can take seconds on large partitions and refuse busy routes.",
+        example: Some(
+            "bbox_embed_status(include_diagnostics=true, diagnostic_routes=[\"voyage-1024\"])",
+        ),
     },
     ToolDoc {
         name: "bbox_topics",

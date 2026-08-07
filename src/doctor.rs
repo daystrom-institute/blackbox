@@ -1062,7 +1062,7 @@ fn index_section(state: &crate::server::state::SharedState) -> SectionReport {
 }
 
 fn vectors_section(state: &crate::server::state::SharedState) -> SectionReport {
-    let findings = match crate::embed_runtime::status_response_for_state(state) {
+    let mut findings = match crate::embed_runtime::status_response_for_state(state) {
         Ok(response) => {
             if response.routes.is_empty() {
                 vec![Finding::info("no embedding routes active yet")]
@@ -1078,6 +1078,61 @@ fn vectors_section(state: &crate::server::state::SharedState) -> SectionReport {
             "embedding status unavailable: {err:#}"
         ))],
     };
+    match bbox_vectors::try_metrics() {
+        None => findings.push(Finding::warn(
+            "vector connectivity diagnostics unavailable: store is warming up",
+        )),
+        Some(metrics) => {
+            let routes = metrics.into_keys().take(64).collect::<Vec<_>>();
+            match bbox_vectors::try_diagnostics_bounded(
+                &routes,
+                std::time::Duration::from_millis(2_000),
+            ) {
+                None => findings.push(Finding::warn(
+                    "vector connectivity diagnostics unavailable: store is warming up",
+                )),
+                Some(Err(err)) => findings.push(Finding::warn(format!(
+                    "vector connectivity diagnostics unavailable: {err:#}"
+                ))),
+                Some(Ok(report)) => {
+                    for unavailable in report.unavailable {
+                        findings.push(Finding::warn(format!(
+                            "vector connectivity unknown for {}: {}",
+                            unavailable.route,
+                            unavailable.reason.as_str()
+                        )));
+                    }
+                    let mut checked = 0usize;
+                    for metrics in report.partitions.into_values() {
+                        let Some(hnsw) = metrics.hnsw else {
+                            continue;
+                        };
+                        checked += 1;
+                        if hnsw.connectivity_breach(bbox_vectors::NOTIFY_CONNECTIVITY_RATIO) {
+                            findings.push(Finding::action(
+                                format!(
+                                    "vector connectivity degraded for {}: {:.2}% zero-in-degree",
+                                    metrics.route,
+                                    hnsw.connectivity_risk_ratio() * 100.0
+                                ),
+                                "run the embed-compaction-arc workflow to rebuild the partition",
+                            ));
+                        }
+                    }
+                    if checked > 0
+                        && !findings.iter().any(|finding| {
+                            finding.message.starts_with("vector connectivity degraded")
+                                || finding.message.starts_with("vector connectivity unknown")
+                        })
+                    {
+                        findings.push(Finding::ok(format!(
+                            "HNSW connectivity diagnostics healthy across {checked} partition(s)"
+                        )));
+                    }
+                }
+            }
+        }
+    }
     SectionReport {
         section: "vectors",
         findings,

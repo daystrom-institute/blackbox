@@ -16,6 +16,18 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct EmbedStatusParams {
+    /// Include explicit HNSW graph diagnostics. Cheap status leaves graph
+    /// fields absent; this opt-in walk can be expensive on large partitions.
+    #[serde(default)]
+    pub include_diagnostics: Option<bool>,
+    /// Optional bounded vector-route set for graph diagnostics. When omitted,
+    /// at most 64 currently loaded routes are inspected.
+    #[serde(default)]
+    pub diagnostic_routes: Option<Vec<String>>,
+    /// Cooperative graph-diagnostic deadline in milliseconds (default 2000,
+    /// clamped to 1..=30000).
+    #[serde(default)]
+    pub diagnostic_deadline_ms: Option<u64>,
     /// Optional vector route (partition name, e.g. "voyage-1024") to run a
     /// sampled HNSW self-recall probe against (gap-1168b0bd c). The probe is
     /// O(sample × search) — seconds on large partitions — and errors with
@@ -117,7 +129,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_embed_status",
-        description = "Return route embedding health and health_reason. recall_probe_route runs a sampled HNSW self-recall probe against that vector partition (vector-recall diagnostic, seconds on large partitions)."
+        description = "Return cheap route embedding health and health_reason. include_diagnostics explicitly requests deadline-bounded HNSW graph diagnostics; recall_probe_route runs a sampled self-recall probe (both can be expensive)."
     )]
     pub(crate) async fn bbox_embed_status(
         &self,
@@ -126,22 +138,48 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("bbox_embed_status", move || {
             let status = crate::embed_runtime::status_json_for_state(&server.state)?;
-            let Some(route) = p.recall_probe_route.as_deref() else {
+            let diagnostics_requested =
+                p.include_diagnostics.unwrap_or(false) || p.diagnostic_routes.is_some();
+            if !diagnostics_requested && p.recall_probe_route.is_none() {
                 return Ok(status);
-            };
-            let sample_every = p.probe_sample_every.unwrap_or(50).max(1);
-            let k = p.probe_k.unwrap_or(10).max(1);
-            let self_recall = crate::vectors::self_recall_probe(route, sample_every, k)?;
+            }
             let mut value: serde_json::Value = serde_json::from_str(&status)?;
-            value["recall_probe"] = serde_json::json!({
-                "route": route,
-                "sample_every": sample_every,
-                "k": k,
-                // null = partition exists but has no HNSW graph yet (or the
-                // store is still warming up). A healthy graph scores ~1.0;
-                // reverse-edge orphaning drags this down (gap-2eabd96d).
-                "self_recall": self_recall,
-            });
+            if diagnostics_requested {
+                let routes = match p.diagnostic_routes.as_ref() {
+                    Some(routes) => routes.clone(),
+                    None => crate::vectors::try_metrics()
+                        .map(|metrics| metrics.into_keys().take(64).collect())
+                        .unwrap_or_default(),
+                };
+                let timeout = std::time::Duration::from_millis(
+                    p.diagnostic_deadline_ms.unwrap_or(2_000).clamp(1, 30_000),
+                );
+                value["vector_diagnostics"] =
+                    match crate::vectors::try_diagnostics_bounded(&routes, timeout) {
+                        Some(report) => serde_json::to_value(report?)?,
+                        None => serde_json::json!({
+                            "partitions": {},
+                            "unavailable": [{
+                                "route": "<vector-store>",
+                                "reason": "store_warming_up"
+                            }]
+                        }),
+                    };
+            }
+            if let Some(route) = p.recall_probe_route.as_deref() {
+                let sample_every = p.probe_sample_every.unwrap_or(50).max(1);
+                let k = p.probe_k.unwrap_or(10).max(1);
+                let self_recall = crate::vectors::self_recall_probe(route, sample_every, k)?;
+                value["recall_probe"] = serde_json::json!({
+                    "route": route,
+                    "sample_every": sample_every,
+                    "k": k,
+                    // null = partition exists but has no HNSW graph yet (or the
+                    // store is still warming up). A healthy graph scores ~1.0;
+                    // reverse-edge orphaning drags this down (gap-2eabd96d).
+                    "self_recall": self_recall,
+                });
+            }
             Ok(serde_json::to_string_pretty(&value)?)
         })
         .await

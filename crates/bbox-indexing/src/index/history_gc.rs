@@ -389,13 +389,13 @@ pub fn evaluate_history_gc(
 /// A sink for vector tombstones, so the sweep is testable without a live
 /// vector store and so the single-writer discipline stays at the call site.
 pub trait HistoryVectorTombstoneSink {
-    fn delete_entity_all_routes(&self, entity_id: &str) -> anyhow::Result<()>;
+    fn delete_entities_all_routes(&self, entity_ids: &[String]) -> anyhow::Result<()>;
 }
 
 /// Tombstone the vectors of ONE retired history generation.
 ///
-/// Iterates the generation's OWN vector-input inventory, one
-/// `delete_entity_all_routes` per entity. It never derives the entity set
+/// Batches the generation's OWN deduplicated vector-input inventory into one
+/// sink call. It never derives the entity set
 /// from a project code selector: commit vectors are repo-scoped and enqueued
 /// once per repository, so a project-selector-driven delete would either miss
 /// them entirely (they carry no project) or, for a monorepo, delete a
@@ -404,12 +404,15 @@ pub fn tombstone_generation_vectors(
     generation: &HistoryGenerationRecordV1,
     sink: &dyn HistoryVectorTombstoneSink,
 ) -> anyhow::Result<u64> {
-    let mut deleted = 0_u64;
-    for input in &generation.vector_inputs {
-        sink.delete_entity_all_routes(&input.entity_id)?;
-        deleted += 1;
-    }
-    Ok(deleted)
+    let entity_ids = generation
+        .vector_inputs
+        .iter()
+        .map(|input| input.entity_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    sink.delete_entities_all_routes(&entity_ids)?;
+    Ok(entity_ids.len() as u64)
 }
 
 /// Generations on disk that the root set does not name.
@@ -839,11 +842,11 @@ mod tests {
         ));
     }
 
-    struct RecordingSink(std::cell::RefCell<Vec<String>>);
+    struct RecordingSink(std::cell::RefCell<Vec<Vec<String>>>);
 
     impl HistoryVectorTombstoneSink for RecordingSink {
-        fn delete_entity_all_routes(&self, entity_id: &str) -> anyhow::Result<()> {
-            self.0.borrow_mut().push(entity_id.to_string());
+        fn delete_entities_all_routes(&self, entity_ids: &[String]) -> anyhow::Result<()> {
+            self.0.borrow_mut().push(entity_ids.to_vec());
             Ok(())
         }
     }
@@ -891,9 +894,12 @@ mod tests {
         let deleted = tombstone_generation_vectors(&generation, &sink).unwrap();
         assert_eq!(deleted, 3);
         let recorded = sink.0.borrow();
-        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded.len(), 1, "history GC must issue one batch call");
+        assert_eq!(recorded[0].len(), 3);
         assert!(
-            recorded.iter().all(|id| id.starts_with("commit:nsmono:")),
+            recorded[0]
+                .iter()
+                .all(|id| id.starts_with("commit:nsmono:")),
             "commit vectors are repo-scoped; a project code selector could not \
              have produced this set"
         );

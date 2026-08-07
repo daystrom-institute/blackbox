@@ -467,21 +467,53 @@ mod tests {
 /// and degrades to empty during cold-start warmup.
 fn collect_vector_connectivity_alerts() -> Vec<crate::inbox::VectorConnectivityAlert> {
     let Some(metrics) = bbox_vectors::metrics_nonblocking() else {
-        return Vec::new();
+        return vec![
+            crate::inbox::VectorConnectivityAlert::DiagnosticsUnavailable {
+                route: "<vector-store>".to_string(),
+                reason: "store_warming_up".to_string(),
+            },
+        ];
     };
-    metrics
-        .into_values()
-        .filter(|m| m.connectivity_breach(bbox_vectors::NOTIFY_CONNECTIVITY_RATIO))
-        .map(|m| {
-            let hnsw = m.hnsw.as_ref().expect("breach implies hnsw metrics");
-            crate::inbox::VectorConnectivityAlert {
-                route: m.route.clone(),
+    let routes = metrics.keys().take(64).cloned().collect::<Vec<_>>();
+    let Some(report) =
+        bbox_vectors::try_diagnostics_bounded(&routes, std::time::Duration::from_millis(500))
+    else {
+        return vec![
+            crate::inbox::VectorConnectivityAlert::DiagnosticsUnavailable {
+                route: "<vector-store>".to_string(),
+                reason: "store_warming_up".to_string(),
+            },
+        ];
+    };
+    let Ok(report) = report else {
+        return vec![
+            crate::inbox::VectorConnectivityAlert::DiagnosticsUnavailable {
+                route: "<diagnostics>".to_string(),
+                reason: "request_rejected".to_string(),
+            },
+        ];
+    };
+    let mut alerts = report
+        .unavailable
+        .into_iter()
+        .map(
+            |unavailable| crate::inbox::VectorConnectivityAlert::DiagnosticsUnavailable {
+                route: unavailable.route,
+                reason: unavailable.reason.as_str().to_string(),
+            },
+        )
+        .collect::<Vec<_>>();
+    alerts.extend(report.partitions.into_values().filter_map(|metrics| {
+        let hnsw = metrics.hnsw?;
+        hnsw.connectivity_breach(bbox_vectors::NOTIFY_CONNECTIVITY_RATIO)
+            .then(|| crate::inbox::VectorConnectivityAlert::Breach {
+                route: metrics.route,
                 active_nodes: hnsw.active_nodes,
                 zero_in_degree_nodes: hnsw.zero_in_degree_nodes,
-                risk_ratio: m.connectivity_risk_ratio(),
-            }
-        })
-        .collect()
+                risk_ratio: hnsw.connectivity_risk_ratio(),
+            })
+    }));
+    alerts
 }
 
 /// Cron scheduling gaps for the inbox (gap-f268badd). A packet whose

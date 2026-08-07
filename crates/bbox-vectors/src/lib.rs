@@ -6,11 +6,12 @@ pub mod migration_inventory;
 pub mod slab;
 pub mod wal;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -244,8 +245,18 @@ pub fn delete(route: &str, entity_id: &str) -> Result<()> {
     global().delete(route, entity_id)
 }
 
+pub fn delete_batch(route: &str, entity_ids: &[String]) -> Result<VectorDeleteBatchResult> {
+    global().delete_batch(route, entity_ids)
+}
+
 pub fn delete_entity_all_routes(entity_id: &str) -> Result<()> {
     global().delete_entity_all_routes(entity_id)
+}
+
+pub fn delete_entities_all_routes(
+    entity_ids: &[String],
+) -> std::result::Result<VectorDeleteAllRoutesResult, VectorDeleteBatchFailure> {
+    global().delete_entities_all_routes(entity_ids)
 }
 
 pub fn contains_active(route: &str, entity_id: &str, content_hash: &str) -> Result<bool> {
@@ -318,6 +329,37 @@ pub fn try_metrics() -> Option<BTreeMap<String, PartitionMetrics>> {
 /// partitions under an active write-lock hold (rebuild) are omitted.
 pub fn metrics_nonblocking() -> Option<BTreeMap<String, PartitionMetrics>> {
     try_global().map(|store| store.metrics_nonblocking())
+}
+
+/// Explicit full HNSW diagnostics. Unlike `metrics`, this traverses graph
+/// connectivity and is intended only for quiesced/diagnostic callers.
+pub fn diagnostics() -> BTreeMap<String, PartitionMetrics> {
+    global().diagnostics()
+}
+
+/// Non-blocking explicit diagnostics: partitions under a write lock are
+/// omitted, and the whole surface is unavailable during vector warmup.
+pub fn diagnostics_nonblocking() -> Option<BTreeMap<String, PartitionMetrics>> {
+    try_global().map(|store| store.diagnostics_nonblocking())
+}
+
+/// Explicit graph diagnostics for a bounded route set. Lock contention and
+/// deadline exhaustion are data in the response, never aliases for healthy
+/// connectivity.
+pub fn diagnostics_bounded(
+    routes: &[String],
+    timeout: Duration,
+) -> Result<VectorDiagnosticsReport> {
+    global().diagnostics_bounded(routes, timeout)
+}
+
+/// Warmup-safe form of [`diagnostics_bounded`]. `None` means the vector store
+/// itself is not installed yet.
+pub fn try_diagnostics_bounded(
+    routes: &[String],
+    timeout: Duration,
+) -> Option<Result<VectorDiagnosticsReport>> {
+    try_global().map(|store| store.diagnostics_bounded(routes, timeout))
 }
 
 /// Partition lifecycle inventory against the installed global store.
@@ -441,20 +483,89 @@ impl VectorStore {
     }
 
     pub fn delete(&self, route: &str, entity_id: &str) -> Result<()> {
+        self.delete_batch(route, &[entity_id.to_string()])?;
+        Ok(())
+    }
+
+    pub fn delete_batch(
+        &self,
+        route: &str,
+        entity_ids: &[String],
+    ) -> Result<VectorDeleteBatchResult> {
         let partition = self.partition(route)?;
-        let result = partition
+        partition
             .write()
-            .delete(entity_id)
-            .with_context(|| format!("deleting vector entity {entity_id} from {route}"));
-        result
+            .delete_batch(entity_ids)
+            .with_context(|| format!("deleting vector batch from {route}"))
     }
 
     pub fn delete_entity_all_routes(&self, entity_id: &str) -> Result<()> {
-        let partitions = self.partitions.read().values().cloned().collect::<Vec<_>>();
-        for partition in partitions {
-            partition.write().delete(entity_id)?;
-        }
+        self.delete_entities_all_routes(&[entity_id.to_string()])
+            .map_err(anyhow::Error::new)?;
         Ok(())
+    }
+
+    pub fn delete_entities_all_routes(
+        &self,
+        entity_ids: &[String],
+    ) -> std::result::Result<VectorDeleteAllRoutesResult, VectorDeleteBatchFailure> {
+        const CHUNK_SIZE: usize = 512;
+        let mut seen = HashSet::with_capacity(entity_ids.len());
+        let entity_ids = entity_ids
+            .iter()
+            .filter(|entity_id| seen.insert(entity_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let partitions = self
+            .partitions
+            .read()
+            .iter()
+            .map(|(route, partition)| (route.clone(), partition.clone()))
+            .collect::<Vec<_>>();
+        let mut result = VectorDeleteAllRoutesResult {
+            requested_entities: entity_ids.len(),
+            routes: Vec::with_capacity(partitions.len()),
+        };
+        let entity_route_ops_total = entity_ids.len() * partitions.len();
+        for (route, partition) in partitions {
+            let mut route_result = VectorDeleteRouteResult {
+                route: route.clone(),
+                ..VectorDeleteRouteResult::default()
+            };
+            for (chunk_index, chunk) in entity_ids.chunks(CHUNK_SIZE).enumerate() {
+                match partition.write().delete_batch(chunk) {
+                    Ok(batch) => {
+                        route_result.requested += batch.requested;
+                        route_result.tombstones_appended += batch.tombstones_appended;
+                        route_result.active_removed += batch.active_removed;
+                        route_result.already_absent += batch.already_absent;
+                        route_result.chunks_completed += 1;
+                    }
+                    Err(source) => {
+                        let entity_route_ops_completed = result
+                            .routes
+                            .iter()
+                            .map(|completed| completed.requested)
+                            .sum::<usize>()
+                            + route_result.requested;
+                        return Err(VectorDeleteBatchFailure {
+                            route,
+                            chunk_index,
+                            chunks_completed: route_result.chunks_completed,
+                            entities_completed: route_result.requested,
+                            requested_entities: entity_ids.len(),
+                            entity_route_ops_completed,
+                            entity_route_ops_remaining: entity_route_ops_total
+                                .saturating_sub(entity_route_ops_completed),
+                            completed_routes: result.routes,
+                            source,
+                        });
+                    }
+                }
+            }
+            result.routes.push(route_result);
+        }
+        Ok(result)
     }
 
     pub fn contains_active(
@@ -720,6 +831,94 @@ impl VectorStore {
             .collect()
     }
 
+    pub fn diagnostics(&self) -> BTreeMap<String, PartitionMetrics> {
+        self.partitions
+            .read()
+            .iter()
+            .map(|(route, partition)| (route.clone(), partition.read().diagnostics()))
+            .collect()
+    }
+
+    pub fn diagnostics_nonblocking(&self) -> BTreeMap<String, PartitionMetrics> {
+        self.partitions
+            .read()
+            .iter()
+            .filter_map(|(route, partition)| {
+                partition
+                    .try_read()
+                    .map(|guard| (route.clone(), guard.diagnostics()))
+            })
+            .collect()
+    }
+
+    pub fn diagnostics_bounded(
+        &self,
+        routes: &[String],
+        timeout: Duration,
+    ) -> Result<VectorDiagnosticsReport> {
+        const MAX_DIAGNOSTIC_ROUTES: usize = 64;
+        let mut seen = HashSet::with_capacity(routes.len());
+        let routes = routes
+            .iter()
+            .filter(|route| seen.insert(route.as_str()))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            routes.len() <= MAX_DIAGNOSTIC_ROUTES,
+            "vector diagnostics accepts at most {MAX_DIAGNOSTIC_ROUTES} routes"
+        );
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let partitions = self.partitions.read();
+        let selected = routes
+            .iter()
+            .map(|route| ((*route).clone(), partitions.get(route.as_str()).cloned()))
+            .collect::<Vec<_>>();
+        drop(partitions);
+
+        let mut report = VectorDiagnosticsReport::default();
+        for (route, partition) in selected {
+            if Instant::now() >= deadline {
+                report.unavailable.push(VectorDiagnosticUnavailable {
+                    route,
+                    reason: VectorDiagnosticUnavailableReason::DeadlineExceeded,
+                });
+                continue;
+            }
+            let Some(partition) = partition else {
+                report.unavailable.push(VectorDiagnosticUnavailable {
+                    route,
+                    reason: VectorDiagnosticUnavailableReason::MissingPartition,
+                });
+                continue;
+            };
+            let Some(partition) = partition.try_read() else {
+                report.unavailable.push(VectorDiagnosticUnavailable {
+                    route,
+                    reason: VectorDiagnosticUnavailableReason::Busy,
+                });
+                continue;
+            };
+            match partition.diagnostics_before(deadline) {
+                Ok(metrics) => {
+                    if metrics.active_count > 0 && metrics.hnsw.is_none() {
+                        report.unavailable.push(VectorDiagnosticUnavailable {
+                            route,
+                            reason: VectorDiagnosticUnavailableReason::MissingGraph,
+                        });
+                    } else {
+                        report.partitions.insert(route, metrics);
+                    }
+                }
+                Err(_) => report.unavailable.push(VectorDiagnosticUnavailable {
+                    route,
+                    reason: VectorDiagnosticUnavailableReason::DeadlineExceeded,
+                }),
+            }
+        }
+        Ok(report)
+    }
+
     fn load_existing_partitions(&self) -> Result<()> {
         for entry in fs::read_dir(&self.root)
             .with_context(|| format!("reading vector store {}", self.root.display()))?
@@ -765,27 +964,56 @@ pub struct PartitionMetrics {
     pub hnsw: Option<HnswMetricsSerde>,
 }
 
-impl PartitionMetrics {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VectorDiagnosticsReport {
+    pub partitions: BTreeMap<String, PartitionMetrics>,
+    pub unavailable: Vec<VectorDiagnosticUnavailable>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VectorDiagnosticUnavailable {
+    pub route: String,
+    pub reason: VectorDiagnosticUnavailableReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorDiagnosticUnavailableReason {
+    Busy,
+    DeadlineExceeded,
+    MissingGraph,
+    MissingPartition,
+}
+
+impl VectorDiagnosticUnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::MissingGraph => "missing_graph",
+            Self::MissingPartition => "missing_partition",
+        }
+    }
+}
+
+impl HnswMetricsSerde {
     /// Fraction of active nodes unreachable by graph traversal
     /// (`zero_in_degree_nodes / active_nodes`) — vector-recall risk
-    /// (gap-1168b0bd). 0.0 for empty or graph-less partitions. Below
+    /// (gap-1168b0bd). 0.0 for an empty graph. Below
     /// `MIN_CONNECTIVITY_GUARD_NODES` active nodes the ratio is noise;
     /// gate consumers must check that floor, this is the raw fraction.
     pub fn connectivity_risk_ratio(&self) -> f32 {
-        let Some(hnsw) = &self.hnsw else { return 0.0 };
-        if hnsw.active_nodes == 0 {
+        if self.active_nodes == 0 {
             return 0.0;
         }
-        hnsw.zero_in_degree_nodes as f32 / hnsw.active_nodes as f32
+        self.zero_in_degree_nodes as f32 / self.active_nodes as f32
     }
 
     /// True when this partition's connectivity degradation merits attention
     /// at `threshold` (and the partition is large enough for the ratio to
     /// be signal rather than noise).
     pub fn connectivity_breach(&self, threshold: f32) -> bool {
-        self.hnsw
-            .as_ref()
-            .is_some_and(|hnsw| hnsw.active_nodes >= MIN_CONNECTIVITY_GUARD_NODES)
+        self.active_nodes >= MIN_CONNECTIVITY_GUARD_NODES
             && self.connectivity_risk_ratio() >= threshold
     }
 }
@@ -824,6 +1052,65 @@ pub struct VectorUpsert {
     pub entity_id: String,
     pub content_hash: String,
     pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorDeleteBatchResult {
+    pub requested: usize,
+    pub tombstones_appended: usize,
+    pub active_removed: usize,
+    pub already_absent: usize,
+    pub checkpointed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorDeleteRouteResult {
+    pub route: String,
+    pub requested: usize,
+    pub tombstones_appended: usize,
+    pub active_removed: usize,
+    pub already_absent: usize,
+    pub chunks_completed: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorDeleteAllRoutesResult {
+    pub requested_entities: usize,
+    pub routes: Vec<VectorDeleteRouteResult>,
+}
+
+#[derive(Debug)]
+pub struct VectorDeleteBatchFailure {
+    pub route: String,
+    pub chunk_index: usize,
+    pub chunks_completed: usize,
+    pub entities_completed: usize,
+    pub requested_entities: usize,
+    pub entity_route_ops_completed: usize,
+    pub entity_route_ops_remaining: usize,
+    pub completed_routes: Vec<VectorDeleteRouteResult>,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for VectorDeleteBatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "vector delete failed on route {} chunk {} after {} chunks / {} route entities ({} entity-route operations completed, {} remaining)",
+            self.route,
+            self.chunk_index,
+            self.chunks_completed,
+            self.entities_completed,
+            self.entity_route_ops_completed,
+            self.entity_route_ops_remaining,
+        )
+    }
+}
+
+impl std::error::Error for VectorDeleteBatchFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1046,16 +1333,75 @@ impl Partition {
     }
 
     fn delete(&mut self, entity_id: &str) -> Result<()> {
-        let record = WalRecord::delete(&self.route, entity_id);
-        wal::append(&self.wal_path(), &record)?;
-        self.wal_records += 1;
-        self.slab.delete(entity_id);
-        if let Some(hnsw) = self.hnsw.as_mut() {
-            hnsw.delete(entity_id);
+        self.delete_batch(&[entity_id.to_string()]).map(|_| ())
+    }
+
+    fn delete_batch(&mut self, entity_ids: &[String]) -> Result<VectorDeleteBatchResult> {
+        let mut seen = HashSet::with_capacity(entity_ids.len());
+        let entity_ids = entity_ids
+            .iter()
+            .filter(|entity_id| seen.insert(entity_id.as_str()))
+            .collect::<Vec<_>>();
+        if entity_ids.is_empty() {
+            return Ok(VectorDeleteBatchResult {
+                checkpointed: true,
+                ..VectorDeleteBatchResult::default()
+            });
         }
-        // Deletion is rare and we want it durable + reflected in slab.bin
-        // so a cold start doesn't resurrect the entity via stale slab.bin.
-        self.flush_derived_full()
+        let records = entity_ids
+            .iter()
+            .map(|entity_id| WalRecord::delete(&self.route, entity_id))
+            .collect::<Vec<_>>();
+
+        // WAL append is the mutation boundary. Everything fallible that can be
+        // checked beforehand is above this point; once appended, a failed
+        // in-memory projection remains replayable.
+        wal::append_many(&self.wal_path(), &records)?;
+        self.wal_records += records.len();
+
+        let mut active_removed = 0usize;
+        for entity_id in &entity_ids {
+            active_removed += usize::from(self.slab.delete(entity_id));
+        }
+        let hnsw_result = match self.hnsw.as_mut() {
+            Some(hnsw) => {
+                let ids = entity_ids
+                    .iter()
+                    .map(|entity_id| (*entity_id).clone())
+                    .collect::<Vec<_>>();
+                let hnsw_removed = hnsw.delete_many(&ids).map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    hnsw_removed == active_removed,
+                    "vector slab/HNSW delete mismatch: slab removed {active_removed}, HNSW removed {hnsw_removed}"
+                );
+                Ok(())
+            }
+            None if active_removed > 0 => Err(anyhow::anyhow!(
+                "vector slab removed {active_removed} active rows but HNSW graph is missing"
+            )),
+            None => Ok(()),
+        };
+
+        // Always attempt the durability boundary after WAL/in-memory mutation,
+        // even if the HNSW projection rejected an impossible snapshot shape.
+        let checkpoint_result = self.flush_derived_full();
+        if let Err(error) = hnsw_result {
+            if let Err(checkpoint_error) = checkpoint_result {
+                return Err(error.context(format!(
+                    "HNSW batch delete failed and vector checkpoint also failed: {checkpoint_error:#}"
+                )));
+            }
+            return Err(error.context("applying HNSW vector batch delete"));
+        }
+        checkpoint_result?;
+
+        Ok(VectorDeleteBatchResult {
+            requested: entity_ids.len(),
+            tombstones_appended: records.len(),
+            active_removed,
+            already_absent: entity_ids.len().saturating_sub(active_removed),
+            checkpointed: true,
+        })
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<SearchHit> {
@@ -1163,17 +1509,19 @@ impl Partition {
         self.slab = snapshot.slab;
         self.slab.rebuild_active_index();
         self.hnsw = snapshot.hnsw;
-        if let Some(hnsw) = &self.hnsw {
-            let metrics = hnsw.metrics();
-            if metrics.active_nodes != self.slab.active_count()
-                || metrics.dimensions != self.slab.dims()
+        if let Some(hnsw) = &mut self.hnsw {
+            hnsw.rebuild_active_index()
+                .map_err(anyhow::Error::msg)
+                .context("rebuilding vector snapshot HNSW active-id lookup")?;
+            if hnsw.active_count() != self.slab.active_count()
+                || hnsw.dimensions() != self.slab.dims()
             {
                 tracing::warn!(
                     route = %self.route,
                     snapshot_active_count = self.slab.active_count(),
-                    hnsw_active_nodes = metrics.active_nodes,
+                    hnsw_active_nodes = hnsw.active_count(),
                     snapshot_dims = self.slab.dims(),
-                    hnsw_dims = metrics.dimensions,
+                    hnsw_dims = hnsw.dimensions(),
                     "vector snapshot HNSW metrics mismatch; rebuilding from WAL"
                 );
                 return Ok(false);
@@ -1216,7 +1564,7 @@ impl Partition {
         if record.deleted_at.is_some() {
             self.slab.delete(&record.entity_id);
             if let Some(hnsw) = self.hnsw.as_mut() {
-                hnsw.delete(&record.entity_id);
+                hnsw.delete(&record.entity_id).map_err(anyhow::Error::msg)?;
             }
             return Ok(());
         }
@@ -1422,11 +1770,7 @@ impl Partition {
     fn metrics(&self) -> PartitionMetrics {
         let dims = self.slab.dims();
         let active_count = self.slab.active_count();
-        let hnsw_metrics = self.hnsw.as_ref().map(|hnsw| hnsw.metrics());
-        let deleted_count = hnsw_metrics
-            .as_ref()
-            .map(|metrics| metrics.deleted_nodes)
-            .unwrap_or(0);
+        let deleted_count = self.slab.deleted_count();
         let denominator = active_count + deleted_count;
         let deleted_ratio = if denominator == 0 {
             0.0
@@ -1446,8 +1790,27 @@ impl Partition {
             deleted_count,
             deleted_ratio,
             hnsw_rebuilds: self.hnsw_rebuilds,
-            hnsw: hnsw_metrics.map(Into::into),
+            hnsw: None,
         }
+    }
+
+    fn diagnostics(&self) -> PartitionMetrics {
+        let mut metrics = self.metrics();
+        metrics.hnsw = self.hnsw.as_ref().map(|hnsw| hnsw.diagnostics().into());
+        metrics
+    }
+
+    fn diagnostics_before(
+        &self,
+        deadline: Instant,
+    ) -> std::result::Result<PartitionMetrics, String> {
+        let mut metrics = self.metrics();
+        metrics.hnsw = self
+            .hnsw
+            .as_ref()
+            .map(|hnsw| hnsw.diagnostics_before(deadline).map(Into::into))
+            .transpose()?;
+        Ok(metrics)
     }
 
     /// Checkpoint the partition: write the small `meta.json` (operator
@@ -1467,28 +1830,48 @@ impl Partition {
     /// checkpoint strength without churning callers.
     fn flush_derived_files(&mut self) -> Result<()> {
         let options = HnswOptions::default();
-        let metrics = self.metrics();
-        fs::create_dir_all(&self.path)?;
-        fs::write(
-            self.path.join("meta.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": VECTOR_SCHEMA_VERSION,
-                "route": self.route,
-                "dims": self.slab.dims(),
-                "wal_records": self.wal_records,
-                "active_count": self.slab.active_count(),
-                "deleted_count": metrics.deleted_count,
-                "deleted_ratio": metrics.deleted_ratio,
-                "m": options.m,
-                "ef_construction": options.ef_construction,
-                "ef_search": options.ef_search,
-                "max_layers": options.max_layers,
-            }))?,
-        )?;
-        // Checkpoint the WAL — durability for everything written since
-        // the last sync. The append path no longer fsyncs per batch
-        // (see `wal::append_many`), so this is where durability lands.
-        crate::wal::sync_path(&self.wal_path())?;
+        let active_count = self.slab.active_count();
+        let deleted_count = self.slab.deleted_count();
+        let denominator = active_count + deleted_count;
+        let deleted_ratio = if denominator == 0 {
+            0.0
+        } else {
+            deleted_count as f32 / denominator as f32
+        };
+        let meta_result = (|| -> Result<()> {
+            fs::create_dir_all(&self.path)?;
+            fs::write(
+                self.path.join("meta.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema_version": VECTOR_SCHEMA_VERSION,
+                    "route": self.route,
+                    "dims": self.slab.dims(),
+                    "wal_records": self.wal_records,
+                    "active_count": active_count,
+                    "deleted_count": deleted_count,
+                    "deleted_ratio": deleted_ratio,
+                    "m": options.m,
+                    "ef_construction": options.ef_construction,
+                    "ef_search": options.ef_search,
+                    "max_layers": options.max_layers,
+                }))?,
+            )?;
+            Ok(())
+        })();
+        // Checkpoint the WAL even when derived metadata failed. Once a caller
+        // appended tombstones and mutated in-memory projections, skipping this
+        // attempt would turn a reportable metadata failure into crash loss.
+        let wal_result = crate::wal::sync_path(&self.wal_path());
+        match (meta_result, wal_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(meta_error), Ok(())) => return Err(meta_error.context("writing vector metadata")),
+            (Ok(()), Err(wal_error)) => return Err(wal_error),
+            (Err(meta_error), Err(wal_error)) => {
+                return Err(meta_error.context(format!(
+                    "writing vector metadata failed and WAL checkpoint also failed: {wal_error:#}"
+                )));
+            }
+        }
         self.last_flushed_wal_records = self.wal_records;
         Ok(())
     }
@@ -1900,6 +2283,211 @@ mod tests {
     }
 
     #[test]
+    fn batch_delete_deduplicates_input_and_checkpoints_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for id in ["a", "b", "c"] {
+            store
+                .upsert("voyage-1024", id, &format!("hash-{id}"), vec![1.0, 0.0])
+                .unwrap();
+        }
+
+        let result = store
+            .delete_batch(
+                "voyage-1024",
+                &["a".into(), "missing".into(), "a".into(), "c".into()],
+            )
+            .unwrap();
+        assert_eq!(result.requested, 3);
+        assert_eq!(result.tombstones_appended, 3);
+        assert_eq!(result.active_removed, 2);
+        assert_eq!(result.already_absent, 1);
+        assert!(result.checkpointed);
+
+        let metrics = store.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(metrics.active_count, 1);
+        assert_eq!(metrics.deleted_count, 2);
+        assert!(
+            metrics.hnsw.is_none(),
+            "cheap metrics must omit diagnostics"
+        );
+        let diagnostics = store.diagnostics().remove("voyage-1024").unwrap();
+        assert!(diagnostics.hnsw.is_some());
+
+        let records = wal::read_all(&tmp.path().join("voyage-1024").join("records.wal"))
+            .expect("WAL should read");
+        assert_eq!(records.len(), 6);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|row| row.deleted_at.is_some())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn all_absent_batch_still_persists_unconditional_tombstones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "seed", "hash-seed", vec![1.0, 0.0])
+            .unwrap();
+        let result = store
+            .delete_batch("voyage-1024", &["absent-a".into(), "absent-b".into()])
+            .unwrap();
+        assert_eq!(result.active_removed, 0);
+        assert_eq!(result.already_absent, 2);
+        assert!(result.checkpointed);
+
+        drop(store);
+        let restored = VectorStore::open(tmp.path()).unwrap();
+        let metrics = restored.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(metrics.wal_records, 3);
+        assert_eq!(metrics.active_count, 1);
+    }
+
+    #[test]
+    fn all_route_delete_chunks_each_route_and_reports_exact_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for route in ["a-route", "b-route"] {
+            store
+                .upsert(route, "entity-0", "hash-0", vec![1.0, 0.0])
+                .unwrap();
+        }
+        let ids = (0..513)
+            .map(|index| format!("entity-{index}"))
+            .collect::<Vec<_>>();
+        let result = store.delete_entities_all_routes(&ids).unwrap();
+        assert_eq!(result.requested_entities, 513);
+        assert_eq!(result.routes.len(), 2);
+        for route in result.routes {
+            assert_eq!(route.requested, 513);
+            assert_eq!(route.tombstones_appended, 513);
+            assert_eq!(route.active_removed, 1);
+            assert_eq!(route.already_absent, 512);
+            assert_eq!(route.chunks_completed, 2);
+            let wal = wal::read_all(&tmp.path().join(route.route).join("records.wal")).unwrap();
+            assert_eq!(wal.len(), 514);
+        }
+    }
+
+    #[test]
+    fn all_route_delete_reports_partial_prefix_and_checkpoints_wal_on_meta_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for route in ["a-complete", "b-fail"] {
+            store
+                .upsert(route, "entity", "hash", vec![1.0, 0.0])
+                .unwrap();
+        }
+        let failing_meta = tmp.path().join("b-fail").join("meta.json");
+        fs::remove_file(&failing_meta).unwrap();
+        fs::create_dir(&failing_meta).unwrap();
+
+        let failure = store
+            .delete_entities_all_routes(&["entity".to_string()])
+            .unwrap_err();
+        assert_eq!(failure.route, "b-fail");
+        assert_eq!(failure.chunk_index, 0);
+        assert_eq!(failure.completed_routes.len(), 1);
+        assert_eq!(failure.entity_route_ops_completed, 1);
+        assert_eq!(failure.entity_route_ops_remaining, 1);
+        let failing_wal = wal::read_all(&tmp.path().join("b-fail").join("records.wal")).unwrap();
+        assert!(
+            failing_wal.last().unwrap().deleted_at.is_some(),
+            "the post-mutation durability attempt must retain the final tombstone"
+        );
+    }
+
+    #[test]
+    fn wal_append_failure_precedes_batch_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("route", "entity", "hash", vec![1.0, 0.0])
+            .unwrap();
+        let wal_path = tmp.path().join("route").join("records.wal");
+        fs::remove_file(&wal_path).unwrap();
+        fs::create_dir(&wal_path).unwrap();
+
+        assert!(
+            store
+                .delete_batch("route", &["entity".to_string()])
+                .is_err()
+        );
+        assert_eq!(store.metrics()["route"].active_count, 1);
+        assert_eq!(
+            store.diagnostics()["route"]
+                .hnsw
+                .as_ref()
+                .unwrap()
+                .active_nodes,
+            1
+        );
+    }
+
+    #[test]
+    fn bounded_diagnostics_reports_deadline_and_missing_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("route", "entity", "hash", vec![1.0, 0.0])
+            .unwrap();
+
+        let timed_out = store
+            .diagnostics_bounded(&["route".to_string()], Duration::ZERO)
+            .unwrap();
+        assert!(timed_out.partitions.is_empty());
+        assert_eq!(
+            timed_out.unavailable[0].reason,
+            VectorDiagnosticUnavailableReason::DeadlineExceeded
+        );
+
+        let missing = store
+            .diagnostics_bounded(&["missing".to_string()], Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            missing.unavailable[0].reason,
+            VectorDiagnosticUnavailableReason::MissingPartition
+        );
+    }
+
+    #[test]
+    fn deleted_ratio_comes_from_slab_after_wal_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "a", "hash-a", vec![1.0, 0.0])
+            .unwrap();
+        store
+            .upsert("voyage-1024", "b", "hash-b", vec![0.0, 1.0])
+            .unwrap();
+        store.delete("voyage-1024", "a").unwrap();
+        drop(store);
+
+        // Remove the cache so open must rebuild HNSW from active slab rows.
+        fs::remove_file(tmp.path().join("voyage-1024").join(SNAPSHOT_FILE)).unwrap();
+        let rebuilt = VectorStore::open(tmp.path()).unwrap();
+        let metrics = rebuilt.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(metrics.active_count, 1);
+        assert_eq!(metrics.deleted_count, 1);
+        assert!((metrics.deleted_ratio - 0.5).abs() < f32::EPSILON);
+        assert_eq!(
+            rebuilt
+                .diagnostics()
+                .remove("voyage-1024")
+                .unwrap()
+                .hnsw
+                .unwrap()
+                .deleted_nodes,
+            0,
+            "rebuilt HNSW contains only active slab rows"
+        );
+    }
+
+    #[test]
     fn partition_metrics_distinguish_empty_from_active_dimensions() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
@@ -1918,59 +2506,47 @@ mod tests {
         assert_eq!(empty.state, PartitionState::Empty);
     }
 
-    fn metrics_with_connectivity(active_nodes: usize, zero_in: usize) -> PartitionMetrics {
-        PartitionMetrics {
-            route: "voyage-1024".into(),
-            state: PartitionState::Active { dims: 2 },
-            dims: 2,
-            wal_records: active_nodes,
-            active_count: active_nodes,
-            deleted_count: 0,
-            deleted_ratio: 0.0,
-            hnsw_rebuilds: 0,
-            hnsw: Some(HnswMetricsSerde {
-                total_nodes: active_nodes,
-                active_nodes,
-                deleted_nodes: 0,
-                dimensions: 2,
-                max_level: 0,
-                entry_point: Some(0),
-                neighbor_refs: active_nodes * 4,
-                avg_neighbor_degree: 4.0,
-                layer_distribution: vec![active_nodes],
-                disconnected_nodes: zero_in,
-                zero_in_degree_nodes: zero_in,
-            }),
+    fn diagnostics_with_connectivity(active_nodes: usize, zero_in: usize) -> HnswMetricsSerde {
+        HnswMetricsSerde {
+            total_nodes: active_nodes,
+            active_nodes,
+            deleted_nodes: 0,
+            dimensions: 2,
+            max_level: 0,
+            entry_point: Some(0),
+            neighbor_refs: active_nodes * 4,
+            avg_neighbor_degree: 4.0,
+            layer_distribution: vec![active_nodes],
+            disconnected_nodes: zero_in,
+            zero_in_degree_nodes: zero_in,
         }
     }
 
     #[test]
     fn connectivity_risk_ratio_is_zero_in_over_active() {
-        let metrics = metrics_with_connectivity(10_000, 600);
+        let metrics = diagnostics_with_connectivity(10_000, 600);
         assert!((metrics.connectivity_risk_ratio() - 0.06).abs() < 1e-6);
 
-        let healthy = metrics_with_connectivity(10_000, 0);
+        let healthy = diagnostics_with_connectivity(10_000, 0);
         assert_eq!(healthy.connectivity_risk_ratio(), 0.0);
-
-        let graphless = PartitionMetrics {
-            hnsw: None,
-            ..metrics_with_connectivity(10_000, 600)
-        };
-        assert_eq!(graphless.connectivity_risk_ratio(), 0.0);
     }
 
     #[test]
     fn connectivity_breach_requires_threshold_and_size_floor() {
         // Over threshold, over the size floor: breach.
         assert!(
-            metrics_with_connectivity(10_000, 600).connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
+            diagnostics_with_connectivity(10_000, 600)
+                .connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
         );
         // Under threshold: no breach.
         assert!(
-            !metrics_with_connectivity(10_000, 100).connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
+            !diagnostics_with_connectivity(10_000, 100)
+                .connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
         );
         // Tiny partition: ratio is noise, never a breach regardless of value.
-        assert!(!metrics_with_connectivity(50, 10).connectivity_breach(COMPACT_CONNECTIVITY_RATIO));
+        assert!(
+            !diagnostics_with_connectivity(50, 10).connectivity_breach(COMPACT_CONNECTIVITY_RATIO)
+        );
     }
 
     #[test]
@@ -2101,7 +2677,11 @@ mod tests {
                 .unwrap();
         }
 
-        let metrics = store.metrics();
+        assert!(
+            store.metrics()["voyage-1024"].hnsw.is_none(),
+            "incremental insertion must not make cheap metrics traverse HNSW"
+        );
+        let metrics = store.diagnostics();
         let partition = &metrics["voyage-1024"];
         assert_eq!(partition.active_count, 100);
         assert_eq!(partition.hnsw.as_ref().unwrap().total_nodes, 100);

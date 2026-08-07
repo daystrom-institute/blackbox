@@ -799,16 +799,27 @@ impl EmbedQueueHandle {
     }
 
     pub fn tombstone(&self, entity_id: &str) {
+        self.tombstone_batch(&[entity_id.to_string()]);
+    }
+
+    pub fn tombstone_batch(&self, entity_ids: &[String]) {
         if let Some(vector_store) = &self.inner.vector_store {
-            if let Err(err) = vector_store.delete_entity_all_routes(entity_id) {
+            if let Err(err) = vector_store.delete_entities_all_routes(entity_ids) {
                 tracing::warn!(
-                    entity_id,
+                    requested_entities = err.requested_entities,
+                    completed_entity_route_ops = err.entity_route_ops_completed,
+                    remaining_entity_route_ops = err.entity_route_ops_remaining,
+                    failing_route = %err.route,
+                    failing_chunk = err.chunk_index,
                     error = %err,
-                    "embedding tombstone failed; vector WAL can be reconstructed by reindex"
+                    "embedding tombstone batch failed after a partial durable prefix; vector WAL can be reconstructed by reindex"
                 );
             }
         }
-        tracing::debug!(entity_id, "embedding tombstone accepted");
+        tracing::debug!(
+            requested_entities = entity_ids.len(),
+            "embedding tombstone batch accepted"
+        );
     }
 
     pub fn status(&self) -> EmbedStatusResponse {
@@ -1883,6 +1894,43 @@ mod tests {
         fn id(&self) -> &str {
             "mock"
         }
+    }
+
+    #[test]
+    fn tombstone_batch_deletes_all_routes_with_one_store_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(bbox_vectors::VectorStore::open(tmp.path()).unwrap());
+        for route in ["route-a", "route-b"] {
+            for entity in ["a", "b"] {
+                store
+                    .upsert(route, entity, &format!("hash-{entity}"), vec![1.0, 0.0])
+                    .unwrap();
+            }
+        }
+        let queue = EmbedQueueHandle::isolated_for_test(
+            "route-a",
+            Arc::new(MockProvider::ok()),
+            store.clone(),
+        );
+
+        queue.tombstone_batch(&["a".into(), "b".into(), "a".into()]);
+
+        let metrics = store.metrics();
+        assert_eq!(metrics["route-a"].active_count, 0);
+        assert_eq!(metrics["route-b"].active_count, 0);
+        for route in ["route-a", "route-b"] {
+            let records =
+                bbox_vectors::wal::read_all(&tmp.path().join(route).join("records.wal")).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record.deleted_at.is_some())
+                    .count(),
+                2,
+                "duplicate batch ids must not multiply tombstones"
+            );
+        }
+        queue.shutdown();
     }
 
     #[test]

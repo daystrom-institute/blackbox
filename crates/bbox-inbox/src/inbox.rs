@@ -50,11 +50,17 @@ pub struct InboxParams {
 /// DAG, so the adapter in the daemon's attention tool builds these from
 /// partition metrics.
 #[derive(Debug, Clone)]
-pub struct VectorConnectivityAlert {
-    pub route: String,
-    pub active_nodes: usize,
-    pub zero_in_degree_nodes: usize,
-    pub risk_ratio: f32,
+pub enum VectorConnectivityAlert {
+    Breach {
+        route: String,
+        active_nodes: usize,
+        zero_in_degree_nodes: usize,
+        risk_ratio: f32,
+    },
+    DiagnosticsUnavailable {
+        route: String,
+        reason: String,
+    },
 }
 
 /// Cron scheduling gap — the silent-maintenance class (gap-f268badd).
@@ -122,13 +128,22 @@ pub fn compute_inbox(
             vector_alerts.len()
         ));
         for alert in vector_alerts {
-            out.push_str(&format!(
-                "  {} — {:.2}% of {} active vectors unreachable ({} zero-in-degree); schedule a rebuild via embed-compaction-arc\n",
-                alert.route,
-                alert.risk_ratio * 100.0,
-                alert.active_nodes,
-                alert.zero_in_degree_nodes,
-            ));
+            match alert {
+                VectorConnectivityAlert::Breach {
+                    route,
+                    active_nodes,
+                    zero_in_degree_nodes,
+                    risk_ratio,
+                } => out.push_str(&format!(
+                    "  {route} — {:.2}% of {active_nodes} active vectors unreachable ({zero_in_degree_nodes} zero-in-degree); schedule a rebuild via embed-compaction-arc\n",
+                    risk_ratio * 100.0,
+                )),
+                VectorConnectivityAlert::DiagnosticsUnavailable { route, reason } => {
+                    out.push_str(&format!(
+                        "  {route} — connectivity diagnostics unavailable ({reason}); health is unknown, not healthy\n"
+                    ));
+                }
+            }
         }
         out.push('\n');
     }
@@ -981,7 +996,7 @@ mod tests {
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
         let gaps = empty_gaps(&dir);
         let whiteboards = WhiteboardRegistry::new();
-        let alerts = vec![VectorConnectivityAlert {
+        let alerts = vec![VectorConnectivityAlert::Breach {
             route: "voyage-1024".into(),
             active_nodes: 399_000,
             zero_in_degree_nodes: 12_000,
@@ -1015,6 +1030,44 @@ mod tests {
         assert!(out.contains("3.01%"));
         assert!(out.contains("embed-compaction-arc"));
         assert!(!out.contains("clean plate"));
+    }
+
+    #[test]
+    fn inbox_does_not_treat_unavailable_vector_diagnostics_as_healthy() {
+        let dir = tempdir().unwrap();
+        let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        let threads = Threads::open(&dir.path().join("th.json")).unwrap();
+        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = empty_gaps(&dir);
+        let alerts = vec![VectorConnectivityAlert::DiagnosticsUnavailable {
+            route: "voyage-1024".into(),
+            reason: "deadline_exceeded".into(),
+        }];
+
+        let out = compute_inbox(
+            &kb,
+            &threads,
+            &notes,
+            &gaps,
+            &[],
+            &alerts,
+            &[],
+            &WhiteboardRegistry::new(),
+            &InboxParams {
+                project: None,
+                provisional: None,
+                limit: None,
+                stale_days: None,
+                include_tasks: None,
+                import_gap_spool: None,
+                aggregate_gaps: None,
+                check_gap_closeouts: None,
+                gap_commit_range: None,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("diagnostics unavailable (deadline_exceeded)"));
+        assert!(out.contains("health is unknown, not healthy"));
     }
 
     /// Cron scheduling gaps are host-level silent-maintenance risk: both
