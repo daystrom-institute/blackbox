@@ -292,21 +292,37 @@ impl BlackboxServer {
         &self,
         checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
     ) -> anyhow::Result<()> {
+        let row = bbox_indexing::checkout_registry::CheckoutRow {
+            project_id: Some(checkout.project_id.clone()),
+            checkout_id: checkout.checkout_id.clone(),
+            checkout_dir: checkout.checkout_dir.clone(),
+            repo_id: Some(checkout.published_scope.repo_id().to_string()),
+            bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath().to_string()),
+            branch_ref: checkout.branch_ref.clone(),
+        };
+        // Fast path: this sits on the entry path of every project-scoped
+        // knowledge/gap/render write, and the overwhelmingly common case is
+        // re-registration of a row the registry already holds verbatim —
+        // which `CheckoutRegistry::register` no-ops without persisting.
+        // Demanding the exclusive lifecycle guard for that no-op made the
+        // whole write plane starve behind shared mutation pins
+        // (F-GUARD-STARVATION: the guard is a bare CAS requiring total
+        // write-quiescence, and gap writes refused lifecycle_busy for days
+        // on a busy daemon). Fail-closed: any absence or difference — a
+        // changed row, a missing scope, a concurrent deregistration — falls
+        // through to the guarded registration below.
+        if let Some(scope) = row.published_scope()
+            && self.state.checkout_registry.read().get(&row.checkout_id, &scope) == Some(&row)
+        {
+            self.watch_resolved_dark_knowledge_checkout(checkout);
+            return Ok(());
+        }
         let _lifecycle = self
             .state
             .checkout_access
             .lifecycle_mutation_guard()
             .map_err(anyhow::Error::new)?;
-        self.state.checkout_registry.write().register(
-            bbox_indexing::checkout_registry::CheckoutRow {
-                project_id: Some(checkout.project_id.clone()),
-                checkout_id: checkout.checkout_id.clone(),
-                checkout_dir: checkout.checkout_dir.clone(),
-                repo_id: Some(checkout.published_scope.repo_id().to_string()),
-                bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath().to_string()),
-                branch_ref: checkout.branch_ref.clone(),
-            },
-        )?;
+        self.state.checkout_registry.write().register(row)?;
         drop(_lifecycle);
         self.watch_resolved_dark_knowledge_checkout(checkout);
         Ok(())

@@ -2246,6 +2246,51 @@ mod catalog_gap_overlay_tests {
         assert!(stored.values.is_empty());
     }
 
+    /// F-GUARD-STARVATION: checkout registration sits on the entry path of
+    /// every project-scoped knowledge/gap/render write, and the common case
+    /// is a row the registry already holds verbatim — a registry no-op.
+    /// That case must not demand the exclusive lifecycle guard (which
+    /// requires total write-quiescence and starves on a busy daemon), while
+    /// any actual change must still fall through to the guarded path.
+    #[test]
+    fn identical_checkout_reregistration_bypasses_the_exclusive_lifecycle_guard() {
+        let fixture = GapOverlayFixture::new(&[gap_note("gap-33333333", "accepted")]);
+        let server = fixture.catalog.server_with_checkout_authority();
+        let checkout = ResolvedCheckoutScope {
+            project_id: PROJECT.to_string(),
+            published_scope: fixture.scope.clone(),
+            checkout_id: BASE_CHECKOUT.to_string(),
+            checkout_dir: fixture.base.to_string_lossy().into_owned(),
+            checkout_project_dir: fixture.base.to_string_lossy().into_owned(),
+            branch_ref: Some("refs/heads/main".into()),
+        };
+        server
+            .register_dark_knowledge_checkout(&checkout)
+            .expect("first registration succeeds unguarded");
+
+        // Hold the exclusive guard: every guarded registration now refuses.
+        let busy = server
+            .state
+            .checkout_access
+            .lifecycle_mutation_guard()
+            .unwrap();
+
+        server
+            .register_dark_knowledge_checkout(&checkout)
+            .expect("identical re-registration is a registry no-op and must not demand the guard");
+
+        let mut changed = checkout.clone();
+        changed.branch_ref = Some("refs/heads/other".into());
+        let refused = server
+            .register_dark_knowledge_checkout(&changed)
+            .expect_err("a changed row must fall through to the guarded path");
+        assert!(
+            refused.to_string().contains("lifecycle_busy"),
+            "guarded fallthrough surfaces the typed busy refusal, got: {refused:#}"
+        );
+        drop(busy);
+    }
+
     #[test]
     fn a_gap_checkout_that_never_settles_during_capture_is_transient() {
         let fixture = GapOverlayFixture::new(&[gap_note("gap-11111111", "accepted")]);
