@@ -1049,12 +1049,19 @@ impl Partition {
         let record = WalRecord::delete(&self.route, entity_id);
         wal::append(&self.wal_path(), &record)?;
         self.wal_records += 1;
-        self.slab.delete(entity_id);
+        let removed = self.slab.delete(entity_id);
         if let Some(hnsw) = self.hnsw.as_mut() {
             hnsw.delete(entity_id);
         }
-        // Deletion is rare and we want it durable + reflected in slab.bin
-        // so a cold start doesn't resurrect the entity via stale slab.bin.
+        if !removed {
+            // The entity was never active here (delete_entity_all_routes
+            // fans out to every partition). The tombstone record is
+            // appended above either way; the periodic flusher picks up
+            // the fsync via needs_flush().
+            return Ok(());
+        }
+        // A lost delete does not self-heal (nothing re-issues tombstones),
+        // so checkpoint the WAL now rather than waiting for the flusher.
         self.flush_derived_full()
     }
 
@@ -1423,10 +1430,14 @@ impl Partition {
         let dims = self.slab.dims();
         let active_count = self.slab.active_count();
         let hnsw_metrics = self.hnsw.as_ref().map(|hnsw| hnsw.metrics());
-        let deleted_count = hnsw_metrics
-            .as_ref()
-            .map(|metrics| metrics.deleted_nodes)
-            .unwrap_or(0);
+        // Slab-derived, not HNSW-derived: `rebuild_hnsw` builds from
+        // active entries only, so after a WAL-rebuild cold start the graph
+        // reports deleted_nodes == 0 while the slab still carries every
+        // tombstone (and the snapshot re-persists the zeroed graph). The
+        // HNSW-derived count read 0.0 deleted_ratio until a compaction
+        // ran, silently disabling the tombstone axis of the workflow
+        // compaction gate.
+        let deleted_count = self.slab.deleted_count();
         let denominator = active_count + deleted_count;
         let deleted_ratio = if denominator == 0 {
             0.0
@@ -1467,7 +1478,20 @@ impl Partition {
     /// checkpoint strength without churning callers.
     fn flush_derived_files(&mut self) -> Result<()> {
         let options = HnswOptions::default();
-        let metrics = self.metrics();
+        // Slab-derived counts only: `Partition::metrics()` walks the full
+        // HNSW graph (six O(N)/O(E) passes) and made every delete a
+        // multi-second full-graph scan (the F-VEC-DELETE grind, 47
+        // deletes/min at prod scale). The compaction gate
+        // (`needs_compaction_with_policy`) already reads these same slab
+        // counts, so meta.json now agrees with the policy that acts on it.
+        let active_count = self.slab.active_count();
+        let deleted_count = self.slab.deleted_count();
+        let denominator = active_count + deleted_count;
+        let deleted_ratio = if denominator == 0 {
+            0.0
+        } else {
+            deleted_count as f32 / denominator as f32
+        };
         fs::create_dir_all(&self.path)?;
         fs::write(
             self.path.join("meta.json"),
@@ -1476,9 +1500,9 @@ impl Partition {
                 "route": self.route,
                 "dims": self.slab.dims(),
                 "wal_records": self.wal_records,
-                "active_count": self.slab.active_count(),
-                "deleted_count": metrics.deleted_count,
-                "deleted_ratio": metrics.deleted_ratio,
+                "active_count": active_count,
+                "deleted_count": deleted_count,
+                "deleted_ratio": deleted_ratio,
                 "m": options.m,
                 "ef_construction": options.ef_construction,
                 "ef_search": options.ef_search,
@@ -2038,6 +2062,72 @@ mod tests {
         assert_eq!(after.active_count, 6);
         assert_eq!(after.deleted_count, 0);
         assert_eq!(after.deleted_ratio, 0.0);
+    }
+
+    #[test]
+    fn wal_rebuild_preserves_deleted_ratio_in_metrics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for idx in 0..10 {
+            let theta = idx as f32 * 0.01;
+            store
+                .upsert(
+                    "voyage-1024",
+                    &format!("id-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin()],
+                )
+                .unwrap();
+        }
+        for idx in 0..4 {
+            store.delete("voyage-1024", &format!("id-{idx}")).unwrap();
+        }
+        drop(store);
+
+        // Remove the snapshot so reopen takes the rebuild_from_wal path.
+        // The rebuilt HNSW holds active entries only (deleted_nodes == 0),
+        // and an HNSW-derived deleted_count read 0 here — hiding every
+        // slab tombstone from the compaction gates until a compaction ran.
+        let snapshot = tmp.path().join("voyage-1024").join(SNAPSHOT_FILE);
+        if snapshot.exists() {
+            std::fs::remove_file(&snapshot).unwrap();
+        }
+
+        let rebuilt = VectorStore::open(tmp.path()).unwrap();
+        let metrics = rebuilt.metrics().remove("voyage-1024").unwrap();
+        assert_eq!(metrics.active_count, 6);
+        assert_eq!(
+            metrics.deleted_count, 4,
+            "post-WAL-rebuild metrics must keep reporting slab tombstones"
+        );
+        assert!(metrics.deleted_ratio > 0.3);
+    }
+
+    #[test]
+    fn delete_of_absent_entity_appends_tombstone_but_skips_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store.upsert("route-a", "x", "h1", vec![1.0, 0.0]).unwrap();
+        store.upsert("route-b", "y", "h2", vec![0.0, 1.0]).unwrap();
+        store.delete_entity_all_routes("x").unwrap();
+
+        let metrics = store.metrics();
+        // Both partitions append the tombstone record (all-routes fan-out
+        // keeps record semantics unchanged) ...
+        assert_eq!(metrics["route-a"].wal_records, 2);
+        assert_eq!(metrics["route-b"].wal_records, 2);
+        // ... but only the partition that actually held the entity pays
+        // the full checkpoint; the other's meta.json still reflects the
+        // creation-time flush (wal_records 0) and defers to the periodic
+        // flusher.
+        let read_meta = |route: &str| -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(tmp.path().join(route).join("meta.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(read_meta("route-a")["wal_records"], 2);
+        assert_eq!(read_meta("route-b")["wal_records"], 0);
     }
 
     #[test]
