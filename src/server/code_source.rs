@@ -90,12 +90,57 @@ struct ReconcileEvent {
     project_id: String,
     scope: PublishedScope,
     kind: ReconcileKind,
+    origin: EventOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ReconcileKind {
     Activate,
     Cutback,
+}
+
+/// Where an enqueued event came from. The origin is NOT part of the
+/// coalescing key, because a config reload must not multiply the pass
+/// count; it is instead sticky through coalescing (see [`merge_pending`]).
+/// A config reload is the documented release surface for
+/// `ManualRetryRequired` (section 12.2), so an origin lost to coalescing
+/// would silently keep a parked project parked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventOrigin {
+    /// An ordinary reconciler trigger: startup sweep, commit observer,
+    /// scheduler deadline, readiness edge.
+    Reconcile,
+    /// A config-reload re-drive from `apply_source_transitions_catalog`.
+    ConfigReload,
+}
+
+/// The coalesced value for one `(project_id, kind)` key.
+#[derive(Clone, Debug)]
+struct PendingEvent {
+    scope: PublishedScope,
+    origin: EventOrigin,
+}
+
+/// Insert or coalesce one pending event. The newest scope wins; a
+/// `ConfigReload` origin is sticky, so a reload re-drive that coalesces
+/// with an ordinary event still releases a `ManualRetryRequired` park.
+fn merge_pending(
+    pending: &mut BTreeMap<(String, ReconcileKind), PendingEvent>,
+    key: (String, ReconcileKind),
+    event: PendingEvent,
+) {
+    match pending.entry(key) {
+        std::collections::btree_map::Entry::Occupied(mut occupied) => {
+            let existing = occupied.get_mut();
+            existing.scope = event.scope;
+            if event.origin == EventOrigin::ConfigReload {
+                existing.origin = EventOrigin::ConfigReload;
+            }
+        }
+        std::collections::btree_map::Entry::Vacant(vacant) => {
+            vacant.insert(event);
+        }
+    }
 }
 
 /// The per-project transition guard (section 4.4). Whoever holds a
@@ -125,13 +170,13 @@ type TransitionGuardMap = std::sync::Mutex<BTreeMap<String, ()>>;
 pub(crate) struct CutbackReconciler {
     /// Coalesced event set: deduplicated by `(project_id, kind)` so
     /// repeated triggers collapse into one pass.
-    pending: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PublishedScope>>>,
+    pending: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PendingEvent>>>,
     /// Deferred events: an event whose project guard is held goes here
     /// instead of being dropped. On guard release (or the 5s timeout
     /// backstop) the deferred set is merged back into `pending` so the
     /// event fires exactly once after the in-flight transition completes
     /// (section 4.4: coalesce-or-defer, never drop).
-    deferred: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PublishedScope>>>,
+    deferred: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PendingEvent>>>,
     /// Wake signal for the background task. Notified on enqueue and on
     /// guard release.
     notify: Arc<std::sync::Condvar>,
@@ -143,7 +188,34 @@ pub(crate) struct CutbackReconciler {
     /// Scheduler shared state: the minimum deadline and associated project
     /// ids. The scheduler reads this on wake.
     scheduler_state: Arc<std::sync::Mutex<SchedulerState>>,
+    /// Daemon-local not-ready tallies, keyed by project id. A not-ready
+    /// attempt (the substrate has not finished coming up) must not burn the
+    /// durable retry budget, so its bookkeeping lives here instead of on
+    /// the persisted record: `CutbackStateV2` is
+    /// `deny_unknown_fields`-tagged and gains no fields.
+    not_ready: Arc<std::sync::Mutex<BTreeMap<String, NotReadyTally>>>,
 }
+
+/// Daemon-local liveness bookkeeping for not-ready cutback attempts.
+#[derive(Clone, Copy, Debug)]
+struct NotReadyTally {
+    /// Wall clock of the first consecutive not-ready attempt for the
+    /// project. Reset by any other outcome and by daemon restart.
+    first_unix_secs: u64,
+    /// Consecutive not-ready attempts; drives the not-ready backoff
+    /// without touching the persisted attempt count.
+    count: u32,
+}
+
+/// Liveness ceiling for not-ready cutback attempts. Not-ready failures do
+/// not increment the durable attempt count, so without a ceiling a
+/// genuinely stuck substrate would retry forever. The bound is wall-clock
+/// and daemon-local (it restarts with the process, exactly like the
+/// substrate it waits on) and is generous against the retirement
+/// re-drive cycle (8 retries plus a 60s re-drive sleep, ~181s), so a
+/// project must be not-ready across several full cycles before the
+/// ordinary retry ladder takes over and eventually parks it.
+const CUTBACK_NOT_READY_CEILING_SECS: u64 = 900;
 
 /// Scheduler state: the minimum deadline across all Transient states and
 /// the set of due projects (section 9.2).
@@ -162,7 +234,29 @@ impl CutbackReconciler {
             guards,
             scheduler_notify: Arc::new(std::sync::Condvar::new()),
             scheduler_state: Arc::new(std::sync::Mutex::new(SchedulerState::default())),
+            not_ready: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Record one consecutive not-ready attempt and return the updated
+    /// tally. The first call for a project stamps `first_unix_secs`.
+    fn note_not_ready(&self, project_id: &str, now: u64) -> NotReadyTally {
+        let mut tallies = self.not_ready.lock().unwrap();
+        let tally = tallies
+            .entry(project_id.to_string())
+            .or_insert(NotReadyTally {
+                first_unix_secs: now,
+                count: 0,
+            });
+        tally.count = tally.count.saturating_add(1);
+        *tally
+    }
+
+    /// Drop a project's not-ready tally. Called on every outcome that is
+    /// not a not-ready failure, so the ceiling measures a CONSECUTIVE
+    /// not-ready run rather than the lifetime of the project.
+    fn clear_not_ready(&self, project_id: &str) {
+        self.not_ready.lock().unwrap().remove(project_id);
     }
 
     /// Register a Transient deadline so the scheduler can re-attempt the
@@ -250,8 +344,24 @@ impl CutbackReconciler {
     /// Enqueue a transition event. Coalesces by `(project_id, kind)`: if
     /// the same event is already pending, this is a no-op (section 4.4).
     fn enqueue(&self, project_id: &str, scope: PublishedScope, kind: ReconcileKind) {
+        self.enqueue_with_origin(project_id, scope, kind, EventOrigin::Reconcile);
+    }
+
+    /// Enqueue carrying an explicit origin. Only the config-reload
+    /// re-drive uses a non-default origin (section 12.2).
+    fn enqueue_with_origin(
+        &self,
+        project_id: &str,
+        scope: PublishedScope,
+        kind: ReconcileKind,
+        origin: EventOrigin,
+    ) {
         let mut pending = self.pending.lock().unwrap();
-        pending.insert((project_id.to_string(), kind), scope);
+        merge_pending(
+            &mut pending,
+            (project_id.to_string(), kind),
+            PendingEvent { scope, origin },
+        );
         self.notify.notify_one();
     }
 
@@ -261,7 +371,14 @@ impl CutbackReconciler {
     /// backstop fires, at which point it is merged back into `pending`.
     fn defer(&self, event: ReconcileEvent) {
         let mut deferred = self.deferred.lock().unwrap();
-        deferred.insert((event.project_id, event.kind), event.scope);
+        merge_pending(
+            &mut deferred,
+            (event.project_id, event.kind),
+            PendingEvent {
+                scope: event.scope,
+                origin: event.origin,
+            },
+        );
     }
 
     /// Merge deferred events back into pending. Called by the background
@@ -274,8 +391,8 @@ impl CutbackReconciler {
         }
         let mut pending = self.pending.lock().unwrap();
         let count = deferred.len();
-        for (key, scope) in deferred.iter() {
-            pending.entry(key.clone()).or_insert_with(|| scope.clone());
+        for (key, event) in deferred.iter() {
+            merge_pending(&mut pending, key.clone(), event.clone());
         }
         deferred.clear();
         count
@@ -286,10 +403,11 @@ impl CutbackReconciler {
         let mut pending = self.pending.lock().unwrap();
         let entries = pending
             .iter()
-            .map(|((project_id, kind), scope)| ReconcileEvent {
+            .map(|((project_id, kind), event)| ReconcileEvent {
                 project_id: project_id.clone(),
-                scope: scope.clone(),
+                scope: event.scope.clone(),
                 kind: kind.clone(),
+                origin: event.origin,
             })
             .collect::<Vec<_>>();
         pending.clear();
@@ -581,6 +699,21 @@ impl CodeSourceRuntime {
     fn enqueue_transition(&self, project_id: &str, scope: PublishedScope, kind: ReconcileKind) {
         if let Some(reconciler) = &self.reconciler {
             reconciler.enqueue(project_id, scope, kind);
+        }
+    }
+
+    /// Enqueue a config-reload re-drive. Reload is the release surface for
+    /// a `ManualRetryRequired` park (section 12.2), so these events carry
+    /// `EventOrigin::ConfigReload` and the reducer treats them differently
+    /// from ordinary triggers.
+    fn enqueue_reload_transition(
+        &self,
+        project_id: &str,
+        scope: PublishedScope,
+        kind: ReconcileKind,
+    ) {
+        if let Some(reconciler) = &self.reconciler {
+            reconciler.enqueue_with_origin(project_id, scope, kind, EventOrigin::ConfigReload);
         }
     }
 
@@ -1425,14 +1558,18 @@ pub(crate) fn apply_source_transitions(state: Arc<SharedState>, transitions: Sou
 /// 8.1 item 3, governing section 12.2).
 fn apply_source_transitions_catalog(state: Arc<SharedState>, transitions: SourceTransitions) {
     for (scope, project_id) in &transitions.cutbacks {
-        state
-            .code_sources
-            .enqueue_transition(project_id, scope.clone(), ReconcileKind::Cutback);
+        state.code_sources.enqueue_reload_transition(
+            project_id,
+            scope.clone(),
+            ReconcileKind::Cutback,
+        );
     }
     for (scope, project_id) in &transitions.activations {
-        state
-            .code_sources
-            .enqueue_transition(project_id, scope.clone(), ReconcileKind::Activate);
+        state.code_sources.enqueue_reload_transition(
+            project_id,
+            scope.clone(),
+            ReconcileKind::Activate,
+        );
     }
     // Config-event re-entry feed (section 8.1 item 3): every project with a
     // non-None persisted cutback state is re-enqueued so the reconciler
@@ -1445,7 +1582,7 @@ fn apply_source_transitions_catalog(state: Arc<SharedState>, transitions: Source
             for record in records {
                 if record.cutback().is_some() {
                     if let Some(scope) = record.published_scope().cloned() {
-                        state.code_sources.enqueue_transition(
+                        state.code_sources.enqueue_reload_transition(
                             record.project_id(),
                             scope,
                             ReconcileKind::Cutback,
@@ -1641,12 +1778,13 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                         );
                     }
 
-                    let mut action = evaluate_reduction(
+                    let mut action = evaluate_reduction_with_origin(
                         desired,
                         effective,
                         persisted.as_ref(),
                         ladder,
                         bridge_open,
+                        event.origin,
                     );
                     action = gate_transient_deadline(action, persisted.as_ref(), unix_now());
 
@@ -1715,6 +1853,46 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                             );
                         }
                         ReducerAction::AttemptCutback | ReducerAction::ReattemptCutback => {
+                            schedule_cutback_catalog(
+                                state_for_task.clone(),
+                                scope,
+                                project_id,
+                                Some(guard),
+                            );
+                        }
+                        ReducerAction::ReleaseManualRetry { error_class } => {
+                            // Reset the durable park to a fresh Transient
+                            // due now, then re-attempt in the same pass.
+                            // The one-attempt driver reads the attempt
+                            // count off this record, so the reset IS the
+                            // budget release.
+                            let released = CutbackStateV2::Transient {
+                                attempt: 1,
+                                error_class,
+                                deadline_unix_secs: unix_now(),
+                            };
+                            if let Err(error) = store.mark_cutback_state(&project_id, released) {
+                                tracing::warn!(
+                                    project_id = %project_id,
+                                    %error,
+                                    "reducer: releasing manual-retry park failed"
+                                );
+                                continue;
+                            }
+                            if let Err(error) = store
+                                .clear_health_failure(&project_id, "cutback_manual_retry_required")
+                            {
+                                tracing::warn!(
+                                    project_id = %project_id,
+                                    %error,
+                                    "reducer: clearing manual-retry health failed"
+                                );
+                            }
+                            tracing::info!(
+                                project_id = %project_id,
+                                ?error_class,
+                                "reducer: config reload released manual-retry park"
+                            );
                             schedule_cutback_catalog(
                                 state_for_task.clone(),
                                 scope,
@@ -2693,6 +2871,10 @@ enum ReducerAction {
     PersistStructural(CutbackReason),
     /// Re-attempt the cutback (attachment now available or scheduler due).
     ReattemptCutback,
+    /// Release a `ManualRetryRequired` park: reset the durable state to a
+    /// fresh `Transient` (attempt 1, due now) and re-attempt. Only a
+    /// config-reload re-drive produces this action (section 12.2).
+    ReleaseManualRetry { error_class: CutbackErrorClass },
     /// Hand off to retirement (P4-G).
     Retire,
 }
@@ -4004,13 +4186,37 @@ fn determine_desired_assignment(state: &Arc<SharedState>, project_id: &str) -> D
 /// the reducer clears any pre-existing Structural cutback state on the
 /// project, sets health to `scope_migration_refresh_required`, and
 /// performs no cutback attempt.
-#[allow(clippy::too_many_arguments)]
+///
+/// The `origin`-free wrapper evaluates the table for an ordinary
+/// reconciler trigger; [`evaluate_reduction_with_origin`] carries the
+/// event origin, which only the `ManualRetryRequired` cell consults.
 fn evaluate_reduction(
     desired: DesiredAssignment,
     effective: EffectiveSource,
     persisted: Option<&CutbackStateV2>,
     ladder: LadderResult,
     bridge_open: bool,
+) -> ReducerAction {
+    evaluate_reduction_with_origin(
+        desired,
+        effective,
+        persisted,
+        ladder,
+        bridge_open,
+        EventOrigin::Reconcile,
+    )
+}
+
+/// Evaluate the reduction table for an event with a known origin
+/// (section 9.3, section 12.2).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_reduction_with_origin(
+    desired: DesiredAssignment,
+    effective: EffectiveSource,
+    persisted: Option<&CutbackStateV2>,
+    ladder: LadderResult,
+    bridge_open: bool,
+    origin: EventOrigin,
 ) -> ReducerAction {
     // Open-bridge predicate: bridge-exempt project. Clear any
     // pre-existing Structural state and perform no cutback attempt
@@ -4095,10 +4301,21 @@ fn evaluate_reduction(
                     let _ = attempt;
                     ReducerAction::ReattemptCutback
                 }
-                Some(CutbackStateV2::ManualRetryRequired { .. }) => {
-                    // Steady-state no-op (explicit retry only).
-                    // Config-event re-entry: a config reload re-evaluates.
-                    ReducerAction::NoOp
+                Some(CutbackStateV2::ManualRetryRequired { error_class, .. }) => {
+                    // Steady-state no-op for ordinary triggers (explicit
+                    // retry only). A config reload IS the explicit retry
+                    // surface (section 12.2), so a reload-originated event
+                    // releases the park when the ladder still selects a
+                    // local attachment. Without a selected attachment a
+                    // reattempt could only reclassify structurally, so the
+                    // park is preserved and stays operator-visible.
+                    if origin == EventOrigin::ConfigReload && ladder == LadderResult::Selected {
+                        ReducerAction::ReleaseManualRetry {
+                            error_class: *error_class,
+                        }
+                    } else {
+                        ReducerAction::NoOp
+                    }
                 }
                 Some(CutbackStateV2::Terminal { .. }) => {
                     // Steady-state no-op (terminal, never auto-retry).
@@ -4158,7 +4375,7 @@ fn attempt_cutback_catalog(
     drop(lease);
     match cutback_to_local_single_attempt(state, scope, project_id, &identity) {
         Ok(()) => Ok(CutbackAttemptOutcome::Success),
-        Err(error) => Ok(classify_staging_error(&error, state)),
+        Err(error) => Ok(classify_staging_error(&error, project_id)),
     }
 }
 
@@ -4173,8 +4390,45 @@ enum CutbackAttemptOutcome {
     /// Transient failure: persist attempt+1, deadline, error class.
     /// After the configured cap: ManualRetryRequired.
     Transient(CutbackErrorClass),
+    /// The substrate has not finished coming up (a queued selector
+    /// retirement still blocks staging, or the vector store is still
+    /// warming). Persists a `Transient` state exactly like
+    /// [`Self::Transient`] but WITHOUT incrementing the attempt count:
+    /// waiting on startup is not a failed attempt, and the readiness edges
+    /// re-drive the project as soon as the wait ends. Bounded by
+    /// [`CUTBACK_NOT_READY_CEILING_SECS`] so a stuck substrate still
+    /// escalates through the ordinary ladder.
+    NotReady(CutbackErrorClass),
     /// Terminal failure (validation/security): GC root, never auto-retry.
     Terminal(CutbackErrorClass),
+}
+
+/// Marker on the staging bail raised when a queued selector retirement
+/// still owns the staging epoch. Matched by [`classify_staging_error`] to
+/// keep a not-ready wait off the durable retry budget, so the two must
+/// change together.
+const CUTBACK_RETIREMENT_QUEUED_MARKER: &str = "error.cutback_selector_retirement_queued";
+
+/// True when any link of the chain is the writer actor's
+/// vector-store-warming refusal.
+fn vector_store_warming(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<bbox_indexing::index::writer_actor::IndexWriterRetryableError>(),
+            Some(bbox_indexing::index::writer_actor::IndexWriterRetryableError::VectorStoreWarming)
+        )
+    })
+}
+
+/// True when ANY link of the error chain renders with `needle`.
+///
+/// `anyhow::Error::to_string` renders only the OUTERMOST message, so a
+/// substring check against it misses a marker that any `.context()` has
+/// wrapped. Terminal classes must never be demoted to transient that way.
+fn error_chain_contains(error: &anyhow::Error, needle: &str) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(needle))
 }
 
 /// Classify a checkout access error into a structural cutback reason
@@ -4214,10 +4468,31 @@ fn classify_checkout_error(error: &CheckoutAccessError) -> CutbackAttemptOutcome
 
 /// Classify a staging error into a transient or terminal cutback class
 /// (section 9.1 step c-d).
-fn classify_staging_error(
-    error: &anyhow::Error,
-    state: &Arc<SharedState>,
-) -> CutbackAttemptOutcome {
+fn classify_staging_error(error: &anyhow::Error, project_id: &str) -> CutbackAttemptOutcome {
+    // Terminality is classified BEFORE the transient classes: a validation
+    // or security refusal wrapped in writer/IO context is still terminal.
+    // ValidationFailure: scope agreement or coherence check.
+    if error_chain_contains(error, "code_source_scope_agreement")
+        || error_chain_contains(error, "code_source_cutback_coherence")
+    {
+        return CutbackAttemptOutcome::Terminal(CutbackErrorClass::ValidationFailure);
+    }
+    // SecurityFailure: any security-context error. The explicit marker is
+    // matched across the chain; the bare word stays on the outermost
+    // message only, because a Terminal class never auto-retries and a
+    // chain-wide bare-word match would promote any incidental mention
+    // (a path component, a wrapped library message) to unrecoverable.
+    if error.to_string().contains("security") || error_chain_contains(error, "SecurityFailure") {
+        return CutbackAttemptOutcome::Terminal(CutbackErrorClass::SecurityFailure);
+    }
+    // NotReady: the substrate has not finished coming up. Neither shape is
+    // a failed attempt, so neither may burn the durable retry budget; the
+    // readiness edges (retirement discharge, vector warmup) re-drive the
+    // project the moment the wait ends.
+    if error_chain_contains(error, CUTBACK_RETIREMENT_QUEUED_MARKER) || vector_store_warming(error)
+    {
+        return CutbackAttemptOutcome::NotReady(CutbackErrorClass::WriterContention);
+    }
     // WriterContention: the index writer pass is in progress.
     if writer_pass_in_progress(error) {
         return CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention);
@@ -4229,18 +4504,14 @@ fn classify_staging_error(
     {
         return CutbackAttemptOutcome::Transient(CutbackErrorClass::IoPressure);
     }
-    // ValidationFailure: scope agreement or coherence check.
-    if error.to_string().contains("code_source_scope_agreement")
-        || error.to_string().contains("code_source_cutback_coherence")
-    {
-        return CutbackAttemptOutcome::Terminal(CutbackErrorClass::ValidationFailure);
-    }
-    // SecurityFailure: any security-context error.
-    if error.to_string().contains("security") || error.to_string().contains("SecurityFailure") {
-        return CutbackAttemptOutcome::Terminal(CutbackErrorClass::SecurityFailure);
-    }
-    // Default: treat as IndexCommit (transient).
-    let _ = state;
+    // Default: treat as IndexCommit (transient). An unclassified staging
+    // error is a classifier gap, so it is logged with the full chain
+    // rather than silently absorbed by the catch-all.
+    tracing::warn!(
+        project_id,
+        error = format!("{error:#}"),
+        "catalog cutback: unclassified staging error defaulted to IndexCommit"
+    );
     CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit)
 }
 
@@ -4324,7 +4595,11 @@ fn cutback_to_local_single_attempt(
     ) {
         Ok(staged) => staged,
         Err(error) if writer_pass_in_progress(&error) => {
-            return Err(anyhow!("error.cutback_writer_contention: {error}"));
+            // Context, never a fresh error: the classifier downcasts
+            // through the chain, so re-raising by message would erase the
+            // typed `IndexWriterRetryableError` and make WriterContention
+            // unreachable.
+            return Err(error).context("error.cutback_writer_contention");
         }
         Err(error) => return Err(error),
     };
@@ -4416,6 +4691,154 @@ fn cutback_to_local_single_attempt(
     Ok(())
 }
 
+/// The durable state a transient-class attempt outcome persists
+/// (section 9.1 step d). Pure so the retry-ladder edges are testable
+/// without a daemon: the caller only records health and registers the
+/// deadline from what this returns.
+///
+/// `not_ready_run` is `Some(consecutive_not_ready_attempts)` when the
+/// attempt failed because the substrate has not finished coming up AND the
+/// liveness ceiling has not expired. That run does NOT increment the
+/// durable attempt count — it only recomputes the deadline off its own
+/// daemon-local counter — so waiting on startup can never park a project
+/// in `ManualRetryRequired`.
+fn next_transient_cutback_state(
+    prev_attempt: u32,
+    class: CutbackErrorClass,
+    not_ready_run: Option<u32>,
+    max_attempts: u32,
+    project_id: &str,
+    base_secs: u64,
+    max_secs: u64,
+) -> CutbackStateV2 {
+    if let Some(run) = not_ready_run {
+        return CutbackStateV2::Transient {
+            // `Transient` refuses attempt 0, so a first not-ready attempt
+            // records 1 and every later one holds there.
+            attempt: prev_attempt.max(1),
+            error_class: class,
+            deadline_unix_secs: compute_retry_deadline(run.max(1), project_id, base_secs, max_secs),
+        };
+    }
+    let next_attempt = prev_attempt.saturating_add(1);
+    if next_attempt > max_attempts {
+        return CutbackStateV2::ManualRetryRequired {
+            error_class: class,
+            // `ManualRetryRequired` refuses attempt 0, which a budget of 0
+            // would otherwise produce.
+            attempt: prev_attempt.max(1),
+        };
+    }
+    CutbackStateV2::Transient {
+        attempt: next_attempt,
+        error_class: class,
+        deadline_unix_secs: compute_retry_deadline(next_attempt, project_id, base_secs, max_secs),
+    }
+}
+
+/// Persist the retry state for a transient-class or not-ready attempt
+/// outcome, then record health / register the deadline from what was
+/// persisted (section 9.1 step d, section 9.2).
+#[allow(clippy::too_many_arguments)]
+fn persist_cutback_retry_outcome(
+    state: &Arc<SharedState>,
+    store: &Arc<CodeSourceStore>,
+    project_id: &str,
+    class: CutbackErrorClass,
+    is_not_ready: bool,
+    max_attempts: u32,
+    base_secs: u64,
+    max_secs: u64,
+) {
+    let prev_attempt = match store
+        .load_activation_mixed(project_id)
+        .ok()
+        .flatten()
+        .and_then(|record| record.cutback().cloned())
+    {
+        Some(CutbackStateV2::Transient { attempt, .. }) => attempt,
+        _ => 0,
+    };
+    // A not-ready wait holds the durable attempt count and backs off on
+    // its own daemon-local counter, until the liveness ceiling expires and
+    // the ordinary ladder takes over (which can then park the project).
+    let not_ready_run = match (is_not_ready, state.code_sources.reconciler()) {
+        (true, Some(reconciler)) => {
+            let now = unix_now();
+            let tally = reconciler.note_not_ready(project_id, now);
+            if now.saturating_sub(tally.first_unix_secs) >= CUTBACK_NOT_READY_CEILING_SECS {
+                tracing::warn!(
+                    project_id,
+                    waited_secs = now.saturating_sub(tally.first_unix_secs),
+                    attempts = tally.count,
+                    "catalog cutback: not-ready liveness ceiling reached, escalating to \
+                     the ordinary retry ladder"
+                );
+                reconciler.clear_not_ready(project_id);
+                None
+            } else {
+                Some(tally.count)
+            }
+        }
+        // Without a reconciler there is no readiness edge to re-drive the
+        // project, so a not-ready outcome stays on the ordinary ladder.
+        (true, None) => None,
+        (false, _) => None,
+    };
+    let persisted = next_transient_cutback_state(
+        prev_attempt,
+        class,
+        not_ready_run,
+        max_attempts,
+        project_id,
+        base_secs,
+        max_secs,
+    );
+    if let Err(error) = store.mark_cutback_state(project_id, persisted.clone()) {
+        tracing::warn!(project_id, %error, "persisting cutback retry state failed");
+    }
+    match &persisted {
+        CutbackStateV2::ManualRetryRequired { .. } => {
+            let _ = store.record_health_failure(
+                project_id,
+                "cutback_manual_retry_required",
+                "cutback exhausted retry budget; config reload required",
+            );
+            tracing::warn!(
+                project_id,
+                ?class,
+                "catalog cutback: retry budget exhausted, ManualRetryRequired persisted"
+            );
+        }
+        CutbackStateV2::Transient {
+            attempt,
+            deadline_unix_secs,
+            ..
+        } => {
+            // Signal the bounded scheduler so it re-attempts when the
+            // deadline arrives (section 9.2).
+            if let Some(reconciler) = state.code_sources.reconciler() {
+                reconciler.register_transient(*deadline_unix_secs, project_id);
+            }
+            tracing::info!(
+                project_id,
+                ?class,
+                attempt,
+                deadline = deadline_unix_secs,
+                not_ready = is_not_ready,
+                "catalog cutback: retry deadline persisted"
+            );
+        }
+        other => {
+            tracing::warn!(
+                project_id,
+                ?other,
+                "catalog cutback: unexpected retry state shape"
+            );
+        }
+    }
+}
+
 /// Catalog-mode schedule_cutback: one attempt, persist outcome, return
 /// (section 9.1). No loop, no sleep. The caller (reconciler) holds the
 /// transition guard.
@@ -4436,6 +4859,15 @@ fn schedule_cutback_catalog(
         let config = state.config.read();
         let cc = &config.code_collection;
 
+        // The not-ready ceiling measures a CONSECUTIVE run, so every
+        // outcome other than NotReady drops the tally (the NotReady arm
+        // manages its own).
+        if !matches!(outcome, Ok(CutbackAttemptOutcome::NotReady(_))) {
+            if let Some(reconciler) = state.code_sources.reconciler() {
+                reconciler.clear_not_ready(pid);
+            }
+        }
+
         match outcome {
             Ok(CutbackAttemptOutcome::Success) => {
                 if let Err(error) = store.clear_cutback_state(pid) {
@@ -4454,64 +4886,26 @@ fn schedule_cutback_catalog(
                     "catalog cutback: structural reason persisted, worker returns"
                 );
             }
-            Ok(CutbackAttemptOutcome::Transient(class)) => {
-                let now_state = store
-                    .load_activation_mixed(pid)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.cutback().cloned());
-                let prev_attempt = match &now_state {
-                    Some(CutbackStateV2::Transient { attempt, .. }) => *attempt,
-                    _ => 0,
-                };
-                let next_attempt = prev_attempt + 1;
-                if next_attempt > cc.cutback_max_attempts {
-                    let mr = CutbackStateV2::ManualRetryRequired {
-                        error_class: class,
-                        attempt: prev_attempt,
-                    };
-                    if let Err(error) = store.mark_cutback_state(pid, mr) {
-                        tracing::warn!(project_id = pid, %error, "persisting ManualRetryRequired failed");
-                    }
-                    let _ = store.record_health_failure(
-                        pid,
-                        "cutback_manual_retry_required",
-                        "cutback exhausted retry budget; config reload required",
-                    );
-                    tracing::warn!(
-                        project_id = pid,
-                        ?class,
-                        "catalog cutback: retry budget exhausted, ManualRetryRequired persisted"
-                    );
-                } else {
-                    let deadline = compute_retry_deadline(
-                        next_attempt,
-                        pid,
-                        cc.cutback_retry_base_secs,
-                        cc.cutback_retry_max_secs,
-                    );
-                    let t = CutbackStateV2::Transient {
-                        attempt: next_attempt,
-                        error_class: class,
-                        deadline_unix_secs: deadline,
-                    };
-                    if let Err(error) = store.mark_cutback_state(pid, t) {
-                        tracing::warn!(project_id = pid, %error, "persisting Transient cutback state failed");
-                    }
-                    // Signal the bounded scheduler so it re-attempts when
-                    // the deadline arrives (section 9.2).
-                    if let Some(reconciler) = state.code_sources.reconciler() {
-                        reconciler.register_transient(deadline, pid);
-                    }
-                    tracing::info!(
-                        project_id = pid,
-                        ?class,
-                        attempt = next_attempt,
-                        deadline,
-                        "catalog cutback: transient failure, deadline persisted"
-                    );
-                }
-            }
+            Ok(CutbackAttemptOutcome::Transient(class)) => persist_cutback_retry_outcome(
+                &state,
+                &store,
+                pid,
+                class,
+                false,
+                cc.cutback_max_attempts,
+                cc.cutback_retry_base_secs,
+                cc.cutback_retry_max_secs,
+            ),
+            Ok(CutbackAttemptOutcome::NotReady(class)) => persist_cutback_retry_outcome(
+                &state,
+                &store,
+                pid,
+                class,
+                true,
+                cc.cutback_max_attempts,
+                cc.cutback_retry_base_secs,
+                cc.cutback_retry_max_secs,
+            ),
             Ok(CutbackAttemptOutcome::Terminal(class)) => {
                 let t = CutbackStateV2::Terminal { error_class: class };
                 if let Err(error) = store.mark_cutback_state(pid, t.clone()) {
@@ -5115,6 +5509,95 @@ fn activate_desired_loop(
     }
 }
 
+/// Readiness edge: re-drive one project's cutback right now.
+///
+/// Enqueueing alone is not enough. The reducer gates `ReattemptCutback`
+/// behind the persisted deadline (`gate_transient_deadline`), so a project
+/// parked on a backoff deadline minutes out would evaluate to NoOp and the
+/// edge would be lost. The deadline is therefore pulled forward to now —
+/// attempt count and error class untouched, since waiting on the substrate
+/// was never a failed attempt — the scheduler is notified, and the event is
+/// enqueued. Reconciler events coalesce by `(project_id, kind)`, so firing
+/// this edge repeatedly is idempotent.
+fn redrive_cutback_now(sources: &CodeSourceRuntime, project_id: &str, reason: &'static str) {
+    if !sources.is_catalog() {
+        return;
+    }
+    let store = sources.store();
+    let record = match store.load_activation_mixed(project_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                %error,
+                "cutback readiness edge: activation load failed"
+            );
+            return;
+        }
+    };
+    let Some(scope) = record.published_scope().cloned() else {
+        return;
+    };
+    if let Some(CutbackStateV2::Transient {
+        attempt,
+        error_class,
+        deadline_unix_secs,
+    }) = record.cutback()
+    {
+        let now = unix_now();
+        if *deadline_unix_secs > now {
+            let pulled = CutbackStateV2::Transient {
+                attempt: *attempt,
+                error_class: *error_class,
+                deadline_unix_secs: now,
+            };
+            if let Err(error) = store.mark_cutback_state(project_id, pulled) {
+                tracing::warn!(
+                    project_id,
+                    %error,
+                    "cutback readiness edge: pulling the retry deadline forward failed"
+                );
+                return;
+            }
+            if let Some(reconciler) = sources.reconciler() {
+                reconciler.register_transient(now, project_id);
+            }
+        }
+    }
+    sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+    tracing::debug!(
+        project_id,
+        reason,
+        "cutback readiness edge re-drove project"
+    );
+}
+
+/// Readiness edge for a daemon-wide condition: re-drive every project
+/// whose activation record holds a `Transient` cutback state.
+pub(crate) fn redrive_transient_cutbacks(sources: &CodeSourceRuntime, reason: &'static str) {
+    if !sources.is_catalog() {
+        return;
+    }
+    let store = sources.store();
+    let records = match store.activation_records_mixed() {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                reason,
+                "cutback readiness edge: loading activation records failed"
+            );
+            return;
+        }
+    };
+    for record in records {
+        if matches!(record.cutback(), Some(CutbackStateV2::Transient { .. })) {
+            redrive_cutback_now(sources, record.project_id(), reason);
+        }
+    }
+}
+
 fn writer_pass_in_progress(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
@@ -5205,8 +5688,31 @@ fn enqueue_unactivated_retirement(
 fn ensure_selector_staging_available(store: &CodeSourceStore, selector: &str) -> Result<()> {
     // The per-project activation lane is the sole runtime enqueuer for its
     // selectors. A durable queue row therefore separates two staging epochs.
+    //
+    // The bail carries a stable marker because the cutback classifier must
+    // recognise it as a not-ready wait rather than a failed attempt; see
+    // `classify_staging_error`.
+    //
+    // KNOWN GAP (orphaned retirement rows, needs design judgment, not fixed
+    // here): nothing discharges a queue row whose selector is observed
+    // ACTIVE. `spawn_retirement` returns early in exactly that case (both
+    // the pre-loop manifest read and the in-loop re-read), leaving the row
+    // behind, and the startup sweep re-drives the same row into the same
+    // early return every boot. Because `local:<project_id>` is a STABLE
+    // name reused by every cutback, a row enqueued for it by a collected
+    // activation that then rolls back blocks every later cutback of that
+    // project forever. Discharging the row on an active-selector
+    // observation is NOT obviously safe: the row is the durable evidence
+    // that a previous staging epoch's documents were never swept, which is
+    // precisely what this gate exists to enforce. A second, narrower shape:
+    // `CodeSourceStore::complete_retirement` hard-fails when the row names
+    // a generation that no longer resolves, so such a row can never be
+    // discharged either (that shape only affects `collected:` selectors,
+    // since local rows carry no generation id).
     if store.retirement_pending(selector)? {
-        bail!("code-source selector retirement remains queued before staging");
+        bail!(
+            "{CUTBACK_RETIREMENT_QUEUED_MARKER}: selector retirement remains queued before staging"
+        );
     }
     Ok(())
 }
@@ -5423,6 +5929,19 @@ fn spawn_retirement(
                         let _ = store.clear_health_failure(
                             &record.project_id,
                             "retirement_failed",
+                        );
+                        // Readiness edge (F-CUTBACK-RACE): discharging the
+                        // queue row is the exact event that unblocks
+                        // `ensure_selector_staging_available`. Without this
+                        // re-drive the waiting cutback only learns about it
+                        // on its next backoff deadline, and that ladder is
+                        // shorter than a retirement retry cycle, so the
+                        // cutback exhausts its budget while the retirement
+                        // it is waiting for is still making progress.
+                        redrive_cutback_now(
+                            &state.code_sources,
+                            &record.project_id,
+                            "selector retirement discharged",
                         );
                         drop(retired);
                         return;
@@ -8845,6 +9364,403 @@ mod tests {
             matches!(action, ReducerAction::NoOp),
             "ManualRetryRequired must be steady-state NoOp"
         );
+    }
+
+    // F-CUTBACK-RACE / F-CLASS-CATCHALL: retry-budget edges, not-ready
+    // classification, chain-walking terminality, and the readiness edges.
+
+    /// The budget transition itself: one attempt past the cap persists
+    /// `ManualRetryRequired`, and everything below the cap persists a
+    /// `Transient` with the attempt incremented.
+    #[test]
+    fn p4e_retry_budget_exhaustion_persists_manual_retry() {
+        let project_id = "p_0000000000000000000000000000f001";
+        let below_cap = next_transient_cutback_state(
+            6,
+            CutbackErrorClass::IndexCommit,
+            None,
+            8,
+            project_id,
+            1,
+            60,
+        );
+        match below_cap {
+            CutbackStateV2::Transient { attempt, .. } => assert_eq!(attempt, 7),
+            other => panic!("expected Transient below the cap, got {other:?}"),
+        }
+
+        let at_cap = next_transient_cutback_state(
+            8,
+            CutbackErrorClass::IndexCommit,
+            None,
+            8,
+            project_id,
+            1,
+            60,
+        );
+        match at_cap {
+            CutbackStateV2::ManualRetryRequired {
+                attempt,
+                error_class,
+            } => {
+                assert_eq!(attempt, 8, "the park records the exhausted attempt count");
+                assert_eq!(error_class, CutbackErrorClass::IndexCommit);
+            }
+            other => panic!("expected ManualRetryRequired past the cap, got {other:?}"),
+        }
+
+        // Every persisted shape must satisfy the durable invariants,
+        // including the attempt >= 1 floor a zero budget would break.
+        next_transient_cutback_state(
+            0,
+            CutbackErrorClass::IoPressure,
+            None,
+            0,
+            "p_0000000000000000000000000000f002",
+            1,
+            60,
+        )
+        .validate()
+        .expect("a zero retry budget must still persist a valid state");
+    }
+
+    /// A not-ready attempt is a wait, not a failure: it re-persists the
+    /// SAME attempt count with a fresh deadline, so the retry budget can
+    /// never be exhausted by waiting for the substrate to come up.
+    #[test]
+    fn p4e_not_ready_outcome_does_not_burn_the_attempt_budget() {
+        let project_id = "p_0000000000000000000000000000f003";
+        for run in 1..=12u32 {
+            let state = next_transient_cutback_state(
+                3,
+                CutbackErrorClass::WriterContention,
+                Some(run),
+                8,
+                project_id,
+                1,
+                60,
+            );
+            match state {
+                CutbackStateV2::Transient {
+                    attempt,
+                    deadline_unix_secs,
+                    ..
+                } => {
+                    assert_eq!(attempt, 3, "not-ready must hold the attempt count");
+                    assert!(deadline_unix_secs >= unix_now(), "deadline must be fresh");
+                }
+                other => panic!("not-ready must never park, got {other:?}"),
+            }
+        }
+
+        // A first not-ready attempt with no persisted state still records a
+        // valid Transient: attempt 0 is refused by the durable invariants.
+        let first = next_transient_cutback_state(
+            0,
+            CutbackErrorClass::WriterContention,
+            Some(1),
+            8,
+            project_id,
+            1,
+            60,
+        );
+        first
+            .validate()
+            .expect("first not-ready state must validate");
+    }
+
+    /// Both known not-ready shapes classify as `NotReady`, including when
+    /// wrapped in context by the staging path.
+    #[test]
+    fn p4e_not_ready_shapes_classify_as_not_ready() {
+        use bbox_indexing::index::writer_actor::IndexWriterRetryableError;
+
+        let queued = anyhow!("{CUTBACK_RETIREMENT_QUEUED_MARKER}: still queued")
+            .context("staging local generation");
+        match classify_staging_error(&queued, "p_0000000000000000000000000000f004") {
+            CutbackAttemptOutcome::NotReady(_) => {}
+            other => panic!("queued retirement must classify NotReady, got {other:?}"),
+        }
+
+        let warming = anyhow::Error::new(IndexWriterRetryableError::VectorStoreWarming)
+            .context("retiring previous selector")
+            .context("cutback to local");
+        match classify_staging_error(&warming, "p_0000000000000000000000000000f004") {
+            CutbackAttemptOutcome::NotReady(_) => {}
+            other => panic!("vector-store warming must classify NotReady, got {other:?}"),
+        }
+    }
+
+    /// Terminality inversion pin: a validation refusal wrapped by any
+    /// `.context()` still classifies Terminal. Before the chain walk it
+    /// was demoted to the transient IndexCommit catch-all, which retried
+    /// an unrecoverable failure until the budget parked the project.
+    #[test]
+    fn p4e_context_wrapped_validation_error_classifies_terminal() {
+        let wrapped = anyhow!("error.code_source_scope_agreement: scope disagrees")
+            .context("staging local generation")
+            .context("catalog cutback attempt");
+        match classify_staging_error(&wrapped, "p_0000000000000000000000000000f005") {
+            CutbackAttemptOutcome::Terminal(CutbackErrorClass::ValidationFailure) => {}
+            other => panic!("expected Terminal(ValidationFailure), got {other:?}"),
+        }
+
+        let coherence = anyhow!("error.code_source_cutback_coherence: mirror disagrees")
+            .context("staging local generation");
+        match classify_staging_error(&coherence, "p_0000000000000000000000000000f005") {
+            CutbackAttemptOutcome::Terminal(CutbackErrorClass::ValidationFailure) => {}
+            other => panic!("expected Terminal(ValidationFailure), got {other:?}"),
+        }
+    }
+
+    /// WriterContention reachability: the staging path re-raises writer
+    /// contention through `.context`, so the typed error survives in the
+    /// chain and the downcast still matches.
+    #[test]
+    fn p4e_context_wrapped_writer_contention_classifies_writer_contention() {
+        use bbox_indexing::index::writer_actor::IndexWriterRetryableError;
+
+        let wrapped = anyhow::Error::new(IndexWriterRetryableError::ReindexPassInProgress)
+            .context("error.cutback_writer_contention");
+        match classify_staging_error(&wrapped, "p_0000000000000000000000000000f006") {
+            CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention) => {}
+            other => panic!("expected Transient(WriterContention), got {other:?}"),
+        }
+    }
+
+    /// An unclassified staging error still defaults to the transient
+    /// IndexCommit class (the catch-all is now logged, not removed).
+    #[test]
+    fn p4e_unclassified_staging_error_defaults_to_index_commit() {
+        let unknown = anyhow!("something nobody classified");
+        match classify_staging_error(&unknown, "p_0000000000000000000000000000f007") {
+            CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit) => {}
+            other => panic!("expected Transient(IndexCommit), got {other:?}"),
+        }
+    }
+
+    /// Config reload is the documented release surface for a
+    /// `ManualRetryRequired` park: a reload-originated event releases it,
+    /// an ordinary reconciler event still no-ops, and a reload without a
+    /// selected attachment keeps the park operator-visible.
+    #[test]
+    fn p4e_config_reload_releases_manual_retry_park() {
+        let parked = CutbackStateV2::ManualRetryRequired {
+            error_class: CutbackErrorClass::WriterContention,
+            attempt: 8,
+        };
+
+        let released = evaluate_reduction_with_origin(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&parked),
+            LadderResult::Selected,
+            false,
+            EventOrigin::ConfigReload,
+        );
+        match released {
+            ReducerAction::ReleaseManualRetry { error_class } => {
+                assert_eq!(error_class, CutbackErrorClass::WriterContention);
+            }
+            other => panic!("config reload must release the park, got {other:?}"),
+        }
+
+        let ordinary = evaluate_reduction_with_origin(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&parked),
+            LadderResult::Selected,
+            false,
+            EventOrigin::Reconcile,
+        );
+        assert!(
+            matches!(ordinary, ReducerAction::NoOp),
+            "an ordinary event must not release the park"
+        );
+
+        let no_attachment = evaluate_reduction_with_origin(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&parked),
+            LadderResult::None,
+            false,
+            EventOrigin::ConfigReload,
+        );
+        assert!(
+            matches!(no_attachment, ReducerAction::NoOp),
+            "a reload without a selected attachment must keep the park"
+        );
+    }
+
+    /// A `ConfigReload` origin survives coalescing with an ordinary event,
+    /// in both enqueue orders. Losing it would silently re-park a project
+    /// the operator just released.
+    #[test]
+    fn p4e_reload_origin_survives_coalescing() {
+        let scope = PublishedScope::try_new("p4e-coalesce", ".").unwrap();
+        for reload_first in [true, false] {
+            let guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
+            let reconciler = CutbackReconciler::new(guards);
+            if reload_first {
+                reconciler.enqueue_with_origin(
+                    "proj-c",
+                    scope.clone(),
+                    ReconcileKind::Cutback,
+                    EventOrigin::ConfigReload,
+                );
+                reconciler.enqueue("proj-c", scope.clone(), ReconcileKind::Cutback);
+            } else {
+                reconciler.enqueue("proj-c", scope.clone(), ReconcileKind::Cutback);
+                reconciler.enqueue_with_origin(
+                    "proj-c",
+                    scope.clone(),
+                    ReconcileKind::Cutback,
+                    EventOrigin::ConfigReload,
+                );
+            }
+            let drained = reconciler.drain();
+            assert_eq!(drained.len(), 1, "events must coalesce by (project, kind)");
+            assert_eq!(
+                drained[0].origin,
+                EventOrigin::ConfigReload,
+                "the reload origin must be sticky (reload_first={reload_first})"
+            );
+        }
+    }
+
+    /// The readiness edge: discharging what a cutback waits on enqueues a
+    /// Cutback event AND pulls the persisted retry deadline forward, since
+    /// the reducer otherwise gates the re-attempt behind that deadline.
+    #[test]
+    fn p4e_readiness_edge_enqueues_and_pulls_deadline_forward() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let store_root = root.join("code-sources");
+
+        let scope = PublishedScope::try_new("p4e-readiness", ".").unwrap();
+        let project_id = "p_0000000000000000000000000000f008";
+        let generation_id = compute_generation_id(
+            "p4d-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+        p4d_seed_catalog_store(&store, &store_root, project_id, &scope, &generation_id);
+
+        let far_deadline = unix_now() + 3600;
+        store
+            .mark_cutback_state(
+                project_id,
+                CutbackStateV2::Transient {
+                    attempt: 4,
+                    error_class: CutbackErrorClass::WriterContention,
+                    deadline_unix_secs: far_deadline,
+                },
+            )
+            .unwrap();
+
+        redrive_cutback_now(&runtime, project_id, "test readiness edge");
+
+        let reconciler = runtime.reconciler().unwrap();
+        let drained = reconciler.drain();
+        assert_eq!(drained.len(), 1, "the edge must enqueue exactly one event");
+        assert_eq!(drained[0].project_id, project_id);
+        assert_eq!(drained[0].kind, ReconcileKind::Cutback);
+
+        let after = store
+            .load_activation_mixed(project_id)
+            .unwrap()
+            .unwrap()
+            .cutback()
+            .cloned();
+        match after {
+            Some(CutbackStateV2::Transient {
+                attempt,
+                deadline_unix_secs,
+                ..
+            }) => {
+                assert_eq!(attempt, 4, "the edge is not an attempt");
+                assert!(
+                    deadline_unix_secs < far_deadline,
+                    "the deadline must be pulled forward so the reducer does not gate"
+                );
+                assert!(
+                    matches!(
+                        gate_transient_deadline(
+                            ReducerAction::ReattemptCutback,
+                            Some(&CutbackStateV2::Transient {
+                                attempt,
+                                error_class: CutbackErrorClass::WriterContention,
+                                deadline_unix_secs,
+                            }),
+                            unix_now(),
+                        ),
+                        ReducerAction::ReattemptCutback
+                    ),
+                    "the pulled-forward deadline must survive the reducer gate"
+                );
+            }
+            other => panic!("expected a Transient state, got {other:?}"),
+        }
+
+        // Idempotent: firing the edge again coalesces into one event.
+        redrive_cutback_now(&runtime, project_id, "test readiness edge");
+        redrive_cutback_now(&runtime, project_id, "test readiness edge");
+        assert_eq!(
+            reconciler.drain().len(),
+            1,
+            "repeated edges must coalesce by (project, kind)"
+        );
+    }
+
+    /// The daemon-wide edge re-drives every project parked on a Transient
+    /// state and leaves other states alone.
+    #[test]
+    fn p4e_readiness_edge_redrives_only_transient_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let store_root = root.join("code-sources");
+
+        let scope_t = PublishedScope::try_new("p4e-warm-transient", ".").unwrap();
+        let scope_s = PublishedScope::try_new("p4e-warm-structural", ".").unwrap();
+        let proj_t = "p_0000000000000000000000000000f009";
+        let proj_s = "p_0000000000000000000000000000f00a";
+        let gen_t = compute_generation_id(
+            "p4d-producer",
+            &empty_generation_descriptor(scope_t.clone(), &"a".repeat(40)),
+        );
+        let gen_s = compute_generation_id(
+            "p4d-producer",
+            &empty_generation_descriptor(scope_s.clone(), &"a".repeat(40)),
+        );
+        p4d_seed_catalog_store(&store, &store_root, proj_t, &scope_t, &gen_t);
+        p4d_seed_catalog_store(&store, &store_root, proj_s, &scope_s, &gen_s);
+        store
+            .mark_cutback_state(
+                proj_t,
+                CutbackStateV2::Transient {
+                    attempt: 2,
+                    error_class: CutbackErrorClass::WriterContention,
+                    deadline_unix_secs: unix_now() + 600,
+                },
+            )
+            .unwrap();
+        store
+            .mark_cutback_state(
+                proj_s,
+                CutbackStateV2::Structural {
+                    reason: CutbackReason::NoLocalAttachment,
+                },
+            )
+            .unwrap();
+
+        redrive_transient_cutbacks(&runtime, "vector store warmed");
+
+        let drained = runtime.reconciler().unwrap().drain();
+        assert_eq!(drained.len(), 1, "only the Transient project re-drives");
+        assert_eq!(drained[0].project_id, proj_t);
     }
 
     #[test]
