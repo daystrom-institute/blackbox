@@ -333,10 +333,13 @@ pub(super) fn open_shared_state(
             )
         }
     };
-    let checkout_access = Arc::new(bbox_indexing::checkout_access::CheckoutAccessBroker::new(
-        access_authority,
-        checkout_access_observations.clone(),
-    ));
+    let checkout_access = Arc::new(
+        bbox_indexing::checkout_access::CheckoutAccessBroker::new_with_lifecycle_writer_wait(
+            access_authority,
+            checkout_access_observations.clone(),
+            std::time::Duration::from_millis(cfg.daemon.checkout_lifecycle_writer_wait_ms),
+        ),
+    );
     if let Some(registry) = &projects_store {
         projects_needs_persist |= backfill_project_languages(registry, &checkout_access);
     }

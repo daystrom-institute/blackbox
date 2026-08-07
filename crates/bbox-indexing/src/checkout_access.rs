@@ -14,19 +14,18 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{atomic_write_json_locked, with_store_lock};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const OBSERVATION_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 256;
-const LIFECYCLE_MUTATION_BIT: usize = 1usize << (usize::BITS - 1);
+const DEFAULT_LIFECYCLE_WRITER_WAIT: Duration = Duration::from_millis(500);
 
 /// Closed set of operations permitted to obtain checkout filesystem authority.
 #[derive(
@@ -189,7 +188,7 @@ pub trait CheckoutAccessLifetimeGuard: fmt::Debug + Send + Sync + 'static {}
 
 #[derive(Debug)]
 struct ActiveCheckoutMutation {
-    state: Arc<AtomicUsize>,
+    gate: Arc<CheckoutLifecycleGate>,
 }
 
 impl CheckoutAccessLifetimeGuard for ActiveCheckoutMutation {}
@@ -203,20 +202,47 @@ impl CheckoutAccessLifetimeGuard for CombinedCheckoutAccessLifetimeGuards {}
 
 impl Drop for ActiveCheckoutMutation {
     fn drop(&mut self) {
-        self.state.fetch_sub(1, Ordering::Release);
+        let mut state = self.gate.state.lock();
+        if state.shared_pins == 0 {
+            tracing::error!("checkout lifecycle shared-pin underflow prevented");
+            return;
+        }
+        state.shared_pins -= 1;
+        if state.shared_pins == 0 {
+            self.gate.changed.notify_all();
+        }
     }
 }
 
-/// Exclusive, fail-fast lifecycle token. Holding it prevents new write leases
-/// while a project or checkout attachment record is changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CheckoutLifecycleState {
+    shared_pins: usize,
+    pending_exclusive: bool,
+    exclusive_held: bool,
+}
+
+#[derive(Debug, Default)]
+struct CheckoutLifecycleGate {
+    state: Mutex<CheckoutLifecycleState>,
+    changed: Condvar,
+}
+
+/// Exclusive lifecycle token. A single pending claimant blocks new pins while
+/// existing filesystem mutations drain for a bounded duration.
 #[derive(Debug)]
 pub struct CheckoutLifecycleMutationGuard {
-    state: Arc<AtomicUsize>,
+    gate: Arc<CheckoutLifecycleGate>,
 }
 
 impl Drop for CheckoutLifecycleMutationGuard {
     fn drop(&mut self) {
-        self.state.store(0, Ordering::Release);
+        let mut state = self.gate.state.lock();
+        if !state.exclusive_held {
+            tracing::error!("checkout lifecycle exclusive-state underflow prevented");
+            return;
+        }
+        state.exclusive_held = false;
+        self.gate.changed.notify_all();
     }
 }
 
@@ -550,7 +576,8 @@ fn validate_relative_path(path: &Path) -> std::result::Result<&Path, CheckoutAcc
 pub struct CheckoutAccessBroker {
     authority: Arc<dyn CheckoutAccessAuthority>,
     observations: CheckoutAccessObservations,
-    lifecycle_state: Arc<AtomicUsize>,
+    lifecycle_gate: Arc<CheckoutLifecycleGate>,
+    lifecycle_writer_wait: Duration,
 }
 
 impl CheckoutAccessBroker {
@@ -558,10 +585,19 @@ impl CheckoutAccessBroker {
         authority: Arc<dyn CheckoutAccessAuthority>,
         observations: CheckoutAccessObservations,
     ) -> Self {
+        Self::new_with_lifecycle_writer_wait(authority, observations, DEFAULT_LIFECYCLE_WRITER_WAIT)
+    }
+
+    pub fn new_with_lifecycle_writer_wait(
+        authority: Arc<dyn CheckoutAccessAuthority>,
+        observations: CheckoutAccessObservations,
+        lifecycle_writer_wait: Duration,
+    ) -> Self {
         Self {
             authority,
             observations,
-            lifecycle_state: Arc::new(AtomicUsize::new(0)),
+            lifecycle_gate: Arc::new(CheckoutLifecycleGate::default()),
+            lifecycle_writer_wait,
         }
     }
 
@@ -602,54 +638,133 @@ impl CheckoutAccessBroker {
     fn acquire_mutation_pin(
         &self,
     ) -> std::result::Result<Arc<dyn CheckoutAccessLifetimeGuard>, CheckoutAccessError> {
-        loop {
-            let current = self.lifecycle_state.load(Ordering::Acquire);
-            if current & LIFECYCLE_MUTATION_BIT != 0 {
-                return Err(CheckoutAccessError::new(
-                    CheckoutAccessErrorCode::LifecycleBusy,
-                    "checkout lifecycle mutation is in progress",
-                ));
-            }
-            let active = current & !LIFECYCLE_MUTATION_BIT;
-            if active == LIFECYCLE_MUTATION_BIT - 1 {
-                return Err(CheckoutAccessError::new(
-                    CheckoutAccessErrorCode::LifecycleBusy,
-                    "checkout mutation pin capacity is exhausted",
-                ));
-            }
-            if self
-                .lifecycle_state
-                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(Arc::new(ActiveCheckoutMutation {
-                    state: self.lifecycle_state.clone(),
-                }));
-            }
+        let mut state = self.lifecycle_gate.state.lock();
+        if state.pending_exclusive || state.exclusive_held {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::LifecycleBusy,
+                "checkout lifecycle mutation is pending or in progress",
+            ));
         }
+        state.shared_pins = state.shared_pins.checked_add(1).ok_or_else(|| {
+            CheckoutAccessError::new(
+                CheckoutAccessErrorCode::LifecycleBusy,
+                "checkout mutation pin capacity is exhausted",
+            )
+        })?;
+        Ok(Arc::new(ActiveCheckoutMutation {
+            gate: self.lifecycle_gate.clone(),
+        }))
     }
 
-    /// Acquire exclusive lifecycle authority without waiting for active
-    /// filesystem mutations. Callers retry or return the typed busy result.
+    /// Acquire exclusive lifecycle authority after a bounded wait for pins
+    /// admitted before this claimant. New pins refuse once pending is set.
     pub fn lifecycle_mutation_guard(
         &self,
     ) -> std::result::Result<CheckoutLifecycleMutationGuard, CheckoutAccessError> {
-        self.lifecycle_state
-            .compare_exchange(
-                0,
-                LIFECYCLE_MUTATION_BIT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map(|_| CheckoutLifecycleMutationGuard {
-                state: self.lifecycle_state.clone(),
-            })
-            .map_err(|_| {
-                CheckoutAccessError::new(
+        self.lifecycle_mutation_guard_with_timeout(self.lifecycle_writer_wait)
+    }
+
+    fn lifecycle_mutation_guard_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<CheckoutLifecycleMutationGuard, CheckoutAccessError> {
+        let started = Instant::now();
+        let mut state = self.lifecycle_gate.state.lock();
+        if state.pending_exclusive || state.exclusive_held {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::LifecycleBusy,
+                "another checkout lifecycle mutation is pending or in progress",
+            ));
+        }
+        state.pending_exclusive = true;
+        while state.shared_pins > 0 {
+            let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                state.pending_exclusive = false;
+                self.lifecycle_gate.changed.notify_all();
+                return Err(CheckoutAccessError::new(
                     CheckoutAccessErrorCode::LifecycleBusy,
-                    "checkout filesystem mutation is in progress",
+                    "timed out waiting for checkout filesystem mutations to drain",
+                ));
+            };
+            if remaining.is_zero() {
+                state.pending_exclusive = false;
+                self.lifecycle_gate.changed.notify_all();
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::LifecycleBusy,
+                    "timed out waiting for checkout filesystem mutations to drain",
+                ));
+            }
+            self.lifecycle_gate.changed.wait_for(&mut state, remaining);
+        }
+        state.pending_exclusive = false;
+        state.exclusive_held = true;
+        Ok(CheckoutLifecycleMutationGuard {
+            gate: self.lifecycle_gate.clone(),
+        })
+    }
+
+    /// Promote a validated write lease into pending exclusive lifecycle
+    /// authority without opening a race between releasing its shared pin and
+    /// installing writer preference. Used by changed checkout registration;
+    /// exact unchanged registration never consumes the lease pin.
+    pub fn promote_write_lease_to_lifecycle_guard(
+        &self,
+        lease: &mut ValidatedCheckoutLease,
+    ) -> std::result::Result<CheckoutLifecycleMutationGuard, CheckoutAccessError> {
+        if lease.intent != CheckoutAccessIntent::Write {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::WriteIntentRequired,
+                "lifecycle promotion requires a write checkout lease",
+            ));
+        }
+        self.revalidate(lease)?;
+        let started = Instant::now();
+        let pin = {
+            let mut state = self.lifecycle_gate.state.lock();
+            if state.pending_exclusive || state.exclusive_held {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::LifecycleBusy,
+                    "another checkout lifecycle mutation is pending or in progress",
+                ));
+            }
+            let pin = lease._lifetime_guard.take().ok_or_else(|| {
+                CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::InvalidRequest,
+                    "write checkout lease is missing its lifecycle mutation pin",
                 )
-            })
+            })?;
+            state.pending_exclusive = true;
+            pin
+        };
+        // Pending is already visible, so no new shared pin can enter between
+        // releasing this lease's pin and obtaining exclusive authority.
+        drop(pin);
+
+        let mut state = self.lifecycle_gate.state.lock();
+        while state.shared_pins > 0 {
+            let Some(remaining) = self.lifecycle_writer_wait.checked_sub(started.elapsed()) else {
+                state.pending_exclusive = false;
+                self.lifecycle_gate.changed.notify_all();
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::LifecycleBusy,
+                    "timed out waiting for checkout filesystem mutations to drain",
+                ));
+            };
+            if remaining.is_zero() {
+                state.pending_exclusive = false;
+                self.lifecycle_gate.changed.notify_all();
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::LifecycleBusy,
+                    "timed out waiting for checkout filesystem mutations to drain",
+                ));
+            }
+            self.lifecycle_gate.changed.wait_for(&mut state, remaining);
+        }
+        state.pending_exclusive = false;
+        state.exclusive_held = true;
+        Ok(CheckoutLifecycleMutationGuard {
+            gate: self.lifecycle_gate.clone(),
+        })
     }
 
     fn finish_acquire(
@@ -804,17 +919,27 @@ impl CheckoutAccessBroker {
         &self,
         leases: impl IntoIterator<Item = &'a ValidatedCheckoutLease>,
     ) -> std::result::Result<CheckoutPublicationGuard, CheckoutAccessError> {
-        let pin = self.acquire_mutation_pin()?;
-        let mut count = 0usize;
-        for lease in leases {
-            self.revalidate(lease)?;
-            count += 1;
-        }
-        if count == 0 {
+        let leases = leases.into_iter().collect::<Vec<_>>();
+        if leases.is_empty() {
             return Err(CheckoutAccessError::new(
                 CheckoutAccessErrorCode::InvalidRequest,
                 "publication requires at least one checkout lease",
             ));
+        }
+        let pin = match leases
+            .iter()
+            .find(|lease| lease.intent == CheckoutAccessIntent::Write)
+        {
+            Some(write_lease) => write_lease._lifetime_guard.clone().ok_or_else(|| {
+                CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::InvalidRequest,
+                    "write checkout lease is missing its lifecycle mutation pin",
+                )
+            })?,
+            None => self.acquire_mutation_pin()?,
+        };
+        for lease in leases {
+            self.revalidate(lease)?;
         }
         Ok(CheckoutPublicationGuard { _pin: pin })
     }
@@ -1663,6 +1788,30 @@ mod tests {
         }
     }
 
+    fn broker_with_wait(
+        root: &Path,
+        kinds: impl IntoIterator<Item = CheckoutAccessKind>,
+        wait: Duration,
+    ) -> Arc<CheckoutAccessBroker> {
+        let mut authority = authority(root, CheckoutAccessKind::RepositoryMutation);
+        authority.candidate.capabilities = kinds.into_iter().collect();
+        Arc::new(CheckoutAccessBroker::new_with_lifecycle_writer_wait(
+            Arc::new(authority),
+            CheckoutAccessObservations::in_memory(),
+            wait,
+        ))
+    }
+
+    fn wait_for_pending_writer(broker: &CheckoutAccessBroker) {
+        for _ in 0..100 {
+            if broker.lifecycle_gate.state.lock().pending_exclusive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("lifecycle writer did not enter pending state");
+    }
+
     #[test]
     fn broker_returns_lease_only_after_full_validation_and_observation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1770,13 +1919,14 @@ mod tests {
     }
 
     #[test]
-    fn mutation_pin_and_lifecycle_change_exclude_each_other_without_waiting() {
+    fn mutation_pin_and_lifecycle_change_exclude_each_other_with_bounded_wait() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir(root.join("project")).unwrap();
-        let broker = CheckoutAccessBroker::new(
+        let broker = CheckoutAccessBroker::new_with_lifecycle_writer_wait(
             Arc::new(authority(&root, CheckoutAccessKind::RepositoryMutation)),
             CheckoutAccessObservations::in_memory(),
+            Duration::from_millis(5),
         );
         let mutation = broker
             .acquire(request(
@@ -1814,13 +1964,261 @@ mod tests {
     }
 
     #[test]
+    fn pending_lifecycle_writer_blocks_new_pins_then_acquires_after_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = broker_with_wait(
+            &root,
+            [CheckoutAccessKind::RepositoryMutation],
+            Duration::from_millis(250),
+        );
+        let mutation = broker
+            .acquire(request(
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_broker = broker.clone();
+        let writer = std::thread::spawn(move || {
+            let guard = writer_broker.lifecycle_mutation_guard().unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        wait_for_pending_writer(&broker);
+
+        assert_eq!(
+            broker
+                .acquire(request(
+                    CheckoutAccessKind::RepositoryMutation,
+                    CheckoutAccessIntent::Write,
+                ))
+                .unwrap_err()
+                .code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        assert_eq!(
+            broker.lifecycle_mutation_guard().unwrap_err().code,
+            CheckoutAccessErrorCode::LifecycleBusy,
+            "only one lifecycle writer may be pending"
+        );
+        assert_eq!(
+            broker
+                .publication_guard_for(std::iter::empty::<&ValidatedCheckoutLease>())
+                .unwrap_err()
+                .code,
+            CheckoutAccessErrorCode::InvalidRequest,
+            "empty publication refusal precedes lifecycle admission"
+        );
+
+        drop(mutation);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let state = *broker.lifecycle_gate.state.lock();
+        assert!(state.exclusive_held);
+        assert!(!state.pending_exclusive);
+        assert_eq!(state.shared_pins, 0);
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            *broker.lifecycle_gate.state.lock(),
+            CheckoutLifecycleState::default()
+        );
+    }
+
+    #[test]
+    fn lifecycle_writer_timeout_clears_only_its_pending_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = broker_with_wait(
+            &root,
+            [CheckoutAccessKind::RepositoryMutation],
+            Duration::from_millis(5),
+        );
+        let mutation = broker
+            .acquire(request(
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            broker.lifecycle_mutation_guard().unwrap_err().code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        assert_eq!(
+            *broker.lifecycle_gate.state.lock(),
+            CheckoutLifecycleState {
+                shared_pins: 1,
+                pending_exclusive: false,
+                exclusive_held: false,
+            }
+        );
+        drop(mutation);
+        drop(broker.lifecycle_mutation_guard().unwrap());
+        assert_eq!(
+            *broker.lifecycle_gate.state.lock(),
+            CheckoutLifecycleState::default()
+        );
+    }
+
+    #[test]
+    fn write_lease_publication_reuses_and_retains_existing_lifecycle_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = broker_with_wait(
+            &root,
+            [CheckoutAccessKind::RepositoryMutation],
+            Duration::from_millis(5),
+        );
+        let lease = broker
+            .acquire(request(
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+
+        let publication = broker.publication_guard(&lease).unwrap();
+        assert_eq!(broker.lifecycle_gate.state.lock().shared_pins, 1);
+        drop(lease);
+        assert_eq!(broker.lifecycle_gate.state.lock().shared_pins, 1);
+        assert_eq!(
+            broker.lifecycle_mutation_guard().unwrap_err().code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        drop(publication);
+        drop(broker.lifecycle_mutation_guard().unwrap());
+    }
+
+    #[test]
+    fn write_lease_promotes_to_exclusive_without_an_admission_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = broker_with_wait(
+            &root,
+            [CheckoutAccessKind::RepositoryMutation],
+            Duration::from_millis(10),
+        );
+        let mut lease = broker
+            .acquire(request(
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+
+        let lifecycle = broker
+            .promote_write_lease_to_lifecycle_guard(&mut lease)
+            .unwrap();
+        assert_eq!(
+            *broker.lifecycle_gate.state.lock(),
+            CheckoutLifecycleState {
+                shared_pins: 0,
+                pending_exclusive: false,
+                exclusive_held: true,
+            }
+        );
+        assert_eq!(
+            broker
+                .acquire(request(
+                    CheckoutAccessKind::RepositoryMutation,
+                    CheckoutAccessIntent::Write,
+                ))
+                .unwrap_err()
+                .code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+        drop(lifecycle);
+        assert_eq!(
+            *broker.lifecycle_gate.state.lock(),
+            CheckoutLifecycleState::default()
+        );
+    }
+
+    #[test]
+    fn pending_writer_does_not_refuse_publication_backed_by_the_pin_it_waits_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = broker_with_wait(
+            &root,
+            [CheckoutAccessKind::RepositoryMutation],
+            Duration::from_millis(250),
+        );
+        let lease = broker
+            .acquire(request(
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_broker = broker.clone();
+        let writer = std::thread::spawn(move || {
+            let guard = writer_broker.lifecycle_mutation_guard().unwrap();
+            acquired_tx.send(()).unwrap();
+            guard
+        });
+        wait_for_pending_writer(&broker);
+
+        let publication = broker.publication_guard(&lease).unwrap();
+        drop(lease);
+        assert!(
+            acquired_rx.try_recv().is_err(),
+            "publication guard must retain the write pin"
+        );
+        drop(publication);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn mixed_publication_uses_one_existing_global_write_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = broker_with_wait(
+            &root,
+            [
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessKind::LocalProjectWalk,
+            ],
+            Duration::from_millis(10),
+        );
+        let write = broker
+            .acquire(request(
+                CheckoutAccessKind::RepositoryMutation,
+                CheckoutAccessIntent::Write,
+            ))
+            .unwrap();
+        let read = broker
+            .acquire(request(
+                CheckoutAccessKind::LocalProjectWalk,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap();
+
+        let publication = broker.publication_guard_for([&read, &write]).unwrap();
+        assert_eq!(broker.lifecycle_gate.state.lock().shared_pins, 1);
+        drop(write);
+        drop(read);
+        assert_eq!(broker.lifecycle_gate.state.lock().shared_pins, 1);
+        drop(publication);
+        assert_eq!(broker.lifecycle_gate.state.lock().shared_pins, 0);
+    }
+
+    #[test]
     fn publication_guard_closes_revalidate_to_publish_lifecycle_window() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir(root.join("project")).unwrap();
-        let broker = CheckoutAccessBroker::new(
+        let broker = CheckoutAccessBroker::new_with_lifecycle_writer_wait(
             Arc::new(authority(&root, CheckoutAccessKind::LocalProjectWalk)),
             CheckoutAccessObservations::in_memory(),
+            Duration::from_millis(5),
         );
         let lease = broker
             .acquire(request(

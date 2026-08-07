@@ -292,12 +292,7 @@ impl BlackboxServer {
         &self,
         checkout: &bbox_corpus_core::project_record::ResolvedCheckoutScope,
     ) -> anyhow::Result<()> {
-        let _lifecycle = self
-            .state
-            .checkout_access
-            .lifecycle_mutation_guard()
-            .map_err(anyhow::Error::new)?;
-        self.state.checkout_registry.write().register(
+        self.register_checkout_row(
             bbox_indexing::checkout_registry::CheckoutRow {
                 project_id: Some(checkout.project_id.clone()),
                 checkout_id: checkout.checkout_id.clone(),
@@ -306,10 +301,59 @@ impl BlackboxServer {
                 bbox_root_relpath: Some(checkout.published_scope.bbox_root_relpath().to_string()),
                 branch_ref: checkout.branch_ref.clone(),
             },
+            None,
         )?;
-        drop(_lifecycle);
         self.watch_resolved_dark_knowledge_checkout(checkout);
         Ok(())
+    }
+
+    pub(crate) fn register_checkout_row(
+        &self,
+        row: bbox_indexing::checkout_registry::CheckoutRow,
+        mut write_lease: Option<&mut bbox_indexing::checkout_access::ValidatedCheckoutLease>,
+    ) -> anyhow::Result<bbox_indexing::checkout_registry::RegistrationOutcome> {
+        use bbox_indexing::checkout_registry::{
+            CheckoutRegistrationApplyError, CheckoutRegistrationPreflight, CheckoutRegistryChanged,
+            RegistrationOutcome,
+        };
+
+        for _ in 0..3 {
+            let preflight = {
+                self.state
+                    .checkout_registry
+                    .write()
+                    .preflight_register(row.clone())?
+            };
+            let token = match preflight {
+                CheckoutRegistrationPreflight::Unchanged => {
+                    return Ok(RegistrationOutcome::Unchanged);
+                }
+                CheckoutRegistrationPreflight::ChangeRequired(token) => token,
+            };
+            // Preflight's registry/store locks are gone before this bounded
+            // lifecycle wait. Changed commits take lifecycle first, registry
+            // second; an exact repeat never enters this branch.
+            let lifecycle = match write_lease.take() {
+                Some(lease) => self
+                    .state
+                    .checkout_access
+                    .promote_write_lease_to_lifecycle_guard(lease),
+                None => self.state.checkout_access.lifecycle_mutation_guard(),
+            }
+            .map_err(anyhow::Error::new)?;
+            let applied = self
+                .state
+                .checkout_registry
+                .write()
+                .compare_and_register(token);
+            drop(lifecycle);
+            match applied {
+                Ok(outcome) => return Ok(outcome),
+                Err(CheckoutRegistrationApplyError::CheckoutRegistryChanged(_)) => continue,
+                Err(CheckoutRegistrationApplyError::Store(error)) => return Err(error),
+            }
+        }
+        Err(anyhow::Error::new(CheckoutRegistryChanged))
     }
 
     pub(crate) fn refresh_dark_knowledge_overlay(

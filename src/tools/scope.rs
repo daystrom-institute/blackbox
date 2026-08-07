@@ -118,7 +118,7 @@ impl BlackboxServer {
             }
             Err(error) => return Err(anyhow::Error::new(error)),
         };
-        let lease = match self.state.checkout_access.acquire(CheckoutAccessRequest {
+        let mut lease = match self.state.checkout_access.acquire(CheckoutAccessRequest {
             project_id: String::new(),
             attachment: CheckoutAttachmentSelector::LegacyPath(raw.to_owned()),
             expected_scope: None,
@@ -162,11 +162,7 @@ impl BlackboxServer {
             .revalidate(&lease)
             .map_err(anyhow::Error::new)?;
         if let Some(checkout) = checkout_scope.as_ref() {
-            // The write lease's mutation pin excludes detach/relocation while
-            // this row is materialized. Registering before the lease drops
-            // prevents callers from carrying an unfenced path descriptor into
-            // a later lifecycle mutation.
-            self.state.checkout_registry.write().register(
+            self.register_checkout_row(
                 bbox_indexing::checkout_registry::CheckoutRow {
                     project_id: Some(checkout.project_id.clone()),
                     checkout_id: checkout.checkout_id.clone(),
@@ -177,6 +173,7 @@ impl BlackboxServer {
                     ),
                     branch_ref: checkout.branch_ref.clone(),
                 },
+                Some(&mut lease),
             )?;
         }
         Ok(ProjectWriteResolution {

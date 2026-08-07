@@ -230,6 +230,13 @@ fn validate_cutback_retry_config(base_secs: u64, max_secs: u64, max_attempts: u3
     Ok(())
 }
 
+fn validate_checkout_lifecycle_writer_wait_ms(wait_ms: u64) -> Result<()> {
+    if !(1..=5_000).contains(&wait_ms) {
+        anyhow::bail!("checkout_lifecycle_writer_wait_ms must be in 1..=5000");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawDaemonConfig {
     #[serde(default = "default_daemon_port")]
@@ -246,6 +253,8 @@ struct RawDaemonConfig {
     pub mcp_session_keepalive_secs: u64,
     #[serde(default = "default_daemon_poller_min_interval_secs")]
     pub poller_min_interval_secs: u64,
+    #[serde(default = "default_checkout_lifecycle_writer_wait_ms")]
+    pub checkout_lifecycle_writer_wait_ms: u64,
     #[serde(default = "default_daemon_executor")]
     pub executor: ExecutorKind,
 }
@@ -309,6 +318,9 @@ fn default_daemon_mcp_session_keepalive_secs() -> u64 {
 } // 6 hours
 fn default_daemon_poller_min_interval_secs() -> u64 {
     5
+}
+fn default_checkout_lifecycle_writer_wait_ms() -> u64 {
+    500
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -512,6 +524,7 @@ pub struct DaemonConfig {
     pub task_ttl_ms: u64,
     pub mcp_session_keepalive_secs: u64,
     pub poller_min_interval_secs: u64,
+    pub checkout_lifecycle_writer_wait_ms: u64,
     pub executor: ExecutorKind,
 }
 
@@ -613,6 +626,7 @@ impl Config {
                 task_ttl_ms: default_daemon_task_ttl_ms(),
                 mcp_session_keepalive_secs: default_daemon_mcp_session_keepalive_secs(),
                 poller_min_interval_secs: default_daemon_poller_min_interval_secs(),
+                checkout_lifecycle_writer_wait_ms: default_checkout_lifecycle_writer_wait_ms(),
                 executor: default_daemon_executor(),
             },
             index: RawIndexConfig {
@@ -911,6 +925,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         raw.code_collection.cutback_retry_max_secs,
         raw.code_collection.cutback_max_attempts,
     )?;
+    validate_checkout_lifecycle_writer_wait_ms(raw.daemon.checkout_lifecycle_writer_wait_ms)?;
 
     // Build final config
     Ok(Config {
@@ -922,6 +937,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             task_ttl_ms: raw.daemon.task_ttl_ms,
             mcp_session_keepalive_secs: raw.daemon.mcp_session_keepalive_secs,
             poller_min_interval_secs: raw.daemon.poller_min_interval_secs,
+            checkout_lifecycle_writer_wait_ms: raw.daemon.checkout_lifecycle_writer_wait_ms,
             executor: raw.daemon.executor,
         },
         index: IndexConfig {
@@ -1664,12 +1680,22 @@ mod tests {
         assert_eq!(config.daemon.shutdown_grace_secs, 15);
         assert_eq!(config.daemon.mcp_session_keepalive_secs, 21600);
         assert_eq!(config.daemon.poller_min_interval_secs, 5);
+        assert_eq!(config.daemon.checkout_lifecycle_writer_wait_ms, 500);
 
         assert_eq!(config.index.reindex_interval_secs, 120);
         assert!(!config.index.edge_index_boot_rebuild);
 
         assert_eq!(config.lsp.idle_timeout_secs, 600);
         assert_eq!(config.lsp.request_timeout_secs, 30);
+    }
+
+    #[test]
+    fn checkout_lifecycle_writer_wait_is_strictly_bounded() {
+        assert!(validate_checkout_lifecycle_writer_wait_ms(1).is_ok());
+        assert!(validate_checkout_lifecycle_writer_wait_ms(500).is_ok());
+        assert!(validate_checkout_lifecycle_writer_wait_ms(5_000).is_ok());
+        assert!(validate_checkout_lifecycle_writer_wait_ms(0).is_err());
+        assert!(validate_checkout_lifecycle_writer_wait_ms(5_001).is_err());
     }
 
     #[test]

@@ -1079,9 +1079,10 @@ fn vectors_section(state: &crate::server::state::SharedState) -> SectionReport {
         ))],
     };
     match bbox_vectors::try_metrics() {
-        None => findings.push(Finding::warn(
-            "vector connectivity diagnostics unavailable: store is warming up",
-        )),
+        // No installed vector store means there is no loaded partition
+        // inventory to diagnose yet. This is the same cold/empty state as the
+        // embedding status above, not a route whose health was fabricated.
+        None => {}
         Some(metrics) => {
             let routes = metrics.into_keys().take(64).collect::<Vec<_>>();
             match bbox_vectors::try_diagnostics_bounded(

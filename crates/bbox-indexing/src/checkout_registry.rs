@@ -72,6 +72,59 @@ pub struct CheckoutRegistryStore {
     pub checkouts: Vec<CheckoutRow>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    Unchanged,
+    Changed,
+}
+
+#[derive(Debug)]
+pub enum CheckoutRegistrationPreflight {
+    Unchanged,
+    ChangeRequired(CheckoutRegistrationPreflightToken),
+}
+
+#[derive(Debug)]
+pub struct CheckoutRegistrationPreflightToken {
+    row: CheckoutRow,
+    store_revision: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckoutRegistryChanged;
+
+impl std::fmt::Display for CheckoutRegistryChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("checkout registry changed after registration preflight")
+    }
+}
+
+impl std::error::Error for CheckoutRegistryChanged {}
+
+#[derive(Debug)]
+pub enum CheckoutRegistrationApplyError {
+    CheckoutRegistryChanged(CheckoutRegistryChanged),
+    Store(anyhow::Error),
+}
+
+impl std::fmt::Display for CheckoutRegistrationApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CheckoutRegistryChanged(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CheckoutRegistrationApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CheckoutRegistryChanged(error) => Some(error),
+            Self::Store(error) => Some(error.as_ref()),
+        }
+    }
+}
+
 impl CheckoutRegistryStore {
     fn new() -> Self {
         Self {
@@ -226,30 +279,131 @@ impl CheckoutRegistry {
         Ok(output)
     }
 
-    /// Register or update one `(checkout_id, published_scope)` row. A monorepo
-    /// checkout may carry several rows without one subproject replacing another.
-    pub fn register(&mut self, row: CheckoutRow) -> Result<()> {
+    fn load_current_locked(&self) -> Result<(CheckoutRegistryStore, bool)> {
+        let path = self.store_path.clone();
+        let recovery_fallback = self.store.clone();
+        let recoverable_corrupt_sha256 = self.recoverable_corrupt_sha256;
+        with_store_lock(&path, || match read_checkout_registry_store(&path) {
+            Ok(current) => Ok(current),
+            Err(_)
+                if recoverable_corrupt_sha256.is_some()
+                    && recoverable_corrupt_registry_sha256(&path) == recoverable_corrupt_sha256 =>
+            {
+                Ok((recovery_fallback, true))
+            }
+            Err(error) => Err(error),
+        })
+    }
+
+    fn store_revision(store: &CheckoutRegistryStore) -> Result<[u8; 32]> {
+        Ok(Sha256::digest(serde_json::to_vec(store)?).into())
+    }
+
+    /// Load disk authority under the registry/store lock and prove whether an
+    /// exact registration is already present. The change token carries the
+    /// disk revision observed here; callers must not hold this lock while they
+    /// wait for lifecycle authority.
+    pub fn preflight_register(
+        &mut self,
+        row: CheckoutRow,
+    ) -> Result<CheckoutRegistrationPreflight> {
         let scope = row.published_scope().with_context(|| {
             format!(
                 "checkout {} has no recorded repo_id/bbox_root_relpath authority",
                 row.checkout_id
             )
         })?;
-        self.mutate_store(move |next| {
+        let (current, needs_persist) = self.load_current_locked()?;
+        let unchanged = !needs_persist
+            && current
+                .checkouts
+                .iter()
+                .find(|existing| existing.matches(&row.checkout_id, &scope))
+                == Some(&row);
+        let store_revision = Self::store_revision(&current)?;
+        self.store = current;
+        self.needs_persist = needs_persist;
+        if unchanged {
+            return Ok(CheckoutRegistrationPreflight::Unchanged);
+        }
+        Ok(CheckoutRegistrationPreflight::ChangeRequired(
+            CheckoutRegistrationPreflightToken {
+                row,
+                store_revision,
+            },
+        ))
+    }
+
+    /// Apply one preflighted change only if disk authority is still the exact
+    /// revision that produced the token.
+    pub fn compare_and_register(
+        &mut self,
+        token: CheckoutRegistrationPreflightToken,
+    ) -> std::result::Result<RegistrationOutcome, CheckoutRegistrationApplyError> {
+        let path = self.store_path.clone();
+        let recovery_fallback = self.store.clone();
+        let recoverable_corrupt_sha256 = self.recoverable_corrupt_sha256;
+        let result = with_store_lock(&path, || -> Result<_> {
+            let (mut next, needs_persist) = match read_checkout_registry_store(&path) {
+                Ok(current) => current,
+                Err(_)
+                    if recoverable_corrupt_sha256.is_some()
+                        && recoverable_corrupt_registry_sha256(&path)
+                            == recoverable_corrupt_sha256 =>
+                {
+                    (recovery_fallback, true)
+                }
+                Err(error) => return Err(error),
+            };
+            if Self::store_revision(&next)? != token.store_revision {
+                return Ok(Err(CheckoutRegistryChanged));
+            }
+            let scope = token.row.published_scope().ok_or_else(|| {
+                anyhow::anyhow!("preflighted checkout registration lost scope authority")
+            })?;
             if let Some(existing) = next
                 .checkouts
                 .iter_mut()
-                .find(|existing| existing.matches(&row.checkout_id, &scope))
+                .find(|existing| existing.matches(&token.row.checkout_id, &scope))
             {
-                if *existing == row {
-                    return Ok(((), false));
-                }
-                *existing = row;
+                *existing = token.row;
             } else {
-                next.checkouts.push(row);
+                next.checkouts.push(token.row);
             }
-            Ok(((), true))
+            if needs_persist || Self::store_revision(&next)? != token.store_revision {
+                atomic_write_json_locked(&path, &next)?;
+                sync_parent_directory(&path)?;
+            }
+            Ok(Ok(next))
         })
+        .map_err(CheckoutRegistrationApplyError::Store)?;
+        let next = result.map_err(CheckoutRegistrationApplyError::CheckoutRegistryChanged)?;
+        self.store = next;
+        self.needs_persist = false;
+        self.recoverable_corrupt_sha256 = None;
+        Ok(RegistrationOutcome::Changed)
+    }
+
+    /// Register or update one `(checkout_id, published_scope)` row. A monorepo
+    /// checkout may carry several rows without one subproject replacing another.
+    pub fn register(&mut self, row: CheckoutRow) -> Result<RegistrationOutcome> {
+        for _ in 0..3 {
+            match self.preflight_register(row.clone())? {
+                CheckoutRegistrationPreflight::Unchanged => {
+                    return Ok(RegistrationOutcome::Unchanged);
+                }
+                CheckoutRegistrationPreflight::ChangeRequired(token) => {
+                    match self.compare_and_register(token) {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(CheckoutRegistrationApplyError::CheckoutRegistryChanged(_)) => {
+                            continue;
+                        }
+                        Err(CheckoutRegistrationApplyError::Store(error)) => return Err(error),
+                    }
+                }
+            }
+        }
+        Err(anyhow::Error::new(CheckoutRegistryChanged))
     }
 
     /// Remove one scope from a checkout while retaining sibling monorepo
@@ -408,11 +562,21 @@ mod tests {
         let d = dir.path().canonicalize().unwrap();
 
         let mut reg = CheckoutRegistry::open(&path).unwrap();
-        reg.register(row("c1", &d)).unwrap();
+        assert_eq!(
+            reg.register(row("c1", &d)).unwrap(),
+            RegistrationOutcome::Changed
+        );
         // Re-register same id with a changed branch: replaces in place.
         let mut updated = row("c1", &d);
         updated.branch_ref = Some("feature/y".into());
-        reg.register(updated).unwrap();
+        assert_eq!(
+            reg.register(updated.clone()).unwrap(),
+            RegistrationOutcome::Changed
+        );
+        assert_eq!(
+            reg.register(updated).unwrap(),
+            RegistrationOutcome::Unchanged
+        );
 
         assert_eq!(reg.rows().len(), 1);
         assert_eq!(
@@ -473,6 +637,36 @@ mod tests {
         first.register(row("c1", &first_path)).unwrap();
         stale.register(row("c2", &second_path)).unwrap();
 
+        let reopened = CheckoutRegistry::open(&path).unwrap();
+        assert!(reopened.get("c1", &root_scope()).is_some());
+        assert!(reopened.get("c2", &root_scope()).is_some());
+    }
+
+    #[test]
+    fn preflight_compare_refuses_stale_revision_then_preserves_both_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("checkouts.json");
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first_path = first_dir.path().canonicalize().unwrap();
+        let second_path = second_dir.path().canonicalize().unwrap();
+        let mut first = CheckoutRegistry::open(&path).unwrap();
+        let mut concurrent = CheckoutRegistry::open(&path).unwrap();
+
+        let token = match first.preflight_register(row("c1", &first_path)).unwrap() {
+            CheckoutRegistrationPreflight::ChangeRequired(token) => token,
+            CheckoutRegistrationPreflight::Unchanged => panic!("empty registry cannot match"),
+        };
+        concurrent.register(row("c2", &second_path)).unwrap();
+        assert!(matches!(
+            first.compare_and_register(token),
+            Err(CheckoutRegistrationApplyError::CheckoutRegistryChanged(_))
+        ));
+
+        assert_eq!(
+            first.register(row("c1", &first_path)).unwrap(),
+            RegistrationOutcome::Changed
+        );
         let reopened = CheckoutRegistry::open(&path).unwrap();
         assert!(reopened.get("c1", &root_scope()).is_some());
         assert!(reopened.get("c2", &root_scope()).is_some());

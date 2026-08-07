@@ -11,6 +11,7 @@ mcp_session_keepalive_secs = 21600
 shutdown_grace_secs = 15
 task_ttl_ms = 86400000
 poller_min_interval_secs = 5
+checkout_lifecycle_writer_wait_ms = 500
 
 [index]
 reindex_interval_secs = 120
