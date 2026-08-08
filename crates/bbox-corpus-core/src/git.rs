@@ -2405,7 +2405,11 @@ pub fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<Vec<GitC
     let output = git_output_strings(root, &args, "reading commit history")
         .with_context(|| format!("failed to execute git log in {}", root.display()))?;
     if !output.status.success() {
-        return Ok(Vec::new());
+        anyhow::bail!(
+            "git log failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     parse_commit_log(&output.stdout)
 }
@@ -3355,6 +3359,13 @@ mod tests {
             blame.author_time.as_deref(),
             Some("2023-11-14T22:13:20+00:00")
         );
+    }
+
+    #[test]
+    fn commit_log_propagates_git_failure() {
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let error = commit_log(not_a_repo.path(), None).unwrap_err();
+        assert!(error.to_string().contains("git log failed"));
     }
 
     #[test]

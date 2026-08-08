@@ -70,7 +70,6 @@ checkout_root_path	crates/bbox-artifacts/src/watcher.rs	fn register_inner	1	coll
 checkout_root_path	crates/bbox-corpus-core/src/project_catalog.rs	fn projected_path_matches	2	collapse into the lease confined readers
 checkout_root_path	crates/bbox-corpus-core/src/project_catalog.rs	fn validate_attachments	2	collapse into the lease confined readers
 checkout_root_path	crates/bbox-corpus-core/src/project_record.rs	fn from_catalog_attachment	1	collapse into the lease confined readers
-checkout_root_path	crates/bbox-gaps/src/overlay.rs	fn recompute_overlay_result	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolution_roots	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolve_checkout	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/checkout_access_v1.rs	fn resolve_legacy_path	1	collapse into the lease confined readers
@@ -146,7 +145,6 @@ checkout_root_path	src/tools/render.rs	fn bbox_render	3	collapse into the lease 
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write	3	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write_scope	1	collapse into the lease confined readers
 checkout_root_path	src/tools/scope.rs	fn resolve_project_write_scope_with_id	1	collapse into the lease confined readers
-direct_git_process	crates/bbox-corpus-core/src/git.rs	fn ensure_notes_merge_strategy_union	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn git_output_strings	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn git_output_with_alternate	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn read_stable_repository_object_format	1	route through the verified-commit git wrapper

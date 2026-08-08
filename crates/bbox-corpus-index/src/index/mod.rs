@@ -1232,7 +1232,9 @@ fn reset_index_on_schema_mismatch(
                 index_path.display()
             );
         }
-        return Ok(not_replaced(false));
+        return Ok(not_replaced(
+            intent == CatalogReplacementIntentV1::PreserveInterrupted,
+        ));
     }
     let marker_path = index_path.join(SCHEMA_VERSION_FILE);
     let observed = match fs::read_to_string(&marker_path) {
@@ -1395,6 +1397,22 @@ fn write_schema_version_marker(index_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_replacement_with_absent_index_keeps_marker_withheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = reset_index_on_schema_mismatch(
+            &dir.path().join("absent-index"),
+            &dir.path().join("projects.json"),
+            &dir.path().join("code-sources"),
+            None,
+            schema_replacement::CatalogReplacementIntentV1::PreserveInterrupted,
+        )
+        .unwrap();
+
+        assert!(outcome.performed.is_none());
+        assert!(outcome.marker_withheld);
+    }
 
     #[test]
     fn index_open_writes_schema_version_marker() {

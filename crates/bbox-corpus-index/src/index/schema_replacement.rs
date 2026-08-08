@@ -233,6 +233,7 @@ pub fn build_commit_doc_from_row(
     doc.add_text(f.project, &owner.project_display);
     doc.add_text(f.role, &row.role);
     if let Some(project_id) = &owner.project_id {
+        doc.add_text(f.project_id, project_id);
         doc.add_text(f.file_path, super::git_history::git_source_key(project_id));
     }
     doc.add_u64(f.byte_offset, row.byte_offset);

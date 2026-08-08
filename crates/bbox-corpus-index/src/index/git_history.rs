@@ -130,25 +130,11 @@ pub fn index_git_history_for_project(
     };
     let commits = bbox_corpus_core::git::commit_log(root, since)?;
     if commits.is_empty() {
-        git_meta.last_ingested_sha = Some(head);
-        ctx.publication.stage_git_history(GitHistoryPublication {
-            edges_dir: ctx.edges_dir.to_path_buf(),
-            project_id: project.project_id.clone(),
-            edges: Vec::new(),
-            force_full: ctx.force_full,
-            git_meta_path,
-            git_meta,
-        });
-        ctx.meta.insert(
-            source_key,
-            FileMeta {
-                mtime: 0,
-                size: bbox_corpus_core::git::head_fingerprint(root).unwrap_or_default(),
-                mat_version: None,
-                source: Default::default(),
-            },
+        anyhow::bail!(
+            "git history read returned no commits for project {} at HEAD {}; refusing to publish an empty replacement",
+            project.project_id,
+            head
         );
-        return Ok(GitIndexStats::default());
     }
 
     let mut edges = Vec::new();
@@ -227,6 +213,7 @@ pub fn build_commit_doc(
     doc.add_text(f.session_id, "");
     doc.add_text(f.account, "git");
     doc.add_text(f.project, project_display);
+    doc.add_text(f.project_id, project_id);
     doc.add_text(f.role, "commit");
     // Not a filesystem path: the per-project history source key, which is the
     // delete term the purge loops' absolute-path arm uses for this lane.
@@ -527,6 +514,7 @@ mod tests {
         assert_eq!(text(&doc, fields.commit_sha), commit.sha);
         assert_eq!(text(&doc, fields.commit_author_name), "A");
         assert_eq!(text(&doc, fields.commit_author_email), "a@example.test");
+        assert_eq!(text(&doc, fields.project_id), "proj1234");
         assert_eq!(
             text(&doc, fields.entity_id),
             format!("commit:repo1234:{}", commit.sha)
