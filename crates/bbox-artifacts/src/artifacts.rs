@@ -2389,9 +2389,12 @@ impl ArtifactCatalog {
             // alone are not sufficient: a reinstall with the same name
             // and version but different content must NOT be deactivated
             // by a stale removal prepared against the old content.
+            let Some(expected_content_sha256) = expected_content_sha256 else {
+                return Ok(None);
+            };
             if meta.name != expected_name
                 || meta.version != expected_version
-                || meta.content_sha256 != expected_content_sha256.map(str::to_string)
+                || meta.content_sha256.as_deref() != Some(expected_content_sha256)
             {
                 return Ok(None);
             }
@@ -3476,6 +3479,59 @@ mod tests {
         let after: ArtifactMetadata =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert!(after.content_sha256.is_some());
+    }
+
+    #[test]
+    fn identity_removal_refuses_hashless_legacy_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        let artifact = serde_json::json!({
+            "name": "legacy-hashless",
+            "version": "1",
+            "actors": {},
+            "start": "Done",
+            "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+        });
+        catalog
+            .install_value(
+                ArtifactKind::Workflow,
+                "src.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let meta_path = dir
+            .path()
+            .join("artifacts/workflow/legacy-hashless/metadata.json");
+        let mut meta: ArtifactMetadata =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.content_sha256 = None;
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+        let removed = catalog
+            .mark_removed_by_source_if_identity(
+                ArtifactScope::Global,
+                ArtifactKind::Workflow,
+                Path::new("src.json"),
+                "legacy-hashless",
+                "1",
+                None,
+            )
+            .unwrap();
+
+        assert!(removed.is_none());
+        assert!(
+            catalog
+                .active_artifact_by_source(
+                    ArtifactScope::Global,
+                    ArtifactKind::Workflow,
+                    Path::new("src.json"),
+                )
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

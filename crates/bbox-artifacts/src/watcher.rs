@@ -219,7 +219,10 @@ impl BbxWatcher {
                     .into_iter()
                     .map(|event| event.event)
                     .collect::<Vec<_>>();
-                let registrations = registrations_cb.lock().unwrap().clone();
+                let registrations = registrations_cb
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 handle_event_batch(
                     &events,
                     &registrations,

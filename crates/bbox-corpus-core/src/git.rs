@@ -2531,27 +2531,24 @@ fn validate_notes_ref_component(value: &str, role: &str) -> Result<()> {
 }
 
 pub fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Result<()> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "notes",
-            "--ref",
-            notes_ref,
-            "append",
-            &format!("--separator={NOTE_DOCUMENT_SEPARATOR}"),
-            "-F",
-            "-",
-            commit,
-        ])
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning git notes append in {}", root.display()))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(body.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args([
+        "notes",
+        "--ref",
+        notes_ref,
+        "append",
+        &format!("--separator={NOTE_DOCUMENT_SEPARATOR}"),
+        "-F",
+        "-",
+        commit,
+    ]);
+    let output = run_git_bounded_with_stdin(
+        command,
+        root,
+        "appending git note",
+        body.as_bytes().to_vec(),
+    )
+    .with_context(|| format!("git notes append timed out in {}", root.display()))?;
     if !output.status.success() {
         anyhow::bail!(
             "git notes append failed in {}: {}",
@@ -2571,12 +2568,12 @@ pub fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str) -> Res
 /// safe; git config writes are idempotent so calling this on every export is
 /// harmless.
 pub fn ensure_notes_merge_strategy_union(root: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["config", "notes.mergeStrategy", "union"])
-        .output()
-        .with_context(|| format!("setting notes.mergeStrategy union in {}", root.display()))?;
+    let output = git_output(
+        root,
+        &["config", "notes.mergeStrategy", "union"],
+        "setting notes merge strategy",
+    )
+    .with_context(|| format!("setting notes.mergeStrategy union in {}", root.display()))?;
     if !output.status.success() {
         anyhow::bail!(
             "git config notes.mergeStrategy union failed in {}: {}",
@@ -2988,6 +2985,23 @@ fn run_git_bounded(cmd: Command, path: &Path, action: &'static str) -> Option<Ou
     run_bounded_with_timeout(cmd, path, action, GIT_OUTPUT_TIMEOUT)
 }
 
+fn run_git_bounded_with_stdin(
+    cmd: Command,
+    path: &Path,
+    action: &'static str,
+    stdin: Vec<u8>,
+) -> Option<Output> {
+    run_bounded_with_timeout_stdin_and_stdout_limit(
+        cmd,
+        path,
+        action,
+        GIT_OUTPUT_TIMEOUT,
+        Some(stdin),
+        None,
+    )
+    .map(BoundedGitOutput::into_output)
+}
+
 #[allow(clippy::disallowed_methods)]
 fn run_bounded_with_timeout(
     cmd: Command,
@@ -3001,15 +3015,37 @@ fn run_bounded_with_timeout(
 
 #[allow(clippy::disallowed_methods)]
 fn run_bounded_with_timeout_and_stdout_limit(
-    mut cmd: Command,
+    cmd: Command,
     path: &Path,
     action: &'static str,
     timeout: Duration,
     retained_stdout_limit: Option<usize>,
 ) -> Option<BoundedGitOutput> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    run_bounded_with_timeout_stdin_and_stdout_limit(
+        cmd,
+        path,
+        action,
+        timeout,
+        None,
+        retained_stdout_limit,
+    )
+}
+
+#[allow(clippy::disallowed_methods)]
+fn run_bounded_with_timeout_stdin_and_stdout_limit(
+    mut cmd: Command,
+    path: &Path,
+    action: &'static str,
+    timeout: Duration,
+    stdin_payload: Option<Vec<u8>>,
+    retained_stdout_limit: Option<usize>,
+) -> Option<BoundedGitOutput> {
+    if stdin_payload.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -3021,6 +3057,12 @@ fn run_bounded_with_timeout_and_stdout_limit(
             );
             return None;
         }
+    };
+    let mut stdin_writer = if let Some(payload) = stdin_payload {
+        let mut stdin_pipe = child.stdin.take()?;
+        Some(std::thread::spawn(move || stdin_pipe.write_all(&payload)))
+    } else {
+        None
     };
     let mut stdout_pipe = child.stdout.take()?;
     let mut stderr_pipe = child.stderr.take()?;
@@ -3041,6 +3083,9 @@ fn run_bounded_with_timeout_and_stdout_limit(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                if let Some(writer) = stdin_writer.take() {
+                    let _ = writer.join();
+                }
                 let (stdout, stdout_overflowed) =
                     stdout_drain.join().unwrap_or_else(|_| (Vec::new(), false));
                 let (stderr, stderr_overflowed) =
@@ -3134,6 +3179,26 @@ mod tests {
             Duration::from_millis(300),
         );
         assert!(out.is_none(), "hung child must yield None");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must return promptly after the deadline, not wait for the child"
+        );
+    }
+
+    #[test]
+    fn run_bounded_with_stdin_kills_hung_child_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let out = run_bounded_with_timeout_stdin_and_stdout_limit(
+            cmd,
+            Path::new("/tmp"),
+            "test-hang-with-stdin",
+            Duration::from_millis(300),
+            Some(vec![b'x'; 1024 * 1024]),
+            None,
+        );
+        assert!(out.is_none(), "hung child with stdin must yield None");
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "must return promptly after the deadline, not wait for the child"

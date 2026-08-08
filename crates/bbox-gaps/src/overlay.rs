@@ -585,7 +585,6 @@ fn gap_overlay_values_from_maps(
     baseline: &BTreeMap<String, Vec<u8>>,
     published: &dyn PublishedGapAuthority,
     working: &BTreeMap<String, Vec<u8>>,
-    checkout_project_dir: &str,
 ) -> std::result::Result<BTreeMap<String, GapOverlayValue>, GapOverlayRecomputeError> {
     let mut paths = BTreeSet::new();
     paths.extend(baseline.keys().cloned());
@@ -610,7 +609,7 @@ fn gap_overlay_values_from_maps(
                         gap.id
                     )));
                 }
-                stamp_gap(&mut gap, checkout_project_dir);
+                stamp_overlay_gap(&mut gap);
                 values.insert(
                     gap.id.clone(),
                     GapOverlayValue::Upsert {
@@ -686,7 +685,7 @@ pub fn recompute_catalog_overlay_result(
     let working_fingerprint = fingerprint_map(working);
     // A catalog overlay row carries no host path: the gap view stamps
     // project identity, and the checkout directory is not authority.
-    let values = gap_overlay_values_from_maps(&baseline, published.published, working, "")?;
+    let values = gap_overlay_values_from_maps(&baseline, published.published, working)?;
 
     let stamp = GapOverlayStamp {
         published_scope: published.published_scope.clone(),
@@ -754,12 +753,7 @@ pub fn recompute_overlay_result(
     validate_gap_map(working, "working").map_err(GapOverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(working);
 
-    let values = gap_overlay_values_from_maps(
-        &baseline,
-        &published,
-        working,
-        &checkout.checkout_project_dir,
-    )?;
+    let values = gap_overlay_values_from_maps(&baseline, &published, working)?;
 
     let stamp = GapOverlayStamp {
         published_scope: checkout.published_scope.clone(),
@@ -789,6 +783,19 @@ pub fn recompute_overlay_result(
 
 fn stamp_gap(gap: &mut GapNote, project: &str) {
     gap.project = Some(project.to_string());
+    gap.write_dir = None;
+    gap.provisional_checkout_id = None;
+    if gap.updated_at.is_empty() {
+        gap.updated_at = gap.created_at.clone();
+    }
+}
+
+fn stamp_overlay_gap(gap: &mut GapNote) {
+    // Overlay snapshots are carrier data, not a durable project authority.
+    // The session view attaches the resolved project path/id after selecting
+    // the row, so checkout bytes may not smuggle either identity through.
+    gap.project = None;
+    gap.project_id = None;
     gap.write_dir = None;
     gap.provisional_checkout_id = None;
     if gap.updated_at.is_empty() {
@@ -1105,7 +1112,8 @@ mod tests {
         ));
         assert!(matches!(
             snapshot.values.get("gap-11111111"),
-            Some(GapOverlayValue::Upsert { gap, .. }) if gap.title == "changed"
+            Some(GapOverlayValue::Upsert { gap, .. })
+                if gap.title == "changed" && gap.project.is_none() && gap.project_id.is_none()
         ));
         assert_eq!(snapshot.snapshot_id.len(), 64);
 
@@ -1287,7 +1295,8 @@ mod tests {
         // A catalog overlay row carries no host path.
         match snapshot.values.get("gap-11111111") {
             Some(GapOverlayValue::Upsert { gap, .. }) => {
-                assert_eq!(gap.project.as_deref(), Some(""));
+                assert_eq!(gap.project, None);
+                assert_eq!(gap.project_id, None);
                 assert_eq!(gap.write_dir, None);
             }
             other => panic!("{other:?}"),

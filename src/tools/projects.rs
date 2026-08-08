@@ -975,17 +975,19 @@ impl BlackboxServer {
                 );
             }
 
-            let _lifecycle = self
-                .state
-                .checkout_access
-                .lifecycle_mutation_guard()
-                .map_err(anyhow::Error::new)?;
-            let removed = {
-                let registry = self.state.project_authority.bridge_registry()?;
+            let unregister_state = self.state.clone();
+            let unregister_project = p.project.clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                let _lifecycle = unregister_state
+                    .checkout_access
+                    .lifecycle_mutation_guard()
+                    .map_err(anyhow::Error::new)?;
+                let registry = unregister_state.project_authority.bridge_registry()?;
                 let mut projects = registry.write();
-                projects.unregister_project(&p.project)?
-            };
-            drop(_lifecycle);
+                projects.unregister_project(&unregister_project)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("project unregister task failed: {error}"))??;
             self.state.persist_projects_durable().await?;
 
             let checkout_rows = self.state.checkout_registry.read().rows().to_vec();

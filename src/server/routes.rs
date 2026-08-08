@@ -1079,18 +1079,42 @@ pub(crate) async fn control_closeout_handler(
     if let Some(checkout_id) = teardown_checkout_id {
         let server = BlackboxServer::new(state);
         if checkout_removed {
-            if let Err(err) = server.deregister_dark_knowledge_checkout(&checkout_id) {
-                tracing::warn!(
-                    checkout_id,
-                    error = %err,
-                    "closeout removed checkout but registry teardown failed; periodic reconciliation will retry"
-                );
+            let cleanup_checkout_id = checkout_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                server.deregister_dark_knowledge_checkout(&cleanup_checkout_id)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        checkout_id,
+                        error = %err,
+                        "closeout removed checkout but registry teardown failed; periodic reconciliation will retry"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        checkout_id,
+                        error = %err,
+                        "closeout removed checkout but registry teardown task failed; periodic reconciliation will retry"
+                    );
+                }
             }
         } else if !was_dry_run {
             // The local target can advance even when a later push or removal
             // fails. Refresh after every mutating closeout attempt so promotion
             // never waits for the committed-tree cache TTL in that case.
-            server.refresh_published_knowledge_for_checkout(&checkout_id);
+            if let Err(err) = tokio::task::spawn_blocking(move || {
+                server.refresh_published_knowledge_for_checkout(&checkout_id)
+            })
+            .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    "closeout checkout refresh task failed; periodic reconciliation will retry"
+                );
+            }
         }
     }
 

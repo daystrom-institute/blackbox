@@ -1275,6 +1275,7 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
     }
 
     let mut active_keys = BTreeSet::new();
+    let mut active_checkout_scopes = BTreeSet::new();
     for (key, attachment) in &snapshot.attachments {
         if key != &attachment.attachment_id {
             return Err(ProjectCatalogError::new(
@@ -1324,6 +1325,19 @@ fn validate_attachments(snapshot: &AttachmentSnapshotV1) -> Result<(), ProjectCa
                     return Err(ProjectCatalogError::new(
                         "error.project_attachments_duplicate_active",
                         format!("attachment {} duplicates an active checkout binding", key),
+                    ));
+                }
+                let checkout_scope = (
+                    attachment.checkout_id.as_str(),
+                    attachment.project_root_relpath.as_str(),
+                );
+                if !active_checkout_scopes.insert(checkout_scope) {
+                    return Err(ProjectCatalogError::new(
+                        "error.project_attachments_duplicate_active",
+                        format!(
+                            "attachment {} reuses an active checkout scope across projects",
+                            key
+                        ),
                     ));
                 }
                 if attachment.detached_at.is_some() {
@@ -2904,6 +2918,22 @@ mod tests {
         snapshot
             .attachments
             .insert(duplicate.attachment_id.clone(), duplicate);
+        assert_eq!(
+            snapshot.validate().unwrap_err().code(),
+            "error.project_attachments_duplicate_active"
+        );
+
+        let mut cross_project = first.clone();
+        cross_project.attachment_id =
+            AttachmentId::parse("att_44444444444444444444444444444444").unwrap();
+        cross_project.project_id = id("two");
+        let mut snapshot = AttachmentSnapshotV1::empty(1).unwrap();
+        snapshot
+            .attachments
+            .insert(first.attachment_id.clone(), first.clone());
+        snapshot
+            .attachments
+            .insert(cross_project.attachment_id.clone(), cross_project);
         assert_eq!(
             snapshot.validate().unwrap_err().code(),
             "error.project_attachments_duplicate_active"
