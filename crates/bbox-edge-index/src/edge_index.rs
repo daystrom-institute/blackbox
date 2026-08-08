@@ -951,13 +951,14 @@ impl EdgeIndex {
             if !sidecar_project_is_registered(&path, registered_project_ids) {
                 continue;
             }
-            if let Some(stem) = sidecar_file_stem(&path) {
-                if migrated_projects.contains(stem) {
-                    continue;
-                }
-            }
-            let skip_derived =
-                sidecar_file_stem(&path).is_some_and(|stem| projects_with_managed.contains(stem));
+            // Migration moves the cut-time rows into split lanes, but legacy
+            // append callers may still create a new top-level lane afterward.
+            // Union that lane through `seen` instead of dropping durable
+            // post-migration writes. Derived rows remain owned by the managed
+            // lane and are filtered from this compatibility input.
+            let skip_derived = sidecar_file_stem(&path).is_some_and(|stem| {
+                migrated_projects.contains(stem) || projects_with_managed.contains(stem)
+            });
             self.project_sidecar_edges_file(&path, seen, skip_derived);
         }
     }
@@ -3619,6 +3620,29 @@ mod tests {
         let obs_edge = serde_json::to_string(&observed_edge("sess-obs", "hashX", "p1")).unwrap();
         fs::write(observed_dir.join("p1.jsonl"), format!("{obs_edge}\n")).unwrap();
 
+        // A compatibility writer can still append a top-level lane after the
+        // project has split explicit/observed lanes. That durable post-cut row
+        // must be unioned rather than hidden merely because migration already
+        // happened.
+        let post_migration_source = EntityRef::Knowledge {
+            id: "k_post_migration".into(),
+        };
+        let post_migration_edge = serde_json::to_string(&Edge {
+            source: post_migration_source.clone(),
+            kind: "SUPERSEDES".into(),
+            target: EntityRef::Knowledge { id: "k_old".into() },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        })
+        .unwrap();
+        fs::write(
+            edges_dir.join("p1.jsonl"),
+            format!("{post_migration_edge}\n"),
+        )
+        .unwrap();
+
         // Load with include_observed=false
         let mut index_no_obs = EdgeIndex::default();
         let mut seen = HashSet::new();
@@ -3639,6 +3663,11 @@ mod tests {
             index_no_obs.forward_edges(&explicit_source).len(),
             1,
             "explicit edge must load even with include_observed=false"
+        );
+        assert_eq!(
+            index_no_obs.forward_edges(&post_migration_source).len(),
+            1,
+            "post-migration top-level writes must remain visible"
         );
         assert_eq!(
             index_no_obs.forward_edges(&transcript_source).len(),

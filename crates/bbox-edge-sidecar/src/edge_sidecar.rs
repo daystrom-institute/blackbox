@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -25,6 +26,8 @@ use bbox_corpus_core::project_catalog_snapshot::{
     STREAMED_CHUNK_BYTES, StreamedLineSplitterV1, ensure_selector_members_unchanged,
     read_row_object_project_id, stamp_row_object,
 };
+
+static COMPACTION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Edge {
@@ -1243,9 +1246,10 @@ pub fn compact_legacy_sidecar(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let nonce = COMPACTION_NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp_path = path.with_file_name(format!(
-        "{project_id}.jsonl.compact-{stamp}-{}.tmp",
-        std::process::id()
+        "{project_id}.jsonl.compact-{stamp}-{}-{nonce}.tmp",
+        std::process::id(),
     ));
     let mut writer = if apply {
         Some(BufWriter::new(
@@ -1301,21 +1305,37 @@ pub fn compact_legacy_sidecar(
         return Ok(stats);
     }
 
-    let backup_path = path.with_file_name(format!("{project_id}.jsonl.bak-{stamp}"));
+    let backup_path = path.with_file_name(format!(
+        "{project_id}.jsonl.bak-{stamp}-{}-{nonce}",
+        std::process::id()
+    ));
     if let Some(mut writer) = writer {
         writer.flush()?;
         writer.get_ref().sync_all()?;
     } else {
         anyhow::bail!("internal error: compaction apply requested without writer");
     }
-    fs::rename(&path, &backup_path)?;
+    // Preserve the old inode without ever removing the live lane. A crash
+    // before the replacement leaves the original path intact; a crash after
+    // it leaves the new path plus this hard-linked backup. The old
+    // rename-away/rename-in sequence exposed an absence window in which every
+    // reader treated the project as having no legacy edges.
+    fs::hard_link(&path, &backup_path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     match fs::rename(&tmp_path, &path) {
         Ok(()) => {}
         Err(err) => {
-            let _ = fs::rename(&backup_path, &path);
             let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&backup_path);
             return Err(err.into());
         }
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
     }
     stats.applied = true;
     stats.backup_path = Some(backup_path.display().to_string());
@@ -2759,6 +2779,45 @@ mod project_catalog_snapshot_tests {
 
         assert!(error.contains("validating edge sidecar project id"));
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel\n");
+    }
+
+    #[test]
+    fn legacy_compaction_preserves_a_complete_backup_without_live_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges = dir.path().canonicalize().unwrap().join("edges");
+        std::fs::create_dir(&edges).unwrap();
+        let project_id = "a1b2c3d4";
+        let path = edges.join(format!("{project_id}.jsonl"));
+        let explicit = Edge {
+            source: EntityRef::parse("task:one").unwrap(),
+            kind: "RELATED_TO".into(),
+            target: EntityRef::parse("task:two").unwrap(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        };
+        let derived = Edge {
+            provenance: EdgeProvenance::Derived,
+            ..explicit.clone()
+        };
+        let original = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&explicit).unwrap(),
+            serde_json::to_string(&derived).unwrap()
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let stats = compact_legacy_sidecar(&edges, project_id, true).unwrap();
+        assert!(stats.applied);
+        assert!(path.is_file());
+        let backup = stats
+            .backup_path
+            .expect("applied compaction keeps a backup");
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        let live = std::fs::read_to_string(path).unwrap();
+        assert!(live.contains("RELATED_TO"));
+        assert!(!live.contains("\"provenance\":\"derived\""));
     }
 }
 

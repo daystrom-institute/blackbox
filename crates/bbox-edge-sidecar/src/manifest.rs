@@ -327,7 +327,11 @@ impl ManifestIndex {
                 }
             }
             idx.receipt_protocol_version = RECEIPT_PROTOCOL_VERSION;
-            idx.write_atomic(edges_dir)?;
+            // A load is observational. Persisting this whole-file upgrade
+            // here raced coordinator-held writers and could overwrite a
+            // snapshot activation that landed after this stale read. The
+            // upgraded value is returned in memory; the next coordinated
+            // mutation persists it together with that mutation.
         } else if idx.receipt_protocol_version != RECEIPT_PROTOCOL_VERSION {
             anyhow::bail!(
                 "manifest receipt protocol version {} != expected {}",
@@ -1487,6 +1491,24 @@ mod tests {
                 .unwrap()
                 .workspaces
                 .contains_key("proj1234")
+        );
+    }
+
+    #[test]
+    fn legacy_receipt_upgrade_is_in_memory_until_a_coordinated_write() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(materialized_dir(dir.path())).unwrap();
+        let mut legacy = ManifestIndex::new();
+        legacy.receipt_protocol_version = 0;
+        let bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        fs::write(manifest_index_path(dir.path()), &bytes).unwrap();
+
+        let loaded = ManifestIndex::load(dir.path()).unwrap();
+        assert_eq!(loaded.receipt_protocol_version, RECEIPT_PROTOCOL_VERSION);
+        assert_eq!(
+            fs::read(manifest_index_path(dir.path())).unwrap(),
+            bytes,
+            "an observational load must not replace a concurrent writer's whole manifest"
         );
     }
 

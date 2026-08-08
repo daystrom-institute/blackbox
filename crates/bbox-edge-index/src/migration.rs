@@ -419,10 +419,15 @@ fn merge_staging_into_lane(staging_path: PathBuf, lane_path: PathBuf) -> Result<
         }
         file.sync_all()?;
     }
-    if lane_path.exists() {
-        fs::remove_file(&lane_path)?;
-    }
+    // POSIX rename replaces an existing regular-file lane atomically. Never
+    // remove the destination first: a kill in that gap used to leave the live
+    // lane absent, after which recovery discarded the only complete staging
+    // copy and silently lost the pre-existing migrated edges.
     fs::rename(&tmp, &lane_path)?;
+    #[cfg(unix)]
+    if let Some(parent) = lane_path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
