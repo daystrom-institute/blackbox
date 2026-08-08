@@ -650,6 +650,13 @@ mod catalog_render_tests {
     #[tokio::test]
     async fn global_render_takes_no_checkout_lease() {
         let fixture = CatalogFixture::new();
+        let render_root = fixture.root().join("global-render");
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", render_root.join("BLACKBOX.md"));
+        env.set("BLACKBOX_GLOBAL_CLAUDE_MD", render_root.join("CLAUDE.md"));
+        env.set("BLACKBOX_GLOBAL_CODEX_MD", render_root.join("AGENTS.md"));
+        env.set("BLACKBOX_GLOBAL_GEMINI_MD", render_root.join("GEMINI.md"));
+        env.set("BLACKBOX_BACKUP_DIR", render_root.join("backups"));
         fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
         let server = fixture.server();
 
@@ -661,6 +668,10 @@ mod catalog_render_tests {
             .await;
 
         assert!(!is_error(&result), "{result:?}");
+        assert!(
+            render_root.join("BLACKBOX.md").is_file(),
+            "the global render must stay inside the test fixture"
+        );
         let attempted: u64 = server
             .state
             .checkout_access
