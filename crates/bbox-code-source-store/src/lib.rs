@@ -11,14 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_code_source::{
-    BeginUploadResponse, CutbackStateV2, DEFAULT_MAX_MANIFEST_FILES,
-    DEFAULT_MAX_MANIFEST_LOGICAL_BYTES, GenerationDescriptor, GenerationState, GenerationStatus,
-    MAX_MANIFEST_PAGE_ENTRIES, ManifestEntry, MissingBlobsPage, generation_id, scope_hash,
-    validate_collected_materialization_selector, validate_manifest, validate_producer_id,
-    validate_sha256,
+    BeginUploadResponse, CutbackErrorClass, CutbackReason, CutbackStateV2,
+    DEFAULT_MAX_MANIFEST_FILES, DEFAULT_MAX_MANIFEST_LOGICAL_BYTES, GenerationDescriptor,
+    GenerationState, GenerationStatus, MAX_MANIFEST_PAGE_ENTRIES, ManifestEntry, MissingBlobsPage,
+    generation_id, scope_hash, validate_collected_materialization_selector, validate_manifest,
+    validate_producer_id, validate_sha256,
 };
-#[cfg(test)]
-use bbox_code_source::{CutbackErrorClass, CutbackReason};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{
@@ -121,6 +119,80 @@ impl std::fmt::Display for StoreRequestError {
 }
 
 impl std::error::Error for StoreRequestError {}
+
+/// Exact activation identity captured by the project-keyed reconciler before
+/// slow cutback staging. The store compares every field under its mutation
+/// lock before applying a cutback outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationFence {
+    project_id: ProjectId,
+    published_scope: PublishedScope,
+    generation_id: String,
+    selector: String,
+    snapshot_id: String,
+    previous_cutback: Option<CutbackStateV2>,
+    authority_revision: CutbackAuthorityRevision,
+}
+
+impl ActivationFence {
+    pub fn from_activation(
+        activation: &ActivationRecordV2,
+        authority_revision: CutbackAuthorityRevision,
+    ) -> Self {
+        Self {
+            project_id: activation.project_id.clone(),
+            published_scope: activation.published_scope.clone(),
+            generation_id: activation.generation_id.clone(),
+            selector: activation.selector.clone(),
+            snapshot_id: activation.snapshot_id.clone(),
+            previous_cutback: activation.cutback.clone(),
+            authority_revision,
+        }
+    }
+
+    pub fn project_id(&self) -> &ProjectId {
+        &self.project_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutbackAuthorityRevision {
+    pub catalog_epoch: u64,
+    pub assignment_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CutbackCompareOutcome {
+    ClearCutback,
+    ClearActivation,
+    Structural(CutbackReason),
+    Transient {
+        error_class: CutbackErrorClass,
+        retry_base_secs: u64,
+        retry_max_secs: u64,
+        max_attempts: u32,
+        now_unix_secs: u64,
+    },
+    Terminal(CutbackErrorClass),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutbackApplyResult {
+    pub persisted: Option<CutbackStateV2>,
+    pub transient_deadline: Option<u64>,
+    pub activation_cleared: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationFenceConflict;
+
+impl std::fmt::Display for ActivationFenceConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("activation changed while cutback work was in flight")
+    }
+}
+
+impl std::error::Error for ActivationFenceConflict {}
 
 struct SharedStoreState {
     limits: RwLock<StoreLimits>,
@@ -3228,6 +3300,17 @@ pub struct RetirementRecord {
     pub generation_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetirementEnqueueConflict;
+
+impl std::fmt::Display for RetirementEnqueueConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("selector already has a different retirement identity")
+    }
+}
+
+impl std::error::Error for RetirementEnqueueConflict {}
+
 impl CodeSourceStore {
     pub fn open(root: impl Into<PathBuf>, limits: StoreLimits) -> Result<Self> {
         Self::open_with_mode(root, limits, RuntimeRecordMode::BridgeV1)
@@ -4473,6 +4556,151 @@ impl CodeSourceStore {
         }
     }
 
+    /// Compare an activation fence and apply one catalog cutback outcome under
+    /// the store mutation lock. This is the only live redrive path that may
+    /// increment the retry ladder or promote it to manual retry.
+    pub fn compare_and_apply_cutback(
+        &self,
+        fence: &ActivationFence,
+        current_authority_revision: CutbackAuthorityRevision,
+        outcome: CutbackCompareOutcome,
+    ) -> Result<CutbackApplyResult> {
+        if self.shared.record_mode == RuntimeRecordMode::BridgeV1 {
+            bail!("error.code_source_record_mode: bridge store refuses v2 activation writes");
+        }
+        if let CutbackCompareOutcome::Transient {
+            retry_base_secs,
+            retry_max_secs,
+            max_attempts,
+            now_unix_secs,
+            ..
+        } = &outcome
+            && (*retry_base_secs == 0
+                || *retry_max_secs < *retry_base_secs
+                || *max_attempts == 0
+                || *now_unix_secs == 0)
+        {
+            bail!("invalid cutback retry policy");
+        }
+        let _guard = self.lock_mutation()?;
+        let Some(mut record) = self.load_activation_v2_locked(fence.project_id.as_str())? else {
+            return Err(anyhow::Error::new(ActivationFenceConflict));
+        };
+        if current_authority_revision != fence.authority_revision
+            || record.project_id != fence.project_id
+            || record.published_scope != fence.published_scope
+            || record.generation_id != fence.generation_id
+            || record.selector != fence.selector
+            || record.snapshot_id != fence.snapshot_id
+            || record.cutback != fence.previous_cutback
+        {
+            return Err(anyhow::Error::new(ActivationFenceConflict));
+        }
+
+        match outcome {
+            CutbackCompareOutcome::ClearActivation => {
+                let path = self.paths.activation(&record.project_id);
+                match fs::remove_file(&path) {
+                    Ok(()) => sync_parent(&path)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(anyhow::Error::new(ActivationFenceConflict));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(CutbackApplyResult {
+                    persisted: None,
+                    transient_deadline: None,
+                    activation_cleared: true,
+                })
+            }
+            CutbackCompareOutcome::ClearCutback => {
+                record.cutback = None;
+                record.cutback_pending = false;
+                record.diagnostic = None;
+                self.save_activation_v2_locked(&record)?;
+                Ok(CutbackApplyResult {
+                    persisted: None,
+                    transient_deadline: None,
+                    activation_cleared: false,
+                })
+            }
+            CutbackCompareOutcome::Structural(reason) => {
+                let persisted = CutbackStateV2::Structural { reason };
+                record.cutback = Some(persisted.clone());
+                record.cutback_pending = true;
+                record.diagnostic = None;
+                self.save_activation_v2_locked(&record)?;
+                Ok(CutbackApplyResult {
+                    persisted: Some(persisted),
+                    transient_deadline: None,
+                    activation_cleared: false,
+                })
+            }
+            CutbackCompareOutcome::Transient {
+                error_class,
+                retry_base_secs,
+                retry_max_secs,
+                max_attempts,
+                now_unix_secs,
+            } => {
+                let previous_attempt = match record.cutback.as_ref() {
+                    Some(CutbackStateV2::Transient { attempt, .. }) => *attempt,
+                    _ => 0,
+                };
+                let next_attempt = previous_attempt.saturating_add(1);
+                let (persisted, transient_deadline) = if next_attempt > max_attempts {
+                    (
+                        CutbackStateV2::ManualRetryRequired {
+                            error_class,
+                            attempt: previous_attempt,
+                        },
+                        None,
+                    )
+                } else {
+                    let deadline = cutback_retry_deadline(
+                        next_attempt,
+                        fence.project_id.as_str(),
+                        retry_base_secs,
+                        retry_max_secs,
+                        now_unix_secs,
+                    );
+                    (
+                        CutbackStateV2::Transient {
+                            attempt: next_attempt,
+                            error_class,
+                            deadline_unix_secs: deadline,
+                        },
+                        Some(deadline),
+                    )
+                };
+                persisted
+                    .validate()
+                    .map_err(|error| anyhow!("error.code_source_cutback_state: {error}"))?;
+                record.cutback = Some(persisted.clone());
+                record.cutback_pending = true;
+                record.diagnostic = None;
+                self.save_activation_v2_locked(&record)?;
+                Ok(CutbackApplyResult {
+                    persisted: Some(persisted),
+                    transient_deadline,
+                    activation_cleared: false,
+                })
+            }
+            CutbackCompareOutcome::Terminal(error_class) => {
+                let persisted = CutbackStateV2::Terminal { error_class };
+                record.cutback = Some(persisted.clone());
+                record.cutback_pending = false;
+                record.diagnostic = None;
+                self.save_activation_v2_locked(&record)?;
+                Ok(CutbackApplyResult {
+                    persisted: Some(persisted),
+                    transient_deadline: None,
+                    activation_cleared: false,
+                })
+            }
+        }
+    }
+
     /// Write the typed cutback state onto the project's v2 activation record
     /// under catalog mode, updating both `cutback` and the derived
     /// `cutback_pending` mirror in one atomic write (section 5.2 item 5).
@@ -4619,6 +4847,12 @@ impl CodeSourceStore {
         let _guard = self.lock_mutation()?;
         validate_retirement_record(record)?;
         let queue_path = self.paths.retirement_for_selector(&record.selector)?;
+        if let Some(existing) = read_retirement_record_nofollow(&queue_path)? {
+            if existing == *record {
+                return Ok(());
+            }
+            return Err(anyhow::Error::new(RetirementEnqueueConflict));
+        }
         atomic_write_json(&queue_path, record)
     }
 
@@ -4844,6 +5078,20 @@ impl CodeSourceStore {
             .entries
             .get(generation_id)
             .ok_or_else(|| anyhow!("collision retirement generation is absent"))?;
+        if entry.state == CollisionRetirementLifecycleStateV1::Completed {
+            let work = CollisionRetirementWorkV1::from_entry(project_id, generation_id, entry);
+            self.record_retained_generation_owner_locked(
+                project_id,
+                &entry.former_scope,
+                generation_id,
+            )?;
+            self.complete_exact_collision_queue_locked(&work)?;
+            return remove_file_if_exists(
+                &self
+                    .paths
+                    .collision_retirement_work(project_id, generation_id)?,
+            );
+        }
         if entry.state != CollisionRetirementLifecycleStateV1::Queued {
             bail!("collision retirement terminal transition requires queued lifecycle state");
         }
@@ -4887,6 +5135,11 @@ impl CodeSourceStore {
         let stored = MixedStoredGeneration::CurrentV2(stored);
         self.save_mixed_generation_locked(&stored)?;
         self.update_desired_if_same_mixed(&stored)?;
+        self.record_retained_generation_owner_locked(
+            project_id,
+            &entry.former_scope,
+            generation_id,
+        )?;
         if stored.state() != GenerationState::Superseded {
             bail!("collision retirement generation did not reach superseded state");
         }
@@ -4903,7 +5156,32 @@ impl CodeSourceStore {
                 .collision_retirement_pending(&lifecycle.project_id),
             &lifecycle,
         )?;
+        self.complete_exact_collision_queue_locked(&work)?;
         remove_file_if_exists(&work_path)
+    }
+
+    fn complete_exact_collision_queue_locked(
+        &self,
+        work: &CollisionRetirementWorkV1,
+    ) -> Result<()> {
+        let Some(selector) = work.exact_selector() else {
+            return Ok(());
+        };
+        let path = self.paths.retirement_for_selector(selector)?;
+        let Some(queued) = read_retirement_record_nofollow(&path)? else {
+            return Ok(());
+        };
+        let expected = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: work.project_id.to_string(),
+            selector: selector.to_string(),
+            snapshot_id: work.snapshot_id.clone(),
+            generation_id: Some(work.generation_id.clone()),
+        };
+        if queued != expected {
+            return Err(anyhow::Error::new(RetirementEnqueueConflict));
+        }
+        remove_file_if_exists(&path)
     }
 
     fn collision_lifecycle_for_project_locked(
@@ -5931,6 +6209,29 @@ fn validate_store_root(root: &Path) -> Result<()> {
         bail!("code-source store root must be an absolute normalized path");
     }
     Ok(())
+}
+
+fn cutback_retry_deadline(
+    attempt: u32,
+    project_id: &str,
+    base_secs: u64,
+    max_secs: u64,
+    now_unix_secs: u64,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let exp = (attempt as u64).saturating_sub(1);
+    let raw = base_secs.saturating_mul(2_u64.saturating_pow(exp.try_into().unwrap_or(u32::MAX)));
+    let capped = raw.min(max_secs);
+    let jitter_max = capped / 4;
+    let jitter = if jitter_max == 0 {
+        0
+    } else {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        project_id.hash(&mut hasher);
+        hasher.finish() % jitter_max
+    };
+    now_unix_secs.saturating_add(capped).saturating_add(jitter)
 }
 
 fn validate_retirement_selector(selector: &str) -> Result<()> {
@@ -7603,6 +7904,28 @@ mod tests {
     }
 
     #[test]
+    fn retirement_enqueue_is_idempotent_but_refuses_selector_identity_collision() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = open_store(&root);
+        let record = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: "project-a".into(),
+            selector: "local:project-a".into(),
+            snapshot_id: "head-aaaaaaaaaaaaaaaa".into(),
+            generation_id: None,
+        };
+        store.enqueue_retirement(&record).unwrap();
+        store.enqueue_retirement(&record).unwrap();
+
+        let mut conflict = record.clone();
+        conflict.snapshot_id = "head-bbbbbbbbbbbbbbbb".into();
+        let error = store.enqueue_retirement(&conflict).unwrap_err();
+        assert!(error.downcast_ref::<RetirementEnqueueConflict>().is_some());
+        assert_eq!(store.retirement_records().unwrap(), vec![record]);
+    }
+
+    #[test]
     fn catalog_v2_retirement_recovers_each_completion_crash_boundary() {
         for owner_written in [false, true] {
             let directory = tempfile::tempdir().unwrap();
@@ -8733,6 +9056,25 @@ mod tests {
             CollisionRetirementLifecycleStateV1::Completed
         );
         assert_eq!(store.collision_retirement_work_records().unwrap().len(), 1);
+        let exact_entry = partial.entry(&exact_generation_id).unwrap();
+        let exact_selector = match &exact_entry.selector_evidence {
+            CollisionRetirementSelectorEvidenceV1::ExactMaterialized(selector) => selector.clone(),
+            CollisionRetirementSelectorEvidenceV1::NoDurableSelector => {
+                panic!("fixture must carry an exact selector")
+            }
+        };
+        let exact_row = RetirementRecord {
+            version: STORE_VERSION,
+            project_id: lifecycle.project_id.to_string(),
+            selector: exact_selector,
+            snapshot_id: exact_entry.snapshot_id.clone(),
+            generation_id: Some(exact_generation_id.clone()),
+        };
+        store.enqueue_retirement(&exact_row).unwrap();
+        store
+            .repair_and_complete_collision_retirement(&lifecycle.project_id, &exact_generation_id)
+            .unwrap();
+        assert!(!store.retirement_pending(&exact_row.selector).unwrap());
         store
             .repair_and_complete_collision_retirement(&lifecycle.project_id, &exact_generation_id)
             .unwrap();
@@ -10364,6 +10706,143 @@ mod tests {
         let records = store.activation_records_mixed().unwrap();
         assert_eq!(records.len(), 1);
         assert!(records[0].is_current_v2());
+    }
+
+    #[test]
+    fn cutback_compare_and_apply_refuses_stale_fences_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        store.save_activation_v2(&activation).unwrap();
+        let revision = CutbackAuthorityRevision {
+            catalog_epoch: 7,
+            assignment_revision: 3,
+        };
+        let fence = ActivationFence::from_activation(&activation, revision);
+
+        let error = store
+            .compare_and_apply_cutback(
+                &fence,
+                CutbackAuthorityRevision {
+                    catalog_epoch: 8,
+                    ..revision
+                },
+                CutbackCompareOutcome::Structural(CutbackReason::NoLocalAttachment),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<ActivationFenceConflict>().is_some());
+        assert!(
+            store
+                .load_activation_mixed("project-a")
+                .unwrap()
+                .unwrap()
+                .cutback()
+                .is_none()
+        );
+
+        store
+            .mark_cutback_state(
+                "project-a",
+                CutbackStateV2::Structural {
+                    reason: CutbackReason::ScopeMismatch,
+                },
+            )
+            .unwrap();
+        let error = store
+            .compare_and_apply_cutback(
+                &fence,
+                revision,
+                CutbackCompareOutcome::Terminal(CutbackErrorClass::SecurityFailure),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<ActivationFenceConflict>().is_some());
+        assert!(matches!(
+            store
+                .load_activation_mixed("project-a")
+                .unwrap()
+                .unwrap()
+                .cutback(),
+            Some(CutbackStateV2::Structural {
+                reason: CutbackReason::ScopeMismatch
+            })
+        ));
+    }
+
+    #[test]
+    fn cutback_compare_and_apply_owns_retry_increment_and_manual_promotion() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        store.save_activation_v2(&activation).unwrap();
+        let revision = CutbackAuthorityRevision {
+            catalog_epoch: 9,
+            assignment_revision: 4,
+        };
+
+        for expected_attempt in 1..=2 {
+            let current = match store.load_activation_mixed("project-a").unwrap().unwrap() {
+                MixedActivationRecord::CurrentV2(current) => current,
+                MixedActivationRecord::LegacyV1(_) => panic!("expected current activation"),
+            };
+            let result = store
+                .compare_and_apply_cutback(
+                    &ActivationFence::from_activation(&current, revision),
+                    revision,
+                    CutbackCompareOutcome::Transient {
+                        error_class: CutbackErrorClass::WriterContention,
+                        retry_base_secs: 10,
+                        retry_max_secs: 60,
+                        max_attempts: 2,
+                        now_unix_secs: 1_700_000_000,
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                result.persisted,
+                Some(CutbackStateV2::Transient { attempt, .. }) if attempt == expected_attempt
+            ));
+            assert!(result.transient_deadline.is_some());
+        }
+
+        let current = match store.load_activation_mixed("project-a").unwrap().unwrap() {
+            MixedActivationRecord::CurrentV2(current) => current,
+            MixedActivationRecord::LegacyV1(_) => panic!("expected current activation"),
+        };
+        let result = store
+            .compare_and_apply_cutback(
+                &ActivationFence::from_activation(&current, revision),
+                revision,
+                CutbackCompareOutcome::Transient {
+                    error_class: CutbackErrorClass::IndexCommit,
+                    retry_base_secs: 10,
+                    retry_max_secs: 60,
+                    max_attempts: 2,
+                    now_unix_secs: 1_700_000_000,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.persisted,
+            Some(CutbackStateV2::ManualRetryRequired {
+                error_class: CutbackErrorClass::IndexCommit,
+                attempt: 2,
+            })
+        );
+        assert_eq!(result.transient_deadline, None);
     }
 
     #[test]

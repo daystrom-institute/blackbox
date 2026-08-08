@@ -17,7 +17,8 @@ use bbox_code_source::{
     MissingBlobsPage, validate_producer_id, validate_scope,
 };
 use bbox_code_source_store::{
-    ActivationRecord, ActivationRecordV2, CodeSourceStore, CollisionRetirementWorkV1,
+    ActivationFence, ActivationFenceConflict, ActivationRecord, ActivationRecordV2,
+    CodeSourceStore, CollisionRetirementWorkV1, CutbackAuthorityRevision, CutbackCompareOutcome,
     MixedActivationRecord, MixedStoredGeneration, RetirementRecord, RuntimeRecordMode, StoreLimits,
     StoreRequestError,
 };
@@ -90,12 +91,32 @@ struct ReconcileEvent {
     project_id: String,
     scope: PublishedScope,
     kind: ReconcileKind,
+    origins: BTreeSet<ReconcileOrigin>,
+    authority_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ReconcileKind {
     Activate,
     Cutback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ReconcileOrigin {
+    AssignmentConfigReload,
+    CatalogCommit,
+    TransientDeadline,
+    SelectorRetirementCompletion,
+    StartupRecovery,
+    ActivationCompletion,
+}
+
+#[derive(Clone, Debug)]
+struct PendingReconcileEvent {
+    scope: PublishedScope,
+    kind: ReconcileKind,
+    origins: BTreeSet<ReconcileOrigin>,
+    authority_revision: Option<u64>,
 }
 
 /// The per-project transition guard (section 4.4). Whoever holds a
@@ -123,15 +144,15 @@ type TransitionGuardMap = std::sync::Mutex<BTreeMap<String, ()>>;
 ///
 /// The reconciler must not disturb persisted cutback state this milestone.
 pub(crate) struct CutbackReconciler {
-    /// Coalesced event set: deduplicated by `(project_id, kind)` so
-    /// repeated triggers collapse into one pass.
-    pending: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PublishedScope>>>,
+    /// Coalesced event set: deduplicated by project id so repeated triggers
+    /// collapse into one pass while retaining every triggering origin.
+    pending: Arc<std::sync::Mutex<BTreeMap<String, PendingReconcileEvent>>>,
     /// Deferred events: an event whose project guard is held goes here
     /// instead of being dropped. On guard release (or the 5s timeout
     /// backstop) the deferred set is merged back into `pending` so the
     /// event fires exactly once after the in-flight transition completes
     /// (section 4.4: coalesce-or-defer, never drop).
-    deferred: Arc<std::sync::Mutex<BTreeMap<(String, ReconcileKind), PublishedScope>>>,
+    deferred: Arc<std::sync::Mutex<BTreeMap<String, PendingReconcileEvent>>>,
     /// Wake signal for the background task. Notified on enqueue and on
     /// guard release.
     notify: Arc<std::sync::Condvar>,
@@ -247,11 +268,34 @@ impl CutbackReconciler {
         }
     }
 
-    /// Enqueue a transition event. Coalesces by `(project_id, kind)`: if
-    /// the same event is already pending, this is a no-op (section 4.4).
-    fn enqueue(&self, project_id: &str, scope: PublishedScope, kind: ReconcileKind) {
+    /// Enqueue a transition event. Coalesces by project id: the latest
+    /// scope/kind/revision wins while origins accumulate (section 4.4).
+    fn enqueue(
+        &self,
+        project_id: &str,
+        scope: PublishedScope,
+        kind: ReconcileKind,
+        origin: ReconcileOrigin,
+        authority_revision: Option<u64>,
+    ) {
         let mut pending = self.pending.lock().unwrap();
-        pending.insert((project_id.to_string(), kind), scope);
+        match pending.entry(project_id.to_string()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(PendingReconcileEvent {
+                    scope,
+                    kind,
+                    origins: BTreeSet::from([origin]),
+                    authority_revision,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut();
+                pending.scope = scope;
+                pending.kind = kind;
+                pending.origins.insert(origin);
+                pending.authority_revision = authority_revision;
+            }
+        }
         self.notify.notify_one();
     }
 
@@ -261,7 +305,23 @@ impl CutbackReconciler {
     /// backstop fires, at which point it is merged back into `pending`.
     fn defer(&self, event: ReconcileEvent) {
         let mut deferred = self.deferred.lock().unwrap();
-        deferred.insert((event.project_id, event.kind), event.scope);
+        match deferred.entry(event.project_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(PendingReconcileEvent {
+                    scope: event.scope,
+                    kind: event.kind,
+                    origins: event.origins,
+                    authority_revision: event.authority_revision,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let deferred = entry.get_mut();
+                deferred.scope = event.scope;
+                deferred.kind = event.kind;
+                deferred.origins.extend(event.origins);
+                deferred.authority_revision = event.authority_revision;
+            }
+        }
     }
 
     /// Merge deferred events back into pending. Called by the background
@@ -274,8 +334,20 @@ impl CutbackReconciler {
         }
         let mut pending = self.pending.lock().unwrap();
         let count = deferred.len();
-        for (key, scope) in deferred.iter() {
-            pending.entry(key.clone()).or_insert_with(|| scope.clone());
+        for (project_id, deferred_event) in deferred.iter() {
+            match pending.entry(project_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(deferred_event.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // Pending was enqueued later and therefore owns the latest
+                    // scope/kind/revision. Deferred contributes origins only.
+                    entry
+                        .get_mut()
+                        .origins
+                        .extend(deferred_event.origins.iter().copied());
+                }
+            }
         }
         deferred.clear();
         count
@@ -286,10 +358,12 @@ impl CutbackReconciler {
         let mut pending = self.pending.lock().unwrap();
         let entries = pending
             .iter()
-            .map(|((project_id, kind), scope)| ReconcileEvent {
+            .map(|(project_id, pending)| ReconcileEvent {
                 project_id: project_id.clone(),
-                scope: scope.clone(),
-                kind: kind.clone(),
+                scope: pending.scope.clone(),
+                kind: pending.kind.clone(),
+                origins: pending.origins.clone(),
+                authority_revision: pending.authority_revision,
             })
             .collect::<Vec<_>>();
         pending.clear();
@@ -345,6 +419,85 @@ struct GuardHandle {
     project_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RetirementWorkKey {
+    Selector(String),
+    Selectorless {
+        project_id: ProjectId,
+        generation_id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetirementWork {
+    Ordinary(RetirementRecord),
+    CollisionExact {
+        record: RetirementRecord,
+        project_id: ProjectId,
+        generation_id: String,
+        former_scope: PublishedScope,
+    },
+    CollisionSelectorless(CollisionRetirementWorkV1),
+}
+
+impl RetirementWork {
+    fn key(&self) -> RetirementWorkKey {
+        match self {
+            Self::Ordinary(record) | Self::CollisionExact { record, .. } => {
+                RetirementWorkKey::Selector(record.selector.clone())
+            }
+            Self::CollisionSelectorless(work) => RetirementWorkKey::Selectorless {
+                project_id: work.project_id.clone(),
+                generation_id: work.generation_id.clone(),
+            },
+        }
+    }
+
+    fn project_id(&self) -> &str {
+        match self {
+            Self::Ordinary(record) | Self::CollisionExact { record, .. } => &record.project_id,
+            Self::CollisionSelectorless(work) => work.project_id.as_str(),
+        }
+    }
+
+    fn same_selector_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ordinary(left), Self::Ordinary(right)) => left == right,
+            (Self::CollisionExact { .. }, Self::CollisionExact { .. }) => self == other,
+            (Self::Ordinary(left), Self::CollisionExact { record: right, .. })
+            | (Self::CollisionExact { record: left, .. }, Self::Ordinary(right)) => left == right,
+            (Self::CollisionSelectorless(left), Self::CollisionSelectorless(right)) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
+struct RetirementWorkEntry {
+    work: RetirementWork,
+    previous_view: Option<Arc<super::CodeReadView>>,
+    attempts: u32,
+    retry_delay: std::time::Duration,
+    next_due: std::time::Instant,
+}
+
+struct RetirementCoordinator {
+    queue: std::sync::Mutex<BTreeMap<RetirementWorkKey, RetirementWorkEntry>>,
+    notify: std::sync::Condvar,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl RetirementCoordinator {
+    fn new() -> Self {
+        Self {
+            queue: std::sync::Mutex::new(BTreeMap::new()),
+            notify: std::sync::Condvar::new(),
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
 impl Drop for GuardHandle {
     fn drop(&mut self) {
         self.guards.lock().unwrap().remove(&self.project_id);
@@ -371,6 +524,10 @@ pub(crate) struct CodeSourceRuntime {
     /// The cutback reconciler event channel. `None` in bridge mode, where
     /// transitions are spawned inline byte-identically to pre-Phase-4.
     reconciler: Option<Arc<CutbackReconciler>>,
+    /// Monotonic generation of the assignment/auth snapshot. Catalog epoch
+    /// and this generation form the cutback authority fence.
+    assignment_revision: std::sync::atomic::AtomicU64,
+    retirement_coordinator: Arc<RetirementCoordinator>,
 }
 
 /// How `build_snapshot` resolves a configured producer scope to the project
@@ -479,6 +636,8 @@ impl CodeSourceRuntime {
             catalog_store,
             transition_guards,
             reconciler,
+            assignment_revision: std::sync::atomic::AtomicU64::new(1),
+            retirement_coordinator: Arc::new(RetirementCoordinator::new()),
         })
     }
 
@@ -508,6 +667,8 @@ impl CodeSourceRuntime {
             .map(|(scope, (project_id, _producer_id))| (scope, project_id))
             .collect();
         *self.snapshot.write() = replacement;
+        self.assignment_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(SourceTransitions {
             cutbacks,
             activations,
@@ -535,6 +696,8 @@ impl CodeSourceRuntime {
             catalog_store: None,
             transition_guards,
             reconciler: None,
+            assignment_revision: std::sync::atomic::AtomicU64::new(1),
+            retirement_coordinator: Arc::new(RetirementCoordinator::new()),
         }
     }
 
@@ -567,6 +730,8 @@ impl CodeSourceRuntime {
             catalog_store: None,
             transition_guards,
             reconciler,
+            assignment_revision: std::sync::atomic::AtomicU64::new(1),
+            retirement_coordinator: Arc::new(RetirementCoordinator::new()),
         }
     }
 
@@ -578,9 +743,16 @@ impl CodeSourceRuntime {
 
     /// Enqueue a transition event to the reconciler channel (section 8.1
     /// item 3). Catalog mode only; bridge mode spawns inline.
-    fn enqueue_transition(&self, project_id: &str, scope: PublishedScope, kind: ReconcileKind) {
+    fn enqueue_transition(
+        &self,
+        project_id: &str,
+        scope: PublishedScope,
+        kind: ReconcileKind,
+        origin: ReconcileOrigin,
+        authority_revision: Option<u64>,
+    ) {
         if let Some(reconciler) = &self.reconciler {
-            reconciler.enqueue(project_id, scope, kind);
+            reconciler.enqueue(project_id, scope, kind, origin, authority_revision);
         }
     }
 
@@ -1184,6 +1356,10 @@ fn schedule_activation(
             retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
         }
         let pending = state.code_sources.end_activation(&project_id);
+        if is_catalog {
+            enqueue_activation_completion(&state, &project_id, &scope);
+            return;
+        }
         if pending
             && let Some((assigned_scope, assigned_project)) = state
                 .code_sources
@@ -1196,6 +1372,61 @@ fn schedule_activation(
         }
         schedule_cutback_if_owner_changed(state, project_id);
     });
+}
+
+/// Every catalog worker emits one completion edge after releasing the
+/// in-memory activation marker and before releasing the transition guard.
+/// The reducer then observes current authority instead of a worker trying to
+/// infer which concurrent trigger won while it was staging.
+fn enqueue_activation_completion(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    fallback_scope: &PublishedScope,
+) {
+    enqueue_current_transition(
+        state,
+        project_id,
+        fallback_scope,
+        ReconcileOrigin::ActivationCompletion,
+        None,
+    );
+}
+
+fn enqueue_current_transition(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    fallback_scope: &PublishedScope,
+    origin: ReconcileOrigin,
+    authority_revision: Option<u64>,
+) {
+    let desired = determine_desired_assignment(state, project_id);
+    let (scope, kind) = match desired {
+        DesiredAssignment::Collected => {
+            let assigned_scope = state
+                .code_sources
+                .assignments()
+                .into_iter()
+                .find_map(|(scope, assigned_project)| {
+                    (assigned_project == project_id).then_some(scope)
+                })
+                .unwrap_or_else(|| fallback_scope.clone());
+            (assigned_scope, ReconcileKind::Activate)
+        }
+        DesiredAssignment::Local | DesiredAssignment::Retired => {
+            let effective_scope = state
+                .code_sources
+                .store()
+                .load_activation_mixed(project_id)
+                .ok()
+                .flatten()
+                .and_then(|activation| activation.published_scope().cloned())
+                .unwrap_or_else(|| fallback_scope.clone());
+            (effective_scope, ReconcileKind::Cutback)
+        }
+    };
+    state
+        .code_sources
+        .enqueue_transition(project_id, scope, kind, origin, authority_revision);
 }
 
 fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String) {
@@ -1222,6 +1453,8 @@ fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String
                 &project_id,
                 generation.descriptor().scope.clone(),
                 ReconcileKind::Cutback,
+                ReconcileOrigin::ActivationCompletion,
+                None,
             );
         } else {
             schedule_cutback(
@@ -1279,6 +1512,8 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
                     project_id,
                     generation.descriptor().scope.clone(),
                     ReconcileKind::Cutback,
+                    ReconcileOrigin::StartupRecovery,
+                    None,
                 );
             } else {
                 schedule_cutback(
@@ -1322,52 +1557,118 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
                     snapshot_id: activation.snapshot_id().to_string(),
                     generation_id: Some(activation.generation_id().to_string()),
                 };
-                if let Err(error) = store
-                    .enqueue_retirement(&retirement)
-                    .and_then(|()| store.clear_activation(activation.project_id()))
-                    .and_then(|()| {
-                        store.clear_health_failure(activation.project_id(), "cutback_pending")
-                    })
-                {
+                let recovery = store.enqueue_retirement(&retirement).and_then(|()| {
+                    if is_catalog {
+                        if let Some(scope) = activation.published_scope().cloned() {
+                            state.code_sources.enqueue_transition(
+                                activation.project_id(),
+                                scope,
+                                ReconcileKind::Cutback,
+                                ReconcileOrigin::StartupRecovery,
+                                None,
+                            );
+                        }
+                        Ok(())
+                    } else {
+                        store.clear_activation(activation.project_id())
+                    }
+                });
+                if let Err(error) = recovery.and_then(|()| {
+                    store.clear_health_failure(activation.project_id(), "cutback_pending")
+                }) {
                     tracing::error!(%error, "recovering completed code-source cutback failed");
                 }
             }
         }
         Err(error) => tracing::error!(%error, "loading code-source activations failed"),
     }
-    match retirement_records_for_recovery(&store) {
-        Ok(records) => {
-            for record in records {
-                spawn_retirement(state.clone(), record, None, RetirementCompletion::Ordinary);
-            }
+    match (
+        collision_retirement_tasks_for_recovery(&store),
+        retirement_records_for_recovery(&store),
+    ) {
+        (Ok(tasks), Ok(records)) => {
+            enqueue_recovered_retirements(state, tasks, records);
         }
-        Err(error) => tracing::error!(%error, "loading code-source retirements failed"),
+        (Err(error), _) => {
+            tracing::error!(%error, "loading collision retirement work failed")
+        }
+        (_, Err(error)) => tracing::error!(%error, "loading code-source retirements failed"),
     }
-    match collision_retirement_tasks_for_recovery(&store) {
-        Ok(tasks) => {
-            for task in tasks {
-                match task {
-                    CollisionRetirementRecoveryTask::Exact { work, selector } => {
-                        let record = RetirementRecord {
-                            version: 1,
-                            project_id: work.project_id.to_string(),
-                            selector,
-                            snapshot_id: work.snapshot_id.clone(),
-                            generation_id: Some(work.generation_id.clone()),
-                        };
-                        let completion = RetirementCompletion::Collision {
-                            project_id: work.project_id,
-                            generation_id: work.generation_id,
-                        };
-                        spawn_retirement(state.clone(), record, None, completion);
-                    }
-                    CollisionRetirementRecoveryTask::Selectorless { work } => {
-                        spawn_selectorless_collision_retirement(state.clone(), work);
-                    }
+}
+
+fn enqueue_recovered_retirements(
+    state: Arc<SharedState>,
+    tasks: Vec<CollisionRetirementRecoveryTask>,
+    records: Vec<RetirementRecord>,
+) {
+    let mut exact = BTreeMap::<String, CollisionRetirementWorkV1>::new();
+    let mut selectorless = Vec::new();
+    for task in tasks {
+        match task {
+            CollisionRetirementRecoveryTask::Exact { work, selector } => {
+                if exact.insert(selector, work).is_some() {
+                    tracing::error!("duplicate exact collision retirement selector refused");
                 }
             }
+            CollisionRetirementRecoveryTask::Selectorless { work } => selectorless.push(work),
         }
-        Err(error) => tracing::error!(%error, "loading collision retirement work failed"),
+    }
+
+    for record in records {
+        let Some(work) = exact.remove(&record.selector) else {
+            spawn_retirement(state.clone(), record, None, RetirementCompletion::Ordinary);
+            continue;
+        };
+        let exact_identity = record.project_id == work.project_id.as_str()
+            && record.snapshot_id == work.snapshot_id
+            && record.generation_id.as_deref() == Some(work.generation_id.as_str())
+            && work.exact_selector() == Some(record.selector.as_str());
+        if !exact_identity {
+            let _ = state.code_sources.store().record_health_failure(
+                work.project_id.as_str(),
+                "retirement_identity_conflict",
+                "retirement queue and collision lifecycle identities disagree",
+            );
+            tracing::error!(
+                project_id = %work.project_id,
+                generation_id = %work.generation_id,
+                "conflicting ordinary and collision retirement identities refused"
+            );
+            continue;
+        }
+        spawn_retirement(
+            state.clone(),
+            record,
+            None,
+            RetirementCompletion::Collision {
+                project_id: work.project_id,
+                generation_id: work.generation_id,
+                former_scope: work.former_scope,
+            },
+        );
+    }
+
+    for (selector, work) in exact {
+        let record = RetirementRecord {
+            version: 1,
+            project_id: work.project_id.to_string(),
+            selector,
+            snapshot_id: work.snapshot_id.clone(),
+            generation_id: Some(work.generation_id.clone()),
+        };
+        spawn_retirement(
+            state.clone(),
+            record,
+            None,
+            RetirementCompletion::Collision {
+                project_id: work.project_id,
+                generation_id: work.generation_id,
+                former_scope: work.former_scope,
+            },
+        );
+    }
+    for work in selectorless {
+        spawn_selectorless_collision_retirement(state.clone(), work);
     }
 }
 
@@ -1425,14 +1726,22 @@ pub(crate) fn apply_source_transitions(state: Arc<SharedState>, transitions: Sou
 /// 8.1 item 3, governing section 12.2).
 fn apply_source_transitions_catalog(state: Arc<SharedState>, transitions: SourceTransitions) {
     for (scope, project_id) in &transitions.cutbacks {
-        state
-            .code_sources
-            .enqueue_transition(project_id, scope.clone(), ReconcileKind::Cutback);
+        state.code_sources.enqueue_transition(
+            project_id,
+            scope.clone(),
+            ReconcileKind::Cutback,
+            ReconcileOrigin::AssignmentConfigReload,
+            None,
+        );
     }
     for (scope, project_id) in &transitions.activations {
-        state
-            .code_sources
-            .enqueue_transition(project_id, scope.clone(), ReconcileKind::Activate);
+        state.code_sources.enqueue_transition(
+            project_id,
+            scope.clone(),
+            ReconcileKind::Activate,
+            ReconcileOrigin::AssignmentConfigReload,
+            None,
+        );
     }
     // Config-event re-entry feed (section 8.1 item 3): every project with a
     // non-None persisted cutback state is re-enqueued so the reconciler
@@ -1449,6 +1758,8 @@ fn apply_source_transitions_catalog(state: Arc<SharedState>, transitions: Source
                             record.project_id(),
                             scope,
                             ReconcileKind::Cutback,
+                            ReconcileOrigin::AssignmentConfigReload,
+                            None,
                         );
                     }
                 }
@@ -1641,13 +1952,15 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                         );
                     }
 
-                    let mut action = evaluate_reduction(
+                    let mut action = evaluate_reduction_for_event(
                         desired,
                         effective,
                         persisted.as_ref(),
                         ladder,
                         bridge_open,
+                        &event.origins,
                     );
+                    action = gate_completion_reentry(action, &event.origins);
                     action = gate_transient_deadline(action, persisted.as_ref(), unix_now());
 
                     tracing::debug!(
@@ -1656,6 +1969,8 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                         ?effective,
                         ?persisted,
                         ?ladder,
+                        ?event.origins,
+                        event.authority_revision,
                         bridge_open,
                         ?action,
                         "reducer: evaluated reduction table"
@@ -1684,7 +1999,12 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                                             "reducer: clearing stale collected activation \
                                              record from cutback crash window"
                                         );
-                                        if let Err(error) = store.clear_activation(&project_id) {
+                                        if let Err(error) = compare_and_apply_current_cutback(
+                                            &state_for_task,
+                                            &project_id,
+                                            &scope,
+                                            CutbackCompareOutcome::ClearActivation,
+                                        ) {
                                             tracing::warn!(
                                                 project_id = %project_id,
                                                 %error,
@@ -1698,7 +2018,12 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                             // Steady-state: guard drops, condvar notified.
                         }
                         ReducerAction::CancelCutback => {
-                            if let Err(error) = store.clear_cutback_state(&project_id) {
+                            if let Err(error) = compare_and_apply_current_cutback(
+                                &state_for_task,
+                                &project_id,
+                                &scope,
+                                CutbackCompareOutcome::ClearCutback,
+                            ) {
                                 tracing::warn!(
                                     project_id = %project_id,
                                     %error,
@@ -1723,8 +2048,12 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                             );
                         }
                         ReducerAction::PersistStructural(reason) => {
-                            let state_v2 = CutbackStateV2::Structural { reason };
-                            if let Err(error) = store.mark_cutback_state(&project_id, state_v2) {
+                            if let Err(error) = compare_and_apply_current_cutback(
+                                &state_for_task,
+                                &project_id,
+                                &scope,
+                                CutbackCompareOutcome::Structural(reason),
+                            ) {
                                 tracing::warn!(
                                     project_id = %project_id,
                                     %error,
@@ -1959,7 +2288,13 @@ pub(crate) fn spawn_commit_observer(state: &Arc<SharedState>) {
                         };
                         state
                             .code_sources
-                            .enqueue_transition(project_id, scope, kind);
+                            .enqueue_transition(
+                                project_id,
+                                scope,
+                                kind,
+                                ReconcileOrigin::CatalogCommit,
+                                Some(event.epoch),
+                            );
                     }
                     tracing::debug!(
                         epoch = event.epoch,
@@ -2043,6 +2378,8 @@ pub(crate) fn spawn_scheduler(state: &Arc<SharedState>, runtime_handle: tokio::r
                             &project_id,
                             scope,
                             ReconcileKind::Cutback,
+                            ReconcileOrigin::TransientDeadline,
+                            None,
                         );
                     } else {
                         tracing::warn!(
@@ -3561,7 +3898,13 @@ pub(crate) fn pre_bind_catalog_recovery(
                     .flatten()
                     .and_then(|a| a.published_scope().cloned());
                 if let Some(scope) = scope {
-                    code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+                    code_sources.enqueue_transition(
+                        project_id,
+                        scope,
+                        ReconcileKind::Cutback,
+                        ReconcileOrigin::StartupRecovery,
+                        None,
+                    );
                 }
             }
             ClassificationOutcome::DeferredToSweep => {
@@ -3575,7 +3918,13 @@ pub(crate) fn pre_bind_catalog_recovery(
                     .flatten()
                     .and_then(|a| a.published_scope().cloned());
                 if let Some(scope) = scope {
-                    code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+                    code_sources.enqueue_transition(
+                        project_id,
+                        scope,
+                        ReconcileKind::Cutback,
+                        ReconcileOrigin::StartupRecovery,
+                        None,
+                    );
                 }
             }
         }
@@ -3628,7 +3977,13 @@ fn resume_persisted_cutback_states_pre_bind(
                         cutback = ?cutback,
                         "startup sweep: re-evaluating structural cutback via reconciler"
                     );
-                    code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+                    code_sources.enqueue_transition(
+                        project_id,
+                        scope,
+                        ReconcileKind::Cutback,
+                        ReconcileOrigin::StartupRecovery,
+                        None,
+                    );
                 }
             }
             CutbackStateV2::Transient {
@@ -3647,6 +4002,8 @@ fn resume_persisted_cutback_states_pre_bind(
                                 project_id,
                                 scope,
                                 ReconcileKind::Cutback,
+                                ReconcileOrigin::StartupRecovery,
+                                None,
                             );
                         }
                     } else {
@@ -3713,7 +4070,13 @@ fn enqueue_desired_effective_mismatches(store: &CodeSourceStore, code_sources: &
             .any(|(_, pid)| pid == project_id);
         if !assigned {
             if let Some(scope) = activation.published_scope().cloned() {
-                code_sources.enqueue_transition(project_id, scope, ReconcileKind::Cutback);
+                code_sources.enqueue_transition(
+                    project_id,
+                    scope,
+                    ReconcileKind::Cutback,
+                    ReconcileOrigin::StartupRecovery,
+                    None,
+                );
             }
         }
     }
@@ -4005,12 +4368,13 @@ fn determine_desired_assignment(state: &Arc<SharedState>, project_id: &str) -> D
 /// project, sets health to `scope_migration_refresh_required`, and
 /// performs no cutback attempt.
 #[allow(clippy::too_many_arguments)]
-fn evaluate_reduction(
+fn evaluate_reduction_for_event(
     desired: DesiredAssignment,
     effective: EffectiveSource,
     persisted: Option<&CutbackStateV2>,
     ladder: LadderResult,
     bridge_open: bool,
+    origins: &BTreeSet<ReconcileOrigin>,
 ) -> ReducerAction {
     // Open-bridge predicate: bridge-exempt project. Clear any
     // pre-existing Structural state and perform no cutback attempt
@@ -4096,9 +4460,16 @@ fn evaluate_reduction(
                     ReducerAction::ReattemptCutback
                 }
                 Some(CutbackStateV2::ManualRetryRequired { .. }) => {
-                    // Steady-state no-op (explicit retry only).
-                    // Config-event re-entry: a config reload re-evaluates.
-                    ReducerAction::NoOp
+                    // Manual retry is sticky across startup, catalog,
+                    // completion, and scheduler noise. Only a fresh operator
+                    // assignment/config event releases it for one attempt.
+                    if origins.contains(&ReconcileOrigin::AssignmentConfigReload)
+                        && ladder == LadderResult::Selected
+                    {
+                        ReducerAction::ReattemptCutback
+                    } else {
+                        ReducerAction::NoOp
+                    }
                 }
                 Some(CutbackStateV2::Terminal { .. }) => {
                     // Steady-state no-op (terminal, never auto-retry).
@@ -4108,6 +4479,46 @@ fn evaluate_reduction(
             }
         }
     }
+}
+
+/// A completion edge is a convergence pass, not independent retry authority.
+/// If no newer/config/readiness origin coalesced with it, it may clear stale
+/// state but must not launch the same worker again immediately.
+fn gate_completion_reentry(
+    action: ReducerAction,
+    origins: &BTreeSet<ReconcileOrigin>,
+) -> ReducerAction {
+    if origins.len() == 1
+        && origins.contains(&ReconcileOrigin::ActivationCompletion)
+        && matches!(
+            action,
+            ReducerAction::Activate
+                | ReducerAction::AttemptCutback
+                | ReducerAction::ReattemptCutback
+        )
+    {
+        ReducerAction::NoOp
+    } else {
+        action
+    }
+}
+
+#[cfg(test)]
+fn evaluate_reduction(
+    desired: DesiredAssignment,
+    effective: EffectiveSource,
+    persisted: Option<&CutbackStateV2>,
+    ladder: LadderResult,
+    bridge_open: bool,
+) -> ReducerAction {
+    evaluate_reduction_for_event(
+        desired,
+        effective,
+        persisted,
+        ladder,
+        bridge_open,
+        &BTreeSet::new(),
+    )
 }
 
 /// Catalog-mode one-attempt cutback driver (section 9.1).
@@ -4126,11 +4537,64 @@ fn evaluate_reduction(
 ///
 /// The caller (reconciler) holds the transition guard via the `guard`
 /// parameter; it drops when this function returns.
+fn current_cutback_authority_revision(state: &Arc<SharedState>) -> CutbackAuthorityRevision {
+    CutbackAuthorityRevision {
+        catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
+        assignment_revision: state
+            .code_sources
+            .assignment_revision
+            .load(std::sync::atomic::Ordering::Acquire),
+    }
+}
+
+fn compare_and_apply_current_cutback(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    fallback_scope: &PublishedScope,
+    outcome: CutbackCompareOutcome,
+) -> Result<()> {
+    let store = state.code_sources.store();
+    let initial_revision = current_cutback_authority_revision(state);
+    let activation = match store.load_activation_mixed(project_id)? {
+        Some(MixedActivationRecord::CurrentV2(activation)) => activation,
+        Some(MixedActivationRecord::LegacyV1(_)) => {
+            bail!("catalog reducer found a legacy activation record")
+        }
+        None => return Ok(()),
+    };
+    let fence = ActivationFence::from_activation(&activation, initial_revision);
+    let current_revision = current_cutback_authority_revision(state);
+    match store.compare_and_apply_cutback(&fence, current_revision, outcome) {
+        Ok(_) => Ok(()),
+        Err(error) if error.downcast_ref::<ActivationFenceConflict>().is_some() => {
+            enqueue_current_transition(
+                state,
+                project_id,
+                fallback_scope,
+                ReconcileOrigin::CatalogCommit,
+                Some(current_revision.catalog_epoch),
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn attempt_cutback_catalog(
     state: &Arc<SharedState>,
     scope: &PublishedScope,
     project_id: &str,
-) -> Result<CutbackAttemptOutcome> {
+) -> Result<FencedCutbackAttempt> {
+    let store = state.code_sources.store();
+    let activation = match store.load_activation_mixed(project_id)? {
+        Some(MixedActivationRecord::CurrentV2(activation)) => activation,
+        Some(MixedActivationRecord::LegacyV1(_)) | None => {
+            bail!("catalog cutback has no current activation to fence")
+        }
+    };
+    let fence =
+        ActivationFence::from_activation(&activation, current_cutback_authority_revision(state));
+
     // a. Resolve identity from the catalog snapshot.
     let identity = resolve_code_project_identity(state, project_id, "catalog cutback attempt")?;
 
@@ -4148,7 +4612,10 @@ fn attempt_cutback_catalog(
     }) {
         Ok(lease) => lease,
         Err(error) => {
-            return Ok(classify_checkout_error(&error));
+            return Ok(FencedCutbackAttempt {
+                fence,
+                outcome: classify_checkout_error(&error),
+            });
         }
     };
 
@@ -4157,25 +4624,81 @@ fn attempt_cutback_catalog(
     //    driver instead of parking in a sleep loop.
     drop(lease);
     match cutback_to_local_single_attempt(state, scope, project_id, &identity) {
-        Ok(()) => Ok(CutbackAttemptOutcome::Success),
-        Err(error) => Ok(classify_staging_error(&error, state)),
+        Ok(success) => Ok(FencedCutbackAttempt {
+            fence,
+            outcome: CutbackAttemptOutcome::Success(success),
+        }),
+        Err(error) => Ok(FencedCutbackAttempt {
+            fence,
+            outcome: classify_staging_error(&error),
+        }),
     }
+}
+
+#[derive(Debug)]
+struct FencedCutbackAttempt {
+    fence: ActivationFence,
+    outcome: CutbackAttemptOutcome,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CutbackSuccessOutcome {
+    ClearCutback,
+    ClearActivation,
 }
 
 /// The outcome of a catalog-mode cutback attempt (section 9.1).
 #[derive(Debug)]
 enum CutbackAttemptOutcome {
     /// Cutback succeeded: local activation complete, state cleared.
-    Success,
+    Success(CutbackSuccessOutcome),
     /// Structural reason: persist without polling. Re-evaluated by
     /// attachment event or config reload.
     Structural(CutbackReason),
     /// Transient failure: persist attempt+1, deadline, error class.
     /// After the configured cap: ManualRetryRequired.
     Transient(CutbackErrorClass),
+    /// Staging is blocked by a durable selector-retirement row. This is a
+    /// readiness dependency, not an attempt failure: do not advance or
+    /// replace the persisted cutback ladder.
+    ReadinessDeferred,
     /// Terminal failure (validation/security): GC root, never auto-retry.
     Terminal(CutbackErrorClass),
 }
+
+#[derive(Debug)]
+struct SelectorRetirementQueued;
+
+impl std::fmt::Display for SelectorRetirementQueued {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("code-source selector retirement remains queued before staging")
+    }
+}
+
+impl std::error::Error for SelectorRetirementQueued {}
+
+#[derive(Debug)]
+struct StagingValidationRefusal;
+
+impl std::fmt::Display for StagingValidationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("staged code-source validation refused publication")
+    }
+}
+
+impl std::error::Error for StagingValidationRefusal {}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct StagingSecurityRefusal;
+
+impl std::fmt::Display for StagingSecurityRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("staged code-source security policy refused publication")
+    }
+}
+
+impl std::error::Error for StagingSecurityRefusal {}
 
 /// Classify a checkout access error into a structural cutback reason
 /// (section 9.1 step b).
@@ -4214,13 +4737,25 @@ fn classify_checkout_error(error: &CheckoutAccessError) -> CutbackAttemptOutcome
 
 /// Classify a staging error into a transient or terminal cutback class
 /// (section 9.1 step c-d).
-fn classify_staging_error(
-    error: &anyhow::Error,
-    state: &Arc<SharedState>,
-) -> CutbackAttemptOutcome {
-    // WriterContention: the index writer pass is in progress.
-    if writer_pass_in_progress(error) {
-        return CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention);
+fn classify_staging_error(error: &anyhow::Error) -> CutbackAttemptOutcome {
+    use bbox_indexing::index::writer_actor::IndexWriterRetryableError;
+
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<SelectorRetirementQueued>().is_some())
+    {
+        return CutbackAttemptOutcome::ReadinessDeferred;
+    }
+    for cause in error.chain() {
+        match cause.downcast_ref::<IndexWriterRetryableError>() {
+            Some(IndexWriterRetryableError::ReindexPassInProgress) => {
+                return CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention);
+            }
+            Some(IndexWriterRetryableError::VectorStoreWarming) => {
+                return CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit);
+            }
+            None => {}
+        }
     }
     // IoPressure: disk or IO failure.
     if error
@@ -4229,18 +4764,33 @@ fn classify_staging_error(
     {
         return CutbackAttemptOutcome::Transient(CutbackErrorClass::IoPressure);
     }
-    // ValidationFailure: scope agreement or coherence check.
-    if error.to_string().contains("code_source_scope_agreement")
-        || error.to_string().contains("code_source_cutback_coherence")
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StagingValidationRefusal>().is_some())
+        || error.chain().any(|cause| {
+            let message = cause.to_string();
+            message.starts_with("error.code_source_scope_agreement:")
+                || message.starts_with("error.code_source_cutback_coherence:")
+        })
     {
         return CutbackAttemptOutcome::Terminal(CutbackErrorClass::ValidationFailure);
     }
-    // SecurityFailure: any security-context error.
-    if error.to_string().contains("security") || error.to_string().contains("SecurityFailure") {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StagingSecurityRefusal>().is_some())
+    {
         return CutbackAttemptOutcome::Terminal(CutbackErrorClass::SecurityFailure);
     }
-    // Default: treat as IndexCommit (transient).
-    let _ = state;
+    // Unknown failures remain retryable. Preserve a bounded chain in logs so
+    // a new typed boundary can be added without turning incidental wording
+    // into a terminal state.
+    let mut chain = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+    chain.truncate(512);
+    tracing::warn!(error_chain = %chain, "catalog cutback: untyped staging failure classified transiently");
     CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit)
 }
 
@@ -4249,6 +4799,7 @@ fn classify_staging_error(
 ///
 /// base * 2^(attempt-1), capped at max_secs, jitter derived from a stable
 /// hash of project_id (0 to 25 percent of the current delay).
+#[cfg(test)]
 fn compute_retry_deadline(attempt: u32, project_id: &str, base_secs: u64, max_secs: u64) -> u64 {
     let exp = (attempt as u64).saturating_sub(1);
     let raw = base_secs.saturating_mul(2_u64.saturating_pow(exp.try_into().unwrap_or(u32::MAX)));
@@ -4265,6 +4816,7 @@ fn compute_retry_deadline(attempt: u32, project_id: &str, base_secs: u64, max_se
 }
 
 /// Stable hash of a project id for deterministic jitter (section 4.3).
+#[cfg(test)]
 fn stable_project_id_hash(project_id: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -4282,7 +4834,7 @@ fn cutback_to_local_single_attempt(
     scope: &PublishedScope,
     project_id: &str,
     identity: &CodeProjectIdentity,
-) -> Result<()> {
+) -> Result<CutbackSuccessOutcome> {
     let store = state.code_sources.store();
     let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
@@ -4303,14 +4855,11 @@ fn cutback_to_local_single_attempt(
         // only by activation replacement or explicit retirement discharge.
         if let Ok(Some(activation)) = store.load_activation_mixed(project_id) {
             if activation.selector().starts_with("collected:") {
-                let _ = store.clear_cutback_state(project_id);
-                return Ok(());
+                return Ok(CutbackSuccessOutcome::ClearCutback);
             }
         }
-        store.clear_activation(project_id)?;
-        return Ok(());
+        return Ok(CutbackSuccessOutcome::ClearActivation);
     }
-    store.mark_cutback_pending_mixed(project_id, "local cutback is staging")?;
     ensure_selector_staging_available(
         store.as_ref(),
         &bbox_code_source::local_selector(project_id),
@@ -4324,7 +4873,7 @@ fn cutback_to_local_single_attempt(
     ) {
         Ok(staged) => staged,
         Err(error) if writer_pass_in_progress(&error) => {
-            return Err(anyhow!("error.cutback_writer_contention: {error}"));
+            return Err(error.context("index writer contention during catalog cutback staging"));
         }
         Err(error) => return Err(error),
     };
@@ -4338,7 +4887,7 @@ fn cutback_to_local_single_attempt(
         .verify_code_selector_document_count(&staged.selector, staged.document_count)
     {
         schedule_unactivated_retirement(state, project_id, &staged, None)?;
-        return Err(error);
+        return Err(error.context(StagingValidationRefusal));
     }
     let previous_entry = manifest.workspaces.get(project_id).cloned();
     let previous_view = state.code_read_view.read().clone();
@@ -4396,7 +4945,6 @@ fn cutback_to_local_single_attempt(
         &staged.selector,
         previous_view,
     )?;
-    store.clear_activation(project_id)?;
     store.clear_health_failure(project_id, "cutback_pending")?;
     tracing::info!(
         project_id,
@@ -4413,7 +4961,7 @@ fn cutback_to_local_single_attempt(
         "",
         &overlay_chunk_targets,
     );
-    Ok(())
+    Ok(CutbackSuccessOutcome::ClearActivation)
 }
 
 /// Catalog-mode schedule_cutback: one attempt, persist outcome, return
@@ -4431,102 +4979,149 @@ fn schedule_cutback_catalog(
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
         let pid = project_id.as_str();
-        let outcome = attempt_cutback_catalog(&state, &scope, pid);
+        let attempt = attempt_cutback_catalog(&state, &scope, pid);
         let store = state.code_sources.store();
-        let config = state.config.read();
-        let cc = &config.code_collection;
+        let (retry_base_secs, retry_max_secs, max_attempts) = {
+            let config = state.config.read();
+            (
+                config.code_collection.cutback_retry_base_secs,
+                config.code_collection.cutback_retry_max_secs,
+                config.code_collection.cutback_max_attempts,
+            )
+        };
 
-        match outcome {
-            Ok(CutbackAttemptOutcome::Success) => {
-                if let Err(error) = store.clear_cutback_state(pid) {
-                    tracing::warn!(project_id = pid, %error, "clearing cutback state after success failed");
-                }
-                let _ = store.clear_health_failure(pid, "cutback_pending");
-            }
-            Ok(CutbackAttemptOutcome::Structural(reason)) => {
-                let state_v2 = CutbackStateV2::Structural { reason };
-                if let Err(error) = store.mark_cutback_state(pid, state_v2.clone()) {
-                    tracing::warn!(project_id = pid, %error, "persisting structural cutback state failed");
-                }
-                tracing::info!(
-                    project_id = pid,
-                    ?reason,
-                    "catalog cutback: structural reason persisted, worker returns"
-                );
-            }
-            Ok(CutbackAttemptOutcome::Transient(class)) => {
-                let now_state = store
-                    .load_activation_mixed(pid)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.cutback().cloned());
-                let prev_attempt = match &now_state {
-                    Some(CutbackStateV2::Transient { attempt, .. }) => *attempt,
-                    _ => 0,
-                };
-                let next_attempt = prev_attempt + 1;
-                if next_attempt > cc.cutback_max_attempts {
-                    let mr = CutbackStateV2::ManualRetryRequired {
-                        error_class: class,
-                        attempt: prev_attempt,
-                    };
-                    if let Err(error) = store.mark_cutback_state(pid, mr) {
-                        tracing::warn!(project_id = pid, %error, "persisting ManualRetryRequired failed");
-                    }
-                    let _ = store.record_health_failure(
-                        pid,
-                        "cutback_manual_retry_required",
-                        "cutback exhausted retry budget; config reload required",
-                    );
-                    tracing::warn!(
-                        project_id = pid,
-                        ?class,
-                        "catalog cutback: retry budget exhausted, ManualRetryRequired persisted"
-                    );
-                } else {
-                    let deadline = compute_retry_deadline(
-                        next_attempt,
-                        pid,
-                        cc.cutback_retry_base_secs,
-                        cc.cutback_retry_max_secs,
-                    );
-                    let t = CutbackStateV2::Transient {
-                        attempt: next_attempt,
-                        error_class: class,
-                        deadline_unix_secs: deadline,
-                    };
-                    if let Err(error) = store.mark_cutback_state(pid, t) {
-                        tracing::warn!(project_id = pid, %error, "persisting Transient cutback state failed");
-                    }
-                    // Signal the bounded scheduler so it re-attempts when
-                    // the deadline arrives (section 9.2).
-                    if let Some(reconciler) = state.code_sources.reconciler() {
-                        reconciler.register_transient(deadline, pid);
-                    }
-                    tracing::info!(
-                        project_id = pid,
-                        ?class,
-                        attempt = next_attempt,
-                        deadline,
-                        "catalog cutback: transient failure, deadline persisted"
-                    );
-                }
-            }
-            Ok(CutbackAttemptOutcome::Terminal(class)) => {
-                let t = CutbackStateV2::Terminal { error_class: class };
-                if let Err(error) = store.mark_cutback_state(pid, t.clone()) {
-                    tracing::warn!(project_id = pid, %error, "persisting Terminal cutback state failed");
-                }
+        match attempt {
+            Ok(FencedCutbackAttempt {
+                outcome: CutbackAttemptOutcome::ReadinessDeferred,
+                ..
+            }) => {
                 let _ = store.record_health_failure(
                     pid,
-                    "cutback_terminal",
-                    "cutback failed terminally; collected generation stays authoritative",
+                    "cutback_waiting_selector_retirement",
+                    "cutback is waiting for selector retirement to complete",
                 );
-                tracing::error!(
+                tracing::info!(
                     project_id = pid,
-                    ?class,
-                    "catalog cutback: terminal failure persisted, generation stays authoritative"
+                    "catalog cutback: selector retirement still queued; attempt ladder unchanged"
                 );
+            }
+            Ok(FencedCutbackAttempt { fence, outcome }) => {
+                let authority_revision = current_cutback_authority_revision(&state);
+                let compare_outcome = match outcome {
+                    CutbackAttemptOutcome::Success(CutbackSuccessOutcome::ClearCutback) => {
+                        CutbackCompareOutcome::ClearCutback
+                    }
+                    CutbackAttemptOutcome::Success(CutbackSuccessOutcome::ClearActivation) => {
+                        CutbackCompareOutcome::ClearActivation
+                    }
+                    CutbackAttemptOutcome::Structural(reason) => {
+                        CutbackCompareOutcome::Structural(reason)
+                    }
+                    CutbackAttemptOutcome::Transient(error_class) => {
+                        CutbackCompareOutcome::Transient {
+                            error_class,
+                            retry_base_secs,
+                            retry_max_secs,
+                            max_attempts,
+                            now_unix_secs: unix_now(),
+                        }
+                    }
+                    CutbackAttemptOutcome::Terminal(error_class) => {
+                        CutbackCompareOutcome::Terminal(error_class)
+                    }
+                    CutbackAttemptOutcome::ReadinessDeferred => unreachable!(),
+                };
+                match store.compare_and_apply_cutback(&fence, authority_revision, compare_outcome) {
+                    Ok(applied) => {
+                        let _ =
+                            store.clear_health_failure(pid, "cutback_waiting_selector_retirement");
+                        match applied.persisted.as_ref() {
+                            Some(CutbackStateV2::Transient {
+                                attempt,
+                                error_class,
+                                deadline_unix_secs,
+                            }) => {
+                                if let Some(reconciler) = state.code_sources.reconciler() {
+                                    reconciler.register_transient(*deadline_unix_secs, pid);
+                                }
+                                tracing::info!(
+                                    project_id = pid,
+                                    ?error_class,
+                                    attempt,
+                                    deadline = deadline_unix_secs,
+                                    "catalog cutback: transient outcome committed"
+                                );
+                            }
+                            Some(CutbackStateV2::ManualRetryRequired {
+                                error_class,
+                                attempt,
+                            }) => {
+                                let _ = store.record_health_failure(
+                                    pid,
+                                    "cutback_manual_retry_required",
+                                    "cutback exhausted retry budget; config reload required",
+                                );
+                                tracing::warn!(
+                                    project_id = pid,
+                                    ?error_class,
+                                    attempt,
+                                    "catalog cutback: retry budget exhausted"
+                                );
+                            }
+                            Some(CutbackStateV2::Terminal { error_class }) => {
+                                let _ = store.record_health_failure(
+                                    pid,
+                                    "cutback_terminal",
+                                    "cutback failed terminally; collected generation stays authoritative",
+                                );
+                                tracing::error!(
+                                    project_id = pid,
+                                    ?error_class,
+                                    "catalog cutback: terminal outcome committed"
+                                );
+                            }
+                            Some(CutbackStateV2::Structural { reason }) => {
+                                tracing::info!(
+                                    project_id = pid,
+                                    ?reason,
+                                    "catalog cutback: structural outcome committed"
+                                );
+                            }
+                            None => {
+                                let _ = store.clear_health_failure(pid, "cutback_pending");
+                                let _ = store
+                                    .clear_health_failure(pid, "cutback_manual_retry_required");
+                                let _ = store.clear_health_failure(pid, "cutback_terminal");
+                            }
+                        }
+                    }
+                    Err(error) if error.downcast_ref::<ActivationFenceConflict>().is_some() => {
+                        tracing::info!(
+                            project_id = pid,
+                            catalog_epoch = authority_revision.catalog_epoch,
+                            "catalog cutback: stale activation fence discarded"
+                        );
+                        enqueue_current_transition(
+                            &state,
+                            pid,
+                            &scope,
+                            ReconcileOrigin::CatalogCommit,
+                            Some(authority_revision.catalog_epoch),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = store.record_health_failure(
+                            pid,
+                            "cutback_pending",
+                            "cutback outcome commit failed; inspect daemon logs",
+                        );
+                        tracing::error!(
+                            project_id = pid,
+                            %error,
+                            "catalog cutback outcome compare-and-apply failed"
+                        );
+                    }
+                }
             }
             Err(error) => {
                 let _ = store.record_health_failure(
@@ -4542,6 +5137,7 @@ fn schedule_cutback_catalog(
             }
         }
         let _pending = state.code_sources.end_activation(pid);
+        enqueue_activation_completion(&state, pid, &scope);
     });
 }
 
@@ -4853,10 +5449,8 @@ fn activate_desired_loop(
                     // immediately instead of sleeping. The caller
                     // handles the transient error.
                     if state.code_sources.store().record_mode() == RuntimeRecordMode::CatalogV2 {
-                        return Err(anyhow!(
-                            "error.cutback_writer_contention: \
-                             index writer pass in progress during activation: {error}"
-                        ));
+                        return Err(error
+                            .context("index writer contention during catalog activation staging"));
                     }
                     if !state.code_sources.assignment_authorizes(
                         scope,
@@ -4989,7 +5583,7 @@ fn activate_desired_loop(
             };
             activation
                 .validate_against_generation(&generation_v2)
-                .map_err(|error| anyhow!("error.code_source_scope_agreement: {error}"))?;
+                .map_err(|error| error.context(StagingValidationRefusal))?;
             store.save_activation_v2(&activation)?;
         } else {
             store.save_activation(&ActivationRecord {
@@ -5206,7 +5800,7 @@ fn ensure_selector_staging_available(store: &CodeSourceStore, selector: &str) ->
     // The per-project activation lane is the sole runtime enqueuer for its
     // selectors. A durable queue row therefore separates two staging epochs.
     if store.retirement_pending(selector)? {
-        bail!("code-source selector retirement remains queued before staging");
+        return Err(anyhow::Error::new(SelectorRetirementQueued));
     }
     Ok(())
 }
@@ -5259,212 +5853,20 @@ fn spawn_retirement(
     previous_view: Option<Arc<super::CodeReadView>>,
     completion: RetirementCompletion,
 ) {
-    if let Err(error) = std::thread::Builder::new()
-        .name("blackbox-code-source-retirement".to_string())
-        .spawn(move || {
-            if let Some(previous_view) = previous_view {
-                while Arc::strong_count(&previous_view) > 1 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-            let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
-            let active_selector =
-                match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
-                    Ok(manifest) => manifest
-                        .workspaces
-                        .get(&record.project_id)
-                        .cloned()
-                        .and_then(|entry| entry.code_source_selector),
-                    Err(error) => {
-                        let _ = state.code_sources.store().record_health_failure(
-                            &record.project_id,
-                            "retirement_failed",
-                            "retirement failed; inspect daemon logs",
-                        );
-                        tracing::error!(%error, "code-source retirement authority read failed");
-                        return;
-                    }
-                };
-            if active_selector.as_deref() == Some(record.selector.as_str()) {
-                return;
-            }
-            let mut retry_attempts = 0;
-            let mut retry_delay = std::time::Duration::from_secs(1);
-            loop {
-                let selector_is_active =
-                    match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
-                        Ok(manifest) => manifest.workspaces.values().any(|entry| {
-                            entry.code_source_selector.as_deref() == Some(record.selector.as_str())
-                        }),
-                        Err(error) => {
-                            let _ = state.code_sources.store().record_health_failure(
-                                &record.project_id,
-                                "retirement_failed",
-                                "retirement failed; inspect daemon logs",
-                            );
-                            tracing::error!(%error, "code-source retirement authority read failed");
-                            return;
-                        }
-                    };
-                if selector_is_active {
-                    return;
-                }
-                match state
-                    .index_writer
-                    .retire_code_selector(record.selector.clone())
-                {
-                    Ok(retired) => {
-                        tracing::info!(
-                            project_id = %record.project_id,
-                            selector = %record.selector,
-                            document_count = retired.document_count,
-                            "retired inactive code-source selector"
-                        );
-                        if let Err(error) = retired.begin_cleanup() {
-                            let _ = state.code_sources.store().record_health_failure(
-                                &record.project_id,
-                                "retirement_failed",
-                                "retirement cleanup hold expired; work remains queued",
-                            );
-                            tracing::error!(%error, "selector retirement cleanup hold expired");
-                            return;
-                        }
-                        let cleanup = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
-                            let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-                                &edges_dir,
-                            )?;
-                            let selector_is_active = manifest.workspaces.values().any(|entry| {
-                                entry.code_source_selector.as_deref()
-                                    == Some(record.selector.as_str())
-                            });
-                            let snapshot_is_active = manifest
-                                .workspaces
-                                .get(&record.project_id)
-                                .and_then(|entry| entry.active_snapshot.as_deref())
-                                == Some(
-                                    bbox_edge_sidecar::snapshot::active_snapshot_rel(
-                                        &record.project_id,
-                                        &record.snapshot_id,
-                                    )
-                                    .as_str(),
-                                );
-                            if selector_is_active || snapshot_is_active {
-                                return Ok(false);
-                            }
-                            if !record.snapshot_id.contains('/')
-                                && !record.snapshot_id.contains('\\')
-                                && record.snapshot_id != "."
-                                && record.snapshot_id != ".."
-                            {
-                                let snapshot = bbox_edge_sidecar::snapshot::snapshot_dir(
-                                    &edges_dir,
-                                    &record.project_id,
-                                    &record.snapshot_id,
-                                );
-                                if snapshot.is_dir() {
-                                    std::fs::remove_dir_all(&snapshot)?;
-                                }
-                            }
-                            Ok(true)
-                        });
-                        match cleanup {
-                            Ok(true) => {}
-                            Ok(false) => return,
-                            Err(error) => {
-                                let _ = state.code_sources.store().record_health_failure(
-                                    &record.project_id,
-                                    "retirement_failed",
-                                    "retirement failed; inspect daemon logs",
-                                );
-                                tracing::error!(%error, "retired snapshot cleanup failed");
-                                return;
-                            }
-                        }
-                        let store = state.code_sources.store();
-                        match &completion {
-                            RetirementCompletion::Collision {
-                                project_id,
-                                generation_id,
-                            } => {
-                                if let Err(error) = repair_and_complete_collision_retirement(
-                                    &store,
-                                    project_id,
-                                    generation_id,
-                                ) {
-                                    let _ = store.record_health_failure(
-                                        project_id.as_str(),
-                                        "retirement_failed",
-                                        "retirement failed; inspect daemon logs",
-                                    );
-                                    tracing::error!(
-                                        project_id = %project_id,
-                                        generation_id,
-                                        %error,
-                                        "collision retirement generation repair failed"
-                                    );
-                                    return;
-                                }
-                            }
-                            RetirementCompletion::Ordinary => {
-                                if let Err(error) = store.complete_retirement(&record) {
-                                    let _ = store.record_health_failure(
-                                        &record.project_id,
-                                        "retirement_failed",
-                                        "retirement failed; inspect daemon logs",
-                                    );
-                                    tracing::error!(
-                                        %error,
-                                        "code-source retirement completion failed"
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                        let _ = store.clear_health_failure(
-                            &record.project_id,
-                            "retirement_failed",
-                        );
-                        drop(retired);
-                        return;
-                    }
-                    Err(error) if selector_retirement_retryable(&error) => {
-                        let Some(delay) = take_selector_retirement_retry(
-                            &mut retry_attempts,
-                            &mut retry_delay,
-                        ) else {
-                            let _ = state.code_sources.store().record_health_failure(
-                                &record.project_id,
-                                "retirement_failed",
-                                "retirement retry budget exhausted; work remains queued",
-                            );
-                            tracing::error!(
-                                %error,
-                                attempts = retry_attempts,
-                                redrive_secs = SELECTOR_RETIREMENT_REDRIVE_DELAY.as_secs(),
-                                "code-source selector retirement retry budget exhausted; scheduling in-process redrive"
-                            );
-                            std::thread::sleep(SELECTOR_RETIREMENT_REDRIVE_DELAY);
-                            retry_attempts = 0;
-                            retry_delay = std::time::Duration::from_secs(1);
-                            continue;
-                        };
-                        std::thread::sleep(delay);
-                    }
-                    Err(error) => {
-                        let _ = state.code_sources.store().record_health_failure(
-                            &record.project_id,
-                            "retirement_failed",
-                            "retirement failed; inspect daemon logs",
-                        );
-                        tracing::error!(%error, "code-source selector retirement failed");
-                        return;
-                    }
-                }
-            }
-        })
-    {
-        tracing::error!(%error, "spawning code-source retirement thread failed");
-    }
+    let work = match completion {
+        RetirementCompletion::Ordinary => RetirementWork::Ordinary(record),
+        RetirementCompletion::Collision {
+            project_id,
+            generation_id,
+            former_scope,
+        } => RetirementWork::CollisionExact {
+            record,
+            project_id,
+            generation_id,
+            former_scope,
+        },
+    };
+    enqueue_retirement_work(state, work, previous_view);
 }
 
 #[derive(Debug, Clone)]
@@ -5473,7 +5875,373 @@ enum RetirementCompletion {
     Collision {
         project_id: ProjectId,
         generation_id: String,
+        former_scope: PublishedScope,
     },
+}
+
+enum RetirementAttempt {
+    Complete,
+    WaitingForReaders,
+    DeferredActive,
+    Retryable(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
+fn enqueue_retirement_work(
+    state: Arc<SharedState>,
+    work: RetirementWork,
+    previous_view: Option<Arc<super::CodeReadView>>,
+) {
+    let coordinator = state.code_sources.retirement_coordinator.clone();
+    let key = work.key();
+    {
+        let mut queue = coordinator.queue.lock().unwrap();
+        match queue.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(RetirementWorkEntry {
+                    work,
+                    previous_view,
+                    attempts: 0,
+                    retry_delay: std::time::Duration::from_secs(1),
+                    next_due: std::time::Instant::now(),
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if !entry.get().work.same_selector_identity(&work) {
+                    let project_id = work.project_id().to_string();
+                    drop(queue);
+                    let _ = state.code_sources.store().record_health_failure(
+                        &project_id,
+                        "retirement_identity_conflict",
+                        "retirement coordinator received conflicting work for one key",
+                    );
+                    tracing::error!(
+                        project_id,
+                        "retirement coordinator refused conflicting keyed work"
+                    );
+                    return;
+                }
+                let current = entry.get_mut();
+                if matches!(&work, RetirementWork::CollisionExact { .. }) {
+                    current.work = work;
+                }
+                if current.previous_view.is_none() {
+                    current.previous_view = previous_view;
+                }
+                current.next_due = std::time::Instant::now();
+            }
+        }
+    }
+    coordinator.notify.notify_one();
+
+    if coordinator
+        .started
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        let shutdown = state.reconciler_shutdown.read().clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("blackbox-code-source-retirement".to_string())
+            .spawn(move || retirement_coordinator_loop(state, coordinator, shutdown))
+        {
+            tracing::error!(%error, "spawning code-source retirement coordinator failed");
+        }
+    }
+}
+
+fn retirement_coordinator_loop(
+    state: Arc<SharedState>,
+    coordinator: Arc<RetirementCoordinator>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+    while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        let mut entry = {
+            let mut queue = coordinator.queue.lock().unwrap();
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                let next = queue
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.next_due)
+                    .map(|(key, entry)| (key.clone(), entry.next_due));
+                match next {
+                    Some((key, due)) if due <= now => {
+                        break queue.remove(&key).expect("selected retirement work exists");
+                    }
+                    Some((_key, due)) => {
+                        let wait = due
+                            .saturating_duration_since(now)
+                            .min(SELECTOR_RETIREMENT_REDRIVE_DELAY);
+                        (queue, _) = coordinator.notify.wait_timeout(queue, wait).unwrap();
+                    }
+                    None => {
+                        (queue, _) = coordinator
+                            .notify
+                            .wait_timeout(queue, SELECTOR_RETIREMENT_REDRIVE_DELAY)
+                            .unwrap();
+                    }
+                }
+            }
+        };
+
+        let result = run_retirement_attempt(&state, &entry);
+        let requeue_delay = match result {
+            RetirementAttempt::Complete => None,
+            RetirementAttempt::WaitingForReaders => Some(std::time::Duration::from_millis(100)),
+            RetirementAttempt::DeferredActive => {
+                entry.attempts = 0;
+                entry.retry_delay = std::time::Duration::from_secs(1);
+                let _ = state.code_sources.store().record_health_failure(
+                    entry.work.project_id(),
+                    "retirement_deferred_active",
+                    "retirement remains queued while selector or snapshot is active",
+                );
+                Some(SELECTOR_RETIREMENT_REDRIVE_DELAY)
+            }
+            RetirementAttempt::Retryable(error) => {
+                let delay =
+                    take_selector_retirement_retry(&mut entry.attempts, &mut entry.retry_delay)
+                        .unwrap_or(SELECTOR_RETIREMENT_REDRIVE_DELAY);
+                if entry.attempts >= SELECTOR_RETIREMENT_RETRY_LIMIT {
+                    let _ = state.code_sources.store().record_health_failure(
+                        entry.work.project_id(),
+                        "retirement_failed",
+                        "retirement retry budget exhausted; work remains queued",
+                    );
+                }
+                tracing::warn!(
+                    project_id = entry.work.project_id(),
+                    attempts = entry.attempts,
+                    retry_secs = delay.as_secs_f64(),
+                    %error,
+                    "selector retirement attempt deferred"
+                );
+                Some(delay)
+            }
+            RetirementAttempt::Failed(error) => {
+                let _ = state.code_sources.store().record_health_failure(
+                    entry.work.project_id(),
+                    "retirement_failed",
+                    "retirement failed; work remains queued",
+                );
+                tracing::error!(
+                    project_id = entry.work.project_id(),
+                    %error,
+                    "selector retirement attempt failed"
+                );
+                Some(SELECTOR_RETIREMENT_REDRIVE_DELAY)
+            }
+        };
+
+        if let Some(delay) = requeue_delay {
+            entry.next_due = std::time::Instant::now() + delay;
+            let key = entry.work.key();
+            let mut queue = coordinator.queue.lock().unwrap();
+            queue.entry(key).or_insert(entry);
+        }
+    }
+}
+
+fn run_retirement_attempt(
+    state: &Arc<SharedState>,
+    entry: &RetirementWorkEntry,
+) -> RetirementAttempt {
+    if entry
+        .previous_view
+        .as_ref()
+        .is_some_and(|view| Arc::strong_count(view) > 1)
+    {
+        return RetirementAttempt::WaitingForReaders;
+    }
+    match &entry.work {
+        RetirementWork::CollisionSelectorless(work) => {
+            let store = state.code_sources.store();
+            if let Err(error) = repair_and_complete_collision_retirement(
+                &store,
+                &work.project_id,
+                &work.generation_id,
+            ) {
+                return RetirementAttempt::Failed(error);
+            }
+            finish_retirement_success(state, work.project_id.as_str(), Some(&work.former_scope));
+            RetirementAttempt::Complete
+        }
+        RetirementWork::Ordinary(record) => run_selector_retirement(state, record, None),
+        RetirementWork::CollisionExact {
+            record,
+            project_id,
+            generation_id,
+            former_scope,
+        } => run_selector_retirement(
+            state,
+            record,
+            Some((project_id, generation_id, former_scope)),
+        ),
+    }
+}
+
+fn retirement_record_is_active(
+    edges_dir: &std::path::Path,
+    record: &RetirementRecord,
+) -> Result<bool> {
+    bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(edges_dir)?;
+        let selector_is_active = manifest
+            .workspaces
+            .values()
+            .any(|entry| entry.code_source_selector.as_deref() == Some(record.selector.as_str()));
+        let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
+            &record.project_id,
+            &record.snapshot_id,
+        );
+        let snapshot_is_active = manifest
+            .workspaces
+            .get(&record.project_id)
+            .and_then(|entry| entry.active_snapshot.as_deref())
+            == Some(expected_snapshot.as_str());
+        Ok(selector_is_active || snapshot_is_active)
+    })
+}
+
+fn run_selector_retirement(
+    state: &Arc<SharedState>,
+    record: &RetirementRecord,
+    collision: Option<(&ProjectId, &String, &PublishedScope)>,
+) -> RetirementAttempt {
+    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    match retirement_record_is_active(&edges_dir, record) {
+        Ok(true) => return RetirementAttempt::DeferredActive,
+        Ok(false) => {}
+        Err(error) => return RetirementAttempt::Failed(error),
+    }
+    let retired = match state
+        .index_writer
+        .retire_code_selector(record.selector.clone())
+    {
+        Ok(retired) => retired,
+        Err(error) if selector_retirement_retryable(&error) => {
+            return RetirementAttempt::Retryable(error);
+        }
+        Err(error) => return RetirementAttempt::Failed(error),
+    };
+    tracing::info!(
+        project_id = %record.project_id,
+        selector = %record.selector,
+        document_count = retired.document_count,
+        "retired inactive code-source selector"
+    );
+    if let Err(error) = retired.begin_cleanup() {
+        return RetirementAttempt::Failed(error);
+    }
+    let cleanup = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
+        let selector_is_active = manifest
+            .workspaces
+            .values()
+            .any(|entry| entry.code_source_selector.as_deref() == Some(record.selector.as_str()));
+        let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
+            &record.project_id,
+            &record.snapshot_id,
+        );
+        let snapshot_is_active = manifest
+            .workspaces
+            .get(&record.project_id)
+            .and_then(|entry| entry.active_snapshot.as_deref())
+            == Some(expected_snapshot.as_str());
+        if selector_is_active || snapshot_is_active {
+            return Ok(false);
+        }
+        if !record.snapshot_id.contains('/')
+            && !record.snapshot_id.contains('\\')
+            && record.snapshot_id != "."
+            && record.snapshot_id != ".."
+        {
+            let snapshot = bbox_edge_sidecar::snapshot::snapshot_dir(
+                &edges_dir,
+                &record.project_id,
+                &record.snapshot_id,
+            );
+            if snapshot.is_dir() {
+                std::fs::remove_dir_all(&snapshot)?;
+            }
+        }
+        Ok(true)
+    });
+    match cleanup {
+        Ok(true) => {}
+        Ok(false) => return RetirementAttempt::DeferredActive,
+        Err(error) => return RetirementAttempt::Failed(error),
+    }
+    let store = state.code_sources.store();
+    let fallback_scope = if let Some((project_id, generation_id, former_scope)) = collision {
+        if let Err(error) =
+            repair_and_complete_collision_retirement(&store, project_id, generation_id)
+        {
+            return RetirementAttempt::Failed(error);
+        }
+        Some(former_scope.clone())
+    } else {
+        let scope = retirement_scope_for_record(&store, record).or_else(|| {
+            state
+                .code_sources
+                .assignments()
+                .into_iter()
+                .find_map(|(scope, project_id)| (project_id == record.project_id).then_some(scope))
+        });
+        if let Err(error) = store.complete_retirement(record) {
+            return RetirementAttempt::Failed(error);
+        }
+        scope
+    };
+    let _ = store.clear_health_failure(&record.project_id, "retirement_failed");
+    let _ = store.clear_health_failure(&record.project_id, "retirement_deferred_active");
+    drop(retired);
+    finish_retirement_success(state, &record.project_id, fallback_scope.as_ref());
+    RetirementAttempt::Complete
+}
+
+fn retirement_scope_for_record(
+    store: &CodeSourceStore,
+    record: &RetirementRecord,
+) -> Option<PublishedScope> {
+    record
+        .generation_id
+        .as_deref()
+        .and_then(|generation_id| store.find_generation_mixed(generation_id).ok())
+        .map(|generation| generation.descriptor().scope.clone())
+        .or_else(|| {
+            store
+                .load_activation_mixed(&record.project_id)
+                .ok()
+                .flatten()
+                .and_then(|activation| activation.published_scope().cloned())
+        })
+}
+
+fn finish_retirement_success(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    fallback_scope: Option<&PublishedScope>,
+) {
+    let store = state.code_sources.store();
+    let _ = store.clear_health_failure(project_id, "retirement_failed");
+    let _ = store.clear_health_failure(project_id, "retirement_deferred_active");
+    if let Some(fallback_scope) = fallback_scope {
+        enqueue_current_transition(
+            state,
+            project_id,
+            fallback_scope,
+            ReconcileOrigin::SelectorRetirementCompletion,
+            None,
+        );
+    }
 }
 
 fn repair_and_complete_collision_retirement(
@@ -5490,33 +6258,7 @@ fn spawn_selectorless_collision_retirement(
     state: Arc<SharedState>,
     work: CollisionRetirementWorkV1,
 ) {
-    if let Err(error) = std::thread::Builder::new()
-        .name("blackbox-code-source-collision-retirement".to_string())
-        .spawn(move || {
-            let store = state.code_sources.store();
-            if let Err(error) = repair_and_complete_collision_retirement(
-                &store,
-                &work.project_id,
-                &work.generation_id,
-            ) {
-                let _ = store.record_health_failure(
-                    work.project_id.as_str(),
-                    "retirement_failed",
-                    "retirement failed; inspect daemon logs",
-                );
-                tracing::error!(
-                    project_id = %work.project_id,
-                    generation_id = %work.generation_id,
-                    %error,
-                    "selectorless collision retirement generation repair failed"
-                );
-                return;
-            }
-            let _ = store.clear_health_failure(work.project_id.as_str(), "retirement_failed");
-        })
-    {
-        tracing::error!(%error, "spawning selectorless collision retirement thread failed");
-    }
+    enqueue_retirement_work(state, RetirementWork::CollisionSelectorless(work), None);
 }
 
 async fn require_upload_scope(
@@ -7957,11 +8699,10 @@ mod tests {
     }
 
     /// P4-D section 8.2: assignment-diff produces exactly-once transitions
-    /// through the reconciler event channel. Events coalesce by
-    /// `(project_id, kind)`: enqueuing the same event N times produces one
-    /// drained event, not N.
+    /// through the reconciler event channel. Events coalesce by project:
+    /// the latest transition wins and triggering origins remain sticky.
     #[test]
-    fn p4d_reconciler_coalesces_events_by_project_and_kind() {
+    fn p4d_reconciler_coalesces_events_by_project() {
         let guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
         let reconciler = CutbackReconciler::new(guards);
 
@@ -7969,30 +8710,46 @@ mod tests {
 
         // Enqueue the same cutback event three times.
         for _ in 0..3 {
-            reconciler.enqueue("proj-a", scope.clone(), ReconcileKind::Cutback);
+            reconciler.enqueue(
+                "proj-a",
+                scope.clone(),
+                ReconcileKind::Cutback,
+                ReconcileOrigin::CatalogCommit,
+                Some(40),
+            );
         }
-        // Enqueue a different kind for the same project (should NOT coalesce
-        // with the cutback).
-        reconciler.enqueue("proj-a", scope.clone(), ReconcileKind::Activate);
-        // Enqueue a different project (should NOT coalesce).
-        reconciler.enqueue("proj-b", scope.clone(), ReconcileKind::Cutback);
-
-        let drained = reconciler.drain();
-        assert_eq!(
-            drained.len(),
-            3,
-            "three distinct (project, kind) pairs must produce three events"
+        // A newer transition for the same project replaces kind/revision,
+        // but preserves the earlier origin.
+        reconciler.enqueue(
+            "proj-a",
+            scope.clone(),
+            ReconcileKind::Activate,
+            ReconcileOrigin::AssignmentConfigReload,
+            None,
+        );
+        reconciler.enqueue(
+            "proj-b",
+            scope.clone(),
+            ReconcileKind::Cutback,
+            ReconcileOrigin::StartupRecovery,
+            None,
         );
 
-        // Verify the exact set: one Cutback for proj-a, one Activate for
-        // proj-a, one Cutback for proj-b.
-        let mut kinds: Vec<_> = drained
+        let drained = reconciler.drain();
+        assert_eq!(drained.len(), 2, "one event per project must remain");
+        let proj_a = drained
             .iter()
-            .filter(|e| e.project_id == "proj-a")
-            .map(|e| e.kind.clone())
-            .collect();
-        kinds.sort();
-        assert_eq!(kinds, vec![ReconcileKind::Activate, ReconcileKind::Cutback]);
+            .find(|event| event.project_id == "proj-a")
+            .unwrap();
+        assert_eq!(proj_a.kind, ReconcileKind::Activate);
+        assert_eq!(proj_a.authority_revision, None);
+        assert_eq!(
+            proj_a.origins,
+            BTreeSet::from([
+                ReconcileOrigin::AssignmentConfigReload,
+                ReconcileOrigin::CatalogCommit,
+            ])
+        );
         assert_eq!(
             drained.iter().filter(|e| e.project_id == "proj-b").count(),
             1
@@ -8111,7 +8868,13 @@ mod tests {
         // We need a minimal SharedState for this, but we can test the
         // enqueue path directly by calling enqueue_transition through the
         // runtime, simulating what apply_source_transitions_catalog does.
-        runtime.enqueue_transition(proj_a, scope_a.clone(), ReconcileKind::Activate);
+        runtime.enqueue_transition(
+            proj_a,
+            scope_a.clone(),
+            ReconcileKind::Activate,
+            ReconcileOrigin::CatalogCommit,
+            Some(41),
+        );
 
         // Simulate the re-entry feed: iterate activation records and enqueue
         // those with non-None cutback.
@@ -8119,34 +8882,34 @@ mod tests {
         for record in &records {
             if record.cutback().is_some() {
                 if let Some(scope) = record.published_scope().cloned() {
-                    runtime.enqueue_transition(record.project_id(), scope, ReconcileKind::Cutback);
+                    runtime.enqueue_transition(
+                        record.project_id(),
+                        scope,
+                        ReconcileKind::Cutback,
+                        ReconcileOrigin::AssignmentConfigReload,
+                        None,
+                    );
                 }
             }
         }
 
-        // Drain and verify: proj_a should have both an Activate and a
-        // Cutback (from the re-entry feed). proj_b should have nothing
-        // because its cutback state is None.
+        // Drain and verify: project-keyed coalescing retains the latest
+        // transition and every origin. proj_b has nothing because its
+        // cutback state is None.
         let reconciler = runtime.reconciler().unwrap();
         let drained = reconciler.drain();
 
         let proj_a_events: Vec<_> = drained.iter().filter(|e| e.project_id == proj_a).collect();
+        assert_eq!(proj_a_events.len(), 1, "proj_a must coalesce by project");
+        let event = proj_a_events[0];
+        assert_eq!(event.kind, ReconcileKind::Cutback);
+        assert_eq!(event.authority_revision, None);
         assert_eq!(
-            proj_a_events.len(),
-            2,
-            "proj_a must have Activate + Cutback"
-        );
-        assert!(
-            proj_a_events
-                .iter()
-                .any(|e| e.kind == ReconcileKind::Activate),
-            "explicit activation must be present"
-        );
-        assert!(
-            proj_a_events
-                .iter()
-                .any(|e| e.kind == ReconcileKind::Cutback),
-            "re-entry feed cutback must be present"
+            event.origins,
+            BTreeSet::from([
+                ReconcileOrigin::AssignmentConfigReload,
+                ReconcileOrigin::CatalogCommit,
+            ])
         );
 
         assert!(
@@ -8171,7 +8934,13 @@ mod tests {
             .expect("acquire must succeed");
 
         // Enqueue an event while the guard is held.
-        reconciler.enqueue("proj-x", scope.clone(), ReconcileKind::Cutback);
+        reconciler.enqueue(
+            "proj-x",
+            scope.clone(),
+            ReconcileKind::Cutback,
+            ReconcileOrigin::CatalogCommit,
+            Some(7),
+        );
 
         // The reconciler loop drains the pending set, then tries to
         // acquire the guard. It fails because the guard is held, so it
@@ -8184,11 +8953,19 @@ mod tests {
         );
         reconciler.defer(drained.into_iter().next().unwrap());
 
-        // Verify pending is empty (the event is in deferred, not pending).
-        assert!(
-            reconciler.drain().is_empty(),
-            "pending must be empty after defer"
+        // A newer config event arrives before the held transition releases.
+        // It owns the latest kind/revision; deferred promotion only merges
+        // its older origin.
+        reconciler.enqueue(
+            "proj-x",
+            scope.clone(),
+            ReconcileKind::Activate,
+            ReconcileOrigin::AssignmentConfigReload,
+            None,
         );
+
+        // Verify pending is empty (the event is in deferred, not pending).
+        assert_eq!(reconciler.pending.lock().unwrap().len(), 1);
 
         // Release the guard (simulates transition completion).
         // GuardHandle::drop notifies the condvar, waking the reconciler.
@@ -8203,7 +8980,15 @@ mod tests {
         let final_drained = reconciler.drain();
         assert_eq!(final_drained.len(), 1, "promoted event fires exactly once");
         assert_eq!(final_drained[0].project_id, "proj-x");
-        assert_eq!(final_drained[0].kind, ReconcileKind::Cutback);
+        assert_eq!(final_drained[0].kind, ReconcileKind::Activate);
+        assert_eq!(final_drained[0].authority_revision, None);
+        assert_eq!(
+            final_drained[0].origins,
+            BTreeSet::from([
+                ReconcileOrigin::AssignmentConfigReload,
+                ReconcileOrigin::CatalogCommit,
+            ])
+        );
 
         // No duplicates remain.
         assert!(reconciler.drain().is_empty());
@@ -8845,6 +9630,109 @@ mod tests {
             matches!(action, ReducerAction::NoOp),
             "ManualRetryRequired must be steady-state NoOp"
         );
+
+        let action = evaluate_reduction_for_event(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&mr),
+            LadderResult::Selected,
+            false,
+            &BTreeSet::from([ReconcileOrigin::AssignmentConfigReload]),
+        );
+        assert!(
+            matches!(action, ReducerAction::ReattemptCutback),
+            "a fresh assignment/config event must release manual retry once"
+        );
+
+        for origin in [
+            ReconcileOrigin::CatalogCommit,
+            ReconcileOrigin::TransientDeadline,
+            ReconcileOrigin::SelectorRetirementCompletion,
+            ReconcileOrigin::StartupRecovery,
+            ReconcileOrigin::ActivationCompletion,
+        ] {
+            let action = evaluate_reduction_for_event(
+                DesiredAssignment::Local,
+                EffectiveSource::Collected,
+                Some(&mr),
+                LadderResult::Selected,
+                false,
+                &BTreeSet::from([origin]),
+            );
+            assert!(
+                matches!(action, ReducerAction::NoOp),
+                "{origin:?} must not release manual retry"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_error_classification_uses_typed_causes_not_incidental_words() {
+        use bbox_indexing::index::writer_actor::IndexWriterRetryableError;
+
+        let queued = anyhow::Error::new(SelectorRetirementQueued);
+        assert!(matches!(
+            classify_staging_error(&queued),
+            CutbackAttemptOutcome::ReadinessDeferred
+        ));
+
+        let writer = anyhow::Error::new(IndexWriterRetryableError::ReindexPassInProgress);
+        assert!(matches!(
+            classify_staging_error(&writer),
+            CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention)
+        ));
+
+        let warming = anyhow::Error::new(IndexWriterRetryableError::VectorStoreWarming);
+        assert!(matches!(
+            classify_staging_error(&warming),
+            CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit)
+        ));
+
+        let validation = anyhow::Error::new(StagingValidationRefusal);
+        assert!(matches!(
+            classify_staging_error(&validation),
+            CutbackAttemptOutcome::Terminal(CutbackErrorClass::ValidationFailure)
+        ));
+
+        let security = anyhow::Error::new(StagingSecurityRefusal);
+        assert!(matches!(
+            classify_staging_error(&security),
+            CutbackAttemptOutcome::Terminal(CutbackErrorClass::SecurityFailure)
+        ));
+
+        let incidental = anyhow!("security cache was unavailable during index commit");
+        assert!(matches!(
+            classify_staging_error(&incidental),
+            CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit)
+        ));
+    }
+
+    #[test]
+    fn activation_completion_is_convergence_only_without_a_new_origin() {
+        let completion = BTreeSet::from([ReconcileOrigin::ActivationCompletion]);
+        for action in [
+            ReducerAction::Activate,
+            ReducerAction::AttemptCutback,
+            ReducerAction::ReattemptCutback,
+        ] {
+            assert!(matches!(
+                gate_completion_reentry(action, &completion),
+                ReducerAction::NoOp
+            ));
+        }
+        assert!(matches!(
+            gate_completion_reentry(ReducerAction::CancelCutback, &completion),
+            ReducerAction::CancelCutback
+        ));
+
+        let completion_and_catalog = BTreeSet::from([
+            ReconcileOrigin::ActivationCompletion,
+            ReconcileOrigin::CatalogCommit,
+        ]);
+        assert!(matches!(
+            gate_completion_reentry(ReducerAction::AttemptCutback, &completion_and_catalog),
+            ReducerAction::AttemptCutback
+        ));
     }
 
     #[test]
@@ -10265,15 +11153,15 @@ mod tests {
         );
     }
 
-    /// F1: the cutback staging path uses mark_cutback_pending_mixed
-    /// (mode-aware v2 API), not the v1-only mark_cutback_pending.
+    /// Catalog cutback staging never emits the migration-only pending mirror
+    /// shape; the compare-and-apply writer derives it from typed state.
     #[test]
-    fn f1_staging_uses_mixed_mark_cutback_pending() {
+    fn catalog_staging_does_not_write_untyped_cutback_pending() {
         let src = self_source();
         let body = extract_fn_body(&src, "cutback_to_local_single_attempt");
         assert!(
-            body.contains("mark_cutback_pending_mixed"),
-            "cutback_to_local_single_attempt must use mark_cutback_pending_mixed (F1 fix)"
+            !body.contains("mark_cutback_pending_mixed"),
+            "catalog staging must leave cutback state to compare-and-apply"
         );
     }
 
@@ -10566,8 +11454,8 @@ mod tests {
 
     /// Property 2: cutback_to_local_single_attempt preserves a collected
     /// activation record when the workspace manifest does not mark the
-    /// project as collected. The local/local stale-state cell clears
-    /// cutback state only, never the activation record.
+    /// project as collected. The local/local stale-state cell returns the
+    /// clear-cutback intent to the fenced store writer.
     #[test]
     fn regression_cutback_preserves_collected_activation_record() {
         let src = self_source();
@@ -10577,9 +11465,11 @@ mod tests {
             "cutback_to_local_single_attempt must check the activation record's selector before clearing it (property 2)"
         );
         assert!(
-            body.contains("clear_cutback_state"),
-            "cutback_to_local_single_attempt must clear cutback state only, not the activation record, for collected records (property 2)"
+            body.contains("CutbackSuccessOutcome::ClearCutback"),
+            "cutback_to_local_single_attempt must return clear-cutback intent for collected records (property 2)"
         );
+        assert!(!body.contains("store.clear_cutback_state"));
+        assert!(!body.contains("store.clear_activation"));
     }
 
     /// Property 2 (second path): cutback_to_local also preserves a
@@ -10639,19 +11529,20 @@ mod tests {
             matches!(action, ReducerAction::CancelCutback),
             "local/local with stale state must cancel cutback (clear state only)"
         );
-        // CancelCutback dispatches clear_cutback_state, not clear_activation.
+        // CancelCutback dispatches the fenced clear-cutback outcome, not a
+        // direct activation delete.
         let src = self_source();
         let cancel_block = src
             .find("ReducerAction::CancelCutback =>")
             .expect("CancelCutback dispatch must exist");
-        let snippet = &src[cancel_block..cancel_block + 200];
+        let snippet = &src[cancel_block..cancel_block + 500];
         assert!(
-            snippet.contains("clear_cutback_state"),
-            "CancelCutback dispatch must call clear_cutback_state, not clear_activation"
+            snippet.contains("CutbackCompareOutcome::ClearCutback"),
+            "CancelCutback dispatch must use the fenced clear-cutback outcome"
         );
         assert!(
-            !snippet.contains("clear_activation"),
-            "CancelCutback dispatch must NOT call clear_activation"
+            !snippet.contains("CutbackCompareOutcome::ClearActivation"),
+            "CancelCutback dispatch must NOT clear the activation"
         );
     }
 
