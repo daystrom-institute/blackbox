@@ -2303,13 +2303,15 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                         false
                     }
                 };
-                if state.index_writer.reindex_in_progress() {
+                let Some(_publication_guard) =
+                    state.index_writer.try_begin_edge_index_rebuild()
+                else {
                     tracing::debug!(
                         pending_nudge,
                         "edge-index watcher deferred while a reindex publication is active"
                     );
                     continue;
-                }
+                };
                 let nudged = std::mem::take(&mut pending_nudge);
                 let current = state.idx.read().num_docs();
                 let registered_project_ids = state.corpus_registered_project_ids();

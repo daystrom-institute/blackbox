@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -54,6 +54,7 @@ use bbox_corpus_core::project_record::ProjectRecordsProvider;
 #[derive(Debug)]
 pub enum IndexWriterRetryableError {
     ReindexPassInProgress,
+    EdgeIndexRebuildInProgress,
     VectorStoreWarming,
 }
 
@@ -61,6 +62,9 @@ impl std::fmt::Display for IndexWriterRetryableError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::ReindexPassInProgress => "an index reindex pass is already running",
+            Self::EdgeIndexRebuildInProgress => {
+                "an edge-index rebuild is already reading the sidecar publication"
+            }
             Self::VectorStoreWarming => "the vector store is still warming up",
         })
     }
@@ -189,7 +193,7 @@ pub enum IndexWriteOp {
 #[derive(Clone)]
 pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
-    reindex_active: Arc<AtomicBool>,
+    publication_activity: Arc<AtomicU8>,
     reader: IndexReader,
     fields: FieldHandles,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
@@ -283,14 +287,32 @@ struct ActorCtx {
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
-    reindex_active: Arc<AtomicBool>,
+    publication_activity: Arc<AtomicU8>,
 }
 
-struct ReindexActivityGuard(Arc<AtomicBool>);
+const PUBLICATION_IDLE: u8 = 0;
+const PUBLICATION_REINDEX: u8 = 1;
+const PUBLICATION_EDGE_REBUILD: u8 = 2;
+
+struct ReindexActivityGuard(Arc<AtomicU8>);
 
 impl Drop for ReindexActivityGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.store(PUBLICATION_IDLE, Ordering::Release);
+    }
+}
+
+/// Admission guard for one complete edge-sidecar parse and graph publication.
+/// A reindex request admitted while the parse was already running used to
+/// mutate the same sidecars underneath it, forcing a multi-minute retry and
+/// doubling peak memory. Holding this guard makes that race impossible; an
+/// interactive reindex request fails fast and the periodic pass retries on
+/// its next tick.
+pub struct EdgeIndexRebuildActivityGuard(Arc<AtomicU8>);
+
+impl Drop for EdgeIndexRebuildActivityGuard {
+    fn drop(&mut self) {
+        self.0.store(PUBLICATION_IDLE, Ordering::Release);
     }
 }
 
@@ -958,7 +980,7 @@ impl IndexWriterActor {
         let post_commit_hook = Arc::new(parking_lot::RwLock::new(None));
         let assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>> =
             Arc::new(parking_lot::RwLock::new(None));
-        let reindex_active = Arc::new(AtomicBool::new(false));
+        let publication_activity = Arc::new(AtomicU8::new(PUBLICATION_IDLE));
         let ctx = ActorCtx {
             index,
             fields,
@@ -969,7 +991,7 @@ impl IndexWriterActor {
             checkout_access: checkout_access.clone(),
             records_provider: records_provider.clone(),
             assignments: assignments.clone(),
-            reindex_active: reindex_active.clone(),
+            publication_activity: publication_activity.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -982,7 +1004,7 @@ impl IndexWriterActor {
         }
         Self {
             tx,
-            reindex_active,
+            publication_activity,
             reader,
             fields,
             post_commit_hook,
@@ -1083,7 +1105,8 @@ impl IndexWriterActor {
             })
             .is_err()
         {
-            self.reindex_active.store(false, Ordering::Release);
+            self.publication_activity
+                .store(PUBLICATION_IDLE, Ordering::Release);
             return Err(anyhow!("index writer actor unavailable"));
         }
         Ok("reindex accepted; the index writer is processing it in the background".to_string())
@@ -1093,14 +1116,41 @@ impl IndexWriterActor {
     /// terminal outcome. Sidecar consumers use this to avoid parsing an
     /// authority set while the pass is still publishing its members.
     pub fn reindex_in_progress(&self) -> bool {
-        self.reindex_active.load(Ordering::Acquire)
+        self.publication_activity.load(Ordering::Acquire) == PUBLICATION_REINDEX
+    }
+
+    /// Try to reserve the sidecar publication for one complete edge-index
+    /// rebuild. The caller must hold the returned guard through both parsing
+    /// and publication so reindex admission cannot slip into that window.
+    pub fn try_begin_edge_index_rebuild(&self) -> Option<EdgeIndexRebuildActivityGuard> {
+        self.publication_activity
+            .compare_exchange(
+                PUBLICATION_IDLE,
+                PUBLICATION_EDGE_REBUILD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| EdgeIndexRebuildActivityGuard(self.publication_activity.clone()))
     }
 
     fn reserve_reindex(&self) -> Result<()> {
-        self.reindex_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        self.publication_activity
+            .compare_exchange(
+                PUBLICATION_IDLE,
+                PUBLICATION_REINDEX,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .map(|_| ())
-            .map_err(|_| anyhow::Error::new(IndexWriterRetryableError::ReindexPassInProgress))
+            .map_err(|activity| {
+                let error = if activity == PUBLICATION_EDGE_REBUILD {
+                    IndexWriterRetryableError::EdgeIndexRebuildInProgress
+                } else {
+                    IndexWriterRetryableError::ReindexPassInProgress
+                };
+                anyhow::Error::new(error)
+            })
     }
 
     fn dispatch_reindex_pass(
@@ -1123,7 +1173,8 @@ impl IndexWriterActor {
             })
             .is_err()
         {
-            self.reindex_active.store(false, Ordering::Release);
+            self.publication_activity
+                .store(PUBLICATION_IDLE, Ordering::Release);
             return Err(anyhow!("index writer actor unavailable"));
         }
         ack_rx
@@ -1331,7 +1382,7 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 accept_empty_projects,
                 ack,
             } => {
-                let activity = ReindexActivityGuard(ctx.reindex_active.clone());
+                let activity = ReindexActivityGuard(ctx.publication_activity.clone());
                 let result = run_pass(&ctx, &rx, full, dirty, cause, &accept_empty_projects);
                 drop(activity);
                 if let Some(ack) = ack {
@@ -3321,8 +3372,32 @@ mod tests {
                     IndexWriterRetryableError::ReindexPassInProgress
                 ))
         );
-        actor.reindex_active.store(false, Ordering::Release);
+        actor
+            .publication_activity
+            .store(PUBLICATION_IDLE, Ordering::Release);
         assert!(!actor.reindex_in_progress());
+
+        let edge_rebuild = actor
+            .try_begin_edge_index_rebuild()
+            .expect("idle publication admits an edge rebuild");
+        let blocked = actor
+            .request_reindex_pass_accepting_empty(false, true, Vec::new())
+            .unwrap_err();
+        assert!(
+            blocked
+                .downcast_ref::<IndexWriterRetryableError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    IndexWriterRetryableError::EdgeIndexRebuildInProgress
+                ))
+        );
+        drop(edge_rebuild);
+
+        actor.reserve_reindex().unwrap();
+        assert!(actor.try_begin_edge_index_rebuild().is_none());
+        actor
+            .publication_activity
+            .store(PUBLICATION_IDLE, Ordering::Release);
 
         let response = actor
             .request_reindex_pass_accepting_empty(false, true, Vec::new())
@@ -3330,7 +3405,7 @@ mod tests {
         assert!(response.contains("accepted"));
         actor.flush_blocking().unwrap();
         for _ in 0..100 {
-            if !actor.reindex_active.load(Ordering::Acquire) {
+            if !actor.reindex_in_progress() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));

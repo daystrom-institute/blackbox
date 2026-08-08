@@ -4940,7 +4940,10 @@ fn classify_staging_error(error: &anyhow::Error) -> CutbackAttemptOutcome {
     }
     for cause in error.chain() {
         match cause.downcast_ref::<IndexWriterRetryableError>() {
-            Some(IndexWriterRetryableError::ReindexPassInProgress) => {
+            Some(
+                IndexWriterRetryableError::ReindexPassInProgress
+                | IndexWriterRetryableError::EdgeIndexRebuildInProgress,
+            ) => {
                 return CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::ReindexPass);
             }
             Some(IndexWriterRetryableError::VectorStoreWarming) => {
