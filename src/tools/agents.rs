@@ -965,8 +965,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::artifacts::ArtifactInstallParams;
-    use crate::server::install_artifact_value;
     use crate::server::state::SharedState;
+    use crate::server::{install_artifact_value, rebuild_edge_index_from_shared};
     use crate::{entity_ref, vectors};
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
@@ -1905,8 +1905,31 @@ mod tests {
             name: "distilled-reviewer".into(),
             version: 1,
         };
+        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&server.state.store_dir);
+        let durable_edges: Vec<crate::edge_index::Edge> =
+            std::fs::read_to_string(edges_dir.join("agents.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(durable_edges.len(), 2);
+
+        // Artifact installation persists provenance and only nudges the
+        // single-flight watcher. It must not synchronously parse and publish
+        // the complete graph on the tool-call path.
         let read_view = server.state.code_read_view.read().clone();
-        let edges = read_view
+        assert!(
+            read_view
+                .edge_index
+                .forward_edges_filtered(&agent_ref, &["DERIVED_FROM"])
+                .is_empty()
+        );
+
+        // Simulate the watcher consuming the nudge, then prove both durable
+        // facts become queryable after the bounded rebuild.
+        rebuild_edge_index_from_shared(&server.state, false).unwrap();
+        let published = server.state.code_read_view.read().clone();
+        let edges = published
             .edge_index
             .forward_edges_filtered(&agent_ref, &["DERIVED_FROM"]);
         assert_eq!(edges.len(), 2);

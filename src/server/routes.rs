@@ -3800,10 +3800,12 @@ mod tests {
 
     #[test]
     fn edge_rebuild_refuses_oversized_active_input_before_parsing() {
-        let _env = crate::util::test_env_lock();
+        let mut env = crate::util::TestEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
-        let state = SharedState::for_test(&dir.path().join("bro"));
+        let root = dir.path().canonicalize().unwrap();
+        let state = SharedState::for_test(&root.join("bro"));
         let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+        std::fs::create_dir_all(&edges_dir).unwrap();
         bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
             &edges_dir,
             "p",
@@ -3815,13 +3817,8 @@ mod tests {
             vec![],
         )
         .unwrap();
-        unsafe {
-            std::env::set_var("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
-        }
+        env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
         let error = rebuild_edge_index_from_shared(&state, false).unwrap_err();
-        unsafe {
-            std::env::remove_var("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES");
-        }
         assert!(
             error.to_string().contains("active sidecar input"),
             "unexpected refusal: {error:#}"
