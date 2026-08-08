@@ -588,7 +588,8 @@ mod tests {
     fn a_duplicate_daemon_cannot_reclaim_a_peers_in_flight_pin_temporary() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = state_root(&dir);
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&root.join("bro"));
+        let edges_dir =
+            crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json"));
         let pins_dir = pending_local_activation_pins_dir(&edges_dir);
 
         // The live daemon owns the root and is mid-publication: its temporary

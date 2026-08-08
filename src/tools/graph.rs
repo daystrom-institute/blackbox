@@ -1005,7 +1005,7 @@ impl BlackboxServer {
             } else {
                 server.validate_project_selection(&p.project_id)?;
             }
-            let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
+            let edges_dir = crate::server::edge_sidecar_dir(&server.state);
             let apply = p.apply.unwrap_or(false);
             let stats = edge_index::compact_legacy_sidecar(&edges_dir, &p.project_id, apply)?;
             let edge_index_rebuilt = apply && p.rebuild.unwrap_or(false);
@@ -1261,7 +1261,7 @@ impl BlackboxServer {
                 &projects,
                 CheckoutAccessIntent::Read,
             )?;
-            let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
+            let edges_dir = crate::server::edge_sidecar_dir(&server.state);
             let authorized_projects = leased_provenance_projects(&inputs);
             let resolve_legacy_target =
                 |project_id: &str,

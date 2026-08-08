@@ -1875,7 +1875,7 @@ pub(crate) fn persist_agent_provenance_edges(
         }
         edges.push(agent_derived_from_edge(source.clone(), target));
     }
-    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = edge_sidecar_dir(state);
     let written = edge_index::append_explicit_edges(&edges_dir, "agents", &edges)?;
     if written > 0 {
         // Persist first and wake the single-flight watcher. An artifact tool
@@ -1947,11 +1947,25 @@ pub(crate) fn deactivate_artifact(
     Ok(())
 }
 
+pub(crate) fn edge_sidecar_dir(state: &SharedState) -> std::path::PathBuf {
+    bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+        &state.idx.read().reindex_config().projects_path,
+    )
+}
+
 pub(crate) fn rebuild_edge_index_from_shared(
     state: &SharedState,
     include_tantivy_projection: bool,
 ) -> anyhow::Result<()> {
-    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = edge_sidecar_dir(state);
+    rebuild_edge_index_from_shared_at(state, include_tantivy_projection, &edges_dir)
+}
+
+pub(crate) fn rebuild_edge_index_from_shared_at(
+    state: &SharedState,
+    include_tantivy_projection: bool,
+    edges_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     let registered_project_ids = state.corpus_registered_project_ids();
     let prepared = (|| -> anyhow::Result<_> {
         let authority = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
@@ -1966,6 +1980,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
         let rebuilt = build_edge_index_from_shared_at_authority(
             state,
             include_tantivy_projection,
+            edges_dir,
             &authority.manifest,
         )?;
         let (selectors, searcher) = {
@@ -2022,10 +2037,10 @@ pub(crate) fn rebuild_edge_index_from_shared(
 fn build_edge_index_from_shared_at_authority(
     state: &SharedState,
     include_tantivy_projection: bool,
+    edges_dir: &std::path::Path,
     authority: &edge_index::SidecarManifestAuthority,
 ) -> anyhow::Result<edge_index::EdgeIndex> {
     let started = std::time::Instant::now();
-    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     // F3: the COMPLETE catalog id set, through the one shared accessor that
     // also seeds startup, the storage tools, and the background GC pass.
     let registered_project_ids = state.corpus_registered_project_ids();
@@ -2061,7 +2076,7 @@ fn build_edge_index_from_shared_at_authority(
             notes: &notes,
             session_brofile_rows: task_store.session_brofile_rows(),
             roadmap: &roadmap,
-            edges_dir: edges_dir.clone(),
+            edges_dir: edges_dir.to_path_buf(),
             registered_project_ids: Some(registered_project_ids.clone()),
             include_tantivy_projection,
             include_observed: true,
@@ -2088,6 +2103,25 @@ fn edge_index_rebuild_max_input_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES)
+}
+
+pub(crate) fn ensure_edge_index_rebuild_admitted_at(
+    state: &SharedState,
+    edges_dir: &std::path::Path,
+    additional_bytes: u64,
+) -> anyhow::Result<u64> {
+    let registered_project_ids = state.corpus_registered_project_ids();
+    let authority = capture_edge_rebuild_authority(edges_dir, Some(&registered_project_ids))?;
+    let max_bytes = edge_index_rebuild_max_input_bytes();
+    let projected_bytes = authority.signature.bytes.saturating_add(additional_bytes);
+    if projected_bytes > max_bytes {
+        anyhow::bail!(
+            "edge-index rebuild refused: projected active sidecar input is {} bytes (limit {}); compact/rematerialize the active edge set before retrying",
+            projected_bytes,
+            max_bytes
+        );
+    }
+    Ok(max_bytes)
 }
 
 fn edge_index_nudge_max_current_edges() -> usize {
@@ -2298,7 +2332,7 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             // Initial settle so the boot-time rebuild already ran.
             std::thread::sleep(std::time::Duration::from_secs(20));
             let mut last_seen: u64 = state.idx.read().num_docs();
-            let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+            let edges_dir = edge_sidecar_dir(&state);
             let mut last_signature = capture_edge_rebuild_authority(
                 &edges_dir,
                 Some(&state.corpus_registered_project_ids()),
@@ -3867,7 +3901,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let state = SharedState::for_test(&root.join("bro"));
-        let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+        let edges_dir = edge_sidecar_dir(&state);
         std::fs::create_dir_all(&edges_dir).unwrap();
         bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
             &edges_dir,

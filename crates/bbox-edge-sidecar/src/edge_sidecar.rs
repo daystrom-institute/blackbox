@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1832,6 +1832,129 @@ pub fn append_explicit_edges(edges_dir: &Path, project_id: &str, edges: &[Edge])
     append_edges_dedup(&edges_dir.join("explicit"), project_id, edges)
 }
 
+/// Merge one bounded explicit-edge generation through a single atomic lane
+/// replacement.
+///
+/// Memory is proportional to the caller-bounded incoming generation, never
+/// the existing lane. Existing rows are streamed byte-for-byte; their import
+/// keys remove matching incoming rows before the remaining additions are
+/// written to the replacement. A reader therefore sees either the complete
+/// old lane or the complete merged lane, never a partially appended import.
+pub fn append_explicit_edges_atomic(
+    edges_dir: &Path,
+    project_id: &str,
+    edges: &[Edge],
+) -> Result<usize> {
+    append_explicit_edges_atomic_bounded(edges_dir, project_id, edges, u64::MAX)
+}
+
+pub fn append_explicit_edges_atomic_bounded(
+    edges_dir: &Path,
+    project_id: &str,
+    edges: &[Edge],
+    max_existing_lane_bytes: u64,
+) -> Result<usize> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    for edge in edges {
+        if edge.provenance == EdgeProvenance::Derived {
+            anyhow::bail!("explicit edge import contains a derived edge");
+        }
+    }
+    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
+    let explicit_dir = edges_dir.join("explicit");
+    fs::create_dir_all(&explicit_dir)?;
+    let path = explicit_dir.join(format!("{project_id}.jsonl"));
+    let nonce = COMPACTION_NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = explicit_dir.join(format!(
+        ".{project_id}.explicit-import-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut incoming = BTreeMap::<String, &Edge>::new();
+    for edge in edges {
+        incoming.entry(edge_import_key(edge)).or_insert(edge);
+    }
+    let result = (|| -> Result<usize> {
+        let existing = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    anyhow::bail!("refusing unsafe explicit edge lane");
+                }
+                if metadata.len() > max_existing_lane_bytes {
+                    anyhow::bail!(
+                        "explicit edge lane is {} bytes (limit {})",
+                        metadata.len(),
+                        max_existing_lane_bytes
+                    );
+                }
+                let mut reader = BufReader::new(fs::File::open(&path)?);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    if reader.read_until(b'\n', &mut line)? == 0 {
+                        break;
+                    }
+                    let mut body = line.as_slice();
+                    if body.last() == Some(&b'\n') {
+                        body = &body[..body.len() - 1];
+                    }
+                    if body.last() == Some(&b'\r') {
+                        body = &body[..body.len() - 1];
+                    }
+                    if let Ok(edge) = serde_json::from_slice::<Edge>(body) {
+                        incoming.remove(&edge_import_key(&edge));
+                    }
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if incoming.is_empty() {
+            return Ok(0);
+        }
+        let tmp = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        let mut writer = BufWriter::new(tmp);
+        let mut existing_ended_with_newline = true;
+        let mut had_existing_bytes = false;
+        if existing {
+            let mut reader = BufReader::new(fs::File::open(&path)?);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                if reader.read_until(b'\n', &mut line)? == 0 {
+                    break;
+                }
+                had_existing_bytes = true;
+                existing_ended_with_newline = line.last() == Some(&b'\n');
+                writer.write_all(&line)?;
+            }
+        }
+        if had_existing_bytes && !existing_ended_with_newline {
+            writer.write_all(b"\n")?;
+        }
+        let written = incoming.len();
+        for edge in incoming.into_values() {
+            serde_json::to_writer(&mut writer, edge)?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        fs::rename(&tmp_path, &path)?;
+        fs::File::open(&explicit_dir)?.sync_all()?;
+        Ok(written)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 pub fn append_observed_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
     for e in edges {
         debug_assert!(
@@ -2187,6 +2310,66 @@ mod project_catalog_snapshot_tests {
     use bbox_corpus_core::project_catalog_snapshot::{
         OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
     };
+
+    fn explicit_edge(target: &str) -> Edge {
+        Edge {
+            source: EntityRef::parse("transcript:test:session:1:0").unwrap(),
+            kind: "READ_FILE".into(),
+            target: EntityRef::parse(target).unwrap(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        }
+    }
+
+    #[test]
+    fn atomic_explicit_import_dedups_without_partial_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        let project_id = "p_00000000000000000000000000000001";
+        let first = explicit_edge("task:first");
+        let second = explicit_edge("task:second");
+        assert_eq!(
+            append_explicit_edges_atomic(&root, project_id, std::slice::from_ref(&first)).unwrap(),
+            1
+        );
+        let before =
+            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl"))).unwrap();
+        assert_eq!(
+            append_explicit_edges_atomic(
+                &root,
+                project_id,
+                &[first.clone(), second.clone(), second]
+            )
+            .unwrap(),
+            1
+        );
+        let after =
+            std::fs::read_to_string(root.join("explicit").join(format!("{project_id}.jsonl")))
+                .unwrap();
+        assert_eq!(after.lines().count(), 2);
+        assert!(after.as_bytes().starts_with(&before));
+        assert_eq!(
+            append_explicit_edges_atomic(&root, project_id, &[first]).unwrap(),
+            0
+        );
+        let third = explicit_edge("task:third");
+        assert!(append_explicit_edges_atomic_bounded(&root, project_id, &[third], 1).is_err());
+        assert_eq!(
+            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl"))).unwrap(),
+            after.as_bytes()
+        );
+        assert!(
+            std::fs::read_dir(root.join("explicit"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp"))
+        );
+    }
 
     #[test]
     fn observed_lane_reader_streams_exact_rows_and_refuses_oversized_source() {

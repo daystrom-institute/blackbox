@@ -430,6 +430,20 @@ impl ProducerAuthRuntime {
             .ok_or(RepoTransportGrantError::ScopeForbidden)
     }
 
+    pub(crate) fn project_transport_grant_for_id(
+        &self,
+        producer_id: &str,
+        scope: &PublishedScope,
+    ) -> std::result::Result<&ProjectId, RepoTransportGrantError> {
+        let grant = self
+            .entries
+            .iter()
+            .find(|entry| entry.grant.producer_id == producer_id)
+            .map(|entry| &entry.grant)
+            .ok_or(RepoTransportGrantError::ScopeForbidden)?;
+        self.project_transport_grant(grant, scope)
+    }
+
     pub(crate) fn repo_transport_grant_for_id(
         &self,
         producer_id: &str,

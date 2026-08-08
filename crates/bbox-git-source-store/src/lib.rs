@@ -15,12 +15,17 @@ use bbox_corpus_core::json_store::{
 };
 use bbox_corpus_core::project_catalog::{CommitNamespace, RepoHistoryId};
 use bbox_git_source::{
-    BeginGitHistoryUploadResponseV1, FinalizeGitHistoryUploadResponseV1, GitHistoryDescriptorV1,
+    BeginGitHistoryUploadResponseV1, BeginProvenanceImportResponseV1,
+    FinalizeGitHistoryUploadResponseV1, FinalizeProvenanceImportResponseV1, GitHistoryDescriptorV1,
     GitHistoryManifestEntryV1, GitHistoryManifestPageV1, GitHistorySourceStateV1,
     GitHistorySourceStatusV1, GitSourceLimits, HistorySourceVerifier,
     MAX_HISTORY_MANIFEST_PAGE_BYTES, MAX_HISTORY_MANIFEST_PAGE_ENTRIES, MAX_HISTORY_RECORD_BYTES,
-    MissingHistoryRecordsPageV1, ProvenanceExportReceiptV1, history_source_generation_id,
-    validate_history_manifest,
+    MAX_PROVENANCE_DOCUMENT_BYTES, MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
+    MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES, MissingHistoryRecordsPageV1,
+    MissingProvenanceDocumentsPageV1, ProvenanceExportReceiptV1, ProvenanceImportDescriptorV1,
+    ProvenanceImportManifestEntryV1, ProvenanceImportManifestPageV1, ProvenanceImportStateV1,
+    ProvenanceImportStatusV1, ProvenanceSourceVerifier, history_source_generation_id,
+    provenance_import_generation_id, validate_history_manifest, validate_provenance_manifest,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -99,6 +104,222 @@ struct HistoryUploadRecordV1 {
     page_digests: BTreeMap<u32, String>,
     source_generation_id: Option<String>,
     updated_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProvenanceUploadRecordV1 {
+    version: u32,
+    upload_id: String,
+    producer_id: String,
+    project_id: String,
+    descriptor: ProvenanceImportDescriptorV1,
+    state: ProvenanceImportStateV1,
+    next_page: u32,
+    page_digests: BTreeMap<u32, String>,
+    import_generation_id: String,
+    updated_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StoredProvenanceImportV1 {
+    pub version: u32,
+    pub import_generation_id: String,
+    pub producer_id: String,
+    pub project_id: String,
+    pub descriptor: ProvenanceImportDescriptorV1,
+    pub state: ProvenanceImportStateV1,
+    pub created_unix_secs: u64,
+    pub accepted_sequence: u64,
+    #[serde(default)]
+    pub edges_imported: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProvenanceGenerationIndexV1 {
+    version: u32,
+    import_generation_id: String,
+    producer_id: String,
+    project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProvenanceReadyPointerV1 {
+    version: u32,
+    import_generation_id: String,
+    producer_id: String,
+    notes_tip: String,
+    accepted_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProvenanceAcceptanceSequenceV1 {
+    version: u32,
+    next_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedProvenanceImportV1 {
+    pub import_generation_id: String,
+    pub producer_id: String,
+    pub project_id: String,
+    pub scope: bbox_corpus_core::identity::PublishedScope,
+    pub notes_ref: String,
+    pub notes_tip: String,
+    pub manifest_sha256: String,
+    pub source_evidence: String,
+    pub document_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedProvenanceDocumentV1 {
+    pub note_commit: String,
+    pub document_ordinal: u32,
+    pub document_sha256: String,
+    pub document: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceImportAuthorityV1 {
+    pub scope: bbox_corpus_core::identity::PublishedScope,
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceImportStageV1 {
+    Prepared,
+    EdgesPublished,
+    Committed,
+    Superseded,
+    Quarantined,
+}
+
+impl ProvenanceImportStageV1 {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Committed | Self::Superseded | Self::Quarantined)
+    }
+
+    fn ordinal(self) -> Option<u8> {
+        match self {
+            Self::Prepared => Some(0),
+            Self::EdgesPublished => Some(1),
+            Self::Committed => Some(2),
+            Self::Superseded => None,
+            Self::Quarantined => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceImportJournalV1 {
+    pub version: u32,
+    pub stage: ProvenanceImportStageV1,
+    pub import_generation_id: String,
+    pub producer_id: String,
+    pub project_id: String,
+    pub source_evidence: String,
+    pub catalog_epoch: u64,
+    pub code_selector: String,
+    #[serde(default)]
+    pub edge_count: u64,
+    #[serde(default)]
+    pub edge_keys_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    pub checksum_sha256: String,
+}
+
+impl ProvenanceImportJournalV1 {
+    pub fn new_prepared(
+        source: &VerifiedProvenanceImportV1,
+        catalog_epoch: u64,
+        code_selector: String,
+    ) -> Result<Self> {
+        Self {
+            version: STORE_VERSION,
+            stage: ProvenanceImportStageV1::Prepared,
+            import_generation_id: source.import_generation_id.clone(),
+            producer_id: source.producer_id.clone(),
+            project_id: source.project_id.clone(),
+            source_evidence: source.source_evidence.clone(),
+            catalog_epoch,
+            code_selector,
+            edge_count: 0,
+            edge_keys_sha256: String::new(),
+            diagnostic: None,
+            checksum_sha256: String::new(),
+        }
+        .seal()
+    }
+
+    pub fn seal(mut self) -> Result<Self> {
+        self.checksum_sha256.clear();
+        self.checksum_sha256 = sha256(&serde_json::to_vec(&self)?);
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != STORE_VERSION
+            || self.project_id.is_empty()
+            || self.code_selector.is_empty()
+            || self.source_evidence.len() != 64
+            || self
+                .diagnostic
+                .as_ref()
+                .is_some_and(|value| value.len() > 512)
+            || (self.stage == ProvenanceImportStageV1::Prepared && self.edge_count != 0)
+            || (self.stage == ProvenanceImportStageV1::Prepared
+                && !self.edge_keys_sha256.is_empty())
+            || (matches!(
+                self.stage,
+                ProvenanceImportStageV1::EdgesPublished | ProvenanceImportStageV1::Committed
+            ) && validate_sha256(&self.edge_keys_sha256).is_err())
+            || (self.stage == ProvenanceImportStageV1::Superseded
+                && !self.edge_keys_sha256.is_empty()
+                && validate_sha256(&self.edge_keys_sha256).is_err())
+            || (self.stage == ProvenanceImportStageV1::Quarantined
+                && !self.edge_keys_sha256.is_empty())
+            || (matches!(
+                self.stage,
+                ProvenanceImportStageV1::Superseded | ProvenanceImportStageV1::Quarantined
+            ) && self.diagnostic.as_deref().is_none_or(str::is_empty))
+            || (!matches!(
+                self.stage,
+                ProvenanceImportStageV1::Superseded | ProvenanceImportStageV1::Quarantined
+            ) && self.diagnostic.is_some())
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        validate_receipt_authority(&self.producer_id, &self.project_id)?;
+        validate_provenance_generation_id(&self.import_generation_id)?;
+        validate_sha256(&self.source_evidence)?;
+        let mut projection = self.clone();
+        let checksum = std::mem::take(&mut projection.checksum_sha256);
+        if checksum != sha256(&serde_json::to_vec(&projection)?) {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn immutable_projection(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&(
+            self.version,
+            &self.import_generation_id,
+            &self.producer_id,
+            &self.project_id,
+            &self.source_evidence,
+            self.catalog_epoch,
+            &self.code_selector,
+        ))?)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -413,6 +634,14 @@ impl GitSourceStore {
             "generation-index",
             "activations",
             "provenance-receipts",
+            "provenance-imports",
+            "provenance-imports/uploads",
+            "provenance-imports/documents",
+            "provenance-imports/documents/sha256",
+            "provenance-imports/generations",
+            "provenance-imports/generation-index",
+            "provenance-imports/journals",
+            "provenance-imports/projects",
         ] {
             NofollowDirectory::open_or_create(&root.join(relative))?;
         }
@@ -533,6 +762,800 @@ impl GitSourceStore {
         }
         receipts.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         Ok(receipts)
+    }
+
+    pub fn begin_provenance_import(
+        &self,
+        producer_id: &str,
+        project_id: &str,
+        descriptor: ProvenanceImportDescriptorV1,
+    ) -> Result<BeginProvenanceImportResponseV1> {
+        validate_receipt_authority(producer_id, project_id)?;
+        let limits = self.current_limits()?;
+        descriptor.validate_header(limits.contract)?;
+        let import_generation_id = provenance_import_generation_id(producer_id, &descriptor)?;
+        let _guard = self.lock_mutation()?;
+        let producer_dir = self.provenance_producer_upload_dir(producer_id)?;
+        let mut open_uploads = 0_usize;
+        for entry in read_directories(&producer_dir)? {
+            let Some(record) = read_json::<ProvenanceUploadRecordV1>(
+                &entry,
+                "upload.json",
+                MAX_UPLOAD_RECORD_BYTES,
+                "provenance import upload record",
+            )?
+            else {
+                continue;
+            };
+            if record.producer_id == producer_id
+                && record.project_id == project_id
+                && record.descriptor == descriptor
+                && matches!(
+                    record.state,
+                    ProvenanceImportStateV1::ReceivingManifest
+                        | ProvenanceImportStateV1::MissingDocuments
+                )
+            {
+                return Ok(begin_provenance_response(record.upload_id));
+            }
+            if matches!(
+                record.state,
+                ProvenanceImportStateV1::ReceivingManifest
+                    | ProvenanceImportStateV1::MissingDocuments
+            ) {
+                open_uploads += 1;
+            }
+        }
+        if open_uploads >= limits.max_open_uploads_per_producer {
+            bail!(StoreRequestError::TooManyOpenUploads);
+        }
+        let upload_id = Uuid::new_v4().simple().to_string();
+        let upload_path = producer_dir.join(&upload_id);
+        let upload_dir = NofollowDirectory::open_or_create(&upload_path)?;
+        NofollowDirectory::open_or_create(&upload_path.join("pages"))?;
+        write_json(
+            &upload_dir,
+            "upload.json",
+            &ProvenanceUploadRecordV1 {
+                version: STORE_VERSION,
+                upload_id: upload_id.clone(),
+                producer_id: producer_id.to_string(),
+                project_id: project_id.to_string(),
+                descriptor,
+                state: ProvenanceImportStateV1::ReceivingManifest,
+                next_page: 0,
+                page_digests: BTreeMap::new(),
+                import_generation_id,
+                updated_unix_secs: now_unix_secs(),
+            },
+        )?;
+        Ok(begin_provenance_response(upload_id))
+    }
+
+    pub fn put_provenance_manifest_page(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+        page: u32,
+        body: &ProvenanceImportManifestPageV1,
+    ) -> Result<()> {
+        if body.entries.is_empty() || body.entries.len() > MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES {
+            bail!(StoreRequestError::LimitExceeded);
+        }
+        let raw = serde_json::to_vec(body)?;
+        if raw.len() > MAX_PROVENANCE_MANIFEST_PAGE_BYTES {
+            bail!(StoreRequestError::LimitExceeded);
+        }
+        let digest = sha256(&raw);
+        let _guard = self.lock_mutation()?;
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let mut record = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        if record.state != ProvenanceImportStateV1::ReceivingManifest {
+            bail!(StoreRequestError::InvalidState);
+        }
+        if page < record.next_page {
+            if record.page_digests.get(&page) == Some(&digest) {
+                return Ok(());
+            }
+            bail!(StoreRequestError::InvalidInput);
+        }
+        if page != record.next_page {
+            bail!(StoreRequestError::InvalidInput);
+        }
+        let pages = NofollowDirectory::open_existing(&upload_path.join("pages"))?
+            .ok_or(StoreRequestError::InvalidState)?;
+        pages.atomic_replace(&format!("{page:08}.json"), &raw)?;
+        record.page_digests.insert(page, digest);
+        record.next_page = record
+            .next_page
+            .checked_add(1)
+            .ok_or(StoreRequestError::LimitExceeded)?;
+        record.updated_unix_secs = now_unix_secs();
+        let directory =
+            NofollowDirectory::open_existing(&upload_path)?.ok_or(StoreRequestError::NotFound)?;
+        write_json(&directory, "upload.json", &record)
+    }
+
+    pub fn complete_provenance_manifest(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+    ) -> Result<MissingProvenanceDocumentsPageV1> {
+        let _guard = self.lock_mutation()?;
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let directory =
+            NofollowDirectory::open_existing(&upload_path)?.ok_or(StoreRequestError::NotFound)?;
+        let mut record = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        if record.state == ProvenanceImportStateV1::MissingDocuments {
+            return self.missing_provenance_documents_locked(&record, None);
+        }
+        if record.state != ProvenanceImportStateV1::ReceivingManifest {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let mut manifest = Vec::new();
+        if record.descriptor.document_count > 0 {
+            if record.next_page == 0 {
+                bail!(StoreRequestError::InvalidState);
+            }
+            for page in 0..record.next_page {
+                let body = read_json::<ProvenanceImportManifestPageV1>(
+                    &upload_path.join("pages"),
+                    &format!("{page:08}.json"),
+                    MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
+                    "provenance import manifest page",
+                )?
+                .ok_or(StoreRequestError::InvalidState)?;
+                manifest.extend(body.entries);
+                if manifest.len() as u64 > record.descriptor.document_count {
+                    bail!(StoreRequestError::LimitExceeded);
+                }
+            }
+        } else if record.next_page != 0 {
+            bail!(StoreRequestError::InvalidInput);
+        }
+        validate_provenance_manifest(
+            &record.descriptor,
+            &manifest,
+            self.current_limits()?.contract,
+        )?;
+        let raw = serde_json::to_vec(&manifest)?;
+        if raw.len() > MAX_MANIFEST_BYTES {
+            bail!(StoreRequestError::LimitExceeded);
+        }
+        directory.atomic_replace("manifest.json", &raw)?;
+        record.state = ProvenanceImportStateV1::MissingDocuments;
+        record.updated_unix_secs = now_unix_secs();
+        write_json(&directory, "upload.json", &record)?;
+        self.missing_provenance_documents_locked(&record, None)
+    }
+
+    pub fn missing_provenance_documents(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<MissingProvenanceDocumentsPageV1> {
+        let _guard = self.lock_mutation()?;
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let record = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        if record.state != ProvenanceImportStateV1::MissingDocuments {
+            bail!(StoreRequestError::InvalidState);
+        }
+        self.missing_provenance_documents_locked(&record, cursor)
+    }
+
+    pub fn expected_provenance_document_size(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+        hash: &str,
+    ) -> Result<u64> {
+        let _guard = self.lock_mutation()?;
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let record = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        if record.state != ProvenanceImportStateV1::MissingDocuments {
+            bail!(StoreRequestError::InvalidState);
+        }
+        self.load_provenance_manifest(&upload_path)?
+            .into_iter()
+            .find(|entry| entry.document_sha256 == hash)
+            .map(|entry| entry.encoded_bytes)
+            .ok_or_else(|| anyhow!(StoreRequestError::NotFound))
+    }
+
+    pub fn install_provenance_document(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+        hash: &str,
+        expected_size: u64,
+        mut reader: impl Read,
+    ) -> Result<()> {
+        if expected_size > MAX_PROVENANCE_DOCUMENT_BYTES {
+            bail!(StoreRequestError::LimitExceeded);
+        }
+        let _guard = self.lock_mutation()?;
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let mut record = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        if record.state != ProvenanceImportStateV1::MissingDocuments {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let manifest = self.load_provenance_manifest(&upload_path)?;
+        let entry = manifest
+            .iter()
+            .find(|entry| entry.document_sha256 == hash)
+            .ok_or(StoreRequestError::NotFound)?;
+        if entry.encoded_bytes != expected_size {
+            bail!(StoreRequestError::InvalidInput);
+        }
+        let mut bytes = Vec::with_capacity(expected_size as usize);
+        reader
+            .by_ref()
+            .take(expected_size.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != expected_size || sha256(&bytes) != hash {
+            bail!(StoreRequestError::InvalidInput);
+        }
+        std::str::from_utf8(&bytes).map_err(|_| StoreRequestError::InvalidInput)?;
+        self.install_provenance_document_bytes(hash, &bytes)?;
+        record.updated_unix_secs = now_unix_secs();
+        let directory =
+            NofollowDirectory::open_existing(&upload_path)?.ok_or(StoreRequestError::NotFound)?;
+        write_json(&directory, "upload.json", &record)
+    }
+
+    pub fn finalize_provenance_import(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+    ) -> Result<FinalizeProvenanceImportResponseV1> {
+        let _guard = self.lock_mutation()?;
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let upload_directory =
+            NofollowDirectory::open_existing(&upload_path)?.ok_or(StoreRequestError::NotFound)?;
+        let mut upload = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        if !matches!(
+            upload.state,
+            ProvenanceImportStateV1::MissingDocuments | ProvenanceImportStateV1::Ready
+        ) {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let manifest = self.load_provenance_manifest(&upload_path)?;
+        let mut verifier = ProvenanceSourceVerifier::new(
+            &upload.descriptor,
+            &manifest,
+            self.current_limits()?.contract,
+        )?;
+        for entry in &manifest {
+            let bytes = self
+                .read_provenance_document_bytes(
+                    &entry.document_sha256,
+                    entry.encoded_bytes as usize,
+                )?
+                .ok_or(StoreRequestError::InvalidState)?;
+            let document = String::from_utf8(bytes).map_err(|_| StoreRequestError::InvalidInput)?;
+            verifier.push(&document)?;
+        }
+        verifier.finish()?;
+        let generation_path = self.provenance_generation_dir(&upload.import_generation_id)?;
+        let existing = read_json::<StoredProvenanceImportV1>(
+            &generation_path,
+            "source.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "stored provenance import",
+        )?;
+        let source = if let Some(existing) = existing {
+            if existing.version != STORE_VERSION
+                || existing.import_generation_id != upload.import_generation_id
+                || existing.accepted_sequence == 0
+                || existing.producer_id != producer_id
+                || existing.project_id != upload.project_id
+                || existing.descriptor != upload.descriptor
+                || self.load_provenance_generation_manifest(&upload.import_generation_id)?
+                    != manifest
+            {
+                bail!(StoreRequestError::InvalidInput);
+            }
+            existing
+        } else {
+            let generation_dir = NofollowDirectory::open_or_create(&generation_path)?;
+            let source = StoredProvenanceImportV1 {
+                version: STORE_VERSION,
+                import_generation_id: upload.import_generation_id.clone(),
+                producer_id: producer_id.to_string(),
+                project_id: upload.project_id.clone(),
+                descriptor: upload.descriptor.clone(),
+                state: ProvenanceImportStateV1::Ready,
+                created_unix_secs: now_unix_secs(),
+                accepted_sequence: self
+                    .allocate_provenance_acceptance_sequence(&upload.project_id)?,
+                edges_imported: 0,
+                diagnostic: None,
+            };
+            install_immutable_json(&generation_dir, "descriptor.json", &upload.descriptor)?;
+            install_immutable_json(&generation_dir, "manifest.json", &manifest)?;
+            install_immutable_json(&generation_dir, "source.json", &source)?;
+            source
+        };
+        let index = NofollowDirectory::open_existing(
+            &self.root.join("provenance-imports/generation-index"),
+        )?
+        .ok_or(StoreRequestError::InvalidState)?;
+        write_json(
+            &index,
+            &format!("{}.json", upload.import_generation_id),
+            &ProvenanceGenerationIndexV1 {
+                version: STORE_VERSION,
+                import_generation_id: upload.import_generation_id.clone(),
+                producer_id: producer_id.to_string(),
+                project_id: upload.project_id.clone(),
+            },
+        )?;
+        self.advance_provenance_ready_pointer(&source)?;
+        upload.state = ProvenanceImportStateV1::Ready;
+        upload.updated_unix_secs = now_unix_secs();
+        write_json(&upload_directory, "upload.json", &upload)?;
+        Ok(finalize_provenance_response(upload.import_generation_id))
+    }
+
+    pub fn provenance_import_status(
+        &self,
+        producer_id: &str,
+        import_generation_id: &str,
+    ) -> Result<ProvenanceImportStatusV1> {
+        let source =
+            self.load_provenance_generation_for_producer(producer_id, import_generation_id)?;
+        Ok(ProvenanceImportStatusV1 {
+            import_generation_id: source.import_generation_id,
+            state: source.state,
+            document_count: source.descriptor.document_count,
+            logical_bytes: source.descriptor.logical_bytes,
+            edges_imported: source.edges_imported,
+            diagnostic: source.diagnostic,
+        })
+    }
+
+    pub fn provenance_upload_authority(
+        &self,
+        producer_id: &str,
+        upload_id: &str,
+    ) -> Result<ProvenanceImportAuthorityV1> {
+        let upload_path = self.provenance_upload_dir(producer_id, upload_id)?;
+        let upload = self.load_provenance_upload(&upload_path, producer_id, upload_id)?;
+        Ok(ProvenanceImportAuthorityV1 {
+            scope: upload.descriptor.scope,
+            project_id: upload.project_id,
+        })
+    }
+
+    pub fn provenance_generation_authority(
+        &self,
+        producer_id: &str,
+        import_generation_id: &str,
+    ) -> Result<ProvenanceImportAuthorityV1> {
+        let source =
+            self.load_provenance_generation_for_producer(producer_id, import_generation_id)?;
+        Ok(ProvenanceImportAuthorityV1 {
+            scope: source.descriptor.scope,
+            project_id: source.project_id,
+        })
+    }
+
+    pub fn ready_provenance_import_ids(&self) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(self.root.join("provenance-imports/generation-index"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || entry.file_type()?.is_symlink() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let index = self.load_provenance_generation_index(id)?;
+            let source = self.load_provenance_generation(id)?;
+            if source.producer_id != index.producer_id || source.project_id != index.project_id {
+                bail!(StoreRequestError::InvalidState);
+            }
+            if matches!(
+                source.state,
+                ProvenanceImportStateV1::Ready | ProvenanceImportStateV1::Importing
+            ) {
+                ids.push(id.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    pub fn current_ready_provenance_import_id(&self, project_id: &str) -> Result<Option<String>> {
+        let Some(pointer) = self.load_provenance_ready_pointer(project_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(pointer.import_generation_id))
+    }
+
+    /// Repair the narrow crash window between immutable generation/index
+    /// installation and ready-pointer replacement. The acceptance sequence
+    /// is allocated durably first, so choosing the greatest surviving
+    /// sequence cannot make an older generation current.
+    pub fn repair_current_ready_provenance_import_id(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<String>> {
+        let _guard = self.lock_mutation()?;
+        if let Some(pointer) = self.load_provenance_ready_pointer(project_id)? {
+            return Ok(Some(pointer.import_generation_id));
+        }
+        let mut candidate: Option<StoredProvenanceImportV1> = None;
+        for entry in fs::read_dir(self.root.join("provenance-imports/generation-index"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() || entry.file_type()?.is_symlink() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let source = self.load_provenance_generation(id)?;
+            if source.project_id != project_id
+                || !matches!(
+                    source.state,
+                    ProvenanceImportStateV1::Ready
+                        | ProvenanceImportStateV1::Importing
+                        | ProvenanceImportStateV1::Active
+                        | ProvenanceImportStateV1::Quarantined
+                )
+            {
+                continue;
+            }
+            if candidate
+                .as_ref()
+                .is_none_or(|current| source.accepted_sequence > current.accepted_sequence)
+            {
+                candidate = Some(source);
+            }
+        }
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        self.advance_provenance_ready_pointer(&candidate)?;
+        Ok(Some(candidate.import_generation_id))
+    }
+
+    pub fn verified_provenance_import(
+        &self,
+        import_generation_id: &str,
+    ) -> Result<VerifiedProvenanceImportV1> {
+        let source = self.load_provenance_generation(import_generation_id)?;
+        if !matches!(
+            source.state,
+            ProvenanceImportStateV1::Ready
+                | ProvenanceImportStateV1::Importing
+                | ProvenanceImportStateV1::Active
+                | ProvenanceImportStateV1::Superseded
+        ) {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let manifest = self.load_provenance_generation_manifest(import_generation_id)?;
+        validate_provenance_manifest(
+            &source.descriptor,
+            &manifest,
+            self.current_limits()?.contract,
+        )?;
+        let source_evidence = sha256(&serde_json::to_vec(&(
+            &source.import_generation_id,
+            &source.producer_id,
+            &source.project_id,
+            &source.descriptor,
+            &manifest,
+        ))?);
+        Ok(VerifiedProvenanceImportV1 {
+            import_generation_id: source.import_generation_id,
+            producer_id: source.producer_id,
+            project_id: source.project_id,
+            scope: source.descriptor.scope,
+            notes_ref: source.descriptor.notes_ref,
+            notes_tip: source.descriptor.notes_tip,
+            manifest_sha256: source.descriptor.manifest_sha256,
+            source_evidence,
+            document_count: source.descriptor.document_count,
+        })
+    }
+
+    pub fn visit_verified_provenance_documents(
+        &self,
+        source: &VerifiedProvenanceImportV1,
+        mut visit: impl FnMut(VerifiedProvenanceDocumentV1) -> Result<()>,
+    ) -> Result<()> {
+        if &self.verified_provenance_import(&source.import_generation_id)? != source {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let manifest = self.load_provenance_generation_manifest(&source.import_generation_id)?;
+        for entry in manifest {
+            let bytes = self
+                .read_provenance_document_bytes(
+                    &entry.document_sha256,
+                    entry.encoded_bytes as usize,
+                )?
+                .ok_or(StoreRequestError::InvalidState)?;
+            let document = String::from_utf8(bytes).map_err(|_| StoreRequestError::InvalidInput)?;
+            visit(VerifiedProvenanceDocumentV1 {
+                note_commit: entry.note_commit,
+                document_ordinal: entry.document_ordinal,
+                document_sha256: entry.document_sha256,
+                document,
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn transition_provenance_import(
+        &self,
+        import_generation_id: &str,
+        next: ProvenanceImportStateV1,
+        edges_imported: u64,
+        diagnostic: Option<&str>,
+    ) -> Result<StoredProvenanceImportV1> {
+        let _guard = self.lock_mutation()?;
+        let mut source = self.load_provenance_generation(import_generation_id)?;
+        let allowed = matches!(
+            (source.state, next),
+            (
+                ProvenanceImportStateV1::Ready,
+                ProvenanceImportStateV1::Importing
+            ) | (
+                ProvenanceImportStateV1::Importing,
+                ProvenanceImportStateV1::Importing
+            ) | (
+                ProvenanceImportStateV1::Importing,
+                ProvenanceImportStateV1::Active
+            ) | (
+                ProvenanceImportStateV1::Ready,
+                ProvenanceImportStateV1::Quarantined
+            ) | (
+                ProvenanceImportStateV1::Importing,
+                ProvenanceImportStateV1::Quarantined
+            ) | (
+                ProvenanceImportStateV1::Active,
+                ProvenanceImportStateV1::Superseded
+            ) | (
+                ProvenanceImportStateV1::Active,
+                ProvenanceImportStateV1::Active
+            ) | (
+                ProvenanceImportStateV1::Ready,
+                ProvenanceImportStateV1::Superseded
+            ) | (
+                ProvenanceImportStateV1::Importing,
+                ProvenanceImportStateV1::Superseded
+            ) | (
+                ProvenanceImportStateV1::Superseded,
+                ProvenanceImportStateV1::Superseded
+            )
+        );
+        if !allowed {
+            bail!(StoreRequestError::InvalidState);
+        }
+        source.state = next;
+        source.edges_imported = edges_imported;
+        source.diagnostic = diagnostic.map(|value| value.chars().take(512).collect());
+        self.write_provenance_source(&source)?;
+        Ok(source)
+    }
+
+    /// Atomically decide whether a fully published import is still the
+    /// newest accepted note generation for its project. Older work may
+    /// finish its idempotent sidecar append, but it can never become Active
+    /// after a newer finalize advanced the durable ready pointer.
+    pub fn settle_provenance_import(
+        &self,
+        import_generation_id: &str,
+        edges_imported: u64,
+    ) -> Result<StoredProvenanceImportV1> {
+        let _guard = self.lock_mutation()?;
+        let mut source = self.load_provenance_generation(import_generation_id)?;
+        if !matches!(
+            source.state,
+            ProvenanceImportStateV1::Ready
+                | ProvenanceImportStateV1::Importing
+                | ProvenanceImportStateV1::Active
+                | ProvenanceImportStateV1::Superseded
+        ) {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let current = self.load_provenance_ready_pointer(&source.project_id)?;
+        let is_current = current
+            .as_ref()
+            .is_some_and(|pointer| pointer.import_generation_id == import_generation_id);
+        if is_current {
+            self.supersede_other_active_provenance_imports_locked(
+                &source.project_id,
+                import_generation_id,
+            )?;
+            source.state = ProvenanceImportStateV1::Active;
+            source.diagnostic = None;
+        } else {
+            source.state = ProvenanceImportStateV1::Superseded;
+            source.diagnostic = Some(
+                current
+                    .map(|pointer| {
+                        format!(
+                            "superseded by accepted provenance import {}",
+                            pointer.import_generation_id
+                        )
+                    })
+                    .unwrap_or_else(|| "provenance ready pointer is absent".to_string()),
+            );
+        }
+        source.edges_imported = edges_imported;
+        self.write_provenance_source(&source)?;
+        Ok(source)
+    }
+
+    pub fn supersede_other_active_provenance_imports(
+        &self,
+        project_id: &str,
+        active_import_generation_id: &str,
+    ) -> Result<u64> {
+        validate_receipt_authority("supersede", project_id)?;
+        validate_provenance_generation_id(active_import_generation_id)?;
+        let _guard = self.lock_mutation()?;
+        self.supersede_other_active_provenance_imports_locked(
+            project_id,
+            active_import_generation_id,
+        )
+    }
+
+    fn supersede_other_active_provenance_imports_locked(
+        &self,
+        project_id: &str,
+        active_import_generation_id: &str,
+    ) -> Result<u64> {
+        let mut superseded = 0_u64;
+        for entry in fs::read_dir(self.root.join("provenance-imports/generation-index"))? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(generation_id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let index = self.load_provenance_generation_index(generation_id)?;
+            if index.project_id != project_id || generation_id == active_import_generation_id {
+                continue;
+            }
+            let mut source = self.load_provenance_generation(generation_id)?;
+            if source.state != ProvenanceImportStateV1::Active {
+                continue;
+            }
+            source.state = ProvenanceImportStateV1::Superseded;
+            source.diagnostic = Some(format!(
+                "superseded by provenance import {active_import_generation_id}"
+            ));
+            self.write_provenance_source(&source)?;
+            superseded = superseded.saturating_add(1);
+        }
+        Ok(superseded)
+    }
+
+    pub fn read_provenance_import_journal(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProvenanceImportJournalV1>> {
+        validate_receipt_authority("read", project_id)?;
+        let journal = read_json::<ProvenanceImportJournalV1>(
+            &self.root.join("provenance-imports/journals"),
+            &format!("{project_id}.json"),
+            MAX_GENERATION_RECORD_BYTES,
+            "provenance import journal",
+        )?;
+        if let Some(journal) = journal.as_ref() {
+            journal.validate()?;
+            if journal.project_id != project_id {
+                bail!(StoreRequestError::InvalidState);
+            }
+        }
+        Ok(journal)
+    }
+
+    pub fn save_provenance_import_journal(
+        &self,
+        journal: ProvenanceImportJournalV1,
+    ) -> Result<ProvenanceImportJournalV1> {
+        let _guard = self.lock_mutation()?;
+        let journal = journal.seal()?;
+        journal.validate()?;
+        let previous = self.read_provenance_import_journal(&journal.project_id)?;
+        match previous.as_ref() {
+            None if journal.stage != ProvenanceImportStageV1::Prepared => {
+                bail!(StoreRequestError::InvalidState)
+            }
+            None => {}
+            Some(previous)
+                if previous.stage.terminal()
+                    && journal.stage == ProvenanceImportStageV1::Prepared => {}
+            Some(previous) => {
+                if previous.immutable_projection()? != journal.immutable_projection()? {
+                    bail!(StoreRequestError::InvalidState);
+                }
+                if previous.stage.terminal() && previous.stage != journal.stage {
+                    bail!(StoreRequestError::InvalidState);
+                }
+                if !matches!(
+                    journal.stage,
+                    ProvenanceImportStageV1::Superseded | ProvenanceImportStageV1::Quarantined
+                ) {
+                    let Some(previous_ordinal) = previous.stage.ordinal() else {
+                        bail!(StoreRequestError::InvalidState);
+                    };
+                    let Some(next_ordinal) = journal.stage.ordinal() else {
+                        bail!(StoreRequestError::InvalidState);
+                    };
+                    if next_ordinal < previous_ordinal
+                        || next_ordinal > previous_ordinal.saturating_add(1)
+                    {
+                        bail!(StoreRequestError::InvalidState);
+                    }
+                }
+            }
+        }
+        if journal.stage == ProvenanceImportStageV1::Prepared {
+            let verified = self.verified_provenance_import(&journal.import_generation_id)?;
+            if verified.producer_id != journal.producer_id
+                || verified.project_id != journal.project_id
+                || verified.source_evidence != journal.source_evidence
+            {
+                bail!(StoreRequestError::InvalidState);
+            }
+        }
+        let directory =
+            NofollowDirectory::open_existing(&self.root.join("provenance-imports/journals"))?
+                .ok_or(StoreRequestError::InvalidState)?;
+        write_json(
+            &directory,
+            &format!("{}.json", journal.project_id),
+            &journal,
+        )?;
+        Ok(journal)
+    }
+
+    pub fn list_provenance_import_journals(&self) -> Result<Vec<ProvenanceImportJournalV1>> {
+        let root = self.root.join("provenance-imports/journals");
+        let mut journals = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(journal) = read_json::<ProvenanceImportJournalV1>(
+                &root,
+                &name,
+                MAX_GENERATION_RECORD_BYTES,
+                "provenance import journal",
+            )?
+            else {
+                continue;
+            };
+            journal.validate()?;
+            if name != format!("{}.json", journal.project_id) {
+                bail!(StoreRequestError::InvalidState);
+            }
+            journals.push(journal);
+        }
+        journals.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        Ok(journals)
     }
 
     /// Reclaim only state that durable store evidence proves unreferenced.
@@ -1525,6 +2548,344 @@ impl GitSourceStore {
         })
     }
 
+    fn missing_provenance_documents_locked(
+        &self,
+        upload: &ProvenanceUploadRecordV1,
+        cursor: Option<&str>,
+    ) -> Result<MissingProvenanceDocumentsPageV1> {
+        let upload_path = self.provenance_upload_dir(&upload.producer_id, &upload.upload_id)?;
+        let manifest = self.load_provenance_manifest(&upload_path)?;
+        let unique = manifest
+            .iter()
+            .map(|entry| entry.document_sha256.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let start = match cursor {
+            Some(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|index| *index <= unique.len())
+                .ok_or(StoreRequestError::InvalidInput)?,
+            None => 0,
+        };
+        let mut missing = Vec::new();
+        let mut examined = start;
+        while examined < unique.len() && missing.len() < MISSING_PAGE_SIZE {
+            let hash = unique[examined];
+            let size = manifest
+                .iter()
+                .find(|entry| entry.document_sha256 == hash)
+                .expect("hash came from manifest")
+                .encoded_bytes as usize;
+            if self.read_provenance_document_bytes(hash, size)?.is_none() {
+                missing.push(hash.to_string());
+            }
+            examined += 1;
+        }
+        Ok(MissingProvenanceDocumentsPageV1 {
+            import_generation_id: upload.import_generation_id.clone(),
+            hashes: missing,
+            next_cursor: (examined < unique.len()).then(|| examined.to_string()),
+        })
+    }
+
+    fn provenance_producer_upload_dir(&self, producer_id: &str) -> Result<PathBuf> {
+        validate_producer_authority(producer_id)?;
+        let path = self
+            .root
+            .join("provenance-imports/uploads")
+            .join(sha256(producer_id.as_bytes()));
+        NofollowDirectory::open_or_create(&path)?;
+        Ok(path)
+    }
+
+    fn provenance_upload_dir(&self, producer_id: &str, upload_id: &str) -> Result<PathBuf> {
+        validate_upload_id(upload_id)?;
+        let path = self
+            .provenance_producer_upload_dir(producer_id)?
+            .join(upload_id);
+        if NofollowDirectory::open_existing(&path)?.is_none() {
+            bail!(StoreRequestError::NotFound);
+        }
+        Ok(path)
+    }
+
+    fn load_provenance_upload(
+        &self,
+        upload_path: &Path,
+        producer_id: &str,
+        upload_id: &str,
+    ) -> Result<ProvenanceUploadRecordV1> {
+        let record = read_json::<ProvenanceUploadRecordV1>(
+            upload_path,
+            "upload.json",
+            MAX_UPLOAD_RECORD_BYTES,
+            "provenance import upload record",
+        )?
+        .ok_or(StoreRequestError::NotFound)?;
+        if record.version != STORE_VERSION
+            || record.producer_id != producer_id
+            || record.upload_id != upload_id
+        {
+            bail!(StoreRequestError::NotFound);
+        }
+        Ok(record)
+    }
+
+    fn load_provenance_manifest(
+        &self,
+        upload_path: &Path,
+    ) -> Result<Vec<ProvenanceImportManifestEntryV1>> {
+        read_json(
+            upload_path,
+            "manifest.json",
+            MAX_MANIFEST_BYTES,
+            "provenance import manifest",
+        )?
+        .ok_or_else(|| anyhow!(StoreRequestError::InvalidState))
+    }
+
+    fn provenance_document_bucket(&self, hash: &str) -> Result<NofollowDirectory> {
+        validate_sha256(hash)?;
+        NofollowDirectory::open_or_create(
+            &self
+                .root
+                .join("provenance-imports/documents/sha256")
+                .join(&hash[..2]),
+        )
+    }
+
+    fn install_provenance_document_bytes(&self, hash: &str, bytes: &[u8]) -> Result<()> {
+        let directory = self.provenance_document_bucket(hash)?;
+        if let Some(existing) = directory.read_regular(
+            hash,
+            MAX_PROVENANCE_DOCUMENT_BYTES as usize,
+            "provenance import document",
+        )? {
+            if existing != bytes || sha256(&existing) != hash {
+                bail!(StoreRequestError::InvalidInput);
+            }
+            return Ok(());
+        }
+        directory.atomic_replace(hash, bytes)
+    }
+
+    fn read_provenance_document_bytes(
+        &self,
+        hash: &str,
+        expected_size: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let directory = self.provenance_document_bucket(hash)?;
+        let Some(bytes) = directory.read_regular(
+            hash,
+            expected_size.saturating_add(1),
+            "provenance import document",
+        )?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != expected_size || sha256(&bytes) != hash {
+            bail!(StoreRequestError::InvalidInput);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn provenance_project_dir(&self, project_id: &str) -> Result<PathBuf> {
+        validate_receipt_authority("project", project_id)?;
+        Ok(self
+            .root
+            .join("provenance-imports/projects")
+            .join(project_id))
+    }
+
+    fn allocate_provenance_acceptance_sequence(&self, project_id: &str) -> Result<u64> {
+        let path = self.provenance_project_dir(project_id)?;
+        let directory = NofollowDirectory::open_or_create(&path)?;
+        let sequence = read_json::<ProvenanceAcceptanceSequenceV1>(
+            &path,
+            "acceptance-sequence.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "provenance acceptance sequence",
+        )?
+        .unwrap_or(ProvenanceAcceptanceSequenceV1 {
+            version: STORE_VERSION,
+            next_sequence: 1,
+        });
+        if sequence.version != STORE_VERSION || sequence.next_sequence == 0 {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let accepted = sequence.next_sequence;
+        let next_sequence = accepted
+            .checked_add(1)
+            .ok_or(StoreRequestError::LimitExceeded)?;
+        write_json(
+            &directory,
+            "acceptance-sequence.json",
+            &ProvenanceAcceptanceSequenceV1 {
+                version: STORE_VERSION,
+                next_sequence,
+            },
+        )?;
+        Ok(accepted)
+    }
+
+    fn load_provenance_ready_pointer(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProvenanceReadyPointerV1>> {
+        let path = self.provenance_project_dir(project_id)?;
+        let Some(pointer) = read_json::<ProvenanceReadyPointerV1>(
+            &path,
+            "current-ready.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "provenance ready pointer",
+        )?
+        else {
+            return Ok(None);
+        };
+        if pointer.version != STORE_VERSION
+            || pointer.accepted_sequence == 0
+            || pointer.import_generation_id.is_empty()
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let source = self.load_provenance_generation(&pointer.import_generation_id)?;
+        if source.project_id != project_id
+            || source.producer_id != pointer.producer_id
+            || source.descriptor.notes_tip != pointer.notes_tip
+            || source.accepted_sequence != pointer.accepted_sequence
+            || !matches!(
+                source.state,
+                ProvenanceImportStateV1::Ready
+                    | ProvenanceImportStateV1::Importing
+                    | ProvenanceImportStateV1::Active
+                    | ProvenanceImportStateV1::Quarantined
+            )
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(Some(pointer))
+    }
+
+    fn advance_provenance_ready_pointer(&self, source: &StoredProvenanceImportV1) -> Result<()> {
+        if !matches!(
+            source.state,
+            ProvenanceImportStateV1::Ready
+                | ProvenanceImportStateV1::Importing
+                | ProvenanceImportStateV1::Active
+        ) {
+            return Ok(());
+        }
+        if let Some(current) = self.load_provenance_ready_pointer(&source.project_id)? {
+            if current.accepted_sequence > source.accepted_sequence {
+                return Ok(());
+            }
+            if current.accepted_sequence == source.accepted_sequence {
+                if current.import_generation_id != source.import_generation_id {
+                    bail!(StoreRequestError::InvalidState);
+                }
+                return Ok(());
+            }
+        }
+        let path = self.provenance_project_dir(&source.project_id)?;
+        let directory = NofollowDirectory::open_or_create(&path)?;
+        write_json(
+            &directory,
+            "current-ready.json",
+            &ProvenanceReadyPointerV1 {
+                version: STORE_VERSION,
+                import_generation_id: source.import_generation_id.clone(),
+                producer_id: source.producer_id.clone(),
+                notes_tip: source.descriptor.notes_tip.clone(),
+                accepted_sequence: source.accepted_sequence,
+            },
+        )
+    }
+
+    fn write_provenance_source(&self, source: &StoredProvenanceImportV1) -> Result<()> {
+        let directory = NofollowDirectory::open_existing(
+            &self.provenance_generation_dir(&source.import_generation_id)?,
+        )?
+        .ok_or(StoreRequestError::NotFound)?;
+        write_json(&directory, "source.json", source)
+    }
+
+    fn provenance_generation_dir(&self, import_generation_id: &str) -> Result<PathBuf> {
+        validate_provenance_generation_id(import_generation_id)?;
+        Ok(self
+            .root
+            .join("provenance-imports/generations")
+            .join(import_generation_id))
+    }
+
+    fn load_provenance_generation_index(
+        &self,
+        import_generation_id: &str,
+    ) -> Result<ProvenanceGenerationIndexV1> {
+        validate_provenance_generation_id(import_generation_id)?;
+        let index = read_json::<ProvenanceGenerationIndexV1>(
+            &self.root.join("provenance-imports/generation-index"),
+            &format!("{import_generation_id}.json"),
+            MAX_GENERATION_RECORD_BYTES,
+            "provenance import generation index",
+        )?
+        .ok_or(StoreRequestError::NotFound)?;
+        if index.version != STORE_VERSION || index.import_generation_id != import_generation_id {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(index)
+    }
+
+    fn load_provenance_generation(
+        &self,
+        import_generation_id: &str,
+    ) -> Result<StoredProvenanceImportV1> {
+        let source = read_json::<StoredProvenanceImportV1>(
+            &self.provenance_generation_dir(import_generation_id)?,
+            "source.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "stored provenance import",
+        )?
+        .ok_or(StoreRequestError::NotFound)?;
+        if source.version != STORE_VERSION
+            || source.import_generation_id != import_generation_id
+            || source.accepted_sequence == 0
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(source)
+    }
+
+    fn load_provenance_generation_for_producer(
+        &self,
+        producer_id: &str,
+        import_generation_id: &str,
+    ) -> Result<StoredProvenanceImportV1> {
+        let index = self.load_provenance_generation_index(import_generation_id)?;
+        if index.producer_id != producer_id {
+            bail!(StoreRequestError::NotFound);
+        }
+        let source = self.load_provenance_generation(import_generation_id)?;
+        if source.producer_id != index.producer_id || source.project_id != index.project_id {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(source)
+    }
+
+    fn load_provenance_generation_manifest(
+        &self,
+        import_generation_id: &str,
+    ) -> Result<Vec<ProvenanceImportManifestEntryV1>> {
+        read_json(
+            &self.provenance_generation_dir(import_generation_id)?,
+            "manifest.json",
+            MAX_MANIFEST_BYTES,
+            "provenance import generation manifest",
+        )?
+        .ok_or_else(|| anyhow!(StoreRequestError::InvalidState))
+    }
+
     fn producer_upload_dir(&self, producer_id: &str) -> Result<PathBuf> {
         let digest = sha256(producer_id.as_bytes());
         let path = self.root.join("uploads").join(digest);
@@ -1665,6 +3026,28 @@ impl GitSourceStore {
         Ok(expired)
     }
 
+    fn expire_stale_provenance_uploads(&self, now: u64) -> Result<u64> {
+        let mut expired = 0_u64;
+        for producer_dir in read_directories(&self.root.join("provenance-imports/uploads"))? {
+            for upload_dir in read_directories(&producer_dir)? {
+                let upload = read_json::<ProvenanceUploadRecordV1>(
+                    &upload_dir,
+                    "upload.json",
+                    MAX_UPLOAD_RECORD_BYTES,
+                    "provenance import upload record",
+                )?
+                .ok_or_else(|| anyhow!("provenance upload directory is missing its record"))?;
+                if now.saturating_sub(upload.updated_unix_secs) < HISTORY_UPLOAD_IDLE_TTL_SECS {
+                    continue;
+                }
+                remove_upload_directory(&upload_dir)?;
+                expired = expired.saturating_add(1);
+            }
+            remove_directory_if_empty(&producer_dir)?;
+        }
+        Ok(expired)
+    }
+
     fn retire_old_generations(
         &self,
         protected_generation_ids: &BTreeSet<String>,
@@ -1765,6 +3148,102 @@ impl GitSourceStore {
                         .join(format!("{}.json", source.source_generation_id)),
                 )?;
                 remove_generation_directory(&history_dir.join(&source.source_generation_id))?;
+                retired = retired.saturating_add(1);
+            }
+        }
+        Ok(retired)
+    }
+
+    fn retire_old_provenance_generations(&self, retained: usize) -> Result<u64> {
+        let mut sources_by_project: BTreeMap<String, Vec<StoredProvenanceImportV1>> =
+            BTreeMap::new();
+        for generation_dir in read_directories(&self.root.join("provenance-imports/generations"))? {
+            let source = read_json::<StoredProvenanceImportV1>(
+                &generation_dir,
+                "source.json",
+                MAX_GENERATION_RECORD_BYTES,
+                "stored provenance import",
+            )?
+            .ok_or_else(|| anyhow!("provenance generation is missing source metadata"))?;
+            if source.accepted_sequence == 0
+                || generation_dir.file_name().and_then(|name| name.to_str())
+                    != Some(source.import_generation_id.as_str())
+            {
+                bail!("provenance generation metadata does not match its durable location");
+            }
+            let index = self.load_provenance_generation_index(&source.import_generation_id)?;
+            if index.producer_id != source.producer_id || index.project_id != source.project_id {
+                bail!("provenance generation index disagrees with source metadata");
+            }
+            sources_by_project
+                .entry(source.project_id.clone())
+                .or_default()
+                .push(source);
+        }
+        let journal_roots = self
+            .list_provenance_import_journals()?
+            .into_iter()
+            .filter(|journal| !journal.stage.terminal())
+            .map(|journal| journal.import_generation_id)
+            .collect::<BTreeSet<_>>();
+        let mut retired = 0_u64;
+        for (project_id, mut sources) in sources_by_project {
+            let current = self.load_provenance_ready_pointer(&project_id)?;
+            sources.sort_by(|left, right| {
+                right
+                    .accepted_sequence
+                    .cmp(&left.accepted_sequence)
+                    .then_with(|| right.import_generation_id.cmp(&left.import_generation_id))
+            });
+            let mut seen_sequences = BTreeSet::new();
+            for source in &sources {
+                if !seen_sequences.insert(source.accepted_sequence) {
+                    bail!("duplicate provenance acceptance sequence for one project");
+                }
+            }
+            let mut keep = BTreeSet::new();
+            if let Some(pointer) = current.as_ref() {
+                keep.insert(pointer.import_generation_id.clone());
+            }
+            let mut retained_prior = 0_usize;
+            for source in &sources {
+                if keep.contains(&source.import_generation_id) {
+                    continue;
+                }
+                if retained_prior >= retained {
+                    break;
+                }
+                keep.insert(source.import_generation_id.clone());
+                retained_prior += 1;
+            }
+            keep.extend(journal_roots.iter().cloned());
+            keep.extend(
+                sources
+                    .iter()
+                    .filter(|source| {
+                        matches!(
+                            source.state,
+                            ProvenanceImportStateV1::Ready
+                                | ProvenanceImportStateV1::Importing
+                                | ProvenanceImportStateV1::Active
+                                | ProvenanceImportStateV1::Quarantined
+                        )
+                    })
+                    .map(|source| source.import_generation_id.clone()),
+            );
+            for source in sources {
+                if keep.contains(&source.import_generation_id) {
+                    continue;
+                }
+                remove_regular_file_if_present(
+                    &self
+                        .root
+                        .join("provenance-imports/generation-index")
+                        .join(format!("{}.json", source.import_generation_id)),
+                )?;
+                remove_generation_directory(
+                    &self.provenance_generation_dir(&source.import_generation_id)?,
+                )?;
                 retired = retired.saturating_add(1);
             }
         }
@@ -1880,6 +3359,104 @@ impl GitSourceStore {
         Ok((deleted, deleted_bytes))
     }
 
+    fn referenced_provenance_document_hashes(
+        &self,
+        limits: GitSourceLimits,
+    ) -> Result<BTreeSet<String>> {
+        let mut referenced = BTreeSet::new();
+        for producer_dir in read_directories(&self.root.join("provenance-imports/uploads"))? {
+            for upload_dir in read_directories(&producer_dir)? {
+                let Some(manifest) = read_json::<Vec<ProvenanceImportManifestEntryV1>>(
+                    &upload_dir,
+                    "manifest.json",
+                    MAX_MANIFEST_BYTES,
+                    "provenance import manifest",
+                )?
+                else {
+                    continue;
+                };
+                let upload = read_json::<ProvenanceUploadRecordV1>(
+                    &upload_dir,
+                    "upload.json",
+                    MAX_UPLOAD_RECORD_BYTES,
+                    "provenance import upload record",
+                )?
+                .ok_or_else(|| anyhow!("provenance upload manifest has no upload record"))?;
+                validate_provenance_manifest(&upload.descriptor, &manifest, limits)?;
+                referenced.extend(manifest.into_iter().map(|entry| entry.document_sha256));
+            }
+        }
+        for generation_dir in read_directories(&self.root.join("provenance-imports/generations"))? {
+            let source = read_json::<StoredProvenanceImportV1>(
+                &generation_dir,
+                "source.json",
+                MAX_GENERATION_RECORD_BYTES,
+                "stored provenance import",
+            )?
+            .ok_or_else(|| anyhow!("provenance generation is missing source metadata"))?;
+            let manifest = read_json::<Vec<ProvenanceImportManifestEntryV1>>(
+                &generation_dir,
+                "manifest.json",
+                MAX_MANIFEST_BYTES,
+                "provenance import generation manifest",
+            )?
+            .ok_or_else(|| anyhow!("provenance generation is missing its manifest"))?;
+            validate_provenance_manifest(&source.descriptor, &manifest, limits)?;
+            referenced.extend(manifest.into_iter().map(|entry| entry.document_sha256));
+        }
+        Ok(referenced)
+    }
+
+    fn sweep_unreferenced_provenance_documents(
+        &self,
+        referenced: &BTreeSet<String>,
+        now: u64,
+        grace_secs: u64,
+    ) -> Result<(u64, u64)> {
+        let documents_root = self.root.join("provenance-imports/documents/sha256");
+        let mut deleted = 0_u64;
+        let mut deleted_bytes = 0_u64;
+        for bucket in read_directories(&documents_root)? {
+            let mut bucket_changed = false;
+            for entry in fs::read_dir(&bucket)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!("refusing unsafe provenance document store member");
+                }
+                let hash = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow!("provenance document name is not UTF-8"))?;
+                validate_sha256(&hash)?;
+                if referenced.contains(&hash) {
+                    continue;
+                }
+                let modified = metadata
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now.saturating_sub(modified) < grace_secs {
+                    continue;
+                }
+                fs::remove_file(&path)?;
+                bucket_changed = true;
+                deleted = deleted.saturating_add(1);
+                deleted_bytes = deleted_bytes.saturating_add(metadata.len());
+            }
+            if bucket_changed {
+                fs::File::open(&bucket)?.sync_all()?;
+            }
+            remove_directory_if_empty(&bucket)?;
+        }
+        if deleted > 0 {
+            fs::File::open(documents_root)?.sync_all()?;
+        }
+        Ok((deleted, deleted_bytes))
+    }
+
     fn lock_mutation(&self) -> Result<MutationGuard<'_>> {
         let in_process = self
             .mutation
@@ -1905,19 +3482,34 @@ impl GitSourceStore {
         now: u64,
     ) -> Result<MaintenanceReport> {
         let limits = self.current_limits()?;
-        let expired_uploads = self.expire_stale_uploads(now)?;
+        let expired_uploads = self
+            .expire_stale_uploads(now)?
+            .saturating_add(self.expire_stale_provenance_uploads(now)?);
         let mut protected_generation_ids = protected_generation_ids.clone();
         protected_generation_ids.extend(self.activation_source_roots()?);
-        let retired_generations = self.retire_old_generations(
-            &protected_generation_ids,
-            limits.retained_history_generations,
-        )?;
+        let retired_generations = self
+            .retire_old_generations(
+                &protected_generation_ids,
+                limits.retained_history_generations,
+            )?
+            .saturating_add(
+                self.retire_old_provenance_generations(limits.retained_history_generations)?,
+            );
         let referenced_records = self.referenced_record_hashes(limits.contract)?;
-        let (deleted_records, deleted_record_bytes) = self.sweep_unreferenced_records(
+        let (history_deleted, history_deleted_bytes) = self.sweep_unreferenced_records(
             &referenced_records,
             now,
             limits.unreferenced_record_grace_secs,
         )?;
+        let referenced_provenance = self.referenced_provenance_document_hashes(limits.contract)?;
+        let (provenance_deleted, provenance_deleted_bytes) = self
+            .sweep_unreferenced_provenance_documents(
+                &referenced_provenance,
+                now,
+                limits.unreferenced_record_grace_secs,
+            )?;
+        let deleted_records = history_deleted.saturating_add(provenance_deleted);
+        let deleted_record_bytes = history_deleted_bytes.saturating_add(provenance_deleted_bytes);
         Ok(MaintenanceReport {
             expired_uploads,
             retired_generations,
@@ -1936,6 +3528,26 @@ fn begin_response(upload_id: String) -> BeginGitHistoryUploadResponseV1 {
     }
 }
 
+fn begin_provenance_response(upload_id: String) -> BeginProvenanceImportResponseV1 {
+    BeginProvenanceImportResponseV1 {
+        upload_id,
+        max_page_entries: MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES,
+        max_page_bytes: MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
+        max_document_bytes: MAX_PROVENANCE_DOCUMENT_BYTES,
+    }
+}
+
+fn finalize_provenance_response(
+    import_generation_id: String,
+) -> FinalizeProvenanceImportResponseV1 {
+    FinalizeProvenanceImportResponseV1 {
+        status_url: format!(
+            "/internal/code-source/v1/provenance/generations/{import_generation_id}/status"
+        ),
+        import_generation_id,
+    }
+}
+
 fn validate_store_limits(limits: StoreLimits) -> Result<()> {
     if limits.max_open_uploads_per_producer == 0
         || limits.retained_history_generations == 0
@@ -1950,6 +3562,13 @@ fn validate_store_limits(limits: StoreLimits) -> Result<()> {
 }
 
 fn validate_receipt_authority(producer_id: &str, project_id: &str) -> Result<()> {
+    validate_producer_authority(producer_id)?;
+    bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())
+        .map_err(|_| anyhow!(StoreRequestError::InvalidInput))?;
+    Ok(())
+}
+
+fn validate_producer_authority(producer_id: &str) -> Result<()> {
     if producer_id.is_empty()
         || producer_id.len() > 128
         || !producer_id
@@ -1958,8 +3577,6 @@ fn validate_receipt_authority(producer_id: &str, project_id: &str) -> Result<()>
     {
         bail!(StoreRequestError::InvalidInput);
     }
-    bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())
-        .map_err(|_| anyhow!(StoreRequestError::InvalidInput))?;
     Ok(())
 }
 
@@ -2150,6 +3767,13 @@ fn validate_generation_id(value: &str) -> Result<()> {
     validate_sha256(digest)
 }
 
+fn validate_provenance_generation_id(value: &str) -> Result<()> {
+    let Some(digest) = value.strip_prefix("pis_") else {
+        bail!(StoreRequestError::NotFound);
+    };
+    validate_sha256(digest)
+}
+
 fn validate_sha256(value: &str) -> Result<()> {
     if value.len() != 64
         || !value
@@ -2177,8 +3801,10 @@ mod tests {
     use super::*;
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_git_source::{
-        GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1, GitObjectFormatV1, SCHEMA_VERSION,
-        encode_history_fragment, history_manifest_sha256,
+        GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1, GitObjectFormatV1,
+        ProvenanceImportDescriptorV1, ProvenanceImportManifestEntryV1,
+        ProvenanceImportManifestPageV1, SCHEMA_VERSION, encode_history_fragment,
+        history_manifest_sha256, provenance_manifest_sha256,
     };
 
     fn fixture() -> (
@@ -2187,6 +3813,343 @@ mod tests {
         Vec<Vec<u8>>,
     ) {
         fixture_for('1', '2')
+    }
+
+    fn provenance_fixture() -> (
+        ProvenanceImportDescriptorV1,
+        Vec<ProvenanceImportManifestEntryV1>,
+        Vec<String>,
+    ) {
+        let commits = ["1".repeat(40), "2".repeat(40)];
+        let documents = commits
+            .iter()
+            .map(|commit| {
+                serde_json::json!({
+                    "schema_version": 1,
+                    "commit": commit,
+                    "produced_by": {},
+                    "tool_calls": [],
+                    "knowledge_writes": []
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        let manifest = commits
+            .iter()
+            .zip(&documents)
+            .map(|(commit, document)| ProvenanceImportManifestEntryV1 {
+                note_commit: commit.clone(),
+                document_ordinal: 0,
+                encoded_bytes: document.len() as u64,
+                document_sha256: sha256(document.as_bytes()),
+            })
+            .collect::<Vec<_>>();
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope: PublishedScope::try_new("repo-a", ".").unwrap(),
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "3".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&manifest),
+            document_count: manifest.len() as u64,
+            logical_bytes: documents.iter().map(|document| document.len() as u64).sum(),
+        };
+        (descriptor, manifest, documents)
+    }
+
+    #[test]
+    fn provenance_import_is_resumable_verified_and_journaled() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let (descriptor, manifest, documents) = provenance_fixture();
+        let begin = store
+            .begin_provenance_import("producer-a", project_id, descriptor)
+            .unwrap();
+        for (page, entry) in manifest.iter().enumerate() {
+            let body = ProvenanceImportManifestPageV1 {
+                entries: vec![entry.clone()],
+            };
+            store
+                .put_provenance_manifest_page("producer-a", &begin.upload_id, page as u32, &body)
+                .unwrap();
+            store
+                .put_provenance_manifest_page("producer-a", &begin.upload_id, page as u32, &body)
+                .unwrap();
+        }
+        let missing = store
+            .complete_provenance_manifest("producer-a", &begin.upload_id)
+            .unwrap();
+        assert_eq!(missing.hashes.len(), 2);
+        for (entry, document) in manifest.iter().zip(&documents) {
+            store
+                .install_provenance_document(
+                    "producer-a",
+                    &begin.upload_id,
+                    &entry.document_sha256,
+                    entry.encoded_bytes,
+                    document.as_bytes(),
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .missing_provenance_documents("producer-a", &begin.upload_id, None)
+                .unwrap()
+                .hashes
+                .is_empty()
+        );
+        let finalized = store
+            .finalize_provenance_import("producer-a", &begin.upload_id)
+            .unwrap();
+        let verified = store
+            .verified_provenance_import(&finalized.import_generation_id)
+            .unwrap();
+        let mut visited = Vec::new();
+        store
+            .visit_verified_provenance_documents(&verified, |document| {
+                visited.push(document.document);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, documents);
+
+        let journal = ProvenanceImportJournalV1::new_prepared(
+            &verified,
+            7,
+            "collected:project:generation".into(),
+        )
+        .unwrap();
+        let journal = store.save_provenance_import_journal(journal).unwrap();
+        let mut published = journal.clone();
+        published.stage = ProvenanceImportStageV1::EdgesPublished;
+        published.edge_count = 4;
+        published.edge_keys_sha256 = "a".repeat(64);
+        store.save_provenance_import_journal(published).unwrap();
+        assert_eq!(
+            store
+                .read_provenance_import_journal(project_id)
+                .unwrap()
+                .unwrap()
+                .edge_count,
+            4
+        );
+    }
+
+    #[test]
+    fn newest_accepted_provenance_generation_alone_becomes_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(
+            &root,
+            StoreLimits {
+                retained_history_generations: 1,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let producer_id = "producer-a";
+        let (first_descriptor, manifest, documents) = provenance_fixture();
+        let finalize = |descriptor: ProvenanceImportDescriptorV1| {
+            let begin = store
+                .begin_provenance_import(producer_id, project_id, descriptor)
+                .unwrap();
+            store
+                .put_provenance_manifest_page(
+                    producer_id,
+                    &begin.upload_id,
+                    0,
+                    &ProvenanceImportManifestPageV1 {
+                        entries: manifest.clone(),
+                    },
+                )
+                .unwrap();
+            store
+                .complete_provenance_manifest(producer_id, &begin.upload_id)
+                .unwrap();
+            for (entry, document) in manifest.iter().zip(&documents) {
+                store
+                    .install_provenance_document(
+                        producer_id,
+                        &begin.upload_id,
+                        &entry.document_sha256,
+                        entry.encoded_bytes,
+                        document.as_bytes(),
+                    )
+                    .unwrap();
+            }
+            store
+                .finalize_provenance_import(producer_id, &begin.upload_id)
+                .unwrap()
+                .import_generation_id
+        };
+        let first = finalize(first_descriptor.clone());
+        let mut second_descriptor = first_descriptor;
+        second_descriptor.notes_tip = "4".repeat(40);
+        let second = finalize(second_descriptor.clone());
+
+        assert_eq!(
+            store
+                .current_ready_provenance_import_id(project_id)
+                .unwrap()
+                .as_deref(),
+            Some(second.as_str())
+        );
+        assert!(
+            store
+                .load_provenance_generation(&first)
+                .unwrap()
+                .accepted_sequence
+                < store
+                    .load_provenance_generation(&second)
+                    .unwrap()
+                    .accepted_sequence
+        );
+
+        store
+            .transition_provenance_import(&first, ProvenanceImportStateV1::Importing, 0, None)
+            .unwrap();
+        assert_eq!(
+            store.settle_provenance_import(&first, 2).unwrap().state,
+            ProvenanceImportStateV1::Superseded
+        );
+        store
+            .transition_provenance_import(&second, ProvenanceImportStateV1::Importing, 0, None)
+            .unwrap();
+        assert_eq!(
+            store.settle_provenance_import(&second, 2).unwrap().state,
+            ProvenanceImportStateV1::Active
+        );
+
+        let mut third_descriptor = second_descriptor;
+        third_descriptor.notes_tip = "5".repeat(40);
+        let third = finalize(third_descriptor);
+        store
+            .transition_provenance_import(&third, ProvenanceImportStateV1::Importing, 0, None)
+            .unwrap();
+        assert_eq!(
+            store.settle_provenance_import(&third, 2).unwrap().state,
+            ProvenanceImportStateV1::Active
+        );
+        assert_eq!(
+            store
+                .maintain(&BTreeSet::new())
+                .unwrap()
+                .retired_generations,
+            1
+        );
+        assert!(store.load_provenance_generation(&first).is_err());
+        assert!(store.load_provenance_generation(&second).is_ok());
+        assert_eq!(
+            store
+                .current_ready_provenance_import_id(project_id)
+                .unwrap()
+                .as_deref(),
+            Some(third.as_str())
+        );
+    }
+
+    #[test]
+    fn provenance_manifest_retry_with_different_bytes_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let (descriptor, manifest, _) = provenance_fixture();
+        let begin = store
+            .begin_provenance_import(
+                "producer-a",
+                "p_00000000000000000000000000000001",
+                descriptor,
+            )
+            .unwrap();
+        let page = ProvenanceImportManifestPageV1 {
+            entries: vec![manifest[0].clone()],
+        };
+        store
+            .put_provenance_manifest_page("producer-a", &begin.upload_id, 0, &page)
+            .unwrap();
+        let conflicting = ProvenanceImportManifestPageV1 {
+            entries: vec![manifest[1].clone()],
+        };
+        assert!(
+            store
+                .put_provenance_manifest_page("producer-a", &begin.upload_id, 0, &conflicting,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn provenance_maintenance_expires_upload_and_reclaims_orphan_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(
+            &root,
+            StoreLimits {
+                unreferenced_record_grace_secs: 0,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        let (descriptor, manifest, documents) = provenance_fixture();
+        let producer_id = "producer-a";
+        let begin = store
+            .begin_provenance_import(
+                producer_id,
+                "p_00000000000000000000000000000001",
+                descriptor,
+            )
+            .unwrap();
+        store
+            .put_provenance_manifest_page(
+                producer_id,
+                &begin.upload_id,
+                0,
+                &ProvenanceImportManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .complete_provenance_manifest(producer_id, &begin.upload_id)
+            .unwrap();
+        for (entry, document) in manifest.iter().zip(&documents) {
+            store
+                .install_provenance_document(
+                    producer_id,
+                    &begin.upload_id,
+                    &entry.document_sha256,
+                    entry.encoded_bytes,
+                    document.as_bytes(),
+                )
+                .unwrap();
+        }
+        let upload_path = store
+            .provenance_upload_dir(producer_id, &begin.upload_id)
+            .unwrap();
+        let mut upload = store
+            .load_provenance_upload(&upload_path, producer_id, &begin.upload_id)
+            .unwrap();
+        upload.updated_unix_secs = 0;
+        let upload_directory = NofollowDirectory::open_existing(&upload_path)
+            .unwrap()
+            .unwrap();
+        write_json(&upload_directory, "upload.json", &upload).unwrap();
+
+        let report = store.maintain(&BTreeSet::new()).unwrap();
+        assert_eq!(report.expired_uploads, 1);
+        assert_eq!(report.deleted_records, 2);
+        for entry in manifest {
+            assert!(
+                store
+                    .read_provenance_document_bytes(
+                        &entry.document_sha256,
+                        entry.encoded_bytes as usize,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

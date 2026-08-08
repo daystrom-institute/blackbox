@@ -17,14 +17,17 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::ErrorResponse;
 use bbox_git_source::{
-    BeginGitHistoryUploadRequestV1, ContractError, GitHistoryManifestPageV1,
-    GitHistoryProbeRequestV1, GitHistoryProbeResponseV1, GitHistorySourceStatusV1, GitSourceLimits,
-    MAX_HISTORY_MANIFEST_PAGE_BYTES, MAX_HISTORY_RECORD_BYTES, MissingHistoryRecordsPageV1,
-    ProvenanceExportPageResponseV1, ProvenanceExportPullRequestV1, ProvenanceExportReceiptV1,
-    SCHEMA_VERSION,
+    BeginGitHistoryUploadRequestV1, BeginProvenanceImportRequestV1, ContractError,
+    GitHistoryManifestPageV1, GitHistoryProbeRequestV1, GitHistoryProbeResponseV1,
+    GitHistorySourceStatusV1, GitSourceLimits, MAX_HISTORY_MANIFEST_PAGE_BYTES,
+    MAX_HISTORY_RECORD_BYTES, MAX_PROVENANCE_DOCUMENT_BYTES, MAX_PROVENANCE_MANIFEST_PAGE_BYTES,
+    MissingHistoryRecordsPageV1, MissingProvenanceDocumentsPageV1, ProvenanceExportPageResponseV1,
+    ProvenanceExportPullRequestV1, ProvenanceExportReceiptV1, ProvenanceImportManifestPageV1,
+    ProvenanceImportStatusV1, SCHEMA_VERSION,
 };
 use bbox_git_source_store::{
-    GitSourceStore, HistoryTransportAuthorityV1, StoreLimits, StoreRequestError,
+    GitSourceStore, HistoryTransportAuthorityV1, ProvenanceImportAuthorityV1, StoreLimits,
+    StoreRequestError,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -60,6 +63,8 @@ pub(crate) struct GitSourceRuntime {
     store: Arc<GitSourceStore>,
     activation_tx: std::sync::mpsc::SyncSender<String>,
     activation_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<String>>>,
+    provenance_import_tx: std::sync::mpsc::SyncSender<String>,
+    provenance_import_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<String>>>,
     /// Repo id -> `(activation-journal checksum, Tantivy searcher generation)`
     /// proven against the exact commit lane and durable snapshot receipts.
     /// Redrive reuses the proof only while both authorities are unchanged;
@@ -81,10 +86,13 @@ impl GitSourceRuntime {
         )?);
         reap_upload_body_tempfiles(store.root())?;
         let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(64);
+        let (provenance_import_tx, provenance_import_rx) = std::sync::mpsc::sync_channel(64);
         Ok(Self {
             store,
             activation_tx,
             activation_rx: std::sync::Mutex::new(Some(activation_rx)),
+            provenance_import_tx,
+            provenance_import_rx: std::sync::Mutex::new(Some(provenance_import_rx)),
             validated_activations: parking_lot::Mutex::new(Default::default()),
             provenance_exports: parking_lot::Mutex::new(Default::default()),
             provenance_pages_served: AtomicU64::new(0),
@@ -96,12 +104,15 @@ impl GitSourceRuntime {
     #[cfg(test)]
     pub(crate) fn for_test(root: &std::path::Path) -> Self {
         let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(64);
+        let (provenance_import_tx, provenance_import_rx) = std::sync::mpsc::sync_channel(64);
         Self {
             store: Arc::new(
                 GitSourceStore::open(root.join("git-sources"), StoreLimits::default()).unwrap(),
             ),
             activation_tx,
             activation_rx: std::sync::Mutex::new(Some(activation_rx)),
+            provenance_import_tx,
+            provenance_import_rx: std::sync::Mutex::new(Some(provenance_import_rx)),
             validated_activations: parking_lot::Mutex::new(Default::default()),
             provenance_exports: parking_lot::Mutex::new(Default::default()),
             provenance_pages_served: AtomicU64::new(0),
@@ -129,6 +140,21 @@ impl GitSourceRuntime {
 
     pub(crate) fn take_activation_receiver(&self) -> Option<std::sync::mpsc::Receiver<String>> {
         self.activation_rx.lock().ok()?.take()
+    }
+
+    pub(crate) fn enqueue_provenance_import(&self, import_generation_id: String) {
+        match self.provenance_import_tx.try_send(import_generation_id) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("provenance import worker is unavailable")
+            }
+        }
+    }
+
+    pub(crate) fn take_provenance_import_receiver(
+        &self,
+    ) -> Option<std::sync::mpsc::Receiver<String>> {
+        self.provenance_import_rx.lock().ok()?.take()
     }
 
     pub(crate) fn activation_was_validated(
@@ -262,6 +288,37 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
         .route(
             "/internal/code-source/v1/provenance/export/receipt",
             post(provenance_export_receipt).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/imports",
+            post(begin_provenance_import).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/imports/{upload_id}/manifest/{page}",
+            put(put_provenance_manifest_page)
+                .layer(DefaultBodyLimit::max(MAX_PROVENANCE_MANIFEST_PAGE_BYTES)),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/imports/{upload_id}/manifest/complete",
+            post(complete_provenance_manifest).layer(DefaultBodyLimit::max(1)),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/imports/{upload_id}/missing",
+            get(missing_provenance_documents),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/imports/{upload_id}/documents/{hash}",
+            put(put_provenance_document).layer(DefaultBodyLimit::max(
+                MAX_PROVENANCE_DOCUMENT_BYTES as usize,
+            )),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/imports/{upload_id}/finalize",
+            post(finalize_provenance_import).layer(DefaultBodyLimit::max(1)),
+        )
+        .route(
+            "/internal/code-source/v1/provenance/generations/{generation}/status",
+            get(provenance_import_generation_status),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
@@ -453,6 +510,170 @@ async fn provenance_export_receipt(
         "accepted provenance export receipt"
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn begin_provenance_import(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<BeginProvenanceImportRequestV1>,
+) -> Result<impl IntoResponse, HttpError> {
+    let project_id = require_project_grant(&state, &grant, &request.descriptor.scope)?;
+    let store = state.git_sources.store();
+    let producer_id = grant.producer_id;
+    let response = blocking(move || {
+        store.begin_provenance_import(&producer_id, &project_id, request.descriptor)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn put_provenance_manifest_page(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path((upload_id, page)): Path<(String, u32)>,
+    Json(page_body): Json<ProvenanceImportManifestPageV1>,
+) -> Result<StatusCode, HttpError> {
+    let store = state.git_sources.store();
+    require_provenance_upload_grant(&state, &store, &grant, &upload_id).await?;
+    let producer_id = grant.producer_id;
+    blocking(move || {
+        store.put_provenance_manifest_page(&producer_id, &upload_id, page, &page_body)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn complete_provenance_manifest(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path(upload_id): Path<String>,
+) -> Result<Json<MissingProvenanceDocumentsPageV1>, HttpError> {
+    let store = state.git_sources.store();
+    require_provenance_upload_grant(&state, &store, &grant, &upload_id).await?;
+    let producer_id = grant.producer_id;
+    Ok(Json(
+        blocking(move || store.complete_provenance_manifest(&producer_id, &upload_id)).await?,
+    ))
+}
+
+async fn missing_provenance_documents(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path(upload_id): Path<String>,
+    Query(query): Query<MissingQuery>,
+) -> Result<Json<MissingProvenanceDocumentsPageV1>, HttpError> {
+    let store = state.git_sources.store();
+    require_provenance_upload_grant(&state, &store, &grant, &upload_id).await?;
+    let producer_id = grant.producer_id;
+    Ok(Json(
+        blocking(move || {
+            store.missing_provenance_documents(&producer_id, &upload_id, query.cursor.as_deref())
+        })
+        .await?,
+    ))
+}
+
+async fn put_provenance_document(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path((upload_id, hash)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<StatusCode, HttpError> {
+    let store = state.git_sources.store();
+    require_provenance_upload_grant(&state, &store, &grant, &upload_id).await?;
+    let expected_size = {
+        let store = store.clone();
+        let producer_id = grant.producer_id.clone();
+        let upload_id = upload_id.clone();
+        let hash = hash.clone();
+        blocking(move || store.expected_provenance_document_size(&producer_id, &upload_id, &hash))
+            .await?
+    };
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            HttpError::unprocessable("content_length_required", "exact Content-Length required")
+        })?;
+    if content_length != expected_size {
+        return Err(HttpError::unprocessable(
+            "provenance_document_size_mismatch",
+            "Content-Length does not match the manifest",
+        ));
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(UPLOAD_BODY_TEMP_PREFIX)
+        .suffix(UPLOAD_BODY_TEMP_SUFFIX)
+        .tempfile_in(store.root())
+        .map_err(HttpError::storage)?;
+    let mut file = tokio::fs::File::from_std(temporary.reopen().map_err(HttpError::storage)?);
+    let mut stream = body.into_data_stream();
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| HttpError::unprocessable("invalid_body", error.to_string()))?;
+        written = written.checked_add(chunk.len() as u64).ok_or_else(|| {
+            HttpError::too_large(
+                "provenance_document_too_large",
+                "provenance document is too large",
+            )
+        })?;
+        if written > expected_size {
+            return Err(HttpError::too_large(
+                "provenance_document_too_large",
+                "provenance document exceeds its manifest size",
+            ));
+        }
+        file.write_all(&chunk).await.map_err(HttpError::storage)?;
+    }
+    if written != expected_size {
+        return Err(HttpError::unprocessable(
+            "provenance_document_size_mismatch",
+            "provenance document is shorter than its manifest size",
+        ));
+    }
+    file.sync_all().await.map_err(HttpError::storage)?;
+    file.seek(SeekFrom::Start(0))
+        .await
+        .map_err(HttpError::storage)?;
+    let file = file.into_std().await;
+    let producer_id = grant.producer_id;
+    blocking(move || {
+        store.install_provenance_document(&producer_id, &upload_id, &hash, expected_size, file)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn finalize_provenance_import(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path(upload_id): Path<String>,
+) -> Result<impl IntoResponse, HttpError> {
+    let store = state.git_sources.store();
+    require_provenance_upload_grant(&state, &store, &grant, &upload_id).await?;
+    let producer_id = grant.producer_id;
+    let response =
+        blocking(move || store.finalize_provenance_import(&producer_id, &upload_id)).await?;
+    state
+        .git_sources
+        .enqueue_provenance_import(response.import_generation_id.clone());
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn provenance_import_generation_status(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Path(generation): Path<String>,
+) -> Result<Json<ProvenanceImportStatusV1>, HttpError> {
+    let store = state.git_sources.store();
+    require_provenance_generation_grant(&state, &store, &grant, &generation).await?;
+    let producer_id = grant.producer_id;
+    Ok(Json(
+        blocking(move || store.provenance_import_status(&producer_id, &generation)).await?,
+    ))
 }
 
 async fn build_provenance_export(
@@ -769,9 +990,7 @@ fn stale_generation(message: &str) -> HttpError {
 }
 
 fn provenance_edges_dir(state: &SharedState) -> std::path::PathBuf {
-    bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
-        &state.idx.read().reindex_config().projects_path,
-    )
+    super::edge_sidecar_dir(state)
 }
 
 async fn require_upload_grant(
@@ -798,6 +1017,50 @@ async fn require_generation_grant(
     let generation = generation.to_string();
     let authority = blocking(move || store.generation_authority(&producer_id, &generation)).await?;
     require_matching_authority(state, grant, authority)
+}
+
+async fn require_provenance_upload_grant(
+    state: &SharedState,
+    store: &Arc<GitSourceStore>,
+    grant: &ProducerGrant,
+    upload_id: &str,
+) -> Result<(), HttpError> {
+    let store = store.clone();
+    let producer_id = grant.producer_id.clone();
+    let upload_id = upload_id.to_string();
+    let authority =
+        blocking(move || store.provenance_upload_authority(&producer_id, &upload_id)).await?;
+    require_matching_provenance_authority(state, grant, authority)
+}
+
+async fn require_provenance_generation_grant(
+    state: &SharedState,
+    store: &Arc<GitSourceStore>,
+    grant: &ProducerGrant,
+    generation: &str,
+) -> Result<(), HttpError> {
+    let store = store.clone();
+    let producer_id = grant.producer_id.clone();
+    let generation = generation.to_string();
+    let authority =
+        blocking(move || store.provenance_generation_authority(&producer_id, &generation)).await?;
+    require_matching_provenance_authority(state, grant, authority)
+}
+
+fn require_matching_provenance_authority(
+    state: &SharedState,
+    grant: &ProducerGrant,
+    authority: ProvenanceImportAuthorityV1,
+) -> Result<(), HttpError> {
+    let current = require_project_grant(state, grant, &authority.scope)?;
+    if current != authority.project_id {
+        return Err(HttpError::new(
+            StatusCode::CONFLICT,
+            "project_authority_changed",
+            "project transport authority changed",
+        ));
+    }
+    Ok(())
 }
 
 fn require_matching_authority(
@@ -1015,9 +1278,11 @@ mod tests {
         RepoHistoryRecord,
     };
     use bbox_git_source::{
-        BeginGitHistoryUploadResponseV1, GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1,
-        GitHistoryDescriptorV1, GitHistoryManifestEntryV1, GitObjectFormatV1, SCHEMA_VERSION,
-        encode_history_fragment, history_manifest_sha256,
+        BeginGitHistoryUploadResponseV1, BeginProvenanceImportResponseV1,
+        GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1, GitHistoryDescriptorV1,
+        GitHistoryManifestEntryV1, GitObjectFormatV1, ProvenanceImportDescriptorV1,
+        ProvenanceImportManifestEntryV1, ProvenanceImportManifestPageV1, SCHEMA_VERSION,
+        encode_history_fragment, history_manifest_sha256, provenance_manifest_sha256,
     };
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
@@ -1266,6 +1531,132 @@ mod tests {
         assert_eq!(
             probe.current.unwrap().source_generation_id,
             finalized.source_generation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_provenance_import_routes_reach_durable_ready_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, token, scope) = enabled_state(directory.path());
+        let app = router(state.clone()).with_state(state);
+        let commit = "1".repeat(40);
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "commit": commit,
+            "produced_by": {},
+            "tool_calls": [],
+            "knowledge_writes": []
+        })
+        .to_string();
+        let hash = hex::encode(Sha256::digest(document.as_bytes()));
+        let manifest = vec![ProvenanceImportManifestEntryV1 {
+            note_commit: commit,
+            document_ordinal: 0,
+            encoded_bytes: document.len() as u64,
+            document_sha256: hash.clone(),
+        }];
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope,
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "2".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&manifest),
+            document_count: 1,
+            logical_bytes: document.len() as u64,
+        };
+        let begun = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/code-source/v1/provenance/imports",
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&BeginProvenanceImportRequestV1 { descriptor }).unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(begun.status(), StatusCode::CREATED);
+        let begun: BeginProvenanceImportResponseV1 =
+            serde_json::from_slice(&to_bytes(begun.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let page = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                &format!(
+                    "/internal/code-source/v1/provenance/imports/{}/manifest/0",
+                    begun.upload_id
+                ),
+                Some(&token),
+                Body::from(
+                    serde_json::to_vec(&ProvenanceImportManifestPageV1 { entries: manifest })
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::NO_CONTENT);
+        let complete = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/code-source/v1/provenance/imports/{}/manifest/complete",
+                    begun.upload_id
+                ),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(complete.status(), StatusCode::OK);
+        let upload = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/internal/code-source/v1/provenance/imports/{}/documents/{hash}",
+                begun.upload_id
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_LENGTH, document.len())
+            .body(Body::from(document))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(upload).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        let finalized = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/code-source/v1/provenance/imports/{}/finalize",
+                    begun.upload_id
+                ),
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(finalized.status(), StatusCode::ACCEPTED);
+        let finalized: bbox_git_source::FinalizeProvenanceImportResponseV1 =
+            serde_json::from_slice(&to_bytes(finalized.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        let status = app
+            .oneshot(request(
+                "GET",
+                &finalized.status_url,
+                Some(&token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status: ProvenanceImportStatusV1 =
+            serde_json::from_slice(&to_bytes(status.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            status.state,
+            bbox_git_source::ProvenanceImportStateV1::Ready
         );
     }
 

@@ -17,6 +17,8 @@ pub const MAX_AUTHOR_FIELD_BYTES: usize = 64 * 1024;
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 pub const MAX_PROVENANCE_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES: usize = 2_000;
+pub const MAX_PROVENANCE_MANIFEST_PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GitSourceLimits {
@@ -662,7 +664,11 @@ impl ProvenanceImportDescriptorV1 {
             .validate()
             .map_err(|_| ContractError::InvalidScope)?;
         validate_notes_ref(&self.notes_ref)?;
-        if !self.notes_tip.is_empty() {
+        if self.notes_tip.is_empty() {
+            if self.document_count != 0 {
+                return Err(ContractError::InvalidObjectId);
+            }
+        } else {
             validate_any_object_id(&self.notes_tip)?;
         }
         validate_sha256(&self.manifest_sha256)?;
@@ -694,6 +700,76 @@ pub struct ProvenanceImportManifestPageV1 {
 #[serde(deny_unknown_fields)]
 pub struct BeginProvenanceImportRequestV1 {
     pub descriptor: ProvenanceImportDescriptorV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BeginProvenanceImportResponseV1 {
+    pub upload_id: String,
+    pub max_page_entries: usize,
+    pub max_page_bytes: usize,
+    pub max_document_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissingProvenanceDocumentsPageV1 {
+    pub import_generation_id: String,
+    pub hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalizeProvenanceImportResponseV1 {
+    pub import_generation_id: String,
+    pub status_url: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceImportStateV1 {
+    ReceivingManifest,
+    MissingDocuments,
+    Ready,
+    Importing,
+    Active,
+    Superseded,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvenanceImportStatusV1 {
+    pub import_generation_id: String,
+    pub state: ProvenanceImportStateV1,
+    pub document_count: u64,
+    pub logical_bytes: u64,
+    #[serde(default)]
+    pub edges_imported: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+pub fn provenance_import_generation_id(
+    producer_id: &str,
+    descriptor: &ProvenanceImportDescriptorV1,
+) -> Result<String, ContractError> {
+    validate_producer_id(producer_id)?;
+    descriptor.validate_header(GitSourceLimits {
+        max_provenance_documents: u64::MAX,
+        max_provenance_logical_bytes: u64::MAX,
+        ..GitSourceLimits::default()
+    })?;
+    let mut encoded = Vec::new();
+    push_field(&mut encoded, b"bbox-provenance-import-source-generation-v1");
+    push_field(&mut encoded, producer_id.as_bytes());
+    push_field(&mut encoded, descriptor.scope.repo_id().as_bytes());
+    push_field(
+        &mut encoded,
+        descriptor.scope.bbox_root_relpath().as_bytes(),
+    );
+    push_field(&mut encoded, descriptor.notes_ref.as_bytes());
+    push_field(&mut encoded, descriptor.notes_tip.as_bytes());
+    push_field(&mut encoded, descriptor.manifest_sha256.as_bytes());
+    Ok(format!("pis_{}", sha256(&encoded)))
 }
 
 pub fn provenance_manifest_sha256(entries: &[ProvenanceImportManifestEntryV1]) -> String {
@@ -731,6 +807,17 @@ pub fn validate_provenance_manifest(
         {
             return Err(ContractError::ProvenanceManifestOutOfOrder);
         }
+        match previous {
+            Some((commit, ordinal)) if commit == entry.note_commit => {
+                if entry.document_ordinal != ordinal.saturating_add(1) {
+                    return Err(ContractError::ProvenanceManifestOutOfOrder);
+                }
+            }
+            _ if entry.document_ordinal != 0 => {
+                return Err(ContractError::ProvenanceManifestOutOfOrder);
+            }
+            _ => {}
+        }
         logical_bytes = logical_bytes
             .checked_add(entry.encoded_bytes)
             .ok_or(ContractError::ProvenanceLimitExceeded)?;
@@ -751,23 +838,92 @@ pub fn validate_provenance_documents(
     documents: &[String],
     limits: GitSourceLimits,
 ) -> Result<(), ContractError> {
-    validate_provenance_manifest(descriptor, manifest, limits)?;
     if manifest.len() != documents.len() {
         return Err(ContractError::ProvenanceCountMismatch);
     }
-    for (entry, document) in manifest.iter().zip(documents) {
-        if entry.encoded_bytes != document.len() as u64
-            || entry.document_sha256 != bbox_provenance::document_sha256(document)
-        {
-            return Err(ContractError::ProvenanceDocumentMismatch);
-        }
-        let note = bbox_provenance::parse_note_document(document)
-            .map_err(|_| ContractError::ProvenanceDocumentInvalid)?;
-        if note.commit != entry.note_commit {
-            return Err(ContractError::ProvenanceDocumentMismatch);
-        }
+    let mut verifier = ProvenanceSourceVerifier::new(descriptor, manifest, limits)?;
+    for document in documents {
+        verifier.push(document)?;
+    }
+    verifier.finish()
+}
+
+pub fn validate_provenance_document(
+    entry: &ProvenanceImportManifestEntryV1,
+    document: &str,
+) -> Result<(), ContractError> {
+    if entry.encoded_bytes != document.len() as u64
+        || entry.document_sha256 != bbox_provenance::document_sha256(document)
+    {
+        return Err(ContractError::ProvenanceDocumentMismatch);
+    }
+    let note = bbox_provenance::parse_note_document(document)
+        .map_err(|_| ContractError::ProvenanceDocumentInvalid)?;
+    if note.commit != entry.note_commit {
+        return Err(ContractError::ProvenanceDocumentMismatch);
     }
     Ok(())
+}
+
+pub struct ProvenanceSourceVerifier<'a> {
+    manifest: &'a [ProvenanceImportManifestEntryV1],
+    next: usize,
+    parts: BTreeMap<(String, String), (u32, BTreeSet<u32>)>,
+}
+
+impl<'a> ProvenanceSourceVerifier<'a> {
+    pub fn new(
+        descriptor: &ProvenanceImportDescriptorV1,
+        manifest: &'a [ProvenanceImportManifestEntryV1],
+        limits: GitSourceLimits,
+    ) -> Result<Self, ContractError> {
+        validate_provenance_manifest(descriptor, manifest, limits)?;
+        Ok(Self {
+            manifest,
+            next: 0,
+            parts: BTreeMap::new(),
+        })
+    }
+
+    pub fn push(&mut self, document: &str) -> Result<(), ContractError> {
+        let entry = self
+            .manifest
+            .get(self.next)
+            .ok_or(ContractError::ProvenanceCountMismatch)?;
+        validate_provenance_document(entry, document)?;
+        let note = bbox_provenance::parse_note_document(document)
+            .map_err(|_| ContractError::ProvenanceDocumentInvalid)?;
+        if note.schema_version == bbox_provenance::SCHEMA_VERSION_V2 {
+            let part = note.part.ok_or(ContractError::ProvenanceDocumentInvalid)?;
+            if part.document_id.len() != 64
+                || !is_lower_hex(&part.document_id)
+                || part.part_count == 0
+                || part.part_index >= part.part_count
+            {
+                return Err(ContractError::ProvenanceDocumentInvalid);
+            }
+            let group = self
+                .parts
+                .entry((entry.note_commit.clone(), part.document_id))
+                .or_insert_with(|| (part.part_count, BTreeSet::new()));
+            if group.0 != part.part_count || !group.1.insert(part.part_index) {
+                return Err(ContractError::ProvenanceDocumentInvalid);
+            }
+        }
+        self.next += 1;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<(), ContractError> {
+        if self.next != self.manifest.len()
+            || self.parts.values().any(|(part_count, indices)| {
+                indices.len() as u32 != *part_count || indices.iter().copied().ne(0..*part_count)
+            })
+        {
+            return Err(ContractError::ProvenanceCountMismatch);
+        }
+        Ok(())
+    }
 }
 
 fn validate_history_fragment(
@@ -1105,7 +1261,12 @@ mod tests {
 
     #[test]
     fn provenance_manifest_reuses_landed_note_schema() {
-        let note = GitProvenanceNote::new_v2("1".repeat(40), ProducedBy::default(), vec![], vec![]);
+        let note = bbox_provenance::fragment_note(
+            &GitProvenanceNote::new_v2("1".repeat(40), ProducedBy::default(), vec![], vec![]),
+            bbox_provenance::MAX_NOTE_DOCUMENT_BYTES,
+        )
+        .unwrap()
+        .remove(0);
         let document = ProvenanceExportDocument::from_note(&note).unwrap().document;
         let mut manifest = vec![ProvenanceImportManifestEntryV1 {
             note_commit: "1".repeat(40),
@@ -1139,6 +1300,102 @@ mod tests {
                 GitSourceLimits::default()
             ),
             Err(ContractError::ProvenanceCommitmentMismatch)
+        );
+    }
+
+    #[test]
+    fn provenance_import_generation_binds_producer_scope_tip_and_manifest() {
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope: scope(),
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "2".repeat(40),
+            manifest_sha256: "a".repeat(64),
+            document_count: 0,
+            logical_bytes: 0,
+        };
+        let first = provenance_import_generation_id("producer-a", &descriptor).unwrap();
+        assert_eq!(
+            first,
+            provenance_import_generation_id("producer-a", &descriptor).unwrap()
+        );
+        assert_ne!(
+            first,
+            provenance_import_generation_id("producer-b", &descriptor).unwrap()
+        );
+        let mut moved = descriptor;
+        moved.notes_tip = "3".repeat(40);
+        assert_ne!(
+            first,
+            provenance_import_generation_id("producer-a", &moved).unwrap()
+        );
+    }
+
+    #[test]
+    fn provenance_source_verifier_requires_complete_nonduplicate_v2_parts() {
+        let commit = "1".repeat(40);
+        let document_id = "d".repeat(64);
+        let make_document = |part_index| {
+            bbox_provenance::serialize_note(&GitProvenanceNote {
+                schema_version: bbox_provenance::SCHEMA_VERSION_V2,
+                commit: commit.clone(),
+                part: Some(bbox_provenance::GitProvenanceNotePart {
+                    document_id: document_id.clone(),
+                    part_index,
+                    part_count: 2,
+                }),
+                produced_by: ProducedBy::default(),
+                tool_calls: Vec::new(),
+                knowledge_writes: Vec::new(),
+            })
+            .unwrap()
+        };
+        let documents = vec![make_document(0), make_document(1)];
+        let manifest = documents
+            .iter()
+            .enumerate()
+            .map(|(ordinal, document)| ProvenanceImportManifestEntryV1 {
+                note_commit: commit.clone(),
+                document_ordinal: ordinal as u32,
+                encoded_bytes: document.len() as u64,
+                document_sha256: bbox_provenance::document_sha256(document),
+            })
+            .collect::<Vec<_>>();
+        let descriptor = ProvenanceImportDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope: scope(),
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            notes_tip: "2".repeat(40),
+            manifest_sha256: provenance_manifest_sha256(&manifest),
+            document_count: 2,
+            logical_bytes: documents.iter().map(|document| document.len() as u64).sum(),
+        };
+        validate_provenance_documents(
+            &descriptor,
+            &manifest,
+            &documents,
+            GitSourceLimits::default(),
+        )
+        .unwrap();
+
+        let mut verifier =
+            ProvenanceSourceVerifier::new(&descriptor, &manifest, GitSourceLimits::default())
+                .unwrap();
+        verifier.push(&documents[0]).unwrap();
+        assert_eq!(
+            verifier.finish(),
+            Err(ContractError::ProvenanceCountMismatch)
+        );
+
+        let duplicate = vec![documents[0].clone(), documents[0].clone()];
+        assert_eq!(
+            validate_provenance_documents(
+                &descriptor,
+                &manifest,
+                &duplicate,
+                GitSourceLimits::default(),
+            ),
+            Err(ContractError::ProvenanceDocumentMismatch)
         );
     }
 

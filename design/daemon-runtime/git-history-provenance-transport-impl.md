@@ -11,7 +11,7 @@ brief: "Replace published catalog-mode checkout Git-history and provenance note 
 ---
 # Typed Git-history and provenance transport implementation plan
 Date: 2026-07-26
-Baseline: branch `beta/blackbox-v2`, committed `HEAD` `09e1ee785380e54c7ebe56b04094a1563f394a99`.
+Baseline: branch `beta/blackbox-v2`, committed predecessor `fce0861ac6ae9b002832c0b78d7812cbbe0ea869`.
 Governing design: [`durable-project-catalog-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-impl.md).
 Transport substrate: [`distributed-code-source-collector-impl.md`](../../../../../design/daemon-runtime/distributed-code-source-collector-impl.md).
 History dependencies: [`durable-project-catalog-phase3-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-phase3-impl.md) and [`durable-project-catalog-phase6-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-phase6-impl.md).
@@ -25,7 +25,7 @@ Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). T
 > wire contract. GH-B intake through durable `ready` is implemented: bounded
 > authenticated routes, resumable immutable storage, exact-HEAD stable Git
 > capture, canonical fragments, shallow refusal, and independent collector
-> backoff. GH-B is implemented: background-only upload expiry, generation
+> backoff. GH-B lifecycle maintenance is implemented: background-only upload expiry, generation
 > retention, explicit future-materializer roots, grace-delayed CAS reclamation,
 > the SHA-1/SHA-256 and graph/path/fragment fixture matrix, and an isolated
 > FreshV2 daemon-plus-collector rehearsal all pass. GH-C is implemented:
@@ -37,8 +37,13 @@ Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). T
 > pre-marker attachment refresh resumes. The strict remote-only smoke covers
 > every action-ahead crash point, grant loss/restoration, code-ahead mismatch,
 > matching republish, force-push replacement, and source retirement. GH-D and
-> later milestones remain unimplemented; provenance note I/O therefore still
-> uses its existing checkout-backed behavior.
+> GH-E are implemented: the collector performs authenticated provenance export
+> plus receipt and uploads one stable notes-ref snapshot; the corpus validates
+> multipart documents, resolves V1 targets against a pinned path-free selector,
+> checks V2 target membership, and publishes explicit edges through a durable
+> replay journal with quarantine and CAS maintenance. Legacy checkout-backed
+> adapters remain intentionally live for the GH-F overlap proof; GH-F parity
+> and GH-G strict cutover are the remaining milestones.
 
 ## 1. Required outcome
 At this slice's exit gate, proved against strict catalog state after Phases 3 through 6 have landed:
@@ -416,7 +421,7 @@ POST /internal/code-source/v1/provenance/imports/{id}/finalize
 GET  /internal/code-source/v1/provenance/generations/{generation}/status
 ```
 `note_commit` is the Git object carrying the note and must equal `GitProvenanceNote.commit`; it is distinct from `NoteToolCall.target_ref`, which names the project-file entity targeted by an imported edge.
-Collector captures one stable listing through `StableGitRepository::snapshot_notes_bounded`, preserving note commit and exact document bytes.
+Collector captures one stable listing through `StableGitRepository::snapshot_notes_generation_bounded`, resolving the moving notes ref once and preserving that immutable tip, note commit, and exact document bytes.
 Corpus validates scope/grant, exact notes ref, object ids, hash, UTF-8, schema, note-commit equality, V2 part metadata, target membership, conflicts, counts, and bytes. Server derives generation id.
 
 ### 6.8 Store layout and GC
@@ -425,16 +430,19 @@ git-sources/
   records/sha256/<first-two>/<hash>
   uploads/<producer-hash>/<upload-id>/...
   repos/<repo-history-id>/history/<source-generation-id>/...
-  repos/<repo-history-id>/provenance/<note-generation-id>/...
+  provenance-imports/generations/<import-generation-id>/...
+  provenance-imports/generation-index/<import-generation-id>.json
+  provenance-imports/projects/<project-id>/current-ready.json
+  provenance-imports/projects/<project-id>/acceptance-sequence.json
   activations/<repo-history-id>.json
-  provenance-import/<note-generation-id>.journal.json
+  provenance-imports/journals/<project-id>.json
   provenance-export/<project-id>.receipt.json
   quarantine/...
 ```
 Private no-follow directories; same-filesystem temp, file fsync, atomic rename, parent fsync; checksummed versioned journal replacement.
 The root is sibling to lexical index and P3 history generations, so schema replacement cannot delete it.
 History roots: open uploads, ready/in-flight/active/retained source generations, activation journals, and source evidence referenced by retained P3 generations.
-Provenance roots: open imports, current/retained note generations, unfinished journals, latest receipt, and failed/quarantined generations pending acknowledged retirement.
+Provenance roots: open imports, the acceptance-sequenced current pointer and configured retained note generations, unfinished journals, latest receipt, the last-good Active generation, and failed/quarantined generations pending acknowledged retirement.
 P3 GC remains sole authority for `RepoHistoryGeneration` and vectors.
 
 ## 7. Runtime, transaction, lock, and recovery mechanics
@@ -487,11 +495,11 @@ Landed local semantics remain: all checks precede page writes; `apply_export_pag
 Final receipt must match current plan generation; stale receipt rejects and restarts. Last successful receipt is health evidence.
 
 ### 7.6 Provenance import transaction
-Finalize installs immutable note generation, then prepares edge rows without publication lock.
-V2 resolves `target_ref`; V1 resolves pinned corpus chunks; invalid calls are excluded with bounded diagnostics.
+Finalize installs an immutable note generation, allocates a durable per-project acceptance sequence, and advances `current-ready.json` only when that sequence is newer. It then prepares edge rows without a publication lock.
+V2 resolves `target_ref`; V1 resolves pinned corpus chunks. A malformed document, cross-project V2 target, inactive target, or invalid V1 path/range quarantines the complete import with a bounded diagnostic before any edge publication.
 Accepted edges retain current `edges_from_note` fields and add note-generation/document-hash metadata without changing `edge_import_key`.
-Projects sort by id. For each: acquire provenance sidecar lock, verify journal, call `append_explicit_edges`, fsync, mark complete, release.
-After all projects: rebuild `EdgeIndex` once, verify edge-key commitment, commit journal.
+The complete prepared edge inventory is capped at 64 MiB. Before touching the lane, publication checks the projected active-sidecar bytes against the edge-index rebuild admission limit; the atomic merge repeats the per-lane bound under its project lock, so a 94 GiB lane is refused from metadata rather than scanned or copied. Admitted publication performs a streaming atomic merge: existing rows are never loaded into memory, readers see either the old lane or the complete merged lane, and an idempotent retry that has no missing keys does not copy the existing lane. The journal advances `Prepared -> EdgesPublished` only after rename/fsync.
+After publication: rebuild `EdgeIndex` once on the dedicated background worker, verify the journaled ordered edge-key commitment against the published read view, atomically settle the source against the current ready pointer, and finish the journal as `Committed` or `Superseded`. The existing 4 GiB active-sidecar admission limit applies before parsing; refusal leaves the source at `Importing`/`EdgesPublished` for operator compaction and retry rather than exposing an unverified graph or destabilizing the daemon. An older queued import may finish an already-started idempotent append, but it cannot become Active after a newer acceptance. `Quarantined` and `Superseded` are terminal recovery states.
 
 ### 7.7 Lock order
 1. Process-lifetime migration lock for offline commands.
@@ -506,7 +514,7 @@ No path needs all layers: producer Git locks never enter daemon; upload locks re
 ### 7.8 Reload and security
 Reload builds one replacement auth table, code assignments, repo grants, and limits. Only a valid auth table swaps; repo split installs blocked health without breaking valid code grants.
 Removing producer revokes future requests. Accepted generations remain; in-flight upload cannot finalize after grant recheck.
-Bearer auth precedes parse; scope precedes lookup/write; ids are producer-bound; server derives catalog ids; paths validate at every boundary; notes ref uses `validate_notes_ref`; object ids are consistent lower hex; documents are UTF-8/schema validated; only `READ_FILE`/`EDITED_FILE` import; invalid refs skip with diagnostics; secrets and content do not enter ids, logs, or metric labels.
+Bearer auth precedes parse; scope precedes lookup/write; ids are producer-bound; server derives catalog ids; paths validate at every boundary; notes ref uses `validate_notes_ref`; object ids are consistent lower hex; documents are UTF-8/schema validated; only `READ_FILE`/`EDITED_FILE` import; invalid refs quarantine the bounded generation with diagnostics before publication; secrets and content do not enter ids, logs, or metric labels.
 
 ### 7.9 Cutover transaction
 `RepoHistoryRecord` gains additive `#[serde(default)] membership_generation: u64` in `bbox-corpus-core::project_catalog`. Its durable home is each record in `CatalogSnapshotV2.repo_histories`; old records decode as zero and new writers emit the field.
@@ -611,6 +619,7 @@ Verification: lane fixtures including retained corpus-only `RAN_BASH`, page/curs
 Gate: focused provenance/sidecar/MCP/CLI/collector tests, dependency acceptance, concurrency lint, cluster verify.
 
 ### GH-E: Authenticated provenance import
+Status: implemented 2026-08-08.
 Ownership: Git source crates, `bbox-provenance`, `provenance.rs`, corpus path-free lookup, edge sidecar, `git_source.rs`, collector.
 Dependencies: GH-C, GH-D, `P3-E`, `P3-RV`, `G10-RV`, `PX-I`.
 Mechanics:

@@ -33,12 +33,57 @@ pub struct ProvenanceProject {
 pub type LegacyTargetResolver<'a> =
     dyn Fn(&str, &Path, &Path, Option<(u64, u64)>) -> Result<Option<EntityRef>> + 'a;
 
+pub type PinnedLegacyTargetResolver<'a> =
+    dyn Fn(&str, Option<(u64, u64)>) -> Result<Option<EntityRef>> + 'a;
+pub type PinnedTargetMembership<'a> = dyn Fn(&EntityRef) -> Result<bool> + 'a;
+
 /// Checkout-derived provenance edges prepared entirely in memory. Callers
 /// must revalidate every lease used to build this value before publishing it
 /// to the durable edge sidecars.
 #[derive(Debug, Default)]
 pub struct PreparedProvenanceImport {
     edges_by_project: BTreeMap<String, Vec<Edge>>,
+}
+
+impl PreparedProvenanceImport {
+    pub fn edge_count(&self) -> u64 {
+        self.edges_by_project
+            .values()
+            .map(|edges| edges.len() as u64)
+            .sum()
+    }
+
+    pub fn ordered_import_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .edges_by_project
+            .values()
+            .flatten()
+            .map(bbox_edge_index::edge_index::edge_import_key)
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    pub fn encoded_edge_bytes(&self) -> Result<u64> {
+        self.edges_by_project
+            .values()
+            .flatten()
+            .try_fold(0_u64, |total, edge| {
+                total
+                    .checked_add(serde_json::to_vec(edge)?.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("prepared provenance edge size overflow"))
+            })
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        for (project_id, edges) in other.edges_by_project {
+            self.edges_by_project
+                .entry(project_id)
+                .or_default()
+                .extend(edges);
+        }
+    }
 }
 
 pub fn export_provenance(edge_index: &EdgeIndex, projects: &[ProvenanceProject]) -> Result<String> {
@@ -145,6 +190,61 @@ pub fn prepare_provenance_import(
     Ok(prepared)
 }
 
+/// Parse and resolve one authenticated producer import against a caller-pinned
+/// corpus generation. V1 documents use the path-free relative-path resolver;
+/// V2 documents must carry a valid project-file target that is a member of
+/// that exact generation. Invalid typed targets fail the whole generation
+/// instead of falling back to the legacy path lane.
+pub fn prepare_authenticated_provenance_import(
+    project_id: &str,
+    import_generation_id: &str,
+    documents: &[(String, String, String)],
+    resolve_legacy_target: &PinnedLegacyTargetResolver<'_>,
+    target_is_member: &PinnedTargetMembership<'_>,
+) -> Result<PreparedProvenanceImport> {
+    if project_id.trim().is_empty() {
+        anyhow::bail!("authenticated provenance import has no project id");
+    }
+    let mut prepared = PreparedProvenanceImport::default();
+    if import_generation_id.trim().is_empty() {
+        anyhow::bail!("authenticated provenance import has no generation id");
+    }
+    for (note_commit, document_sha256, document) in documents {
+        let note = parse_note_document(document)
+            .map_err(|error| anyhow::anyhow!("invalid provenance document: {error}"))?;
+        if &note.commit != note_commit {
+            anyhow::bail!("provenance document commit does not match its manifest key");
+        }
+        if note.schema_version >= bbox_provenance::SCHEMA_VERSION_V2 {
+            for call in note
+                .tool_calls
+                .iter()
+                .filter(|call| authenticated_edge_kind_for_call(call).is_some())
+            {
+                let target = validated_target_for_project(call, project_id)
+                    .ok_or_else(|| anyhow::anyhow!("invalid v2 provenance target_ref"))?;
+                if !target_is_member(&target)? {
+                    anyhow::bail!("v2 provenance target is not in the pinned project corpus");
+                }
+            }
+        }
+        let edges = edges_from_authenticated_note(
+            project_id,
+            import_generation_id,
+            document_sha256,
+            &note,
+            resolve_legacy_target,
+            target_is_member,
+        )?;
+        prepared
+            .edges_by_project
+            .entry(project_id.to_string())
+            .or_default()
+            .extend(edges);
+    }
+    Ok(prepared)
+}
+
 fn parse_note_for_target(raw: &str, target_commit: &str) -> Option<GitProvenanceNote> {
     let note = parse_note_document(raw).ok()?;
     (note.commit == target_commit).then_some(note)
@@ -157,10 +257,23 @@ pub fn publish_prepared_provenance_import(
     prepared: PreparedProvenanceImport,
     edges_dir: &Path,
 ) -> Result<u64> {
+    publish_prepared_provenance_import_bounded(prepared, edges_dir, u64::MAX)
+}
+
+pub fn publish_prepared_provenance_import_bounded(
+    prepared: PreparedProvenanceImport,
+    edges_dir: &Path,
+    max_existing_lane_bytes: u64,
+) -> Result<u64> {
     let mut edges_imported = 0u64;
     for (project_id, edges) in prepared.edges_by_project {
         edges_imported +=
-            bbox_edge_index::edge_index::append_explicit_edges(edges_dir, &project_id, &edges)
+            bbox_edge_index::edge_index::append_explicit_edges_atomic_bounded(
+                edges_dir,
+                &project_id,
+                &edges,
+                max_existing_lane_bytes,
+            )
                 .map_err(|_| {
                     anyhow::anyhow!(
                         "error.provenance_store_unavailable: imported provenance edges could not be persisted"
@@ -247,6 +360,76 @@ fn edges_from_note(
     Ok(edges)
 }
 
+fn edges_from_authenticated_note(
+    project_id: &str,
+    import_generation_id: &str,
+    document_sha256: &str,
+    note: &GitProvenanceNote,
+    resolve_legacy_target: &PinnedLegacyTargetResolver<'_>,
+    target_is_member: &PinnedTargetMembership<'_>,
+) -> Result<Vec<Edge>> {
+    let mut edges = Vec::new();
+    for call in &note.tool_calls {
+        let Some(edge_kind) = authenticated_edge_kind_for_call(call) else {
+            continue;
+        };
+        let Some(source_ref) = call.source_ref.as_deref() else {
+            continue;
+        };
+        let Ok(source) = EntityRef::parse(source_ref) else {
+            continue;
+        };
+        let file = call.file.as_deref();
+        let target = if note.schema_version >= bbox_provenance::SCHEMA_VERSION_V2 {
+            let target = validated_target_for_project(call, project_id)
+                .ok_or_else(|| anyhow::anyhow!("invalid v2 provenance target_ref"))?;
+            if !target_is_member(&target)? {
+                anyhow::bail!("v2 provenance target is not in the pinned project corpus");
+            }
+            target
+        } else {
+            let Some(file) = file else {
+                continue;
+            };
+            let Some(target) =
+                resolve_legacy_target(file, call.byte_range.map(|range| (range[0], range[1])))?
+            else {
+                continue;
+            };
+            target
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert("anchor.project_id".into(), project_id.to_string());
+        if let Some(file) = file {
+            metadata.insert("anchor.file_path".into(), file.to_string());
+        }
+        metadata.insert("anchor.commit_sha_at_edit".into(), note.commit.clone());
+        metadata.insert(
+            "provenance.import_generation_id".into(),
+            import_generation_id.to_string(),
+        );
+        metadata.insert(
+            "provenance.document_sha256".into(),
+            document_sha256.to_string(),
+        );
+        metadata.insert("tool.name".into(), call.tool.clone());
+        if let Some([start, end]) = call.byte_range {
+            metadata.insert("anchor.byte_start".into(), start.to_string());
+            metadata.insert("anchor.byte_end".into(), end.to_string());
+        }
+        edges.push(Edge {
+            source,
+            kind: edge_kind.to_string(),
+            target,
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata,
+            project_id: None,
+        });
+    }
+    Ok(edges)
+}
+
 fn validated_target_for_project(call: &NoteToolCall, project_id: &str) -> Option<EntityRef> {
     let target = EntityRef::parse(call.target_ref.as_deref()?).ok()?;
     match &target {
@@ -269,6 +452,14 @@ fn edge_kind_for_call(call: &NoteToolCall) -> Option<&str> {
     match call.tool.as_str() {
         "Read" | "read" => Some("READ_FILE"),
         "Edit" | "edit" | "Write" | "write" => Some("EDITED_FILE"),
+        _ => None,
+    }
+}
+
+fn authenticated_edge_kind_for_call(call: &NoteToolCall) -> Option<&str> {
+    match edge_kind_for_call(call)? {
+        "READ_FILE" => Some("READ_FILE"),
+        "EDITED_FILE" => Some("EDITED_FILE"),
         _ => None,
     }
 }
@@ -419,5 +610,153 @@ mod tests {
         assert_eq!(note.produced_by.session_ids, vec!["sess-a", "sess-b"]);
         assert_eq!(note.schema_version, bbox_provenance::SCHEMA_VERSION_V2);
         assert!(note.tool_calls.iter().all(|call| call.target_ref.is_some()));
+    }
+
+    #[test]
+    fn authenticated_v2_import_fails_closed_on_foreign_or_inactive_targets() {
+        let note = GitProvenanceNote::new_v2(
+            "abc123",
+            ProducedBy::default(),
+            vec![NoteToolCall {
+                tool: "Edit".into(),
+                edge_kind: None,
+                source_ref: Some("transcript:test:session:1:0".into()),
+                target_ref: Some(format!(
+                    "project_file:other-project:path:{}:0",
+                    "a".repeat(64)
+                )),
+                file: Some("src/lib.rs".into()),
+                byte_range: Some([0, 1]),
+                turn: Some(1),
+            }],
+            Vec::new(),
+        );
+        let document = serialize_note(&note).unwrap();
+        assert!(
+            prepare_authenticated_provenance_import(
+                "project-one",
+                "pgi_test",
+                &[("abc123".into(), "a".repeat(64), document)],
+                &|_, _| unreachable!("v2 must not fall back to a V1 resolver"),
+                &|_| Ok(true),
+            )
+            .is_err()
+        );
+
+        let target = format!("project_file:project-one:path:{}:0", "a".repeat(64));
+        let mut note = note;
+        note.tool_calls[0].target_ref = Some(target);
+        let document = serialize_note(&note).unwrap();
+        assert!(
+            prepare_authenticated_provenance_import(
+                "project-one",
+                "pgi_test",
+                &[("abc123".into(), "a".repeat(64), document)],
+                &|_, _| unreachable!("v2 must not fall back to a V1 resolver"),
+                &|_| Ok(false),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn authenticated_import_ignores_non_file_calls() {
+        let target = format!("project_file:project-one:path:{}:0", "a".repeat(64));
+        let note = GitProvenanceNote::new_v2(
+            "abc123",
+            ProducedBy::default(),
+            vec![
+                NoteToolCall {
+                    tool: "Bash".into(),
+                    edge_kind: Some("RAN_BASH".into()),
+                    source_ref: Some("transcript:test:session:1:0".into()),
+                    target_ref: None,
+                    file: None,
+                    byte_range: None,
+                    turn: Some(1),
+                },
+                NoteToolCall {
+                    tool: "Read".into(),
+                    edge_kind: Some("READ_FILE".into()),
+                    source_ref: Some("transcript:test:session:1:0".into()),
+                    target_ref: Some(target),
+                    file: Some("src/lib.rs".into()),
+                    byte_range: Some([0, 1]),
+                    turn: Some(1),
+                },
+            ],
+            Vec::new(),
+        );
+        let document = serialize_note(&note).unwrap();
+        let prepared = prepare_authenticated_provenance_import(
+            "project-one",
+            "pgi_test",
+            &[("abc123".into(), "a".repeat(64), document)],
+            &|_, _| unreachable!("v2 must not fall back to a V1 resolver"),
+            &|_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(prepared.edge_count(), 1);
+        assert_eq!(
+            prepared.edges_by_project["project-one"][0].kind,
+            "READ_FILE"
+        );
+    }
+
+    #[test]
+    fn authenticated_v1_import_uses_the_pinned_relative_path_resolver() {
+        let note = GitProvenanceNote {
+            schema_version: bbox_provenance::SCHEMA_VERSION_V1,
+            commit: "abc123".into(),
+            part: None,
+            produced_by: ProducedBy::default(),
+            tool_calls: vec![NoteToolCall {
+                tool: "Read".into(),
+                edge_kind: None,
+                source_ref: Some("transcript:test:session:1:0".into()),
+                target_ref: None,
+                file: Some("src/lib.rs".into()),
+                byte_range: Some([4, 8]),
+                turn: Some(1),
+            }],
+            knowledge_writes: vec![bbox_provenance::KnowledgeWrite {
+                id: "ignored".into(),
+                kind: "remember".into(),
+            }],
+        };
+        let document = serialize_note(&note).unwrap();
+        let target = EntityRef::ProjectFile {
+            project_id: "project-one".into(),
+            rel_path_hash: "path".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 0,
+        };
+        let prepared = prepare_authenticated_provenance_import(
+            "project-one",
+            "pgi_test",
+            &[("abc123".into(), "a".repeat(64), document)],
+            &|path, range| {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(range, Some((4, 8)));
+                Ok(Some(target.clone()))
+            },
+            &|_| unreachable!("v1 has no typed target membership probe"),
+        )
+        .unwrap();
+        assert_eq!(prepared.edge_count(), 1);
+        assert_eq!(prepared.ordered_import_keys().len(), 1);
+        let edge = &prepared.edges_by_project["project-one"][0];
+        assert_eq!(
+            edge.metadata
+                .get("provenance.import_generation_id")
+                .map(String::as_str),
+            Some("pgi_test")
+        );
+        assert_eq!(
+            edge.metadata
+                .get("provenance.document_sha256")
+                .map(String::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 }

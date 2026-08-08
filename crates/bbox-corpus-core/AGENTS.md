@@ -107,6 +107,10 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   sentinel. The custom reader alone accepts the legacy flat `attachment_id`
   form, only when `source` is absent; new serialization is always typed and
   both/neither forms fail closed.
+- A provenance collector snapshot resolves the moving notes ref exactly once,
+  then lists and reads notes through that immutable tree. The returned notes
+  tip is part of the transport generation commitment; never list by one tip
+  and read note bytes through the moving ref again.
 
 ## Rerank math (search/rerank.rs)
 

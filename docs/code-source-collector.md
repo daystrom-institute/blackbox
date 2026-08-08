@@ -88,14 +88,19 @@ uses resumable content-addressed upload. Multiple configured projects sharing
 one Git common directory publish that repository history only once per cycle.
 
 `provenance` also defaults to `false` and runs on an independent retry lane.
-When enabled, the collector pulls deterministic generation-bound pages made
-only from that project's direct observed `EDITED_FILE` and `READ_FILE` edges,
-applies them under the repository's shared provenance lock, and posts a receipt
-binding the plan inventory to the resulting local notes tip. Imported explicit
+When enabled, the collector first pulls deterministic generation-bound pages
+made only from that project's direct observed `EDITED_FILE` and `READ_FILE`
+edges, applies them under the repository's shared provenance lock, and posts a
+receipt binding the plan inventory to the resulting local notes tip. It then
+captures that exact notes-ref generation through the stable no-follow Git
+authority and uploads its manifest and content-addressed documents. The corpus
+validates V2 target membership or resolves V1 paths against one pinned active
+code selector before journaled, idempotent edge publication. Imported explicit
 edges and `RAN_BASH` observations are never re-exported. If the observed lane
-changes during paging or before receipt, the collector restarts from page one;
-already-written documents are counted as unchanged, so a crash after the notes
-write but before receipt is safe to retry.
+changes during export paging or before receipt, the collector restarts from
+page one; already-written documents are counted as unchanged. Import status is
+polled to `active`/`superseded`, while invalid typed targets are quarantined
+with a durable diagnostic.
 
 Publish once and wait for a terminal generation state:
 
@@ -158,6 +163,24 @@ page responses are independently capped at 128 KiB before JSON decoding. These
 explicit transport limits keep an accidentally huge sidecar from becoming
 either a daemon-heap allocation or an unbounded scan; compact or archive the
 observed lane before retrying rather than raising daemon memory.
+
+Authenticated provenance imports live under
+`<state_dir>/git-sources/provenance-imports/`. Their document bytes are
+content-addressed, while a durable per-project acceptance sequence and ready
+pointer prevent an older queued note snapshot from replacing a newer one.
+Edge preparation is capped at 64 MiB; a larger or semantically invalid import
+is quarantined before sidecar publication. The projected active-sidecar size
+is checked before the project lane is read, and the lane size is checked again
+under its mutation lock, so an oversized estate is refused without scanning or
+copying it. Successful publication performs one
+atomic streaming merge of the project lane and one bounded edge-index rebuild;
+the import becomes Active only after its exact edge-key commitment is visible
+in the published read view. If active sidecars exceed the rebuild admission
+limit, the daemon refuses before parsing and leaves the import recoverably
+`Importing` until the lanes are compacted.
+Maintenance retains the current and configured prior import generations plus
+unfinished, Active, and quarantined evidence, then reclaims unreferenced
+document blobs after the normal grace interval.
 
 When a retained blob is corrupt, the daemon keeps already materialized active
 documents readable and requests the missing hash during the next publication.

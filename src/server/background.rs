@@ -19,6 +19,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     super::code_source::spawn_commit_observer(&shared);
     super::code_source::spawn_store_maintenance(&shared)?;
     super::history_activation::spawn_worker(&shared)?;
+    super::provenance_import::spawn_worker(&shared)?;
     install_badgey_adapter(&shared);
     configure_dispatch_path_env();
     restore_badgey_registry_from_notes(&shared);

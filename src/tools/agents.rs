@@ -1905,7 +1905,7 @@ mod tests {
             name: "distilled-reviewer".into(),
             version: 1,
         };
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&server.state.store_dir);
+        let edges_dir = crate::server::edge_sidecar_dir(&server.state);
         let durable_edges: Vec<crate::edge_index::Edge> =
             std::fs::read_to_string(edges_dir.join("explicit/agents.jsonl"))
                 .unwrap()

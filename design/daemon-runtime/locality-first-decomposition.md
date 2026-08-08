@@ -9,19 +9,20 @@ topic:
   - corpus
   - knowledge
 tags: [decomposition, satellite, harness, worktrees, knowledge-seam, collector, render, provenance, indexing]
-brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, the single-host knowledge seam, and fleetd are complete. Checkout-local provenance export and collected code ingestion are partial strangler moves; provenance import, blame, project render, Git-history acquisition, remaining project-file walks, and the remote knowledge source still have daemon-side checkout dependencies."
+brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, the single-host knowledge seam, fleetd, and typed Git-history/provenance transport through authenticated import are complete. Overlap proof and strict cutover, blame, project render, remaining project-file walks, and the remote knowledge source remain."
 ---
 
 # Locality-first decomposition: the checkout plane and the corpus plane
 
 > **Status: partial; current-HEAD inventory reverified 2026-08-08 at
-> `beta/blackbox-v2` `055071aa`.** Durable project identity, the
-> single-host knowledge seam, and fleetd are complete. Checkout-local
-> provenance export is live beside its legacy daemon adapter. Collected code
-> ingestion, activation, and cutback are live, but daemon-side local walking
-> remains an active source rung. Provenance import, blame, project render,
-> and Git-history acquisition still open or mutate an attached checkout from
-> blackboxd. The knowledge model is complete for the monolithic rung, but its
+> `beta/blackbox-v2` predecessor `fce0861ac6ae9b002832c0b78d7812cbbe0ea869`.** Durable project identity, the
+> single-host knowledge seam, fleetd, authenticated Git-history transport,
+> and bidirectional authenticated provenance transport are implemented.
+> Collected code ingestion, activation, and cutback are live, but legacy
+> daemon adapters deliberately remain during the GH-F overlap proof and
+> daemon-side local walking remains an active source rung. Blame, project
+> render writes, and the remote knowledge source still reach into an attached
+> checkout from blackboxd. The knowledge model is complete for the monolithic rung, but its
 > published and provisional sources still rely on same-host admitted
 > checkouts. Section 3 is the current code-verified inventory and section 6
 > is the dependency and retirement map. Line cites rot; reverify symbols and
@@ -177,24 +178,26 @@ path-free durable identity does not by itself make the operation local.
 
 | Concern | Current HEAD | Locality end-state | Adapter retirement gate |
 |---|---|---|---|
-| Provenance export | `bbox_provenance_export_plan` performs corpus-only planning and `bro provenance export` applies the generation-bound page through `bbox-provenance` in its own checkout. `bbox_provenance_export` remains a daemon-side overlap adapter and still takes a write `ProvenanceNoteIo` lease. | Keep corpus planning and the checkout-local apply path. If unattended export remains a requirement, a scope-authorized producer pulls the plan and returns a typed receipt; blackboxd never writes the notes ref. | Observe adapter use over a declared window; prove plan/apply parity, idempotency, stale-generation refusal, and notes-ref confinement; provide the authenticated unattended path if policy requires it; obtain explicit operator approval before deleting the adapter. |
-| Provenance import | `bbox_provenance_import` opens the checkout's stable notes ref under a read `ProvenanceNoteIo` lease, prepares documents, and publishes explicit corpus edges. | A scope-authorized checkout producer snapshots the stable notes ref and uploads a bounded typed import. Corpus-side validation and edge publication stay central. Arbitrary caller-supplied note JSON is not graph authority. | Durable replay or receipt semantics, bounded completeness checks, project/scope authorization, import parity, and an observation window with no daemon `ProvenanceNoteIo` reads for covered projects. |
+| Provenance export | Authenticated collector page/apply/receipt is implemented; `bbox_provenance_export_plan` and `bro provenance export` remain interactive paths. `bbox_provenance_export` is still a daemon-side overlap adapter and takes a write `ProvenanceNoteIo` lease. | Keep corpus planning and checkout-local apply. The scope-authorized producer pulls the plan and returns a typed receipt; blackboxd never writes the notes ref after cutover. | GH-F parity/observation proof and GH-G operator-authorized retirement; preserve idempotency, stale-generation refusal, and notes-ref confinement. |
+| Provenance import | Authenticated stable snapshot upload, corpus validation, pinned V1 resolution, strict V2 membership, durable replay, and quarantine are implemented. `bbox_provenance_import` remains a daemon-side overlap adapter and still takes a read `ProvenanceNoteIo` lease. | Keep typed producer capture and central edge publication. Arbitrary caller-supplied note JSON is not graph authority. | GH-F typed/legacy edge-key coverage plus GH-G cutover and a zero-lease observation window for covered projects. |
 | `bbox_blame` | `bbox_blame` still executes in blackboxd. Both path mode and corpus-entity mode open an attached Git object database and run blame; catalog mode correctly pins the corpus generation and commit but does not change the execution locus. | A checkout-side binding returns a typed blame fact at an explicit commit or working-tree state. The corpus-side query joins that fact to anchors, sessions, brofiles, and threads. A checkout path never becomes corpus authority. | Path and entity-mode parity, dirty/committed-state tests, scope and commit binding, bounded payloads, and a measured zero-use window for the daemon adapter. |
 | Project-scope render | `bbox_render` resolves an attachment, takes a write `RenderFileProvider` lease, and invokes the shared `bbox-knowledge` renderer inside blackboxd. The immutable-candidate merge gate already invokes `render --check` semantics. No `bro render` or harness-native equivalent exists. | `bro render` and/or a harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs and explicit provisional view from the corpus. Global render remains operator-host local. | Byte/output parity through the shared renderer, target-confinement tests, published/own/all view tests, candidate-tree gate parity, and a measured zero-use window before removing daemon write authority. |
 | Project source indexing | `bbox-code-collector`, its authenticated manifest/blob endpoint, immutable generations, activation, health, and cutback are implemented. An active collected generation suppresses local walking. `LocalProjectWalk` remains live for local/unassigned projects and as the explicit cutback destination. | Checkout owners walk, hash, and ship raw capped bytes; the corpus chunks and indexes them. Every intended project uses an active collected source. No daemon source rung opens a checkout. | Configured producer coverage, successful active generations, restart/rebuild recovery, bounded observation with no local-walk attempts, and an explicit decision about replacing or deleting local cutback before `LocalProjectWalk` retires. |
 | Repo-owned `.bbox/` read path | Durable checkout identity, pinned published views, per-checkout provisional overlays, explicit visibility, content-equality promotion, lifecycle teardown, gap convergence, and candidate-tree gates are implemented. `write_redirects` is retired. The daemon still watches and reads admitted same-host checkouts to build those views. | A harness reads its own branch state directly. Published and deliberately shared provisional inputs reach the corpus through an authenticated checkout-source contract; corpus coordination, validation, promotion, and indexing remain central. | Preserve read-your-writes, pinned-published, tombstone, promotion, visibility, and merge-gate semantics while proving blackboxd no longer reads or watches project `.bbox/` paths. This is the remote rung of the shipped knowledge design, not a redesign of its identity model. |
-| Git history ingest | Immutable repo-history generations, selectors, health, GC, and rebuild are implemented. Acquisition is still `refresh_consolidated_repo_history`: blackboxd takes a `GitHistory` lease and walks an attached checkout. Collected code activation can therefore succeed while history stays unavailable on a remote-only project. | A scope-authorized producer sends complete-then-incremental history materialization and current-file Git facts. Corpus-side generation publication, selectors, indexing, and graph construction stay central. | Complete reachable-history bootstrap, incremental cursor/replay correctness, generation and scope validation, restart/rebuild tests, and no daemon `GitHistory` lease for covered projects. |
+| Git history ingest | Authenticated complete reachable-history capture, resumable intake, certified P3 materialization, producer overlays, health, recovery, GC, and rebuild are implemented. `refresh_consolidated_repo_history` remains the overlap adapter and still takes a `GitHistory` lease where transport cutover has not occurred. | The scope-authorized producer owns Git acquisition; corpus-side generation publication, selectors, indexing, and graph construction stay central. | GH-F parity/coverage proof and GH-G no-fallback cutover; then no daemon `GitHistory` lease for covered projects. |
 
 The rebaseline result is therefore:
 
 - **Complete:** slice 1's durable identity contract; slice 3's knowledge
   semantics on the single-host rung; slice 5's fleetd extraction.
-- **Partial:** slice 2's checkout-local provenance export and render merge
-  gate; slice 4's collector transport, immutable code generations, and
-  activation/cutback authority.
-- **Not relocated:** provenance import, blame, project-scope render,
-  Git-history acquisition, the remaining local project-file source rung,
-  and the remote source for published/provisional `.bbox/` views.
+- **Implemented but still in measured overlap:** typed Git-history and
+  provenance acquisition/publication through GH-E; legacy daemon adapters
+  remain until GH-F/G.
+- **Partial:** slice 2's render merge gate; slice 4's collector transport,
+  immutable code generations, and activation/cutback authority.
+- **Not relocated:** blame, project-scope render, the remaining local
+  project-file source rung, and the remote source for published/provisional
+  `.bbox/` views.
 
 Non-normative operator snapshot, taken during this rebaseline: the current
 catalog contains nineteen projects, one in the Published lane and eighteen
@@ -381,7 +384,7 @@ monolith:
 | Slice | Current state | What remains |
 |---|---|---|
 | 1. Identity contract | Complete | Preserve the path-free authority and attachment-as-observation invariants. |
-| 2. Harness-ward moves | Partial | Provenance export is local and candidate render checking is live; import, blame, render writes, and the remote knowledge source remain. |
+| 2. Harness-ward moves | Partial | Provenance export/import transport and candidate render checking are live; overlap cutover, blame, render writes, and the remote knowledge source remain. |
 | 3. Knowledge seam | Complete on the single-host rung | Move source acquisition without changing the shipped identity, view, promotion, and integration contracts. |
 | 4. Code-corpus collector | Partial | Cut over intended projects, remove the local-walk/cutback dependency, and stop coupling collected activation to daemon-side Git acquisition. |
 | 5. Fleetd | Complete | No locality-program work remains. |
@@ -389,11 +392,11 @@ monolith:
 
 The executable dependency map from this rebaseline is:
 
-1. **Rebaseline and implement the typed Git/provenance checkout-source
-   contract first.** This is the next implementation arc. Start from
+1. **Typed Git/provenance checkout-source contract: implemented through GH-E.**
+   The next arc is GH-F overlap/parity proof followed by the separately gated
+   GH-G strict cutover. Continue from
    [git-history-provenance-transport-impl.md](git-history-provenance-transport-impl.md),
-   but reconcile its pre-Phase-6 owner/caller inventory with current HEAD
-   before dispatching any implementation cell. The contract supplies
+   using its current owner/caller inventory. The implemented contract supplies
    complete and incremental Git history, provenance import, and any required
    unattended provenance-export receipt without granting callers arbitrary
    graph-write authority. It removes the `GitHistory` and
@@ -421,11 +424,11 @@ The executable dependency map from this rebaseline is:
    project-scoped stores; checkout/workspace identity in `bro-core`;
    per-view `built_from` stamps on knowledge and indexed-lane responses.
    Additive.
-2. **Harness-ward moves — partial.** Checkout-local provenance export and
-   candidate-tree render checking are implemented. Provenance import, blame,
-   project render writes, and remote knowledge source acquisition remain.
-   Daemon adapters stay live during measured overlap, then retire only under
-   the section 3 gates.
+2. **Harness-ward moves: partial.** Checkout-local provenance export,
+   authenticated notes import, and candidate-tree render checking are
+   implemented. Blame, project render writes, and remote knowledge source
+   acquisition remain. Daemon adapters stay live during measured overlap,
+   then retire only under the section 3 gates.
 3. **Knowledge seam — complete on the single-host rung.** The provisional
    lane, explicit visibility, promotion, lifecycle, gap convergence,
    `write_redirects` retirement, and candidate-tree merge gate are live.

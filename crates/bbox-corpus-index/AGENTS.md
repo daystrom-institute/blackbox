@@ -36,3 +36,11 @@
   — the worktree case made history lanes invisible for weeks. When touching
   filter resolution, keep "registry first, hash fallback last" and test the
   out-of-tree worktree path explicitly.
+
+## Pinned provenance target resolution
+
+- Authenticated provenance import resolves legacy V1 path/range targets only
+  against the journal-pinned collected selector and a pinned Tantivy searcher.
+  The resolver is exact on project id, selector, and repository-relative path;
+  it never consults the live checkout or silently crosses into another active
+  code generation while an import is being prepared.

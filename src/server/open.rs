@@ -621,7 +621,7 @@ pub(super) fn open_shared_state(
     // R21F1: load_metas errors ABORT recovery with a typed error, never
     // silently become None (which would treat all pending journals as
     // uncommitted and discard committed transactions).
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&store_dir);
+    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&projects_path);
     let commit_payload: String = idx
         .index_handle()
         .load_metas()
@@ -660,6 +660,7 @@ pub(super) fn open_shared_state(
         &code_sources,
         &checkout_access,
         &store_dir,
+        &projects_path,
     )?;
     idx.refresh_active_code_selectors()
         .context("refreshing active code selectors after pre-bind catalog recovery")?;
@@ -747,7 +748,6 @@ pub(super) fn open_shared_state(
         &notes_store.read(),
         &task_store,
         &roadmap_store.read(),
-        &store_dir,
         &records_provider.records_snapshot(),
         &pending_first_republish,
     )?;
@@ -982,7 +982,6 @@ fn build_startup_edge_index(
     notes_store: &Notes,
     task_store: &TaskStore,
     roadmap_store: &Roadmap,
-    store_dir: &Path,
     records: &bbox_corpus_core::project_record::ProjectRecordsSnapshot,
     pending_first_republish: &BTreeSet<String>,
 ) -> anyhow::Result<edge_index::EdgeIndex> {
@@ -995,7 +994,9 @@ fn build_startup_edge_index(
                 notes: notes_store,
                 session_brofile_rows: task_store.session_brofile_rows(),
                 roadmap: roadmap_store,
-                edges_dir: edge_index::edges_dir_from_bro_store(store_dir),
+                edges_dir: bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                    &idx.reindex_config().projects_path,
+                ),
                 registered_project_ids: Some(records.registered_project_ids()),
                 include_tantivy_projection: false,
                 include_observed: true,

@@ -20,6 +20,7 @@ mod mcp;
 mod open;
 pub(crate) mod producer_auth;
 pub mod progress;
+pub(crate) mod provenance_import;
 pub(crate) mod repo_io;
 pub(crate) mod resolver_compat;
 pub mod response;

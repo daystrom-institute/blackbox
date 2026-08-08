@@ -87,6 +87,17 @@ pub struct StableGitNoteSnapshotEntry {
     pub bytes: Vec<u8>,
 }
 
+/// Immutable contents of one exact notes-ref generation.
+///
+/// `notes_tip` is resolved once and the tree/blobs are subsequently read by
+/// object id, so callers can bind transport metadata and document bytes to
+/// the same generation without reopening a moving ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableGitNotesSnapshot {
+    pub notes_tip: String,
+    pub entries: Vec<StableGitNoteSnapshotEntry>,
+}
+
 impl std::fmt::Debug for StableGitRepository {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("StableGitRepository(<held authority>)")
@@ -378,10 +389,43 @@ impl StableGitRepository {
         max_entries: usize,
         max_bytes: usize,
     ) -> Result<Option<Vec<StableGitNoteSnapshotEntry>>> {
+        Ok(self
+            .snapshot_notes_generation_bounded(notes_ref, max_entries, max_bytes)?
+            .map(|snapshot| snapshot.entries))
+    }
+
+    pub fn snapshot_notes_generation_bounded(
+        &self,
+        notes_ref: &str,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Option<StableGitNotesSnapshot>> {
+        let mut entries = Vec::new();
+        let Some(notes_tip) =
+            self.visit_notes_generation_bounded(notes_ref, max_entries, max_bytes, |entry| {
+                entries.push(entry);
+                Ok(())
+            })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(StableGitNotesSnapshot { notes_tip, entries }))
+    }
+
+    /// Resolve a moving notes ref once, then stream each blob from that exact
+    /// immutable tree. The aggregate byte limit bounds work while the caller
+    /// controls payload residency (for example, by spooling each document).
+    pub fn visit_notes_generation_bounded(
+        &self,
+        notes_ref: &str,
+        max_entries: usize,
+        max_bytes: usize,
+        mut visit: impl FnMut(StableGitNoteSnapshotEntry) -> Result<()>,
+    ) -> Result<Option<String>> {
         validate_stable_reference(notes_ref)?;
         #[cfg(not(unix))]
         {
-            let _ = (notes_ref, max_entries, max_bytes);
+            let _ = (notes_ref, max_entries, max_bytes, &mut visit);
             anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
         }
         #[cfg(unix)]
@@ -441,7 +485,6 @@ impl StableGitRepository {
                 anyhow::bail!("stable Git notes tree repeats a target object");
             }
             let mut total_bytes = listing.len();
-            let mut entries = Vec::with_capacity(listed.len());
             for (target_oid, note_oid) in listed {
                 let remaining = max_bytes
                     .checked_sub(total_bytes)
@@ -455,10 +498,9 @@ impl StableGitRepository {
                 total_bytes = total_bytes
                     .checked_add(bytes.len())
                     .context("stable Git notes snapshot byte count overflow")?;
-                entries.push(StableGitNoteSnapshotEntry { target_oid, bytes });
+                visit(StableGitNoteSnapshotEntry { target_oid, bytes })?;
             }
-            entries.sort_by(|left, right| left.target_oid.cmp(&right.target_oid));
-            Ok(Some(entries))
+            Ok(Some(commit_oid))
         }
     }
 }
@@ -3345,6 +3387,7 @@ fn run_git_bounded_with_stdin(
     })
 }
 
+#[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 fn run_bounded_with_timeout(
     cmd: Command,
@@ -4654,6 +4697,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let repository = open_stable_git_repository(&authority).unwrap().unwrap();
+        let first_generation = repository
+            .snapshot_notes_generation_bounded("refs/notes/stable-test", 16, 64 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_generation.entries.len(), 1);
+        assert_eq!(first_generation.entries[0].target_oid, inside_head);
+        assert!(!first_generation.notes_tip.is_empty());
         let first_snapshot = repository
             .snapshot_notes_bounded("refs/notes/stable-test", 16, 64 * 1024)
             .unwrap()

@@ -1363,7 +1363,7 @@ mod clause_one_exit_proof {
             "{}|{}|{}",
             sidecar_edge.source, sidecar_edge.kind, sidecar_edge.target
         );
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&populated.state.store_dir);
+        let edges_dir = crate::server::edge_sidecar_dir(&populated.state);
         std::fs::create_dir_all(&edges_dir).unwrap();
         std::fs::write(
             edges_dir.join(format!("{ATTACHED_PROJECT}.jsonl")),

@@ -6,3 +6,4 @@
 - History facts are typed commit records, not Git packs or object databases. Object format, graph closure, HEAD reachability, paths, fragments, counts, bytes, hashes, and commitments all fail closed here.
 - Canonical hashes use explicit versioned length-prefix encodings. Never replace them with JSON serialization hashes.
 - Provenance reuses `bbox-provenance` note documents and export pages. This crate does not define a second note or edge schema, and no import request carries corpus `Edge` values.
+- Provenance import generation ids bind producer, published scope, notes ref/tip, and manifest. Manifest ordinals are contiguous per note commit; the streaming verifier requires complete, nonduplicate V2 part groups before a generation becomes ready.

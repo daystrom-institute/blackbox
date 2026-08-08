@@ -1204,7 +1204,7 @@ pub(crate) fn resume_pending_activations(state: Arc<SharedState>) {
     for (scope, project_id) in assignments {
         schedule_activation(state.clone(), scope, project_id, None);
     }
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = super::edge_sidecar_dir(&state);
     let manifest = match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -2644,7 +2644,7 @@ fn install_git_overlay_selector(
     let RepoHistoryMaterialization::Ready { generation_id } = &history.materialization else {
         return Ok(());
     };
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = super::edge_sidecar_dir(state);
     // Monotonic per project. Read under the same manifest the swap writes, so
     // two overlays that agree on every other field are still distinguishable
     // - "did the overlay actually swap?" must be answerable from the manifest.
@@ -3745,6 +3745,7 @@ pub(crate) fn pre_bind_catalog_recovery(
     code_sources: &CodeSourceRuntime,
     checkout_access: &CheckoutAccessBroker,
     bro_home: &std::path::Path,
+    projects_path: &std::path::Path,
 ) -> Result<BTreeSet<String>> {
     let Some(catalog_store) = project_authority.catalog_store() else {
         // Bridge mode: steps 5-8 do not run (byte-compatible).
@@ -3762,7 +3763,7 @@ pub(crate) fn pre_bind_catalog_recovery(
     let catalog = snapshot.catalog();
 
     // Load the manifest index for workspace entries (link 5).
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(bro_home);
+    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
         .context("pre-bind: manifest index for relationship chain")?;
 
@@ -4058,7 +4059,7 @@ fn is_bridge_open(
 /// Determine the effective activation source for a project.
 fn determine_effective_source(state: &Arc<SharedState>, project_id: &str) -> EffectiveSource {
     let store = state.code_sources.store();
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = super::edge_sidecar_dir(state);
     let manifest = match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
         Ok(m) => m,
         Err(_) => return EffectiveSource::Unavailable,
@@ -4813,7 +4814,7 @@ fn cutback_to_local_single_attempt(
     identity: &CodeProjectIdentity,
 ) -> Result<CutbackSuccessOutcome> {
     let store = state.code_sources.store();
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = super::edge_sidecar_dir(state);
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
     let active_is_collected = manifest
         .workspaces
@@ -5145,7 +5146,7 @@ fn cutback_to_local(
     project_id: &str,
 ) -> Result<()> {
     let store = state.code_sources.store();
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = super::edge_sidecar_dir(state);
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
     let active_is_collected = manifest
         .workspaces
@@ -5322,7 +5323,7 @@ fn activate_desired_loop(
             return Ok(());
         }
         if desired_state == GenerationState::Active {
-            let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+            let edges_dir = super::edge_sidecar_dir(state);
             let expected_snapshot = bbox_edge_sidecar::snapshot::collected_snapshot_id(
                 project_id,
                 &desired_generation_id,
@@ -5362,7 +5363,7 @@ fn activate_desired_loop(
             continue;
         }
         if desired_state == GenerationState::StagingIndex {
-            let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+            let edges_dir = super::edge_sidecar_dir(state);
             let active_entry = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?
                 .workspaces
                 .get(project_id)
@@ -5619,7 +5620,7 @@ fn activate_desired_loop(
             return Ok(());
         }
 
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+        let edges_dir = super::edge_sidecar_dir(state);
         let previous_manifest =
             bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
         let previous_entry = previous_manifest.workspaces.get(project_id).cloned();
@@ -6113,7 +6114,7 @@ fn run_selector_retirement(
     record: &RetirementRecord,
     collision: Option<(&ProjectId, &String, &PublishedScope)>,
 ) -> RetirementAttempt {
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = super::edge_sidecar_dir(state);
     match retirement_record_is_active(&edges_dir, record) {
         Ok(true) => return RetirementAttempt::DeferredActive,
         Ok(false) => {}
@@ -7458,7 +7459,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&restarted.store_dir);
+        let edges_dir = crate::server::edge_sidecar_dir(&restarted);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
         assert_eq!(
             manifest
@@ -7602,7 +7603,7 @@ mod tests {
         );
         // The activation transaction stages no Git member at all now; the
         // overlay owns that file and never got to write it.
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+        let edges_dir = crate::server::edge_sidecar_dir(&state);
         let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(
             &project.project_id,
             &ready.generation_id,
@@ -10404,7 +10405,7 @@ mod tests {
             vec![],
         );
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
+            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
         )
         .unwrap();
         // No activation records in the store: chain must pass.
@@ -10472,7 +10473,7 @@ mod tests {
         // Catalog has a DIFFERENT scope than the activation.
         let snapshot = p4f_catalog_snapshot(project_id, catalog_scope, vec![]);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
+            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
         )
         .unwrap();
 
@@ -10521,7 +10522,7 @@ mod tests {
         // Manifest is fresh/empty: no workspace entry for the project.
         // This is the migrated-root shape: chain must PASS.
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
+            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
         )
         .unwrap();
 
@@ -10556,7 +10557,8 @@ mod tests {
             false,
         );
         let catalog = p4f_catalog_snapshot(project_id, scope.clone(), vec![]);
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&root.join("bro"));
+        let edges_dir =
+            crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json"));
         let initial = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
         validate_relationship_chain(&store, &catalog, &initial).unwrap();
 
@@ -10646,7 +10648,8 @@ mod tests {
     fn p4f_absent_local_materialization_remains_drift() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let edges_dir = crate::edge_index::edges_dir_from_bro_store(&root.join("bro"));
+        let edges_dir =
+            crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json"));
         let project_id = "p_000000000000000000000000000004f5";
         let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
         manifest.workspaces.insert(
@@ -10872,7 +10875,7 @@ mod tests {
         // pending-first-republish so the chain reaches link 6.
         let snapshot = p4f_catalog_snapshot(project_id, scope, vec![]);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(
-            &crate::edge_index::edges_dir_from_bro_store(&root.join("bro")),
+            &crate::edge_index::edges_dir_from_projects_path(&root.join("projects.json")),
         )
         .unwrap();
 

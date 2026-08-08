@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use crate::artifacts;
 use crate::config;
-use crate::edge_index;
 use crate::index;
 use crate::mcp_tools;
 use crate::orchestration;
@@ -498,7 +497,7 @@ impl BlackboxServer {
                 }
                 Err(error) => return Err(error),
             }
-            let edges_dir = edge_index::edges_dir_from_bro_store(&server.state.store_dir);
+            let edges_dir = crate::server::edge_sidecar_dir(&server.state);
             let provenance_lease =
                 match crate::server::checkout_access::acquire_selected_project_access(
                     &server.state.checkout_access,

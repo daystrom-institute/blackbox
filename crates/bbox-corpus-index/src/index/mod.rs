@@ -696,6 +696,90 @@ impl TranscriptIndex {
         }
     }
 
+    /// Resolve a legacy provenance `(relative_path, byte_range)` against one
+    /// caller-pinned code generation. No checkout path is consulted: both
+    /// the selector map and searcher come from the daemon's coherent
+    /// `CodeReadView`.
+    pub fn resolve_project_chunk_for_selector_with_searcher(
+        &self,
+        project_id: &str,
+        selector: &str,
+        relative_path: &str,
+        byte_range: Option<(u64, u64)>,
+        searcher: &tantivy::Searcher,
+    ) -> Result<Option<bbox_corpus_core::entity_ref::EntityRef>> {
+        use bbox_corpus_core::entity_ref::EntityRef;
+
+        bbox_code_source::validate_relative_path(relative_path).map_err(anyhow::Error::new)?;
+        if byte_range.is_some_and(|(start, end)| start > end) {
+            anyhow::bail!("invalid provenance byte range");
+        }
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.code_source_selector, selector),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.relative_path, relative_path),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        let count = searcher.search(&query, &Count)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        if count > 100_000 {
+            anyhow::bail!("one active project file exceeds the provenance resolution limit");
+        }
+        let mut candidates = Vec::with_capacity(count);
+        for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+            let document = searcher.doc::<TantivyDocument>(address)?;
+            let entity = document
+                .get_first(self.fields.entity_id)
+                .and_then(|value| match value {
+                    OwnedValue::Str(value) => Some(value.as_str()),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("active project-file document has no entity id"))
+                .and_then(|value| EntityRef::parse(value).map_err(anyhow::Error::new))?;
+            let occurrence_idx = match &entity {
+                EntityRef::ProjectFileV2 {
+                    project_id: target_project,
+                    occurrence_idx,
+                    ..
+                } if target_project == project_id => *occurrence_idx,
+                EntityRef::ProjectFileV2 { .. } => {
+                    anyhow::bail!("active selector contains a foreign project-file identity")
+                }
+                _ => anyhow::bail!("active selector contains a non-V2 project-file identity"),
+            };
+            let byte_start = document
+                .get_first(self.fields.byte_offset)
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("active project-file document has no byte start"))?;
+            let byte_end = document
+                .get_first(self.fields.byte_end)
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("active project-file document has no byte end"))?;
+            candidates.push((occurrence_idx, byte_start, byte_end, entity));
+        }
+        candidates.sort_by_key(|candidate| candidate.0);
+        let selected = byte_range
+            .and_then(|(start, _)| {
+                candidates
+                    .iter()
+                    .find(|(_, byte_start, byte_end, _)| *byte_start <= start && start <= *byte_end)
+            })
+            .or_else(|| candidates.first());
+        Ok(selected.map(|(_, _, _, entity)| entity.clone()))
+    }
+
     /// Get the reindex config for the background thread.
     pub fn reindex_config(&self) -> ReindexConfig {
         self.config.clone()
@@ -2330,6 +2414,67 @@ mod tests {
         assert_eq!(
             resolved.chunk_hash.as_deref(),
             Some(chunk.chunk_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn provenance_v1_resolver_uses_exact_selector_and_byte_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = TranscriptIndex::open_or_create_with_records(
+            &root.join("index"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let selector = "collected:project-one:generation-one";
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        for (occurrence, start, end, hash) in [
+            (0_u32, 0_u64, 9_u64, "a".repeat(64)),
+            (1_u32, 10_u64, 20_u64, "b".repeat(64)),
+        ] {
+            let mut document = TantivyDocument::default();
+            document.add_text(fields.code_source_selector, selector);
+            document.add_text(fields.relative_path, "src/lib.rs");
+            document.add_u64(fields.byte_offset, start);
+            document.add_u64(fields.byte_end, end);
+            document.add_text(
+                fields.entity_id,
+                format!("project_file_v2:project-one:snapshot:path:{hash}:{occurrence}"),
+            );
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+        let searcher = index.searcher();
+        let selected = index
+            .resolve_project_chunk_for_selector_with_searcher(
+                "project-one",
+                selector,
+                "src/lib.rs",
+                Some((12, 13)),
+                &searcher,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(selected.to_string().ends_with(":1"));
+        assert!(
+            index
+                .resolve_project_chunk_for_selector_with_searcher(
+                    "project-one",
+                    "collected:project-one:other",
+                    "src/lib.rs",
+                    Some((12, 13)),
+                    &searcher,
+                )
+                .unwrap()
+                .is_none()
         );
     }
 }

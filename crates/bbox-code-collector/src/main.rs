@@ -17,12 +17,16 @@ use bbox_code_source::{
 use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
 use bbox_git_source::{
     BeginGitHistoryUploadRequestV1, BeginGitHistoryUploadResponseV1,
-    FinalizeGitHistoryUploadResponseV1, GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1,
-    GitHistoryDescriptorV1, GitHistoryManifestEntryV1, GitHistoryManifestPageV1,
-    GitHistoryProbeRequestV1, GitHistoryProbeResponseV1, GitHistorySourceStateV1,
-    GitHistorySourceStatusV1, GitObjectFormatV1, GitSourceLimits, MAX_HISTORY_RECORD_BYTES,
+    BeginProvenanceImportRequestV1, BeginProvenanceImportResponseV1,
+    FinalizeGitHistoryUploadResponseV1, FinalizeProvenanceImportResponseV1,
+    GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1, GitHistoryDescriptorV1,
+    GitHistoryManifestEntryV1, GitHistoryManifestPageV1, GitHistoryProbeRequestV1,
+    GitHistoryProbeResponseV1, GitHistorySourceStateV1, GitHistorySourceStatusV1,
+    GitObjectFormatV1, GitSourceLimits, MAX_HISTORY_RECORD_BYTES, MAX_PROVENANCE_DOCUMENT_BYTES,
     ProvenanceExportPageResponseV1, ProvenanceExportPullRequestV1, ProvenanceExportReceiptV1,
-    SCHEMA_VERSION as GIT_SOURCE_SCHEMA_VERSION, encode_history_fragment, history_manifest_sha256,
+    ProvenanceImportDescriptorV1, ProvenanceImportManifestEntryV1, ProvenanceImportManifestPageV1,
+    ProvenanceImportStateV1, ProvenanceImportStatusV1, SCHEMA_VERSION as GIT_SOURCE_SCHEMA_VERSION,
+    encode_history_fragment, history_manifest_sha256, provenance_manifest_sha256,
 };
 use bro_rpc::ServiceToken;
 use clap::{Parser, Subcommand};
@@ -109,6 +113,12 @@ struct CapturedGitHistory {
     records: tempfile::TempDir,
 }
 
+struct CapturedProvenanceImport {
+    descriptor: ProvenanceImportDescriptorV1,
+    entries: Vec<ProvenanceImportManifestEntryV1>,
+    documents: tempfile::TempDir,
+}
+
 fn default_interval_secs() -> u64 {
     120
 }
@@ -183,7 +193,7 @@ async fn run_provenance_lane(runtime: &Runtime, config: &CollectorConfig) {
         match publish_provenance_projects(runtime, config).await {
             Ok(()) => backoff = interval,
             Err(error) => {
-                tracing::error!(error = %error, "provenance export failed");
+                tracing::error!(error = %error, "provenance synchronization failed");
                 backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
             }
         }
@@ -253,12 +263,21 @@ const MAX_PROVENANCE_PAGE_RESPONSE_BYTES: usize = 128 * 1024;
 
 async fn publish_provenance_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
     for project in config.projects.iter().filter(|project| project.provenance) {
-        publish_project_provenance(runtime, project).await?;
+        publish_project_provenance(
+            runtime,
+            project,
+            Duration::from_secs(config.status_timeout_secs),
+        )
+        .await?;
     }
     Ok(())
 }
 
-async fn publish_project_provenance(runtime: &Runtime, project: &ProjectConfig) -> Result<()> {
+async fn publish_project_provenance(
+    runtime: &Runtime,
+    project: &ProjectConfig,
+    status_timeout: Duration,
+) -> Result<()> {
     let root = project.root.canonicalize().with_context(|| {
         format!(
             "canonicalizing provenance project root {}",
@@ -272,9 +291,13 @@ async fn publish_project_provenance(runtime: &Runtime, project: &ProjectConfig) 
     if committed_scope != project.scope {
         bail!("configured provenance scope does not match committed project identity");
     }
+    let mut resolved_project_id = None;
     for restart in 0..=MAX_PROVENANCE_STALE_RESTARTS {
         match publish_project_provenance_attempt(runtime, &root, &project.scope).await {
-            Ok(()) => return Ok(()),
+            Ok(project_id) => {
+                resolved_project_id = Some(project_id);
+                break;
+            }
             Err(error)
                 if has_remote_error_code(&error, "provenance_export_stale_generation")
                     && restart < MAX_PROVENANCE_STALE_RESTARTS =>
@@ -287,14 +310,16 @@ async fn publish_project_provenance(runtime: &Runtime, project: &ProjectConfig) 
             Err(error) => return Err(error),
         }
     }
-    unreachable!("bounded provenance restart loop always returns")
+    let project_id = resolved_project_id.context("provenance export did not converge")?;
+    let captured = capture_provenance_import(&root, &project.scope, &project_id)?;
+    publish_provenance_import(runtime, captured, status_timeout).await
 }
 
 async fn publish_project_provenance_attempt(
     runtime: &Runtime,
     root: &Path,
     scope: &PublishedScope,
-) -> Result<()> {
+) -> Result<String> {
     let mut cursor = None;
     let mut generation = None;
     let mut project_id = None;
@@ -431,7 +456,7 @@ async fn publish_project_provenance_attempt(
         unchanged = receipt.unchanged,
         "provenance export reached durable terminal success"
     );
-    Ok(())
+    project_id.context("provenance export returned no project id")
 }
 
 fn require_stable_value<T: Clone + PartialEq>(
@@ -447,6 +472,278 @@ fn require_stable_value<T: Clone + PartialEq>(
             Ok(())
         }
     }
+}
+
+fn capture_provenance_import(
+    root: &Path,
+    scope: &PublishedScope,
+    project_id: &str,
+) -> Result<CapturedProvenanceImport> {
+    let authority = bbox_corpus_core::json_store::NofollowDirectory::open_existing(root)?
+        .ok_or_else(|| anyhow!("provenance project root disappeared"))?;
+    let repository = bbox_corpus_core::git::open_stable_git_repository(&authority)?
+        .ok_or_else(|| anyhow!("provenance project has no stable Git repository"))?;
+    let notes_ref = bbox_corpus_core::git::notes_ref("provenance")?;
+    let limits = GitSourceLimits::default();
+    let documents = tempfile::tempdir()?;
+    let mut entries = Vec::new();
+    let mut logical_bytes = 0_u64;
+    let notes_tip = repository
+        .visit_notes_generation_bounded(
+            &notes_ref,
+            usize::try_from(limits.max_provenance_documents).unwrap_or(usize::MAX),
+            usize::try_from(limits.max_provenance_logical_bytes).unwrap_or(usize::MAX),
+            |note| {
+                let body = std::str::from_utf8(&note.bytes)
+                    .context("provenance note blob is not UTF-8")?;
+                for (ordinal, document) in bbox_provenance::split_note_documents(body)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if !provenance_document_belongs_to_project(document, project_id)? {
+                        continue;
+                    }
+                    let document = document.as_bytes();
+                    if document.len() as u64 > MAX_PROVENANCE_DOCUMENT_BYTES {
+                        bail!("provenance note document exceeds the transport limit");
+                    }
+                    let hash = hex::encode(Sha256::digest(document));
+                    let path = documents.path().join(&hash);
+                    if path.exists() {
+                        if fs::read(&path)? != document {
+                            bail!("captured provenance document hash collision");
+                        }
+                    } else {
+                        fs::write(&path, document)?;
+                    }
+                    logical_bytes = logical_bytes
+                        .checked_add(document.len() as u64)
+                        .ok_or_else(|| anyhow!("provenance import size overflow"))?;
+                    entries.push(ProvenanceImportManifestEntryV1 {
+                        note_commit: note.target_oid.clone(),
+                        document_ordinal: u32::try_from(ordinal)
+                            .map_err(|_| anyhow!("one provenance note has too many documents"))?,
+                        encoded_bytes: document.len() as u64,
+                        document_sha256: hash,
+                    });
+                }
+                Ok(())
+            },
+        )?
+        .unwrap_or_default();
+    if entries.len() as u64 > limits.max_provenance_documents
+        || logical_bytes > limits.max_provenance_logical_bytes
+    {
+        bail!("captured provenance import exceeds an enforced limit");
+    }
+    let descriptor = ProvenanceImportDescriptorV1 {
+        schema_version: GIT_SOURCE_SCHEMA_VERSION,
+        scope: scope.clone(),
+        notes_ref,
+        notes_tip,
+        manifest_sha256: provenance_manifest_sha256(&entries),
+        document_count: entries.len() as u64,
+        logical_bytes,
+    };
+    descriptor.validate_header(limits)?;
+    Ok(CapturedProvenanceImport {
+        descriptor,
+        entries,
+        documents,
+    })
+}
+
+fn provenance_document_belongs_to_project(document: &str, project_id: &str) -> Result<bool> {
+    let Ok(note) = bbox_provenance::parse_note_document(document) else {
+        // Preserve malformed local evidence for the authenticated server-side
+        // verifier to quarantine with a durable diagnostic.
+        return Ok(true);
+    };
+    if note.schema_version < bbox_provenance::SCHEMA_VERSION_V2 {
+        return Ok(true);
+    }
+    let mut owns_target = false;
+    let mut foreign_target = false;
+    for call in &note.tool_calls {
+        let Some(raw) = call.target_ref.as_deref() else {
+            continue;
+        };
+        let Ok(target) = bbox_corpus_core::entity_ref::EntityRef::parse(raw) else {
+            continue;
+        };
+        let target_project = match target {
+            bbox_corpus_core::entity_ref::EntityRef::ProjectFile { project_id, .. }
+            | bbox_corpus_core::entity_ref::EntityRef::ProjectFileV2 { project_id, .. } => {
+                project_id
+            }
+            _ => continue,
+        };
+        if target_project == project_id {
+            owns_target = true;
+        } else {
+            foreign_target = true;
+        }
+    }
+    if owns_target && foreign_target {
+        bail!("one provenance document mixes target projects");
+    }
+    Ok(!foreign_target)
+}
+
+async fn publish_provenance_import(
+    runtime: &Runtime,
+    captured: CapturedProvenanceImport,
+    status_timeout: Duration,
+) -> Result<()> {
+    let begin: BeginProvenanceImportResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/provenance/imports")?,
+            )
+            .json(&BeginProvenanceImportRequestV1 {
+                descriptor: captured.descriptor.clone(),
+            }),
+    )
+    .await?;
+    let pages = pack_provenance_manifest_pages(
+        &captured.entries,
+        begin
+            .max_page_entries
+            .min(bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_ENTRIES),
+        begin
+            .max_page_bytes
+            .min(bbox_git_source::MAX_PROVENANCE_MANIFEST_PAGE_BYTES),
+    )?;
+    for (page, page_body) in pages.into_iter().enumerate() {
+        let url = runtime.endpoint(&format!(
+            "internal/code-source/v1/provenance/imports/{}/manifest/{page}",
+            begin.upload_id
+        ))?;
+        send_empty(runtime.request(reqwest::Method::PUT, url).json(&page_body)).await?;
+    }
+    let complete_url = runtime.endpoint(&format!(
+        "internal/code-source/v1/provenance/imports/{}/manifest/complete",
+        begin.upload_id
+    ))?;
+    let mut missing: bbox_git_source::MissingProvenanceDocumentsPageV1 =
+        send_json(runtime.request(reqwest::Method::POST, complete_url)).await?;
+    let entries_by_hash = captured
+        .entries
+        .iter()
+        .map(|entry| (entry.document_sha256.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    loop {
+        for hash in &missing.hashes {
+            let entry = entries_by_hash
+                .get(hash.as_str())
+                .copied()
+                .ok_or_else(|| anyhow!("server requested an unknown provenance document"))?;
+            let bytes = fs::read(captured.documents.path().join(hash))?;
+            if bytes.len() as u64 != entry.encoded_bytes
+                || hex::encode(Sha256::digest(&bytes)) != entry.document_sha256
+            {
+                bail!("captured provenance document changed before upload");
+            }
+            let url = runtime.endpoint(&format!(
+                "internal/code-source/v1/provenance/imports/{}/documents/{hash}",
+                begin.upload_id
+            ))?;
+            send_empty(
+                runtime
+                    .request(reqwest::Method::PUT, url)
+                    .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                    .body(bytes),
+            )
+            .await?;
+        }
+        let Some(cursor) = missing.next_cursor.as_deref() else {
+            break;
+        };
+        let mut url = runtime.endpoint(&format!(
+            "internal/code-source/v1/provenance/imports/{}/missing",
+            begin.upload_id
+        ))?;
+        url.query_pairs_mut().append_pair("cursor", cursor);
+        missing = send_json(runtime.request(reqwest::Method::GET, url)).await?;
+    }
+    let finalize_url = runtime.endpoint(&format!(
+        "internal/code-source/v1/provenance/imports/{}/finalize",
+        begin.upload_id
+    ))?;
+    let finalized: FinalizeProvenanceImportResponseV1 =
+        send_json(runtime.request(reqwest::Method::POST, finalize_url)).await?;
+    let status_url = runtime.endpoint(finalized.status_url.trim_start_matches('/'))?;
+    with_status_timeout(status_timeout, async {
+        loop {
+            let status: ProvenanceImportStatusV1 =
+                send_json(runtime.request(reqwest::Method::GET, status_url.clone())).await?;
+            match status.state {
+                ProvenanceImportStateV1::Active | ProvenanceImportStateV1::Superseded => {
+                    tracing::info!(
+                        import_generation = %status.import_generation_id,
+                        documents = status.document_count,
+                        bytes = status.logical_bytes,
+                        edges = status.edges_imported,
+                        "provenance import reached durable terminal success"
+                    );
+                    return Ok(());
+                }
+                ProvenanceImportStateV1::Quarantined => {
+                    bail!(
+                        "provenance import {} was quarantined: {}",
+                        status.import_generation_id,
+                        status.diagnostic.as_deref().unwrap_or("no diagnostic")
+                    );
+                }
+                _ => tokio::time::sleep(Duration::from_secs(1)).await,
+            }
+        }
+    })
+    .await
+}
+
+fn pack_provenance_manifest_pages(
+    entries: &[ProvenanceImportManifestEntryV1],
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<Vec<ProvenanceImportManifestPageV1>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if max_entries == 0 || max_bytes == 0 {
+        bail!("server returned invalid provenance manifest page limits");
+    }
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    for entry in entries {
+        let mut candidate = current.clone();
+        candidate.push(entry.clone());
+        let candidate_page = ProvenanceImportManifestPageV1 { entries: candidate };
+        if candidate_page.entries.len() > max_entries
+            || serde_json::to_vec(&candidate_page)?.len() > max_bytes
+        {
+            if current.is_empty() {
+                bail!("one provenance manifest entry exceeds the server page limit");
+            }
+            pages.push(ProvenanceImportManifestPageV1 { entries: current });
+            current = vec![entry.clone()];
+            if serde_json::to_vec(&ProvenanceImportManifestPageV1 {
+                entries: current.clone(),
+            })?
+            .len()
+                > max_bytes
+            {
+                bail!("one provenance manifest entry exceeds the server page limit");
+            }
+        } else {
+            current = candidate_page.entries;
+        }
+    }
+    if !current.is_empty() {
+        pages.push(ProvenanceImportManifestPageV1 { entries: current });
+    }
+    Ok(pages)
 }
 
 async fn publish_code_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
@@ -1840,6 +2137,20 @@ mod tests {
         // and still produce a valid terminal receipt.
         let first = bbox_provenance::apply_export_page(&root, &page).unwrap();
         assert_eq!(first.written, 1);
+        let captured = capture_provenance_import(&root, &scope, "project").unwrap();
+        assert_eq!(captured.entries.len(), 1);
+        assert_eq!(captured.entries[0].note_commit, head);
+        assert!(!captured.descriptor.notes_tip.is_empty());
+        assert_eq!(
+            fs::read_to_string(
+                captured
+                    .documents
+                    .path()
+                    .join(&captured.entries[0].document_sha256)
+            )
+            .unwrap(),
+            plan.documents[0].document
+        );
         let response = ProvenanceExportPageResponseV1 {
             schema_version: GIT_SOURCE_SCHEMA_VERSION,
             page,
@@ -1893,6 +2204,47 @@ mod tests {
     }
 
     #[test]
+    fn v2_provenance_capture_filters_foreign_projects_and_refuses_mixed_documents() {
+        let document = |targets: &[&str]| {
+            serde_json::json!({
+                "schema_version": 2,
+                "commit": "1".repeat(40),
+                "part": {
+                    "document_id": "d".repeat(64),
+                    "part_index": 0,
+                    "part_count": 1
+                },
+                "produced_by": {},
+                "tool_calls": targets.iter().map(|project_id| serde_json::json!({
+                    "tool": "Read",
+                    "source_ref": "transcript:test:session:1:0",
+                    "target_ref": format!(
+                        "project_file_v2:{project_id}:snapshot:path:{}:0",
+                        "a".repeat(64)
+                    ),
+                    "file": "src/lib.rs"
+                })).collect::<Vec<_>>(),
+                "knowledge_writes": []
+            })
+            .to_string()
+        };
+        assert!(
+            provenance_document_belongs_to_project(&document(&["project-a"]), "project-a").unwrap()
+        );
+        assert!(
+            !provenance_document_belongs_to_project(&document(&["project-b"]), "project-a")
+                .unwrap()
+        );
+        assert!(
+            provenance_document_belongs_to_project(
+                &document(&["project-a", "project-b"]),
+                "project-a"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn manifest_pages_obey_entry_and_encoded_byte_limits() {
         let entries = (0..3)
             .map(|index| ManifestEntry {
@@ -1916,6 +2268,29 @@ mod tests {
         );
         assert!(pack_manifest_pages(&entries, 0, one_entry_bytes).is_err());
         assert!(pack_manifest_pages(&entries[..1], 1, one_entry_bytes - 1).is_err());
+
+        let provenance_entries = (0..3)
+            .map(|index| ProvenanceImportManifestEntryV1 {
+                note_commit: format!("{index}").repeat(40),
+                document_ordinal: 0,
+                encoded_bytes: 1,
+                document_sha256: format!("{index}").repeat(64),
+            })
+            .collect::<Vec<_>>();
+        let one_provenance_entry_bytes = serde_json::to_vec(&ProvenanceImportManifestPageV1 {
+            entries: vec![provenance_entries[0].clone()],
+        })
+        .unwrap()
+        .len();
+        let pages =
+            pack_provenance_manifest_pages(&provenance_entries, 2, one_provenance_entry_bytes)
+                .unwrap();
+        assert_eq!(pages.len(), 3);
+        assert!(
+            pages
+                .iter()
+                .all(|page| serde_json::to_vec(page).unwrap().len() <= one_provenance_entry_bytes)
+        );
     }
 
     #[cfg(unix)]
