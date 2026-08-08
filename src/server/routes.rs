@@ -2193,7 +2193,14 @@ fn capture_edge_rebuild_authority(
     edges_dir: &std::path::Path,
     registered_project_ids: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<EdgeRebuildAuthority> {
-    let manifest = edge_index::SidecarManifestAuthority::capture(edges_dir)?;
+    let mut manifest = edge_index::SidecarManifestAuthority::capture(edges_dir)?;
+    // `updated_at` is operational metadata, not loader authority. Reindex can
+    // refresh it while leaving every selected path and selector unchanged;
+    // including it in the before/after equality made a semantic no-op look
+    // like an input mutation.
+    if let edge_index::SidecarManifestAuthority::Manifest(index) = &mut manifest {
+        index.updated_at = None;
+    }
     let mut sig = EdgeSidecarSignature {
         files: 0,
         bytes: 0,
@@ -2244,14 +2251,23 @@ fn capture_edge_rebuild_authority(
             }
         }
     }
-    // Fold in the manifest-index, which records *which* snapshot/overlay is
-    // active per workspace. A branch switch can change only this authority
-    // file while every already-materialized JSONL member keeps its metadata.
-    fold_sidecar_path(
-        &mut sig,
-        &mut seen,
-        &crate::manifest::manifest_index_path(edges_dir),
-    );
+    // Fold the semantic manifest authority, not manifest-index.json's inode
+    // and mtime. The reindexer can rewrite a byte-equivalent authority file;
+    // file metadata is not a graph input and must not launch a 1+ GiB parse.
+    // Active-pointer and selector changes remain visible through the stable
+    // serialized authority, even when already-materialized JSONL metadata is
+    // unchanged (for example, a branch switch back to a retained snapshot).
+    let mut manifest_hasher = std::collections::hash_map::DefaultHasher::new();
+    match &manifest {
+        edge_index::SidecarManifestAuthority::Manifest(index) => {
+            std::hash::Hash::hash(&1_u8, &mut manifest_hasher);
+            std::hash::Hash::hash(&serde_json::to_vec(index)?, &mut manifest_hasher);
+        }
+        edge_index::SidecarManifestAuthority::LegacyMissing => {
+            std::hash::Hash::hash(&0_u8, &mut manifest_hasher);
+        }
+    }
+    sig.path_identity ^= std::hash::Hasher::finish(&manifest_hasher);
     Ok(EdgeRebuildAuthority {
         manifest,
         signature: sig,
@@ -3814,6 +3830,34 @@ mod tests {
         assert_ne!(
             sig1, sig2,
             "active-pointer change must change the signature even with no .jsonl change"
+        );
+    }
+
+    #[test]
+    fn edge_sidecar_signature_ignores_manifest_timestamp_only_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let base = edge_sidecar_signature(edges_dir).unwrap();
+
+        let mut index = bbox_edge_sidecar::manifest::ManifestIndex::load(edges_dir).unwrap();
+        index.updated_at = Some("timestamp-only-rewrite".into());
+        index.write_atomic(edges_dir).unwrap();
+
+        assert_eq!(
+            base,
+            edge_sidecar_signature(edges_dir).unwrap(),
+            "volatile manifest timestamps are not graph inputs"
         );
     }
 

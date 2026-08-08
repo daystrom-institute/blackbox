@@ -363,6 +363,9 @@ impl ManifestIndex {
     }
 
     pub fn upsert_workspace(&mut self, project_id: &str, entry: WorkspaceIndexEntry) {
+        if self.workspaces.get(project_id) == Some(&entry) {
+            return;
+        }
         self.updated_at = Some(chrono_now_rfc3339());
         self.workspaces.insert(project_id.to_string(), entry);
     }
@@ -800,6 +803,18 @@ fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Res
     let bytes = serde_json::to_vec_pretty(index)?;
     if bytes.len() > MAX_MANIFEST_INDEX_BYTES {
         anyhow::bail!("manifest-index exceeds its byte limit");
+    }
+    // Reindex passes may rediscover exactly the authority already published.
+    // Replacing the file anyway changes its inode/mtime, which used to make
+    // the edge watcher treat a no-op pass as a new multi-GB graph input.
+    // A concurrent writer that lands after this read is also safe: returning
+    // preserves its newer publication instead of replacing it with ours.
+    if read_manifest_index_confined(edges_dir)
+        .ok()
+        .as_deref()
+        .is_some_and(|existing| existing == bytes.as_slice())
+    {
+        return Ok(());
     }
     let dir = open_materialized_dir(edges_dir, true)?;
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1364,6 +1379,13 @@ fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Res
     if bytes.len() > MAX_MANIFEST_INDEX_BYTES {
         anyhow::bail!("manifest-index exceeds its byte limit");
     }
+    if read_manifest_index_confined(edges_dir)
+        .ok()
+        .as_deref()
+        .is_some_and(|existing| existing == bytes.as_slice())
+    {
+        return Ok(());
+    }
     let temp = dir.join(format!(".manifest-index.{}.tmp", std::process::id()));
     fs::write(&temp, bytes)?;
     fs::rename(temp, manifest_index_path(edges_dir))?;
@@ -1540,6 +1562,44 @@ mod tests {
             result.unwrap_err(),
             ManifestFallbackReason::MissingNotMigrated
         );
+    }
+
+    #[test]
+    fn identical_workspace_upsert_preserves_manifest_timestamp() {
+        let entry = WorkspaceIndexEntry {
+            manifest: "workspace/proj1234/manifest.json".into(),
+            active_snapshot: Some("workspace/proj1234/snapshots/head-abc".into()),
+            dirty_overlay: None,
+            repo_materialization: None,
+            code_source_selector: None,
+            code_source_generation: None,
+            git_overlay: None,
+            git_overlay_managed: false,
+        };
+        let mut index = ManifestIndex::new();
+        index.upsert_workspace("proj1234", entry.clone());
+        index.updated_at = Some("stable-timestamp".into());
+
+        index.upsert_workspace("proj1234", entry);
+
+        assert_eq!(index.updated_at.as_deref(), Some("stable-timestamp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_manifest_index_write_preserves_file_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = ManifestIndex::new();
+        index.write_atomic(dir.path()).unwrap();
+        let before = std::fs::metadata(manifest_index_path(dir.path())).unwrap();
+
+        index.write_atomic(dir.path()).unwrap();
+        let after = std::fs::metadata(manifest_index_path(dir.path())).unwrap();
+
+        assert_eq!(before.dev(), after.dev());
+        assert_eq!(before.ino(), after.ino());
     }
 
     #[test]
