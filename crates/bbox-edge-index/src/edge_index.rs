@@ -2404,6 +2404,25 @@ mod tests {
     }
 
     #[test]
+    fn plan_tool_only_legacy_lane_is_extractable_with_managed_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        append_edges(dir.path(), "p1", &[observed_tool_edge("READ_FILE")]).unwrap();
+        replace_materialized_edges(
+            dir.path(),
+            "project",
+            "p1",
+            &[derived_chunker_edge("NEXT_SECTION")],
+        )
+        .unwrap();
+
+        let plan = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
+        assert_eq!(plan.derived_lines, 0);
+        assert_eq!(plan.tool_lines, 1);
+        assert!(plan.managed_replacement_exists);
+        assert!(plan.extractable);
+    }
+
+    #[test]
     fn repeated_materialized_replace_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let edge = derived_chunker_edge("CALLS");

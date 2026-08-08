@@ -2010,7 +2010,7 @@ pub fn plan_legacy_edge_extraction(
         }
     }
 
-    plan.extractable = plan.managed_replacement_exists && plan.derived_lines > 0;
+    plan.extractable = plan.managed_replacement_exists && plan.total_lines > plan.blank_lines;
     Ok(plan)
 }
 
