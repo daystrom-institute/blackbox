@@ -19,6 +19,8 @@ use bbox_corpus_core::code_project_identity::CodeProjectIdentity;
 use bbox_corpus_core::entity_ref::{self, EntityRef};
 use bbox_corpus_core::project_record::ProjectRecord;
 
+const MAX_ACTIVE_HISTORY_CHUNK_TARGETS: usize = 2_000_000;
+
 /// Version-1 project-file document fields that [`CodeProjectIdentity`]
 /// deliberately does not carry, resolved by the caller from the attached
 /// `ProjectRecord` when one exists (Phase 3 plan section 6 items 1 and 5).
@@ -573,6 +575,78 @@ pub fn collected_materialization_selector(project_id: &str, generation_id: &str)
         bbox_code_source::source_selector(project_id, generation_id),
         hex::encode(&hasher.finalize()[..8])
     )
+}
+
+/// Reconstruct the first-chunk target for every file in one already-active
+/// code generation.
+///
+/// Producer history can arrive long after code activation, when the staging
+/// result that originally carried this map is gone. The lexical generation is
+/// the durable authority at that point; querying by its exact selector and
+/// requiring the expected V2 `(project, snapshot)` identity prevents a stale
+/// or foreign generation from feeding overlay edges.
+pub fn current_chunk_targets_for_active_selector(
+    searcher: &tantivy::Searcher,
+    f: FieldHandles,
+    project_id: &str,
+    snapshot_id: &str,
+    selector: &str,
+) -> Result<HashMap<String, EntityRef>> {
+    let query = TermQuery::new(
+        Term::from_field_text(f.code_source_selector, selector),
+        IndexRecordOption::Basic,
+    );
+    let count = searcher.search(&query, &Count)?;
+    if count == 0 {
+        return Ok(HashMap::new());
+    }
+    if count > MAX_ACTIVE_HISTORY_CHUNK_TARGETS {
+        anyhow::bail!("active code source chunk targets exceed the staging safety limit");
+    }
+    let mut targets: HashMap<String, (u32, EntityRef)> = HashMap::new();
+    for (_score, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+        let document = searcher.doc::<TantivyDocument>(address)?;
+        let Some(relative_path) =
+            document
+                .get_first(f.relative_path)
+                .and_then(|value| match value {
+                    tantivy::schema::OwnedValue::Str(value) => Some(value.clone()),
+                    _ => None,
+                })
+        else {
+            continue;
+        };
+        let entity = document
+            .get_first(f.entity_id)
+            .and_then(|value| match value {
+                tantivy::schema::OwnedValue::Str(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("active project-file document has no entity id"))
+            .and_then(|value| EntityRef::parse(value).map_err(anyhow::Error::new))?;
+        let occurrence_idx = match &entity {
+            EntityRef::ProjectFileV2 {
+                project_id: entity_project,
+                snapshot_id: entity_snapshot,
+                occurrence_idx,
+                ..
+            } if entity_project == project_id && entity_snapshot == snapshot_id => *occurrence_idx,
+            EntityRef::ProjectFileV2 { .. } => {
+                anyhow::bail!("active selector contains a foreign project-file identity")
+            }
+            _ => anyhow::bail!("active selector contains a non-V2 project-file identity"),
+        };
+        let replace = targets
+            .get(&relative_path)
+            .is_none_or(|(current, _)| occurrence_idx < *current);
+        if replace {
+            targets.insert(relative_path, (occurrence_idx, entity));
+        }
+    }
+    Ok(targets
+        .into_iter()
+        .map(|(path, (_, entity))| (path, entity))
+        .collect())
 }
 
 pub fn local_activation_marker(project_id: &str) -> String {

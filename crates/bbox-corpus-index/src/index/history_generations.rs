@@ -788,6 +788,31 @@ pub struct HistoryGenerationStore {
     io: Arc<dyn HistoryGenerationIo>,
 }
 
+/// Deterministic, fully validated generation body before its durable commit
+/// point is published.
+///
+/// The id is already final here. Transaction orchestrators may therefore bind
+/// it into a `Prepared` journal before calling [`HistoryGenerationStore::publish`].
+/// Construction remains singular: [`HistoryGenerationStore::prepare`] owns
+/// sorting, canonical encoding, commitments, and id derivation, while
+/// `publish` merely installs and verifies those exact prepared bytes.
+#[derive(Debug)]
+pub struct PreparedHistoryGenerationV1 {
+    record: HistoryGenerationRecordV1,
+    document_bytes: Vec<u8>,
+    input_bytes: Vec<u8>,
+}
+
+impl PreparedHistoryGenerationV1 {
+    pub fn record(&self) -> &HistoryGenerationRecordV1 {
+        &self.record
+    }
+
+    pub fn generation_id(&self) -> &HistoryGenerationIdV1 {
+        &self.record.id
+    }
+}
+
 impl HistoryGenerationStore {
     /// Open (creating on demand) the generations root sibling to `index_path`.
     pub fn open_for_index(index_path: &Path) -> HistoryGenerationResult<Self> {
@@ -834,6 +859,13 @@ impl HistoryGenerationStore {
         &self,
         input: HistoryGenerationInputV1,
     ) -> HistoryGenerationResult<HistoryGenerationRecordV1> {
+        self.publish(Self::prepare(input)?)
+    }
+
+    /// Derive and validate the exact future generation without writing it.
+    pub fn prepare(
+        input: HistoryGenerationInputV1,
+    ) -> HistoryGenerationResult<PreparedHistoryGenerationV1> {
         let mut commit_documents = input.commit_documents;
         commit_documents.sort_by(|left, right| {
             (
@@ -885,6 +917,26 @@ impl HistoryGenerationStore {
             vector_inputs,
         };
         record.validate()?;
+
+        Ok(PreparedHistoryGenerationV1 {
+            record,
+            document_bytes,
+            input_bytes,
+        })
+    }
+
+    /// Publish one value produced by [`Self::prepare`], then verify it from
+    /// disk. No caller can inject separately encoded rows through this seam.
+    pub fn publish(
+        &self,
+        prepared: PreparedHistoryGenerationV1,
+    ) -> HistoryGenerationResult<HistoryGenerationRecordV1> {
+        let PreparedHistoryGenerationV1 {
+            record,
+            document_bytes,
+            input_bytes,
+        } = prepared;
+        let id = record.id.clone();
 
         // The manifest file is the commit point. A crash after the two row
         // files but before the manifest leaves a directory that `load`

@@ -717,6 +717,18 @@ pub(super) fn open_shared_state(
         tracing::info!(?coverage, "rebuild coverage gate");
     }
 
+    // GH-C startup recovery: producer-backed Git overlays are not allowed
+    // into the first read view merely because their selector survived a
+    // crash. Re-prove the exact Tantivy generation and each durable snapshot
+    // receipt, clearing only invalid producer arms for background repair.
+    super::history_activation::recover_prebind(
+        &project_authority,
+        &code_sources,
+        &git_sources,
+        &idx,
+        &index_path,
+    )?;
+
     // Shared reindex trigger. Initialized `true` so the first background pass
     // runs once after startup and indexes repo-owned `.bbox/knowledge` that may
     // have changed while the daemon was down (no watcher event fires for those,
@@ -749,7 +761,12 @@ pub(super) fn open_shared_state(
         // Same boot snapshot, same rule: the startup view pins the durable
         // overlay selection so the first request after open joins commit-file
         // edges through exactly the overlays the manifest names.
-        git_overlays: super::state::read_git_overlays_for_view(&project_authority, &store_dir),
+        git_overlays: super::state::read_git_overlays_for_view(
+            &project_authority,
+            &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+                &idx.reindex_config().projects_path,
+            ),
+        ),
     };
     // Phase 3 plan section 10 item 4: the derived repo-history reference
     // manifest is rebuilt and checksummed from durable inputs at startup,

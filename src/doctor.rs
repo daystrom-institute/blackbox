@@ -740,6 +740,15 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                             "inspect daemon logs for the walk failure, then publish the checkout again to retry",
                         )
                     }
+                    bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE => {
+                        Finding::action(
+                            format!(
+                                "project `{}` typed repository-history activation has not converged: {}",
+                                record.project_id, record.diagnostic
+                            ),
+                            "repair the reported producer source, catalog grant, or publication receipt; the background activation lane retries automatically",
+                        )
+                    }
                     "git_history_unavailable" => Finding::warn(format!(
                         "project `{}` Git current-file overlay is unavailable: {}",
                         record.project_id, record.diagnostic
@@ -885,8 +894,8 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
 /// guessing.
 fn repo_history_findings(state: &crate::server::state::SharedState) -> Vec<Finding> {
     use bbox_indexing::index::history_health::{
-        HISTORY_REFRESH_FAILED_CODE, HistoryHealthInputsV1, HistoryHealthStateV1,
-        derive_history_health,
+        HISTORY_REFRESH_FAILED_CODE, HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE,
+        HistoryHealthInputsV1, HistoryHealthStateV1, derive_history_health,
     };
 
     let Some(catalog_store) = state.project_authority.catalog_store() else {
@@ -897,7 +906,9 @@ fn repo_history_findings(state: &crate::server::state::SharedState) -> Vec<Findi
             "the project catalog is unreadable, so repository-history health cannot be derived",
         )];
     };
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+        &state.idx.read().reindex_config().projects_path,
+    );
     let overlays =
         bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir).unwrap_or_default();
     let failed_refreshes = state
@@ -906,7 +917,12 @@ fn repo_history_findings(state: &crate::server::state::SharedState) -> Vec<Findi
         .health_records()
         .unwrap_or_default()
         .into_iter()
-        .filter(|record| record.code == HISTORY_REFRESH_FAILED_CODE)
+        .filter(|record| {
+            matches!(
+                record.code.as_str(),
+                HISTORY_REFRESH_FAILED_CODE | HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE
+            )
+        })
         .filter_map(|record| {
             // The durable record is per PROJECT; the health model is per
             // REPOSITORY. Map through the catalog rather than assuming the

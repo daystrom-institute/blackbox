@@ -38,6 +38,11 @@ pub const HISTORY_REFRESH_FAILED_CODE: &str = "history_refresh_failed";
 /// two made every remote-only project look degraded forever.
 pub const HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE: &str = "history_unavailable_no_attachment";
 
+/// Durable per-project projection of a typed producer activation that has not
+/// converged yet. Kept separate from checkout refresh failures so doctor does
+/// not prescribe restoring an attachment for a transport-owned fault.
+pub const HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE: &str = "history_transport_activation_failed";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HistoryHealthStateV1 {
     /// A validated attachment exists and the recorded cursor matches the
@@ -133,13 +138,44 @@ fn derive_one(
         member_project_ids: member_project_ids.clone(),
     };
 
-    // Checked first: a failed refresh is a fact about an attempt that already
-    // happened, so it outranks every state derived from current shape.
+    let ready_generation = catalog
+        .repo_histories
+        .get(&group.repo_history_id)
+        .and_then(|record| match &record.materialization {
+            RepoHistoryMaterialization::Ready { generation_id } => Some(generation_id.as_str()),
+            RepoHistoryMaterialization::NotBuilt => None,
+        });
+
+    // A failed refresh is a fact about an attempt that already happened, so
+    // it outranks every state derived from the currently selected shape.
     if inputs.failed_refreshes.contains(&repo_history_id) {
         return finish(
             HistoryHealthStateV1::FailedLastRefresh,
             "the last consolidated history refresh failed; commit documents \
              remain readable at the previously published generation"
+                .to_string(),
+        );
+    }
+
+    let producer_overlays = group
+        .members
+        .keys()
+        .filter_map(|project_id| inputs.overlays.get(project_id))
+        .filter(|overlay| overlay.source.producer_transport().is_some())
+        .collect::<Vec<_>>();
+    if let Some(first) = producer_overlays.first()
+        && ready_generation == Some(first.repo_history_generation.as_str())
+        && first.commit_namespace == commit_namespace
+        && producer_overlays.iter().all(|overlay| {
+            overlay.repo_history_generation == first.repo_history_generation
+                && overlay.repo_head == first.repo_head
+                && overlay.commit_namespace == first.commit_namespace
+                && overlay.source == first.source
+        })
+    {
+        return finish(
+            HistoryHealthStateV1::Current,
+            "the published generation and active project overlays are backed by one verified typed producer source"
                 .to_string(),
         );
     }
@@ -191,16 +227,7 @@ fn derive_one(
         _ => {}
     }
 
-    let materialized = catalog
-        .repo_histories
-        .get(&group.repo_history_id)
-        .is_some_and(|record| {
-            matches!(
-                record.materialization,
-                RepoHistoryMaterialization::Ready { .. }
-            )
-        });
-    if !materialized {
+    if ready_generation.is_none() {
         return finish(
             HistoryHealthStateV1::Lagging,
             "no history generation has been published for this repository yet; \
@@ -375,6 +402,31 @@ mod tests {
                 &HistoryHealthInputsV1::default()
             ),
             HistoryHealthStateV1::UnavailableNoAttachment
+        );
+
+        // current: a verified typed producer overlay is refresh authority and
+        // does not require any attachment to exist.
+        let inputs = HistoryHealthInputsV1 {
+            overlays: BTreeMap::from([(
+                project_id().as_str().to_string(),
+                GitOverlaySelector {
+                    project_id: project_id().as_str().to_string(),
+                    code_generation: "code-a".into(),
+                    repo_history_generation: format!("rhg_{}", "a".repeat(64)),
+                    source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::ProducerTransport {
+                        producer_id: "producer-a".into(),
+                        source_generation_id: format!("ghs_{}", "b".repeat(64)),
+                    },
+                    repo_head: "c".repeat(40),
+                    commit_namespace: "nsmono".into(),
+                    overlay_generation: 1,
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            state(&catalog_ready, &attachments(None), &inputs),
+            HistoryHealthStateV1::Current
         );
 
         // invalid-scope: the attachment proved a different repository.

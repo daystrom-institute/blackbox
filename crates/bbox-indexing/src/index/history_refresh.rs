@@ -238,7 +238,7 @@ pub fn refresh_repo_history_generation(
 /// outgoing index against a recorded materialization, where a disagreement
 /// means the two describe different content; here the disagreement IS the new
 /// content.
-fn advance_primary_materialization(
+pub fn advance_primary_materialization(
     store: &ProjectCatalogStore,
     expected_epoch: u64,
     repo_history_id: &RepoHistoryId,

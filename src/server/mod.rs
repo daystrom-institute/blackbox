@@ -11,6 +11,7 @@ pub mod dispatch;
 mod gap_view;
 pub(crate) mod git_source;
 pub mod handler;
+pub(crate) mod history_activation;
 pub mod instance_lock;
 mod knowledge_lifecycle;
 mod knowledge_merge_gate;

@@ -372,13 +372,12 @@ pub(crate) struct CodeReadView {
 /// commit-edge problem, which is the exact inversion P3-B's F5 fix removed.
 pub(crate) fn read_git_overlays_for_view(
     authority: &ProjectAuthority,
-    store_dir: &std::path::Path,
+    edges_dir: &std::path::Path,
 ) -> BTreeMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector> {
     if !matches!(authority, ProjectAuthority::Catalog { .. }) {
         return BTreeMap::new();
     }
-    let edges_dir = crate::edge_index::edges_dir_from_bro_store(store_dir);
-    match bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir) {
+    match bbox_edge_sidecar::snapshot::selected_git_overlays(edges_dir) {
         Ok(overlays) => overlays,
         Err(error) => {
             tracing::warn!(
@@ -1701,7 +1700,9 @@ mod code_read_view_tests {
                         project_id: "p_0000000000000000000000000000ep01".to_string(),
                         code_generation: "gen-ep01".to_string(),
                         repo_history_generation: format!("rhg_{}", "a".repeat(64)),
-                        attachment_id: "att_0000000000000000000000000000ep01".to_string(),
+                        source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::Attachment {
+                            attachment_id: "att_0000000000000000000000000000ep01".to_string(),
+                        },
                         repo_head: "b".repeat(40),
                         commit_namespace: "nsep01".to_string(),
                         overlay_generation: 7,

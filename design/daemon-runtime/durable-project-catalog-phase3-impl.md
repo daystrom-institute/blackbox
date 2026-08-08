@@ -928,8 +928,14 @@ Ownership: `bbox-corpus-index/git_history.rs`, `bbox-edge-sidecar`,
 `bbox-edge-index`, `src/server/code_source.rs`, catalog admin guards, doctor.
 
 1. `GitOverlaySelector { project_id, code_generation,
-   repo_history_generation, attachment_id, repo_head, commit_namespace,
-   overlay_generation }` in `bbox-corpus-core`; `CodeReadView.git_overlays`
+   repo_history_generation, source, repo_head, commit_namespace,
+   overlay_generation }` in `bbox-corpus-core`, where `source` is the closed
+   discriminant `Attachment { attachment_id } | ProducerTransport {
+   producer_id, source_generation_id }`; no producer arm fabricates an
+   attachment sentinel. The migration reader accepts the former flat
+   `attachment_id` shape only when no typed `source` is present, rejects
+   ambiguous both/neither input, and every new write emits the typed shape.
+   `CodeReadView.git_overlays`
    per section 4.5; the workspace manifest entry gains additive overlay
    fields (non-strict serde, cheap); `active_paths_for_loader` gates the
    `git-current.jsonl` member on the overlay selection; activating a new
@@ -950,13 +956,19 @@ Ownership: `bbox-corpus-index/git_history.rs`, `bbox-edge-sidecar`,
    cursor on the history record's runtime state. Bridge mode keeps
    per-project walks unchanged. `run_local_stage` converts to the overlay
    step here, completing the P3-B deferral.
-3. Live history refresh creates a superseding immutable generation
+3. Live history refresh and authenticated typed-producer refresh each create
+   a superseding immutable generation
    (generations are immutable; nothing appends in place) through the same
    content-addressed creation path as the materializer:
-   one shared creation path whose only callers are the materializer and the
-   live refresh, with no other code constructing generations (the governing
-   section 11 wording is amended to this formulation in the same commit as
-   this plan). `Ready` generation ids advance through transact; commit
+   one shared creation path whose only callers are the pre-replacement
+   materializer (also reused by the Phase 6 path-free rebuild), the P3-F live
+   checkout refresh, and the typed producer refresh, with no other code
+   constructing generations (the governing section 11 wording is amended to
+   this formulation in the same commit as the producer caller). The producer
+   caller lowers an immutable verified source to the same canonical rows,
+   prepares the exact future content-addressed id, records it in its monotonic
+   activation journal, and publishes only that prepared value. `Ready`
+   generation ids advance through transact; commit
    vectors enqueue once per repo, not per project. Amended per
    closing-review round 2: the refresh's constant source marker is
    provenance only (D-039 keeps evidence out of the id preimage, so the
@@ -1104,8 +1116,9 @@ The plan reviewer must reject this plan unless it proves:
   destructive replacement, the schema bump isolated to exactly one milestone
   that also wires the guarded replacement, and the overlay after the cut;
 - history and quarantine generations are constructed through exactly one
-  shared creation path whose only callers are the materializer and the P3-F
-  live refresh, the materializer's proofs bind to persisted Phase 1
+  shared creation path whose only callers are the pre-replacement materializer
+  (including the Phase 6 path-free rebuild), the P3-F live checkout refresh,
+  and the typed producer refresh, the materializer's proofs bind to persisted Phase 1
   commitments through the new immutable asset, and every refusal arm
   preserves the last-good lexical and vector views including on crash
   (prepared/committed manifest recovery, bridge spill-lane recovery);

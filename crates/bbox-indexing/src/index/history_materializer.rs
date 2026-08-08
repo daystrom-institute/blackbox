@@ -67,9 +67,9 @@ use bbox_corpus_index::index::history_generations::{
     HistoryGenerationError, HistoryGenerationIdV1, HistoryGenerationInputV1, HistoryGenerationIo,
     HistoryGenerationOwnerV1, HistoryGenerationRecordV1, HistoryGenerationStore,
     HistoryIndexScanV1, HistoryNamespaceCaptureV1, HistoryProofModeV1, HistoryScanLimitsV1,
-    RealHistoryGenerationIo, RepoHistoryRebuildDispositionV1, RepoHistoryRebuildManifestV1,
-    RepoHistoryRebuildNamespaceV1, RepoHistoryRebuildPreparedV1, RepoHistoryRebuildRecoveryV1,
-    scan_commit_documents,
+    PreparedHistoryGenerationV1, RealHistoryGenerationIo, RepoHistoryRebuildDispositionV1,
+    RepoHistoryRebuildManifestV1, RepoHistoryRebuildNamespaceV1, RepoHistoryRebuildPreparedV1,
+    RepoHistoryRebuildRecoveryV1, scan_commit_documents,
 };
 
 use crate::project_catalog_migration::{
@@ -414,8 +414,9 @@ pub fn materialize_history_generations_with_io(
 /// THE single creation path for repo-history generations.
 ///
 /// Governing section 11, as amended by Phase 3 plan section 10 item 3: the
-/// pre-replacement materializer and the live history refresh are its ONLY
-/// callers, and no other code constructs a generation. The rule exists
+/// pre-replacement materializer, live history refresh, and typed producer
+/// refresh are its ONLY callers, and no other code constructs a generation.
+/// The rule exists
 /// because generation identity is content-addressed: a third constructor
 /// that assembled the body slightly differently (a field defaulted, a
 /// truncation count derived by another rule, rows filtered by another
@@ -435,6 +436,25 @@ pub fn create_history_generation(
     input: HistoryGenerationInputV1,
 ) -> HistoryMaterializerResult<HistoryGenerationRecordV1> {
     Ok(store.create_or_open(input)?)
+}
+
+/// Prepare the exact future generation id before its durable commit point.
+///
+/// This exists for the typed producer activation journal. It is not another
+/// constructor: the opaque value comes from the same canonical preparation
+/// used by [`create_history_generation`] and can only be installed by the
+/// matching publish helper.
+pub fn prepare_history_generation(
+    input: HistoryGenerationInputV1,
+) -> HistoryMaterializerResult<PreparedHistoryGenerationV1> {
+    Ok(HistoryGenerationStore::prepare(input)?)
+}
+
+pub fn publish_prepared_history_generation(
+    store: &HistoryGenerationStore,
+    prepared: PreparedHistoryGenerationV1,
+) -> HistoryMaterializerResult<HistoryGenerationRecordV1> {
+    Ok(store.publish(prepared)?)
 }
 
 /// The proof this pass can run over its source index, with the evidence it

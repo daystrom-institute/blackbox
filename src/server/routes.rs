@@ -1999,7 +1999,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
             catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
             git_overlays: super::state::read_git_overlays_for_view(
                 &state.project_authority,
-                &state.store_dir,
+                &edges_dir,
             ),
         });
         Ok(())

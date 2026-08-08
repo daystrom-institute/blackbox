@@ -1681,7 +1681,9 @@ fn the_durable_overlay_map_roots_its_generation_and_clears_on_a_new_activation()
         project_id: fixture.published_project.as_str().to_string(),
         code_generation: runtime.generation_id.clone(),
         repo_history_generation: history_generation.clone(),
-        attachment_id: "att_00000000000000000000000000000e01".to_string(),
+        source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::Attachment {
+            attachment_id: "att_00000000000000000000000000000e01".to_string(),
+        },
         repo_head: "c".repeat(40),
         commit_namespace: fixture.proved_namespace.clone(),
         overlay_generation: 1,

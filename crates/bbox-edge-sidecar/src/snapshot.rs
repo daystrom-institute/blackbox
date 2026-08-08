@@ -1129,35 +1129,94 @@ pub fn select_git_overlay(
     project_id: &str,
     selector: Option<GitOverlaySelector>,
 ) -> Result<()> {
+    select_git_overlays(
+        edges_dir,
+        &std::collections::BTreeMap::from([(project_id.to_string(), selector)]),
+    )
+}
+
+/// Atomically replace or clear several projects' Git overlay selectors.
+///
+/// A repo-level producer activation fans one history source out to every
+/// member project. Publishing those selectors one manifest write at a time
+/// exposes a torn monorepo after a crash. This batch form validates EVERY
+/// intended swap against the same manifest image and writes it once under the
+/// coordinator; either the whole repository moves to the new source arm or
+/// none of it does.
+pub fn select_git_overlays(
+    edges_dir: &Path,
+    selectors: &std::collections::BTreeMap<String, Option<GitOverlaySelector>>,
+) -> Result<()> {
     with_manifest_coordinator(|| {
         let mut index = ManifestIndex::load_or_new(edges_dir)?;
-        let Some(entry) = index.workspaces.get(project_id).cloned() else {
-            anyhow::bail!("workspace manifest entry does not exist for the overlay swap");
-        };
-        if let Some(selector) = selector.as_ref() {
-            if !entry.git_overlay_managed {
-                anyhow::bail!(
-                    "workspace entry does not own an overlay-managed Git member; \
-                     the local reindex lane stages its own"
-                );
+        let receipt_bindings = index.receipt_managed_snapshots.clone();
+        let mut replacements = Vec::with_capacity(selectors.len());
+        for (project_id, selector) in selectors {
+            let Some(entry) = index.workspaces.get(project_id).cloned() else {
+                anyhow::bail!("workspace manifest entry does not exist for the overlay swap");
+            };
+            if let Some(selector) = selector.as_ref() {
+                if selector.project_id != *project_id {
+                    anyhow::bail!("Git overlay selector project id disagrees with its map key");
+                }
+                if !entry.git_overlay_managed {
+                    anyhow::bail!(
+                        "workspace entry does not own an overlay-managed Git member; \
+                         the local reindex lane stages its own"
+                    );
+                }
+                let live = entry.code_source_generation.as_deref().unwrap_or_default();
+                if !selector.matches_code_generation(live) {
+                    anyhow::bail!(
+                        "Git overlay targets code generation {} but {} is active",
+                        selector.code_generation,
+                        live
+                    );
+                }
+                if selector.source.producer_transport().is_some() {
+                    let snapshot = entry.active_snapshot.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "producer Git overlay has no active snapshot receipt authority"
+                        )
+                    })?;
+                    let expected =
+                        index
+                            .receipt_managed_snapshots
+                            .get(snapshot)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "producer Git overlay active snapshot has no receipt binding"
+                                )
+                            })?;
+                    let actual = snapshot_receipt_digest(edges_dir, snapshot)?;
+                    if actual.as_deref() != Some(expected.as_str()) {
+                        anyhow::bail!(
+                            "producer Git overlay active snapshot receipt disagrees with its manifest binding"
+                        );
+                    }
+                }
             }
-            let live = entry.code_source_generation.as_deref().unwrap_or_default();
-            if !selector.matches_code_generation(live) {
-                anyhow::bail!(
-                    "Git overlay targets code generation {} but {} is active",
-                    selector.code_generation,
-                    live
-                );
-            }
+            replacements.push((project_id.clone(), selector.clone(), entry));
         }
-        index.upsert_workspace(
-            project_id,
-            WorkspaceIndexEntry {
-                git_overlay: selector,
-                ..entry
-            },
-        );
-        index.write_atomic(edges_dir)
+
+        for (project_id, selector, entry) in replacements {
+            index.upsert_workspace(
+                &project_id,
+                WorkspaceIndexEntry {
+                    git_overlay: selector,
+                    ..entry
+                },
+            );
+        }
+        if index.receipt_managed_snapshots != receipt_bindings {
+            anyhow::bail!("Git overlay selector mutation changed snapshot receipt authority");
+        }
+        index.write_atomic(edges_dir)?;
+        let persisted = ManifestIndex::load_or_new(edges_dir)?;
+        if persisted.receipt_managed_snapshots != receipt_bindings {
+            anyhow::bail!("Git overlay selector write lost snapshot receipt authority");
+        }
+        Ok(())
     })
 }
 
@@ -3460,6 +3519,51 @@ pub(crate) fn snapshot_receipt_digest(edges_dir: &Path, snapshot: &str) -> Resul
             Err(error) => Err(error),
         }
     }
+}
+
+/// Return the durable receipt commitment for one published snapshot.
+///
+/// Unlike a transaction commitment, this digest remains authoritative after
+/// the transaction journal and Tantivy payload closeout have been reclaimed.
+/// Activation journals use it to prove the exact `git-current.jsonl` bytes on
+/// every restart without scanning the rest of the sidecar estate.
+pub fn snapshot_publication_commitment(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+) -> Result<Option<String>> {
+    validate_snapshot_component(project_id)?;
+    validate_snapshot_component(snapshot_id)?;
+    let snapshot = format!("workspace/{project_id}/snapshots/{snapshot_id}");
+    let index = crate::manifest::ManifestIndex::load_or_new(edges_dir)?;
+    let Some(expected) = index.receipt_managed_snapshots.get(&snapshot) else {
+        return Ok(None);
+    };
+    let actual = snapshot_receipt_digest(edges_dir, &snapshot)?;
+    let Some(actual) = actual else {
+        anyhow::bail!(
+            "snapshot publication manifest binds {snapshot} to {expected}, but its durable receipt is absent"
+        );
+    };
+    if actual != *expected {
+        anyhow::bail!(
+            "snapshot publication manifest binds {snapshot} to {expected}, but the durable receipt hashes to {actual}"
+        );
+    }
+    Ok(Some(expected.clone()))
+}
+
+/// Prove one activation journal's durable snapshot receipt commitment.
+pub fn snapshot_publication_matches(
+    edges_dir: &Path,
+    project_id: &str,
+    snapshot_id: &str,
+    expected: &str,
+) -> Result<bool> {
+    Ok(
+        snapshot_publication_commitment(edges_dir, project_id, snapshot_id)?.as_deref()
+            == Some(expected),
+    )
 }
 
 fn load_snapshot_receipt_by_relative(
@@ -7113,7 +7217,9 @@ mod tests {
             project_id: project_id.to_string(),
             code_generation: generation.to_string(),
             repo_history_generation: format!("rhg_{}", "a".repeat(64)),
-            attachment_id: "att_1".to_string(),
+            source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::Attachment {
+                attachment_id: "att_1".to_string(),
+            },
             repo_head: "b".repeat(40),
             commit_namespace: "nsmono".to_string(),
             overlay_generation: 1,
@@ -7191,6 +7297,39 @@ mod tests {
     }
 
     #[test]
+    fn repo_overlay_batch_validates_every_member_before_one_manifest_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        overlay_fixture(&edges_dir, "p_1", "gen-a");
+        overlay_fixture(&edges_dir, "p_2", "gen-b");
+
+        let invalid = std::collections::BTreeMap::from([
+            ("p_1".to_string(), Some(overlay_for("p_1", "gen-a"))),
+            (
+                "p_2".to_string(),
+                Some(overlay_for("p_2", "wrong-generation")),
+            ),
+        ]);
+        assert!(select_git_overlays(&edges_dir, &invalid).is_err());
+        assert!(
+            selected_git_overlays(&edges_dir).unwrap().is_empty(),
+            "a late member refusal must not expose the earlier member"
+        );
+
+        let valid = std::collections::BTreeMap::from([
+            ("p_1".to_string(), Some(overlay_for("p_1", "gen-a"))),
+            ("p_2".to_string(), Some(overlay_for("p_2", "gen-b"))),
+        ]);
+        select_git_overlays(&edges_dir, &valid).unwrap();
+        assert_eq!(selected_git_overlays(&edges_dir).unwrap(), {
+            valid
+                .into_iter()
+                .map(|(project, selector)| (project, selector.unwrap()))
+                .collect()
+        });
+    }
+
+    #[test]
     fn standalone_snapshot_member_transaction_stages_and_finalizes() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
@@ -7236,6 +7375,14 @@ mod tests {
         );
 
         finalize_snapshot_publication(&txn_handle).unwrap();
+        let durable = snapshot_publication_commitment(&edges_dir, "p_1", &snapshot_id)
+            .unwrap()
+            .expect("finalization publishes a durable receipt");
+        assert!(snapshot_publication_matches(&edges_dir, "p_1", &snapshot_id, &durable).unwrap());
+        assert_ne!(
+            durable, txn_handle.commitment,
+            "the activation journal must retain the durable receipt digest, not a transient txn token"
+        );
         let live_after = fs::read(&live_member).unwrap_or_default();
         assert_eq!(
             live_before, live_after,

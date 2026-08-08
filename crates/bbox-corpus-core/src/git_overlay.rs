@@ -19,10 +19,10 @@
 //! - `repo_history_generation` is the GC reference. A retained overlay is one
 //!   of the durable inputs to the history reference manifest, so a generation
 //!   named here can never be swept while the overlay is selected.
-//! - `attachment_id` and `repo_head` are the freshness evidence behind the
-//!   five-state history health model: an overlay whose head no longer matches
-//!   the attachment's head is `lagging`, and an overlay whose attachment is
-//!   gone is `unavailable-no-attachment`.
+//! - `source` and `repo_head` are the freshness evidence. Attachment-backed
+//!   overlays name the exact host-local attachment the walk read. Producer
+//!   overlays instead name the authenticated producer and immutable accepted
+//!   source generation; they deliberately carry no attachment sentinel.
 //! - `overlay_generation` is a monotonic per-project counter, NOT an identity
 //!   hash. It exists so a reader can tell two overlays apart when every other
 //!   field happens to agree (a rebuild at the same head against the same
@@ -35,7 +35,39 @@
 //! which is the single durable authority for the live selector (Phase 3 plan
 //! section 4.7).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Durable provenance for one selected Git overlay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitOverlaySourceV1 {
+    Attachment {
+        attachment_id: String,
+    },
+    ProducerTransport {
+        producer_id: String,
+        source_generation_id: String,
+    },
+}
+
+impl GitOverlaySourceV1 {
+    pub fn attachment_id(&self) -> Option<&str> {
+        match self {
+            Self::Attachment { attachment_id } => Some(attachment_id),
+            Self::ProducerTransport { .. } => None,
+        }
+    }
+
+    pub fn producer_transport(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::ProducerTransport {
+                producer_id,
+                source_generation_id,
+            } => Some((producer_id, source_generation_id)),
+            Self::Attachment { .. } => None,
+        }
+    }
+}
 
 /// One project's selected Git current-file overlay.
 ///
@@ -44,7 +76,7 @@ use serde::{Deserialize, Serialize};
 /// may have written without these fields and a newer one may extend. An
 /// unknown field must degrade to "ignore it", never to a manifest that
 /// refuses to load and takes every project's edges down with it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitOverlaySelector {
     pub project_id: String,
     /// The code generation id this overlay's file edges target. An overlay
@@ -55,11 +87,10 @@ pub struct GitOverlaySelector {
     /// overlay's edges join against. A GC reference for as long as the
     /// overlay is selected or retained.
     pub repo_history_generation: String,
-    /// The attachment the walk read. Host-local; an overlay outlives the
-    /// attachment's removal (the edges stay valid) but stops being
-    /// refreshable, which is exactly the `unavailable-no-attachment` health
-    /// state.
-    pub attachment_id: String,
+    /// Exact source provenance. New writers always emit this discriminant;
+    /// the custom reader below accepts the retired flat `attachment_id` form
+    /// only long enough for the manifest coordinator to rewrite it.
+    pub source: GitOverlaySourceV1,
     /// The head the walk observed. Compared against the attachment's current
     /// head to separate `current` from `lagging`.
     pub repo_head: String,
@@ -70,6 +101,50 @@ pub struct GitOverlaySelector {
     /// Monotonic per-project overlay counter. Not an identity hash; see the
     /// module docs for why a counter rather than a content address.
     pub overlay_generation: u64,
+}
+
+impl<'de> Deserialize<'de> for GitOverlaySelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CompatibleSelector {
+            project_id: String,
+            code_generation: String,
+            repo_history_generation: String,
+            #[serde(default)]
+            source: Option<GitOverlaySourceV1>,
+            #[serde(default)]
+            attachment_id: Option<String>,
+            repo_head: String,
+            commit_namespace: String,
+            overlay_generation: u64,
+        }
+
+        let compatible = CompatibleSelector::deserialize(deserializer)?;
+        let source = match (compatible.source, compatible.attachment_id) {
+            (Some(source), None) => source,
+            (None, Some(attachment_id)) => GitOverlaySourceV1::Attachment { attachment_id },
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "Git overlay selector carries both typed and legacy source provenance",
+                ));
+            }
+            (None, None) => {
+                return Err(serde::de::Error::missing_field("source"));
+            }
+        };
+        Ok(Self {
+            project_id: compatible.project_id,
+            code_generation: compatible.code_generation,
+            repo_history_generation: compatible.repo_history_generation,
+            source,
+            repo_head: compatible.repo_head,
+            commit_namespace: compatible.commit_namespace,
+            overlay_generation: compatible.overlay_generation,
+        })
+    }
 }
 
 impl GitOverlaySelector {
@@ -91,7 +166,9 @@ mod tests {
             project_id: "p_1".to_string(),
             code_generation: "gen-a".to_string(),
             repo_history_generation: format!("rhg_{}", "a".repeat(64)),
-            attachment_id: "att_1".to_string(),
+            source: GitOverlaySourceV1::Attachment {
+                attachment_id: "att_1".to_string(),
+            },
             repo_head: "b".repeat(40),
             commit_namespace: "ns1".to_string(),
             overlay_generation: 3,
@@ -128,5 +205,29 @@ mod tests {
         let encoded = serde_json::to_string(&selector()).unwrap();
         let decoded: GitOverlaySelector = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, selector());
+    }
+
+    #[test]
+    fn typed_and_legacy_sources_cannot_be_combined() {
+        let mut json = serde_json::to_value(selector()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("attachment_id".to_string(), serde_json::json!("att_legacy"));
+        assert!(serde_json::from_value::<GitOverlaySelector>(json).is_err());
+    }
+
+    #[test]
+    fn producer_transport_round_trips_without_attachment_sentinel() {
+        let mut expected = selector();
+        expected.source = GitOverlaySourceV1::ProducerTransport {
+            producer_id: "producer-a".to_string(),
+            source_generation_id: format!("ghs_{}", "c".repeat(64)),
+        };
+        let encoded = serde_json::to_value(&expected).unwrap();
+        assert!(encoded.get("attachment_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<GitOverlaySelector>(encoded).unwrap(),
+            expected
+        );
     }
 }

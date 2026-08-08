@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::TermQuery;
+use tantivy::query::{BooleanQuery, Occur, TermQuery};
 use tantivy::schema::{IndexRecordOption, Term};
 use tantivy::{Index, IndexReader, IndexWriter};
 
@@ -178,6 +178,15 @@ pub enum IndexWriteOp {
         snapshot_by_project: std::collections::BTreeMap<String, String>,
         ack: mpsc::SyncSender<Result<u64>>,
     },
+    /// Publish the exact document/vector inventory carried by one verified
+    /// immutable P3 generation, plus its per-project current-file edges.
+    PublishHistoryGeneration {
+        generation: Box<bbox_corpus_index::index::history_generations::HistoryGenerationRecordV1>,
+        owner: Box<bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1>,
+        edges_by_project: std::collections::BTreeMap<String, Vec<bbox_chunker::Edge>>,
+        snapshot_by_project: std::collections::BTreeMap<String, String>,
+        ack: mpsc::SyncSender<Result<HistoryPublicationResultV1>>,
+    },
     RetireCodeSelector {
         selector: String,
         ack: mpsc::SyncSender<Result<u64>>,
@@ -201,6 +210,13 @@ pub struct IndexWriterActor {
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
     config: ReindexConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPublicationResultV1 {
+    pub commit_document_count: u64,
+    pub commit_view_commitment: String,
+    pub overlay_file_commitments: std::collections::BTreeMap<String, String>,
 }
 
 type PostCommitHook = Arc<dyn Fn(tantivy::Searcher) + Send + Sync>;
@@ -1327,6 +1343,28 @@ impl IndexWriterActor {
             .map_err(|_| anyhow!("index writer actor dropped the consolidated-history ack"))?
     }
 
+    pub fn publish_history_generation(
+        &self,
+        generation: bbox_corpus_index::index::history_generations::HistoryGenerationRecordV1,
+        owner: bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1,
+        edges_by_project: std::collections::BTreeMap<String, Vec<bbox_chunker::Edge>>,
+        snapshot_by_project: std::collections::BTreeMap<String, String>,
+    ) -> Result<HistoryPublicationResultV1> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(IndexWriteOp::PublishHistoryGeneration {
+                generation: Box::new(generation),
+                owner: Box::new(owner),
+                edges_by_project,
+                snapshot_by_project,
+                ack,
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the history-publication ack"))?
+    }
+
     pub fn retire_code_selector(&self, selector: String) -> Result<RetiredCodeSelector> {
         let (ack, ack_rx) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::sync_channel(1);
@@ -1479,6 +1517,22 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 );
                 let _ = ack.send(result);
             }
+            IndexWriteOp::PublishHistoryGeneration {
+                generation,
+                owner,
+                edges_by_project,
+                snapshot_by_project,
+                ack,
+            } => {
+                let result = run_history_generation_publication(
+                    &ctx,
+                    &generation,
+                    &owner,
+                    &edges_by_project,
+                    &snapshot_by_project,
+                );
+                let _ = ack.send(result);
+            }
             IndexWriteOp::RetireCodeSelector {
                 selector,
                 ack,
@@ -1521,6 +1575,10 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                         // own writer and commits, so batching it beside small
                         // ops would nest two writers on one index.
                         Ok(history @ IndexWriteOp::StageConsolidatedHistory { .. }) => {
+                            deferred = Some(history);
+                            break;
+                        }
+                        Ok(history @ IndexWriteOp::PublishHistoryGeneration { .. }) => {
                             deferred = Some(history);
                             break;
                         }
@@ -1982,6 +2040,175 @@ fn run_consolidated_history(
     Ok(written)
 }
 
+/// Publish the exact rows already verified in one immutable P3 generation.
+// executes inside the IndexWriterActor pass (sanctioned single-writer).
+#[allow(clippy::disallowed_methods)]
+fn run_history_generation_publication(
+    ctx: &ActorCtx,
+    generation: &bbox_corpus_index::index::history_generations::HistoryGenerationRecordV1,
+    owner: &bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1,
+    edges_by_project: &std::collections::BTreeMap<String, Vec<bbox_chunker::Edge>>,
+    snapshot_by_project: &std::collections::BTreeMap<String, String>,
+) -> Result<HistoryPublicationResultV1> {
+    generation
+        .validate()
+        .map_err(|error| anyhow!("verified history generation is invalid: {error}"))?;
+    if edges_by_project.keys().ne(snapshot_by_project.keys()) {
+        anyhow::bail!("history edge projects and snapshot-receipt projects must be exactly equal");
+    }
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    // This generation is the COMPLETE active commit view for its namespace.
+    // A force-push can legitimately remove commits, so delete the
+    // `(repo_id, doc_type=commit)` lane before re-emitting the exact
+    // generation inventory; deleting `repo_id` alone would also erase live
+    // code chunks from that repository.
+    writer.delete_query(Box::new(BooleanQuery::new(vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(
+                    ctx.fields.repo_id,
+                    generation.manifest.body.namespace.as_str(),
+                ),
+                IndexRecordOption::Basic,
+            )),
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(ctx.fields.doc_type, "commit"),
+                IndexRecordOption::Basic,
+            )),
+        ),
+    ])))?;
+    let written = bbox_corpus_index::index::schema_replacement::reemit_commit_documents(
+        &writer,
+        ctx.fields,
+        &generation.commit_documents,
+        owner,
+    )?;
+    for input in &generation.vector_inputs {
+        super::embed_hook::emit_git_message(&input.entity_id, &input.content_hash, &input.message);
+    }
+
+    let mut publications: Vec<(String, super::project_files::PublicationResult)> = Vec::new();
+    let staging_attempt = (|| -> Result<()> {
+        for (project_id, edges) in edges_by_project {
+            bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
+                &edges_dir, "git", project_id, edges,
+            )?;
+            if let Some(snapshot_id) = snapshot_by_project.get(project_id) {
+                let mut publication =
+                    super::project_files::ProjectIndexPublicationBundle::default();
+                publication.stage_snapshot_git_current(&edges_dir, project_id, snapshot_id, true);
+                publications.push((project_id.clone(), publication.publish()?));
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = staging_attempt {
+        let mut cleanup_failures = Vec::new();
+        for (_, publication) in &mut publications {
+            if let Err(cleanup) = publication.rollback_pending() {
+                cleanup_failures.push(format!("{cleanup:#}"));
+            }
+        }
+        if !cleanup_failures.is_empty() {
+            return Err(error).context(format!(
+                "history snapshot staging failed and rollback left unresolved state: {}",
+                cleanup_failures.join("; ")
+            ));
+        }
+        return Err(error);
+    }
+    for (_, publication) in &publications {
+        if publication.pending_commitments().len() != 1 {
+            anyhow::bail!("history overlay publication did not stage exactly one receipt");
+        }
+    }
+    let commit_attempt = (|| -> Result<String> {
+        let prior_payload = ctx
+            .index
+            .load_metas()
+            .context("loading prior index payload before history commit")?
+            .payload;
+        let current = publications
+            .iter()
+            .flat_map(|(_, publication)| publication.pending_commitments())
+            .collect::<Vec<_>>();
+        let commitments = bbox_edge_sidecar::snapshot::carry_forward_commitments(
+            &edges_dir,
+            prior_payload.as_deref(),
+            &current,
+        )?;
+        let mut prepared = writer.prepare_commit()?;
+        let payload = commitments.join(",");
+        if !payload.is_empty() {
+            prepared.set_payload(&payload);
+        }
+        prepared.commit()?;
+        Ok(payload)
+    })();
+    let commit_payload = match commit_attempt {
+        Ok(payload) => payload,
+        Err(error) => {
+            let mut cleanup_failures = Vec::new();
+            for (_, publication) in &mut publications {
+                if let Err(cleanup) = publication.rollback_pending() {
+                    cleanup_failures.push(format!("{cleanup:#}"));
+                }
+            }
+            if !cleanup_failures.is_empty() {
+                return Err(error).context(format!(
+                    "history snapshot commit failed and rollback left unresolved state: {}",
+                    cleanup_failures.join("; ")
+                ));
+            }
+            return Err(error);
+        }
+    };
+    let mut handles = Vec::new();
+    for (_, publication) in &mut publications {
+        publication.mark_commit_succeeded();
+        handles.extend(publication.take_pending_snapshot_finalizations());
+    }
+    for handle in &handles {
+        bbox_edge_sidecar::snapshot::finalize_snapshot_publication(handle)?;
+    }
+    let overlay_file_commitments = publications
+        .iter()
+        .map(|(project_id, _)| {
+            let snapshot_id = snapshot_by_project
+                .get(project_id)
+                .ok_or_else(|| anyhow!("history overlay publication lost its snapshot id"))?;
+            let commitment = bbox_edge_sidecar::snapshot::snapshot_publication_commitment(
+                &edges_dir,
+                project_id,
+                snapshot_id,
+            )?
+            .ok_or_else(|| anyhow!("history overlay publication has no durable receipt"))?;
+            Ok((project_id.clone(), commitment))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+        &edges_dir,
+        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+    )?;
+    post_commit(ctx);
+    Ok(HistoryPublicationResultV1 {
+        commit_document_count: written,
+        commit_view_commitment: generation
+            .manifest
+            .body
+            .commit_document_commitment_sha256
+            .clone(),
+        overlay_file_commitments,
+    })
+}
+
 fn run_selector_retirement(ctx: &ActorCtx, selector: &str) -> Result<u64> {
     let edges_dir =
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
@@ -2272,6 +2499,7 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
         | IndexWriteOp::StageLocalGeneration { .. }
         | IndexWriteOp::StageGitCurrentOverlay { .. }
         | IndexWriteOp::StageConsolidatedHistory { .. }
+        | IndexWriteOp::PublishHistoryGeneration { .. }
         | IndexWriteOp::RetireCodeSelector { .. }
         | IndexWriteOp::Flush(_) => {
             debug_assert!(false, "control ops are routed before apply_small_op");
@@ -2419,6 +2647,130 @@ mod tests {
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn history_publication_replaces_the_exact_namespace_after_force_push() {
+        use bbox_corpus_core::git::GitCommit;
+        use bbox_corpus_core::project_catalog::{CommitNamespace, RepoHistoryId};
+        use bbox_corpus_index::index::history_generations::{
+            HistoryGenerationInputV1, HistoryGenerationOwnerV1, HistoryGenerationStore,
+            generation_rows_for_commit, live_schema_evidence,
+        };
+        use bbox_corpus_index::index::schema_replacement::CommitDocumentOwnerV1;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let transcript = test_index(&root);
+        let namespace = CommitNamespace::parse("repo-force-push").unwrap();
+        let sentinel_entity = "code-document-sharing-history-repo-id";
+        {
+            let index = transcript.index_handle();
+            let mut writer = index.writer(15_000_000).unwrap();
+            let fields = transcript.field_handles();
+            let mut document = tantivy::TantivyDocument::default();
+            document.add_text(fields.entity_id, sentinel_entity);
+            document.add_text(fields.doc_type, "code");
+            document.add_text(fields.repo_id, namespace.as_str());
+            writer.add_document(document).unwrap();
+            writer.commit().unwrap();
+        }
+        let actor = IndexWriterActor::spawn_for(&transcript);
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap();
+        let make_generation = |commits: Vec<GitCommit>| {
+            let mut documents = Vec::new();
+            let mut vectors = Vec::new();
+            for commit in commits {
+                let (document, vector) = generation_rows_for_commit(&commit, namespace.as_str());
+                documents.push(document);
+                vectors.push(vector);
+            }
+            let (schema_version, schema_fingerprint) = live_schema_evidence().unwrap();
+            HistoryGenerationStore::open_for_index(&root.join("idx"))
+                .unwrap()
+                .create_or_open(HistoryGenerationInputV1 {
+                    namespace: namespace.clone(),
+                    owner: HistoryGenerationOwnerV1::Owned {
+                        repo_history_id: history.clone(),
+                    },
+                    commit_documents: documents,
+                    vector_inputs: vectors,
+                    truncated_message_count: 0,
+                    source_schema_version: schema_version,
+                    source_schema_fingerprint_sha256: schema_fingerprint,
+                    source_index_fingerprint_sha256: "test-force-push".into(),
+                })
+                .unwrap()
+        };
+        let removed = GitCommit {
+            sha: "1".repeat(40),
+            parent_shas: vec![],
+            author_name: "A".into(),
+            author_email: "a@example.invalid".into(),
+            message: "removed".into(),
+        };
+        let retained = GitCommit {
+            sha: "2".repeat(40),
+            parent_shas: vec![],
+            author_name: "B".into(),
+            author_email: "b@example.invalid".into(),
+            message: "retained".into(),
+        };
+        let first = make_generation(vec![removed, retained.clone()]);
+        assert!(
+            actor
+                .publish_history_generation(
+                    first.clone(),
+                    CommitDocumentOwnerV1::unclaimed(namespace.as_str()),
+                    std::collections::BTreeMap::from([("p_one".to_string(), Vec::new())]),
+                    Default::default(),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("must be exactly equal"),
+            "the writer must not publish project edges without their durable snapshot receipt"
+        );
+        actor
+            .publish_history_generation(
+                first,
+                CommitDocumentOwnerV1::unclaimed(namespace.as_str()),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+        let replacement = make_generation(vec![retained]);
+        let result = actor
+            .publish_history_generation(
+                replacement.clone(),
+                CommitDocumentOwnerV1::unclaimed(namespace.as_str()),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(result.commit_document_count, 1);
+        assert_eq!(
+            result.commit_view_commitment,
+            replacement.manifest.body.commit_document_commitment_sha256
+        );
+        super::super::history_transport::verify_history_commit_view(
+            &transcript.searcher(),
+            transcript.field_handles(),
+            &replacement,
+        )
+        .unwrap();
+        let fields = transcript.field_handles();
+        let sentinel_query = TermQuery::new(
+            Term::from_field_text(fields.entity_id, sentinel_entity),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(
+            transcript
+                .searcher()
+                .search(&sentinel_query, &Count)
+                .unwrap(),
+            1,
+            "exact Git replacement must not delete code documents sharing the repo id"
+        );
     }
 
     #[test]

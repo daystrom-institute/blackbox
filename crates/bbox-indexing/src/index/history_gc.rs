@@ -462,7 +462,9 @@ mod tests {
             project_id: project.to_string(),
             code_generation: "code-gen".to_string(),
             repo_history_generation: generation.to_string(),
-            attachment_id: "att_1".to_string(),
+            source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::Attachment {
+                attachment_id: "att_1".to_string(),
+            },
             repo_head: "b".repeat(40),
             commit_namespace: "nsmono".to_string(),
             overlay_generation: 1,

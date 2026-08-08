@@ -35,6 +35,13 @@ const UPLOAD_BODY_TEMP_SUFFIX: &str = ".tmp";
 
 pub(crate) struct GitSourceRuntime {
     store: Arc<GitSourceStore>,
+    activation_tx: std::sync::mpsc::SyncSender<String>,
+    activation_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<String>>>,
+    /// Repo id -> `(activation-journal checksum, Tantivy searcher generation)`
+    /// proven against the exact commit lane and durable snapshot receipts.
+    /// Redrive reuses the proof only while both authorities are unchanged;
+    /// any index commit forces a fresh exact-view probe.
+    validated_activations: parking_lot::Mutex<std::collections::BTreeMap<String, (String, u64)>>,
 }
 
 impl GitSourceRuntime {
@@ -44,15 +51,25 @@ impl GitSourceRuntime {
             checked_store_limits(config)?,
         )?);
         reap_upload_body_tempfiles(store.root())?;
-        Ok(Self { store })
+        let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(64);
+        Ok(Self {
+            store,
+            activation_tx,
+            activation_rx: std::sync::Mutex::new(Some(activation_rx)),
+            validated_activations: parking_lot::Mutex::new(Default::default()),
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(root: &std::path::Path) -> Self {
+        let (activation_tx, activation_rx) = std::sync::mpsc::sync_channel(64);
         Self {
             store: Arc::new(
                 GitSourceStore::open(root.join("git-sources"), StoreLimits::default()).unwrap(),
             ),
+            activation_tx,
+            activation_rx: std::sync::Mutex::new(Some(activation_rx)),
+            validated_activations: parking_lot::Mutex::new(Default::default()),
         }
     }
 
@@ -62,6 +79,45 @@ impl GitSourceRuntime {
 
     pub(crate) fn update_limits(&self, config: &crate::config::Config) -> Result<()> {
         self.store.update_limits(checked_store_limits(config)?)
+    }
+
+    pub(crate) fn enqueue_activation(&self, source_generation_id: String) {
+        match self.activation_tx.try_send(source_generation_id) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!("Git-history activation worker is unavailable")
+            }
+        }
+    }
+
+    pub(crate) fn take_activation_receiver(&self) -> Option<std::sync::mpsc::Receiver<String>> {
+        self.activation_rx.lock().ok()?.take()
+    }
+
+    pub(crate) fn activation_was_validated(
+        &self,
+        repo_history_id: &str,
+        journal_checksum: &str,
+        searcher_generation: u64,
+    ) -> bool {
+        self.validated_activations
+            .lock()
+            .get(repo_history_id)
+            .is_some_and(|current| {
+                current.0 == journal_checksum && current.1 == searcher_generation
+            })
+    }
+
+    pub(crate) fn mark_activation_validated(
+        &self,
+        repo_history_id: &str,
+        journal_checksum: &str,
+        searcher_generation: u64,
+    ) {
+        self.validated_activations.lock().insert(
+            repo_history_id.to_string(),
+            (journal_checksum.to_string(), searcher_generation),
+        );
     }
 
     pub(crate) fn validate_config(config: &crate::config::Config) -> Result<()> {
@@ -318,6 +374,9 @@ async fn finalize_history_upload(
     let producer_id = grant.producer_id;
     let response =
         blocking(move || store.finalize_history_upload(&producer_id, &upload_id)).await?;
+    state
+        .git_sources
+        .enqueue_activation(response.source_generation_id.clone());
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 

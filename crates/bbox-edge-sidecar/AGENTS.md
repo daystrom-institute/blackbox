@@ -24,6 +24,15 @@ per-row structure will fall over on a real host while passing every fixture.
 - One open descriptor is one coherent version of a lane. A concurrent atomic
   replacement cannot tear a read that is already in progress, which is why the
   read halves do not need the double-scan the buffered tree capture uses.
+- Repo-level Git overlay selection validates every member against one manifest
+  image and publishes one atomic manifest replacement. Activation journals
+  retain the final snapshot receipt digest, not the staging transaction token;
+  recovery proves only each named snapshot receipt and must never scan the
+  global sidecar estate to decide whether an overlay is current.
+- Once a `TranscriptIndex` is open, every sidecar reader and writer derives the
+  edges root from that index's configured `projects_path`. Inferring it from a
+  conventional `bro/` store sibling can silently split receipts, selectors,
+  and writer output across two trees in embedded or test layouts.
 
 ## The project-catalog backfill obligation is SELECTOR-keyed
 

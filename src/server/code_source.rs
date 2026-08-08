@@ -2300,11 +2300,19 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "code-source blob GC failed"),
                 }
-                match state
-                    .git_sources
-                    .store()
-                    .maintain(&std::collections::BTreeSet::new())
-                {
+                let protected_git_sources = state
+                    .code_read_view
+                    .read()
+                    .git_overlays
+                    .values()
+                    .filter_map(|overlay| {
+                        overlay
+                            .source
+                            .producer_transport()
+                            .map(|(_, source)| source.to_string())
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                match state.git_sources.store().maintain(&protected_git_sources) {
                     Ok(report) if report != bbox_git_source_store::MaintenanceReport::default() => {
                         tracing::info!(
                             expired_uploads = report.expired_uploads,
@@ -2436,7 +2444,10 @@ fn resolve_code_project_identity(
 /// Republish the pinned code read view after a post-activation overlay
 /// landed. The active selector map is already correct (the activation set
 /// it); only the edge index and searcher move.
-fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
+pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
+    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+        &state.idx.read().reindex_config().projects_path,
+    );
     let index = state.idx.write();
     let selectors = index.active_code_selectors();
     *state.code_read_view.write() = Arc::new(super::CodeReadView {
@@ -2454,7 +2465,7 @@ fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
         // view claims not to have.
         git_overlays: super::state::read_git_overlays_for_view(
             &state.project_authority,
-            &state.store_dir,
+            &edges_dir,
         ),
     });
     state.nudge_edge_index_rebuild();
@@ -2654,7 +2665,9 @@ fn install_git_overlay_selector(
             project_id: project_id.to_string(),
             code_generation: code_generation.to_string(),
             repo_history_generation: generation_id.as_str().to_string(),
-            attachment_id: attachment_id.to_string(),
+            source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::Attachment {
+                attachment_id: attachment_id.to_string(),
+            },
             repo_head: repo_head.unwrap_or_default().to_string(),
             commit_namespace: history.primary_namespace.as_str().to_string(),
             overlay_generation: previous_generation.saturating_add(1),
@@ -2695,6 +2708,22 @@ fn stage_git_current_overlay_after_activation(
     >,
 ) {
     let store = state.code_sources.store();
+    match super::history_activation::reconcile_transport_currency(state, project_id) {
+        Ok(true) => {
+            let _ = store.clear_health_failure(project_id, "git_history_unavailable");
+            let _ = store.clear_health_failure(
+                project_id,
+                bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE,
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            project_id,
+            %error,
+            "Git-history transport currency could not be proved; attachment refresh remains eligible"
+        ),
+    }
     let record = state
         .records_provider
         .records_snapshot()
@@ -4872,7 +4901,7 @@ fn cutback_to_local_single_attempt(
                 catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
-                    &state.store_dir,
+                    &edges_dir,
                 ),
             });
             Ok(())
@@ -5216,7 +5245,7 @@ fn cutback_to_local(
                 // the activation just wrote: the atomic overlay clear.
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
-                    &state.store_dir,
+                    &edges_dir,
                 ),
             });
             Ok(())
@@ -5630,7 +5659,7 @@ fn activate_desired_loop(
                     // same swap rather than one republish later.
                     git_overlays: super::state::read_git_overlays_for_view(
                         &state.project_authority,
-                        &state.store_dir,
+                        &edges_dir,
                     ),
                 });
                 Ok(())

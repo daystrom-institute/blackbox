@@ -257,7 +257,8 @@ the Phase 3 plan, section 4.1). Phase 1 does not read commit-document bodies
 or create history generations. Phase 3's pre-replacement materializer owns
 the single creation path that creates immutable history/quarantine
 generations and advances those catalog fields to `Ready` through the regular
-catalog transaction; the Phase 3 live history refresh reuses that same path. A fresh v2 history
+catalog transaction; the Phase 3 live checkout refresh and authenticated
+typed producer refresh reuse that same path. A fresh v2 history
 may remain `NotBuilt` until its first successful build. At the Phase 6 cut,
 however, startup refuses when the migration inventory proved materialized
 legacy commit documents for a catalog or ambiguous namespace whose field is
@@ -1274,12 +1275,21 @@ GitOverlaySelector {
     project_id,
     code_generation,
     repo_history_generation,
-    attachment_id,
+    source: Attachment { attachment_id }
+          | ProducerTransport { producer_id, source_generation_id },
     repo_head,
     commit_namespace,
     overlay_generation,
 }
 ```
+
+The discriminant is durable provenance, not a compatibility label. A
+`ProducerTransport` arm never carries an attachment sentinel and survives
+checkout detach while its producer source, grant, exact history generation,
+matching code selector, and overlay receipts remain current. The migration
+reader accepts the former flat `attachment_id` encoding only when `source` is
+absent; ambiguous both/neither input is invalid, and every new write uses the
+typed encoding.
 
 `CodeReadView` selects the active code snapshot plus either a matching Git
 overlay or `None`. Activating a new code generation without a usable attachment
@@ -1322,10 +1332,13 @@ history build references the repo-history generation. Vector tombstoning is
 driven by the repo-history generation, never by one project's code selector.
 
 Phase 3's pre-replacement history materializer, reused by the Phase 6
-path-free-rebuild subcommand and by the Phase 3 live history refresh, owns
-the single creation path for `RepoHistoryGeneration` and
-`RepoHistoryQuarantineGeneration`; no other code constructs those
-generations. Phase 1 import only records namespace ownership/ambiguity and
+path-free-rebuild subcommand, the Phase 3 live checkout refresh, and the
+authenticated typed producer refresh are the three exclusive callers of the
+single creation path for `RepoHistoryGeneration` and
+`RepoHistoryQuarantineGeneration`; no other code constructs those generations.
+The producer caller may prepare the exact future content-addressed id for its
+activation journal, but publication accepts only that builder-produced value
+and is not a second constructor. Phase 1 import only records namespace ownership/ambiguity and
 the complete legacy index inventory needed to prove what the later
 materializer must find.
 

@@ -16,7 +16,7 @@ Governing design: [`durable-project-catalog-impl.md`](../../../../../design/daem
 Transport substrate: [`distributed-code-source-collector-impl.md`](../../../../../design/daemon-runtime/distributed-code-source-collector-impl.md).
 History dependencies: [`durable-project-catalog-phase3-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-phase3-impl.md) and [`durable-project-catalog-phase6-impl.md`](../../../../../design/daemon-runtime/durable-project-catalog-phase6-impl.md).
 Provenance predecessor: [`checkout-provenance-export-impl.md`](../../../../../design/daemon-runtime/checkout-provenance-export-impl.md).
-Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). This plan uses slice-local decisions `GH-FD-*`. GH-C records the certified P3-F caller-list and selector-source amendment as a new Decision Ledger entry at implementation time; this plan assumes no entry number.
+Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). This plan uses slice-local decisions `GH-FD-*`; D-043 records GH-C's certified P3-F caller-list and selector-source amendment.
 
 > **Implementation status (2026-08-08).** The caller/owner map was rebaselined
 > against current `beta/blackbox-v2`. GH-A is implemented: code and Git lanes
@@ -28,9 +28,17 @@ Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). T
 > backoff. GH-B is implemented: background-only upload expiry, generation
 > retention, explicit future-materializer roots, grace-delayed CAS reclamation,
 > the SHA-1/SHA-256 and graph/path/fragment fixture matrix, and an isolated
-> FreshV2 daemon-plus-collector rehearsal all pass. GH-C and later milestones
-> remain unimplemented; blackboxd therefore still acquires `GitHistory` and
-> `ProvenanceNoteIo` leases for active corpus behavior.
+> FreshV2 daemon-plus-collector rehearsal all pass. GH-C is implemented:
+> verified producer sources use the canonical P3 builder, repo-level commit
+> views and exact snapshot receipts publish under a monotonic recovery
+> journal, monorepo selectors swap atomically through the typed
+> `ProducerTransport` arm, startup re-proves only selected producer views, and
+> loss of grant/code/source currency clears those arms before eligible
+> pre-marker attachment refresh resumes. The strict remote-only smoke covers
+> every action-ahead crash point, grant loss/restoration, code-ahead mismatch,
+> matching republish, force-push replacement, and source retirement. GH-D and
+> later milestones remain unimplemented; provenance note I/O therefore still
+> uses its existing checkout-backed behavior.
 
 ## 1. Required outcome
 At this slice's exit gate, proved against strict catalog state after Phases 3 through 6 have landed:
@@ -442,35 +450,33 @@ Reject nonowning producer, nonmember V2 target, unsafe repo path, and concurrent
 One history generation emits commits once; path fan-out uses each member `bbox_root_relpath`.
 
 ### 7.3 History publication transaction
-1. Verify immutable source generation off-lock.
-2. Write `HistoryActivationJournalV1::Prepared` with source, catalog epoch, repo id, prior/new P3 generations, code selectors, and planned overlays.
-3. Stream into P3-F builder off-lock.
-4. Verify `RepoHistoryGeneration`.
-5. Atomically advance journal state to `GenerationVerified`, binding the verified P3 generation hash.
-6. Stage commit docs and vector coverage in writer actor.
-7. Stage exact matching overlays off-lock.
-8. Recheck catalog epoch, repo authority, and code selectors.
-9. On drift, atomically mark `Superseded`, discard staging, retain immutable assets, and replan.
-10. Advance `RepoHistoryRecord.materialization` through regular catalog transaction, then atomically record `MaterializationAdvanced` with the resulting catalog epoch.
-11. Publish and verify the commit view, then atomically record `CommitViewPublished` with its selector and commitment.
-12. Publish and verify every overlay, then atomically record `OverlaysPublished` with ordered overlay commitments.
-13. Atomically record `Committed` and republish `CodeReadView`.
+1. Verify the immutable source generation and prepare canonical rows through the sole P3-F builder off-lock, deriving the exact future generation id and manifest hash without publishing it.
+2. Write `HistoryActivationJournalV1::Prepared` with the verified source evidence, catalog epoch, repo id, prior/new P3 generations, code selectors, and planned overlays.
+3. Publish the prepared P3 generation, re-open it, and verify its bound id, manifest hash, document commitment, and vector-input commitment.
+4. Atomically advance the journal to `GenerationVerified`.
+5. Recheck catalog epoch, repo authority, the repository's `current-ready` source pointer, and code selectors, then advance `RepoHistoryRecord.materialization` through the regular catalog CAS. Every later bounded plan recheck repeats the source-pointer proof; an older activation loses to a newer accepted source while the previously selected Active view remains last-good until its successor commits.
+6. Record `MaterializationAdvanced` with the resulting catalog epoch. If the catalog already names the exact planned generation after an action-ahead crash, prove it and checkpoint instead of issuing another CAS; if it names any other generation, mark the attempt `Superseded`.
+7. Build the exact matching project edges off-lock and publish the exact `(repo_id, doc_type=commit)` lane plus snapshot receipts through the writer actor; the edge-project and receipt-project key sets must be identical, and repository code documents sharing `repo_id` are outside that replacement.
+8. Query that authoritative commit lane, compare every stored commit row to the retained P3 generation, verify each durable snapshot-receipt digest, then record `CommitViewPublished` with the commitments.
+9. Recheck catalog authority and code selectors, then swap or clear all typed overlay selectors in one manifest transaction.
+10. Verify the selected overlays and record `OverlaysPublished`.
+11. Atomically record `Committed`, mark the source active, and republish `CodeReadView`.
 Journal states are plan-defined and monotonic: `Prepared`, `GenerationVerified`, `MaterializationAdvanced`, `CommitViewPublished`, `OverlaysPublished`, `Committed`, or terminal `Superseded`.
-No lock spans steps 1-6. Catalog and manifest critical sections are short and do not nest Git or index commit.
+No lock spans source traversal or index publication. Catalog and manifest critical sections are short and do not nest source reads or index commit.
 
 ### 7.4 History crash recovery
-The durable state is a progress lower bound, not the sole discriminator. Recovery performs this authoritative probe sequence for every nonterminal journal:
+The durable state is a progress lower bound, not the sole discriminator. Recovery performs this authoritative probe sequence for every nonterminal journal, and startup re-proves only producer sources actually selected by the first read view rather than scanning the global sidecar estate:
 1. Verify the exact planned `RepoHistoryGeneration` exists and matches its bound hash.
 2. Read `RepoHistoryRecord.materialization` and compare it to the exact planned generation id.
-3. Read the active commit-view selector and document/vector commitment and compare them to the journal.
-4. Read every planned `GitOverlaySelector` plus overlay file commitment and compare them in project-id order.
+3. Query the exact primary `(repo_id, doc_type=commit)` lane and compare the complete stored row set to the retained generation; compare the retained document/vector-input commitments to the journal.
+4. Read every planned `GitOverlaySelector` and the durable finalized snapshot-receipt digest in project-id order.
 Recovery arms:
 - No journal: no work.
 - Planned generation absent: resume builder from `Prepared`.
 - Generation present but materialization still names the prior generation: resume staging and the catalog CAS.
 - Materialization names a different new generation: atomically mark `Superseded`; never overwrite it.
 - Exact materialization advanced but commit-view probe mismatches: re-emit before bind.
-- Commit view matches but any overlay probe mismatches: rebuild only missing or mismatched overlays.
+- Commit view and durable snapshot receipts match but selectors are not yet swapped: reuse those publications and perform only the manifest transaction. A missing or corrupt durable publication is re-emitted exactly; a valid one is never rebuilt merely because its next journal checkpoint was interrupted.
 - All probes match but journal is not `Committed`: advance missing checkpoints and commit.
 - `Committed`: re-run all probes before exposure; mismatch fails history capability closed to last-good.
 Exact-generation comparisons make each probe monotone under the catalog CAS and distinguish crashes between an external action and its next journal checkpoint. Recovery reuses P3-D/P3-F manifests. `HistoryActivationJournalV1` orchestrates intake only and is not a replacement rebuild manifest.
@@ -571,6 +577,7 @@ Verification: SHA-1/SHA-256, linear/merge/root/rename/delete/large fixtures, gra
 Gate: focused tests, dependency acceptance, isolated smoke, cluster verify.
 
 ### GH-C: History activation and remote overlays
+Status: implemented 2026-08-08.
 Ownership: P3-F builder, `writer_actor.rs`, history orchestration, edge sidecar, `code_source.rs`, doctor/GC.
 Dependencies: GH-B, `P3-D`, `P3-E`, `P3-F`, `P6-R`, `G11-A`, `G11-C`, `G11-X`.
 Mechanics:

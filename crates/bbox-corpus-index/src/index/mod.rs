@@ -536,6 +536,13 @@ impl TranscriptIndex {
         self.index.clone()
     }
 
+    /// Canonical store path this handle actually opened. Runtime
+    /// orchestrators must derive sibling durable assets from this value, not
+    /// re-read configuration that test or embedded callers may override.
+    pub fn index_path(&self) -> &Path {
+        &self.index_path
+    }
+
     /// Snapshot a searcher off the shared `IndexReader`. Cheap — the
     /// reader is `OnCommit`-driven and segment-arc-cloned. Use this
     /// from per-call tool handlers instead of

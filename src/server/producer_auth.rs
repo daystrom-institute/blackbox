@@ -409,6 +409,20 @@ impl ProducerAuthRuntime {
             _ => Err(RepoTransportGrantError::RepoHistoryScopeSplit),
         }
     }
+
+    pub(crate) fn repo_transport_grant_for_id(
+        &self,
+        producer_id: &str,
+        repo_history_id: &RepoHistoryId,
+    ) -> std::result::Result<&RepoTransportGrant, RepoTransportGrantError> {
+        match self.repo_grants.get(repo_history_id) {
+            Some(RepoTransportGrantState::Granted(grant)) if grant.producer_id == producer_id => {
+                Ok(grant)
+            }
+            Some(_) => Err(RepoTransportGrantError::RepoHistoryScopeSplit),
+            None => Err(RepoTransportGrantError::RepoHistoryNotFound),
+        }
+    }
 }
 
 pub(crate) fn resolve_grant_scope(
@@ -516,7 +530,23 @@ fn derive_repo_transport_grants(
             continue;
         }
         let producer_id = producers.into_iter().next().expect("length checked above");
-        let authority_scope = members[0].scope.clone();
+        // The capture authority is the shallowest registered scope, not the
+        // first project id. Project-id order is unrelated to monorepo
+        // topology and could otherwise make adding or renaming a member
+        // silently change the source descriptor expected by the server.
+        let authority_scope = members
+            .iter()
+            .min_by(|left, right| {
+                let left_depth = scope_depth(&left.scope);
+                let right_depth = scope_depth(&right.scope);
+                left_depth
+                    .cmp(&right_depth)
+                    .then_with(|| left.scope.cmp(&right.scope))
+                    .then_with(|| left.project_id.cmp(&right.project_id))
+            })
+            .expect("repo transport groups are nonempty")
+            .scope
+            .clone();
         let commitment = repo_grant_commitment(
             &producer_id,
             &repo_history_id,
@@ -536,6 +566,15 @@ fn derive_repo_transport_grants(
         );
     }
     (project_to_repo_history, grants)
+}
+
+fn scope_depth(scope: &PublishedScope) -> usize {
+    let relative = scope.bbox_root_relpath();
+    if relative == "." {
+        0
+    } else {
+        relative.split('/').count()
+    }
 }
 
 fn repo_grant_commitment(
@@ -671,8 +710,8 @@ mod tests {
             },
         );
         for (id, scope) in [
-            ("p_00000000000000000000000000000001", root_scope.clone()),
-            ("p_00000000000000000000000000000002", child_scope.clone()),
+            ("p_00000000000000000000000000000002", root_scope.clone()),
+            ("p_00000000000000000000000000000001", child_scope.clone()),
         ] {
             let project = project(id, ProjectScope::Published(scope), &repo_history_id);
             catalog.projects.insert(project.project_id.clone(), project);
@@ -697,8 +736,8 @@ mod tests {
     #[test]
     fn repo_grant_requires_every_published_member_on_one_producer() {
         let (catalog, history_id, root_scope, child_scope) = catalog_with_two_published_members();
-        let root_id = "p_00000000000000000000000000000001";
-        let child_id = "p_00000000000000000000000000000002";
+        let root_id = "p_00000000000000000000000000000002";
+        let child_id = "p_00000000000000000000000000000001";
 
         let (_, grants) = derive_repo_transport_grants(
             &catalog,

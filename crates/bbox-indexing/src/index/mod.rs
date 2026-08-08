@@ -16,6 +16,7 @@ pub mod history_gc;
 pub mod history_health;
 pub mod history_materializer;
 pub mod history_refresh;
+pub mod history_transport;
 mod knowledge_docs;
 mod reindex;
 mod roadmap_docs;

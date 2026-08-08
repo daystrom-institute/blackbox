@@ -8,6 +8,8 @@ use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bbox_corpus_core::git::GitCommit;
+use bbox_corpus_core::git_overlay::GitOverlaySelector;
 use bbox_corpus_core::json_store::{
     NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow,
 };
@@ -112,6 +114,238 @@ pub struct StoredHistorySourceV1 {
     pub diagnostic: Option<String>,
 }
 
+/// Immutable, fully reverified handoff into the certified P3 history builder.
+///
+/// The handle carries metadata only. Commit records are visited one commit at
+/// a time through [`GitSourceStore::visit_verified_history_commits`], keeping
+/// source-sized payloads out of the daemon heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGitHistorySourceV1 {
+    pub source_generation_id: String,
+    pub producer_id: String,
+    pub authority_scope: bbox_corpus_core::identity::PublishedScope,
+    pub repo_history_id: RepoHistoryId,
+    pub primary_namespace: CommitNamespace,
+    pub repo_head: String,
+    pub manifest_sha256: String,
+    pub source_evidence: String,
+    pub commit_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGitHistoryCommitV1 {
+    pub commit: GitCommit,
+    pub changed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryActivationStageV1 {
+    Prepared,
+    GenerationVerified,
+    MaterializationAdvanced,
+    CommitViewPublished,
+    OverlaysPublished,
+    Committed,
+    Superseded,
+}
+
+impl HistoryActivationStageV1 {
+    fn ordinal(self) -> Option<u8> {
+        match self {
+            Self::Prepared => Some(0),
+            Self::GenerationVerified => Some(1),
+            Self::MaterializationAdvanced => Some(2),
+            Self::CommitViewPublished => Some(3),
+            Self::OverlaysPublished => Some(4),
+            Self::Committed => Some(5),
+            Self::Superseded => None,
+        }
+    }
+
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Committed | Self::Superseded)
+    }
+
+    pub fn is_at_least(self, expected: Self) -> bool {
+        match (self.ordinal(), expected.ordinal()) {
+            (Some(current), Some(expected)) => current >= expected,
+            _ => self == expected,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryActivationOverlayV1 {
+    pub project_id: String,
+    pub snapshot_id: String,
+    pub selector: GitOverlaySelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_commitment: Option<String>,
+}
+
+/// Monotonic durable lower bound for one repo-level history activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryActivationJournalV1 {
+    pub version: u32,
+    pub stage: HistoryActivationStageV1,
+    pub source_generation_id: String,
+    pub producer_id: String,
+    pub source_evidence: String,
+    pub grant_commitment: String,
+    pub catalog_epoch_prepared: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_epoch_after: Option<u64>,
+    pub repo_history_id: RepoHistoryId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_p3_generation_id: Option<String>,
+    pub planned_p3_generation_id: String,
+    pub planned_p3_manifest_sha256: String,
+    pub code_selectors: BTreeMap<String, String>,
+    pub overlays: Vec<HistoryActivationOverlayV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlay_clears: Vec<String>,
+    pub commit_document_count: u64,
+    pub commit_document_commitment_sha256: String,
+    pub vector_input_count: u64,
+    pub vector_input_commitment_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_view_commitment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    pub checksum_sha256: String,
+}
+
+impl HistoryActivationJournalV1 {
+    pub fn seal(mut self) -> Result<Self> {
+        self.checksum_sha256 = self.recompute_checksum()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != STORE_VERSION
+            || self.source_generation_id.is_empty()
+            || self.producer_id.is_empty()
+            || self.source_evidence.len() != 64
+            || self.grant_commitment.len() != 64
+            || self.planned_p3_manifest_sha256.len() != 64
+            || self.commit_document_commitment_sha256.len() != 64
+            || self.vector_input_commitment_sha256.len() != 64
+            || self.recompute_checksum()? != self.checksum_sha256
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        validate_generation_id(&self.source_generation_id)?;
+        for digest in [
+            &self.grant_commitment,
+            &self.source_evidence,
+            &self.planned_p3_manifest_sha256,
+            &self.commit_document_commitment_sha256,
+            &self.vector_input_commitment_sha256,
+        ] {
+            validate_sha256(digest)?;
+        }
+        if let Some(commitment) = &self.commit_view_commitment {
+            validate_sha256(commitment)?;
+        }
+        let mut previous = None;
+        for overlay in &self.overlays {
+            if overlay.project_id != overlay.selector.project_id
+                || overlay.selector.repo_history_generation != self.planned_p3_generation_id
+                || self.code_selectors.get(&overlay.project_id)
+                    != Some(&overlay.selector.code_generation)
+                || overlay.selector.source.producer_transport()
+                    != Some((
+                        self.producer_id.as_str(),
+                        self.source_generation_id.as_str(),
+                    ))
+                || overlay.snapshot_id.is_empty()
+                || previous
+                    .as_ref()
+                    .is_some_and(|prior| prior >= &overlay.project_id)
+            {
+                bail!(StoreRequestError::InvalidState);
+            }
+            if let Some(commitment) = &overlay.file_commitment {
+                validate_sha256(commitment)?;
+            }
+            previous = Some(overlay.project_id.clone());
+        }
+        if self
+            .overlay_clears
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+            || self.overlay_clears.iter().any(|project_id| {
+                self.overlays
+                    .iter()
+                    .any(|overlay| overlay.project_id == *project_id)
+            })
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        if self.stage != HistoryActivationStageV1::Superseded {
+            if self
+                .stage
+                .is_at_least(HistoryActivationStageV1::MaterializationAdvanced)
+                && self.catalog_epoch_after.is_none()
+            {
+                bail!(StoreRequestError::InvalidState);
+            }
+            if self
+                .stage
+                .is_at_least(HistoryActivationStageV1::CommitViewPublished)
+                && (self.commit_view_commitment.as_deref()
+                    != Some(self.commit_document_commitment_sha256.as_str())
+                    || self.overlays.iter().any(|overlay| {
+                        overlay.file_commitment.as_deref().is_none_or(str::is_empty)
+                    }))
+            {
+                bail!(StoreRequestError::InvalidState);
+            }
+        }
+        Ok(())
+    }
+
+    fn recompute_checksum(&self) -> Result<String> {
+        let mut projection = self.clone();
+        projection.checksum_sha256.clear();
+        Ok(sha256(&serde_json::to_vec(&projection)?))
+    }
+
+    fn immutable_projection(&self) -> Result<Vec<u8>> {
+        let overlays = self
+            .overlays
+            .iter()
+            .map(|overlay| (&overlay.project_id, &overlay.snapshot_id, &overlay.selector))
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_vec(&(
+            (
+                self.version,
+                &self.source_generation_id,
+                &self.producer_id,
+                &self.source_evidence,
+                &self.grant_commitment,
+                self.catalog_epoch_prepared,
+                &self.repo_history_id,
+                &self.prior_p3_generation_id,
+                &self.planned_p3_generation_id,
+            ),
+            (
+                &self.planned_p3_manifest_sha256,
+                &self.code_selectors,
+                overlays,
+                &self.overlay_clears,
+                self.commit_document_count,
+                &self.commit_document_commitment_sha256,
+                self.vector_input_count,
+                &self.vector_input_commitment_sha256,
+            ),
+        ))?)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct GenerationIndexV1 {
@@ -143,6 +377,12 @@ pub struct HistoryTransportAuthorityV1 {
     pub primary_namespace: CommitNamespace,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHistorySourceAuthorityV1 {
+    pub producer_id: String,
+    pub repo_history_id: RepoHistoryId,
+}
+
 struct MutationGuard<'a> {
     _anchor: StoreLockGuard,
     _in_process: MutexGuard<'a, ()>,
@@ -159,6 +399,7 @@ impl GitSourceStore {
             "records/sha256",
             "repos",
             "generation-index",
+            "activations",
         ] {
             NofollowDirectory::open_or_create(&root.join(relative))?;
         }
@@ -621,6 +862,512 @@ impl GitSourceStore {
         })
     }
 
+    pub fn generation_authority_for_any_producer(
+        &self,
+        source_generation_id: &str,
+    ) -> Result<StoredHistorySourceAuthorityV1> {
+        validate_generation_id(source_generation_id)?;
+        let index = read_json::<GenerationIndexV1>(
+            &self.root.join("generation-index"),
+            &format!("{source_generation_id}.json"),
+            MAX_GENERATION_RECORD_BYTES,
+            "Git-history generation index",
+        )?
+        .ok_or_else(|| anyhow!(StoreRequestError::NotFound))?;
+        if index.source_generation_id != source_generation_id {
+            bail!(StoreRequestError::NotFound);
+        }
+        Ok(StoredHistorySourceAuthorityV1 {
+            producer_id: index.producer_id,
+            repo_history_id: index.repo_history_id,
+        })
+    }
+
+    /// Reverify one immutable accepted source and return its path-free builder
+    /// handoff. Verification reads every manifest record and re-runs graph
+    /// closure; a successful finalize from an earlier process is evidence,
+    /// never a substitute for checking the bytes this process will consume.
+    pub fn verified_history_source(
+        &self,
+        producer_id: &str,
+        source_generation_id: &str,
+    ) -> Result<VerifiedGitHistorySourceV1> {
+        let (verified, manifest) =
+            self.verified_history_source_metadata(producer_id, source_generation_id)?;
+        let source = self.load_generation(&verified.repo_history_id, source_generation_id)?;
+        let mut verifier = HistorySourceVerifier::new(
+            &source.descriptor,
+            &manifest,
+            self.current_limits()?.contract,
+        )?;
+        for entry in &manifest {
+            let bytes = self
+                .read_record_bytes(&entry.content_sha256, entry.encoded_bytes as usize)?
+                .ok_or(StoreRequestError::InvalidState)?;
+            verifier.push_encoded(&bytes)?;
+        }
+        verifier.finish()?;
+        Ok(verified)
+    }
+
+    /// Rebind a verified handoff to the immutable descriptor + manifest
+    /// without rereading the source-sized CAS record set. Every consuming
+    /// pass still hashes and decodes each record it reads; this bounded seam
+    /// is for journal pinning and for avoiding a redundant full graph walk
+    /// before each such pass.
+    fn verified_history_source_metadata(
+        &self,
+        producer_id: &str,
+        source_generation_id: &str,
+    ) -> Result<(VerifiedGitHistorySourceV1, Vec<GitHistoryManifestEntryV1>)> {
+        validate_generation_id(source_generation_id)?;
+        let index = read_json::<GenerationIndexV1>(
+            &self.root.join("generation-index"),
+            &format!("{source_generation_id}.json"),
+            MAX_GENERATION_RECORD_BYTES,
+            "Git-history generation index",
+        )?
+        .ok_or_else(|| anyhow!(StoreRequestError::NotFound))?;
+        if index.producer_id != producer_id || index.source_generation_id != source_generation_id {
+            bail!(StoreRequestError::NotFound);
+        }
+        let source = self.load_generation(&index.repo_history_id, source_generation_id)?;
+        if source.producer_id != producer_id
+            || source.source_generation_id != source_generation_id
+            || matches!(
+                source.state,
+                GitHistorySourceStateV1::ReceivingManifest
+                    | GitHistorySourceStateV1::MissingRecords
+                    | GitHistorySourceStateV1::Failed
+            )
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let generation_dir = self.generation_dir(&source.repo_history_id, source_generation_id)?;
+        let manifest: Vec<GitHistoryManifestEntryV1> = read_json(
+            &generation_dir,
+            "manifest.json",
+            MAX_MANIFEST_BYTES,
+            "Git-history generation manifest",
+        )?
+        .ok_or(StoreRequestError::InvalidState)?;
+        validate_history_manifest(
+            &source.descriptor,
+            &manifest,
+            self.current_limits()?.contract,
+        )?;
+        let source_evidence = sha256(&serde_json::to_vec(&(
+            &source.source_generation_id,
+            &source.producer_id,
+            &source.repo_history_id,
+            &source.primary_namespace,
+            &source.descriptor,
+            &manifest,
+        ))?);
+        Ok((
+            VerifiedGitHistorySourceV1 {
+                source_generation_id: source.source_generation_id,
+                producer_id: source.producer_id,
+                authority_scope: source.descriptor.scope.clone(),
+                repo_history_id: source.repo_history_id,
+                primary_namespace: source.primary_namespace,
+                repo_head: source.descriptor.repo_head,
+                manifest_sha256: source.descriptor.manifest_sha256,
+                source_evidence,
+                commit_count: source.descriptor.commit_count,
+            },
+            manifest,
+        ))
+    }
+
+    /// Re-prove the bounded immutable metadata pinned by an activation
+    /// journal without rereading the source-sized record set. Later recovery
+    /// stages use this before trusting already-published P3/index/sidecar
+    /// commitments; any repair that must consume records still goes through
+    /// [`Self::verified_history_source`] and the per-record visitor.
+    pub fn verify_activation_source_pin(
+        &self,
+        journal: &HistoryActivationJournalV1,
+    ) -> Result<VerifiedGitHistorySourceV1> {
+        let (source, _) = self.verified_history_source_metadata(
+            &journal.producer_id,
+            &journal.source_generation_id,
+        )?;
+        if source.repo_history_id != journal.repo_history_id
+            || source.source_evidence != journal.source_evidence
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(source)
+    }
+
+    /// Visit a reverified source one reconstructed commit at a time.
+    ///
+    /// The manifest is ordered by `(commit_oid, fragment_index)`, so only one
+    /// commit's changed-path set is resident. The source metadata and every
+    /// record hash are rechecked against the verified handoff before the
+    /// visitor receives anything.
+    pub fn visit_verified_history_commits(
+        &self,
+        source: &VerifiedGitHistorySourceV1,
+        mut visit: impl FnMut(VerifiedGitHistoryCommitV1) -> Result<()>,
+    ) -> Result<()> {
+        let (current, manifest) = self
+            .verified_history_source_metadata(&source.producer_id, &source.source_generation_id)?;
+        if &current != source {
+            bail!(StoreRequestError::InvalidState);
+        }
+
+        let mut active_oid: Option<String> = None;
+        let mut header: Option<bbox_git_source::GitHistoryCommitHeaderV1> = None;
+        let mut changed_paths = Vec::new();
+        let mut emitted = 0_u64;
+        let flush = |oid: &mut Option<String>,
+                     header: &mut Option<bbox_git_source::GitHistoryCommitHeaderV1>,
+                     paths: &mut Vec<String>,
+                     emitted: &mut u64,
+                     visit: &mut dyn FnMut(VerifiedGitHistoryCommitV1) -> Result<()>|
+         -> Result<()> {
+            let Some(oid) = oid.take() else {
+                return Ok(());
+            };
+            let header = header.take().ok_or(StoreRequestError::InvalidState)?;
+            visit(VerifiedGitHistoryCommitV1 {
+                commit: GitCommit {
+                    sha: oid,
+                    parent_shas: header.parent_oids,
+                    author_name: header.author_name,
+                    author_email: header.author_email,
+                    message: header.message,
+                },
+                changed_paths: std::mem::take(paths),
+            })?;
+            *emitted = emitted.saturating_add(1);
+            Ok(())
+        };
+
+        for entry in &manifest {
+            if active_oid
+                .as_deref()
+                .is_some_and(|active| active != entry.commit_oid)
+            {
+                flush(
+                    &mut active_oid,
+                    &mut header,
+                    &mut changed_paths,
+                    &mut emitted,
+                    &mut visit,
+                )?;
+            }
+            let bytes = self
+                .read_record_bytes(&entry.content_sha256, entry.encoded_bytes as usize)?
+                .ok_or(StoreRequestError::InvalidState)?;
+            let fragment = bbox_git_source::decode_history_fragment(&bytes)?;
+            if active_oid.is_none() {
+                active_oid = Some(fragment.commit_oid.clone());
+            }
+            if let Some(fragment_header) = fragment.header {
+                if header.replace(fragment_header).is_some() {
+                    bail!(StoreRequestError::InvalidState);
+                }
+            }
+            changed_paths.extend(fragment.changed_paths);
+        }
+        flush(
+            &mut active_oid,
+            &mut header,
+            &mut changed_paths,
+            &mut emitted,
+            &mut visit,
+        )?;
+        if emitted != source.commit_count {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(())
+    }
+
+    pub fn read_activation_journal(
+        &self,
+        repo_history_id: &RepoHistoryId,
+    ) -> Result<Option<HistoryActivationJournalV1>> {
+        let journal = read_json::<HistoryActivationJournalV1>(
+            &self.root.join("activations"),
+            &format!("{}.json", repo_history_id.as_str()),
+            MAX_GENERATION_RECORD_BYTES,
+            "Git-history activation journal",
+        )?;
+        if let Some(journal) = journal.as_ref() {
+            journal.validate()?;
+            if &journal.repo_history_id != repo_history_id {
+                bail!(StoreRequestError::InvalidState);
+            }
+        }
+        Ok(journal)
+    }
+
+    /// Install `Prepared` or monotonically advance one existing activation.
+    /// Immutable plan fields cannot drift after preparation; recovery changes
+    /// only progress evidence and exact publication commitments.
+    pub fn save_activation_journal(
+        &self,
+        journal: HistoryActivationJournalV1,
+    ) -> Result<HistoryActivationJournalV1> {
+        let _guard = self.lock_mutation()?;
+        let journal = journal.seal()?;
+        journal.validate()?;
+        let previous = self.read_activation_journal(&journal.repo_history_id)?;
+        match previous.as_ref() {
+            None if journal.stage != HistoryActivationStageV1::Prepared => {
+                bail!(StoreRequestError::InvalidState);
+            }
+            None => {}
+            Some(previous)
+                if previous.stage.terminal()
+                    && journal.stage == HistoryActivationStageV1::Prepared => {}
+            Some(previous) => {
+                if previous.immutable_projection()? != journal.immutable_projection()? {
+                    bail!(StoreRequestError::InvalidState);
+                }
+                if previous.stage.terminal() && previous.stage != journal.stage {
+                    bail!(StoreRequestError::InvalidState);
+                }
+                if journal.stage != HistoryActivationStageV1::Superseded {
+                    let Some(previous_ordinal) = previous.stage.ordinal() else {
+                        bail!(StoreRequestError::InvalidState);
+                    };
+                    let Some(next_ordinal) = journal.stage.ordinal() else {
+                        bail!(StoreRequestError::InvalidState);
+                    };
+                    if next_ordinal < previous_ordinal
+                        || next_ordinal > previous_ordinal.saturating_add(1)
+                    {
+                        bail!(StoreRequestError::InvalidState);
+                    }
+                }
+            }
+        }
+        if journal.stage == HistoryActivationStageV1::Prepared {
+            let (verified, _) = self.verified_history_source_metadata(
+                &journal.producer_id,
+                &journal.source_generation_id,
+            )?;
+            if verified.repo_history_id != journal.repo_history_id
+                || verified.source_evidence != journal.source_evidence
+            {
+                bail!(StoreRequestError::InvalidState);
+            }
+        }
+        let activations = NofollowDirectory::open_existing(&self.root.join("activations"))?
+            .ok_or(StoreRequestError::InvalidState)?;
+        write_json(
+            &activations,
+            &format!("{}.json", journal.repo_history_id.as_str()),
+            &journal,
+        )?;
+        Ok(journal)
+    }
+
+    pub fn list_activation_journals(&self) -> Result<Vec<HistoryActivationJournalV1>> {
+        let root = self.root.join("activations");
+        let mut journals = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Some(journal) = read_json::<HistoryActivationJournalV1>(
+                &root,
+                &name,
+                MAX_GENERATION_RECORD_BYTES,
+                "Git-history activation journal",
+            )?
+            else {
+                continue;
+            };
+            journal.validate()?;
+            if name != format!("{}.json", journal.repo_history_id.as_str()) {
+                bail!(StoreRequestError::InvalidState);
+            }
+            journals.push(journal);
+        }
+        journals.sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+        Ok(journals)
+    }
+
+    pub fn activation_source_roots(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .list_activation_journals()?
+            .into_iter()
+            .map(|journal| journal.source_generation_id)
+            .collect())
+    }
+
+    pub fn current_ready_source_ids(&self) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for repo_dir in read_directories(&self.root.join("repos"))? {
+            let history_dir = repo_dir.join("history");
+            if NofollowDirectory::open_existing(&history_dir)?.is_none() {
+                continue;
+            }
+            if let Some(pointer) = read_json::<ReadyPointerV1>(
+                &history_dir,
+                "current-ready.json",
+                MAX_GENERATION_RECORD_BYTES,
+                "Git-history ready pointer",
+            )? {
+                validate_generation_id(&pointer.source_generation_id)?;
+                ids.push(pointer.source_generation_id);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    pub fn current_ready_source_id(
+        &self,
+        repo_history_id: &RepoHistoryId,
+    ) -> Result<Option<String>> {
+        let history_dir = self.repo_history_root(repo_history_id)?;
+        let Some(pointer) = read_json::<ReadyPointerV1>(
+            &history_dir,
+            "current-ready.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "Git-history ready pointer",
+        )?
+        else {
+            return Ok(None);
+        };
+        validate_generation_id(&pointer.source_generation_id)?;
+        let source = self.load_generation(repo_history_id, &pointer.source_generation_id)?;
+        if source.producer_id != pointer.producer_id
+            || source.descriptor.repo_head != pointer.repo_head
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        Ok(Some(pointer.source_generation_id))
+    }
+
+    pub fn set_history_source_state(
+        &self,
+        producer_id: &str,
+        source_generation_id: &str,
+        next: GitHistorySourceStateV1,
+        diagnostic: Option<String>,
+    ) -> Result<StoredHistorySourceV1> {
+        let _guard = self.lock_mutation()?;
+        let authority = self.generation_authority(producer_id, source_generation_id)?;
+        let mut source = self.load_generation(&authority.repo_history_id, source_generation_id)?;
+        let allowed = source.state == next
+            || matches!(
+                (source.state, next),
+                (
+                    GitHistorySourceStateV1::Ready,
+                    GitHistorySourceStateV1::Materializing
+                ) | (
+                    GitHistorySourceStateV1::Active,
+                    GitHistorySourceStateV1::Materializing
+                ) | (
+                    GitHistorySourceStateV1::Superseded,
+                    GitHistorySourceStateV1::Materializing
+                ) | (
+                    GitHistorySourceStateV1::Materializing,
+                    GitHistorySourceStateV1::Publishing
+                ) | (
+                    GitHistorySourceStateV1::Publishing,
+                    GitHistorySourceStateV1::Active
+                ) | (
+                    GitHistorySourceStateV1::Ready,
+                    GitHistorySourceStateV1::Superseded
+                ) | (
+                    GitHistorySourceStateV1::Materializing,
+                    GitHistorySourceStateV1::Superseded
+                ) | (
+                    GitHistorySourceStateV1::Publishing,
+                    GitHistorySourceStateV1::Superseded
+                ) | (
+                    GitHistorySourceStateV1::Active,
+                    GitHistorySourceStateV1::Superseded
+                ) | (
+                    GitHistorySourceStateV1::Ready,
+                    GitHistorySourceStateV1::Failed
+                ) | (
+                    GitHistorySourceStateV1::Materializing,
+                    GitHistorySourceStateV1::Failed
+                ) | (
+                    GitHistorySourceStateV1::Publishing,
+                    GitHistorySourceStateV1::Failed
+                )
+            );
+        if !allowed {
+            bail!(StoreRequestError::InvalidState);
+        }
+        source.state = next;
+        source.diagnostic = diagnostic.map(|value| value.chars().take(512).collect());
+        let generation_dir = NofollowDirectory::open_existing(
+            &self.generation_dir(&authority.repo_history_id, source_generation_id)?,
+        )?
+        .ok_or(StoreRequestError::NotFound)?;
+        write_json(&generation_dir, "source.json", &source)?;
+        Ok(source)
+    }
+
+    /// Retire older active sources after the selected activation is durable.
+    ///
+    /// This is deliberately state-selective: a newer `Ready` upload may have
+    /// arrived while the current activation was publishing and remains
+    /// eligible for the next activation. Only obsolete `Active` rows are
+    /// superseded, including the prior source left active when recovery
+    /// resumes after the journal replaced its committed predecessor.
+    pub fn supersede_other_active_history_sources(
+        &self,
+        repo_history_id: &RepoHistoryId,
+        active_source_generation_id: &str,
+    ) -> Result<u64> {
+        validate_generation_id(active_source_generation_id)?;
+        let _guard = self.lock_mutation()?;
+        let history_dir = self.repo_history_root(repo_history_id)?;
+        let mut superseded = 0_u64;
+        for generation_dir in read_child_directories(&history_dir, &["current-ready.json"])? {
+            let Some(mut source) = read_json::<StoredHistorySourceV1>(
+                &generation_dir,
+                "source.json",
+                MAX_GENERATION_RECORD_BYTES,
+                "stored Git-history source",
+            )?
+            else {
+                bail!("Git-history generation is missing source metadata");
+            };
+            if source.repo_history_id != *repo_history_id
+                || generation_dir.file_name().and_then(|name| name.to_str())
+                    != Some(source.source_generation_id.as_str())
+            {
+                bail!("Git-history generation metadata does not match its durable location");
+            }
+            if source.source_generation_id == active_source_generation_id
+                || source.state != GitHistorySourceStateV1::Active
+            {
+                continue;
+            }
+            source.state = GitHistorySourceStateV1::Superseded;
+            source.diagnostic = Some(format!(
+                "superseded by activated source {active_source_generation_id}"
+            ));
+            let directory = NofollowDirectory::open_existing(&generation_dir)?
+                .ok_or(StoreRequestError::NotFound)?;
+            write_json(&directory, "source.json", &source)?;
+            superseded = superseded.saturating_add(1);
+        }
+        Ok(superseded)
+    }
+
     fn missing_history_records_locked(
         &self,
         upload: &HistoryUploadRecordV1,
@@ -836,7 +1583,11 @@ impl GitSourceStore {
                     != Some(source.source_generation_id.as_str())
                     || repo_dir.file_name().and_then(|name| name.to_str())
                         != Some(source.repo_history_id.as_str())
-                    || source.state != GitHistorySourceStateV1::Ready
+                    || matches!(
+                        source.state,
+                        GitHistorySourceStateV1::ReceivingManifest
+                            | GitHistorySourceStateV1::MissingRecords
+                    )
                 {
                     bail!("Git-history generation metadata does not match its durable location");
                 }
@@ -878,6 +1629,19 @@ impl GitSourceStore {
             }
             let mut keep = protected_generation_ids.clone();
             keep.extend(retained_by_policy);
+            keep.extend(
+                sources
+                    .iter()
+                    .filter(|source| {
+                        matches!(
+                            source.state,
+                            GitHistorySourceStateV1::Materializing
+                                | GitHistorySourceStateV1::Publishing
+                                | GitHistorySourceStateV1::Active
+                        )
+                    })
+                    .map(|source| source.source_generation_id.clone()),
+            );
             for source in sources {
                 if keep.contains(&source.source_generation_id) {
                     continue;
@@ -1030,8 +1794,10 @@ impl GitSourceStore {
     ) -> Result<MaintenanceReport> {
         let limits = self.current_limits()?;
         let expired_uploads = self.expire_stale_uploads(now)?;
+        let mut protected_generation_ids = protected_generation_ids.clone();
+        protected_generation_ids.extend(self.activation_source_roots()?);
         let retired_generations = self.retire_old_generations(
-            protected_generation_ids,
+            &protected_generation_ids,
             limits.retained_history_generations,
         )?;
         let referenced_records = self.referenced_record_hashes(limits.contract)?;
@@ -1420,6 +2186,53 @@ mod tests {
             .sum()
     }
 
+    fn activation_journal(
+        source: &VerifiedGitHistorySourceV1,
+        history: &RepoHistoryId,
+    ) -> HistoryActivationJournalV1 {
+        let p3 = format!("rhg_{}", "a".repeat(64));
+        HistoryActivationJournalV1 {
+            version: 1,
+            stage: HistoryActivationStageV1::Prepared,
+            source_generation_id: source.source_generation_id.clone(),
+            producer_id: source.producer_id.clone(),
+            source_evidence: source.source_evidence.clone(),
+            grant_commitment: "b".repeat(64),
+            catalog_epoch_prepared: 7,
+            catalog_epoch_after: None,
+            repo_history_id: history.clone(),
+            prior_p3_generation_id: None,
+            planned_p3_generation_id: p3.clone(),
+            planned_p3_manifest_sha256: "c".repeat(64),
+            code_selectors: BTreeMap::from([("p_one".into(), "code-one".into())]),
+            overlays: vec![HistoryActivationOverlayV1 {
+                project_id: "p_one".into(),
+                snapshot_id: "snapshot-one".into(),
+                selector: GitOverlaySelector {
+                    project_id: "p_one".into(),
+                    code_generation: "code-one".into(),
+                    repo_history_generation: p3,
+                    source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::ProducerTransport {
+                        producer_id: source.producer_id.clone(),
+                        source_generation_id: source.source_generation_id.clone(),
+                    },
+                    repo_head: source.repo_head.clone(),
+                    commit_namespace: source.primary_namespace.as_str().to_string(),
+                    overlay_generation: 1,
+                },
+                file_commitment: None,
+            }],
+            overlay_clears: Vec::new(),
+            commit_document_count: 2,
+            commit_document_commitment_sha256: "d".repeat(64),
+            vector_input_count: 2,
+            vector_input_commitment_sha256: "e".repeat(64),
+            commit_view_commitment: None,
+            diagnostic: None,
+            checksum_sha256: String::new(),
+        }
+    }
+
     #[test]
     fn resumable_history_intake_reaches_ready_and_survives_reopen() {
         let temp = tempfile::tempdir().unwrap();
@@ -1548,6 +2361,167 @@ mod tests {
                     std::io::Cursor::new(corrupt),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn verified_handoff_streams_reconstructed_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap();
+        let namespace = CommitNamespace::parse("repo-a").unwrap();
+        let (_, generation) = ingest_fixture(&store, &history, &namespace, fixture());
+        let source = store
+            .verified_history_source("producer-a", &generation)
+            .unwrap();
+        let mut observed = Vec::new();
+        store
+            .visit_verified_history_commits(&source, |commit| {
+                observed.push((commit.commit.sha, commit.changed_paths));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            observed,
+            vec![
+                ("1".repeat(40), vec!["README.md".to_string()]),
+                ("2".repeat(40), vec!["src/lib.rs".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_journal_is_monotonic_and_roots_its_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = GitSourceStore::open(
+            &root,
+            StoreLimits {
+                retained_history_generations: 1,
+                unreferenced_record_grace_secs: 0,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap();
+        let namespace = CommitNamespace::parse("repo-a").unwrap();
+        let (_, generation_one) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        set_generation_created(&store, &history, &generation_one, 1);
+        let source = store
+            .verified_history_source("producer-a", &generation_one)
+            .unwrap();
+        let mut journal = store
+            .save_activation_journal(activation_journal(&source, &history))
+            .unwrap();
+
+        let mut skipped = journal.clone();
+        skipped.stage = HistoryActivationStageV1::MaterializationAdvanced;
+        skipped.catalog_epoch_after = Some(8);
+        assert!(store.save_activation_journal(skipped).is_err());
+
+        journal.stage = HistoryActivationStageV1::GenerationVerified;
+        journal = store.save_activation_journal(journal).unwrap();
+        let mut drifted = journal.clone();
+        drifted
+            .code_selectors
+            .insert("p_one".into(), "foreign".into());
+        assert!(store.save_activation_journal(drifted).is_err());
+
+        journal.stage = HistoryActivationStageV1::MaterializationAdvanced;
+        journal.catalog_epoch_after = Some(8);
+        journal = store.save_activation_journal(journal).unwrap();
+        let mut incomplete = journal.clone();
+        incomplete.stage = HistoryActivationStageV1::CommitViewPublished;
+        assert!(store.save_activation_journal(incomplete).is_err());
+        journal.stage = HistoryActivationStageV1::CommitViewPublished;
+        journal.commit_view_commitment = Some("d".repeat(64));
+        let missing_receipt = journal.clone();
+        assert!(store.save_activation_journal(missing_receipt).is_err());
+        journal.overlays[0].file_commitment = Some("f".repeat(64));
+        journal = store.save_activation_journal(journal).unwrap();
+        journal.stage = HistoryActivationStageV1::OverlaysPublished;
+        let mut invalid_receipt = journal.clone();
+        invalid_receipt.overlays[0].file_commitment = Some("transient-txn-token".into());
+        assert!(store.save_activation_journal(invalid_receipt).is_err());
+        journal = store.save_activation_journal(journal).unwrap();
+        journal.stage = HistoryActivationStageV1::Committed;
+        journal = store.save_activation_journal(journal).unwrap();
+        let mut backwards = journal.clone();
+        backwards.stage = HistoryActivationStageV1::OverlaysPublished;
+        assert!(store.save_activation_journal(backwards).is_err());
+
+        let (_, generation_two) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        set_generation_created(&store, &history, &generation_two, 2);
+        let (_, generation_three) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '4'));
+        set_generation_created(&store, &history, &generation_three, 3);
+        store.maintain(&BTreeSet::new()).unwrap();
+        assert!(store.history_status("producer-a", &generation_one).is_ok());
+        assert!(store.history_status("producer-a", &generation_two).is_ok());
+        assert!(
+            store
+                .history_status("producer-a", &generation_three)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn committing_a_source_supersedes_only_older_active_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap();
+        let namespace = CommitNamespace::parse("repo-a").unwrap();
+        let (_, first) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        let (_, second) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        let (_, pending) = ingest_fixture(&store, &history, &namespace, fixture_for('1', '4'));
+        for generation in [&first, &second] {
+            store
+                .set_history_source_state(
+                    "producer-a",
+                    generation,
+                    GitHistorySourceStateV1::Materializing,
+                    None,
+                )
+                .unwrap();
+            store
+                .set_history_source_state(
+                    "producer-a",
+                    generation,
+                    GitHistorySourceStateV1::Publishing,
+                    None,
+                )
+                .unwrap();
+            store
+                .set_history_source_state(
+                    "producer-a",
+                    generation,
+                    GitHistorySourceStateV1::Active,
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .supersede_other_active_history_sources(&history, &second)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.history_status("producer-a", &first).unwrap().state,
+            GitHistorySourceStateV1::Superseded
+        );
+        assert_eq!(
+            store.history_status("producer-a", &second).unwrap().state,
+            GitHistorySourceStateV1::Active
+        );
+        assert_eq!(
+            store.history_status("producer-a", &pending).unwrap().state,
+            GitHistorySourceStateV1::Ready
         );
     }
 

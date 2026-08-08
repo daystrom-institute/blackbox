@@ -1244,3 +1244,56 @@ until a later entry explicitly supersedes it.
   store with catalog assignment, or selector retirement moves to an external
   durable scheduler that preserves the same exact-key and completion-event
   contracts.
+
+## D-043: Typed producer history is a third P3 builder caller with durable source provenance
+
+- Date: 2026-08-08
+- Phase: typed Git-history transport, GH-C
+- Status: accepted with the GH-C implementation and governing-design amendment
+- Decision: the single P3 history-generation builder has exactly three caller
+  classes: the pre-replacement materializer (including the Phase 6 path-free
+  rebuild), the live checkout refresh, and authenticated typed producer
+  refresh. Producer refresh may prepare the builder's exact future
+  content-addressed id so a monotonic activation journal can name it before
+  publication, but it cannot construct or publish a parallel generation
+  format. `GitOverlaySelector` replaces its flat attachment field with the
+  closed source discriminant `Attachment { attachment_id } |
+  ProducerTransport { producer_id, source_generation_id }`; producer transport
+  never fabricates an attachment id. Old flat attachment bytes are read only
+  as an unambiguous migration form and all new writes are typed.
+- Recovery consequence: producer activation binds the exact P3 generation,
+  catalog materialization, complete Tantivy namespace, code selectors, typed
+  overlay selectors, and durable per-snapshot receipt digests in one monotonic
+  journal. Pre-bind recovery re-proves those authorities before exposing a
+  producer overlay. A mismatch clears only the producer overlay and schedules
+  background repair; it neither exposes a partial view nor makes code search
+  depend on a checkout or a sidecar-estate scan.
+- Evidence:
+  - A flat `attachment_id` cannot truthfully name a source uploaded by an
+    authenticated producer and would make checkout detach appear to revoke
+    immutable transported history.
+  - A second producer-specific generation writer would fork the P3 identity,
+    rebuild, vector, and GC proofs. Lowering typed commits into the certified
+    canonical rows preserves byte-identical ids for equal facts.
+  - Transaction commitments are temporary closeout evidence and can disappear
+    from later Tantivy payloads. The activation journal therefore stores the
+    final receipt content digest and verifies it against the manifest binding
+    and receipt bytes; the commit-view probe compares the complete
+    `(repo_id, doc_type=commit)` lane, catching missing rows, duplicates, and
+    force-push residue without treating code chunks as history rows.
+  - Source-sized verification and rebuilding run in the background activation
+    lane. Startup inspects only the selected producer repos, their Tantivy
+    namespaces, and named snapshot receipts, never the global edge estate.
+- Rejected alternatives:
+  - Encode producer provenance in an attachment sentinel. That lies about
+    authority, collides with detach semantics, and leaves no generation-scoped
+    GC root.
+  - Let producer refresh write its own generation manifest. That creates a
+    fourth identity authority rather than a third caller of one authority.
+  - Trust `Committed` as sufficient recovery evidence. A crash between an
+    external publication and its checkpoint, later receipt damage, or stale
+    force-pushed documents can all make the label disagree with served bytes.
+- Revisit only if: history generation construction moves to an external
+  transactional service with an equally singular identity API, or the edge
+  sidecar gains a stronger durable multi-project publication primitive that
+  subsumes the per-snapshot receipt commitments.

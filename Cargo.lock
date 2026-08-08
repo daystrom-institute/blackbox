@@ -614,6 +614,8 @@ dependencies = [
  "bbox-edge-index",
  "bbox-edge-sidecar",
  "bbox-gaps",
+ "bbox-git-source",
+ "bbox-git-source-store",
  "bbox-indexing",
  "bbox-knowledge",
  "bbox-packets",

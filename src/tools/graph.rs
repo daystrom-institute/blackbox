@@ -2714,7 +2714,9 @@ mod catalog_adapter_tests {
                 project_id: project_id.to_string(),
                 code_generation: "cg_test".into(),
                 repo_history_generation: "rhg_test".into(),
-                attachment_id: ATTACHMENT_ONE.into(),
+                source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::Attachment {
+                    attachment_id: ATTACHMENT_ONE.into(),
+                },
                 repo_head: repo_head.to_string(),
                 commit_namespace: "ns".into(),
                 overlay_generation: 1,

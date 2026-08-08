@@ -101,6 +101,12 @@ below bbox-indexing (ingest passes, sidecars) can call them.
   remigration from the v1 predecessor. A source added later is absent from the
   list and therefore refuses rather than being guessed at; a test in
   bbox-indexing walks the owner set and pins the two lists together.
+- `GitOverlaySelector.source` is a closed authority discriminant:
+  `Attachment { attachment_id }` or `ProducerTransport { producer_id,
+  source_generation_id }`. Producer transport never uses an attachment
+  sentinel. The custom reader alone accepts the legacy flat `attachment_id`
+  form, only when `source` is absent; new serialization is always typed and
+  both/neither forms fail closed.
 
 ## Rerank math (search/rerank.rs)
 
