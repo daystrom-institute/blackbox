@@ -687,9 +687,17 @@ fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Ve
         return Ok(Vec::new());
     }
     let dir = repo_gaps_dir(project_dir);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
+    let directory = match bbox_corpus_core::json_store::NofollowDirectory::open_existing(&dir) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return Ok(Vec::new()),
+        Err(error) => {
+            tracing::warn!(
+                "gaps load: refusing unsafe directory {}: {error:#}",
+                dir.display()
+            );
+            return Ok(Vec::new());
+        }
+    };
     let mut out = Vec::new();
     let mut skipped = 0usize;
     let read_dir = match fs::read_dir(&dir) {
@@ -756,6 +764,13 @@ fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Ve
             out.len(),
             skipped
         );
+    }
+    if let Err(error) = directory.ensure_still_current() {
+        tracing::warn!(
+            "gaps load: directory changed during read {}; discarding snapshot: {error:#}",
+            dir.display()
+        );
+        return Ok(Vec::new());
     }
     Ok(out)
 }
@@ -2645,6 +2660,36 @@ mod tests {
 
         let loaded = load_repo_gap_entries(&root, root.to_string_lossy().as_ref()).unwrap();
         assert!(loaded.is_empty(), "symlinked gap must not load");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_gap_loader_rejects_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempdir().unwrap();
+        let central = tempdir().unwrap();
+        let mut seed = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        seed.file(&file_params(
+            "linked",
+            "tooling/test-domain/symlink-gap-directory",
+        ))
+        .unwrap();
+        let mut linked = seed.all()[0].clone();
+        linked.id = "gap-linked".into();
+        linked.project = None;
+        fs::write(
+            outside.path().join("gap-linked.json"),
+            serde_json::to_vec(&linked).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        symlink(outside.path(), repo_gaps_dir(&root)).unwrap();
+
+        let loaded = load_repo_gap_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        assert!(loaded.is_empty(), "symlinked gap directory must not load");
     }
 
     /// Generation purge still reaps a file whose gap the store has

@@ -1,4 +1,7 @@
+use std::collections::BTreeSet;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -13,6 +16,7 @@ const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
 // versioned JSON. Keep the envelope bounded without applying the broker's
 // per-component limit to the encoded aggregate.
 const MAX_CARRIER_ID_BYTES: usize = 4096;
+const MAX_GAP_SPOOL_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GapSpoolImportReport {
@@ -242,6 +246,20 @@ fn import_source(
     report: &mut GapSpoolImportReport,
     source: &SpoolSource,
 ) -> Result<()> {
+    if source.allowed_root.is_some() {
+        match bbox_corpus_core::json_store::NofollowDirectory::open_existing(&source.inbox_dir) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                report.rejected.push(RejectedGapFile {
+                    path: source.report_path(&source.inbox_dir),
+                    moved_to: None,
+                    error: format!("repository gap spool path is unsafe: {err:#}"),
+                });
+                return Ok(());
+            }
+        }
+    }
     let inbox_dir = match source.inbox_dir.canonicalize() {
         Ok(inbox_dir) => inbox_dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -268,6 +286,10 @@ fn import_source(
         logical_prefix: source.logical_prefix.clone(),
         allowed_root: source.allowed_root.clone(),
     };
+    let tracked_at_head = match source.allowed_root.as_deref() {
+        Some(root) => tracked_spool_paths_at_head(root)?,
+        None => BTreeSet::new(),
+    };
     let entries = match fs::read_dir(&source.inbox_dir) {
         Ok(entries) => entries,
         Err(err) => {
@@ -289,6 +311,18 @@ fn import_source(
         if !file_type.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
+        if source.allowed_root.as_deref().is_some_and(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                .is_some_and(|relative| tracked_at_head.contains(&relative))
+        }) {
+            report.skipped.push(SkippedGapFile {
+                path: source.report_path(&path),
+                reason: "repository spool file is tracked at HEAD".into(),
+            });
+            continue;
+        }
         import_one(gaps, state, report, &source, &path)?;
     }
     Ok(())
@@ -301,7 +335,13 @@ fn import_one(
     source: &SpoolSource,
     path: &Path,
 ) -> Result<()> {
-    let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = match read_bounded_spool_file(path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            reject_file(report, source, path, format!("invalid spool file: {err:#}"))?;
+            return Ok(());
+        }
+    };
     let hash = sha256_hex(&raw);
     let path_s = source.report_path(path);
     if state
@@ -396,6 +436,74 @@ fn import_one(
     Ok(())
 }
 
+fn tracked_spool_paths_at_head(root: &Path) -> Result<BTreeSet<String>> {
+    let Some(head) = bbox_corpus_core::git::current_head(root) else {
+        return Ok(BTreeSet::new());
+    };
+    let output = bbox_corpus_core::git::git_output(
+        root,
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            &head,
+            "--",
+            ".bbox/gaps/inbox",
+        ],
+        "checking committed gap spool files",
+    )
+    .context("running bounded git tree inspection for gap spool")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "checking committed gap spool files failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
+fn read_bounded_spool_file(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting gap spool file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        anyhow::bail!("gap spool entry is not a regular file");
+    }
+    if metadata.len() > MAX_GAP_SPOOL_FILE_BYTES as u64 {
+        anyhow::bail!(
+            "gap spool file exceeds {} byte limit",
+            MAX_GAP_SPOOL_FILE_BYTES
+        );
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening gap spool file {}", path.display()))?;
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_GAP_SPOOL_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .with_context(|| format!("reading gap spool file {}", path.display()))?;
+    if raw.len() > MAX_GAP_SPOOL_FILE_BYTES {
+        anyhow::bail!(
+            "gap spool file exceeds {} byte limit",
+            MAX_GAP_SPOOL_FILE_BYTES
+        );
+    }
+    Ok(raw)
+}
+
 fn reject_file(
     report: &mut GapSpoolImportReport,
     source: &SpoolSource,
@@ -475,6 +583,7 @@ mod tests {
     use super::*;
     use crate::repo_io::test_support::TestGapRepoIo;
     use crate::repo_io::{GapRepoRead, GapRepoWrite};
+    use std::process::Command;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -499,6 +608,16 @@ mod tests {
             "dedupe_key": format!("workflow/gap-spool-test/{dedupe_slug}")
         })
         .to_string()
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
     }
 
     #[test]
@@ -627,6 +746,68 @@ mod tests {
         assert_eq!(report.rejected.len(), 1);
         assert!(host.join("rejected/bad.json").exists());
         assert!(host.join("rejected/bad.json.error.txt").exists());
+        assert!(gaps.all().is_empty());
+    }
+
+    #[test]
+    fn rejects_oversized_spool_file_without_unbounded_read() {
+        let dir = tempdir().unwrap();
+        let host = dir.path().join("host/inbox");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(
+            host.join("huge.json"),
+            vec![b'x'; MAX_GAP_SPOOL_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+        let io = TestGapRepoIo::default();
+
+        let report = import_gap_spool_with_host_inbox(
+            &mut gaps,
+            &[],
+            &io,
+            &dir.path().join("state"),
+            Some(host.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(report.rejected.len(), 1);
+        assert!(report.rejected[0].error.contains("exceeds"));
+        assert!(host.join("rejected/huge.json").exists());
+        assert!(gaps.all().is_empty());
+    }
+
+    #[test]
+    fn repository_spool_skips_files_tracked_at_head() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        let inbox = project.join(".bbox/gaps/inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let gap_path = inbox.join("committed.json");
+        let original = gap_body("Committed inbox entry", "committed");
+        fs::write(&gap_path, &original).unwrap();
+        git(&project, &["init", "-q", "-b", "main"]);
+        git(&project, &["config", "user.email", "t@example.com"]);
+        git(&project, &["config", "user.name", "Test"]);
+        git(&project, &["add", ".bbox/gaps/inbox/committed.json"]);
+        git(&project, &["commit", "-q", "-m", "committed inbox"]);
+
+        let canonical = project.canonicalize().unwrap();
+        let (io, carriers) = repo_access(&canonical, "project:test");
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
+        let report = import_gap_spool_with_host_inbox(
+            &mut gaps,
+            &carriers,
+            io.as_ref(),
+            &dir.path().join("state"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].reason.contains("tracked at HEAD"));
+        assert_eq!(fs::read_to_string(&gap_path).unwrap(), original);
+        assert!(!inbox.join("imported/committed.json").exists());
         assert!(gaps.all().is_empty());
     }
 

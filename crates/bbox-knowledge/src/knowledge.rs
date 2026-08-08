@@ -886,15 +886,32 @@ struct RecallStat {
 /// are advisory ranking input, never durable truth — losing them only resets a
 /// small ranking boost, so a corrupt sidecar must never block loading entries).
 fn load_repo_kb_stats(project_dir: &Path) -> std::collections::BTreeMap<String, RecallStat> {
-    let path = repo_kb_stats_path(project_dir);
-    let raw = match fs::read_to_string(&path) {
+    const MAX_RECALL_STATS_BYTES: usize = 8 * 1024 * 1024;
+    let local_dir = project_dir.join(".bbox").join("local");
+    let directory = match bbox_corpus_core::json_store::NofollowDirectory::open_existing(&local_dir)
+    {
+        Ok(Some(directory)) => directory,
+        Ok(None) | Err(_) => return std::collections::BTreeMap::new(),
+    };
+    let raw = match directory.read_regular(
+        "knowledge-stats.json",
+        MAX_RECALL_STATS_BYTES,
+        "knowledge recall-stats sidecar",
+    ) {
+        Ok(Some(raw)) => raw,
+        Ok(None) | Err(_) => return std::collections::BTreeMap::new(),
+    };
+    if directory.ensure_still_current().is_err() {
+        return std::collections::BTreeMap::new();
+    }
+    let raw = match String::from_utf8(raw) {
         Ok(raw) => raw,
         Err(_) => return std::collections::BTreeMap::new(),
     };
     serde_json::from_str(&raw).unwrap_or_else(|e| {
         tracing::warn!(
             "kb recall-stats sidecar unparseable at {}: {e}",
-            path.display()
+            repo_kb_stats_path(project_dir).display()
         );
         std::collections::BTreeMap::new()
     })
@@ -927,36 +944,45 @@ fn persist_repo_kb_stats(
     project_dir: &Path,
     stats: &std::collections::BTreeMap<String, RecallStat>,
 ) -> Result<()> {
-    let path = repo_kb_stats_path(project_dir);
     let local_dir = project_dir.join(".bbox").join("local");
     // If there is nothing to record and no sidecar exists yet, do not create the
     // local dir at all (keeps a pristine repo free of an empty sidecar).
-    if stats.is_empty() && !path.exists() {
-        return Ok(());
+    if stats.is_empty() {
+        match bbox_corpus_core::json_store::NofollowDirectory::open_existing(&local_dir)? {
+            Some(directory)
+                if directory
+                    .read_regular(
+                        "knowledge-stats.json",
+                        8 * 1024 * 1024,
+                        "knowledge recall-stats sidecar",
+                    )?
+                    .is_some() => {}
+            _ => return Ok(()),
+        }
     }
-    fs::create_dir_all(&local_dir).with_context(|| format!("creating {}", local_dir.display()))?;
+    let directory = bbox_corpus_core::json_store::NofollowDirectory::open_or_create(&local_dir)?;
+    directory.lock_exclusive()?;
     // Mirror `bbox_project_init`: gitignore everything under local/ except the
     // ignore file itself, so the sidecar is host-local and never committed.
-    let gitignore = local_dir.join(".gitignore");
-    if !gitignore.exists() {
-        let _ = fs::write(&gitignore, "*\n!.gitignore\n");
+    if directory
+        .read_regular(".gitignore", 1024 * 1024, "local gitignore")?
+        .is_none()
+    {
+        directory.atomic_replace(".gitignore", b"*\n!.gitignore\n")?;
     }
     let new_bytes = bbox_corpus_core::json_store::to_vec_pretty_newline(stats)?;
-    bbox_corpus_core::json_store::with_store_lock(&path, || {
-        if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
-            return Ok(());
-        }
-        bbox_corpus_core::json_store::atomic_write_json_locked(&path, stats)
-    })?;
-    sync_parent_directory(&path)
-}
-
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::File::open(parent)
-        .with_context(|| format!("opening {} for fsync", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("fsync directory {}", parent.display()))
+    if directory
+        .read_regular(
+            "knowledge-stats.json",
+            8 * 1024 * 1024,
+            "knowledge recall-stats sidecar",
+        )?
+        .is_none_or(|current| current != new_bytes)
+    {
+        directory.atomic_replace("knowledge-stats.json", &new_bytes)?;
+    }
+    directory.sync_all()?;
+    directory.ensure_still_current()
 }
 
 /// A project is "repo-owned" once its `.bbox/knowledge/` directory exists —
@@ -985,9 +1011,17 @@ fn load_repo_kb_entries(
         return Ok((Vec::new(), BTreeMap::new()));
     }
     let dir = repo_kb_dir(project_dir);
-    if !dir.exists() {
-        return Ok((Vec::new(), BTreeMap::new()));
-    }
+    let directory = match bbox_corpus_core::json_store::NofollowDirectory::open_existing(&dir) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return Ok((Vec::new(), BTreeMap::new())),
+        Err(error) => {
+            tracing::warn!(
+                "kb load: refusing unsafe directory {}: {error:#}",
+                dir.display()
+            );
+            return Ok((Vec::new(), BTreeMap::new()));
+        }
+    };
     let mut out = Vec::new();
     let mut provenance = BTreeMap::new();
     // Committed-tree context for the published-vs-provisional label (slice 3.2),
@@ -1084,6 +1118,13 @@ fn load_repo_kb_entries(
         );
     } else {
         tracing::debug!("kb load: {} loaded={}", dir.display(), out.len());
+    }
+    if let Err(error) = directory.ensure_still_current() {
+        tracing::warn!(
+            "kb load: directory changed during read {}; discarding snapshot: {error:#}",
+            dir.display()
+        );
+        return Ok((Vec::new(), BTreeMap::new()));
     }
     Ok((out, provenance))
 }
@@ -6429,6 +6470,53 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         let (loaded, _) = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
         assert!(loaded.is_empty(), "symlinked knowledge must not load");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_loader_rejects_symlinked_knowledge_directory() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        fs::write(
+            outside.path().join("linked.json"),
+            serde_json::to_vec(&entry("linked", "linked", "body", Scope::Project)).unwrap(),
+        )
+        .unwrap();
+        symlink(outside.path(), repo_kb_dir(&root)).unwrap();
+
+        let (loaded, _) = load_repo_kb_entries(&root, root.to_string_lossy().as_ref()).unwrap();
+        assert!(
+            loaded.is_empty(),
+            "symlinked knowledge directory must not load"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recall_stats_refuse_symlinked_local_directory() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        symlink(outside.path(), root.join(".bbox/local")).unwrap();
+        let stats = BTreeMap::from([(
+            "linked".into(),
+            RecallStat {
+                recall_count: 1,
+                last_recalled: None,
+            },
+        )]);
+
+        let error = persist_repo_kb_stats(&root, &stats).unwrap_err();
+        assert!(error.to_string().contains("without following links"));
+        assert!(!outside.path().join("knowledge-stats.json").exists());
+        assert!(!outside.path().join(".gitignore").exists());
     }
 
     #[test]
