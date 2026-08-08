@@ -38,8 +38,8 @@ use sha2::{Digest, Sha256};
 
 use crate::accepted_publication_runtime::{AcceptedPublicationRuntime, AcceptedPublicationState};
 use crate::project_catalog_inventory::{
-    LegacyPathStoreKindV1, OperatorResolutionNoteV1, Sha256ValueV1, digest_path,
-    digest_published_scope, digest_publisher_full_ref,
+    LegacyPathStoreKindV1, MAX_PROJECT_CATALOG_REPORT_BYTES, OperatorResolutionNoteV1,
+    Sha256ValueV1, digest_path, digest_published_scope, digest_publisher_full_ref,
 };
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationError, ProjectCatalogMigrationMutationDispositionV1,
@@ -56,7 +56,13 @@ pub const BACKFILL_COMPLETION_JOURNAL_VERSION_V1: u32 = 1;
 /// The completion journal's fixed filename beside the store (section 3.3).
 pub const BACKFILL_COMPLETION_JOURNAL_FILE: &str = "backfill-completion.json";
 
-const MAX_BACKFILL_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+// The report repeats every effective ledger binding with its classification,
+// so it can lawfully be larger than the 8 MiB catalog snapshot it summarizes.
+// Use the project-catalog report budget rather than the smaller operator-owned
+// resolution budget; sharing one cap made large but valid migrated catalogs
+// impossible to backfill.
+const MAX_BACKFILL_REPORT_BYTES: usize = MAX_PROJECT_CATALOG_REPORT_BYTES;
+const MAX_BACKFILL_RESOLUTION_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BACKFILL_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// The plan's NEW resolution refusal code (section 7.3). A resolution naming a
@@ -2583,12 +2589,24 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
 // ---------------------------------------------------------------------------
 
 fn encode_report(report: &DurableBackfillReportV1) -> BackfillResult<Vec<u8>> {
-    serde_json::to_vec(report).map_err(|error| {
+    let bytes = serde_json::to_vec(report).map_err(|error| {
         refuse(
             ERROR_STALE_REPORT,
             format!("report cannot be encoded: {error}"),
         )
-    })
+    })?;
+    if bytes.len() > MAX_BACKFILL_REPORT_BYTES {
+        return Err(refuse(
+            ERROR_STALE_REPORT,
+            format!(
+                "backfill report has {} ledger rows and encodes to {} bytes, exceeding the {}-byte report limit",
+                report.ledger_rows.len(),
+                bytes.len(),
+                MAX_BACKFILL_REPORT_BYTES
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn decode_report(bytes: &[u8]) -> BackfillResult<DurableBackfillReportV1> {
@@ -2653,10 +2671,18 @@ fn decode_resolution(bytes: &[u8]) -> BackfillResult<DurableBackfillResolutionV1
 const REPORT_LABEL: &str = "durable backfill report";
 const RESOLUTION_LABEL: &str = "durable backfill resolution";
 
+fn backfill_artifact_byte_limit(label: &'static str) -> usize {
+    match label {
+        REPORT_LABEL => MAX_BACKFILL_REPORT_BYTES,
+        RESOLUTION_LABEL => MAX_BACKFILL_RESOLUTION_BYTES,
+        _ => unreachable!("backfill artifact labels are code-owned"),
+    }
+}
+
 fn read_backfill_artifact_required(path: &Path, label: &'static str) -> BackfillResult<Vec<u8>> {
     crate::project_catalog_migration::read_artifact_required(
         path,
-        MAX_BACKFILL_ARTIFACT_BYTES,
+        backfill_artifact_byte_limit(label),
         label,
     )
 }
@@ -2667,7 +2693,7 @@ fn read_backfill_artifact_optional(
 ) -> BackfillResult<Option<Vec<u8>>> {
     crate::project_catalog_migration::read_artifact_optional(
         path,
-        MAX_BACKFILL_ARTIFACT_BYTES,
+        backfill_artifact_byte_limit(label),
         label,
     )
 }
@@ -2682,7 +2708,7 @@ fn write_backfill_artifact_if_absent(
     crate::project_catalog_migration::write_artifact_if_absent(
         path,
         bytes,
-        MAX_BACKFILL_ARTIFACT_BYTES,
+        backfill_artifact_byte_limit(label),
         label,
     )
 }
@@ -2695,7 +2721,7 @@ fn write_backfill_artifact_replacing(
     crate::project_catalog_migration::write_artifact_replacing(
         path,
         bytes,
-        MAX_BACKFILL_ARTIFACT_BYTES,
+        backfill_artifact_byte_limit(label),
         label,
     )
 }
@@ -2866,7 +2892,7 @@ mod tests {
         // one byte beyond it.
         std::fs::write(
             review.join("resolution.json"),
-            vec![b'x'; MAX_BACKFILL_ARTIFACT_BYTES + 1],
+            vec![b'x'; MAX_BACKFILL_RESOLUTION_BYTES + 1],
         )
         .unwrap();
         assert_eq!(
@@ -4088,6 +4114,65 @@ mod tests {
         assert_eq!(
             decode_report(&encode_report(&report).unwrap()).unwrap(),
             report
+        );
+    }
+
+    /// A valid catalog is capped at 8 MiB, but the reviewed report repeats
+    /// every effective ledger row with derived classification fields. The
+    /// report therefore needs its own larger budget: sharing the catalog or
+    /// resolution cap made a large valid migration impossible to backfill.
+    #[test]
+    fn the_report_budget_accepts_a_report_larger_than_the_catalog_budget() {
+        let project_id = project('a');
+        let mut ledger_rows = Vec::with_capacity(30_000);
+        for index in 1..=30_000 {
+            ledger_rows.push(BackfillLedgerRowV1 {
+                legacy_path_binding_id: LegacyPathBindingId::parse(format!("lpb_{index:032x}"))
+                    .unwrap(),
+                store_kind: LegacyPathStoreKindV1::Knowledge,
+                historical_path_digest: hash((index % 251) as u8),
+                source_row_id: format!("legacy-row-{index:032x}"),
+                inventory_epoch: 1,
+                classification: LegacyRowClassificationV1::Mappable,
+                project_id: Some(project_id.clone()),
+                superseded_count: 0,
+            });
+        }
+        let report = DurableBackfillReportV1 {
+            version: DURABLE_BACKFILL_REPORT_VERSION_V1,
+            generated_at: "2026-07-26T00:00:00Z".to_string(),
+            status: DurableBackfillStatusV1::Clean,
+            inventory_hash: hash(1),
+            plan_hash: hash(2),
+            resolution_artifact_hash: hash(3),
+            predecessor_catalog_epoch: 7,
+            predecessor_catalog_hash: hash(4),
+            predecessor_attachment_hash: hash(5),
+            ledger_rows,
+            classification_counts: BTreeMap::new(),
+            planned_stamps: BTreeMap::new(),
+            unscoped_legacy_counts: BTreeMap::new(),
+            publisher_verification: Vec::new(),
+            stamp_coverage: BTreeMap::new(),
+            predicted_post_image_catalog_epoch: 7,
+            completion_journal_relative_path: BACKFILL_COMPLETION_JOURNAL_FILE.to_string(),
+        };
+
+        let bytes = encode_report(&report).unwrap();
+        assert!(
+            bytes.len() > bbox_corpus_core::project_catalog::MAX_PROJECT_CATALOG_BYTES,
+            "the fixture must cross the old shared 8 MiB ceiling"
+        );
+        assert!(bytes.len() <= MAX_BACKFILL_REPORT_BYTES);
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let report_path = root.join("review").join("report.json");
+        std::fs::create_dir_all(report_path.parent().unwrap()).unwrap();
+        write_backfill_artifact_replacing(&report_path, &bytes, REPORT_LABEL).unwrap();
+        assert_eq!(
+            read_backfill_artifact_required(&report_path, REPORT_LABEL).unwrap(),
+            bytes
         );
     }
 
