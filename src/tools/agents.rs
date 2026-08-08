@@ -1907,7 +1907,7 @@ mod tests {
         };
         let edges_dir = crate::edge_index::edges_dir_from_bro_store(&server.state.store_dir);
         let durable_edges: Vec<crate::edge_index::Edge> =
-            std::fs::read_to_string(edges_dir.join("agents.jsonl"))
+            std::fs::read_to_string(edges_dir.join("explicit/agents.jsonl"))
                 .unwrap()
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())

@@ -367,7 +367,7 @@ mod tests {
             .edges_by_project
             .insert("project-one".into(), vec![edge]);
 
-        let sidecar = dir.path().join("project-one.jsonl");
+        let sidecar = dir.path().join("explicit/project-one.jsonl");
         assert!(!sidecar.exists());
         assert_eq!(
             publish_prepared_provenance_import(prepared, dir.path()).unwrap(),
