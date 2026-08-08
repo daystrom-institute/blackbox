@@ -221,7 +221,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_reindex",
         category: ToolCategory::Transcripts,
-        summary: "Build or incrementally update the search index.",
+        summary: "Queue a full or incremental search-index update. Returns after admission by default; wait=true is for internal migrations that require completion.",
         when_to_use: "Rarely — background reindexer runs every 120s. Interactive calls return as soon as the single writer actor accepts the pass; a duplicate request reports that a pass is already active. Use `full=true` after corpus corruption or schema changes. `wait=true` is reserved for internal migrations that require completion. `accept_empty_projects` is an operator acknowledgement: name the projects whose empty local root should purge normally (clearing their `empty_root_refused` health), never set it on the operator's behalf.",
         example: None,
     },
