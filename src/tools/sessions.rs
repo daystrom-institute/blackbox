@@ -74,7 +74,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_reindex",
-        description = "Build or incrementally update the search index."
+        description = "Queue a full or incremental search-index update. Returns after admission by default; wait=true is for internal migrations that require completion."
     )]
     pub(crate) async fn bbox_reindex(
         &self,
@@ -88,11 +88,20 @@ impl BlackboxServer {
             // `accept_empty_projects` is operator authority passed straight
             // through (RX-V1): never defaulted, never inferred from a prior
             // refusal.
-            server.state.index_writer.run_reindex_pass_accepting_empty(
-                p.full.unwrap_or(false),
-                true,
-                p.accept_empty_projects.clone().unwrap_or_default(),
-            )
+            let full = p.full.unwrap_or(false);
+            let accepted_empty = p.accept_empty_projects.unwrap_or_default();
+            if p.wait.unwrap_or(false) {
+                server.state.index_writer.run_reindex_pass_accepting_empty(
+                    full,
+                    true,
+                    accepted_empty,
+                )
+            } else {
+                server
+                    .state
+                    .index_writer
+                    .request_reindex_pass_accepting_empty(full, true, accepted_empty)
+            }
         })
         .await
     }

@@ -127,6 +127,11 @@ pub struct ReindexParams {
     /// Force full reindex (default: false)
     #[serde(default)]
     pub full: Option<bool>,
+    /// Wait for the complete corpus pass instead of returning after the
+    /// single writer actor accepts it. Intended for internal migrations;
+    /// interactive callers should keep the default false.
+    #[serde(default)]
+    pub wait: Option<bool>,
     /// Operator acknowledgement for the empty-root purge refusal: project
     /// ids whose local scan may purge normally on THIS pass even though it
     /// returned zero entries, clearing their `empty_root_refused` health

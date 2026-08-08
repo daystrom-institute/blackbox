@@ -748,6 +748,15 @@ fn scan_inactive_snapshots_bounded(
         .filter_map(|entry| entry.active_snapshot.as_deref())
         .map(|relative| bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join(relative))
         .collect::<HashSet<_>>();
+    protected_snapshot_dirs.extend(
+        manifest
+            .workspaces
+            .values()
+            .filter_map(|entry| entry.dirty_overlay.as_deref())
+            .map(|relative| {
+                bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join(relative)
+            }),
+    );
     for pending in bbox_edge_sidecar::snapshot::pending_snapshot_paths(edges_dir)? {
         protected_snapshot_dirs
             .insert(bbox_edge_sidecar::manifest::materialized_dir(edges_dir).join(pending));
@@ -945,7 +954,17 @@ fn classify_materialized_entry(
                 kind: FileKind::InactiveSnapshot,
                 project_id: Some(project_id),
                 bytes,
-                reason: Some("inactive snapshot directory not selected by the manifest".into()),
+                reason: Some(
+                    if matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("dirty-current" | ".reclaim-dirty-current")
+                    ) {
+                        "inactive dirty overlay directory not selected by the manifest"
+                    } else {
+                        "inactive snapshot directory not selected by the manifest"
+                    }
+                    .into(),
+                ),
             });
             return Ok(None);
         }
@@ -971,6 +990,19 @@ fn classify_materialized_entry(
 }
 
 fn inactive_snapshot_dir_key(path: &Path) -> Option<(String, String)> {
+    if matches!(
+        path.file_name()?.to_str()?,
+        "dirty-current" | ".reclaim-dirty-current"
+    ) {
+        let project_dir = path.parent()?;
+        if project_dir.parent()?.file_name()?.to_str()? != "workspace" {
+            return None;
+        }
+        return Some((
+            project_dir.file_name()?.to_str()?.to_string(),
+            path.to_string_lossy().into_owned(),
+        ));
+    }
     let _snapshot_id = path.file_name()?.to_str()?;
     let snapshots = path.parent()?;
     if snapshots.file_name()?.to_str()? != "snapshots" {
@@ -1641,6 +1673,26 @@ fn plan_snapshot_gc(
         if file.kind != FileKind::InactiveSnapshot {
             continue;
         }
+        if matches!(
+            Path::new(&file.path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("dirty-current" | ".reclaim-dirty-current")
+        ) {
+            candidates.push(GcCandidate {
+                path: file.path.clone(),
+                root_relative_path: None,
+                planned_device: None,
+                planned_inode: None,
+                planned_mtime_secs: None,
+                kind: file.kind,
+                bytes: file.bytes,
+                project_id: file.project_id.clone(),
+                rule: "inactive_dirty_overlay_unselected".to_string(),
+                deletable: true,
+            });
+            continue;
+        }
         let Some((project_id, snapshot_dir)) = inactive_snapshot_key(&file.path) else {
             continue;
         };
@@ -1932,11 +1984,20 @@ pub fn apply_gc(edges_dir: &Path, candidates: &[GcCandidate]) -> (Vec<String>, V
                     }
                 }
                 if c.kind == FileKind::InactiveSnapshot {
-                    bbox_edge_sidecar::snapshot::remove_inactive_snapshot_tree(
-                        edges_dir,
-                        Path::new(relative),
-                        (device, inode),
-                    )
+                    let relative = Path::new(relative);
+                    if bbox_edge_sidecar::snapshot::is_inactive_dirty_overlay_path(relative) {
+                        bbox_edge_sidecar::snapshot::remove_inactive_dirty_overlay_tree(
+                            edges_dir,
+                            relative,
+                            (device, inode),
+                        )
+                    } else {
+                        bbox_edge_sidecar::snapshot::remove_inactive_snapshot_tree(
+                            edges_dir,
+                            relative,
+                            (device, inode),
+                        )
+                    }
                 } else {
                     bbox_edge_sidecar::snapshot::remove_gc_candidate_file(
                         edges_dir,
@@ -1957,11 +2018,19 @@ pub fn apply_gc(edges_dir: &Path, candidates: &[GcCandidate]) -> (Vec<String>, V
                 .strip_prefix(edges_dir)
                 .map_err(anyhow::Error::from);
             relative.and_then(|relative| {
-                bbox_edge_sidecar::snapshot::remove_inactive_snapshot_tree(
-                    edges_dir,
-                    relative,
-                    (0, 0),
-                )
+                if bbox_edge_sidecar::snapshot::is_inactive_dirty_overlay_path(relative) {
+                    bbox_edge_sidecar::snapshot::remove_inactive_dirty_overlay_tree(
+                        edges_dir,
+                        relative,
+                        (0, 0),
+                    )
+                } else {
+                    bbox_edge_sidecar::snapshot::remove_inactive_snapshot_tree(
+                        edges_dir,
+                        relative,
+                        (0, 0),
+                    )
+                }
             })
         } else {
             fs::remove_file(&c.path).map(|_| true).map_err(Into::into)
@@ -2480,6 +2549,56 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("proj1234.jsonl") && !p.contains(".bak-")),
             "active sidecar must not appear in deleted list"
+        );
+    }
+
+    #[test]
+    fn unselected_dirty_overlay_is_reclaimed_without_snapshot_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().canonicalize().unwrap().join("edges");
+        let active = write_snapshot_jsonl(&edges_dir, "p1", "head-active");
+        let overlay = bbox_edge_sidecar::manifest::materialized_dir(&edges_dir)
+            .join("workspace/p1/dirty-current");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("project.jsonl"), b"{}\n").unwrap();
+        write_workspace_manifest(
+            &edges_dir,
+            "p1",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "p1", "head-active");
+
+        let registered = HashSet::from(["p1".to_string()]);
+        let candidates = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: false,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: true,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.rule == "inactive_dirty_overlay_unselected")
+            .expect("unselected overlay must be an explicit GC candidate");
+        assert!(candidate.deletable);
+
+        let (deleted, errors) = apply_gc(&edges_dir, &candidates);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(deleted.iter().any(|path| path.contains("dirty-current")));
+        assert!(!overlay.exists());
+        assert!(
+            active.exists(),
+            "the selected snapshot must remain authoritative"
         );
     }
 

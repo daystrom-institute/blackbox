@@ -23,7 +23,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     restore_badgey_registry_from_notes(&shared);
     recover_badgey_non_terminal_state(&shared);
     configure_embed_queue(&shared);
-    spawn_vector_warmup_thread()?;
+    spawn_vector_warmup_thread(shared.clone())?;
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
     spawn_storage_gc(shared.clone());
     spawn_runtime_metrics_sampler();
@@ -188,10 +188,10 @@ fn configure_embed_queue(shared: &Arc<SharedState>) {
     embed_queue::install(embed::queue::EmbedQueueHandle::start_default_without_store());
 }
 
-fn spawn_vector_warmup_thread() -> anyhow::Result<()> {
+fn spawn_vector_warmup_thread(shared: Arc<SharedState>) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("blackbox-vectors-warmup".into())
-        .spawn(|| {
+        .spawn(move || {
             let started = std::time::Instant::now();
             let store = vectors::global();
             embed_queue::install(embed::queue::EmbedQueueHandle::start_default_with_store(
@@ -202,6 +202,7 @@ fn spawn_vector_warmup_thread() -> anyhow::Result<()> {
                 elapsed_ms = started.elapsed().as_millis(),
                 "vector store warmed"
             );
+            super::code_source::notify_cutback_readiness_available(&shared);
         })
         .map_err(|e| anyhow::anyhow!("spawning vector store warmup thread: {e}"))?;
     Ok(())

@@ -26,13 +26,6 @@ use bbox_corpus_core::git_overlay::GitOverlaySelector;
 // new fields).
 const INDEXER_VERSION: &str = "project-index-v2-path-free";
 const CHUNKER_VERSION: &str = "chunker-v1";
-// Changes to the durable derived-edge set semantics belong here rather than
-// in INDEXER_VERSION: they must invalidate per-file materialization freshness
-// and snapshot ids, but they do not require a Tantivy schema replacement.
-// v2 makes managed materialization set-like; the outgoing writer preserved
-// duplicate symbol-only edges on every incremental pass, growing two live
-// projects to 33.5 million JSONL rows for about 1.2 million unique edges.
-const EDGE_MATERIALIZATION_VERSION: &str = "edge-set-v2-deduplicated";
 const DIRTY_OVERLAY_DIRNAME: &str = "dirty-current";
 const PENDING_LOCAL_ACTIVATIONS_FILENAME: &str = "pending-local-activations.json";
 /// R28F2: the v2 GC pin representation is one confined file per project under
@@ -51,6 +44,78 @@ fn lock_manifest_coordinator() -> Result<MutexGuard<'static, ()>> {
 pub fn with_manifest_coordinator<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let _coordinator = lock_manifest_coordinator()?;
     operation()
+}
+
+/// Physically deduplicate the selected project-edge members of an active
+/// materialization without changing its logical snapshot identity. Receipt-
+/// managed snapshots are skipped because their member bytes are committed by
+/// digest; current writers already emit set-like lanes, so only legacy direct
+/// members require this one-time migration.
+pub fn compact_active_project_edge_sets(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<Vec<crate::edge_sidecar::ManagedEdgeSetCompactionStats>> {
+    with_manifest_coordinator(|| {
+        let index = ManifestIndex::load_or_new(edges_dir)?;
+        // This performs the complete confined-path and active-shape
+        // validation before any relative path below is trusted.
+        drop(index.active_paths_for_loader(edges_dir)?);
+        let Some(entry) = index.workspaces.get(project_id) else {
+            return Ok(Vec::new());
+        };
+        let mut relatives = Vec::new();
+        if let Some(snapshot) = entry.active_snapshot.as_deref()
+            && !index.receipt_managed_snapshots.contains_key(snapshot)
+        {
+            relatives.push(PathBuf::from(snapshot).join("project.jsonl"));
+        }
+        if let Some(overlay) = entry.dirty_overlay.as_deref() {
+            relatives.push(PathBuf::from(overlay).join("project.jsonl"));
+        }
+
+        let mut compacted = Vec::new();
+        for relative in relatives {
+            let path = materialized_dir(edges_dir).join(&relative);
+            let marker = path.with_file_name(format!(
+                ".project.{}",
+                crate::edge_sidecar::MANAGED_EDGE_SET_VERSION
+            ));
+            if crate::edge_sidecar::edge_set_file_needs_compaction(&path, &marker) {
+                compacted.push(crate::edge_sidecar::compact_edge_set_file(&path, &marker)?);
+            }
+        }
+        Ok(compacted)
+    })
+}
+
+pub fn active_project_edge_sets_need_compaction(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<bool> {
+    with_manifest_coordinator(|| {
+        let index = ManifestIndex::load_or_new(edges_dir)?;
+        drop(index.active_paths_for_loader(edges_dir)?);
+        let Some(entry) = index.workspaces.get(project_id) else {
+            return Ok(false);
+        };
+        let mut relatives = Vec::new();
+        if let Some(snapshot) = entry.active_snapshot.as_deref()
+            && !index.receipt_managed_snapshots.contains_key(snapshot)
+        {
+            relatives.push(PathBuf::from(snapshot).join("project.jsonl"));
+        }
+        if let Some(overlay) = entry.dirty_overlay.as_deref() {
+            relatives.push(PathBuf::from(overlay).join("project.jsonl"));
+        }
+        Ok(relatives.into_iter().any(|relative| {
+            let path = materialized_dir(edges_dir).join(relative);
+            let marker = path.with_file_name(format!(
+                ".project.{}",
+                crate::edge_sidecar::MANAGED_EDGE_SET_VERSION
+            ));
+            crate::edge_sidecar::edge_set_file_needs_compaction(&path, &marker)
+        }))
+    })
 }
 
 #[cfg(unix)]
@@ -204,6 +269,149 @@ pub fn remove_inactive_snapshot_tree(
 ) -> Result<bool> {
     with_manifest_coordinator(|| {
         remove_inactive_snapshot_tree_locked(edges_dir, root_relative, expected_identity)
+    })
+}
+
+pub fn is_inactive_dirty_overlay_path(root_relative: &Path) -> bool {
+    let components = root_relative.components().collect::<Vec<_>>();
+    components.len() == 4
+        && components[0].as_os_str() == "materialized"
+        && components[1].as_os_str() == "workspace"
+        && matches!(
+            components[3].as_os_str().to_str(),
+            Some("dirty-current" | ".reclaim-dirty-current")
+        )
+}
+
+/// Reclaim an unselected dirty overlay with the same authority check and
+/// no-follow identity fence used for inactive snapshots. Dirty overlays are
+/// rebuildable caches and carry no receipt commitment.
+#[cfg(unix)]
+pub fn remove_inactive_dirty_overlay_tree(
+    edges_dir: &Path,
+    root_relative: &Path,
+    expected_identity: (u64, u64),
+) -> Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    with_manifest_coordinator(|| {
+        if !is_inactive_dirty_overlay_path(root_relative) {
+            anyhow::bail!("inactive dirty overlay path does not have the writer-exact shape");
+        }
+        let components = root_relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(value) => Ok(value.to_os_string()),
+                _ => anyhow::bail!("inactive dirty overlay path is not normalized"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let project_id = components[2]
+            .to_str()
+            .context("inactive dirty overlay project id is not UTF-8")?;
+        validate_snapshot_component(project_id)?;
+        let selected = format!("workspace/{project_id}/dirty-current");
+        let manifest = ManifestIndex::load_or_new(edges_dir)?;
+        if manifest
+            .workspaces
+            .get(project_id)
+            .and_then(|entry| entry.dirty_overlay.as_deref())
+            == Some(selected.as_str())
+        {
+            return Ok(false);
+        }
+
+        let mut directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(edges_dir)?;
+        for component in &components[..3] {
+            let component = std::ffi::CString::new(component.as_bytes())?;
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                return Err(error.into());
+            }
+            directory = unsafe { fs::File::from_raw_fd(fd) };
+        }
+        let leaf = std::ffi::CString::new(components[3].as_bytes())?;
+        let stat = match fstatat_nofollow(directory.as_raw_fd(), &leaf) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || (stat.st_dev as u64, stat.st_ino as u64) != expected_identity
+        {
+            anyhow::bail!("inactive dirty overlay identity changed before deletion");
+        }
+        let tombstone = std::ffi::CString::new(".reclaim-dirty-current")?;
+        if components[3] == "dirty-current" {
+            match fstatat_nofollow(directory.as_raw_fd(), &tombstone) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => anyhow::bail!("inactive dirty overlay tombstone already exists"),
+                Err(error) => return Err(error.into()),
+            }
+            if unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    directory.as_raw_fd(),
+                    tombstone.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            directory.sync_all()?;
+        }
+        unlinkat_tree(directory.as_raw_fd(), &tombstone)?;
+        directory.sync_all()?;
+        Ok(true)
+    })
+}
+
+#[cfg(not(unix))]
+pub fn remove_inactive_dirty_overlay_tree(
+    edges_dir: &Path,
+    root_relative: &Path,
+    _expected_identity: (u64, u64),
+) -> Result<bool> {
+    if !is_inactive_dirty_overlay_path(root_relative) {
+        anyhow::bail!("inactive dirty overlay path does not have the writer-exact shape");
+    }
+    with_manifest_coordinator(|| {
+        let components = root_relative.components().collect::<Vec<_>>();
+        let project_id = components[2]
+            .as_os_str()
+            .to_str()
+            .context("inactive dirty overlay project id is not UTF-8")?;
+        let selected = format!("workspace/{project_id}/dirty-current");
+        let manifest = ManifestIndex::load_or_new(edges_dir)?;
+        if manifest
+            .workspaces
+            .get(project_id)
+            .and_then(|entry| entry.dirty_overlay.as_deref())
+            == Some(selected.as_str())
+        {
+            return Ok(false);
+        }
+        let path = edges_dir.join(root_relative);
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_dir_all(path)?;
+        Ok(true)
     })
 }
 
@@ -593,11 +801,10 @@ pub(crate) fn write_materialized_file_atomic(
 /// parser version is included because it changes the derived edge entity refs.
 pub fn current_materialization_version() -> String {
     format!(
-        "{}+{}+{}+{}",
+        "{}+{}+{}",
         INDEXER_VERSION,
         CHUNKER_VERSION,
         bbox_corpus_core::entity_ref::PARSER_VERSION,
-        EDGE_MATERIALIZATION_VERSION,
     )
 }
 
@@ -608,7 +815,6 @@ pub fn clean_snapshot_id(repo_id: &str, project_id: &str, head_sha: &str) -> Str
     hasher.update(head_sha.as_bytes());
     hasher.update(INDEXER_VERSION.as_bytes());
     hasher.update(CHUNKER_VERSION.as_bytes());
-    hasher.update(EDGE_MATERIALIZATION_VERSION.as_bytes());
     let hash = hasher.finalize();
     let sha_prefix = &head_sha[..head_sha.len().min(12)];
     format!("head-{}-{}", sha_prefix, hex::encode(&hash[..8]))
@@ -620,7 +826,6 @@ pub fn nongit_snapshot_id(project_id: &str, source_tree_fingerprint: &str) -> St
     hasher.update(source_tree_fingerprint.as_bytes());
     hasher.update(INDEXER_VERSION.as_bytes());
     hasher.update(CHUNKER_VERSION.as_bytes());
-    hasher.update(EDGE_MATERIALIZATION_VERSION.as_bytes());
     let hash = hasher.finalize();
     format!("nongit-{}", hex::encode(&hash[..16]))
 }
@@ -7237,6 +7442,45 @@ mod tests {
         assert!(
             !content.contains("stale"),
             "overwritten snapshot must not have old content"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_edge_set_compaction_preserves_logical_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().canonicalize().unwrap();
+        let edge = derived_edge("k_source", "DESCRIBES", "k_target");
+        let duplicate_edges = [edge.clone(), edge];
+        write_snapshot_files(
+            &edges_dir,
+            "p1",
+            "snap-duplicate",
+            &[("project.jsonl", &duplicate_edges)],
+        )
+        .unwrap();
+        activate_local_snapshot(
+            &edges_dir,
+            "p1",
+            "repo1",
+            "head1",
+            "local:p1",
+            "snap-duplicate",
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(active_project_edge_sets_need_compaction(&edges_dir, "p1").unwrap());
+        let stats = compact_active_project_edge_sets(&edges_dir, "p1").unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].rows_before, 2);
+        assert_eq!(stats[0].rows_after, 1);
+        assert!(!active_project_edge_sets_need_compaction(&edges_dir, "p1").unwrap());
+
+        let index = ManifestIndex::load_or_new(&edges_dir).unwrap();
+        assert_eq!(
+            index.workspaces["p1"].active_snapshot.as_deref(),
+            Some("workspace/p1/snapshots/snap-duplicate")
         );
     }
 

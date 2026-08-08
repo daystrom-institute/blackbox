@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -98,7 +98,9 @@ pub enum IndexWriteOp {
         /// passed through and never defaulted (RX-V1): no code path may add
         /// a project here on the operator's behalf.
         accept_empty_projects: Vec<String>,
-        ack: mpsc::SyncSender<Result<String>>,
+        /// Synchronous internal callers wait for the pass result. Interactive
+        /// tool requests omit the ack and receive admission immediately.
+        ack: Option<mpsc::SyncSender<Result<String>>>,
     },
     /// Stage one collected generation. Identity-first (Phase 3 plan section 6
     /// item 1): the op carries no checkout path and the handler opens no Git,
@@ -187,6 +189,7 @@ pub enum IndexWriteOp {
 #[derive(Clone)]
 pub struct IndexWriterActor {
     tx: mpsc::Sender<IndexWriteOp>,
+    reindex_active: Arc<AtomicBool>,
     reader: IndexReader,
     fields: FieldHandles,
     post_commit_hook: Arc<parking_lot::RwLock<Option<PostCommitHook>>>,
@@ -280,6 +283,15 @@ struct ActorCtx {
     checkout_access: Arc<CheckoutAccessBroker>,
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
+    reindex_active: Arc<AtomicBool>,
+}
+
+struct ReindexActivityGuard(Arc<AtomicBool>);
+
+impl Drop for ReindexActivityGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 fn commit_snapshot_publications(
@@ -946,6 +958,7 @@ impl IndexWriterActor {
         let post_commit_hook = Arc::new(parking_lot::RwLock::new(None));
         let assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>> =
             Arc::new(parking_lot::RwLock::new(None));
+        let reindex_active = Arc::new(AtomicBool::new(false));
         let ctx = ActorCtx {
             index,
             fields,
@@ -956,6 +969,7 @@ impl IndexWriterActor {
             checkout_access: checkout_access.clone(),
             records_provider: records_provider.clone(),
             assignments: assignments.clone(),
+            reindex_active: reindex_active.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -968,6 +982,7 @@ impl IndexWriterActor {
         }
         Self {
             tx,
+            reindex_active,
             reader,
             fields,
             post_commit_hook,
@@ -1046,6 +1061,41 @@ impl IndexWriterActor {
         )
     }
 
+    /// Admit an interactive reindex request without holding the MCP call open
+    /// for the entire corpus walk. Exactly one pass may be queued or running;
+    /// completion is logged by the actor and periodic reconciliation remains
+    /// the durable correctness backstop.
+    pub fn request_reindex_pass_accepting_empty(
+        &self,
+        full: bool,
+        dirty: bool,
+        accept_empty_projects: Vec<String>,
+    ) -> Result<String> {
+        self.reserve_reindex()?;
+        if self
+            .tx
+            .send(IndexWriteOp::ReindexPass {
+                full,
+                dirty,
+                cause: FullRebuildCause::Ordinary,
+                accept_empty_projects,
+                ack: None,
+            })
+            .is_err()
+        {
+            self.reindex_active.store(false, Ordering::Release);
+            return Err(anyhow!("index writer actor unavailable"));
+        }
+        Ok("reindex accepted; the index writer is processing it in the background".to_string())
+    }
+
+    fn reserve_reindex(&self) -> Result<()> {
+        self.reindex_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| anyhow::Error::new(IndexWriterRetryableError::ReindexPassInProgress))
+    }
+
     fn dispatch_reindex_pass(
         &self,
         full: bool,
@@ -1053,16 +1103,22 @@ impl IndexWriterActor {
         cause: FullRebuildCause,
         accept_empty_projects: Vec<String>,
     ) -> Result<String> {
+        self.reserve_reindex()?;
         let (ack, ack_rx) = mpsc::sync_channel(1);
-        self.tx
+        if self
+            .tx
             .send(IndexWriteOp::ReindexPass {
                 full,
                 dirty,
                 cause,
                 accept_empty_projects,
-                ack,
+                ack: Some(ack),
             })
-            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+            .is_err()
+        {
+            self.reindex_active.store(false, Ordering::Release);
+            return Err(anyhow!("index writer actor unavailable"));
+        }
         ack_rx
             .recv()
             .map_err(|_| anyhow!("index writer actor dropped the reindex ack"))?
@@ -1268,8 +1324,17 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                 accept_empty_projects,
                 ack,
             } => {
+                let activity = ReindexActivityGuard(ctx.reindex_active.clone());
                 let result = run_pass(&ctx, &rx, full, dirty, cause, &accept_empty_projects);
-                let _ = ack.send(result);
+                drop(activity);
+                if let Some(ack) = ack {
+                    let _ = ack.send(result);
+                } else {
+                    match result {
+                        Ok(summary) => tracing::info!(%summary, "background reindex completed"),
+                        Err(error) => tracing::error!(%error, "background reindex failed"),
+                    }
+                }
             }
             IndexWriteOp::StageCollectedGeneration {
                 identity,
@@ -1997,9 +2062,11 @@ fn run_pass(
             while let Ok(op) = rx.try_recv() {
                 match op {
                     IndexWriteOp::ReindexPass { ack, .. } => {
-                        let _ = ack.send(Err(anyhow::Error::new(
-                            IndexWriterRetryableError::ReindexPassInProgress,
-                        )));
+                        if let Some(ack) = ack {
+                            let _ = ack.send(Err(anyhow::Error::new(
+                                IndexWriterRetryableError::ReindexPassInProgress,
+                            )));
+                        }
                     }
                     IndexWriteOp::StageCollectedGeneration { ack, .. } => {
                         let _ = ack.send(Err(anyhow::Error::new(
@@ -3227,6 +3294,39 @@ mod tests {
             .retire_code_selector("local:00000000".into())
             .expect("empty-index retirement completes");
         assert_eq!(retired.document_count, 0);
+    }
+
+    #[test]
+    fn interactive_reindex_admission_is_nonblocking_and_single_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let actor = IndexWriterActor::spawn_for(&index);
+
+        actor.reserve_reindex().unwrap();
+        let duplicate = actor.reserve_reindex().unwrap_err();
+        assert!(
+            duplicate
+                .downcast_ref::<IndexWriterRetryableError>()
+                .is_some_and(|error| matches!(
+                    error,
+                    IndexWriterRetryableError::ReindexPassInProgress
+                ))
+        );
+        actor.reindex_active.store(false, Ordering::Release);
+
+        let response = actor
+            .request_reindex_pass_accepting_empty(false, true, Vec::new())
+            .unwrap();
+        assert!(response.contains("accepted"));
+        actor.flush_blocking().unwrap();
+        for _ in 0..100 {
+            if !actor.reindex_active.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!actor.reindex_active.load(Ordering::Acquire));
     }
 
     #[test]

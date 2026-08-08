@@ -22,7 +22,8 @@ pub(super) async fn exec_schema_migration_rebuild(
     into_var: Option<&str>,
     ctx: &ArcContext,
 ) -> Result<OpEffect> {
-    let result = call_blackbox_tool("bbox_reindex", json!({"full": true}), ctx).await?;
+    let result =
+        call_blackbox_tool("bbox_reindex", json!({"full": true, "wait": true}), ctx).await?;
     tracing::info!(
         arc_id = %ctx.meta.arc_id,
         "schema_migration_rebuild: full reindex complete"

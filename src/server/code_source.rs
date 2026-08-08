@@ -105,6 +105,7 @@ enum ReconcileKind {
 enum ReconcileOrigin {
     AssignmentConfigReload,
     CatalogCommit,
+    ReadinessAvailable,
     TransientDeadline,
     SelectorRetirementCompletion,
     StartupRecovery,
@@ -1773,6 +1774,46 @@ fn apply_source_transitions_catalog(state: Arc<SharedState>, transitions: Source
         }
     }
     let _ = transitions;
+}
+
+/// Re-drive cutbacks that older daemons may have stranded by counting
+/// writer/vector readiness as retry failures. Called when vector warmup
+/// completes; current readiness deferrals also schedule their own bounded
+/// retry, so this is both a migration edge and a prompt wake-up signal.
+pub(crate) fn notify_cutback_readiness_available(state: &Arc<SharedState>) {
+    if !state.code_sources.is_catalog() {
+        return;
+    }
+    let store = state.code_sources.store();
+    let records = match store.activation_records_mixed() {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(%error, "readiness reconciliation: loading activations failed");
+            return;
+        }
+    };
+    for record in records {
+        let should_repair = matches!(
+            record.cutback(),
+            Some(CutbackStateV2::ManualRetryRequired {
+                error_class: CutbackErrorClass::WriterContention | CutbackErrorClass::IndexCommit,
+                ..
+            })
+        );
+        if !should_repair {
+            continue;
+        }
+        let Some(scope) = record.published_scope().cloned() else {
+            continue;
+        };
+        enqueue_current_transition(
+            state,
+            record.project_id(),
+            &scope,
+            ReconcileOrigin::ReadinessAvailable,
+            None,
+        );
+    }
 }
 
 /// Hourly blob GC, mode-split (F8).
@@ -4463,11 +4504,20 @@ fn evaluate_reduction_for_event(
                     let _ = attempt;
                     ReducerAction::ReattemptCutback
                 }
-                Some(CutbackStateV2::ManualRetryRequired { .. }) => {
+                Some(CutbackStateV2::ManualRetryRequired { error_class, .. }) => {
                     // Manual retry is sticky across startup, catalog,
-                    // completion, and scheduler noise. Only a fresh operator
+                    // completion, and scheduler noise. A fresh operator
                     // assignment/config event releases it for one attempt.
-                    if origins.contains(&ReconcileOrigin::AssignmentConfigReload)
+                    // ReadinessAvailable also repairs states produced by the
+                    // former bug that counted writer/vector readiness as an
+                    // attempt failure until the retry ladder was exhausted.
+                    let readiness_repair = origins.contains(&ReconcileOrigin::ReadinessAvailable)
+                        && matches!(
+                            error_class,
+                            CutbackErrorClass::WriterContention | CutbackErrorClass::IndexCommit
+                        );
+                    if (origins.contains(&ReconcileOrigin::AssignmentConfigReload)
+                        || readiness_repair)
                         && ladder == LadderResult::Selected
                     {
                         ReducerAction::ReattemptCutback
@@ -4662,12 +4712,29 @@ enum CutbackAttemptOutcome {
     /// Transient failure: persist attempt+1, deadline, error class.
     /// After the configured cap: ManualRetryRequired.
     Transient(CutbackErrorClass),
-    /// Staging is blocked by a durable selector-retirement row. This is a
-    /// readiness dependency, not an attempt failure: do not advance or
-    /// replace the persisted cutback ladder.
-    ReadinessDeferred,
+    /// Staging is blocked by selector retirement, an active reindex, or vector
+    /// warmup. This is a readiness dependency, not an attempt failure: do not
+    /// advance or replace the persisted cutback ladder.
+    ReadinessDeferred(CutbackReadiness),
     /// Terminal failure (validation/security): GC root, never auto-retry.
     Terminal(CutbackErrorClass),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CutbackReadiness {
+    SelectorRetirement,
+    ReindexPass,
+    VectorStore,
+}
+
+impl CutbackReadiness {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::SelectorRetirement => "cutback is waiting for selector retirement to complete",
+            Self::ReindexPass => "cutback is waiting for the active reindex pass to complete",
+            Self::VectorStore => "cutback is waiting for the vector store to finish warming",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4748,15 +4815,15 @@ fn classify_staging_error(error: &anyhow::Error) -> CutbackAttemptOutcome {
         .chain()
         .any(|cause| cause.downcast_ref::<SelectorRetirementQueued>().is_some())
     {
-        return CutbackAttemptOutcome::ReadinessDeferred;
+        return CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::SelectorRetirement);
     }
     for cause in error.chain() {
         match cause.downcast_ref::<IndexWriterRetryableError>() {
             Some(IndexWriterRetryableError::ReindexPassInProgress) => {
-                return CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention);
+                return CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::ReindexPass);
             }
             Some(IndexWriterRetryableError::VectorStoreWarming) => {
-                return CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit);
+                return CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::VectorStore);
             }
             None => {}
         }
@@ -5000,18 +5067,34 @@ fn schedule_cutback_catalog(
 
         match attempt {
             Ok(FencedCutbackAttempt {
-                outcome: CutbackAttemptOutcome::ReadinessDeferred,
+                outcome: CutbackAttemptOutcome::ReadinessDeferred(readiness),
                 ..
             }) => {
+                let _ = store.clear_health_failure(pid, "cutback_manual_retry_required");
+                let _ = store.clear_health_failure(pid, "cutback_waiting_selector_retirement");
                 let _ = store.record_health_failure(
                     pid,
-                    "cutback_waiting_selector_retirement",
-                    "cutback is waiting for selector retirement to complete",
+                    "cutback_waiting_readiness",
+                    readiness.diagnostic(),
                 );
                 tracing::info!(
                     project_id = pid,
-                    "catalog cutback: selector retirement still queued; attempt ladder unchanged"
+                    ?readiness,
+                    "catalog cutback: readiness dependency unavailable; attempt ladder unchanged"
                 );
+                let retry_state = state.clone();
+                let retry_scope = scope.clone();
+                let retry_project = project_id.clone();
+                tokio::runtime::Handle::current().spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    enqueue_current_transition(
+                        &retry_state,
+                        &retry_project,
+                        &retry_scope,
+                        ReconcileOrigin::ReadinessAvailable,
+                        None,
+                    );
+                });
             }
             Ok(FencedCutbackAttempt { fence, outcome }) => {
                 let authority_revision = current_cutback_authority_revision(&state);
@@ -5037,10 +5120,11 @@ fn schedule_cutback_catalog(
                     CutbackAttemptOutcome::Terminal(error_class) => {
                         CutbackCompareOutcome::Terminal(error_class)
                     }
-                    CutbackAttemptOutcome::ReadinessDeferred => unreachable!(),
+                    CutbackAttemptOutcome::ReadinessDeferred(_) => unreachable!(),
                 };
                 match store.compare_and_apply_cutback(&fence, authority_revision, compare_outcome) {
                     Ok(applied) => {
+                        let _ = store.clear_health_failure(pid, "cutback_waiting_readiness");
                         let _ =
                             store.clear_health_failure(pid, "cutback_waiting_selector_retirement");
                         match applied.persisted.as_ref() {
@@ -9652,6 +9736,36 @@ mod tests {
             "a fresh assignment/config event must release manual retry once"
         );
 
+        let action = evaluate_reduction_for_event(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&mr),
+            LadderResult::Selected,
+            false,
+            &BTreeSet::from([ReconcileOrigin::ReadinessAvailable]),
+        );
+        assert!(
+            matches!(action, ReducerAction::ReattemptCutback),
+            "readiness must repair retry state poisoned by the former classifier"
+        );
+
+        let terminal_class_manual = CutbackStateV2::ManualRetryRequired {
+            error_class: CutbackErrorClass::SecurityFailure,
+            attempt: 8,
+        };
+        let action = evaluate_reduction_for_event(
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            Some(&terminal_class_manual),
+            LadderResult::Selected,
+            false,
+            &BTreeSet::from([ReconcileOrigin::ReadinessAvailable]),
+        );
+        assert!(
+            matches!(action, ReducerAction::NoOp),
+            "readiness must not release unrelated manual-retry classes"
+        );
+
         for origin in [
             ReconcileOrigin::CatalogCommit,
             ReconcileOrigin::TransientDeadline,
@@ -9681,19 +9795,19 @@ mod tests {
         let queued = anyhow::Error::new(SelectorRetirementQueued);
         assert!(matches!(
             classify_staging_error(&queued),
-            CutbackAttemptOutcome::ReadinessDeferred
+            CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::SelectorRetirement)
         ));
 
         let writer = anyhow::Error::new(IndexWriterRetryableError::ReindexPassInProgress);
         assert!(matches!(
             classify_staging_error(&writer),
-            CutbackAttemptOutcome::Transient(CutbackErrorClass::WriterContention)
+            CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::ReindexPass)
         ));
 
         let warming = anyhow::Error::new(IndexWriterRetryableError::VectorStoreWarming);
         assert!(matches!(
             classify_staging_error(&warming),
-            CutbackAttemptOutcome::Transient(CutbackErrorClass::IndexCommit)
+            CutbackAttemptOutcome::ReadinessDeferred(CutbackReadiness::VectorStore)
         ));
 
         let validation = anyhow::Error::new(StagingValidationRefusal);

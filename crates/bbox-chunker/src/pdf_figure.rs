@@ -26,12 +26,32 @@
 //! the whole background reindex pass, not just this file).
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use lopdf::{Dictionary, Document, Object};
 
 use super::{Chunk, placeholder_chunk};
 
 pub const PDF_FIGURE_CHUNK_KIND: &str = "pdf_figure";
+
+// Figure extraction runs inside the single index-writer actor. These are
+// hard safety ceilings, not tuning targets: an image-heavy or adversarial PDF
+// must yield partial figure coverage instead of monopolizing the daemon.
+const MAX_PDF_FIGURE_PAGES: usize = 256;
+const MAX_PDF_FIGURE_IMAGES_SCANNED: usize = 512;
+const MAX_PDF_FIGURE_CHUNKS: usize = 128;
+const MAX_PDF_FIGURE_AXIS: usize = 8_192;
+const MAX_PDF_FIGURE_PIXELS: usize = 5_000_000;
+const MAX_PDF_FIGURE_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PDF_FIGURE_DECODED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PDF_FIGURE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PDF_FIGURE_ELAPSED: Duration = Duration::from_secs(10);
+
+struct DecodedImage {
+    bytes: Vec<u8>,
+    media_type: &'static str,
+    budget_bytes: usize,
+}
 
 /// Extract `pdf_figure` chunks from a PDF's embedded raster XObjects,
 /// storing each one's bytes in the visual payload sidecar. Never returns
@@ -56,6 +76,7 @@ pub fn extract_figure_chunks(path: &Path, bytes: &[u8]) -> Vec<Chunk> {
 }
 
 fn extract_figure_chunks_inner(path: &Path, bytes: &[u8]) -> Vec<Chunk> {
+    let started = Instant::now();
     let document = match Document::load_mem(bytes) {
         Ok(document) => document,
         Err(err) => {
@@ -70,7 +91,21 @@ fn extract_figure_chunks_inner(path: &Path, bytes: &[u8]) -> Vec<Chunk> {
 
     let mut chunks = Vec::new();
     let mut occurrence_idx = 0u32;
-    for (page_number, page_id) in document.get_pages() {
+    let mut pages_scanned = 0usize;
+    let mut images_scanned = 0usize;
+    let mut bytes_remaining = MAX_PDF_FIGURE_TOTAL_BYTES;
+    let mut truncated_reason = None;
+    'pages: for (page_index, (page_number, page_id)) in document.get_pages().into_iter().enumerate()
+    {
+        if page_index >= MAX_PDF_FIGURE_PAGES {
+            truncated_reason = Some("page limit");
+            break;
+        }
+        if started.elapsed() >= MAX_PDF_FIGURE_ELAPSED {
+            truncated_reason = Some("elapsed-time limit");
+            break;
+        }
+        pages_scanned += 1;
         let images = match document.get_page_images(page_id) {
             Ok(images) => images,
             Err(err) => {
@@ -84,10 +119,29 @@ fn extract_figure_chunks_inner(path: &Path, bytes: &[u8]) -> Vec<Chunk> {
             }
         };
         for image in images {
-            let Some((payload_bytes, media_type)) = decode_supported_image(&image) else {
+            if images_scanned >= MAX_PDF_FIGURE_IMAGES_SCANNED {
+                truncated_reason = Some("image scan limit");
+                break 'pages;
+            }
+            if chunks.len() >= MAX_PDF_FIGURE_CHUNKS {
+                truncated_reason = Some("figure chunk limit");
+                break 'pages;
+            }
+            if bytes_remaining == 0 {
+                truncated_reason = Some("decoded-byte limit");
+                break 'pages;
+            }
+            if started.elapsed() >= MAX_PDF_FIGURE_ELAPSED {
+                truncated_reason = Some("elapsed-time limit");
+                break 'pages;
+            }
+            images_scanned += 1;
+            let Some(decoded) = decode_supported_image(&image, bytes_remaining) else {
                 continue;
             };
-            let payload = match bbox_visual_store::global().put(&payload_bytes, media_type) {
+            bytes_remaining = bytes_remaining.saturating_sub(decoded.budget_bytes);
+            let payload = match bbox_visual_store::global().put(&decoded.bytes, decoded.media_type)
+            {
                 Ok(payload) => payload,
                 Err(err) => {
                     tracing::warn!(
@@ -118,6 +172,18 @@ fn extract_figure_chunks_inner(path: &Path, bytes: &[u8]) -> Vec<Chunk> {
             occurrence_idx += 1;
         }
     }
+    if let Some(reason) = truncated_reason {
+        tracing::warn!(
+            path = %path.display(),
+            reason,
+            pages_scanned,
+            images_scanned,
+            figures_emitted = chunks.len(),
+            budget_bytes_consumed = MAX_PDF_FIGURE_TOTAL_BYTES - bytes_remaining,
+            elapsed_ms = started.elapsed().as_millis(),
+            "pdf figure extraction reached a safety ceiling; keeping partial results"
+        );
+    }
     chunks
 }
 
@@ -125,14 +191,39 @@ fn extract_figure_chunks_inner(path: &Path, bytes: &[u8]) -> Vec<Chunk> {
 /// filter/color-space/bit-depth combination is one of the "easy encodings";
 /// `None` for anything else (see the module doc comment for the exact
 /// supported matrix).
-fn decode_supported_image(image: &lopdf::xobject::PdfImage<'_>) -> Option<(Vec<u8>, &'static str)> {
+fn decode_supported_image(
+    image: &lopdf::xobject::PdfImage<'_>,
+    bytes_remaining: usize,
+) -> Option<DecodedImage> {
+    if image.content.len() > MAX_PDF_FIGURE_SOURCE_BYTES {
+        return None;
+    }
+    checked_image_dimensions(image)?;
     let filters = image.filters.as_deref().unwrap_or_default();
     match filters {
         // DCTDecode content is already a complete baseline JPEG stream.
-        [filter] if filter == "DCTDecode" => Some((image.content.to_vec(), "image/jpeg")),
-        [filter] if filter == "FlateDecode" => decode_flate_raster(image),
+        [filter] if filter == "DCTDecode" && image.content.len() <= bytes_remaining => {
+            Some(DecodedImage {
+                bytes: image.content.to_vec(),
+                media_type: "image/jpeg",
+                budget_bytes: image.content.len(),
+            })
+        }
+        [filter] if filter == "FlateDecode" => decode_flate_raster(image, bytes_remaining),
         _ => None,
     }
+}
+
+fn checked_image_dimensions(image: &lopdf::xobject::PdfImage<'_>) -> Option<(usize, usize)> {
+    let width = usize::try_from(image.width).ok()?;
+    let height = usize::try_from(image.height).ok()?;
+    if width == 0 || height == 0 || width > MAX_PDF_FIGURE_AXIS || height > MAX_PDF_FIGURE_AXIS {
+        return None;
+    }
+    if width.checked_mul(height)? > MAX_PDF_FIGURE_PIXELS {
+        return None;
+    }
+    Some((width, height))
 }
 
 /// FlateDecode raster passthrough: only 8-bit DeviceGray/DeviceRGB with no
@@ -141,7 +232,10 @@ fn decode_supported_image(image: &lopdf::xobject::PdfImage<'_>) -> Option<(Vec<u
 /// scheme) rather than raw scanlines; reversing that is out of scope for
 /// this pass, so those streams are skipped rather than mis-decoded into
 /// garbage pixels.
-fn decode_flate_raster(image: &lopdf::xobject::PdfImage<'_>) -> Option<(Vec<u8>, &'static str)> {
+fn decode_flate_raster(
+    image: &lopdf::xobject::PdfImage<'_>,
+    bytes_remaining: usize,
+) -> Option<DecodedImage> {
     if has_non_trivial_predictor(image.origin_dict) {
         return None;
     }
@@ -153,22 +247,23 @@ fn decode_flate_raster(image: &lopdf::xobject::PdfImage<'_>) -> Option<(Vec<u8>,
     if image.bits_per_component != Some(8) {
         return None;
     }
-    let width = usize::try_from(image.width).ok()?;
-    let height = usize::try_from(image.height).ok()?;
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let raw = decode_zlib(image.content)?;
+    let (width, height) = checked_image_dimensions(image)?;
     let expected_len = width.checked_mul(height)?.checked_mul(channels)?;
-    if raw.len() != expected_len {
-        // Length mismatch means an assumption above doesn't hold for this
-        // stream (e.g. an undeclared predictor, or a partial/corrupt
-        // stream) - skip rather than encode a corrupt image.
+    if expected_len > MAX_PDF_FIGURE_DECODED_BYTES || expected_len > bytes_remaining {
         return None;
     }
+    let raw = decode_zlib_exact(image.content, expected_len)?;
     let color_type = if channels == 1 { 0 } else { 2 };
     let png = encode_png(width as u32, height as u32, color_type, channels, &raw)?;
-    Some((png, "image/png"))
+    let budget_bytes = expected_len.checked_add(png.len())?;
+    if png.len() > MAX_PDF_FIGURE_DECODED_BYTES || budget_bytes > bytes_remaining {
+        return None;
+    }
+    Some(DecodedImage {
+        bytes: png,
+        media_type: "image/png",
+        budget_bytes,
+    })
 }
 
 fn has_non_trivial_predictor(dict: &Dictionary) -> bool {
@@ -188,12 +283,14 @@ fn has_non_trivial_predictor(dict: &Dictionary) -> bool {
     !matches!(predictor, None | Some(1))
 }
 
-fn decode_zlib(bytes: &[u8]) -> Option<Vec<u8>> {
+fn decode_zlib_exact(bytes: &[u8], expected_len: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut decoder = flate2::read::ZlibDecoder::new(bytes);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok()?;
-    Some(out)
+    let decoder = flate2::read::ZlibDecoder::new(bytes);
+    let read_limit = u64::try_from(expected_len).ok()?.checked_add(1)?;
+    let mut limited = decoder.take(read_limit);
+    let mut out = Vec::with_capacity(expected_len.saturating_add(1));
+    limited.read_to_end(&mut out).ok()?;
+    (out.len() == expected_len).then_some(out)
 }
 
 /// Minimal PNG encoder: signature + IHDR + one IDAT (all scanlines, filter
@@ -464,5 +561,26 @@ mod tests {
                 std::fs::read(bbox_visual_store::global().path_for(&payload.content_hash)).unwrap();
             assert_eq!(stored[25], 0, "grayscale PNG color type is 0");
         });
+    }
+
+    #[test]
+    fn declared_raster_over_pixel_budget_is_skipped_before_decode() {
+        with_store(|| {
+            let compressed = flate_compress(&[0u8; 3]);
+            let bytes = build_pdf_with_image(
+                "/Width 8192 /Height 8192 /ColorSpace /DeviceRGB \
+                 /BitsPerComponent 8 /Filter /FlateDecode",
+                &compressed,
+            );
+            let chunks = extract_figure_chunks(Path::new("oversized.pdf"), &bytes);
+            assert!(chunks.is_empty());
+        });
+    }
+
+    #[test]
+    fn zlib_decode_refuses_expansion_past_exact_expected_length() {
+        let compressed = flate_compress(&[1, 2, 3, 4]);
+        assert!(decode_zlib_exact(&compressed, 3).is_none());
+        assert_eq!(decode_zlib_exact(&compressed, 4), Some(vec![1, 2, 3, 4]));
     }
 }

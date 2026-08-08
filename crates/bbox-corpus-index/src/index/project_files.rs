@@ -137,6 +137,10 @@ enum ProjectIndexPublication {
         replace_all: bool,
         compact_legacy: bool,
     },
+    CompactProjectEdgeStorage {
+        edges_dir: PathBuf,
+        project_id: String,
+    },
     GitHistory(super::git_history::GitHistoryPublication),
     SnapshotGitCurrent {
         edges_dir: PathBuf,
@@ -216,6 +220,42 @@ impl ProjectIndexPublicationBundle {
                     replace_all,
                     compact_legacy,
                 } => {
+                    if !replace_all
+                        && bbox_edge_sidecar::edge_sidecar::managed_edge_set_needs_compaction(
+                            &edges_dir,
+                            "project",
+                            &project_id,
+                        )
+                    {
+                        let stats = bbox_edge_sidecar::edge_sidecar::compact_managed_edge_set(
+                            &edges_dir,
+                            "project",
+                            &project_id,
+                        )?;
+                        tracing::info!(
+                            project_id = %project_id,
+                            rows_before = stats.rows_before,
+                            rows_after = stats.rows_after,
+                            bytes_before = stats.bytes_before,
+                            bytes_after = stats.bytes_after,
+                            "managed project-edge lane migrated to set semantics"
+                        );
+                    }
+                    if !replace_all {
+                        for stats in bbox_edge_sidecar::snapshot::compact_active_project_edge_sets(
+                            &edges_dir,
+                            &project_id,
+                        )? {
+                            tracing::info!(
+                                project_id = %project_id,
+                                rows_before = stats.rows_before,
+                                rows_after = stats.rows_after,
+                                bytes_before = stats.bytes_before,
+                                bytes_after = stats.bytes_after,
+                                "active project-edge materialization migrated to set semantics"
+                            );
+                        }
+                    }
                     if replace_all {
                         bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
                             &edges_dir,
@@ -248,6 +288,48 @@ impl ProjectIndexPublicationBundle {
                             project_id = %project_id,
                             error = %error,
                             "failed to compact legacy edge sidecar after full project refresh"
+                        );
+                    }
+                }
+                ProjectIndexPublication::CompactProjectEdgeStorage {
+                    edges_dir,
+                    project_id,
+                } => {
+                    let stats = bbox_edge_sidecar::edge_sidecar::compact_managed_edge_set(
+                        &edges_dir,
+                        "project",
+                        &project_id,
+                    )?;
+                    tracing::info!(
+                        project_id = %project_id,
+                        rows_before = stats.rows_before,
+                        rows_after = stats.rows_after,
+                        bytes_before = stats.bytes_before,
+                        bytes_after = stats.bytes_after,
+                        "managed project-edge lane migrated to set semantics"
+                    );
+                    for stats in bbox_edge_sidecar::snapshot::compact_active_project_edge_sets(
+                        &edges_dir,
+                        &project_id,
+                    )? {
+                        tracing::info!(
+                            project_id = %project_id,
+                            rows_before = stats.rows_before,
+                            rows_after = stats.rows_after,
+                            bytes_before = stats.bytes_before,
+                            bytes_after = stats.bytes_after,
+                            "active project-edge materialization migrated to set semantics"
+                        );
+                    }
+                    if let Err(error) = bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(
+                        &edges_dir,
+                        &project_id,
+                        true,
+                    ) {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            error = %error,
+                            "failed to compact legacy edge sidecar during set migration"
                         );
                     }
                 }
@@ -1954,17 +2036,23 @@ fn index_project(
         .map_or(base_mat_version.clone(), |snapshot_id| {
             format!("{base_mat_version}+ref-snapshot:{snapshot_id}")
         });
-    // A materialization-version change alters the meaning of every derived
-    // edge. Incremental preservation would carry the outgoing generation's
-    // symbol-only edges forward because those rows have no rel_path_hash to
-    // invalidate. The publication must replace the complete managed lane.
-    let mut replace_all_project_edges = ctx.force_git_full
-        || ctx.meta.iter().any(|(key, meta)| {
-            bbox_code_source::parse_project_file_meta_key(key).is_some_and(|(project_id, _, _)| {
-                project_id == project.project_id
-                    && meta.mat_version.as_deref() != Some(&mat_version)
-            })
-        });
+    let replace_all_project_edges = ctx.force_git_full;
+    // Edge-set storage is independently versioned from document/chunker
+    // materialization. The v2 migration streams and deduplicates the existing
+    // lane; it must not force unchanged source files through every chunker.
+    let managed_edges_need_compaction =
+        bbox_edge_sidecar::edge_sidecar::managed_edge_set_needs_compaction(
+            ctx.edges_dir,
+            "project",
+            &project.project_id,
+        );
+    let active_edges_need_compaction =
+        bbox_edge_sidecar::snapshot::active_project_edge_sets_need_compaction(
+            ctx.edges_dir,
+            &project.project_id,
+        )?;
+    let project_edge_storage_needs_migration =
+        managed_edges_need_compaction || active_edges_need_compaction;
     // On-disk freshness-key set for this project, captured before `files` is
     // moved. Keyed by the P3-E composite (plan section 4.6), the same key the
     // meta map now uses, so the deletion detection below compares like with
@@ -1990,9 +2078,6 @@ fn index_project(
             &relative_path,
         );
         let previous = ctx.meta.get(meta_key.as_str());
-        if previous.is_some_and(|meta| meta.mat_version.as_deref() != Some(&mat_version)) {
-            replace_all_project_edges = true;
-        }
         match classify_project_file(previous, mtime, size, &mat_version) {
             ProjectFileAction::Skip => {
                 ctx.stats.skipped += 1;
@@ -2158,7 +2243,15 @@ fn index_project(
                 edges: project_edges,
                 deleted_rel_hashes,
                 replace_all: replace_all_project_edges,
-                compact_legacy: replace_all_project_edges,
+                compact_legacy: replace_all_project_edges || project_edge_storage_needs_migration,
+            });
+    } else if project_edge_storage_needs_migration {
+        ctx.stats
+            .publication
+            .actions
+            .push(ProjectIndexPublication::CompactProjectEdgeStorage {
+                edges_dir: ctx.edges_dir.to_path_buf(),
+                project_id: project.project_id.clone(),
             });
     }
 
@@ -2934,7 +3027,7 @@ mod tests {
     }
 
     #[test]
-    fn materialization_version_cut_replaces_and_deduplicates_managed_lane() {
+    fn full_edge_refresh_replaces_and_deduplicates_managed_lane() {
         let directory = tempfile::tempdir().unwrap();
         let edges_dir = directory.path().canonicalize().unwrap();
         let managed =

@@ -1087,9 +1087,173 @@ pub fn append_project_edges(
 // so GC cannot unlink a temp the writer is actively using via a
 // deterministic name (R16F2).
 static WRITER_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) const MANAGED_EDGE_SET_VERSION: &str = "edge-set-v2-deduplicated";
+const MAX_MANAGED_EDGE_COMPACTION_INPUT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 fn writer_temp_sequence() -> u64 {
     WRITER_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn managed_edge_set_marker_path(edges_dir: &Path, namespace: &str, project_id: &str) -> PathBuf {
+    managed_derived_edges_dir(edges_dir)
+        .join(".versions")
+        .join(namespace)
+        .join(format!("{project_id}.{MANAGED_EDGE_SET_VERSION}"))
+}
+
+pub fn managed_edge_set_needs_compaction(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+) -> bool {
+    let lane = managed_derived_edges_dir(edges_dir)
+        .join(namespace)
+        .join(format!("{project_id}.jsonl"));
+    edge_set_file_needs_compaction(
+        &lane,
+        &managed_edge_set_marker_path(edges_dir, namespace, project_id),
+    )
+}
+
+fn stamp_managed_edge_set_current(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+) -> Result<()> {
+    let marker = managed_edge_set_marker_path(edges_dir, namespace, project_id);
+    stamp_edge_set_current(&marker)
+}
+
+fn stamp_edge_set_current(marker: &Path) -> Result<()> {
+    let parent = marker.parent().context("edge-set marker has no parent")?;
+    fs::create_dir_all(parent)?;
+    let tmp = marker.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        writer_temp_sequence()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        file.write_all(MANAGED_EDGE_SET_VERSION.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &marker)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+pub(crate) fn edge_set_file_needs_compaction(path: &Path, marker: &Path) -> bool {
+    path.is_file() && !marker.is_file()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedEdgeSetCompactionStats {
+    pub rows_before: u64,
+    pub rows_after: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// One-time storage migration for the v2 set-like managed lane. It streams
+/// the outgoing JSONL and retains one row per semantic edge key, so memory is
+/// proportional to unique edges rather than the duplicate-amplified file.
+/// Document freshness and snapshot identity are deliberately untouched.
+#[allow(clippy::disallowed_methods)]
+pub fn compact_managed_edge_set(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+) -> Result<ManagedEdgeSetCompactionStats> {
+    let path = managed_derived_edges_dir(edges_dir)
+        .join(namespace)
+        .join(format!("{project_id}.jsonl"));
+    let marker = managed_edge_set_marker_path(edges_dir, namespace, project_id);
+    compact_edge_set_file(&path, &marker)
+}
+
+pub(crate) fn compact_edge_set_file(
+    path: &Path,
+    marker: &Path,
+) -> Result<ManagedEdgeSetCompactionStats> {
+    if !edge_set_file_needs_compaction(path, marker) {
+        let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        return Ok(ManagedEdgeSetCompactionStats {
+            rows_before: 0,
+            rows_after: 0,
+            bytes_before: bytes,
+            bytes_after: bytes,
+        });
+    }
+    let bytes_before = fs::metadata(&path)?.len();
+    anyhow::ensure!(
+        bytes_before <= MAX_MANAGED_EDGE_COMPACTION_INPUT_BYTES,
+        "edge-set lane exceeds the {} byte compaction ceiling: {}",
+        MAX_MANAGED_EDGE_COMPACTION_INPUT_BYTES,
+        path.display()
+    );
+    let dir = path.parent().context("edge-set lane has no parent")?;
+    fs::create_dir_all(&dir)?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("edge-set lane filename is not UTF-8")?;
+    let tmp = dir.join(format!(
+        "{filename}.compact.{}.{}.tmp",
+        std::process::id(),
+        writer_temp_sequence()
+    ));
+    let result = (|| -> Result<ManagedEdgeSetCompactionStats> {
+        let input = std::io::BufReader::new(fs::File::open(&path)?);
+        let output = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+        let mut writer = BufWriter::new(output);
+        let mut seen: HashSet<EdgeKey> = HashSet::new();
+        let mut rows_before = 0u64;
+        let mut rows_after = 0u64;
+        for line in input.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            rows_before += 1;
+            match serde_json::from_str::<Edge>(trimmed) {
+                Ok(edge) => {
+                    if !seen.insert(edge.dedup_key()) {
+                        continue;
+                    }
+                    serde_json::to_writer(&mut writer, &edge)?;
+                }
+                Err(_) => writer.write_all(trimmed.as_bytes())?,
+            }
+            writer.write_all(b"\n")?;
+            rows_after += 1;
+        }
+        let file = writer.into_inner().map_err(|error| error.into_error())?;
+        file.sync_all()?;
+        let bytes_after = file.metadata()?.len();
+        drop(file);
+        fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        fs::File::open(&dir)?.sync_all()?;
+        stamp_edge_set_current(marker)?;
+        Ok(ManagedEdgeSetCompactionStats {
+            rows_before,
+            rows_after,
+            bytes_before,
+            bytes_after,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 // edge sidecar writes run on the reindex/writer-actor thread.
@@ -1109,7 +1273,7 @@ pub fn replace_project_edges(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
-        return Ok(());
+        return stamp_managed_edge_set_current(edges_dir, namespace, project_id);
     }
 
     let tmp_path = dir.join(format!(
@@ -1139,7 +1303,7 @@ pub fn replace_project_edges(
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp_path, &path)?;
-        Ok(())
+        stamp_managed_edge_set_current(edges_dir, namespace, project_id)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
@@ -1633,7 +1797,7 @@ pub fn replace_materialized_edges_incremental(
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp_path, &path)?;
-        Ok(())
+        stamp_managed_edge_set_current(edges_dir, namespace, project_id)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
@@ -2884,6 +3048,48 @@ mod project_catalog_snapshot_tests {
         let live = std::fs::read_to_string(path).unwrap();
         assert!(live.contains("RELATED_TO"));
         assert!(!live.contains("\"provenance\":\"derived\""));
+    }
+
+    #[test]
+    fn managed_edge_set_migration_deduplicates_without_document_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges = dir.path().canonicalize().unwrap().join("edges");
+        let project_id = "a1b2c3d4";
+        let lane_dir = managed_derived_edges_dir(&edges).join("project");
+        std::fs::create_dir_all(&lane_dir).unwrap();
+        let lane = lane_dir.join(format!("{project_id}.jsonl"));
+        let edge = Edge {
+            source: EntityRef::parse("task:one").unwrap(),
+            kind: "RELATED_TO".into(),
+            target: EntityRef::parse("task:two").unwrap(),
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        };
+        let row = serde_json::to_string(&edge).unwrap();
+        std::fs::write(&lane, format!("{row}\n{row}\nmalformed-but-preserved\n")).unwrap();
+
+        assert!(managed_edge_set_needs_compaction(
+            &edges, "project", project_id
+        ));
+        let stats = compact_managed_edge_set(&edges, "project", project_id).unwrap();
+        assert_eq!(stats.rows_before, 3);
+        assert_eq!(stats.rows_after, 2);
+        assert!(stats.bytes_after < stats.bytes_before);
+        assert!(!managed_edge_set_needs_compaction(
+            &edges, "project", project_id
+        ));
+        let content = std::fs::read_to_string(&lane).unwrap();
+        assert_eq!(content.matches("RELATED_TO").count(), 1);
+        assert!(content.contains("malformed-but-preserved"));
+
+        let second = compact_managed_edge_set(&edges, "project", project_id).unwrap();
+        assert_eq!(
+            second.rows_before, 0,
+            "version marker makes migration one-shot"
+        );
+        assert_eq!(second.bytes_before, second.bytes_after);
     }
 }
 
