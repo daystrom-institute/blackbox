@@ -2393,11 +2393,13 @@ mod tests {
 
         let fixture = CatalogFixture::new();
         fixture.add_published_project("p_dryrun", &scope);
-        fixture.attach_checkout(
+        fixture.attach_overlay_checkout(
             "p_dryrun",
             &scope,
             &checkout,
             "att_00000000000000000000000000000d01",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01",
+            true,
         );
         fixture.install_publication(
             "p_dryrun",
@@ -2406,7 +2408,7 @@ mod tests {
             &[knowledge_entry("knowledge-a", "generationone")],
             &[],
         );
-        let server = fixture.server();
+        let server = fixture.server_with_checkout_authority();
         server.state.install_code_read_view_commit_hook();
         let project_id = ProjectId::parse("p_dryrun").unwrap();
 

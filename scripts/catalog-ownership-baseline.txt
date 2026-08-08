@@ -1,13 +1,13 @@
-#   scripts/acceptance-catalog-ownership.sh --write-baseline
 # Catalog ownership inventory baseline (plan section 14.2 Proof B).
 # One row per SITE: pattern, file, enclosing item, count, Phase 6 reason.
-# Phase 6 deletion inventory; see
-# Refresh after a legitimate removal:
 # Spans are computed by parsing each file, so test items and members are
-# design/daemon-runtime/durable-project-catalog-phase6-handoff.md.
 # excluded structurally rather than by matching text. A site absent here
 # fails the check even when the total is unchanged, which is what rejects
 # substituting a prohibited occurrence for an approved one. Every row is
+# Phase 6 deletion inventory; see
+# design/daemon-runtime/durable-project-catalog-phase6-handoff.md.
+# Refresh after a legitimate removal:
+#   scripts/acceptance-catalog-ownership.sh --write-baseline
 canonical_path_read	crates/bbox-corpus-core/src/project_record.rs	fn from	2	delete with ProjectRecord
 canonical_path_read	crates/bbox-corpus-core/src/project_record.rs	fn resolve_base_project_for_scope	3	delete with ProjectRecord
 canonical_path_read	crates/bbox-corpus-core/src/project_selector.rs	fn display	1	delete with ProjectRecord
@@ -132,10 +132,10 @@ checkout_root_path	src/tools/knowledge.rs	fn stable_knowledge_overlay	2	collapse
 checkout_root_path	src/tools/project_catalog.rs	fn attachment_row_governing	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_attach	4	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_catalog_get	1	collapse into the lease confined readers
+checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_advance	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_bind	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn probe_attachment_scopes	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn probe_migration_attachments	2	collapse into the lease confined readers
-checkout_root_path	src/tools/project_catalog.rs	fn publisher_publish_probe	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn register_catalog_arm	5	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn rename_catalog_arm	5	collapse into the lease confined readers
 checkout_root_path	src/tools/projects.rs	fn bbox_project_eject	2	collapse into the lease confined readers
