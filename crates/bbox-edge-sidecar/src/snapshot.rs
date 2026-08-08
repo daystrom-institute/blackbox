@@ -307,12 +307,7 @@ fn remove_inactive_snapshot_tree_locked(
                 anyhow::bail!("inactive snapshot directory identity changed before deletion");
             }
             let snapshot_dir = open_confined_dir_fd(directory.as_raw_fd(), &leaf)?;
-            let staging = std::ffi::CString::new(".staging")?;
-            match fstatat_nofollow(snapshot_dir.as_raw_fd(), &staging) {
-                Ok(_) => anyhow::bail!("refusing to delete a staged snapshot directory"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            refuse_live_snapshot_staging(&snapshot_dir)?;
             let loaded = load_snapshot_receipt_from_dir(&snapshot_dir, project_id, snapshot_id)?;
             match (
                 manifest.receipt_managed_snapshots.get(&snapshot_relative),
@@ -827,6 +822,9 @@ fn activate_source_snapshot(
     WorkspaceManifest::write_to(edges_dir, &manifest)?;
 
     let mut index = ManifestIndex::load_or_new(edges_dir)?;
+    index
+        .snapshot_reclamations
+        .remove(&active_snapshot_rel(project_id, snapshot_id));
     let repo_materialization = index
         .workspaces
         .get(project_id)
@@ -2006,10 +2004,41 @@ pub fn activate_pending_local_snapshots(
     activations: &[PendingLocalSnapshotActivation],
 ) -> Result<()> {
     with_manifest_coordinator(|| {
-        for activation in activations {
-            if !snapshot_dir(edges_dir, &activation.project_id, &activation.snapshot_id).is_dir() {
-                anyhow::bail!("pending local edge snapshot is not staged");
+        let mut index = ManifestIndex::load_or_new(edges_dir)?;
+        let eligible = activations
+            .iter()
+            .filter(|activation| {
+                !index
+                    .workspaces
+                    .get(&activation.project_id)
+                    .and_then(|entry| entry.code_source_selector.as_deref())
+                    .is_some_and(|selector| selector.starts_with("collected:"))
+            })
+            .collect::<Vec<_>>();
+
+        // A committed pin whose derived snapshot has disappeared cannot be
+        // activated or repaired from the pin. Skip it so one corrupt project
+        // cannot wedge every other activation and daemon open forever; the
+        // next reindex restages it from source authority.
+        let mut activations = Vec::with_capacity(eligible.len());
+        let mut missing = Vec::new();
+        for activation in eligible {
+            if snapshot_dir(edges_dir, &activation.project_id, &activation.snapshot_id).is_dir() {
+                activations.push(activation);
+            } else {
+                missing.push(format!(
+                    "{}:{}",
+                    activation.project_id, activation.snapshot_id
+                ));
             }
+        }
+        if !missing.is_empty() {
+            tracing::error!(
+                missing = %missing.join(","),
+                "skipping committed local activations whose derived snapshots are missing; reindex will restage them"
+            );
+        }
+        for activation in &activations {
             let manifest = WorkspaceManifest {
                 version: 1,
                 project_id: activation.project_id.clone(),
@@ -2033,35 +2062,18 @@ pub fn activate_pending_local_snapshots(
             WorkspaceManifest::write_to(edges_dir, &manifest)?;
         }
 
-        let mut index = ManifestIndex::load_or_new(edges_dir)?;
         // R28F1: a reclamation intent that declined its own destructive
         // continuation because this snapshot was pinned is settled the moment
         // the snapshot becomes active. Retiring it here keeps the
         // active-plus-intent state (which every reclamation entry point
         // refuses) from having to wait for the next pre-bind recovery.
-        for activation in activations {
+        for activation in &activations {
             index.snapshot_reclamations.remove(&active_snapshot_rel(
                 &activation.project_id,
                 &activation.snapshot_id,
             ));
         }
-        for activation in activations {
-            // Preserve an existing collected: entry: a project whose
-            // effective source is collected must not be overwritten by a
-            // local reindex pass. The reindex scans local checkouts and
-            // stages local snapshots, but the manifest entry reflects the
-            // activation record's authoritative selector. Overwriting a
-            // collected entry with local breaks the relationship chain on
-            // restart.
-            if let Some(existing) = index.workspaces.get(&activation.project_id) {
-                if existing
-                    .code_source_selector
-                    .as_deref()
-                    .is_some_and(|s| s.starts_with("collected:"))
-                {
-                    continue;
-                }
-            }
+        for activation in &activations {
             index.upsert_workspace(
                 &activation.project_id,
                 WorkspaceIndexEntry {
@@ -5661,6 +5673,42 @@ fn fstatat_nofollow(
 }
 
 #[cfg(unix)]
+fn refuse_live_snapshot_staging(snapshot_dir: &fs::File) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let staging = std::ffi::CString::new(".staging")?;
+    let fd = unsafe {
+        libc::openat(
+            snapshot_dir.as_raw_fd(),
+            staging.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let marker = unsafe { fs::File::from_raw_fd(fd) };
+    if !marker.metadata()?.is_file() {
+        anyhow::bail!("snapshot staging marker is not a regular nofollow file");
+    }
+    if unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!("refusing to delete a snapshot with live staging");
+        }
+        return Err(error.into());
+    }
+    // An unlocked marker is crash residue. The manifest coordinator excludes
+    // a new staging guard until this reclamation either commits or declines,
+    // so it is safe to let deletion reclaim the marker with the tree.
+    Ok(())
+}
+
+#[cfg(unix)]
 fn collect_dir_entries(dir: &fs::File) -> Result<Vec<std::ffi::OsString>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
@@ -5794,9 +5842,27 @@ fn clear_snapshot_staging_marker(
     }
 }
 
+#[derive(Debug)]
+pub struct SnapshotStagingGuard {
+    #[cfg(unix)]
+    _marker: fs::File,
+    #[cfg(not(unix))]
+    _marker_path: PathBuf,
+}
+
+#[derive(Debug)]
 pub struct SnapshotEdgeWriter {
     writer: Option<std::io::BufWriter<fs::File>>,
+    staging_guard: Option<SnapshotStagingGuard>,
+    #[cfg(unix)]
+    directory: fs::File,
+    #[cfg(unix)]
+    temporary_leaf: std::ffi::CString,
+    #[cfg(unix)]
+    destination_leaf: std::ffi::CString,
+    #[cfg(not(unix))]
     temporary: PathBuf,
+    #[cfg(not(unix))]
     destination: PathBuf,
 }
 
@@ -5813,24 +5879,59 @@ impl SnapshotEdgeWriter {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<()> {
+    pub fn finish(mut self) -> Result<SnapshotStagingGuard> {
         let writer = self
             .writer
             .take()
             .ok_or_else(|| anyhow::anyhow!("snapshot edge writer is already finished"))?;
         let file = writer.into_inner().map_err(|error| error.into_error())?;
         file.sync_all()?;
-        fs::rename(&self.temporary, &self.destination)?;
-        if let Some(parent) = self.destination.parent() {
-            fs::File::open(parent)?.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            if unsafe {
+                libc::renameat(
+                    self.directory.as_raw_fd(),
+                    self.temporary_leaf.as_ptr(),
+                    self.directory.as_raw_fd(),
+                    self.destination_leaf.as_ptr(),
+                )
+            } != 0
+            {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    libc::unlinkat(self.directory.as_raw_fd(), self.temporary_leaf.as_ptr(), 0);
+                }
+                return Err(error.into());
+            }
+            self.directory.sync_all()?;
         }
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            fs::rename(&self.temporary, &self.destination)?;
+            if let Some(parent) = self.destination.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+        }
+        self.staging_guard
+            .take()
+            .context("snapshot edge writer lost its staging guard")
     }
 }
 
 impl Drop for SnapshotEdgeWriter {
     fn drop(&mut self) {
         if self.writer.is_some() {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+
+                unsafe {
+                    libc::unlinkat(self.directory.as_raw_fd(), self.temporary_leaf.as_ptr(), 0);
+                }
+            }
+            #[cfg(not(unix))]
             let _ = fs::remove_file(&self.temporary);
         }
     }
@@ -5842,15 +5943,106 @@ pub fn create_snapshot_edge_writer(
     snapshot_id: &str,
     filename: &str,
 ) -> Result<SnapshotEdgeWriter> {
-    let directory = snapshot_dir(edges_dir, project_id, snapshot_id);
-    fs::create_dir_all(&directory)?;
-    let destination = directory.join(filename);
-    let temporary = destination.with_extension("jsonl.tmp");
-    let file = fs::File::create(&temporary)?;
-    Ok(SnapshotEdgeWriter {
-        writer: Some(std::io::BufWriter::new(file)),
-        temporary,
-        destination,
+    with_manifest_coordinator(|| {
+        validate_snapshot_component(project_id)?;
+        validate_snapshot_component(snapshot_id)?;
+        validate_snapshot_component(filename)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+
+            let relative = Path::new("materialized")
+                .join("workspace")
+                .join(project_id)
+                .join("snapshots")
+                .join(snapshot_id);
+            let directory = open_dir_under_root(edges_dir, &relative, true)?;
+            let marker_leaf = std::ffi::CString::new(".staging")?;
+            let marker_fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    marker_leaf.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if marker_fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut marker = unsafe { fs::File::from_raw_fd(marker_fd) };
+            let stat = marker.metadata()?;
+            if !stat.is_file() {
+                anyhow::bail!("snapshot staging marker is not a regular file");
+            }
+            if unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    anyhow::bail!("snapshot staging is already in progress");
+                }
+                return Err(error.into());
+            }
+            marker.set_len(0)?;
+            marker.write_all(b"blackbox-collected-snapshot-staging-v1\n")?;
+            marker.sync_all()?;
+            directory.sync_all()?;
+
+            static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let temporary_leaf = std::ffi::CString::new(format!(
+                ".{filename}.{}.{}.tmp",
+                std::process::id(),
+                TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))?;
+            let destination_leaf = std::ffi::CString::new(filename)?;
+            let file_fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    temporary_leaf.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if file_fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let file = unsafe { fs::File::from_raw_fd(file_fd) };
+            Ok(SnapshotEdgeWriter {
+                writer: Some(std::io::BufWriter::new(file)),
+                staging_guard: Some(SnapshotStagingGuard { _marker: marker }),
+                directory,
+                temporary_leaf,
+                destination_leaf,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let directory = snapshot_dir(edges_dir, project_id, snapshot_id);
+            fs::create_dir_all(&directory)?;
+            let marker_path = directory.join(".staging");
+            let marker = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker_path)?;
+            marker.sync_all()?;
+            let destination = directory.join(filename);
+            let temporary = destination.with_extension("jsonl.tmp");
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            Ok(SnapshotEdgeWriter {
+                writer: Some(std::io::BufWriter::new(file)),
+                staging_guard: Some(SnapshotStagingGuard {
+                    _marker_path: marker_path,
+                }),
+                temporary,
+                destination,
+            })
+        }
     })
 }
 
@@ -7992,6 +8184,82 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn collected_staging_guard_blocks_gc_and_crash_residue_is_reclaimable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().canonicalize().unwrap();
+        let mut writer =
+            create_snapshot_edge_writer(&edges_dir, "project-1", "snapshot-1", "project.jsonl")
+                .unwrap();
+        writer
+            .append(&[derived_edge("source", "DESCRIBES", "target")])
+            .unwrap();
+        let guard = writer.finish().unwrap();
+        let snapshot = snapshot_dir(&edges_dir, "project-1", "snapshot-1");
+        let metadata = std::fs::symlink_metadata(&snapshot).unwrap();
+        let relative = Path::new("materialized/workspace/project-1/snapshots/snapshot-1");
+
+        let error =
+            remove_inactive_snapshot_tree(&edges_dir, relative, (metadata.dev(), metadata.ino()))
+                .expect_err("a live collected staging guard must fence GC");
+        assert!(error.to_string().contains("live staging"), "{error}");
+        assert!(snapshot.exists());
+
+        drop(guard);
+        assert!(
+            remove_inactive_snapshot_tree(&edges_dir, relative, (metadata.dev(), metadata.ino()),)
+                .unwrap(),
+            "an unlocked crash-left marker must not leak the snapshot forever"
+        );
+        assert!(!snapshot.exists());
+    }
+
+    #[test]
+    fn a_missing_local_snapshot_does_not_wedge_other_committed_activations() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let first = stage_local_snapshot_activation(
+            edges_dir,
+            "project-1",
+            "repo-1",
+            None,
+            "aaaa",
+            false,
+            None,
+            "snapshot-1",
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let second = stage_local_snapshot_activation(
+            edges_dir,
+            "project-2",
+            "repo-2",
+            None,
+            "bbbb",
+            false,
+            None,
+            "snapshot-2",
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        std::fs::remove_dir_all(snapshot_dir(edges_dir, "project-2", "snapshot-2")).unwrap();
+
+        activate_pending_local_snapshots(edges_dir, &[first, second]).unwrap();
+
+        assert!(WorkspaceManifest::manifest_path(edges_dir, "project-1").exists());
+        assert!(!WorkspaceManifest::manifest_path(edges_dir, "project-2").exists());
+        let index = ManifestIndex::load_or_new(edges_dir).unwrap();
+        assert!(index.workspaces.contains_key("project-1"));
+        assert!(!index.workspaces.contains_key("project-2"));
+    }
+
     /// Regression: a background reindex that stages a local snapshot for a
     /// project whose effective source is collected must NOT overwrite the
     /// manifest index entry with a `local:` selector. If it does, the
@@ -8087,6 +8355,10 @@ mod tests {
                 .as_deref()
                 .is_some_and(|s| s.starts_with("collected:")),
             "persisted entry must carry collected selector across restart"
+        );
+        assert!(
+            !WorkspaceManifest::manifest_path(edges_dir, project_id).exists(),
+            "a skipped local activation must not overwrite the collected workspace manifest"
         );
     }
 
@@ -10420,6 +10692,56 @@ mod tests {
             .map(|pin| pin.activation().clone())
             .collect::<Vec<_>>();
         activate_pending_local_snapshots(&edges_dir, &activations).unwrap();
+        assert!(
+            ManifestIndex::load(&edges_dir)
+                .unwrap()
+                .snapshot_reclamations
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_collected_activation_retires_a_standing_reclamation_intent() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let project_id = "p_1";
+        let snapshot_id = "snapshot-a";
+        write_snapshot_files(
+            &edges_dir,
+            project_id,
+            snapshot_id,
+            &[("project.jsonl", &[])],
+        )
+        .unwrap();
+        let snapshot = snapshot_dir(&edges_dir, project_id, snapshot_id);
+        let metadata = fs::symlink_metadata(&snapshot).unwrap();
+        let snapshot_key = active_snapshot_rel(project_id, snapshot_id);
+        let mut manifest = ManifestIndex::load_or_new(&edges_dir).unwrap();
+        manifest.snapshot_reclamations.insert(
+            snapshot_key,
+            crate::manifest::SnapshotReclamationIntent {
+                receipt_digest: None,
+                tombstone: ".reclaim-snapshot-a".to_string(),
+                device: metadata.dev() as u64,
+                inode: metadata.ino() as u64,
+            },
+        );
+        manifest.write_atomic(&edges_dir).unwrap();
+
+        activate_collected_snapshot(
+            &edges_dir,
+            project_id,
+            "repo-1",
+            "head-1",
+            "generation-1",
+            "collected:p_1:generation-1",
+            snapshot_id,
+        )
+        .unwrap();
+
         assert!(
             ManifestIndex::load(&edges_dir)
                 .unwrap()

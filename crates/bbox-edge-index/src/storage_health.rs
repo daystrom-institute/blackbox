@@ -1442,15 +1442,6 @@ pub fn plan_gc_with_policy(
             }
             if candidate.kind == FileKind::InactiveSnapshot {
                 validate_inactive_snapshot_identity(&report, candidate, &metadata)?;
-                let staging = path.join(".staging");
-                match fs::symlink_metadata(&staging) {
-                    Ok(marker) if marker.is_file() && !marker.file_type().is_symlink() => {
-                        anyhow::bail!("inactive snapshot became staged before identity commitment");
-                    }
-                    Ok(_) => anyhow::bail!("snapshot staging marker is not a regular file"),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
             }
             candidate.root_relative_path = Some(relative.to_string_lossy().into_owned());
             candidate.planned_device = Some(metadata.dev());
@@ -3277,12 +3268,19 @@ mod tests {
             deletable: true,
         };
 
-        fs::write(snapshot_dir.join(".staging"), b"pending\n").unwrap();
+        let writer = bbox_edge_sidecar::snapshot::create_snapshot_edge_writer(
+            &edges_dir,
+            "p1",
+            "snap1",
+            "staged.jsonl",
+        )
+        .unwrap();
+        let _staging_guard = writer.finish().unwrap();
         let (deleted, errors) = apply_gc(&edges_dir, &[candidate]);
 
         assert!(deleted.is_empty());
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("staged snapshot"));
+        assert!(errors[0].contains("live staging"));
         assert_eq!(fs::read(&member).unwrap(), b"candidate");
     }
 

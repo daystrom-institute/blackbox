@@ -7,7 +7,16 @@
 //! (`edge_sidecar`). Store-agnostic: the store->edge emitters stay in the
 //! root crate's `edge_index` module and call down into this crate.
 
+#[cfg(not(unix))]
+compile_error!(
+    "bbox-edge-sidecar requires Unix descriptor confinement and file-lock semantics; no non-Unix persistence fallback is supported"
+);
+
+#[cfg(unix)]
 pub mod edge_sidecar;
+#[cfg(unix)]
 pub mod manifest;
+#[cfg(unix)]
 pub mod migration_inventory;
+#[cfg(unix)]
 pub mod snapshot;

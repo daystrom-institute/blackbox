@@ -438,6 +438,10 @@ pub struct CollectedIndexResult {
     pub head_commit: String,
     pub dirty_fingerprint: String,
     pub worktree_dirty: bool,
+    // Held from the first sidecar write through activation. GC observes the
+    // locked on-disk marker and cannot reclaim this inactive snapshot while a
+    // collected generation is still staging or awaiting activation.
+    _snapshot_staging_guard: bbox_edge_sidecar::snapshot::SnapshotStagingGuard,
 }
 
 pub fn collected_materialization_selector(project_id: &str, generation_id: &str) -> String {
@@ -1701,7 +1705,7 @@ where
             entity_ids.push(entity_id);
         }
     }
-    edge_writer.finish()?;
+    let snapshot_staging_guard = edge_writer.finish()?;
     let snapshot_dir =
         bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, project_id, snapshot_id);
     publication
@@ -1726,6 +1730,7 @@ where
         head_commit: descriptor.head_commit.clone(),
         dirty_fingerprint: descriptor.dirty_fingerprint.clone(),
         worktree_dirty,
+        _snapshot_staging_guard: snapshot_staging_guard,
     })
 }
 
