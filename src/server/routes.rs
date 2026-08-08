@@ -2289,8 +2289,9 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             )
             .ok()
             .map(|authority| authority.signature);
+            let mut pending_nudge = false;
             loop {
-                let nudged = match &nudge_rx {
+                pending_nudge |= match &nudge_rx {
                     Some(rx) => match rx.recv_timeout(interval) {
                         Ok(()) => true,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
@@ -2302,6 +2303,14 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                         false
                     }
                 };
+                if state.index_writer.reindex_in_progress() {
+                    tracing::debug!(
+                        pending_nudge,
+                        "edge-index watcher deferred while a reindex publication is active"
+                    );
+                    continue;
+                }
+                let nudged = std::mem::take(&mut pending_nudge);
                 let current = state.idx.read().num_docs();
                 let registered_project_ids = state.corpus_registered_project_ids();
                 let signature = match capture_edge_rebuild_authority(

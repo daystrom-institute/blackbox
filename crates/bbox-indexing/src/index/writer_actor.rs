@@ -1089,6 +1089,13 @@ impl IndexWriterActor {
         Ok("reindex accepted; the index writer is processing it in the background".to_string())
     }
 
+    /// Whether a reindex pass has been admitted and has not yet reached its
+    /// terminal outcome. Sidecar consumers use this to avoid parsing an
+    /// authority set while the pass is still publishing its members.
+    pub fn reindex_in_progress(&self) -> bool {
+        self.reindex_active.load(Ordering::Acquire)
+    }
+
     fn reserve_reindex(&self) -> Result<()> {
         self.reindex_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -3304,6 +3311,7 @@ mod tests {
         let actor = IndexWriterActor::spawn_for(&index);
 
         actor.reserve_reindex().unwrap();
+        assert!(actor.reindex_in_progress());
         let duplicate = actor.reserve_reindex().unwrap_err();
         assert!(
             duplicate
@@ -3314,6 +3322,7 @@ mod tests {
                 ))
         );
         actor.reindex_active.store(false, Ordering::Release);
+        assert!(!actor.reindex_in_progress());
 
         let response = actor
             .request_reindex_pass_accepting_empty(false, true, Vec::new())
@@ -3326,7 +3335,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(!actor.reindex_active.load(Ordering::Acquire));
+        assert!(!actor.reindex_in_progress());
     }
 
     #[test]

@@ -192,6 +192,33 @@ impl ProjectIndexPublicationBundle {
             });
     }
 
+    fn stage_collected_snapshot_git_current_if_needed(
+        &mut self,
+        edges_dir: &Path,
+        project_id: &str,
+        snapshot_id: &str,
+        include_managed_git: bool,
+        snapshot_rebuilt: bool,
+        git_changed: bool,
+    ) {
+        if !include_managed_git {
+            return;
+        }
+        let member = bbox_edge_sidecar::snapshot::snapshot_dir(edges_dir, project_id, snapshot_id)
+            .join(bbox_edge_sidecar::manifest::GIT_CURRENT_MEMBER);
+        let member_is_regular = fs::symlink_metadata(&member)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false);
+        if snapshot_rebuilt || git_changed || !member_is_regular {
+            self.stage_snapshot_git_current(
+                edges_dir,
+                project_id,
+                snapshot_id,
+                include_managed_git,
+            );
+        }
+    }
+
     /// Publish every filesystem-derived effect staged by the corpus pass.
     /// The caller must hold the checkout publication guard for all leases that
     /// contributed to this bundle for the entire call and the Tantivy commit.
@@ -1451,22 +1478,23 @@ fn index_active_collected_project(
     stats.indexed_commits += git_stats.indexed_commits;
     stats.indexed_docs += git_stats.indexed_commits;
     stats.emitted_edges += git_stats.emitted_edges;
-    if let Some(staged) = staged {
-        stats.publication.stage_snapshot_git_current(
+    let snapshot_id = staged
+        .as_ref()
+        .map(|staged| staged.snapshot_id.as_str())
+        .unwrap_or(activation.snapshot_id.as_str());
+    stats
+        .publication
+        .stage_collected_snapshot_git_current_if_needed(
             edges_dir,
             project_id,
-            &staged.snapshot_id,
+            snapshot_id,
             repo_id.is_some(),
+            staged.is_some(),
+            git_stats.indexed_commits > 0,
         );
+    if let Some(staged) = staged {
         stats.indexed_docs += staged.document_count;
         stats.indexed_files += stored.descriptor.file_count;
-    } else {
-        stats.publication.stage_snapshot_git_current(
-            edges_dir,
-            project_id,
-            &activation.snapshot_id,
-            repo_id.is_some(),
-        );
     }
     Ok(())
 }
@@ -3024,6 +3052,59 @@ mod tests {
                 "the first staged transaction must remain under rollback ownership"
             );
         }
+    }
+
+    #[test]
+    fn unchanged_collected_git_snapshot_does_not_publish_and_missing_member_repairs() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_dir =
+            bbox_edge_sidecar::snapshot::snapshot_dir(&edges_dir, "p1", "collected-p1-generation");
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        let member = snapshot_dir.join(bbox_edge_sidecar::manifest::GIT_CURRENT_MEMBER);
+        fs::write(&member, b"").unwrap();
+
+        let mut unchanged = ProjectIndexPublicationBundle::default();
+        unchanged.stage_collected_snapshot_git_current_if_needed(
+            &edges_dir,
+            "p1",
+            "collected-p1-generation",
+            true,
+            false,
+            false,
+        );
+        assert!(
+            unchanged.is_empty(),
+            "an unchanged regular member must not create a snapshot transaction"
+        );
+
+        fs::remove_file(&member).unwrap();
+        let mut repair = ProjectIndexPublicationBundle::default();
+        repair.stage_collected_snapshot_git_current_if_needed(
+            &edges_dir,
+            "p1",
+            "collected-p1-generation",
+            true,
+            false,
+            false,
+        );
+        assert!(!repair.is_empty(), "a missing member must be repaired");
+        repair.publish().unwrap().finalize_publications().unwrap();
+        assert!(member.is_file(), "repair must publish the live member");
+
+        let mut no_attachment = ProjectIndexPublicationBundle::default();
+        no_attachment.stage_collected_snapshot_git_current_if_needed(
+            &edges_dir,
+            "p1",
+            "collected-p1-generation",
+            false,
+            true,
+            true,
+        );
+        assert!(
+            no_attachment.is_empty(),
+            "a project without managed Git must not publish an empty Git member"
+        );
     }
 
     #[test]
