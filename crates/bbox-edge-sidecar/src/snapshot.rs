@@ -708,6 +708,7 @@ pub(crate) fn write_materialized_file_atomic(
     relative: &Path,
     bytes: &[u8],
 ) -> Result<()> {
+    use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
@@ -759,6 +760,45 @@ pub(crate) fn write_materialized_file_atomic(
     ));
     let temp_c = std::ffi::CString::new(temp.as_bytes())?;
     let leaf_c = std::ffi::CString::new(leaf.as_bytes())?;
+    // Stable local snapshot ids are deliberately reusable across incremental
+    // passes. Replacing a byte-identical member changes only inode/mtime, but
+    // that metadata is the watcher's cheap change detector and used to launch
+    // another full graph parse every reindex tick. Compare against the already
+    // materialized leaf in bounded chunks and preserve its identity when the
+    // publication is a semantic no-op.
+    let existing_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            leaf_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if existing_fd >= 0 {
+        let mut existing = unsafe { fs::File::from_raw_fd(existing_fd) };
+        let before = existing.metadata()?;
+        if before.is_file() && before.len() == bytes.len() as u64 {
+            let mut offset = 0;
+            let mut chunk = [0_u8; 64 * 1024];
+            let mut matches = true;
+            while offset < bytes.len() {
+                let wanted = chunk.len().min(bytes.len() - offset);
+                let read = existing.read(&mut chunk[..wanted])?;
+                if read == 0 || chunk[..read] != bytes[offset..offset + read] {
+                    matches = false;
+                    break;
+                }
+                offset += read;
+            }
+            let after = existing.metadata()?;
+            if matches
+                && offset == bytes.len()
+                && before.len() == after.len()
+                && before.modified().ok() == after.modified().ok()
+            {
+                return Ok(());
+            }
+        }
+    }
     let fd = unsafe {
         libc::openat(
             directory.as_raw_fd(),
@@ -7013,6 +7053,27 @@ mod tests {
             a, b,
             "different head_sha must produce different snapshot ids"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_materialized_write_preserves_file_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let relative = Path::new("workspace/p/snapshots/nongit-stable/project.jsonl");
+        write_materialized_file_atomic(dir.path(), relative, b"same bytes\n").unwrap();
+        let path = materialized_dir(dir.path()).join(relative);
+        let before = std::fs::metadata(&path).unwrap();
+
+        write_materialized_file_atomic(dir.path(), relative, b"same bytes\n").unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+
+        assert_eq!(before.dev(), after.dev());
+        assert_eq!(before.ino(), after.ino());
+
+        write_materialized_file_atomic(dir.path(), relative, b"changed bytes\n").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"changed bytes\n");
     }
 
     // -- P3-F: Git overlay swap/clear matrix ------------------------------
