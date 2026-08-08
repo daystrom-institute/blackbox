@@ -739,33 +739,37 @@ fn fragment_history_commit(
         bail!("Git commit contains an oversized indivisible header");
     }
 
+    let continuation_only = GitHistoryCommitFragmentV1 {
+        commit_oid: commit.oid.clone(),
+        fragment_index: 1,
+        fragment_count: 1,
+        header: None,
+        changed_paths: Vec::new(),
+    };
+    let continuation_base_bytes = encode_history_fragment(&continuation_only).len();
     let mut path_groups = vec![Vec::<String>::new()];
+    let mut current_bytes = encode_history_fragment(&header_only).len();
     for path in &commit.changed_paths {
         let current_index = path_groups.len() - 1;
-        let mut trial = path_groups[current_index].clone();
-        trial.push(path.clone());
-        let fragment = GitHistoryCommitFragmentV1 {
-            commit_oid: commit.oid.clone(),
-            fragment_index: current_index as u32,
-            fragment_count: 1,
-            header: (current_index == 0).then(|| header.clone()),
-            changed_paths: trial.clone(),
-        };
-        if encode_history_fragment(&fragment).len() as u64 <= MAX_HISTORY_RECORD_BYTES {
-            path_groups[current_index] = trial;
+        let path_bytes = 8_usize
+            .checked_add(path.len())
+            .context("Git changed-path length overflowed")?;
+        if current_bytes
+            .checked_add(path_bytes)
+            .is_some_and(|bytes| bytes as u64 <= MAX_HISTORY_RECORD_BYTES)
+        {
+            path_groups[current_index].push(path.clone());
+            current_bytes += path_bytes;
             continue;
         }
-        path_groups.push(vec![path.clone()]);
-        let fragment = GitHistoryCommitFragmentV1 {
-            commit_oid: commit.oid.clone(),
-            fragment_index: current_index as u32 + 1,
-            fragment_count: 1,
-            header: None,
-            changed_paths: vec![path.clone()],
-        };
-        if encode_history_fragment(&fragment).len() as u64 > MAX_HISTORY_RECORD_BYTES {
+        if continuation_base_bytes
+            .checked_add(path_bytes)
+            .is_none_or(|bytes| bytes as u64 > MAX_HISTORY_RECORD_BYTES)
+        {
             bail!("Git commit contains an oversized changed path");
         }
+        path_groups.push(vec![path.clone()]);
+        current_bytes = continuation_base_bytes + path_bytes;
     }
     let fragment_count = u32::try_from(path_groups.len())
         .context("Git commit requires too many history fragments")?;
@@ -1243,12 +1247,46 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("README.md"), "root\n").unwrap();
-        git(&root, &["add", ".bbox/config.toml", "README.md"]);
+        fs::write(root.join("obsolete.txt"), "remove me\n").unwrap();
+        git(
+            &root,
+            &["add", ".bbox/config.toml", "README.md", "obsolete.txt"],
+        );
         git(&root, &["commit", "--quiet", "-m", "root"]);
+        git(&root, &["branch", "-M", "main"]);
+        git(&root, &["branch", "feature"]);
+
         fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        git(&root, &["mv", "README.md", "docs/README.md"]);
+        git(&root, &["rm", "--quiet", "obsolete.txt"]);
         git(&root, &["add", "src/lib.rs"]);
-        git(&root, &["commit", "--quiet", "-m", "second"]);
+        git(
+            &root,
+            &["commit", "--quiet", "-m", "main rename and delete"],
+        );
+
+        git(&root, &["switch", "--quiet", "feature"]);
+        fs::write(
+            root.join("feature.rs"),
+            "pub fn feature() -> bool { true }\n",
+        )
+        .unwrap();
+        git(&root, &["add", "feature.rs"]);
+        git(&root, &["commit", "--quiet", "-m", "feature"]);
+        git(&root, &["switch", "--quiet", "main"]);
+        git(
+            &root,
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "feature",
+                "-m",
+                "merge feature",
+            ],
+        );
 
         let captured = capture_git_history(&ProjectConfig {
             root: root.clone(),
@@ -1256,7 +1294,7 @@ mod tests {
             git_history: true,
         })
         .unwrap();
-        assert_eq!(captured.descriptor.commit_count, 2);
+        assert_eq!(captured.descriptor.commit_count, 4);
         assert_eq!(
             captured.descriptor.repo_head,
             bbox_corpus_core::git::current_head(&root).unwrap()
@@ -1275,6 +1313,155 @@ mod tests {
                     .is_file()
             );
         }
+        let fragments = captured
+            .entries
+            .iter()
+            .map(|entry| {
+                bbox_git_source::decode_history_fragment(
+                    &read_captured_history_record(&captured, entry).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(fragments.iter().any(|fragment| {
+            fragment
+                .header
+                .as_ref()
+                .is_some_and(|header| header.parent_oids.is_empty())
+        }));
+        assert!(fragments.iter().any(|fragment| {
+            fragment
+                .header
+                .as_ref()
+                .is_some_and(|header| header.parent_oids.len() == 2)
+        }));
+        let renamed_commit = fragments
+            .iter()
+            .find(|fragment| {
+                fragment
+                    .header
+                    .as_ref()
+                    .is_some_and(|header| header.message.trim() == "main rename and delete")
+            })
+            .unwrap()
+            .commit_oid
+            .clone();
+        let renamed_paths = fragments
+            .iter()
+            .filter(|fragment| fragment.commit_oid == renamed_commit)
+            .flat_map(|fragment| fragment.changed_paths.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        assert!(renamed_paths.contains(&"README.md"));
+        assert!(renamed_paths.contains(&"docs/README.md"));
+        assert!(renamed_paths.contains(&"obsolete.txt"));
+    }
+
+    #[test]
+    fn history_fragmentation_is_linear_and_bounded_for_large_path_sets() {
+        let path_payload = "x".repeat(4_080);
+        let path_count = MAX_HISTORY_RECORD_BYTES as usize / (path_payload.len() + 24) + 8;
+        let changed_paths = (0..path_count)
+            .map(|index| format!("{index:08}/{path_payload}"))
+            .collect::<Vec<_>>();
+        let commit = bbox_corpus_core::git::StableGitHistoryCommit {
+            oid: "1".repeat(40),
+            parent_oids: Vec::new(),
+            author_name: "History Fixture".into(),
+            author_email: "history@example.invalid".into(),
+            message: "large paths".into(),
+            changed_paths: changed_paths.clone(),
+        };
+
+        let fragments = fragment_history_commit(&commit).unwrap();
+        assert!(fragments.len() > 1);
+        assert!(fragments[0].header.is_some());
+        assert!(
+            fragments
+                .iter()
+                .skip(1)
+                .all(|fragment| fragment.header.is_none())
+        );
+        assert!(fragments.iter().all(|fragment| {
+            encode_history_fragment(fragment).len() as u64 <= MAX_HISTORY_RECORD_BYTES
+        }));
+        assert_eq!(
+            fragments
+                .iter()
+                .flat_map(|fragment| fragment.changed_paths.iter().cloned())
+                .collect::<Vec<_>>(),
+            changed_paths
+        );
+    }
+
+    #[test]
+    fn sha256_history_capture_and_shallow_refusal_are_explicit() {
+        let sha256_directory = tempfile::tempdir().unwrap();
+        let sha256_root = sha256_directory.path().canonicalize().unwrap();
+        git(&sha256_root, &["init", "--quiet", "--object-format=sha256"]);
+        git(&sha256_root, &["config", "user.name", "History Fixture"]);
+        git(
+            &sha256_root,
+            &["config", "user.email", "history@example.invalid"],
+        );
+        fs::create_dir_all(sha256_root.join(".bbox")).unwrap();
+        fs::write(
+            sha256_root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"sha256-history-fixture\"\n",
+        )
+        .unwrap();
+        fs::write(sha256_root.join("README.md"), "sha256\n").unwrap();
+        git(&sha256_root, &["add", ".bbox/config.toml", "README.md"]);
+        git(&sha256_root, &["commit", "--quiet", "-m", "sha256 root"]);
+        let captured = capture_git_history(&ProjectConfig {
+            root: sha256_root,
+            scope: PublishedScope::try_new("sha256-history-fixture", ".").unwrap(),
+            git_history: true,
+        })
+        .unwrap();
+        assert_eq!(captured.descriptor.object_format, GitObjectFormatV1::Sha256);
+        assert_eq!(captured.descriptor.repo_head.len(), 64);
+
+        let source_directory = tempfile::tempdir().unwrap();
+        let source_root = source_directory.path().canonicalize().unwrap();
+        git(&source_root, &["init", "--quiet"]);
+        git(&source_root, &["config", "user.name", "History Fixture"]);
+        git(
+            &source_root,
+            &["config", "user.email", "history@example.invalid"],
+        );
+        fs::create_dir_all(source_root.join(".bbox")).unwrap();
+        fs::write(
+            source_root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"shallow-history-fixture\"\n",
+        )
+        .unwrap();
+        fs::write(source_root.join("README.md"), "shallow\n").unwrap();
+        git(&source_root, &["add", ".bbox/config.toml", "README.md"]);
+        git(&source_root, &["commit", "--quiet", "-m", "shallow root"]);
+
+        let clone_parent = tempfile::tempdir().unwrap();
+        let clone_root = clone_parent.path().join("clone");
+        let source_url = Url::from_directory_path(&source_root).unwrap();
+        let output = std::process::Command::new("git")
+            .args(["clone", "--quiet", "--depth=1", source_url.as_str()])
+            .arg(&clone_root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git clone: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let clone_root = clone_root.canonicalize().unwrap();
+        let error = match capture_git_history(&ProjectConfig {
+            root: clone_root,
+            scope: PublishedScope::try_new("shallow-history-fixture", ".").unwrap(),
+            git_history: true,
+        }) {
+            Ok(_) => panic!("shallow Git history capture unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("shallow repository"));
     }
 
     #[test]

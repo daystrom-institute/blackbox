@@ -125,7 +125,12 @@ retained-generation scrubbing run in the background.
 Verified Git-history source records live separately under
 `<state_dir>/git-sources/`. Unchanged HEADs are skipped by probe and commit
 records are content-addressed, so a new complete snapshot reuses prior commit
-records rather than copying an entire history sidecar again.
+records rather than copying an entire history sidecar again. The background
+maintenance lane expires uploads after 24 idle hours, keeps the current ready
+history plus the configured number of prior generations, honors active
+materializer pins, and deletes unreferenced records only after
+`unreferenced_blob_grace_hours`. Startup and upload requests never perform the
+full record sweep.
 
 When a retained blob is corrupt, the daemon keeps already materialized active
 documents readable and requests the missing hash during the next publication.

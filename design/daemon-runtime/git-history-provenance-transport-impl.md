@@ -25,10 +25,12 @@ Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). T
 > wire contract. GH-B intake through durable `ready` is implemented: bounded
 > authenticated routes, resumable immutable storage, exact-HEAD stable Git
 > capture, canonical fragments, shallow refusal, and independent collector
-> backoff. GH-B retention/expiry maintenance, the full adversarial fixture
-> matrix, and the isolated live bootsmoke remain before GH-B closes. GH-C and
-> later milestones remain unimplemented; blackboxd therefore still acquires
-> `GitHistory` and `ProvenanceNoteIo` leases for active corpus behavior.
+> backoff. GH-B is implemented: background-only upload expiry, generation
+> retention, explicit future-materializer roots, grace-delayed CAS reclamation,
+> the SHA-1/SHA-256 and graph/path/fragment fixture matrix, and an isolated
+> FreshV2 daemon-plus-collector rehearsal all pass. GH-C and later milestones
+> remain unimplemented; blackboxd therefore still acquires `GitHistory` and
+> `ProvenanceNoteIo` leases for active corpus behavior.
 
 ## 1. Required outcome
 At this slice's exit gate, proved against strict catalog state after Phases 3 through 6 have landed:
@@ -552,7 +554,7 @@ Verification: auth goldens, duplicate/missing/split matrices, codec/adversarial 
 Gate: pinned format, focused workspace nextest, concurrency lint, cluster verify.
 
 ### GH-B: Durable history intake and collector capture
-Status: partial as of 2026-08-08; intake/capture through `ready` is implemented, while retention/expiry maintenance, the remaining fixture matrix, and the isolated live bootsmoke are open.
+Status: implemented 2026-08-08. Maintenance runs off startup and request paths; the isolated FreshV2 rehearsal reached durable `ready` and a second exact-HEAD collector run reused the probe result without another upload.
 Ownership: new `bbox-git-source-store`, new `src/server/git_source.rs`, `bbox-code-collector`, packaging/docs, maintenance.
 Dependencies: GH-A, `C6.2`, `C8`, `G11-B`.
 Mechanics:

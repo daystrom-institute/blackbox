@@ -78,12 +78,18 @@ fn store_limits(config: &crate::config::Config) -> StoreLimits {
             max_provenance_logical_bytes: config.code_collection.max_provenance_logical_bytes,
         },
         max_open_uploads_per_producer: config.code_collection.max_open_uploads_per_producer,
+        retained_history_generations: config.code_collection.retained_generations,
+        unreferenced_record_grace_secs: config
+            .code_collection
+            .unreferenced_blob_grace_hours
+            .saturating_mul(60 * 60),
     }
 }
 
 fn checked_store_limits(config: &crate::config::Config) -> Result<StoreLimits> {
     let limits = store_limits(config);
     if limits.max_open_uploads_per_producer == 0
+        || limits.retained_history_generations == 0
         || limits.contract.max_history_commits == 0
         || limits.contract.max_history_logical_bytes == 0
         || limits.contract.max_provenance_documents == 0

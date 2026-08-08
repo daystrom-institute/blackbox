@@ -2300,6 +2300,23 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "code-source blob GC failed"),
                 }
+                match state
+                    .git_sources
+                    .store()
+                    .maintain(&std::collections::BTreeSet::new())
+                {
+                    Ok(report) if report != bbox_git_source_store::MaintenanceReport::default() => {
+                        tracing::info!(
+                            expired_uploads = report.expired_uploads,
+                            generations = report.retired_generations,
+                            records = report.deleted_records,
+                            bytes = report.deleted_record_bytes,
+                            "Git-source maintenance reclaimed unreferenced data"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "Git-source maintenance failed"),
+                }
                 if tick.is_multiple_of(24) {
                     match store.scrub_retained() {
                         Ok(stats) => tracing::info!(

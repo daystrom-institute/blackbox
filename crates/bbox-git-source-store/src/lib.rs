@@ -29,11 +29,14 @@ const MAX_UPLOAD_RECORD_BYTES: usize = 256 * 1024;
 const MAX_GENERATION_RECORD_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
 const MISSING_PAGE_SIZE: usize = 1_000;
+const HISTORY_UPLOAD_IDLE_TTL_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreLimits {
     pub contract: GitSourceLimits,
     pub max_open_uploads_per_producer: usize,
+    pub retained_history_generations: usize,
+    pub unreferenced_record_grace_secs: u64,
 }
 
 impl Default for StoreLimits {
@@ -41,8 +44,18 @@ impl Default for StoreLimits {
         Self {
             contract: GitSourceLimits::default(),
             max_open_uploads_per_producer: 2,
+            retained_history_generations: 2,
+            unreferenced_record_grace_secs: 7 * 24 * 60 * 60,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    pub expired_uploads: u64,
+    pub retired_generations: u64,
+    pub deleted_records: u64,
+    pub deleted_record_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +180,18 @@ impl GitSourceStore {
             .write()
             .map_err(|_| anyhow!("Git-source limit lock is poisoned"))? = limits;
         Ok(())
+    }
+
+    /// Reclaim only state that durable store evidence proves unreferenced.
+    /// Future materializers pass their pinned source-generation ids here;
+    /// GH-B has no external pins, so current/retained ready sources are the
+    /// complete root set.
+    pub fn maintain(
+        &self,
+        protected_generation_ids: &BTreeSet<String>,
+    ) -> Result<MaintenanceReport> {
+        let _guard = self.lock_mutation()?;
+        self.maintain_locked(protected_generation_ids, now_unix_secs())
     }
 
     pub fn begin_history_upload(
@@ -391,7 +416,7 @@ impl GitSourceStore {
         }
         let _guard = self.lock_mutation()?;
         let upload_dir = self.upload_dir(producer_id, upload_id)?;
-        let record = self.load_upload(&upload_dir, producer_id, upload_id)?;
+        let mut record = self.load_upload(&upload_dir, producer_id, upload_id)?;
         if record.state != GitHistorySourceStateV1::MissingRecords {
             bail!(StoreRequestError::InvalidState);
         }
@@ -412,7 +437,11 @@ impl GitSourceStore {
             bail!(StoreRequestError::InvalidInput);
         }
         bbox_git_source::decode_history_fragment(&bytes)?;
-        self.install_record_bytes(hash, &bytes)
+        self.install_record_bytes(hash, &bytes)?;
+        record.updated_unix_secs = now_unix_secs();
+        let upload_directory = NofollowDirectory::open_existing(&upload_dir)?
+            .ok_or_else(|| anyhow!(StoreRequestError::NotFound))?;
+        write_json(&upload_directory, "upload.json", &record)
     }
 
     pub fn finalize_history_upload(
@@ -755,6 +784,226 @@ impl GitSourceStore {
         .ok_or_else(|| anyhow!(StoreRequestError::NotFound))
     }
 
+    fn expire_stale_uploads(&self, now: u64) -> Result<u64> {
+        let mut expired = 0_u64;
+        for producer_dir in read_directories(&self.root.join("uploads"))? {
+            for upload_dir in read_directories(&producer_dir)? {
+                let upload = read_json::<HistoryUploadRecordV1>(
+                    &upload_dir,
+                    "upload.json",
+                    MAX_UPLOAD_RECORD_BYTES,
+                    "Git-history upload record",
+                )?
+                .ok_or_else(|| anyhow!("Git-source upload directory is missing its record"))?;
+                if now.saturating_sub(upload.updated_unix_secs) < HISTORY_UPLOAD_IDLE_TTL_SECS {
+                    continue;
+                }
+                remove_upload_directory(&upload_dir)?;
+                expired = expired.saturating_add(1);
+            }
+            remove_directory_if_empty(&producer_dir)?;
+        }
+        Ok(expired)
+    }
+
+    fn retire_old_generations(
+        &self,
+        protected_generation_ids: &BTreeSet<String>,
+        retained: usize,
+    ) -> Result<u64> {
+        let mut retired = 0_u64;
+        for repo_dir in read_directories(&self.root.join("repos"))? {
+            let history_dir = repo_dir.join("history");
+            if NofollowDirectory::open_existing(&history_dir)?.is_none() {
+                continue;
+            }
+            let current = read_json::<ReadyPointerV1>(
+                &history_dir,
+                "current-ready.json",
+                MAX_GENERATION_RECORD_BYTES,
+                "Git-history ready pointer",
+            )?;
+            let mut sources = Vec::new();
+            for generation_dir in read_child_directories(&history_dir, &["current-ready.json"])? {
+                let source = read_json::<StoredHistorySourceV1>(
+                    &generation_dir,
+                    "source.json",
+                    MAX_GENERATION_RECORD_BYTES,
+                    "stored Git-history source",
+                )?
+                .ok_or_else(|| anyhow!("Git-history generation is missing source metadata"))?;
+                if generation_dir.file_name().and_then(|name| name.to_str())
+                    != Some(source.source_generation_id.as_str())
+                    || repo_dir.file_name().and_then(|name| name.to_str())
+                        != Some(source.repo_history_id.as_str())
+                    || source.state != GitHistorySourceStateV1::Ready
+                {
+                    bail!("Git-history generation metadata does not match its durable location");
+                }
+                sources.push(source);
+            }
+            if let Some(pointer) = current.as_ref() {
+                let source = sources
+                    .iter()
+                    .find(|source| source.source_generation_id == pointer.source_generation_id)
+                    .ok_or_else(|| {
+                        anyhow!("Git-history ready pointer references a missing generation")
+                    })?;
+                if source.producer_id != pointer.producer_id
+                    || source.descriptor.repo_head != pointer.repo_head
+                {
+                    bail!("Git-history ready pointer disagrees with its generation");
+                }
+            }
+            sources.sort_by(|left, right| {
+                right
+                    .created_unix_secs
+                    .cmp(&left.created_unix_secs)
+                    .then_with(|| right.source_generation_id.cmp(&left.source_generation_id))
+            });
+            let mut retained_by_policy = BTreeSet::new();
+            if let Some(pointer) = current.as_ref() {
+                retained_by_policy.insert(pointer.source_generation_id.clone());
+            }
+            let mut retained_prior = 0_usize;
+            for source in &sources {
+                if retained_by_policy.contains(&source.source_generation_id) {
+                    continue;
+                }
+                if retained_prior >= retained {
+                    break;
+                }
+                retained_by_policy.insert(source.source_generation_id.clone());
+                retained_prior += 1;
+            }
+            let mut keep = protected_generation_ids.clone();
+            keep.extend(retained_by_policy);
+            for source in sources {
+                if keep.contains(&source.source_generation_id) {
+                    continue;
+                }
+                remove_regular_file_if_present(
+                    &self
+                        .root
+                        .join("generation-index")
+                        .join(format!("{}.json", source.source_generation_id)),
+                )?;
+                remove_generation_directory(&history_dir.join(&source.source_generation_id))?;
+                retired = retired.saturating_add(1);
+            }
+        }
+        Ok(retired)
+    }
+
+    fn referenced_record_hashes(&self, limits: GitSourceLimits) -> Result<BTreeSet<String>> {
+        let mut referenced = BTreeSet::new();
+        for producer_dir in read_directories(&self.root.join("uploads"))? {
+            for upload_dir in read_directories(&producer_dir)? {
+                if let Some(manifest) = read_json::<Vec<GitHistoryManifestEntryV1>>(
+                    &upload_dir,
+                    "manifest.json",
+                    MAX_MANIFEST_BYTES,
+                    "Git-history manifest",
+                )? {
+                    let upload = read_json::<HistoryUploadRecordV1>(
+                        &upload_dir,
+                        "upload.json",
+                        MAX_UPLOAD_RECORD_BYTES,
+                        "Git-history upload record",
+                    )?
+                    .ok_or_else(|| anyhow!("Git-history upload manifest has no upload record"))?;
+                    validate_history_manifest(&upload.descriptor, &manifest, limits)?;
+                    referenced.extend(manifest.into_iter().map(|entry| entry.content_sha256));
+                }
+            }
+        }
+        for repo_dir in read_directories(&self.root.join("repos"))? {
+            let history_dir = repo_dir.join("history");
+            if NofollowDirectory::open_existing(&history_dir)?.is_none() {
+                continue;
+            }
+            for generation_dir in read_child_directories(&history_dir, &["current-ready.json"])? {
+                let source = read_json::<StoredHistorySourceV1>(
+                    &generation_dir,
+                    "source.json",
+                    MAX_GENERATION_RECORD_BYTES,
+                    "stored Git-history source",
+                )?
+                .ok_or_else(|| anyhow!("Git-history generation is missing source metadata"))?;
+                let descriptor = read_json::<GitHistoryDescriptorV1>(
+                    &generation_dir,
+                    "descriptor.json",
+                    MAX_GENERATION_RECORD_BYTES,
+                    "Git-history generation descriptor",
+                )?
+                .ok_or_else(|| anyhow!("Git-history generation is missing its descriptor"))?;
+                if source.descriptor != descriptor {
+                    bail!("Git-history generation descriptor disagrees with source metadata");
+                }
+                let manifest = read_json::<Vec<GitHistoryManifestEntryV1>>(
+                    &generation_dir,
+                    "manifest.json",
+                    MAX_MANIFEST_BYTES,
+                    "Git-history generation manifest",
+                )?
+                .ok_or_else(|| anyhow!("Git-history generation is missing its manifest"))?;
+                validate_history_manifest(&descriptor, &manifest, limits)?;
+                referenced.extend(manifest.into_iter().map(|entry| entry.content_sha256));
+            }
+        }
+        Ok(referenced)
+    }
+
+    fn sweep_unreferenced_records(
+        &self,
+        referenced: &BTreeSet<String>,
+        now: u64,
+        grace_secs: u64,
+    ) -> Result<(u64, u64)> {
+        let records_root = self.root.join("records/sha256");
+        let mut deleted = 0_u64;
+        let mut deleted_bytes = 0_u64;
+        for bucket in read_directories(&records_root)? {
+            let mut bucket_changed = false;
+            for entry in fs::read_dir(&bucket)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!("refusing unsafe Git-history record store member");
+                }
+                let hash = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow!("Git-history record name is not UTF-8"))?;
+                validate_sha256(&hash)?;
+                if referenced.contains(&hash) {
+                    continue;
+                }
+                let modified = metadata
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now.saturating_sub(modified) < grace_secs {
+                    continue;
+                }
+                fs::remove_file(&path)?;
+                bucket_changed = true;
+                deleted = deleted.saturating_add(1);
+                deleted_bytes = deleted_bytes.saturating_add(metadata.len());
+            }
+            if bucket_changed {
+                fs::File::open(&bucket)?.sync_all()?;
+            }
+            remove_directory_if_empty(&bucket)?;
+        }
+        if deleted > 0 {
+            fs::File::open(records_root)?.sync_all()?;
+        }
+        Ok((deleted, deleted_bytes))
+    }
+
     fn lock_mutation(&self) -> Result<MutationGuard<'_>> {
         let in_process = self
             .mutation
@@ -773,6 +1022,31 @@ impl GitSourceStore {
             .map(|limits| *limits)
             .map_err(|_| anyhow!("Git-source limit lock is poisoned"))
     }
+
+    fn maintain_locked(
+        &self,
+        protected_generation_ids: &BTreeSet<String>,
+        now: u64,
+    ) -> Result<MaintenanceReport> {
+        let limits = self.current_limits()?;
+        let expired_uploads = self.expire_stale_uploads(now)?;
+        let retired_generations = self.retire_old_generations(
+            protected_generation_ids,
+            limits.retained_history_generations,
+        )?;
+        let referenced_records = self.referenced_record_hashes(limits.contract)?;
+        let (deleted_records, deleted_record_bytes) = self.sweep_unreferenced_records(
+            &referenced_records,
+            now,
+            limits.unreferenced_record_grace_secs,
+        )?;
+        Ok(MaintenanceReport {
+            expired_uploads,
+            retired_generations,
+            deleted_records,
+            deleted_record_bytes,
+        })
+    }
 }
 
 fn begin_response(upload_id: String) -> BeginGitHistoryUploadResponseV1 {
@@ -786,6 +1060,7 @@ fn begin_response(upload_id: String) -> BeginGitHistoryUploadResponseV1 {
 
 fn validate_store_limits(limits: StoreLimits) -> Result<()> {
     if limits.max_open_uploads_per_producer == 0
+        || limits.retained_history_generations == 0
         || limits.contract.max_history_commits == 0
         || limits.contract.max_history_logical_bytes == 0
         || limits.contract.max_provenance_documents == 0
@@ -817,6 +1092,104 @@ fn read_directories(path: &Path) -> Result<Vec<PathBuf>> {
     }
     directories.sort();
     Ok(directories)
+}
+
+fn read_child_directories(path: &Path, allowed_files: &[&str]) -> Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            bail!("refusing symlink in Git-source store");
+        }
+        if metadata.is_dir() {
+            directories.push(entry.path());
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("Git-source store member name is not UTF-8"))?;
+        if !metadata.is_file() || !allowed_files.contains(&name.as_str()) {
+            bail!("refusing unexpected Git-source store member");
+        }
+    }
+    directories.sort();
+    Ok(directories)
+}
+
+fn remove_upload_directory(path: &Path) -> Result<()> {
+    let pages = path.join("pages");
+    if NofollowDirectory::open_existing(&pages)?.is_some() {
+        for entry in fs::read_dir(&pages)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow!("Git-source manifest page name is not UTF-8"))?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || name.len() != 13
+                || !name.ends_with(".json")
+                || !name[..8].bytes().all(|byte| byte.is_ascii_digit())
+            {
+                bail!("refusing unexpected Git-source manifest page member");
+            }
+            fs::remove_file(entry.path())?;
+        }
+        fs::File::open(&pages)?.sync_all()?;
+        fs::remove_dir(&pages)?;
+    }
+    for name in ["upload.json", "manifest.json"] {
+        remove_regular_file_if_present(&path.join(name))?;
+    }
+    if fs::read_dir(path)?.next().transpose()?.is_some() {
+        bail!("refusing to remove nonempty Git-source upload directory");
+    }
+    fs::remove_dir(path)?;
+    sync_parent(path)
+}
+
+fn remove_generation_directory(path: &Path) -> Result<()> {
+    NofollowDirectory::open_existing(path)?
+        .ok_or_else(|| anyhow!("Git-history generation disappeared during maintenance"))?;
+    for name in ["descriptor.json", "manifest.json", "source.json"] {
+        remove_regular_file_if_present(&path.join(name))?;
+    }
+    if fs::read_dir(path)?.next().transpose()?.is_some() {
+        bail!("refusing to remove nonempty Git-history generation directory");
+    }
+    fs::remove_dir(path)?;
+    sync_parent(path)
+}
+
+fn remove_regular_file_if_present(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("refusing to remove unsafe Git-source store member");
+    }
+    fs::remove_file(path)?;
+    sync_parent(path)
+}
+
+fn remove_directory_if_empty(path: &Path) -> Result<()> {
+    if fs::read_dir(path)?.next().transpose()?.is_none() {
+        fs::remove_dir(path)?;
+        sync_parent(path)?;
+    }
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn read_json<T: DeserializeOwned>(
@@ -909,8 +1282,19 @@ mod tests {
         Vec<GitHistoryManifestEntryV1>,
         Vec<Vec<u8>>,
     ) {
-        let root = "1".repeat(40);
-        let head = "2".repeat(40);
+        fixture_for('1', '2')
+    }
+
+    fn fixture_for(
+        root_digit: char,
+        head_digit: char,
+    ) -> (
+        GitHistoryDescriptorV1,
+        Vec<GitHistoryManifestEntryV1>,
+        Vec<Vec<u8>>,
+    ) {
+        let root = root_digit.to_string().repeat(40);
+        let head = head_digit.to_string().repeat(40);
         let fragments = [
             GitHistoryCommitFragmentV1 {
                 commit_oid: root.clone(),
@@ -962,6 +1346,78 @@ mod tests {
             logical_bytes: manifest.iter().map(|entry| entry.encoded_bytes).sum(),
         };
         (descriptor, manifest, records)
+    }
+
+    fn ingest_fixture(
+        store: &GitSourceStore,
+        history: &RepoHistoryId,
+        namespace: &CommitNamespace,
+        fixture: (
+            GitHistoryDescriptorV1,
+            Vec<GitHistoryManifestEntryV1>,
+            Vec<Vec<u8>>,
+        ),
+    ) -> (String, String) {
+        let (descriptor, manifest, records) = fixture;
+        let begin = store
+            .begin_history_upload("producer-a", history, namespace, descriptor)
+            .unwrap();
+        store
+            .put_history_manifest_page(
+                "producer-a",
+                &begin.upload_id,
+                0,
+                &GitHistoryManifestPageV1 {
+                    entries: manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .complete_history_manifest("producer-a", &begin.upload_id)
+            .unwrap();
+        for (entry, bytes) in manifest.iter().zip(records) {
+            store
+                .install_history_record(
+                    "producer-a",
+                    &begin.upload_id,
+                    &entry.content_sha256,
+                    entry.encoded_bytes,
+                    std::io::Cursor::new(bytes),
+                )
+                .unwrap();
+        }
+        let finalized = store
+            .finalize_history_upload("producer-a", &begin.upload_id)
+            .unwrap();
+        (begin.upload_id, finalized.source_generation_id)
+    }
+
+    fn set_generation_created(
+        store: &GitSourceStore,
+        history: &RepoHistoryId,
+        generation: &str,
+        created_unix_secs: u64,
+    ) {
+        let path = store.generation_dir(history, generation).unwrap();
+        let mut source = read_json::<StoredHistorySourceV1>(
+            &path,
+            "source.json",
+            MAX_GENERATION_RECORD_BYTES,
+            "test Git-history source",
+        )
+        .unwrap()
+        .unwrap();
+        source.created_unix_secs = created_unix_secs;
+        let directory = NofollowDirectory::open_existing(&path).unwrap().unwrap();
+        write_json(&directory, "source.json", &source).unwrap();
+    }
+
+    fn stored_record_count(root: &Path) -> usize {
+        read_directories(&root.join("records/sha256"))
+            .unwrap()
+            .into_iter()
+            .map(|bucket| fs::read_dir(bucket).unwrap().count())
+            .sum()
     }
 
     #[test]
@@ -1092,6 +1548,105 @@ mod tests {
                     std::io::Cursor::new(corrupt),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn maintenance_preserves_pins_then_reclaims_expired_unreferenced_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("git-sources");
+        let store = GitSourceStore::open(
+            &root,
+            StoreLimits {
+                retained_history_generations: 1,
+                unreferenced_record_grace_secs: 0,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap();
+        let namespace = CommitNamespace::parse("repo-a").unwrap();
+        let (upload_one, generation_one) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '2'));
+        set_generation_created(&store, &history, &generation_one, 1);
+        let (upload_two, generation_two) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '3'));
+        set_generation_created(&store, &history, &generation_two, 2);
+        let (upload_three, generation_three) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '4'));
+        set_generation_created(&store, &history, &generation_three, 3);
+
+        let protected = BTreeSet::from([generation_one.clone()]);
+        let report = store.maintain(&protected).unwrap();
+        assert_eq!(report.retired_generations, 0);
+        assert!(store.history_status("producer-a", &generation_one).is_ok());
+        assert!(store.history_status("producer-a", &generation_two).is_ok());
+        assert!(
+            store
+                .history_status("producer-a", &generation_three)
+                .is_ok()
+        );
+
+        let report = store.maintain(&BTreeSet::new()).unwrap();
+        assert_eq!(report.retired_generations, 1);
+        assert!(store.history_status("producer-a", &generation_one).is_err());
+        assert!(store.history_status("producer-a", &generation_two).is_ok());
+        assert!(
+            store
+                .history_status("producer-a", &generation_three)
+                .is_ok()
+        );
+
+        let (upload_four, generation_four) =
+            ingest_fixture(&store, &history, &namespace, fixture_for('1', '5'));
+        set_generation_created(&store, &history, &generation_four, 4);
+        assert_eq!(stored_record_count(&root), 5);
+        let report = store.maintain(&BTreeSet::new()).unwrap();
+        assert_eq!(report.retired_generations, 1);
+        assert!(store.history_status("producer-a", &generation_two).is_err());
+        assert!(
+            store
+                .history_status("producer-a", &generation_three)
+                .is_ok()
+        );
+        assert!(store.history_status("producer-a", &generation_four).is_ok());
+
+        for upload_id in [upload_one, upload_two, upload_three, upload_four] {
+            let upload_dir = store.upload_dir("producer-a", &upload_id).unwrap();
+            let mut upload = store
+                .load_upload(&upload_dir, "producer-a", &upload_id)
+                .unwrap();
+            upload.updated_unix_secs = 0;
+            let directory = NofollowDirectory::open_existing(&upload_dir)
+                .unwrap()
+                .unwrap();
+            write_json(&directory, "upload.json", &upload).unwrap();
+        }
+        drop(store);
+
+        let reopened = GitSourceStore::open(
+            &root,
+            StoreLimits {
+                retained_history_generations: 1,
+                unreferenced_record_grace_secs: 0,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        let report = reopened.maintain(&BTreeSet::new()).unwrap();
+        assert_eq!(report.expired_uploads, 4);
+        assert_eq!(report.deleted_records, 2);
+        assert!(report.deleted_record_bytes > 0);
+        assert_eq!(stored_record_count(&root), 3);
+        assert!(
+            reopened
+                .history_status("producer-a", &generation_three)
+                .is_ok()
+        );
+        assert!(
+            reopened
+                .history_status("producer-a", &generation_four)
+                .is_ok()
         );
     }
 }
