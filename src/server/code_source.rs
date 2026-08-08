@@ -11647,7 +11647,7 @@ mod tests {
     }
 
     /// R2F2 regression: activate_pending_local_snapshots must check for an
-    /// existing collected: entry and skip overwriting it with local:.
+    /// existing collected: entry and exclude it before publishing local:.
     /// Without this guard the background reindex overwrites the collected
     /// selector that reconstruction placed, breaking the restart chain.
     #[test]
@@ -11662,8 +11662,8 @@ mod tests {
             "activate_pending_local_snapshots must check for existing collected: selector"
         );
         assert!(
-            body.contains("continue"),
-            "activate_pending_local_snapshots must skip (continue) collected entries"
+            body.contains(".filter(") && body.contains("!index"),
+            "activate_pending_local_snapshots must exclude collected entries from the effective activation set"
         );
     }
 

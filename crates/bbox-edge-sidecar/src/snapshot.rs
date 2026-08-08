@@ -5951,6 +5951,13 @@ pub fn create_snapshot_edge_writer(
         {
             use std::os::fd::{AsRawFd, FromRawFd};
 
+            // The collected writer is also the first durable edge write for
+            // a newly-created state root. Preserve that constructor contract
+            // before switching to descriptor-confined traversal: callers may
+            // legitimately supply an edges directory whose ancestors do not
+            // exist yet. The nofollow root open below remains the authority
+            // boundary after creation and rejects a substituted root symlink.
+            fs::create_dir_all(edges_dir)?;
             let relative = Path::new("materialized")
                 .join("workspace")
                 .join(project_id)
