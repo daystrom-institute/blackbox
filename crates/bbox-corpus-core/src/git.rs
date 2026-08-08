@@ -25,6 +25,18 @@ pub struct GitCommit {
     pub message: String,
 }
 
+/// One commit from a complete, exact-HEAD history snapshot captured through
+/// `StableGitRepository`. Paths are repository-relative and byte-sorted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableGitHistoryCommit {
+    pub oid: String,
+    pub parent_oids: Vec<String>,
+    pub author_name: String,
+    pub author_email: String,
+    pub message: String,
+    pub changed_paths: Vec<String>,
+}
+
 /// A full object id verified to name a commit in one exact repository/object
 /// environment. The exact worktree root, canonical Git directory, and explicit
 /// alternate object directory are captured once so every subsequent tree/blob
@@ -117,6 +129,91 @@ impl StableGitRepository {
         #[cfg(not(unix))]
         {
             unreachable!("stable Git repositories require Unix")
+        }
+    }
+
+    pub fn object_id_hex_len(&self) -> Result<usize> {
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        read_stable_repository_object_format(&self.authority)
+    }
+
+    pub fn is_shallow(&self) -> Result<bool> {
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            let bytes = run_stable_repository_stdout_bounded_with_timeout(
+                &self.authority,
+                &["rev-parse", "--is-shallow-repository"],
+                "checking exact stable repository depth",
+                32,
+                GIT_OUTPUT_TIMEOUT,
+            )?;
+            match std::str::from_utf8(&bytes)
+                .context("stable Git shallow probe is not UTF-8")?
+                .trim()
+            {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => anyhow::bail!("stable Git shallow probe returned an invalid value"),
+            }
+        }
+    }
+
+    /// Capture every commit reachable from one exact verified HEAD.
+    ///
+    /// This is a complete snapshot, never a cursor delta. The Git child runs
+    /// under the stable repository's held-directory authority with ambient
+    /// replacements, alternates, lazy fetches, and configuration disabled.
+    pub fn complete_history_bounded(
+        &self,
+        head_oid: &str,
+        max_commits: usize,
+        max_logical_bytes: usize,
+    ) -> Result<Vec<StableGitHistoryCommit>> {
+        validate_full_object_id(head_oid)?;
+        if max_commits == 0 || max_logical_bytes == 0 {
+            anyhow::bail!("stable Git history limits must be nonzero");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (max_commits, max_logical_bytes);
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            const MARKER: &str = "BBOX_GIT_HISTORY_COMMIT_V1";
+            let overhead = max_commits
+                .checked_mul(256)
+                .context("stable Git history overhead bound overflow")?;
+            let output_limit = max_logical_bytes
+                .checked_add(overhead)
+                .context("stable Git history output bound overflow")?;
+            let format =
+                format!("--format=format:%x00{MARKER}%x00%H%x00%P%x00%an%x00%ae%x00%B%x00");
+            let bytes = run_stable_repository_stdout_bounded_with_timeout(
+                &self.authority,
+                &[
+                    "log",
+                    "--topo-order",
+                    "--reverse",
+                    "--no-renames",
+                    "-z",
+                    &format,
+                    "--name-only",
+                    head_oid,
+                ],
+                "capturing complete exact Git history",
+                output_limit,
+                GIT_HISTORY_OUTPUT_TIMEOUT,
+            )?;
+            parse_stable_history_log(&bytes, MARKER, head_oid, max_commits, max_logical_bytes)
         }
     }
 
@@ -1307,6 +1404,23 @@ fn run_stable_repository_stdout_bounded(
     action: &'static str,
     max_bytes: usize,
 ) -> Result<Vec<u8>> {
+    run_stable_repository_stdout_bounded_with_timeout(
+        repository,
+        args,
+        action,
+        max_bytes,
+        GIT_OUTPUT_TIMEOUT,
+    )
+}
+
+#[cfg(unix)]
+fn run_stable_repository_stdout_bounded_with_timeout(
+    repository: &StableRepositoryAuthority,
+    args: &[&str],
+    action: &'static str,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command.args(args);
     configure_stable_repository_command(&mut command, repository)?;
@@ -1314,7 +1428,7 @@ fn run_stable_repository_stdout_bounded(
         command,
         &repository.root,
         action,
-        GIT_OUTPUT_TIMEOUT,
+        timeout,
         Some(max_bytes),
     )
     .with_context(|| format!("running Git while {action}"))?;
@@ -1323,6 +1437,116 @@ fn run_stable_repository_stdout_bounded(
         anyhow::bail!("{action} output exceeded its byte limit");
     }
     Ok(output.stdout)
+}
+
+fn parse_stable_history_log(
+    bytes: &[u8],
+    marker: &str,
+    head_oid: &str,
+    max_commits: usize,
+    max_logical_bytes: usize,
+) -> Result<Vec<StableGitHistoryCommit>> {
+    let marker = marker.as_bytes();
+    let tokens = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut index = 0_usize;
+    let mut logical_bytes = 0_usize;
+    let mut commits = Vec::new();
+    while index < tokens.len() {
+        while index < tokens.len() && (tokens[index].is_empty() || tokens[index] == b"\n") {
+            index += 1;
+        }
+        if index == tokens.len() {
+            break;
+        }
+        if tokens[index] != marker {
+            anyhow::bail!("stable Git history output has an invalid record boundary");
+        }
+        index += 1;
+        if commits.len() >= max_commits || index.saturating_add(5) > tokens.len() {
+            anyhow::bail!("stable Git history exceeds its commit limit or is truncated");
+        }
+        let oid = history_utf8(tokens[index], "commit object id")?.to_string();
+        index += 1;
+        let parents = history_utf8(tokens[index], "parent object ids")?;
+        index += 1;
+        let author_name = history_utf8(tokens[index], "author name")?.to_string();
+        index += 1;
+        let author_email = history_utf8(tokens[index], "author email")?.to_string();
+        index += 1;
+        let message = history_utf8(tokens[index], "commit message")?.to_string();
+        index += 1;
+
+        validate_full_object_id(&oid)?;
+        if oid.len() != head_oid.len() {
+            anyhow::bail!("stable Git history mixes object formats");
+        }
+        let parent_oids = parents
+            .split_whitespace()
+            .map(|parent| {
+                validate_full_object_id(parent)?;
+                if parent.len() != head_oid.len() {
+                    anyhow::bail!("stable Git history mixes object formats");
+                }
+                Ok(parent.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut changed_paths = Vec::new();
+        let mut first_path = true;
+        while index < tokens.len() && tokens[index] != marker {
+            let mut path = tokens[index];
+            index += 1;
+            if path.is_empty() || path == b"\n" {
+                continue;
+            }
+            if first_path && path.first() == Some(&b'\n') {
+                path = &path[1..];
+            }
+            first_path = false;
+            if path.is_empty() {
+                continue;
+            }
+            changed_paths.push(history_utf8(path, "changed path")?.to_string());
+        }
+        changed_paths.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        changed_paths.dedup();
+
+        logical_bytes = logical_bytes
+            .checked_add(oid.len())
+            .and_then(|value| {
+                parent_oids
+                    .iter()
+                    .try_fold(value, |value, parent| value.checked_add(parent.len()))
+            })
+            .and_then(|value| value.checked_add(author_name.len()))
+            .and_then(|value| value.checked_add(author_email.len()))
+            .and_then(|value| value.checked_add(message.len()))
+            .and_then(|value| {
+                changed_paths
+                    .iter()
+                    .try_fold(value, |value, path| value.checked_add(path.len()))
+            })
+            .context("stable Git history logical byte count overflow")?;
+        if logical_bytes > max_logical_bytes {
+            anyhow::bail!("stable Git history exceeds its logical byte limit");
+        }
+        commits.push(StableGitHistoryCommit {
+            oid,
+            parent_oids,
+            author_name,
+            author_email,
+            message,
+            changed_paths,
+        });
+    }
+    if commits.is_empty() || !commits.iter().any(|commit| commit.oid == head_oid) {
+        anyhow::bail!("stable Git history does not contain its exact HEAD");
+    }
+    Ok(commits)
+}
+
+fn history_utf8<'a>(bytes: &'a [u8], label: &str) -> Result<&'a str> {
+    std::str::from_utf8(bytes).with_context(|| format!("stable Git history {label} is not UTF-8"))
 }
 
 #[cfg(unix)]
@@ -2878,6 +3102,7 @@ pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
 /// all indexing until the child was killed by hand. 10s is generous for
 /// every metadata/log invocation these helpers make against healthy repos.
 const GIT_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
+const GIT_HISTORY_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const GIT_STDERR_RETAINED_LIMIT: usize = 64 * 1024;
 const GIT_STDOUT_RETAINED_LIMIT: usize = 128 * 1024 * 1024;
 
@@ -3261,6 +3486,21 @@ fn drain_with_retention_limit(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn stable_history_protocol_preserves_graph_metadata_and_paths() {
+        let root = "1".repeat(40);
+        let head = "2".repeat(40);
+        let marker = "BBOX_GIT_HISTORY_COMMIT_V1";
+        let bytes = format!(
+            "\0{marker}\0{root}\0\0A\0a@example.invalid\0root\n\0\nREADME.md\0\0\0{marker}\0{head}\0{root}\0B\0b@example.invalid\0head\n\0\nsrc/lib.rs\0src/main.rs\0\n"
+        );
+        let commits = parse_stable_history_log(bytes.as_bytes(), marker, &head, 2, 4096).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].changed_paths, vec!["README.md"]);
+        assert_eq!(commits[1].parent_oids, vec![root]);
+        assert_eq!(commits[1].changed_paths, vec!["src/lib.rs", "src/main.rs"]);
+    }
 
     #[test]
     fn run_bounded_kills_hung_child_at_the_deadline() {

@@ -29,6 +29,15 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
             let _ = sighup.recv().await;
             match config::load() {
                 Ok(new_cfg) => {
+                    if let Err(error) =
+                        super::git_source::GitSourceRuntime::validate_config(&new_cfg)
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "SIGHUP Git-source limit reload rejected"
+                        );
+                        continue;
+                    }
                     let projects = shared.records_provider.records_snapshot().records;
                     let transitions = match shared.code_sources.reload(&new_cfg, &projects) {
                         Ok(transitions) => transitions,
@@ -40,6 +49,13 @@ fn spawn_config_reload_handler(shared: Arc<SharedState>) {
                             continue;
                         }
                     };
+                    if let Err(error) = shared.git_sources.update_limits(&new_cfg) {
+                        tracing::error!(
+                            error = %error,
+                            "SIGHUP Git-source limit reload failed after validated auth reload"
+                        );
+                        continue;
+                    }
                     let old_cfg = shared.config.read();
                     if old_cfg.daemon.port != new_cfg.daemon.port
                         || old_cfg.daemon.bind != new_cfg.daemon.bind

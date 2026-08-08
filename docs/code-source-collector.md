@@ -1,13 +1,17 @@
 # Code Source Collector
 
-The code source collector publishes current project files from the machine that
-owns a checkout to the corpus daemon. The collector only walks, hashes, and
-uploads bounded raw bytes. The daemon remains responsible for chunking,
-indexing, embeddings, entity references, and graph snapshots.
+The code source collector publishes current project files and optional complete
+typed Git-history snapshots from the machine that owns a checkout to the corpus
+daemon. It uploads bounded raw file bytes and canonical commit facts, never Git
+packs or an object database. The daemon remains responsible for chunking,
+indexing, embeddings, entity references, graph snapshots, and activation.
 
-This is an overlap facility. The daemon must already have exactly one local
-project registration whose committed `.bbox/config.toml` resolves to the same
-published scope. Git history still comes from that registered checkout.
+This is an overlap facility. The daemon must already have catalog projects
+whose committed `.bbox/config.toml` resolve to the configured published
+scopes. Git-history transport additionally requires every published member of
+one repo-history identity to be assigned to the same producer. Intake currently
+stops at a verified durable `ready` source; corpus materialization and overlay
+activation are the next rollout milestone.
 
 ## Configure the daemon
 
@@ -26,12 +30,17 @@ Add the producer and its exact published scopes to the daemon configuration:
 ```toml
 [code_collection]
 enabled = true
+git_transport_enabled = true
 max_manifest_files = 250000
 max_manifest_logical_bytes = 5368709120
 max_open_uploads_per_producer = 2
 retained_generations = 2
 unreferenced_blob_grace_hours = 168
 stale_warning_hours = 24
+max_git_history_commits = 2000000
+max_git_history_logical_bytes = 8589934592
+max_provenance_documents = 1000000
+max_provenance_logical_bytes = 2147483648
 
 [[code_collection.producers]]
 producer_id = "checkout-host-a"
@@ -60,12 +69,19 @@ interval_secs = 120
 [[projects]]
 root = "/home/operator/repos/project"
 scope = { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." }
+git_history = true
 ```
 
 The configured root must be the main Git worktree for its clone. The committed
 scope at the observed `HEAD` must match the configured scope. Symlinks,
 submodules, special files, `.bbox`, build output, and unsupported or oversized
 files are not published.
+
+`git_history` defaults to `false`. When enabled, the collector captures every
+commit reachable from one exact `HEAD` through the stable no-follow Git
+authority, refuses shallow clones, verifies the complete graph locally, and
+uses resumable content-addressed upload. Multiple configured projects sharing
+one Git common directory publish that repository history only once per cycle.
 
 Publish once and wait for a terminal generation state:
 
@@ -105,6 +121,11 @@ and failed retirement. The durable store is under
 `<state_dir>/code-sources/`. Upload sessions expire after 24 idle hours, while
 active and retained generations remain protected. Blob garbage collection and
 retained-generation scrubbing run in the background.
+
+Verified Git-history source records live separately under
+`<state_dir>/git-sources/`. Unchanged HEADs are skipped by probe and commit
+records are content-addressed, so a new complete snapshot reuses prior commit
+records rather than copying an entire history sidecar again.
 
 When a retained blob is corrupt, the daemon keeps already materialized active
 documents readable and requests the missing hash during the next publication.

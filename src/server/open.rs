@@ -608,6 +608,7 @@ pub(super) fn open_shared_state(
         catalog_store.clone(),
         checkout_access.clone(),
     )?);
+    let git_sources = Arc::new(super::git_source::GitSourceRuntime::open(&cfg)?);
 
     // R21F1: unconditional pre-bind transaction recovery. Runs before
     // selector refresh, read-view construction, and edge-index loading.
@@ -804,6 +805,7 @@ pub(super) fn open_shared_state(
         reindex_dirty,
         code_read_view: RwLock::new(Arc::new(code_read_view)),
         code_sources,
+        git_sources,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

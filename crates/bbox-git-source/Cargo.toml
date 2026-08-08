@@ -1,22 +1,15 @@
 [package]
-name = "bbox-provenance"
+name = "bbox-git-source"
 version = "0.0.1"
 edition = "2024"
 
-[features]
-default = ["local-git"]
-local-git = ["dep:bbox-config"]
-
 [dependencies]
-anyhow = "1"
-bbox-config = { path = "../bbox-config", optional = true }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
-fs2 = "0.4"
+bbox-provenance = { path = "../bbox-provenance", default-features = false }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 
 [dev-dependencies]
-tempfile = "3"
+serde_json = "1"

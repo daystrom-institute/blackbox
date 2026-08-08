@@ -50,9 +50,9 @@ done
 if ((failures > 0)); then
     cat >&2 <<'EOF'
 
-bbox-code-collector walks, hashes, and uploads raw bounded files. Chunking,
-indexing, vectors, edge materialization, model runtimes, and daemon behavior
-belong on the corpus side of the boundary.
+bbox-code-collector walks, hashes, and uploads raw bounded files plus typed
+Git-history facts. Chunking, indexing, vectors, edge materialization, model
+runtimes, and daemon behavior belong on the corpus side of the boundary.
 EOF
     exit 1
 fi

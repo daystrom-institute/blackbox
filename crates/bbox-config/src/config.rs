@@ -127,6 +127,8 @@ struct RawConfig {
 struct RawCodeCollectionConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub git_transport_enabled: bool,
     #[serde(default = "default_code_collection_max_manifest_files")]
     pub max_manifest_files: u64,
     #[serde(default = "default_code_collection_max_manifest_logical_bytes")]
@@ -143,6 +145,14 @@ struct RawCodeCollectionConfig {
     pub max_migration_survivor_bytes: usize,
     #[serde(default = "default_code_collection_stale_warning_hours")]
     pub stale_warning_hours: u64,
+    #[serde(default = "default_git_history_max_commits")]
+    pub max_git_history_commits: u64,
+    #[serde(default = "default_git_history_max_logical_bytes")]
+    pub max_git_history_logical_bytes: u64,
+    #[serde(default = "default_provenance_max_documents")]
+    pub max_provenance_documents: u64,
+    #[serde(default = "default_provenance_max_logical_bytes")]
+    pub max_provenance_logical_bytes: u64,
     #[serde(default = "default_cutback_retry_base_secs")]
     pub cutback_retry_base_secs: u64,
     #[serde(default = "default_cutback_retry_max_secs")]
@@ -157,6 +167,7 @@ impl Default for RawCodeCollectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            git_transport_enabled: false,
             max_manifest_files: default_code_collection_max_manifest_files(),
             max_manifest_logical_bytes: default_code_collection_max_manifest_logical_bytes(),
             max_open_uploads_per_producer: default_code_collection_max_open_uploads(),
@@ -165,6 +176,10 @@ impl Default for RawCodeCollectionConfig {
             max_migration_survivor_rows: default_code_collection_migration_survivor_rows(),
             max_migration_survivor_bytes: default_code_collection_migration_survivor_bytes(),
             stale_warning_hours: default_code_collection_stale_warning_hours(),
+            max_git_history_commits: default_git_history_max_commits(),
+            max_git_history_logical_bytes: default_git_history_max_logical_bytes(),
+            max_provenance_documents: default_provenance_max_documents(),
+            max_provenance_logical_bytes: default_provenance_max_logical_bytes(),
             cutback_retry_base_secs: default_cutback_retry_base_secs(),
             cutback_retry_max_secs: default_cutback_retry_max_secs(),
             cutback_max_attempts: default_cutback_max_attempts(),
@@ -203,6 +218,22 @@ fn default_code_collection_migration_survivor_bytes() -> usize {
 
 fn default_code_collection_stale_warning_hours() -> u64 {
     24
+}
+
+fn default_git_history_max_commits() -> u64 {
+    2_000_000
+}
+
+fn default_git_history_max_logical_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+fn default_provenance_max_documents() -> u64 {
+    1_000_000
+}
+
+fn default_provenance_max_logical_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_cutback_retry_base_secs() -> u64 {
@@ -542,6 +573,7 @@ pub struct IndexConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeCollectionConfig {
     pub enabled: bool,
+    pub git_transport_enabled: bool,
     pub max_manifest_files: u64,
     pub max_manifest_logical_bytes: u64,
     pub max_open_uploads_per_producer: usize,
@@ -550,6 +582,10 @@ pub struct CodeCollectionConfig {
     pub max_migration_survivor_rows: usize,
     pub max_migration_survivor_bytes: usize,
     pub stale_warning_hours: u64,
+    pub max_git_history_commits: u64,
+    pub max_git_history_logical_bytes: u64,
+    pub max_provenance_documents: u64,
+    pub max_provenance_logical_bytes: u64,
     pub cutback_retry_base_secs: u64,
     pub cutback_retry_max_secs: u64,
     pub cutback_max_attempts: u32,
@@ -950,6 +986,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         },
         code_collection: CodeCollectionConfig {
             enabled: raw.code_collection.enabled,
+            git_transport_enabled: raw.code_collection.git_transport_enabled,
             max_manifest_files: raw.code_collection.max_manifest_files,
             max_manifest_logical_bytes: raw.code_collection.max_manifest_logical_bytes,
             max_open_uploads_per_producer: raw.code_collection.max_open_uploads_per_producer,
@@ -958,6 +995,10 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             max_migration_survivor_rows: raw.code_collection.max_migration_survivor_rows,
             max_migration_survivor_bytes: raw.code_collection.max_migration_survivor_bytes,
             stale_warning_hours: raw.code_collection.stale_warning_hours,
+            max_git_history_commits: raw.code_collection.max_git_history_commits,
+            max_git_history_logical_bytes: raw.code_collection.max_git_history_logical_bytes,
+            max_provenance_documents: raw.code_collection.max_provenance_documents,
+            max_provenance_logical_bytes: raw.code_collection.max_provenance_logical_bytes,
             cutback_retry_base_secs: raw.code_collection.cutback_retry_base_secs,
             cutback_retry_max_secs: raw.code_collection.cutback_retry_max_secs,
             cutback_max_attempts: raw.code_collection.cutback_max_attempts,
@@ -2780,6 +2821,7 @@ state_dir = "~"
     fn cutback_retry_defaults_are_non_zero() {
         let config = CodeCollectionConfig {
             enabled: false,
+            git_transport_enabled: false,
             max_manifest_files: 0,
             max_manifest_logical_bytes: 0,
             max_open_uploads_per_producer: 0,
@@ -2788,6 +2830,10 @@ state_dir = "~"
             max_migration_survivor_rows: 0,
             max_migration_survivor_bytes: 0,
             stale_warning_hours: 0,
+            max_git_history_commits: default_git_history_max_commits(),
+            max_git_history_logical_bytes: default_git_history_max_logical_bytes(),
+            max_provenance_documents: default_provenance_max_documents(),
+            max_provenance_logical_bytes: default_provenance_max_logical_bytes(),
             cutback_retry_base_secs: default_cutback_retry_base_secs(),
             cutback_retry_max_secs: default_cutback_retry_max_secs(),
             cutback_max_attempts: default_cutback_max_attempts(),

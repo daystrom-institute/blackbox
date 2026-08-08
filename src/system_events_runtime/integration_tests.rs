@@ -149,6 +149,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(
             tmp.path(),
         )),
+        git_sources: Arc::new(crate::server::git_source::GitSourceRuntime::for_test(
+            tmp.path(),
+        )),
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

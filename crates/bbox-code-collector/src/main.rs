@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::io::Read;
@@ -15,6 +15,14 @@ use bbox_code_source::{
     manifest_sha256, max_bytes_for_path,
 };
 use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
+use bbox_git_source::{
+    BeginGitHistoryUploadRequestV1, BeginGitHistoryUploadResponseV1,
+    FinalizeGitHistoryUploadResponseV1, GitHistoryCommitFragmentV1, GitHistoryCommitHeaderV1,
+    GitHistoryDescriptorV1, GitHistoryManifestEntryV1, GitHistoryManifestPageV1,
+    GitHistoryProbeRequestV1, GitHistoryProbeResponseV1, GitHistorySourceStateV1,
+    GitHistorySourceStatusV1, GitObjectFormatV1, GitSourceLimits, MAX_HISTORY_RECORD_BYTES,
+    SCHEMA_VERSION as GIT_SOURCE_SCHEMA_VERSION, encode_history_fragment, history_manifest_sha256,
+};
 use bro_rpc::ServiceToken;
 use clap::{Parser, Subcommand};
 use ignore::{DirEntry, WalkBuilder};
@@ -54,6 +62,24 @@ struct CollectorConfig {
 struct ProjectConfig {
     root: PathBuf,
     scope: PublishedScope,
+    #[serde(default)]
+    git_history: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CommittedProjectConfig {
+    #[serde(default)]
+    project: CommittedProjectIdentity,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CommittedProjectIdentity {
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    project_key_override: Option<String>,
+    #[serde(default)]
+    aka_repo_ids: Vec<String>,
 }
 
 struct Runtime {
@@ -72,6 +98,12 @@ struct ScannedProject {
     skipped_oversize: u64,
     skipped_nested_repositories: u64,
     read_races: u64,
+}
+
+struct CapturedGitHistory {
+    descriptor: GitHistoryDescriptorV1,
+    entries: Vec<GitHistoryManifestEntryV1>,
+    records: tempfile::TempDir,
 }
 
 fn default_interval_secs() -> u64 {
@@ -133,23 +165,40 @@ impl Runtime {
 }
 
 async fn run_loop(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
-    let mut backoff = Duration::from_secs(config.interval_secs.max(1));
+    tokio::select! {
+        _ = run_code_lane(runtime, config) => unreachable!("code lane is an endless loop"),
+        _ = run_history_lane(runtime, config) => unreachable!("history lane is an endless loop"),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+async fn run_code_lane(runtime: &Runtime, config: &CollectorConfig) {
+    let interval = Duration::from_secs(config.interval_secs.max(1));
+    let mut backoff = interval;
     loop {
-        let publish_result = tokio::select! {
-            result = publish_all(runtime, config) => result,
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-        };
-        match publish_result {
-            Ok(()) => backoff = Duration::from_secs(config.interval_secs.max(1)),
+        match publish_code_projects(runtime, config).await {
+            Ok(()) => backoff = interval,
             Err(error) => {
                 tracing::error!(error = %error, "code-source publication failed");
                 backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
             }
         }
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            _ = tokio::time::sleep(jittered(backoff)) => {}
+        tokio::time::sleep(jittered(backoff)).await;
+    }
+}
+
+async fn run_history_lane(runtime: &Runtime, config: &CollectorConfig) {
+    let interval = Duration::from_secs(config.interval_secs.max(1));
+    let mut backoff = interval;
+    loop {
+        match publish_history_repositories(runtime, config).await {
+            Ok(()) => backoff = interval,
+            Err(error) => {
+                tracing::error!(error = %error, "Git-history publication failed");
+                backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
+            }
         }
+        tokio::time::sleep(jittered(backoff)).await;
     }
 }
 
@@ -160,6 +209,19 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     if config.status_timeout_secs == 0 {
         bail!("collector status_timeout_secs must be greater than zero");
     }
+    let code = publish_code_projects(runtime, config).await;
+    let history = publish_history_repositories(runtime, config).await;
+    match (code, history) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(code), Ok(())) => Err(code.context("code-source lane failed")),
+        (Ok(()), Err(history)) => Err(history.context("Git-history lane failed")),
+        (Err(code), Err(history)) => Err(anyhow!(
+            "code-source lane failed: {code:#}; Git-history lane failed: {history:#}"
+        )),
+    }
+}
+
+async fn publish_code_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
     for project in &config.projects {
         let scanned = scan_project(project)?;
         publish_project(
@@ -170,6 +232,162 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
         .await?;
     }
     Ok(())
+}
+
+async fn publish_history_repositories(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    let mut published_history_repositories = HashSet::new();
+    for project in config.projects.iter().filter(|project| project.git_history) {
+        let root = project
+            .root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing history root {}", project.root.display()))?;
+        let common_dir = bbox_corpus_core::git::git_common_dir(&root)
+            .ok_or_else(|| anyhow!("Git common directory is unavailable"))?;
+        if published_history_repositories.insert(common_dir) {
+            let captured = capture_git_history(project)?;
+            publish_git_history(
+                runtime,
+                captured,
+                Duration::from_secs(config.status_timeout_secs),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn publish_git_history(
+    runtime: &Runtime,
+    captured: CapturedGitHistory,
+    status_timeout: Duration,
+) -> Result<()> {
+    let probe: GitHistoryProbeResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/git-history/probe")?,
+            )
+            .json(&GitHistoryProbeRequestV1 {
+                scope: captured.descriptor.scope.clone(),
+                repo_head: captured.descriptor.repo_head.clone(),
+                object_format: captured.descriptor.object_format,
+            }),
+    )
+    .await?;
+    if let Some(current) = probe.current {
+        tracing::info!(
+            source_generation = %current.source_generation_id,
+            commits = current.commit_count,
+            bytes = current.logical_bytes,
+            "Git-history source is already current"
+        );
+        return Ok(());
+    }
+
+    let begin: BeginGitHistoryUploadResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/git-history/uploads")?,
+            )
+            .json(&BeginGitHistoryUploadRequestV1 {
+                descriptor: captured.descriptor.clone(),
+            }),
+    )
+    .await?;
+    let pages = pack_history_manifest_pages(
+        &captured.entries,
+        begin
+            .max_page_entries
+            .min(bbox_git_source::MAX_HISTORY_MANIFEST_PAGE_ENTRIES),
+        begin
+            .max_page_bytes
+            .min(bbox_git_source::MAX_HISTORY_MANIFEST_PAGE_BYTES),
+    )?;
+    for (page, page_body) in pages.into_iter().enumerate() {
+        let url = runtime.endpoint(&format!(
+            "internal/code-source/v1/git-history/uploads/{}/manifest/{page}",
+            begin.upload_id
+        ))?;
+        send_empty(runtime.request(reqwest::Method::PUT, url).json(&page_body)).await?;
+    }
+
+    let complete_url = runtime.endpoint(&format!(
+        "internal/code-source/v1/git-history/uploads/{}/manifest/complete",
+        begin.upload_id
+    ))?;
+    let mut missing: bbox_git_source::MissingHistoryRecordsPageV1 =
+        send_json(runtime.request(reqwest::Method::POST, complete_url)).await?;
+    let entries_by_hash = captured
+        .entries
+        .iter()
+        .map(|entry| (entry.content_sha256.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    loop {
+        for hash in &missing.hashes {
+            let entry = entries_by_hash
+                .get(hash.as_str())
+                .copied()
+                .ok_or_else(|| anyhow!("server requested an unknown Git-history record"))?;
+            let bytes = read_captured_history_record(&captured, entry)?;
+            let url = runtime.endpoint(&format!(
+                "internal/code-source/v1/git-history/uploads/{}/records/{hash}",
+                begin.upload_id
+            ))?;
+            send_empty(
+                runtime
+                    .request(reqwest::Method::PUT, url)
+                    .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                    .body(bytes),
+            )
+            .await?;
+        }
+        let Some(cursor) = missing.next_cursor.as_deref() else {
+            break;
+        };
+        let mut url = runtime.endpoint(&format!(
+            "internal/code-source/v1/git-history/uploads/{}/missing",
+            begin.upload_id
+        ))?;
+        url.query_pairs_mut().append_pair("cursor", cursor);
+        missing = send_json(runtime.request(reqwest::Method::GET, url)).await?;
+    }
+
+    let finalize_url = runtime.endpoint(&format!(
+        "internal/code-source/v1/git-history/uploads/{}/finalize",
+        begin.upload_id
+    ))?;
+    let finalized: FinalizeGitHistoryUploadResponseV1 =
+        send_json(runtime.request(reqwest::Method::POST, finalize_url)).await?;
+    let status_url = runtime.endpoint(finalized.status_url.trim_start_matches('/'))?;
+    with_status_timeout(status_timeout, async {
+        loop {
+            let status: GitHistorySourceStatusV1 =
+                send_json(runtime.request(reqwest::Method::GET, status_url.clone())).await?;
+            match status.state {
+                GitHistorySourceStateV1::Ready
+                | GitHistorySourceStateV1::Active
+                | GitHistorySourceStateV1::Superseded => {
+                    tracing::info!(
+                        source_generation = %status.source_generation_id,
+                        commits = status.commit_count,
+                        bytes = status.logical_bytes,
+                        "Git-history source reached durable terminal success"
+                    );
+                    return Ok(());
+                }
+                GitHistorySourceStateV1::Failed => {
+                    bail!(
+                        "Git-history source {} failed: {}",
+                        status.source_generation_id,
+                        status.diagnostic.as_deref().unwrap_or("no diagnostic")
+                    );
+                }
+                _ => tokio::time::sleep(Duration::from_secs(1)).await,
+            }
+        }
+    })
+    .await
 }
 
 async fn publish_project(
@@ -423,6 +641,174 @@ fn scan_project(config: &ProjectConfig) -> Result<ScannedProject> {
     })
 }
 
+fn capture_git_history(config: &ProjectConfig) -> Result<CapturedGitHistory> {
+    let root = config
+        .root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", config.root.display()))?;
+    require_main_worktree(&root)?;
+    let directory = bbox_corpus_core::json_store::NofollowDirectory::open_existing(&root)?
+        .ok_or_else(|| anyhow!("collector project root disappeared"))?;
+    let repository = bbox_corpus_core::git::open_stable_git_repository(&directory)?
+        .ok_or_else(|| anyhow!("collector project is not a stable Git repository"))?;
+    if repository.is_shallow()? {
+        bail!("Git-history publication refuses a shallow repository");
+    }
+    let head = repository
+        .verified_head()?
+        .ok_or_else(|| anyhow!("Git-history publication requires a commit HEAD"))?;
+    let actual_scope = resolve_committed_scope(&root, head.oid())?;
+    if actual_scope != config.scope {
+        bail!("configured scope does not match committed project identity");
+    }
+    let object_format = match repository.object_id_hex_len()? {
+        40 => GitObjectFormatV1::Sha1,
+        64 => GitObjectFormatV1::Sha256,
+        _ => bail!("Git repository uses an unsupported object format"),
+    };
+    let limits = GitSourceLimits::default();
+    let max_commits = usize::try_from(limits.max_history_commits)
+        .context("Git-history commit limit exceeds this platform")?;
+    let max_logical_bytes = usize::try_from(limits.max_history_logical_bytes)
+        .context("Git-history logical-byte limit exceeds this platform")?;
+    let commits =
+        repository.complete_history_bounded(head.oid(), max_commits, max_logical_bytes)?;
+    let records = tempfile::tempdir().context("creating Git-history record spool")?;
+    let mut entries = Vec::new();
+    for commit in &commits {
+        for fragment in fragment_history_commit(commit)? {
+            let bytes = encode_history_fragment(&fragment);
+            let hash = hex::encode(Sha256::digest(&bytes));
+            install_captured_history_record(records.path(), &hash, &bytes)?;
+            entries.push(GitHistoryManifestEntryV1 {
+                commit_oid: fragment.commit_oid,
+                fragment_index: fragment.fragment_index,
+                encoded_bytes: bytes.len() as u64,
+                content_sha256: hash,
+            });
+        }
+    }
+    entries.sort_by(|left, right| {
+        (&left.commit_oid, left.fragment_index).cmp(&(&right.commit_oid, right.fragment_index))
+    });
+    let logical_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.encoded_bytes)
+            .context("Git-history logical byte count overflow")
+    })?;
+    let descriptor = GitHistoryDescriptorV1 {
+        schema_version: GIT_SOURCE_SCHEMA_VERSION,
+        scope: actual_scope,
+        repo_head: head.oid().to_string(),
+        object_format,
+        manifest_sha256: history_manifest_sha256(&entries),
+        commit_count: commits.len() as u64,
+        fragment_count: entries.len() as u64,
+        logical_bytes,
+    };
+    let mut verifier = bbox_git_source::HistorySourceVerifier::new(&descriptor, &entries, limits)?;
+    for entry in &entries {
+        let bytes = fs::read(records.path().join(&entry.content_sha256))?;
+        verifier.push_encoded(&bytes)?;
+    }
+    verifier.finish()?;
+    Ok(CapturedGitHistory {
+        descriptor,
+        entries,
+        records,
+    })
+}
+
+fn fragment_history_commit(
+    commit: &bbox_corpus_core::git::StableGitHistoryCommit,
+) -> Result<Vec<GitHistoryCommitFragmentV1>> {
+    let header = GitHistoryCommitHeaderV1 {
+        parent_oids: commit.parent_oids.clone(),
+        author_name: commit.author_name.clone(),
+        author_email: commit.author_email.clone(),
+        message: commit.message.clone(),
+    };
+    let header_only = GitHistoryCommitFragmentV1 {
+        commit_oid: commit.oid.clone(),
+        fragment_index: 0,
+        fragment_count: 1,
+        header: Some(header.clone()),
+        changed_paths: Vec::new(),
+    };
+    if encode_history_fragment(&header_only).len() as u64 > MAX_HISTORY_RECORD_BYTES {
+        bail!("Git commit contains an oversized indivisible header");
+    }
+
+    let mut path_groups = vec![Vec::<String>::new()];
+    for path in &commit.changed_paths {
+        let current_index = path_groups.len() - 1;
+        let mut trial = path_groups[current_index].clone();
+        trial.push(path.clone());
+        let fragment = GitHistoryCommitFragmentV1 {
+            commit_oid: commit.oid.clone(),
+            fragment_index: current_index as u32,
+            fragment_count: 1,
+            header: (current_index == 0).then(|| header.clone()),
+            changed_paths: trial.clone(),
+        };
+        if encode_history_fragment(&fragment).len() as u64 <= MAX_HISTORY_RECORD_BYTES {
+            path_groups[current_index] = trial;
+            continue;
+        }
+        path_groups.push(vec![path.clone()]);
+        let fragment = GitHistoryCommitFragmentV1 {
+            commit_oid: commit.oid.clone(),
+            fragment_index: current_index as u32 + 1,
+            fragment_count: 1,
+            header: None,
+            changed_paths: vec![path.clone()],
+        };
+        if encode_history_fragment(&fragment).len() as u64 > MAX_HISTORY_RECORD_BYTES {
+            bail!("Git commit contains an oversized changed path");
+        }
+    }
+    let fragment_count = u32::try_from(path_groups.len())
+        .context("Git commit requires too many history fragments")?;
+    path_groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, changed_paths)| {
+            Ok(GitHistoryCommitFragmentV1 {
+                commit_oid: commit.oid.clone(),
+                fragment_index: u32::try_from(index)?,
+                fragment_count,
+                header: (index == 0).then(|| header.clone()),
+                changed_paths,
+            })
+        })
+        .collect()
+}
+
+fn install_captured_history_record(root: &Path, hash: &str, bytes: &[u8]) -> Result<()> {
+    let path = root.join(hash);
+    if path.exists() {
+        if fs::read(&path)? != bytes {
+            bail!("Git-history record hash collision");
+        }
+        return Ok(());
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn read_captured_history_record(
+    captured: &CapturedGitHistory,
+    entry: &GitHistoryManifestEntryV1,
+) -> Result<Vec<u8>> {
+    let bytes = fs::read(captured.records.path().join(&entry.content_sha256))?;
+    if bytes.len() as u64 != entry.encoded_bytes
+        || hex::encode(Sha256::digest(&bytes)) != entry.content_sha256
+    {
+        bail!("captured Git-history record changed before upload");
+    }
+    Ok(bytes)
+}
+
 fn read_stable_file(root: &Path, entry: &ManifestEntry) -> Result<Vec<u8>> {
     let path = root.join(Path::new(&entry.relative_path));
     let canonical_parent = path
@@ -492,11 +878,35 @@ fn resolve_committed_scope(root: &Path, head_commit: &str) -> Result<PublishedSc
     let git_root = bbox_corpus_core::git::git_root_for_path(root)
         .ok_or_else(|| anyhow!("project is not inside a Git repository"))?
         .canonicalize()?;
-    let inputs = bbox_config::config::read_repo_id_inputs_at_ref(root, head_commit)?;
-    let repo_id = resolve_recorded_repo_id(&inputs)
-        .ok_or_else(|| anyhow!("committed project config has no recorded repo authority"))?;
+    let root_directory = bbox_corpus_core::json_store::NofollowDirectory::open_existing(&git_root)?
+        .ok_or_else(|| anyhow!("Git repository root disappeared"))?;
+    let repository = bbox_corpus_core::git::open_stable_git_repository(&root_directory)?
+        .ok_or_else(|| anyhow!("project is not a stable Git repository"))?;
+    let commit = repository.verify_commit_oid(head_commit)?;
     let bbox_root_relpath = bbox_root_relpath(&git_root, root)
         .ok_or_else(|| anyhow!("project root is outside Git root"))?;
+    let config_relpath = if bbox_root_relpath == "." {
+        ".bbox/config.toml".to_string()
+    } else {
+        format!("{bbox_root_relpath}/.bbox/config.toml")
+    };
+    let source = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+        &commit,
+        &config_relpath,
+        1024 * 1024,
+    )?;
+    let source = std::str::from_utf8(&source).context("committed project config is not UTF-8")?;
+    let project = toml::from_str::<CommittedProjectConfig>(source)
+        .context("parsing committed project identity")?
+        .project;
+    let inputs = bbox_corpus_core::identity::RepoIdInputs {
+        project_key_override: project.project_key_override,
+        recorded: project.repo_id,
+        aka_repo_ids: project.aka_repo_ids,
+        computed: None,
+    };
+    let repo_id = resolve_recorded_repo_id(&inputs)
+        .ok_or_else(|| anyhow!("committed project config has no recorded repo authority"))?;
     Ok(PublishedScope::try_new(repo_id, bbox_root_relpath)?)
 }
 
@@ -651,6 +1061,52 @@ fn pack_manifest_pages(
     Ok(pages)
 }
 
+fn pack_history_manifest_pages(
+    entries: &[GitHistoryManifestEntryV1],
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<Vec<GitHistoryManifestPageV1>> {
+    if max_entries == 0 || max_bytes == 0 {
+        bail!("server advertised invalid Git-history manifest page limits");
+    }
+    let empty_size = serde_json::to_vec(&GitHistoryManifestPageV1 {
+        entries: Vec::new(),
+    })?
+    .len();
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    let mut current_size = empty_size;
+    for entry in entries {
+        let entry_size = serde_json::to_vec(entry)?.len();
+        let separator = usize::from(!current.is_empty());
+        let next_size = current_size
+            .checked_add(separator)
+            .and_then(|size| size.checked_add(entry_size))
+            .ok_or_else(|| anyhow!("Git-history manifest page size overflow"))?;
+        if current.len() == max_entries || next_size > max_bytes {
+            if current.is_empty() {
+                bail!("one Git-history manifest entry exceeds the server page byte limit");
+            }
+            pages.push(GitHistoryManifestPageV1 { entries: current });
+            current = Vec::new();
+            current_size = empty_size;
+        }
+        let separator = usize::from(!current.is_empty());
+        current_size = current_size
+            .checked_add(separator)
+            .and_then(|size| size.checked_add(entry_size))
+            .ok_or_else(|| anyhow!("Git-history manifest page size overflow"))?;
+        if current_size > max_bytes {
+            bail!("one Git-history manifest entry exceeds the server page byte limit");
+        }
+        current.push(entry.clone());
+    }
+    if !current.is_empty() {
+        pages.push(GitHistoryManifestPageV1 { entries: current });
+    }
+    Ok(pages)
+}
+
 fn validate_server_url(url: &Url) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
@@ -710,6 +1166,21 @@ fn truncate(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn remote_plaintext_is_rejected() {
         assert!(validate_server_url(&Url::parse("http://example.test/").unwrap()).is_err());
@@ -751,6 +1222,59 @@ mod tests {
             )
             .is_err()
         );
+        let config = toml::from_str::<CollectorConfig>(
+            "server_url = \"https://example.test\"\ntoken_file = \"/tmp/token\"\n[[projects]]\nroot = \"/tmp/project\"\nscope = { repo_id = \"repo-a\", bbox_root_relpath = \".\" }\n",
+        )
+        .unwrap();
+        assert!(!config.projects[0].git_history);
+    }
+
+    #[test]
+    fn complete_git_history_capture_is_typed_and_exact_head_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.name", "History Fixture"]);
+        git(&root, &["config", "user.email", "history@example.invalid"]);
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"history-fixture\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        git(&root, &["add", ".bbox/config.toml", "README.md"]);
+        git(&root, &["commit", "--quiet", "-m", "root"]);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        git(&root, &["add", "src/lib.rs"]);
+        git(&root, &["commit", "--quiet", "-m", "second"]);
+
+        let captured = capture_git_history(&ProjectConfig {
+            root: root.clone(),
+            scope: PublishedScope::try_new("history-fixture", ".").unwrap(),
+            git_history: true,
+        })
+        .unwrap();
+        assert_eq!(captured.descriptor.commit_count, 2);
+        assert_eq!(
+            captured.descriptor.repo_head,
+            bbox_corpus_core::git::current_head(&root).unwrap()
+        );
+        assert!(captured.entries.len() >= 2);
+        assert!(captured.entries.windows(2).all(|pair| {
+            (&pair[0].commit_oid, pair[0].fragment_index)
+                < (&pair[1].commit_oid, pair[1].fragment_index)
+        }));
+        for entry in &captured.entries {
+            assert!(
+                captured
+                    .records
+                    .path()
+                    .join(&entry.content_sha256)
+                    .is_file()
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 ---
 title: "Typed Git-history and provenance transport implementation plan"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -18,18 +18,17 @@ History dependencies: [`durable-project-catalog-phase3-impl.md`](../../../../../
 Provenance predecessor: [`checkout-provenance-export-impl.md`](../../../../../design/daemon-runtime/checkout-provenance-export-impl.md).
 Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). This plan uses slice-local decisions `GH-FD-*`. GH-C records the certified P3-F caller-list and selector-source amendment as a new Decision Ledger entry at implementation time; this plan assumes no entry number.
 
-> **Rebaseline required before implementation.** The locality inventory was
-> reverified on 2026-08-08 at `beta/blackbox-v2` `055071aa`. The immutable
-> history substrate and code-collector authority described here have since
-> landed, but typed Git/provenance producer routes have not: blackboxd still
-> acquires `GitHistory` and `ProvenanceNoteIo` leases. This plan remains the
-> starting contract, not a current caller/owner map. Reconcile every named
-> Phase 3-6 owner, selector transition, cutover row, and test fixture with
-> current code before splitting implementation cells; do not recreate a
-> planned type whose landed owner now has another name. The current program
-> order and retirement gates live in
-> [locality-first-decomposition.md](locality-first-decomposition.md) sections
-> 3 and 6.
+> **Implementation status (2026-08-08).** The caller/owner map was rebaselined
+> against current `beta/blackbox-v2`. GH-A is implemented: code and Git lanes
+> share one producer credential snapshot, whole-repository grants are derived
+> from catalog membership, and `bbox-git-source` owns the dependency-clean
+> wire contract. GH-B intake through durable `ready` is implemented: bounded
+> authenticated routes, resumable immutable storage, exact-HEAD stable Git
+> capture, canonical fragments, shallow refusal, and independent collector
+> backoff. GH-B retention/expiry maintenance, the full adversarial fixture
+> matrix, and the isolated live bootsmoke remain before GH-B closes. GH-C and
+> later milestones remain unimplemented; blackboxd therefore still acquires
+> `GitHistory` and `ProvenanceNoteIo` leases for active corpus behavior.
 
 ## 1. Required outcome
 At this slice's exit gate, proved against strict catalog state after Phases 3 through 6 have landed:
@@ -538,6 +537,7 @@ Any observation outside its active category fails the gate. `GitHistory` deltas 
 Every milestone is independently committable and cluster-verifiable. Runtime changes get isolated bootsmokes. Bridge parity stays green except the explicit parity changes below.
 
 ### GH-A: Shared auth extraction and wire leaf
+Status: implemented 2026-08-08.
 Ownership: new `src/server/producer_auth.rs`, new `crates/bbox-git-source`, `src/server/code_source.rs`, `src/server/state.rs`, `src/server/mcp.rs`, `crates/bbox-config/src/config.rs`, dependency script.
 Dependencies: `C4.1`, `C4.3`, `C5`, `G12-A`, `G16-A`.
 Mechanics:
@@ -552,6 +552,7 @@ Verification: auth goldens, duplicate/missing/split matrices, codec/adversarial 
 Gate: pinned format, focused workspace nextest, concurrency lint, cluster verify.
 
 ### GH-B: Durable history intake and collector capture
+Status: partial as of 2026-08-08; intake/capture through `ready` is implemented, while retention/expiry maintenance, the remaining fixture matrix, and the isolated live bootsmoke are open.
 Ownership: new `bbox-git-source-store`, new `src/server/git_source.rs`, `bbox-code-collector`, packaging/docs, maintenance.
 Dependencies: GH-A, `C6.2`, `C8`, `G11-B`.
 Mechanics:

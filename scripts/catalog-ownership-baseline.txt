@@ -151,7 +151,7 @@ direct_git_process	crates/bbox-corpus-core/src/git.rs	fn read_stable_repository_
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn resolve_stable_repository_commitish	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn resolve_stable_repository_ref	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn run_hardened_repository_path_query	1	route through the verified-commit git wrapper
-direct_git_process	crates/bbox-corpus-core/src/git.rs	fn run_stable_repository_stdout_bounded	1	route through the verified-commit git wrapper
+direct_git_process	crates/bbox-corpus-core/src/git.rs	fn run_stable_repository_stdout_bounded_with_timeout	1	route through the stable-repository exact-read wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn spawn	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn write_note	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-gaps/src/gap_closeout.rs	fn scan_git_trailers	1	route through the verified-commit git wrapper
@@ -203,6 +203,7 @@ project_record_import	crates/bbox-indexing/src/project_resolver.rs	<file scope>	
 project_record_import	crates/bbox-indexing/src/projects.rs	<file scope>	1	delete with the v1 record type
 project_record_import	crates/bbox-indexing/src/publisher.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/code_source.rs	<file scope>	1	delete with the v1 record type
+project_record_import	src/server/producer_auth.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/gap_view.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/knowledge_lifecycle.rs	<file scope>	1	delete with the v1 record type
 project_record_import	src/server/knowledge_view.rs	<file scope>	1	delete with the v1 record type

@@ -348,8 +348,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bbox-code-source",
- "bbox-config",
  "bbox-corpus-core",
+ "bbox-git-source",
  "bro-rpc",
  "clap",
  "hex",
@@ -552,6 +552,34 @@ dependencies = [
  "strum 0.26.3",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "bbox-git-source"
+version = "0.0.1"
+dependencies = [
+ "bbox-corpus-core",
+ "bbox-provenance",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bbox-git-source-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-git-source",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -1015,6 +1043,8 @@ dependencies = [
  "bbox-edge-sidecar",
  "bbox-embed",
  "bbox-gaps",
+ "bbox-git-source",
+ "bbox-git-source-store",
  "bbox-inbox",
  "bbox-indexing",
  "bbox-knowledge",

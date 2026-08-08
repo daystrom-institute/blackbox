@@ -199,6 +199,7 @@ pub(crate) struct SharedState {
     pub(crate) reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) code_read_view: RwLock<Arc<CodeReadView>>,
     pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
+    pub(crate) git_sources: Arc<super::git_source::GitSourceRuntime>,
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
@@ -814,6 +815,7 @@ impl SharedState {
                 git_overlays: BTreeMap::new(),
             })),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
+            git_sources: Arc::new(super::git_source::GitSourceRuntime::for_test(store_dir)),
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             )),

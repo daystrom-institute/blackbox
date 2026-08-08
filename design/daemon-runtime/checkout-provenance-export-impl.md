@@ -1,7 +1,7 @@
 ---
 title: "Checkout-plane provenance export implementation plan"
 kind: design
-lifecycle: proposed
+lifecycle: superseded
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -10,6 +10,11 @@ brief: "Move provenance Git-note writes out of blackboxd without introducing an 
 ---
 
 # Checkout-plane provenance export implementation plan
+
+Superseded by
+[`git-history-provenance-transport-impl.md`](git-history-provenance-transport-impl.md),
+which retains the landed local writer while joining authenticated export and
+import under the shared producer transport authority.
 
 Date: 2026-07-21
 

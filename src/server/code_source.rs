@@ -5,16 +5,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::{
     BeginUploadRequest, ContractError, CutbackErrorClass, CutbackReason, CutbackStateV2,
     ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus, ManifestPage,
-    MissingBlobsPage, validate_producer_id, validate_scope,
+    MissingBlobsPage,
 };
 use bbox_code_source_store::{
     ActivationFence, ActivationFenceConflict, ActivationRecord, ActivationRecordV2,
@@ -30,55 +29,18 @@ use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessError, CheckoutAccessIntent, CheckoutAccessKind,
     CheckoutAccessRequest, CheckoutAccessSourceLane, CheckoutAttachmentSelector,
 };
-use bro_rpc::ServiceToken;
 use futures::StreamExt;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use super::SharedState;
+use super::producer_auth::{ProducerAuthRuntime, ProducerGrant};
 
 const UPLOAD_BODY_TEMP_PREFIX: &str = ".upload-body-";
 const UPLOAD_BODY_TEMP_SUFFIX: &str = ".tmp";
 
-#[derive(Clone)]
-pub(crate) struct ProducerGrant {
-    producer_id: String,
-    projects: BTreeMap<PublishedScope, String>,
-}
-
-#[derive(Clone)]
-struct AuthEntry {
-    token: ServiceToken,
-    grant: ProducerGrant,
-}
-
-/// Catalog-mode typed grant table (P4-B plan section 6.1 item 3). Carries
-/// the same entries as `CodeSourceSnapshot.auth` plus typed
-/// `scope_to_project` and `producer_to_scopes` indexes resolved from the
-/// pinned `CatalogSnapshotV2`. Constructed only in catalog mode; bridge
-/// mode leaves this `None` and keeps its lease-derived `String` grants
-/// byte-identical.
-///
-/// The typed indexes are consumed by P4-C (strict scope-bearing v2
-/// records) and later milestones; this milestone establishes the table
-/// and verifies catalog-scope resolution.
-#[allow(dead_code)]
-struct AuthTable {
-    entries: Vec<AuthEntry>,
-    scope_to_project: BTreeMap<PublishedScope, ProjectId>,
-    producer_to_scopes: BTreeMap<String, BTreeSet<PublishedScope>>,
-}
-
 struct CodeSourceSnapshot {
-    enabled: bool,
-    auth: Vec<AuthEntry>,
-    /// `Some` only in catalog mode, carrying the typed grant indexes
-    /// resolved from the pinned catalog snapshot. `None` on the bridge.
-    /// Consumed by P4-C and later milestones; this milestone establishes
-    /// the table and verifies catalog-scope resolution.
-    #[allow(dead_code)]
-    auth_table: Option<AuthTable>,
+    auth: Arc<ProducerAuthRuntime>,
     store: Arc<CodeSourceStore>,
 }
 
@@ -531,80 +493,6 @@ pub(crate) struct CodeSourceRuntime {
     retirement_coordinator: Arc<RetirementCoordinator>,
 }
 
-/// How `build_snapshot` resolves a configured producer scope to the project
-/// that owns it (Phase 3 plan section 6 item 6, the single Phase 4
-/// pull-forward).
-enum GrantScopeResolution {
-    /// Version-1 bridge: one `PublisherConfigTreeRead` lease per registered
-    /// project, acquired and revalidated up front exactly as before, with
-    /// the resolved scope carried here. Unchanged, including the hard
-    /// failure of the whole snapshot on any lease error.
-    Bridge {
-        project_scopes: Vec<(String, Option<PublishedScope>)>,
-    },
-    /// Catalog mode: exact scope equality against the pinned catalog
-    /// snapshot, acquiring no leases at all. Without this arm a remote-only
-    /// project can never hold a grant, because the v1 resolution requires a
-    /// publisher-config lease on every registered project, and the Phase 3
-    /// exit gate ("a remote-only fixture activates") is unsatisfiable.
-    Catalog { catalog: Arc<CatalogSnapshotV2> },
-}
-
-/// One configured scope resolved to its owning project id. Both failure
-/// modes keep today's error shapes on both arms.
-fn resolve_grant_scope(
-    resolution: &GrantScopeResolution,
-    scope: &PublishedScope,
-) -> Result<String> {
-    match resolution {
-        GrantScopeResolution::Bridge { project_scopes } => {
-            let matching: Vec<&str> = project_scopes
-                .iter()
-                .filter(|(_, project_scope)| project_scope.as_ref() == Some(scope))
-                .map(|(project_id, _)| project_id.as_str())
-                .collect();
-            let [project_id] = matching.as_slice() else {
-                if matching.is_empty() {
-                    bail!("code-collection scope is not registered");
-                }
-                bail!("code-collection scope resolves to multiple registered projects");
-            };
-            Ok((*project_id).to_string())
-        }
-        GrantScopeResolution::Catalog { catalog } => Ok(resolve_catalog_project(catalog, scope)?
-            .as_str()
-            .to_string()),
-    }
-}
-
-/// Catalog-mode scope resolution returning the typed `ProjectId` (P4-B plan
-/// section 6.1 item 2). Exact `PublishedScope` equality against the pinned
-/// snapshot; unknown scope and multi-project collision fail closed with the
-/// same error shapes as the bridge arm.
-fn resolve_catalog_project(
-    catalog: &CatalogSnapshotV2,
-    scope: &PublishedScope,
-) -> Result<ProjectId> {
-    let matching: Vec<&ProjectId> = catalog
-        .projects
-        .iter()
-        .filter(|(_, project)| match &project.scope {
-            bbox_corpus_core::project_catalog::ProjectScope::Published(published) => {
-                published == scope
-            }
-            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => false,
-        })
-        .map(|(project_id, _)| project_id)
-        .collect();
-    let [project_id] = matching.as_slice() else {
-        if matching.is_empty() {
-            bail!("code-collection scope is not registered");
-        }
-        bail!("code-collection scope resolves to multiple registered projects");
-    };
-    Ok((*project_id).clone())
-}
-
 #[derive(Default)]
 pub(crate) struct SourceTransitions {
     cutbacks: Vec<(PublishedScope, String)>,
@@ -684,9 +572,7 @@ impl CodeSourceRuntime {
         let transition_guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
         Self {
             snapshot: parking_lot::RwLock::new(Arc::new(CodeSourceSnapshot {
-                enabled: false,
-                auth: Vec::new(),
-                auth_table: None,
+                auth: Arc::new(ProducerAuthRuntime::disabled()),
                 store,
             })),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
@@ -700,6 +586,12 @@ impl CodeSourceRuntime {
             assignment_revision: std::sync::atomic::AtomicU64::new(1),
             retirement_coordinator: Arc::new(RetirementCoordinator::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_auth_for_test(&self, auth: Arc<ProducerAuthRuntime>) {
+        let store = self.store();
+        *self.snapshot.write() = Arc::new(CodeSourceSnapshot { auth, store });
     }
 
     /// Test constructor for catalog mode: initializes the store in
@@ -718,9 +610,7 @@ impl CodeSourceRuntime {
         let reconciler = Some(Arc::new(CutbackReconciler::new(transition_guards.clone())));
         Self {
             snapshot: parking_lot::RwLock::new(Arc::new(CodeSourceSnapshot {
-                enabled: false,
-                auth: Vec::new(),
-                auth_table: None,
+                auth: Arc::new(ProducerAuthRuntime::disabled()),
                 store,
             })),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
@@ -763,22 +653,8 @@ impl CodeSourceRuntime {
         self.reconciler.as_ref()
     }
 
-    fn authenticate(&self, candidate: &str) -> Option<ProducerGrant> {
-        let snapshot = self.snapshot.read().clone();
-        if !snapshot.enabled {
-            return None;
-        }
-        let mut matched = None;
-        for entry in &snapshot.auth {
-            if entry.token.verify(candidate) {
-                matched = Some(entry.grant.clone());
-            }
-        }
-        matched
-    }
-
-    fn enabled(&self) -> bool {
-        self.snapshot.read().enabled
+    pub(crate) fn producer_auth(&self) -> Arc<ProducerAuthRuntime> {
+        self.snapshot.read().auth.clone()
     }
 
     pub(crate) fn store(&self) -> Arc<CodeSourceStore> {
@@ -804,17 +680,12 @@ impl CodeSourceRuntime {
     }
 
     fn assignments(&self) -> Vec<(PublishedScope, String)> {
-        let snapshot = self.snapshot.read().clone();
-        snapshot
-            .auth
-            .iter()
-            .flat_map(|entry| entry.grant.projects.clone())
-            .collect()
+        self.producer_auth().assignments()
     }
 
     fn assignment_matches(&self, scope: &PublishedScope, project_id: &str) -> bool {
-        let snapshot = self.snapshot.read().clone();
-        assignment_map(&snapshot)
+        self.producer_auth()
+            .assignment_map()
             .get(scope)
             .is_some_and(|(assigned, _producer_id)| assigned == project_id)
     }
@@ -825,8 +696,8 @@ impl CodeSourceRuntime {
         project_id: &str,
         producer_id: &str,
     ) -> bool {
-        let snapshot = self.snapshot.read().clone();
-        assignment_map(&snapshot)
+        self.producer_auth()
+            .assignment_map()
             .get(scope)
             .is_some_and(|(assigned_project, assigned_producer)| {
                 assigned_project == project_id && assigned_producer == producer_id
@@ -840,28 +711,12 @@ impl CodeSourceRuntime {
 /// rather than infer it from store residue.
 impl bbox_indexing::index::ProducerAssignmentSource for CodeSourceRuntime {
     fn assigned_project_ids(&self) -> std::collections::BTreeSet<String> {
-        self.snapshot
-            .read()
-            .auth
-            .iter()
-            .flat_map(|entry| entry.grant.projects.values().cloned())
-            .collect()
+        self.producer_auth().assigned_project_ids()
     }
 }
 
 fn assignment_map(snapshot: &CodeSourceSnapshot) -> BTreeMap<PublishedScope, (String, String)> {
-    snapshot
-        .auth
-        .iter()
-        .flat_map(|entry| {
-            entry.grant.projects.iter().map(|(scope, project_id)| {
-                (
-                    scope.clone(),
-                    (project_id.clone(), entry.grant.producer_id.clone()),
-                )
-            })
-        })
-        .collect()
+    snapshot.auth.assignment_map()
 }
 
 fn build_snapshot(
@@ -897,116 +752,16 @@ fn build_snapshot(
         )?);
         store
     };
-    if !config.code_collection.enabled {
-        return Ok(CodeSourceSnapshot {
-            enabled: false,
-            auth: Vec::new(),
-            auth_table: None,
-            store,
-        });
+    let auth = Arc::new(ProducerAuthRuntime::build(
+        config,
+        projects,
+        catalog_store,
+        checkout_access,
+    )?);
+    if auth.enabled() {
+        reap_upload_body_tempfiles(store.root())?;
     }
-    reap_upload_body_tempfiles(store.root())?;
-    if config.code_collection.producers.is_empty() {
-        bail!("enabled code collection requires at least one producer");
-    }
-
-    // Catalog mode resolves grants against the pinned catalog snapshot and
-    // acquires nothing; bridge mode keeps the lease-derived resolution
-    // unchanged, one lease per registered project, failing the whole
-    // snapshot on any lease error.
-    let resolution = match catalog_store {
-        Some(store) => GrantScopeResolution::Catalog {
-            catalog: store
-                .snapshot()
-                .map_err(|error| anyhow!("catalog snapshot unavailable: {error}"))?
-                .catalog()
-                .clone(),
-        },
-        None => GrantScopeResolution::Bridge {
-            project_scopes: projects
-                .iter()
-                .map(|project| {
-                    let lease = checkout_access
-                        .acquire(CheckoutAccessRequest {
-                            project_id: project.project_id.clone(),
-                            attachment: CheckoutAttachmentSelector::Selected,
-                            expected_scope: None,
-                            kind: CheckoutAccessKind::PublisherConfigTreeRead,
-                            intent: CheckoutAccessIntent::Read,
-                            source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
-                        })
-                        .map_err(anyhow::Error::new)?;
-                    let scope = lease.published_scope().cloned();
-                    checkout_access
-                        .revalidate(&lease)
-                        .map_err(anyhow::Error::new)?;
-                    Ok::<_, anyhow::Error>((project.project_id.clone(), scope))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        },
-    };
-    let mut auth = Vec::new();
-    let mut scope_to_project: BTreeMap<PublishedScope, ProjectId> = BTreeMap::new();
-    let mut producer_to_scopes: BTreeMap<String, BTreeSet<PublishedScope>> = BTreeMap::new();
-    let mut producer_ids = BTreeSet::new();
-    let mut token_digests = BTreeSet::new();
-    let mut assigned_scopes = BTreeSet::new();
-    for producer in &config.code_collection.producers {
-        validate_producer_id(&producer.producer_id)?;
-        if !producer_ids.insert(producer.producer_id.clone()) {
-            bail!("duplicate code-collection producer id");
-        }
-        let token = ServiceToken::load(&producer.token_file).with_context(|| {
-            format!("loading code-collection token for {}", producer.producer_id)
-        })?;
-        let token_digest = Sha256::digest(token.expose_secret().as_bytes());
-        if !token_digests.insert(token_digest.to_vec()) {
-            bail!("code-collection token values must be unique");
-        }
-        if producer.scopes.is_empty() {
-            bail!("enabled code-collection producer has no scopes");
-        }
-        let mut resolved = BTreeMap::new();
-        let mut producer_scopes = BTreeSet::new();
-        for scope in &producer.scopes {
-            validate_scope(scope)?;
-            if !assigned_scopes.insert(scope.clone()) {
-                bail!("code-collection scope is assigned more than once");
-            }
-            let project_id_string = resolve_grant_scope(&resolution, scope)?;
-            if let GrantScopeResolution::Catalog { catalog } = &resolution {
-                let project_id = resolve_catalog_project(catalog, scope)?;
-                scope_to_project.insert(scope.clone(), project_id);
-            }
-            producer_scopes.insert(scope.clone());
-            resolved.insert(scope.clone(), project_id_string);
-        }
-        producer_to_scopes.insert(producer.producer_id.clone(), producer_scopes);
-        auth.push(AuthEntry {
-            token,
-            grant: ProducerGrant {
-                producer_id: producer.producer_id.clone(),
-                projects: resolved,
-            },
-        });
-    }
-    // The typed AuthTable exists only in catalog mode (P4-B plan section
-    // 6.1 item 3 and 6.2): bridge mode leaves it None and retains its
-    // lease-derived String grants byte-identical.
-    let auth_table = match &resolution {
-        GrantScopeResolution::Catalog { .. } => Some(AuthTable {
-            entries: auth.clone(),
-            scope_to_project,
-            producer_to_scopes,
-        }),
-        GrantScopeResolution::Bridge { .. } => None,
-    };
-    Ok(CodeSourceSnapshot {
-        enabled: true,
-        auth,
-        auth_table,
-        store,
-    })
+    Ok(CodeSourceSnapshot { auth, store })
 }
 
 fn store_limits(config: &crate::config::Config) -> StoreLimits {
@@ -1057,34 +812,8 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
-            authenticate_request,
+            super::producer_auth::authenticate_code_source_request,
         ))
-}
-
-async fn authenticate_request(
-    State(state): State<Arc<SharedState>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    if !state.code_sources.enabled() {
-        return HttpError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service_disabled",
-            "code collection is disabled",
-        )
-        .into_response();
-    }
-    let candidate = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let Some(grant) = candidate.and_then(|value| state.code_sources.authenticate(value)) else {
-        return HttpError::new(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized")
-            .into_response();
-    };
-    request.extensions_mut().insert(grant);
-    next.run(request).await
 }
 
 async fn begin_upload(
@@ -3374,7 +3103,7 @@ fn validate_relationship_chain(
         })?;
         let catalog_project = snapshot.projects.get(&pid);
         let scope_matches = catalog_project.is_some_and(|p| {
-            matches!(&p.scope, bbox_corpus_core::project_catalog::ProjectScope::Published(ps) if ps == scope)
+            matches!(&p.scope, bbox_corpus_core::project_catalog::ProjectScope::Published(ps) if *ps == *scope)
         });
         let migration_records: Vec<_> = snapshot
             .scope_migrations
@@ -6695,9 +6424,13 @@ mod tests {
         CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError,
         CheckoutAccessErrorCode, CheckoutAccessObservations, CheckoutAttachmentStatus,
     };
+    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
     use super::*;
+    use crate::server::producer_auth::{
+        GrantScopeResolution, resolve_catalog_project, resolve_grant_scope,
+    };
 
     #[derive(Clone)]
     struct SnapshotAuthority {
@@ -6836,15 +6569,17 @@ mod tests {
     ) {
         let store = state.code_sources.store();
         *state.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
-            enabled: true,
-            auth: vec![AuthEntry {
-                token: ServiceToken::parse("a".repeat(64)).unwrap(),
-                grant: ProducerGrant {
-                    producer_id: producer_id.to_string(),
-                    projects: BTreeMap::from([(scope.clone(), project_id.to_string())]),
-                },
-            }],
-            auth_table: None,
+            auth: Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![(
+                    bro_rpc::ServiceToken::parse("a".repeat(64)).unwrap(),
+                    ProducerGrant {
+                        producer_id: producer_id.to_string(),
+                        projects: BTreeMap::from([(scope.clone(), project_id.to_string())]),
+                    },
+                )],
+            )),
             store,
         });
     }
@@ -6864,18 +6599,20 @@ mod tests {
     ) -> (Arc<SharedState>, String) {
         let state = Arc::new(SharedState::for_test(root));
         let token_secret = "a".repeat(64);
-        let token = ServiceToken::parse(token_secret.clone()).unwrap();
+        let token = bro_rpc::ServiceToken::parse(token_secret.clone()).unwrap();
         let store = state.code_sources.store();
         *state.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
-            enabled: true,
-            auth: vec![AuthEntry {
-                token,
-                grant: ProducerGrant {
-                    producer_id: "http-test-producer".into(),
-                    projects: BTreeMap::from([(scope.clone(), "http-test-project".into())]),
-                },
-            }],
-            auth_table: None,
+            auth: Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "http-test-producer".into(),
+                        projects: BTreeMap::from([(scope.clone(), "http-test-project".into())]),
+                    },
+                )],
+            )),
             store,
         });
         (state, token_secret)
@@ -7089,30 +6826,32 @@ mod tests {
 
         let other_token_secret = "e".repeat(64);
         *state.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
-            enabled: true,
-            auth: vec![
-                AuthEntry {
-                    token: ServiceToken::parse(token.clone()).unwrap(),
-                    grant: ProducerGrant {
-                        producer_id: "http-test-producer".into(),
-                        projects: BTreeMap::from([(
-                            descriptor.scope.clone(),
-                            "http-test-project".into(),
-                        )]),
-                    },
-                },
-                AuthEntry {
-                    token: ServiceToken::parse(other_token_secret.clone()).unwrap(),
-                    grant: ProducerGrant {
-                        producer_id: "other-http-producer".into(),
-                        projects: BTreeMap::from([(
-                            descriptor.scope.clone(),
-                            "http-test-project".into(),
-                        )]),
-                    },
-                },
-            ],
-            auth_table: None,
+            auth: Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![
+                    (
+                        bro_rpc::ServiceToken::parse(token.clone()).unwrap(),
+                        ProducerGrant {
+                            producer_id: "http-test-producer".into(),
+                            projects: BTreeMap::from([(
+                                descriptor.scope.clone(),
+                                "http-test-project".into(),
+                            )]),
+                        },
+                    ),
+                    (
+                        bro_rpc::ServiceToken::parse(other_token_secret.clone()).unwrap(),
+                        ProducerGrant {
+                            producer_id: "other-http-producer".into(),
+                            projects: BTreeMap::from([(
+                                descriptor.scope.clone(),
+                                "http-test-project".into(),
+                            )]),
+                        },
+                    ),
+                ],
+            )),
             store: state.code_sources.store(),
         });
         let response = app
@@ -7652,9 +7391,7 @@ mod tests {
 
         let store = restarted.code_sources.store();
         *restarted.code_sources.snapshot.write() = Arc::new(CodeSourceSnapshot {
-            enabled: false,
-            auth: Vec::new(),
-            auth_table: None,
+            auth: Arc::new(ProducerAuthRuntime::disabled()),
             store: store.clone(),
         });
         cutback_to_local(&restarted, &scope, &project.project_id).unwrap();
@@ -7943,25 +7680,22 @@ mod tests {
 
         // P4-B: the typed AuthTable is populated in catalog mode with the
         // typed ProjectId (not a path hash) and producer scope index.
-        let auth_table = snapshot
-            .auth_table
-            .as_ref()
-            .expect("catalog mode must populate the typed AuthTable");
+        let auth_table = snapshot.auth.as_ref();
+        assert!(auth_table.is_catalog_mode());
         assert_eq!(
-            auth_table.scope_to_project.get(&scope),
+            auth_table.scope_project(&scope),
             Some(&ProjectId::parse(remote_only).unwrap()),
             "scope_to_project must map to the typed catalog ProjectId"
         );
         assert_eq!(
             auth_table
-                .producer_to_scopes
-                .get("catalog-producer")
+                .producer_scopes("catalog-producer")
                 .map(|scopes| scopes.iter().cloned().collect::<Vec<_>>()),
             Some(vec![scope.clone()]),
             "producer_to_scopes must index the producer's resolved scopes"
         );
         assert_eq!(
-            auth_table.entries.len(),
+            auth_table.assignments().len(),
             1,
             "the AuthTable carries the resolved entries"
         );
@@ -8087,11 +7821,11 @@ mod tests {
             .expect("bridge mode resolves grants through leases");
 
         assert!(
-            snapshot.auth_table.is_none(),
+            !snapshot.auth.is_catalog_mode(),
             "bridge mode must not construct a typed AuthTable"
         );
         assert!(
-            !snapshot.auth.is_empty(),
+            !snapshot.auth.assignments().is_empty(),
             "bridge mode still populates the String-based auth entries"
         );
     }
@@ -9033,14 +8767,17 @@ mod tests {
         // off-lock and swaps `self.snapshot` atomically on success.
         let old_token_secret = "a".repeat(64);
         *runtime.snapshot.write() = Arc::new(CodeSourceSnapshot {
-            enabled: true,
-            auth: vec![],
-            auth_table: None,
+            auth: Arc::new(ProducerAuthRuntime::for_test(true, false, vec![])),
             store: store.clone(),
         });
 
         // Old token is rejected post-swap (the auth table is now empty).
-        assert!(runtime.authenticate(&old_token_secret).is_none());
+        assert!(
+            runtime
+                .producer_auth()
+                .authenticate(&old_token_secret)
+                .is_none()
+        );
 
         // The generation remains active and the activation record is intact.
         let after = store.load_activation_mixed(project_id).unwrap().unwrap();

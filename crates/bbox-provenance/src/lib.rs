@@ -1,12 +1,17 @@
 //! Shared provenance Git-note protocol and checkout-local application.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "local-git")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(feature = "local-git")]
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
+use bbox_corpus_core::identity::PublishedScope;
+#[cfg(feature = "local-git")]
+use bbox_corpus_core::identity::{bbox_root_relpath, resolve_recorded_repo_id};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -319,6 +324,7 @@ pub fn validate_notes_ref(notes_ref: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "local-git")]
 pub fn resolve_committed_scope(root: &Path) -> Result<PublishedScope> {
     let root = canonical_project_root(root)?;
     let git_root = bbox_corpus_core::git::git_root_for_path(&root)
@@ -337,6 +343,7 @@ pub fn resolve_committed_scope(root: &Path) -> Result<PublishedScope> {
     Ok(PublishedScope::try_new(repo_id, bbox_root_relpath)?)
 }
 
+#[cfg(feature = "local-git")]
 pub fn apply_export_page(
     root: &Path,
     page: &ProvenanceExportPage,
@@ -614,6 +621,7 @@ pub fn append_note_documents_dedup(
     })
 }
 
+#[cfg(feature = "local-git")]
 fn validate_page(root: &Path, page: &ProvenanceExportPage) -> Result<()> {
     if page.project_id.trim().is_empty() {
         bail!("provenance export page project_id must not be empty");
@@ -691,6 +699,7 @@ fn validate_export_document(document: &ProvenanceExportDocument) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "local-git")]
 fn validate_v2_target(call: &NoteToolCall, project_id: &str) -> Result<()> {
     let target_ref = call
         .target_ref
