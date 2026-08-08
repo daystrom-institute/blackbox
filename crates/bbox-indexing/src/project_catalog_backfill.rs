@@ -30,12 +30,13 @@ use std::sync::Arc;
 use bbox_corpus_core::json_store::NofollowDirectory;
 use bbox_corpus_core::project_catalog::{
     AttachmentSnapshotV1, LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry,
-    LegacyPathRelationship, ProjectId,
+    LegacyPathRelationship, ProjectId, ProjectScope,
 };
 use bbox_corpus_core::project_catalog_snapshot::{LegacySelectorMembersV1, OwnerRowRequestV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::accepted_publication_runtime::{AcceptedPublicationRuntime, AcceptedPublicationState};
 use crate::project_catalog_inventory::{
     LegacyPathStoreKindV1, OperatorResolutionNoteV1, Sha256ValueV1, digest_path,
     digest_published_scope, digest_publisher_full_ref,
@@ -558,10 +559,11 @@ pub struct BackfillCompletionJournalV1 {
     /// FINAL publication boundary.
     ///
     /// Accepted-publication state sits outside the four-hash identity, so this
-    /// is the only durable record of what the applied backfill actually
-    /// observed. Verify re-proves the dispositions and compares this digest, so
-    /// "the publication state moved since apply" is a distinct, checkable
-    /// answer rather than an unnoticed one.
+    /// is the durable audit record of the exact cut-time state apply observed.
+    /// Later verification validates the CURRENT accepted-publication authority
+    /// independently: Establish, Advance, rebind, scope migration, and project
+    /// retirement are lawful post-cut changes and must not be compared to this
+    /// frozen digest as though they were corruption.
     pub publisher_verification_digest: Sha256ValueV1,
 }
 
@@ -1607,6 +1609,63 @@ fn revalidate_publisher_dispositions(
     Ok(observed)
 }
 
+/// Verify the live accepted-publication authority after the cut.
+///
+/// The migration marker freezes the population and cut-time evidence, but it
+/// does not freeze the publisher forever. A valid Establish may replace a
+/// `NoPublishedContentAcknowledged` absence, and a valid Advance may replace a
+/// seeded pointer. Retired projects are no longer served and therefore carry
+/// no live publisher obligation. For every project still in the catalog, the
+/// current accepted arm must either verify or (only for the acknowledged-empty
+/// branch) remain exactly absent. Prior/corrupt states remain repair defects.
+fn verify_post_cut_publisher_authority(
+    projects_path: &Path,
+    state: &crate::project_catalog_store::ProjectCatalogState,
+    dispositions: &[BackfillPublisherDispositionV1],
+) -> BackfillResult<()> {
+    let runtime = AcceptedPublicationRuntime::open_global(projects_path)
+        .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
+    for disposition in dispositions {
+        let project_id = disposition.project_id();
+        let Some(project) = state.catalog().projects.get(project_id) else {
+            // A completed retirement removes the catalog authority. Its old
+            // migration disposition is retained as history, not a live read
+            // obligation.
+            continue;
+        };
+        let ProjectScope::Published(catalog_scope) = &project.scope else {
+            return Err(refuse(
+                ERROR_STALE_POST_IMAGE,
+                format!(
+                    "project {} no longer has a published scope required by its migration publisher disposition",
+                    project_id.as_str()
+                ),
+            ));
+        };
+        let status = runtime
+            .status(project_id, Some(catalog_scope))
+            .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
+        let valid = match (disposition, status.state()) {
+            (_, AcceptedPublicationState::Current) => true,
+            (
+                BackfillPublisherDispositionV1::NoPublishedContentAcknowledged { .. },
+                AcceptedPublicationState::Missing,
+            ) => true,
+            _ => false,
+        };
+        if !valid {
+            return Err(refuse(
+                ERROR_STALE_POST_IMAGE,
+                format!(
+                    "project {} no longer has a valid current accepted publication for its live catalog state",
+                    project_id.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Requests and facade
 // ---------------------------------------------------------------------------
@@ -1739,6 +1798,7 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             None,
         )?;
         let projects_path = request.layout.projects_path().to_path_buf();
+        let state_dir = request.layout.state_dir_for_backfill().to_path_buf();
         let pointers_root = request.layout.accepted_publication_pointers_for_backfill();
         let generations_root = request
             .layout
@@ -1760,6 +1820,12 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         let state = store
             .snapshot()
             .map_err(|error| refuse(ERROR_STALE_POST_IMAGE, error.to_string()))?;
+        if read_backfill_completion_journal(&state_dir)?.is_some() {
+            return Err(refuse(
+                ERROR_STALE_POST_IMAGE,
+                "durable backfill is already complete for this target; use --verify instead of creating a new cut-time preflight",
+            ));
+        }
         let (epoch, catalog_hash, attachment_hash, attachments) = (
             state.epoch(),
             Sha256ValueV1::parse(state.catalog_sha256().to_string())
@@ -2192,10 +2258,6 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
         validate_target_selection(&request.layout, request.target_selection)?;
         let projects_path = request.layout.projects_path().to_path_buf();
         let state_dir = request.layout.state_dir_for_backfill().to_path_buf();
-        let pointers_root = request.layout.accepted_publication_pointers_for_backfill();
-        let generations_root = request
-            .layout
-            .accepted_publication_generations_for_backfill();
         let Some(journal) = read_backfill_completion_journal(&state_dir)? else {
             return Err(refuse(
                 ERROR_STALE_POST_IMAGE,
@@ -2497,38 +2559,13 @@ impl ProjectCatalogDurableBackfillFacadeV1 {
             }
         }
 
-        // The publisher/G1 disposition is proved FRESH here too, against the
-        // same marker-sourced population. Verify exists to answer "is this
-        // target's applied backfill still sound", and a D-040 defect that
-        // appeared after apply makes it unsound; a journal that recorded a
-        // clean set says nothing about now.
+        // Re-prove the marker-sourced population against the CURRENT publisher
+        // authority. The journal digest remains cut-time audit evidence; it is
+        // deliberately not compared with live bytes because valid Establish,
+        // Advance, rebind, scope migration, and retirement operations change
+        // those bytes after backfill without weakening the stamped rows.
         let publisher_dispositions = backfill_publisher_dispositions(&store)?;
-        let observed_publisher_verification = verify_publisher_dispositions(
-            &publisher_dispositions,
-            &pointers_root,
-            &generations_root,
-        )?;
-        if observed_publisher_verification
-            .iter()
-            .any(|row| row.outcome.is_defect())
-        {
-            return Err(refuse(
-                ERROR_STALE_POST_IMAGE,
-                "the target's accepted-publication evidence no longer satisfies its \
-                 migration publisher dispositions",
-            ));
-        }
-        // And it must be the SAME set apply committed against. Without the
-        // journal's stamp this could only ask "is it clean now", which a
-        // publication that appeared and was corrected would answer yes.
-        if publisher_verification_digest(&observed_publisher_verification)
-            != journal.publisher_verification_digest
-        {
-            return Err(refuse(
-                ERROR_STALE_POST_IMAGE,
-                "the accepted-publication state changed after the backfill was applied",
-            ));
-        }
+        verify_post_cut_publisher_authority(&projects_path, &state, &publisher_dispositions)?;
         Ok(DurableBackfillVerifyReceiptV1 {
             version: DURABLE_BACKFILL_REPORT_VERSION_V1,
             predecessor_catalog_epoch: journal.predecessor_catalog_epoch,

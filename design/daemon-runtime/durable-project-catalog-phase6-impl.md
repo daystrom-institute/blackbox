@@ -657,6 +657,19 @@ mutation; bumped when quarantine conversions land); and the
 `BackfillCompletionJournalV1` path for the rebuild preflight's four-hash
 chain.
 
+Publisher verification has two lifecycle phases. Preflight and apply prove
+the marker's exact cut-time disposition, including the final boundary before
+the completion journal is published; the journal digest is immutable audit
+evidence of that observation. A later `durable-backfill --verify` validates
+the current accepted-publication authority instead of comparing live pointer
+bytes to the frozen digest. A valid post-cut Establish, Advance, rebind, scope
+migration, or project retirement is therefore not reported as backfill
+corruption, while a live project whose accepted state is missing (unless its
+disposition remains acknowledged-empty), Prior-only, or corrupt still
+refuses. Once the completion journal exists, a new preflight refuses with an
+explicit direction to use `--verify`; preflight is a cut-planning operation,
+not a way to re-baseline publisher history.
+
 ### 3.4. `path-free-rebuild` semantics
 
 The path-free rebuild replaces the on-disk index with a path-free schema,

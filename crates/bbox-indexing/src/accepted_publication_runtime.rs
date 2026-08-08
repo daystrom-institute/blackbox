@@ -8,13 +8,14 @@
 //! verified content, the two stamps that identify it, per-project status,
 //! and the protected generation roots a collector must honour.
 //!
-//! This facade reads. Establish, bind, and advance are the later publisher
-//! milestone; nothing here mutates a pointer or a generation.
+//! Reads and publisher mutations share this facade so pointer verification,
+//! cache invalidation, and generation protection stay under one authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bbox_corpus_core::identity::PublishedScope;
@@ -846,6 +847,12 @@ pub struct AcceptedPublicationRuntime {
     paths: AcceptedPublicationStorePaths,
     limits: AcceptedPublicationLimits,
     cache: RwLock<BTreeMap<ProjectId, ProjectCacheEntry>>,
+    /// Monotonic invalidation fence for reads that verify under the store
+    /// lock and install into the process cache afterward. The cache write
+    /// lock serializes the final revision check with every invalidation, so a
+    /// read that raced a publish, bind, or catalog-side detach can return its
+    /// point-in-time view but cannot reinstall it for later callers.
+    cache_revision: AtomicU64,
     /// Test-only interruption hook for the publish transaction. Production
     /// leaves it `None`.
     faults: Option<Arc<dyn AcceptedPublicationFaultInjector>>,
@@ -873,6 +880,7 @@ impl AcceptedPublicationRuntime {
             paths,
             limits: AcceptedPublicationLimits::default(),
             cache: RwLock::new(BTreeMap::new()),
+            cache_revision: AtomicU64::new(0),
             faults: None,
             in_flight: Arc::new(InFlightGenerations::default()),
         })
@@ -935,8 +943,9 @@ impl AcceptedPublicationRuntime {
         let guard = self.lock()?;
         let mut scan = AcceptedPublicationStartupScan::default();
         for (project_id, catalog_scope) in projects {
+            let observed_revision = self.cache_revision.load(Ordering::Acquire);
             let outcome = self.read_project(&guard, &project_id);
-            let status = self.install(&project_id, &outcome, false);
+            let status = self.install(&project_id, &outcome, false, observed_revision);
             scan.record(&status.with_scope(catalog_scope.as_ref()));
         }
         Ok(scan)
@@ -946,7 +955,9 @@ impl AcceptedPublicationRuntime {
     /// content. This is the rebind invalidation: the pointer's attachment
     /// changed, the accepted bytes did not.
     pub fn invalidate_binding(&self, project_id: &ProjectId) {
-        if let Some(entry) = self.cache.write().get_mut(project_id) {
+        let mut cache = self.cache.write();
+        self.cache_revision.fetch_add(1, Ordering::Release);
+        if let Some(entry) = cache.get_mut(project_id) {
             entry.binding = None;
             entry.status = None;
         }
@@ -955,7 +966,9 @@ impl AcceptedPublicationRuntime {
     /// Drop cached content and binding for one project. This is the
     /// advance invalidation: new accepted content replaces the old.
     pub fn invalidate_content(&self, project_id: &ProjectId) {
-        self.cache.write().remove(project_id);
+        let mut cache = self.cache.write();
+        self.cache_revision.fetch_add(1, Ordering::Release);
+        cache.remove(project_id);
     }
 
     /// Generation ids that must survive collection: every supplied
@@ -1166,7 +1179,6 @@ impl AcceptedPublicationRuntime {
             },
             &mut swap_attempted,
         );
-        drop(guard);
         // Invalidate on ANY outcome that reached the swap, not just success.
         // A read-back failure leaves the new pointer durably installed while
         // reporting an error, and a runtime that kept serving its cached
@@ -1174,6 +1186,7 @@ impl AcceptedPublicationRuntime {
         if swap_attempted {
             self.invalidate_content(&prepared.project_id);
         }
+        drop(guard);
         let receipt = match receipt {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -1240,11 +1253,12 @@ impl AcceptedPublicationRuntime {
         retain_content: bool,
     ) -> Result<(ProjectReadOutcome, AcceptedPublicationStatus), AcceptedPublicationRuntimeError>
     {
+        let observed_revision = self.cache_revision.load(Ordering::Acquire);
         let guard = self.lock()?;
         let outcome = self.read_project(&guard, project_id);
-        drop(guard);
         let outcome = self.reuse_cached_content(project_id, outcome);
-        let status = self.install(project_id, &outcome, retain_content);
+        let status = self.install(project_id, &outcome, retain_content, observed_revision);
+        drop(guard);
         Ok((outcome, status))
     }
 
@@ -1322,19 +1336,42 @@ impl AcceptedPublicationRuntime {
         project_id: &ProjectId,
         outcome: &ProjectReadOutcome,
         retain_content: bool,
+        observed_revision: u64,
     ) -> AcceptedPublicationStatus {
         let status = status_from(project_id, outcome);
         let mut cache = self.cache.write();
+        if self.cache_revision.load(Ordering::Acquire) != observed_revision {
+            return status;
+        }
         let entry = cache.entry(project_id.clone()).or_default();
         match outcome {
             ProjectReadOutcome::Verified { content, binding } => {
-                if retain_content {
+                if binding.selection == AcceptedPublicationSelection::Prior {
+                    // Prior is a verified availability fallback, but the
+                    // current-arm failure may have been transient. Serve this
+                    // call and force the next load/status to retry current
+                    // rather than latching repair-required indefinitely.
+                    entry.content = None;
+                    entry.binding = None;
+                    entry.status = None;
+                    return status;
+                } else if retain_content {
                     entry.content = Some(content.clone());
                     entry.binding = Some(binding.clone());
                 } else {
-                    // A bounded scan keeps identity, not payload.
-                    entry.content = None;
-                    entry.binding = None;
+                    // A bounded scan does not retain a newly decoded payload,
+                    // but a status refresh must not evict byte-identical
+                    // content already pinned by a prior verified load.
+                    if entry
+                        .content
+                        .as_ref()
+                        .is_some_and(|cached| cached.stamp == content.stamp)
+                    {
+                        entry.binding = Some(binding.clone());
+                    } else {
+                        entry.content = None;
+                        entry.binding = None;
+                    }
                 }
             }
             ProjectReadOutcome::Missing | ProjectReadOutcome::Corrupt(_) => {
@@ -1890,8 +1927,13 @@ mod tests {
         let before = runtime.load_verified(&project_id).unwrap();
 
         // A binding invalidation re-reads the pointer and must reuse the
-        // decoded content it already verified.
+        // decoded content it already verified. An intervening status poll is
+        // identity-only and must not evict that decoded allocation.
         runtime.invalidate_binding(&project_id);
+        assert_eq!(
+            runtime.status(&project_id, Some(&scope())).unwrap().state(),
+            AcceptedPublicationState::Current
+        );
         let after_invalidate = runtime.load_verified(&project_id).unwrap();
         assert!(before.shares_content_with(&after_invalidate));
 
@@ -1932,6 +1974,61 @@ mod tests {
         assert!(!before.shares_content_with(&advanced));
         assert_ne!(before.content_stamp(), advanced.content_stamp());
         assert_eq!(advanced.content_stamp().accepted_commit(), COMMIT_TWO);
+    }
+
+    #[test]
+    fn invalidation_fence_rejects_a_read_started_before_invalidation() {
+        let fixture = fixture();
+        let project_id = project("p_cachefence");
+        publish(&fixture.paths, &project_id, COMMIT_ONE, "first", None);
+        let runtime = fixture.runtime();
+
+        let observed_revision = runtime.cache_revision.load(Ordering::Acquire);
+        let guard = runtime.lock().unwrap();
+        let outcome = runtime.read_project(&guard, &project_id);
+        drop(guard);
+
+        // Models a publish/bind/detach landing after the pointer read but
+        // before its cache install.
+        runtime.invalidate_content(&project_id);
+        let status = runtime.install(&project_id, &outcome, true, observed_revision);
+        assert_eq!(status.state(), AcceptedPublicationState::Current);
+        assert!(runtime.cached_view(&project_id).is_none());
+    }
+
+    #[test]
+    fn prior_fallback_is_rechecked_instead_of_cached_indefinitely() {
+        let fixture = fixture();
+        let project_id = project("p_priorretry");
+        let first = publish(&fixture.paths, &project_id, COMMIT_ONE, "first", None);
+        let second = publish(
+            &fixture.paths,
+            &project_id,
+            COMMIT_TWO,
+            "second",
+            Some(&first),
+        );
+        let current_path = fixture.paths.generation(&project_id, &second.generation_id);
+        let current_bytes = std::fs::read(&current_path).unwrap();
+        fixtures::corrupt_generation(&fixture.paths, &project_id, &second.generation_id);
+
+        let runtime = fixture.runtime();
+        let prior = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(
+            prior.binding_stamp().selection(),
+            AcceptedPublicationSelection::Prior
+        );
+        assert!(runtime.cached_view(&project_id).is_none());
+
+        // A transient current-arm read failure clears; the very next call
+        // must recover Current without an explicit invalidation or restart.
+        std::fs::write(current_path, current_bytes).unwrap();
+        let current = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(
+            current.binding_stamp().selection(),
+            AcceptedPublicationSelection::Current
+        );
+        assert_eq!(current.content_stamp().accepted_commit(), COMMIT_TWO);
     }
 
     #[test]

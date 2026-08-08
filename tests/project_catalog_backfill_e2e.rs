@@ -46,7 +46,7 @@ use bbox_config::config::{self, Config, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{
     LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyPathRelationship,
-    ProjectId,
+    ProjectId, ProjectScope,
 };
 use bbox_corpus_core::project_catalog_snapshot::{
     LegacySelectorMembersV1, OwnerRowRequestV1, singleton_selector_members,
@@ -54,6 +54,9 @@ use bbox_corpus_core::project_catalog_snapshot::{
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause;
 use bbox_edge_sidecar::manifest::ManifestIndex;
+use bbox_indexing::accepted_publication_runtime::{
+    AcceptedPublicationRuntime, PublishRequest, PublishSources, PublisherPublishMode,
+};
 use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
 use bbox_indexing::project_catalog_backfill::{
     ATTACHMENT_RELOCATION_SOURCE, DurableBackfillApplyOutcomeV1, DurableBackfillApplyRequestV1,
@@ -1808,6 +1811,97 @@ fn a_publication_that_moves_after_apply_refuses_the_verify() {
         error.code,
         "error.project_catalog_inventory_stale_post_image"
     );
+}
+
+/// A publisher Advance is the lawful successor to a seeded migration
+/// disposition. The completion journal records the cut-time pointer for audit,
+/// but live verify must validate the newly advanced pointer through the
+/// accepted-publication authority instead of demanding byte equality with the
+/// frozen cut. The same Current-state branch admits a D-040 Establish after an
+/// acknowledged-empty migration.
+#[test]
+fn a_legitimate_advance_after_apply_keeps_backfill_verify_valid() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.report_path()).unwrap()).unwrap();
+    let row = &report["publisher_verification"][0];
+    assert_eq!(
+        row["kind"], "seed_g1",
+        "this proof needs the seeded publisher branch"
+    );
+    let project_id = ProjectId::parse(row["project_id"].as_str().unwrap()).unwrap();
+    let store = ProjectCatalogStore::open_existing(fixture.layout.projects_path()).unwrap();
+    let state = store.snapshot().unwrap();
+    let ProjectScope::Published(scope) = &state
+        .catalog()
+        .projects
+        .get(&project_id)
+        .expect("publisher project remains in the catalog")
+        .scope
+    else {
+        panic!("publisher project must have a published scope");
+    };
+
+    let runtime = AcceptedPublicationRuntime::open_global(fixture.layout.projects_path()).unwrap();
+    let attachment_id = runtime
+        .status(&project_id, Some(scope))
+        .unwrap()
+        .binding_stamp()
+        .expect("migration installed a verified seeded binding")
+        .attachment_id()
+        .clone();
+    let (expected_generation_id, expected_pointer_sha256) = runtime
+        .advance_tokens(&project_id)
+        .unwrap()
+        .expect("migration installed the seeded pointer");
+    let prepared = runtime
+        .prepare_publish(
+            PublishRequest {
+                mode: PublisherPublishMode::Advance {
+                    expected_generation_id,
+                    expected_pointer_sha256,
+                },
+                project_id,
+                attachment_id,
+                scope: scope.clone(),
+                full_ref: "refs/heads/main".to_string(),
+                accepted_commit: "b".repeat(40),
+                dry_run: false,
+            },
+            PublishSources::default(),
+        )
+        .unwrap();
+    runtime.commit_publish(prepared, &mut || Ok(())).unwrap();
+
+    fixture
+        .verify()
+        .expect("a valid post-cut Advance must not stale the backfill proof");
+}
+
+#[test]
+fn preflight_after_completion_directs_the_operator_to_verify() {
+    let fixture = Fixture::new();
+    fixture.preflight(fixture.production_stamper()).unwrap();
+    fixture.apply(fixture.production_stamper()).unwrap();
+
+    let error = fixture
+        .preflight(fixture.production_stamper())
+        .expect_err("a completed cut has no second cut-time preflight");
+    assert_eq!(
+        error.code,
+        "error.project_catalog_inventory_stale_post_image"
+    );
+    assert!(error.message.contains("already complete"));
+    assert!(error.message.contains("--verify"));
 }
 
 /// D-026: an existing reviewed resolution is HONOURED, never rewritten, and the
