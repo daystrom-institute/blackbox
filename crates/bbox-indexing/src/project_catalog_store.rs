@@ -813,8 +813,8 @@ impl ProjectCatalogStore {
         // publication and lock release). We keep the base catalog's
         // project map AND attachment map for per-entry comparison after
         // the build closure.
-        let old_projects = base.catalog.projects.clone();
-        let old_attachments = base.attachments.clone();
+        let old_projects = &base.catalog.projects;
+        let old_attachments = &base.attachments;
 
         let mut catalog = (*base.catalog).clone();
         let mut attachments = (*base.attachments).clone();
@@ -831,46 +831,52 @@ impl ProjectCatalogStore {
                 "transaction closure changed owner-controlled fields",
             ));
         }
-        let new_project_ids: BTreeSet<String> = catalog
-            .projects
-            .keys()
-            .map(|k| k.as_str().to_string())
-            .collect();
-        let old_project_ids: BTreeSet<String> = old_projects
-            .keys()
-            .map(|k| k.as_str().to_string())
-            .collect();
+        let new_project_ids: BTreeSet<ProjectId> = catalog.projects.keys().cloned().collect();
+        let old_project_ids: BTreeSet<ProjectId> = old_projects.keys().cloned().collect();
         // Compute changed project ids before catalog moves into candidate
         // (section 9.4). A project id is "changed" if it was added,
         // removed, or its entry content differs between old and new
         // catalog snapshots, OR if its attachment entry differs between
         // old and new attachment snapshots (attachment-only operations
         // must also emit changed ids).
-        let new_attachment_project_ids: BTreeSet<String> = attachments
+        let new_attachment_project_ids: BTreeSet<ProjectId> = attachments
             .attachments
             .values()
-            .map(|a| a.project_id.as_str().to_string())
+            .map(|attachment| attachment.project_id.clone())
             .collect();
-        let old_attachment_project_ids: BTreeSet<String> = old_attachments
+        let old_attachment_project_ids: BTreeSet<ProjectId> = old_attachments
             .attachments
             .values()
-            .map(|a| a.project_id.as_str().to_string())
+            .map(|attachment| attachment.project_id.clone())
             .collect();
+        let old_attachments_by_project = old_attachments.attachments.values().fold(
+            BTreeMap::<&ProjectId, BTreeMap<&str, &CheckoutAttachment>>::new(),
+            |mut grouped, attachment| {
+                grouped
+                    .entry(&attachment.project_id)
+                    .or_default()
+                    .insert(attachment.attachment_id.as_str(), attachment);
+                grouped
+            },
+        );
+        let new_attachments_by_project = attachments.attachments.values().fold(
+            BTreeMap::<&ProjectId, BTreeMap<&str, &CheckoutAttachment>>::new(),
+            |mut grouped, attachment| {
+                grouped
+                    .entry(&attachment.project_id)
+                    .or_default()
+                    .insert(attachment.attachment_id.as_str(), attachment);
+                grouped
+            },
+        );
         let changed_project_ids: BTreeSet<String> = new_project_ids
             .iter()
             .chain(old_project_ids.iter())
             .chain(new_attachment_project_ids.iter())
             .chain(old_attachment_project_ids.iter())
             .filter(|pid| {
-                let old_entry = old_projects
-                    .iter()
-                    .find(|(k, _)| k.as_str() == pid.as_str())
-                    .map(|(_, v)| v);
-                let new_entry = catalog
-                    .projects
-                    .iter()
-                    .find(|(k, _)| k.as_str() == pid.as_str())
-                    .map(|(_, v)| v);
+                let old_entry = old_projects.get(*pid);
+                let new_entry = catalog.projects.get(*pid);
                 let catalog_changed = match (old_entry, new_entry) {
                     (None, Some(_)) => true,
                     (Some(_), None) => true,
@@ -884,40 +890,18 @@ impl ProjectCatalogStore {
                 // project, not just the first one found. A project with
                 // multiple attachments where only the second changed must
                 // be detected.
-                let old_atts: BTreeMap<&str, &CheckoutAttachment> = old_attachments
-                    .attachments
-                    .values()
-                    .filter(|a| a.project_id.as_str() == pid.as_str())
-                    .map(|a| (a.attachment_id.as_str(), a))
-                    .collect();
-                let new_atts: BTreeMap<&str, &CheckoutAttachment> = attachments
-                    .attachments
-                    .values()
-                    .filter(|a| a.project_id.as_str() == pid.as_str())
-                    .map(|a| (a.attachment_id.as_str(), a))
-                    .collect();
-                if old_atts.len() != new_atts.len() {
+                if old_attachments_by_project.get(*pid) != new_attachments_by_project.get(*pid) {
                     return true;
                 }
-                for (key, old_val) in &old_atts {
-                    match new_atts.get(*key) {
-                        Some(new_val) if old_val != new_val => return true,
-                        None => return true,
-                        _ => {}
-                    }
-                }
                 // R2F6: also compare default_attachments selection.
-                let pid_parsed = ProjectId::parse(pid.as_str()).ok();
-                if let Some(pid_key) = &pid_parsed {
-                    let old_default = old_attachments.default_attachments.get(pid_key);
-                    let new_default = attachments.default_attachments.get(pid_key);
-                    if old_default != new_default {
-                        return true;
-                    }
+                let old_default = old_attachments.default_attachments.get(*pid);
+                let new_default = attachments.default_attachments.get(*pid);
+                if old_default != new_default {
+                    return true;
                 }
                 false
             })
-            .cloned()
+            .map(|project_id| project_id.as_str().to_string())
             .collect();
         let new_epoch = expected_epoch.checked_add(1).ok_or_else(|| {
             ProjectCatalogStoreError::new(
@@ -6292,13 +6276,18 @@ impl ProjectCatalogTransactionOwner {
         self.verify_journal_pair_invariants(&journal, ExpectedSide::New)?;
         self.io.checkpoint(FaultPoint::CompletePlanVerify)?;
 
+        // Prove the complete serving-side migration state while the journal
+        // is still Prepared. A late refusal must remain recoverable; writing a
+        // terminal Committed journal first would make the verify facade
+        // permanently replay the same unverified state.
+        let state = self.verify_current_migration_state(&journal)?;
+
         journal.state = TransactionStateV1::Committed;
         journal.outcome = Some(TransactionOutcomeV1::Committed);
         journal.committed_at = Some(unix_timestamp()?);
         journal.validate()?;
         self.preserve_committed_migration_journal(&mut journal)?;
         self.write_journal(&journal, FaultPoint::CommittedJournalWrite)?;
-        let state = self.verify_current_migration_state(&journal)?;
         Ok(ProjectCatalogCommit {
             epoch: state.epoch,
             catalog_sha256: state.catalog_sha256.to_string(),

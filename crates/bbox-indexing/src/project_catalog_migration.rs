@@ -4268,6 +4268,11 @@ impl ClosedMigrationIntegrationV1 for CurrentClosedMigrationIntegrationV1 {
         if let Some(result) =
             verify_exact_installed_review(layout, report_bytes, report, resolution_bytes)?
         {
+            // The catalog transaction can commit before the one-time legacy
+            // git_meta backup finishes. Retrying an exact installed review
+            // must resume that post-commit obligation instead of returning a
+            // false AlreadyApplied success with the backup still absent.
+            git_meta_backup_copy_if_needed(layout).map_err(post_commit_verification_error)?;
             return Ok(ProjectCatalogMigrationApplyResultV1 {
                 receipt: ProjectCatalogMigrationApplyReceiptV1 {
                     version: FACADE_VERSION_V1,
