@@ -4408,16 +4408,19 @@ impl CodeSourceStore {
         let mut records = Vec::new();
         for entry in fs::read_dir(self.root().join("retained-owners"))? {
             let entry = entry?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("retained owner store contains a non-utf8 entry"))?;
+            if name.ends_with(".tmp") {
+                continue;
+            }
             if !entry.file_type()?.is_file() || !is_canonical_record_file(&entry) {
                 bail!("retained owner store contains a non-canonical entry");
             }
             let record: RetainedGenerationOwnerRecord = read_json(&entry.path())?;
-            if record.version != STORE_VERSION
-                || !entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name == format!("{}.json", record.generation_id))
-            {
+            if record.version != STORE_VERSION || name != format!("{}.json", record.generation_id) {
                 bail!("retained owner record identity is invalid");
             }
             validate_sha256(&record.generation_id)?;
@@ -5006,7 +5009,7 @@ impl CodeSourceStore {
         };
         let mut records = Vec::new();
         let mut completed_lag_paths = Vec::new();
-        for name in sorted_regular_entry_names(
+        for name in sorted_regular_record_entry_names(
             &path,
             MAX_MIGRATION_INVENTORY_GENERATIONS,
             "collision retirement work",
@@ -6607,6 +6610,38 @@ fn sorted_regular_entry_names(path: &Path, max_rows: usize, label: &str) -> Resu
     sorted_entry_names(path, max_rows, label, true)
 }
 
+fn sorted_regular_record_entry_names(
+    path: &Path,
+    max_rows: usize,
+    label: &str,
+) -> Result<Vec<String>> {
+    let Some(_directory) = NofollowDirectory::open_existing(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{label} directory contains a non-utf8 entry"))?;
+        if name.ends_with(".tmp") {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            bail!("{label} directory contains an unexpected entry type");
+        }
+        if names.len() >= max_rows {
+            bail!("{label} directory exceeds its row limit");
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
 fn sorted_directory_entry_names(path: &Path, max_rows: usize, label: &str) -> Result<Vec<String>> {
     sorted_entry_names(path, max_rows, label, false)
 }
@@ -7436,6 +7471,14 @@ mod tests {
         let project_id = ProjectId::parse("project-a").unwrap();
         let activation = sample_v2_activation(&active);
         store.save_activation_v2(&activation).unwrap();
+        fs::write(
+            store
+                .root()
+                .join("retained-owners")
+                .join(format!("orphan.{}.tmp", Uuid::new_v4())),
+            b"{\"version\":",
+        )
+        .unwrap();
 
         let owners = store.retained_generation_owner_records().unwrap();
         assert_eq!(owners.len(), StoreLimits::default().retained_generations);
@@ -8981,6 +9024,14 @@ mod tests {
         write_collision_lifecycle(&store, &lifecycle);
 
         store.reconcile_collision_retirements().unwrap();
+        fs::write(
+            store
+                .root()
+                .join("collision-retirement-work")
+                .join(format!("orphan.{}.tmp", Uuid::new_v4())),
+            b"{\"version\":",
+        )
+        .unwrap();
 
         let queued = read_collision_lifecycle(&store, &lifecycle.project_id);
         assert!(

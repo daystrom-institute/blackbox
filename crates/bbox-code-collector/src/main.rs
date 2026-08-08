@@ -3,6 +3,8 @@ use std::fs;
 use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -68,6 +70,8 @@ struct ScannedProject {
     skipped_special: u64,
     skipped_unsupported: u64,
     skipped_oversize: u64,
+    skipped_nested_repositories: u64,
+    read_races: u64,
 }
 
 fn default_interval_secs() -> u64 {
@@ -260,6 +264,8 @@ async fn publish_project(
                         skipped_special = scanned.skipped_special,
                         skipped_unsupported = scanned.skipped_unsupported,
                         skipped_oversize = scanned.skipped_oversize,
+                        skipped_nested_repositories = scanned.skipped_nested_repositories,
+                        read_races = scanned.read_races,
                         "code-source generation reached terminal success"
                     );
                     return Ok(());
@@ -314,22 +320,33 @@ fn scan_project(config: &ProjectConfig) -> Result<ScannedProject> {
     let mut skipped_special = 0_u64;
     let mut skipped_unsupported = 0_u64;
     let mut skipped_oversize = 0_u64;
+    let mut read_races = 0_u64;
+    let mut first_read_race = None::<String>;
+    let skipped_nested_repositories = Arc::new(AtomicU64::new(0));
+    let nested_counter = Arc::clone(&skipped_nested_repositories);
     let walker = WalkBuilder::new(&root)
         .hidden(false)
-        .filter_entry(|entry| entry.depth() == 0 || !skip_entry(entry))
+        .filter_entry(move |entry| {
+            entry.depth() == 0 || !skip_entry(entry, nested_counter.as_ref())
+        })
         .build();
     for result in walker {
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
-                tracing::warn!(error = %error, "collector walk entry failed");
+                read_races = read_races.saturating_add(1);
+                first_read_race.get_or_insert_with(|| truncate(&error.to_string(), 256));
                 continue;
             }
         };
         let path = entry.path();
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(error) => {
+                read_races = read_races.saturating_add(1);
+                first_read_race.get_or_insert_with(|| truncate(&error.to_string(), 256));
+                continue;
+            }
         };
         if metadata.file_type().is_symlink() {
             skipped_symlinks += 1;
@@ -367,6 +384,12 @@ fn scan_project(config: &ProjectConfig) -> Result<ScannedProject> {
             size: metadata.len(),
         });
     }
+    if read_races != 0 {
+        bail!(
+            "source scan observed {read_races} read races; first error: {}",
+            first_read_race.as_deref().unwrap_or("unavailable")
+        );
+    }
     entries.sort_by(|left, right| {
         left.relative_path
             .as_bytes()
@@ -395,6 +418,8 @@ fn scan_project(config: &ProjectConfig) -> Result<ScannedProject> {
         skipped_special,
         skipped_unsupported,
         skipped_oversize,
+        skipped_nested_repositories: skipped_nested_repositories.load(Ordering::Relaxed),
+        read_races,
     })
 }
 
@@ -420,8 +445,35 @@ fn read_stable_file(root: &Path, entry: &ManifestEntry) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn skip_entry(entry: &DirEntry) -> bool {
-    entry.file_name().to_str().is_some_and(is_skipped_component)
+fn skip_entry(entry: &DirEntry, skipped_nested_repositories: &AtomicU64) -> bool {
+    if entry.file_name().to_str().is_some_and(is_skipped_component) {
+        return true;
+    }
+    if entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+        && has_nested_git_marker(entry.path())
+    {
+        let _ = skipped_nested_repositories.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |count| Some(count.saturating_add(1)),
+        );
+        return true;
+    }
+    false
+}
+
+fn has_nested_git_marker(path: &Path) -> bool {
+    match fs::symlink_metadata(path.join(".git")) {
+        Ok(metadata) => {
+            metadata.is_file() || metadata.is_dir() || metadata.file_type().is_symlink()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // Failure to inspect the marker is not authority to traverse a
+        // possible nested repository. Skip the subtree fail closed.
+        Err(_) => true,
+    }
 }
 
 fn require_main_worktree(root: &Path) -> Result<()> {
@@ -670,6 +722,20 @@ mod tests {
         assert!(is_skipped_component(".bbox"));
         assert!(is_skipped_component("node_modules"));
         assert!(!is_skipped_component("src"));
+    }
+
+    #[test]
+    fn nested_repository_markers_are_detected_without_following_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let nested = root.join("nested");
+        let ordinary = root.join("ordinary");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&ordinary).unwrap();
+        fs::write(nested.join(".git"), b"gitdir: elsewhere").unwrap();
+
+        assert!(has_nested_git_marker(&nested));
+        assert!(!has_nested_git_marker(&ordinary));
     }
 
     #[test]
