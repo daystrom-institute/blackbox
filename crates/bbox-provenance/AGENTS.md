@@ -3,10 +3,14 @@
 - This crate owns the versioned provenance Git-note schema, deterministic
   serialization and hashing, bounded fragmentation, export DTOs, and the one
   checkout-local page application path.
-- Keep the dependency ceiling narrow: `bbox-corpus-core`, `bbox-config`, and
+- Keep the dependency ceiling narrow: `bbox-corpus-core`, TOML, and
   small serialization, hashing, and error crates only. Never add blackbox,
   bbox-edge-index, bbox-indexing, bbox-chunker, Tantivy, V8, bro-harness, or
   bro-cli.
+- The `local-git` feature is the dependency-clean writer, tip resolver, and
+  committed-scope validator used by the collector. It must not acquire a
+  `bbox-config` dependency: doing so transitively links daemon-only vector and
+  configuration machinery into the checkout-side binary.
 - A local write is authoritative only when committed `.bbox/config.toml` at
   the selected Git ref supplies `project_key_override` or `repo_id`. Computed
   ids and `aka_repo_ids` never establish write authority.

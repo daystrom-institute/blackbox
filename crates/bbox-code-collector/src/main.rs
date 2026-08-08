@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_code_source::{
-    BeginUploadRequest, BeginUploadResponse, FinalizeResponse, GenerationDescriptor,
+    BeginUploadRequest, BeginUploadResponse, ErrorResponse, FinalizeResponse, GenerationDescriptor,
     GenerationState, GenerationStatus, ManifestEntry, ManifestPage, MissingBlobsPage,
     SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint, is_skipped_component,
     manifest_sha256, max_bytes_for_path,
@@ -21,6 +21,7 @@ use bbox_git_source::{
     GitHistoryDescriptorV1, GitHistoryManifestEntryV1, GitHistoryManifestPageV1,
     GitHistoryProbeRequestV1, GitHistoryProbeResponseV1, GitHistorySourceStateV1,
     GitHistorySourceStatusV1, GitObjectFormatV1, GitSourceLimits, MAX_HISTORY_RECORD_BYTES,
+    ProvenanceExportPageResponseV1, ProvenanceExportPullRequestV1, ProvenanceExportReceiptV1,
     SCHEMA_VERSION as GIT_SOURCE_SCHEMA_VERSION, encode_history_fragment, history_manifest_sha256,
 };
 use bro_rpc::ServiceToken;
@@ -64,6 +65,8 @@ struct ProjectConfig {
     scope: PublishedScope,
     #[serde(default)]
     git_history: bool,
+    #[serde(default)]
+    provenance: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -168,7 +171,23 @@ async fn run_loop(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
     tokio::select! {
         _ = run_code_lane(runtime, config) => unreachable!("code lane is an endless loop"),
         _ = run_history_lane(runtime, config) => unreachable!("history lane is an endless loop"),
+        _ = run_provenance_lane(runtime, config) => unreachable!("provenance lane is an endless loop"),
         _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+async fn run_provenance_lane(runtime: &Runtime, config: &CollectorConfig) {
+    let interval = Duration::from_secs(config.interval_secs.max(1));
+    let mut backoff = interval;
+    loop {
+        match publish_provenance_projects(runtime, config).await {
+            Ok(()) => backoff = interval,
+            Err(error) => {
+                tracing::error!(error = %error, "provenance export failed");
+                backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
+            }
+        }
+        tokio::time::sleep(jittered(backoff)).await;
     }
 }
 
@@ -211,13 +230,222 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     }
     let code = publish_code_projects(runtime, config).await;
     let history = publish_history_repositories(runtime, config).await;
-    match (code, history) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(code), Ok(())) => Err(code.context("code-source lane failed")),
-        (Ok(()), Err(history)) => Err(history.context("Git-history lane failed")),
-        (Err(code), Err(history)) => Err(anyhow!(
-            "code-source lane failed: {code:#}; Git-history lane failed: {history:#}"
-        )),
+    let provenance = publish_provenance_projects(runtime, config).await;
+    let mut failures = Vec::new();
+    if let Err(error) = code {
+        failures.push(format!("code-source lane failed: {error:#}"));
+    }
+    if let Err(error) = history {
+        failures.push(format!("Git-history lane failed: {error:#}"));
+    }
+    if let Err(error) = provenance {
+        failures.push(format!("provenance lane failed: {error:#}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(failures.join("; "))
+    }
+}
+
+const MAX_PROVENANCE_STALE_RESTARTS: usize = 3;
+const MAX_PROVENANCE_PAGE_RESPONSE_BYTES: usize = 128 * 1024;
+
+async fn publish_provenance_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    for project in config.projects.iter().filter(|project| project.provenance) {
+        publish_project_provenance(runtime, project).await?;
+    }
+    Ok(())
+}
+
+async fn publish_project_provenance(runtime: &Runtime, project: &ProjectConfig) -> Result<()> {
+    let root = project.root.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing provenance project root {}",
+            project.root.display()
+        )
+    })?;
+    require_main_worktree(&root)?;
+    let head = bbox_corpus_core::git::current_head(&root)
+        .ok_or_else(|| anyhow!("provenance project has no committed HEAD"))?;
+    let committed_scope = resolve_committed_scope(&root, &head)?;
+    if committed_scope != project.scope {
+        bail!("configured provenance scope does not match committed project identity");
+    }
+    for restart in 0..=MAX_PROVENANCE_STALE_RESTARTS {
+        match publish_project_provenance_attempt(runtime, &root, &project.scope).await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if has_remote_error_code(&error, "provenance_export_stale_generation")
+                    && restart < MAX_PROVENANCE_STALE_RESTARTS =>
+            {
+                tracing::warn!(
+                    restart = restart + 1,
+                    "provenance inventory changed; restarting export from page one"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded provenance restart loop always returns")
+}
+
+async fn publish_project_provenance_attempt(
+    runtime: &Runtime,
+    root: &Path,
+    scope: &PublishedScope,
+) -> Result<()> {
+    let mut cursor = None;
+    let mut generation = None;
+    let mut project_id = None;
+    let mut notes_ref = None;
+    let mut document_count = None;
+    let mut logical_bytes = None;
+    let mut ordered_document_commitment = None;
+    let mut seen_cursors = HashSet::new();
+    let mut received = 0_u64;
+    let mut received_bytes = 0_u64;
+    let mut inventory_commitment = None;
+    let mut written = 0_u64;
+    let mut unchanged = 0_u64;
+
+    loop {
+        let response: ProvenanceExportPageResponseV1 = send_json_bounded(
+            runtime
+                .request(
+                    reqwest::Method::POST,
+                    runtime.endpoint("internal/code-source/v1/provenance/export/page")?,
+                )
+                .json(&ProvenanceExportPullRequestV1 {
+                    scope: scope.clone(),
+                    cursor: cursor.clone(),
+                    generation: generation.clone(),
+                }),
+            MAX_PROVENANCE_PAGE_RESPONSE_BYTES,
+        )
+        .await?;
+        response.validate(GitSourceLimits::default())?;
+        if response.page.scope != *scope {
+            bail!("provenance export page returned the wrong published scope");
+        }
+        require_stable_value(&mut generation, &response.page.generation, "generation")?;
+        require_stable_value(&mut project_id, &response.page.project_id, "project id")?;
+        require_stable_value(&mut notes_ref, &response.page.notes_ref, "notes ref")?;
+        require_stable_value(
+            &mut document_count,
+            &response.document_count,
+            "document count",
+        )?;
+        require_stable_value(&mut logical_bytes, &response.logical_bytes, "logical bytes")?;
+        require_stable_value(
+            &mut ordered_document_commitment,
+            &response.ordered_document_commitment,
+            "ordered document commitment",
+        )?;
+        let inventory_commitment = inventory_commitment.get_or_insert_with(|| {
+            bbox_provenance::OrderedDocumentCommitmentBuilderV1::new(response.document_count)
+        });
+        for document in &response.page.documents {
+            inventory_commitment.push(document)?;
+            received_bytes = received_bytes
+                .checked_add(document.document.len() as u64)
+                .ok_or_else(|| anyhow!("provenance logical byte count overflow"))?;
+        }
+        received = received
+            .checked_add(response.page.documents.len() as u64)
+            .ok_or_else(|| anyhow!("provenance document count overflow"))?;
+        let next_cursor = response.page.next_cursor.clone();
+        let page = response.page;
+        let root = root.to_path_buf();
+        let applied =
+            tokio::task::spawn_blocking(move || bbox_provenance::apply_export_page(&root, &page))
+                .await
+                .context("provenance apply worker failed")??;
+        if applied.rejected != 0 {
+            bail!("provenance page application rejected one or more documents");
+        }
+        written = written
+            .checked_add(applied.written)
+            .ok_or_else(|| anyhow!("provenance written count overflow"))?;
+        unchanged = unchanged
+            .checked_add(applied.unchanged)
+            .ok_or_else(|| anyhow!("provenance unchanged count overflow"))?;
+
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            bail!("provenance export repeated a pagination cursor");
+        }
+        cursor = Some(next_cursor);
+    }
+
+    let document_count = document_count.context("provenance export returned no plan evidence")?;
+    let logical_bytes =
+        logical_bytes.context("provenance export returned no logical byte total")?;
+    let actual_commitment = inventory_commitment
+        .context("provenance export returned no inventory builder")?
+        .finish()?;
+    if received != document_count
+        || received_bytes != logical_bytes
+        || written.checked_add(unchanged) != Some(document_count)
+        || ordered_document_commitment.as_deref() != Some(actual_commitment.as_str())
+    {
+        bail!("provenance export counts do not match the plan inventory");
+    }
+    let notes_ref = notes_ref.context("provenance export returned no notes ref")?;
+    let root = root.to_path_buf();
+    let notes_ref_for_tip = notes_ref.clone();
+    let local_notes_tip = tokio::task::spawn_blocking(move || {
+        bbox_provenance::resolve_notes_tip(&root, &notes_ref_for_tip)
+    })
+    .await
+    .context("provenance notes-tip worker failed")??
+    .unwrap_or_default();
+    let receipt = ProvenanceExportReceiptV1 {
+        schema_version: GIT_SOURCE_SCHEMA_VERSION,
+        scope: scope.clone(),
+        generation: generation.context("provenance export returned no generation")?,
+        notes_ref,
+        document_count,
+        ordered_document_commitment: ordered_document_commitment
+            .context("provenance export returned no inventory commitment")?,
+        local_notes_tip,
+        written,
+        unchanged,
+    };
+    receipt.validate(GitSourceLimits::default())?;
+    send_empty(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/provenance/export/receipt")?,
+            )
+            .json(&receipt),
+    )
+    .await?;
+    tracing::info!(
+        generation = %receipt.generation,
+        documents = receipt.document_count,
+        written = receipt.written,
+        unchanged = receipt.unchanged,
+        "provenance export reached durable terminal success"
+    );
+    Ok(())
+}
+
+fn require_stable_value<T: Clone + PartialEq>(
+    current: &mut Option<T>,
+    incoming: &T,
+    label: &str,
+) -> Result<()> {
+    match current {
+        Some(current) if current != incoming => bail!("provenance export changed {label} mid-plan"),
+        Some(_) => Ok(()),
+        None => {
+            *current = Some(incoming.clone());
+            Ok(())
+        }
     }
 }
 
@@ -1145,6 +1373,30 @@ async fn send_json<T: serde::de::DeserializeOwned>(request: reqwest::RequestBuil
     response.json().await.map_err(Into::into)
 }
 
+async fn send_json_bounded<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    max_bytes: usize,
+) -> Result<T> {
+    let mut response = request.send().await?;
+    if !response.status().is_success() {
+        return Err(response_error_value(response).await);
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!("code-source server response exceeds its byte limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            bail!("code-source server response exceeds its byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("decoding bounded code-source server response")
+}
+
 async fn response_error(response: reqwest::Response) -> Result<()> {
     Err(response_error_value(response).await)
 }
@@ -1155,11 +1407,43 @@ async fn response_error_value(response: reqwest::Response) -> anyhow::Error {
     if status == StatusCode::UNAUTHORIZED {
         anyhow!("code-source server rejected collector credentials")
     } else {
-        anyhow!(
-            "code-source server returned {status}: {}",
-            truncate(&body, 512)
-        )
+        let parsed = serde_json::from_str::<ErrorResponse>(&body).ok();
+        anyhow!(RemoteResponseError {
+            status,
+            code: parsed.as_ref().map(|error| error.code.clone()),
+            message: parsed
+                .map(|error| error.message)
+                .unwrap_or_else(|| truncate(&body, 512)),
+        })
     }
+}
+
+#[derive(Debug)]
+struct RemoteResponseError {
+    status: StatusCode,
+    code: Option<String>,
+    message: String,
+}
+
+impl std::fmt::Display for RemoteResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "code-source server returned {}", self.status)?;
+        if let Some(code) = &self.code {
+            write!(formatter, " ({code})")?;
+        }
+        write!(formatter, ": {}", self.message)
+    }
+}
+
+impl std::error::Error for RemoteResponseError {}
+
+fn has_remote_error_code(error: &anyhow::Error, expected: &str) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RemoteResponseError>()
+            .and_then(|remote| remote.code.as_deref())
+            == Some(expected)
+    })
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -1231,6 +1515,7 @@ mod tests {
         )
         .unwrap();
         assert!(!config.projects[0].git_history);
+        assert!(!config.projects[0].provenance);
     }
 
     #[test]
@@ -1292,6 +1577,7 @@ mod tests {
             root: root.clone(),
             scope: PublishedScope::try_new("history-fixture", ".").unwrap(),
             git_history: true,
+            provenance: false,
         })
         .unwrap();
         assert_eq!(captured.descriptor.commit_count, 4);
@@ -1416,6 +1702,7 @@ mod tests {
             root: sha256_root,
             scope: PublishedScope::try_new("sha256-history-fixture", ".").unwrap(),
             git_history: true,
+            provenance: false,
         })
         .unwrap();
         assert_eq!(captured.descriptor.object_format, GitObjectFormatV1::Sha256);
@@ -1457,6 +1744,7 @@ mod tests {
             root: clone_root,
             scope: PublishedScope::try_new("shallow-history-fixture", ".").unwrap(),
             git_history: true,
+            provenance: false,
         }) {
             Ok(_) => panic!("shallow Git history capture unexpectedly succeeded"),
             Err(error) => error,
@@ -1499,6 +1787,109 @@ mod tests {
                 .to_string()
                 .contains("did not reach a terminal state")
         );
+    }
+
+    #[tokio::test]
+    async fn provenance_attempt_recovers_after_write_before_receipt() {
+        use std::sync::Mutex;
+
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode as AxumStatusCode;
+        use axum::routing::post;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.name", "Provenance Fixture"]);
+        git(
+            &root,
+            &["config", "user.email", "provenance@example.invalid"],
+        );
+        fs::create_dir_all(root.join(".bbox")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo-a\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".bbox/config.toml", "README.md"]);
+        git(&root, &["commit", "--quiet", "-m", "fixture"]);
+        let head = bbox_corpus_core::git::current_head(&root).unwrap();
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let note = bbox_provenance::GitProvenanceNote::new_v2(
+            &head,
+            bbox_provenance::ProducedBy::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let part = bbox_provenance::fragment_note(&note, bbox_provenance::MAX_NOTE_DOCUMENT_BYTES)
+            .unwrap()
+            .remove(0);
+        let document = bbox_provenance::ProvenanceExportDocument::from_note(&part).unwrap();
+        let plan = bbox_provenance::ProvenanceExportPlan::new(
+            scope.clone(),
+            "project",
+            "refs/notes/bbox/provenance",
+            vec![document],
+        )
+        .unwrap();
+        let page = plan.page(plan.documents.clone(), None);
+        // This is the crash point: the notes write landed, but no receipt was
+        // sent. The next collector attempt must count the page as unchanged
+        // and still produce a valid terminal receipt.
+        let first = bbox_provenance::apply_export_page(&root, &page).unwrap();
+        assert_eq!(first.written, 1);
+        let response = ProvenanceExportPageResponseV1 {
+            schema_version: GIT_SOURCE_SCHEMA_VERSION,
+            page,
+            document_count: plan.document_count(),
+            logical_bytes: plan
+                .documents
+                .iter()
+                .map(|document| document.document.len() as u64)
+                .sum(),
+            ordered_document_commitment: plan.ordered_document_commitment().unwrap(),
+        };
+        let receipts = Arc::new(Mutex::new(Vec::<ProvenanceExportReceiptV1>::new()));
+        let page_response = response.clone();
+        let receipt_sink = receipts.clone();
+        let app = Router::new()
+            .route(
+                "/internal/code-source/v1/provenance/export/page",
+                post(move || {
+                    let response = page_response.clone();
+                    async move { Json(response) }
+                }),
+            )
+            .route(
+                "/internal/code-source/v1/provenance/export/receipt",
+                post(move |Json(receipt): Json<ProvenanceExportReceiptV1>| {
+                    let receipt_sink = receipt_sink.clone();
+                    async move {
+                        receipt_sink.lock().unwrap().push(receipt);
+                        AxumStatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runtime = Runtime {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            token: ServiceToken::parse("9".repeat(64)).unwrap(),
+            client: Client::builder().build().unwrap(),
+        };
+
+        publish_project_provenance_attempt(&runtime, &root, &scope)
+            .await
+            .unwrap();
+        server.abort();
+        let receipts = receipts.lock().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].written, 0);
+        assert_eq!(receipts[0].unchanged, 1);
+        assert!(!receipts[0].local_notes_tip.is_empty());
     }
 
     #[test]

@@ -24,6 +24,12 @@ per-row structure will fall over on a real host while passing every fixture.
 - One open descriptor is one coherent version of a lane. A concurrent atomic
   replacement cannot tear a read that is already in progress, which is why the
   read halves do not need the double-scan the buffered tree capture uses.
+- Authenticated provenance export reads only `observed/<project>.jsonl` through
+  the streamed visitor. It checks source length before the first read, digests
+  exact bytes, and re-probes inode/version metadata before publishing the
+  snapshot; continuation checks use that cheap token rather than rescanning.
+  The caller owns any selected-row memory cap and must never widen the reader
+  to explicit, derived, materialized, or legacy-combined lanes.
 - Repo-level Git overlay selection validates every member against one manifest
   image and publishes one atomic manifest replacement. Activation journals
   retain the final snapshot receipt digest, not the staging transaction token;

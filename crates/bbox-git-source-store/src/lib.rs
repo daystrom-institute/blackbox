@@ -19,7 +19,8 @@ use bbox_git_source::{
     GitHistoryManifestEntryV1, GitHistoryManifestPageV1, GitHistorySourceStateV1,
     GitHistorySourceStatusV1, GitSourceLimits, HistorySourceVerifier,
     MAX_HISTORY_MANIFEST_PAGE_BYTES, MAX_HISTORY_MANIFEST_PAGE_ENTRIES, MAX_HISTORY_RECORD_BYTES,
-    MissingHistoryRecordsPageV1, history_source_generation_id, validate_history_manifest,
+    MissingHistoryRecordsPageV1, ProvenanceExportReceiptV1, history_source_generation_id,
+    validate_history_manifest,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ const STORE_VERSION: u32 = 1;
 const MAX_UPLOAD_RECORD_BYTES: usize = 256 * 1024;
 const MAX_GENERATION_RECORD_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024 * 1024;
+const MAX_PROVENANCE_RECEIPT_BYTES: usize = 64 * 1024;
 const MISSING_PAGE_SIZE: usize = 1_000;
 const HISTORY_UPLOAD_IDLE_TTL_SECS: u64 = 24 * 60 * 60;
 
@@ -383,6 +385,16 @@ pub struct StoredHistorySourceAuthorityV1 {
     pub repo_history_id: RepoHistoryId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StoredProvenanceExportReceiptV1 {
+    pub version: u32,
+    pub producer_id: String,
+    pub project_id: String,
+    pub receipt: ProvenanceExportReceiptV1,
+    pub accepted_unix_secs: u64,
+}
+
 struct MutationGuard<'a> {
     _anchor: StoreLockGuard,
     _in_process: MutexGuard<'a, ()>,
@@ -400,6 +412,7 @@ impl GitSourceStore {
             "repos",
             "generation-index",
             "activations",
+            "provenance-receipts",
         ] {
             NofollowDirectory::open_or_create(&root.join(relative))?;
         }
@@ -421,6 +434,105 @@ impl GitSourceStore {
             .write()
             .map_err(|_| anyhow!("Git-source limit lock is poisoned"))? = limits;
         Ok(())
+    }
+
+    pub fn current_contract_limits(&self) -> Result<GitSourceLimits> {
+        Ok(self.current_limits()?.contract)
+    }
+
+    /// Atomically retain the last collector proof for one catalog project.
+    /// An identical retry is a true no-op, including its acceptance time.
+    pub fn record_provenance_export_receipt(
+        &self,
+        producer_id: &str,
+        project_id: &str,
+        receipt: ProvenanceExportReceiptV1,
+    ) -> Result<StoredProvenanceExportReceiptV1> {
+        let limits = self.current_limits()?;
+        receipt.validate(limits.contract)?;
+        validate_receipt_authority(producer_id, project_id)?;
+        let _guard = self.lock_mutation()?;
+        let directory = NofollowDirectory::open_or_create(&self.root.join("provenance-receipts"))?;
+        let name = format!("{project_id}.json");
+        if let Some(bytes) = directory.read_regular(
+            &name,
+            MAX_PROVENANCE_RECEIPT_BYTES,
+            "provenance export receipt",
+        )? {
+            let existing: StoredProvenanceExportReceiptV1 =
+                serde_json::from_slice(&bytes).context("decoding provenance export receipt")?;
+            validate_stored_provenance_receipt(&existing, limits.contract)?;
+            if existing.project_id != project_id {
+                bail!("provenance receipt filename disagrees with its project id");
+            }
+            if existing.producer_id == producer_id && existing.receipt == receipt {
+                return Ok(existing);
+            }
+        }
+        let stored = StoredProvenanceExportReceiptV1 {
+            version: STORE_VERSION,
+            producer_id: producer_id.to_string(),
+            project_id: project_id.to_string(),
+            receipt,
+            accepted_unix_secs: now_unix_secs(),
+        };
+        write_json(&directory, &name, &stored)?;
+        Ok(stored)
+    }
+
+    pub fn provenance_export_receipt(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<StoredProvenanceExportReceiptV1>> {
+        validate_receipt_authority("read", project_id)?;
+        let Some(stored) = read_json::<StoredProvenanceExportReceiptV1>(
+            &self.root.join("provenance-receipts"),
+            &format!("{project_id}.json"),
+            MAX_PROVENANCE_RECEIPT_BYTES,
+            "provenance export receipt",
+        )?
+        else {
+            return Ok(None);
+        };
+        validate_stored_provenance_receipt(&stored, self.current_limits()?.contract)?;
+        if stored.project_id != project_id {
+            bail!("provenance receipt filename disagrees with its project id");
+        }
+        Ok(Some(stored))
+    }
+
+    pub fn provenance_export_receipts(&self) -> Result<Vec<StoredProvenanceExportReceiptV1>> {
+        let root = self.root.join("provenance-receipts");
+        let limits = self.current_limits()?.contract;
+        let mut receipts = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("refusing unsafe provenance receipt store member");
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow!("provenance receipt filename is not UTF-8"))?;
+            let Some(project_id) = name.strip_suffix(".json") else {
+                bail!("unexpected provenance receipt store member");
+            };
+            let stored = read_json::<StoredProvenanceExportReceiptV1>(
+                &root,
+                &name,
+                MAX_PROVENANCE_RECEIPT_BYTES,
+                "provenance export receipt",
+            )?
+            .ok_or_else(|| anyhow!("provenance receipt disappeared while reading"))?;
+            validate_stored_provenance_receipt(&stored, limits)?;
+            if stored.project_id != project_id {
+                bail!("provenance receipt filename disagrees with its project id");
+            }
+            receipts.push(stored);
+        }
+        receipts.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        Ok(receipts)
     }
 
     /// Reclaim only state that durable store evidence proves unreferenced.
@@ -1837,6 +1949,32 @@ fn validate_store_limits(limits: StoreLimits) -> Result<()> {
     Ok(())
 }
 
+fn validate_receipt_authority(producer_id: &str, project_id: &str) -> Result<()> {
+    if producer_id.is_empty()
+        || producer_id.len() > 128
+        || !producer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!(StoreRequestError::InvalidInput);
+    }
+    bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())
+        .map_err(|_| anyhow!(StoreRequestError::InvalidInput))?;
+    Ok(())
+}
+
+fn validate_stored_provenance_receipt(
+    stored: &StoredProvenanceExportReceiptV1,
+    limits: GitSourceLimits,
+) -> Result<()> {
+    if stored.version != STORE_VERSION {
+        bail!(StoreRequestError::InvalidInput);
+    }
+    validate_receipt_authority(&stored.producer_id, &stored.project_id)?;
+    stored.receipt.validate(limits)?;
+    Ok(())
+}
+
 fn finalize_response(source_generation_id: String) -> FinalizeGitHistoryUploadResponseV1 {
     FinalizeGitHistoryUploadResponseV1 {
         status_url: format!(
@@ -2049,6 +2187,44 @@ mod tests {
         Vec<Vec<u8>>,
     ) {
         fixture_for('1', '2')
+    }
+
+    #[test]
+    fn provenance_receipt_is_durable_and_identical_retry_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let receipt = ProvenanceExportReceiptV1 {
+            schema_version: bbox_git_source::SCHEMA_VERSION,
+            scope: PublishedScope::try_new("repo-a", ".").unwrap(),
+            generation: "a".repeat(64),
+            notes_ref: "refs/notes/bbox/provenance".into(),
+            document_count: 0,
+            ordered_document_commitment: "b".repeat(64),
+            local_notes_tip: String::new(),
+            written: 0,
+            unchanged: 0,
+        };
+        let first = store
+            .record_provenance_export_receipt("producer-a", project_id, receipt.clone())
+            .unwrap();
+        let second = store
+            .record_provenance_export_receipt("producer-a", project_id, receipt.clone())
+            .unwrap();
+        assert_eq!(first, second);
+        drop(store);
+
+        let reopened = GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        assert_eq!(
+            reopened
+                .provenance_export_receipt(project_id)
+                .unwrap()
+                .unwrap()
+                .receipt,
+            receipt
+        );
+        assert_eq!(reopened.provenance_export_receipts().unwrap().len(), 1);
     }
 
     fn fixture_for(

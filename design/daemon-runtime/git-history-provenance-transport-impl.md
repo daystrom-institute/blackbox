@@ -596,6 +596,7 @@ Verification: checkout-vs-typed golden, monorepo fan-out, head/force-push/detach
 Gate: focused history/writer/edge/vector/doctor tests, cluster verify, strict catalog smoke.
 
 ### GH-D: Authenticated provenance export
+Status: implemented 2026-08-08.
 Ownership: `bbox-provenance`, `provenance_plan.rs`, edge sidecar, `git_source.rs`, collector, tool docs.
 Dependencies: GH-A, `PX-S`, `PX-V2`, `PX-P`, `PX-W`, `G14-L`.
 Mechanics:

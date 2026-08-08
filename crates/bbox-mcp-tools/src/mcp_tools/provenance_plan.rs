@@ -39,19 +39,32 @@ pub fn export_plan_page(
     notes_ref: &str,
     edge_index: &EdgeIndex,
 ) -> Result<ProvenanceExportPage> {
-    let plan = build_plan(scope, project_id, notes_ref, edge_index)?;
-    validate_requested_generation(params, &plan)?;
-    paginate_plan(params.cursor.as_deref(), &plan)
+    let edges = edge_index.all_edges();
+    let plan = build_plan_from_observed_edges(scope, project_id, notes_ref, edges, edge_index)?;
+    export_plan_page_from_plan(params, &plan)
 }
 
-fn build_plan(
+pub fn export_plan_page_from_plan(
+    params: &ProvenanceExportPlanParams,
+    plan: &ProvenanceExportPlan,
+) -> Result<ProvenanceExportPage> {
+    validate_requested_generation(params, plan)?;
+    paginate_plan(params.cursor.as_deref(), plan)
+}
+
+/// Build the pure provenance plan from an explicitly supplied observed-lane
+/// inventory. Relation lookups may use the published index, but primary file
+/// events never come from it; imported explicit edges therefore cannot leak
+/// back into an export.
+pub fn build_plan_from_observed_edges<'a>(
     scope: PublishedScope,
     project_id: &str,
     notes_ref: &str,
+    observed_edges: impl IntoIterator<Item = &'a Edge>,
     edge_index: &EdgeIndex,
 ) -> Result<ProvenanceExportPlan> {
     let mut grouped = BTreeMap::<String, Vec<&Edge>>::new();
-    for edge in edge_index.all_edges() {
+    for edge in observed_edges {
         if !matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE")
             || edge.metadata.get("anchor.project_id").map(String::as_str) != Some(project_id)
         {
@@ -463,6 +476,27 @@ mod tests {
         .unwrap();
         assert_eq!(first.generation, second.generation);
         assert_eq!(first.documents, second.documents);
+    }
+
+    #[test]
+    fn direct_observed_inventory_excludes_imported_and_ran_bash_edges() {
+        let observed = edge("project", &commit(1), 1, 10);
+        let imported = edge("project", &commit(2), 2, 10);
+        let mut ran_bash = edge("project", &commit(3), 3, 10);
+        ran_bash.kind = "RAN_BASH".into();
+        let relation_index =
+            EdgeIndex::from_edges_for_tests(vec![observed.clone(), imported, ran_bash.clone()]);
+        let direct_lane = [observed, ran_bash];
+        let plan = build_plan_from_observed_edges(
+            scope(),
+            "project",
+            "refs/notes/bbox/provenance",
+            direct_lane.iter(),
+            &relation_index,
+        )
+        .unwrap();
+        assert_eq!(plan.documents.len(), 1);
+        assert_eq!(plan.documents[0].commit, commit(1));
     }
 
     #[test]

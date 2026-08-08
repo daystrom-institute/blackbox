@@ -933,6 +933,26 @@ pub fn verify_commit_oid_with_alternate(
     verify_commit_oid_with_alternate_unix(root, oid, alternate_root)
 }
 
+/// Resolve one full reference through a held, exact worktree authority.
+///
+/// The caller must pass the exact worktree root. Repository discovery is
+/// confirmed before the ref read, and the read itself uses the captured Git,
+/// common-directory, and object-directory handles rather than ambient Git
+/// configuration or a later path lookup.
+pub fn resolve_stable_reference_oid(root: &Path, reference: &str) -> Result<Option<String>> {
+    validate_stable_reference(reference)?;
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        anyhow::bail!("stable Git reference reads require Unix directory-handle confinement");
+    }
+    #[cfg(unix)]
+    {
+        let repository = resolve_and_open_stable_repository(root, "stable reference repository")?;
+        resolve_stable_repository_ref(&repository, reference)
+    }
+}
+
 /// Strict bounded blob read for a previously verified exact commit.
 ///
 /// The stdout drain retains at most `max_bytes` while continuing to drain the

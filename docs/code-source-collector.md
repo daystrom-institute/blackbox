@@ -3,15 +3,18 @@
 The code source collector publishes current project files and optional complete
 typed Git-history snapshots from the machine that owns a checkout to the corpus
 daemon. It uploads bounded raw file bytes and canonical commit facts, never Git
-packs or an object database. The daemon remains responsible for chunking,
+packs or an object database. In the reverse direction, optional provenance
+export pulls a daemon-authored observed-edge plan and applies it through the
+shared checkout-local writer. The daemon remains responsible for chunking,
 indexing, embeddings, entity references, graph snapshots, and activation.
 
 This is an overlap facility. The daemon must already have catalog projects
 whose committed `.bbox/config.toml` resolve to the configured published
 scopes. Git-history transport additionally requires every published member of
-one repo-history identity to be assigned to the same producer. Intake currently
-stops at a verified durable `ready` source; corpus materialization and overlay
-activation are the next rollout milestone.
+one repo-history identity to be assigned to the same producer. Verified history
+sources materialize and activate through the same corpus builder as local
+history. Provenance export is project-scoped and does not widen one member's
+credential to its repository siblings.
 
 ## Configure the daemon
 
@@ -70,6 +73,7 @@ interval_secs = 120
 root = "/home/operator/repos/project"
 scope = { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." }
 git_history = true
+provenance = true
 ```
 
 The configured root must be the main Git worktree for its clone. The committed
@@ -82,6 +86,16 @@ commit reachable from one exact `HEAD` through the stable no-follow Git
 authority, refuses shallow clones, verifies the complete graph locally, and
 uses resumable content-addressed upload. Multiple configured projects sharing
 one Git common directory publish that repository history only once per cycle.
+
+`provenance` also defaults to `false` and runs on an independent retry lane.
+When enabled, the collector pulls deterministic generation-bound pages made
+only from that project's direct observed `EDITED_FILE` and `READ_FILE` edges,
+applies them under the repository's shared provenance lock, and posts a receipt
+binding the plan inventory to the resulting local notes tip. Imported explicit
+edges and `RAN_BASH` observations are never re-exported. If the observed lane
+changes during paging or before receipt, the collector restarts from page one;
+already-written documents are counted as unchanged, so a crash after the notes
+write but before receipt is safe to retry.
 
 Publish once and wait for a terminal generation state:
 
@@ -131,6 +145,19 @@ history plus the configured number of prior generations, honors active
 materializer pins, and deletes unreferenced records only after
 `unreferenced_blob_grace_hours`. Startup and upload requests never perform the
 full record sweep.
+
+The last accepted provenance receipt for each project lives under
+`<state_dir>/git-sources/provenance-receipts/`. `bbox_doctor` reports those
+receipts plus in-process page, stale-restart, and accepted-receipt counters.
+The daemon refuses an observed lane larger than the lower of the configured
+`max_provenance_logical_bytes` and the 512 MiB transport scan ceiling before
+scanning it. Selected edge inventory is capped at 32 MiB and the cached plan at
+64 MiB, with at most four plans resident globally; stale plans retain only a
+weak generation check and cannot pin an obsolete full edge index. Collector
+page responses are independently capped at 128 KiB before JSON decoding. These
+explicit transport limits keep an accidentally huge sidecar from becoming
+either a daemon-heap allocation or an unbounded scan; compact or archive the
+observed lane before retrying rather than raising daemon memory.
 
 When a retained blob is corrupt, the daemon keeps already materialized active
 documents readable and requests the missing hash during the next publication.

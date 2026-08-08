@@ -347,9 +347,11 @@ name = "bbox-code-collector"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "axum",
  "bbox-code-source",
  "bbox-corpus-core",
  "bbox-git-source",
+ "bbox-provenance",
  "bro-rpc",
  "clap",
  "hex",
@@ -732,7 +734,6 @@ name = "bbox-provenance"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "bbox-config",
  "bbox-corpus-core",
  "fs2",
  "hex",
@@ -741,6 +742,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
@@ -1052,6 +1054,7 @@ dependencies = [
  "bbox-knowledge",
  "bbox-mcp-tools",
  "bbox-packets",
+ "bbox-provenance",
  "bbox-providers",
  "bbox-slack",
  "bbox-stores",

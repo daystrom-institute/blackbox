@@ -869,6 +869,33 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
         ))),
     }
     findings.extend(repo_history_findings(state));
+    match state.git_sources.store().provenance_export_receipts() {
+        Ok(receipts) => {
+            for stored in receipts {
+                findings.push(Finding::ok(format!(
+                    "project `{}` provenance export receipted ({} documents, generation {})",
+                    stored.project_id,
+                    stored.receipt.document_count,
+                    &stored.receipt.generation[..12],
+                )));
+            }
+        }
+        Err(error) => findings.push(Finding::blocked(format!(
+            "provenance export receipts are unreadable: {error:#}"
+        ))),
+    }
+    let provenance = state.git_sources.provenance_export_metrics();
+    if provenance.pages_served > 0
+        || provenance.stale_restarts > 0
+        || provenance.receipts_accepted > 0
+    {
+        findings.push(Finding::info(format!(
+            "provenance transport served {} page(s), accepted {} receipt(s), and requested {} stale restart(s) since daemon start",
+            provenance.pages_served,
+            provenance.receipts_accepted,
+            provenance.stale_restarts,
+        )));
+    }
     if findings.is_empty() {
         findings.push(if state.config.read().code_collection.enabled {
             Finding::info("code collection enabled with no active collected generations")

@@ -410,6 +410,26 @@ impl ProducerAuthRuntime {
         }
     }
 
+    /// Resolve one authenticated project assignment without requiring every
+    /// published member of its repository to belong to this producer. Git
+    /// history is repository-wide; provenance export is intentionally scoped
+    /// to exactly one project.
+    pub(crate) fn project_transport_grant(
+        &self,
+        grant: &ProducerGrant,
+        scope: &PublishedScope,
+    ) -> std::result::Result<&ProjectId, RepoTransportGrantError> {
+        self.scope_to_project
+            .get(scope)
+            .filter(|project_id| {
+                grant
+                    .projects
+                    .get(scope)
+                    .is_some_and(|configured| configured == project_id.as_str())
+            })
+            .ok_or(RepoTransportGrantError::ScopeForbidden)
+    }
+
     pub(crate) fn repo_transport_grant_for_id(
         &self,
         producer_id: &str,

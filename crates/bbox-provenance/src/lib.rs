@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(feature = "local-git")]
@@ -174,6 +173,14 @@ impl ProvenanceExportPlan {
             next_cursor,
         }
     }
+
+    pub fn document_count(&self) -> u64 {
+        self.documents.len() as u64
+    }
+
+    pub fn ordered_document_commitment(&self) -> Result<String> {
+        ordered_document_commitment(&self.documents)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,11 +321,7 @@ pub fn validate_notes_ref(notes_ref: &str) -> Result<()> {
     let valid_prefix = components.next() == Some("refs") && components.next() == Some("notes");
     let namespace = components.next().unwrap_or_default();
     let valid_suffix = components.next() == Some("provenance") && components.next().is_none();
-    if !valid_prefix
-        || !valid_suffix
-        || !is_safe_notes_namespace(namespace)
-        || !git_check_ref_format(notes_ref)
-    {
+    if !valid_prefix || !valid_suffix || !is_safe_notes_namespace(namespace) {
         bail!("invalid provenance notes ref: expected refs/notes/<safe-namespace>/provenance");
     }
     Ok(())
@@ -327,20 +330,60 @@ pub fn validate_notes_ref(notes_ref: &str) -> Result<()> {
 #[cfg(feature = "local-git")]
 pub fn resolve_committed_scope(root: &Path) -> Result<PublishedScope> {
     let root = canonical_project_root(root)?;
-    let git_root = bbox_corpus_core::git::git_root_for_path(&root)
-        .ok_or_else(|| anyhow!("{} is not inside a Git repository", root.display()))?
-        .canonicalize()
-        .with_context(|| "canonicalizing provenance repository root")?;
-    let inputs = bbox_config::config::read_repo_id_inputs_at_ref(&root, "HEAD")
-        .with_context(|| "reading committed project identity at HEAD")?;
+    let git_root = canonical_git_root(&root)?;
+    let directory = bbox_corpus_core::json_store::NofollowDirectory::open_existing(&git_root)?
+        .ok_or_else(|| anyhow!("provenance repository root disappeared"))?;
+    let repository = bbox_corpus_core::git::open_stable_git_repository(&directory)?
+        .ok_or_else(|| anyhow!("provenance project is not a stable Git repository"))?;
+    let head = bbox_corpus_core::git::current_head(&root)
+        .ok_or_else(|| anyhow!("provenance project has no committed HEAD"))?;
+    let commit = repository.verify_commit_oid(&head)?;
+    let bbox_root_relpath = bbox_root_relpath(&git_root, &root)
+        .ok_or_else(|| anyhow!("project root is outside its Git repository"))?;
+    let config_relpath = if bbox_root_relpath == "." {
+        ".bbox/config.toml".to_string()
+    } else {
+        format!("{bbox_root_relpath}/.bbox/config.toml")
+    };
+    let source = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+        &commit,
+        &config_relpath,
+        1024 * 1024,
+    )?;
+    let source = std::str::from_utf8(&source).context("committed project config is not UTF-8")?;
+    let project = toml::from_str::<CommittedProjectConfigV1>(source)
+        .context("parsing committed project identity")?
+        .project;
+    let inputs = bbox_corpus_core::identity::RepoIdInputs {
+        project_key_override: project.project_key_override,
+        recorded: project.repo_id,
+        aka_repo_ids: project.aka_repo_ids,
+        computed: None,
+    };
     let repo_id = resolve_recorded_repo_id(&inputs).ok_or_else(|| {
         anyhow!(
             "committed .bbox/config.toml must record project.repo_id or project.project_key_override"
         )
     })?;
-    let bbox_root_relpath = bbox_root_relpath(&git_root, &root)
-        .ok_or_else(|| anyhow!("project root is outside its Git repository"))?;
     Ok(PublishedScope::try_new(repo_id, bbox_root_relpath)?)
+}
+
+#[cfg(feature = "local-git")]
+#[derive(Debug, Default, Deserialize)]
+struct CommittedProjectConfigV1 {
+    #[serde(default)]
+    project: CommittedProjectIdentityV1,
+}
+
+#[cfg(feature = "local-git")]
+#[derive(Debug, Default, Deserialize)]
+struct CommittedProjectIdentityV1 {
+    #[serde(default)]
+    repo_id: Option<String>,
+    #[serde(default)]
+    project_key_override: Option<String>,
+    #[serde(default)]
+    aka_repo_ids: Vec<String>,
 }
 
 #[cfg(feature = "local-git")]
@@ -400,6 +443,15 @@ pub fn apply_export_page(
         unchanged,
         rejected: 0,
     })
+}
+
+#[cfg(feature = "local-git")]
+pub fn resolve_notes_tip(root: &Path, notes_ref: &str) -> Result<Option<String>> {
+    let root = canonical_project_root(root)?;
+    validate_notes_ref(notes_ref)?;
+    let git_root = canonical_git_root(&root)?;
+    bbox_corpus_core::git::resolve_stable_reference_oid(&git_root, notes_ref)
+        .with_context(|| format!("resolving provenance notes ref in {}", root.display()))
 }
 
 /// Capture every document under one explicit provenance notes ref.
@@ -591,7 +643,8 @@ pub fn append_note_documents_dedup(
 ) -> Result<ApplyExportPageResult> {
     let root = canonical_project_root(root)?;
     validate_notes_ref(notes_ref)?;
-    if !commit_exists(&root, commit)? {
+    let git_root = canonical_git_root(&root)?;
+    if !commit_exists(&git_root, commit)? {
         bail!("provenance target commit does not exist");
     }
     let _repository_lock = lock_repository(&root)?;
@@ -634,12 +687,13 @@ fn validate_page(root: &Path, page: &ProvenanceExportPage) -> Result<()> {
     if local_scope != page.scope {
         bail!("provenance export page scope does not match the committed local project scope");
     }
+    let git_root = canonical_git_root(root)?;
 
     let mut part_counts = BTreeMap::<(String, String), u32>::new();
     let mut part_hashes = BTreeMap::<(String, String, u32), String>::new();
     for document in &page.documents {
         validate_export_document(document)?;
-        if !commit_exists(root, &document.commit)? {
+        if !commit_exists(&git_root, &document.commit)? {
             bail!(
                 "provenance export commit {} does not exist locally",
                 document.commit
@@ -747,6 +801,78 @@ fn plan_generation(
     Ok(sha256_hex(&serde_json::to_vec(&input)?))
 }
 
+/// Commit to the exact ordered inventory transported by one export plan.
+///
+/// Document bodies are already content-addressed, so the inventory binds the
+/// Git object, fragment ordinal, and body digest without hashing the (possibly
+/// large) body a second time. Length prefixes keep the encoding unambiguous.
+pub fn ordered_document_commitment(documents: &[ProvenanceExportDocument]) -> Result<String> {
+    let mut builder = OrderedDocumentCommitmentBuilderV1::new(documents.len() as u64);
+    for document in documents {
+        builder.push(document)?;
+    }
+    builder.finish()
+}
+
+/// Incremental form of [`ordered_document_commitment`] for paged consumers.
+/// It retains only the previous inventory key and the SHA-256 state.
+pub struct OrderedDocumentCommitmentBuilderV1 {
+    hasher: Sha256,
+    expected_count: u64,
+    seen: u64,
+    previous: Option<(String, u32)>,
+}
+
+impl OrderedDocumentCommitmentBuilderV1 {
+    pub fn new(expected_count: u64) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"bbox-provenance-export-inventory-v1");
+        hasher.update(expected_count.to_be_bytes());
+        Self {
+            hasher,
+            expected_count,
+            seen: 0,
+            previous: None,
+        }
+    }
+
+    pub fn push(&mut self, document: &ProvenanceExportDocument) -> Result<()> {
+        validate_export_document(document)?;
+        let key = (document.commit.as_str(), document.part_index);
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| (previous.0.as_str(), previous.1) >= key)
+        {
+            bail!("provenance export inventory is not strictly sorted");
+        }
+        self.previous = Some((document.commit.clone(), document.part_index));
+        for field in [
+            document.commit.as_bytes(),
+            document.document_sha256.as_bytes(),
+        ] {
+            self.hasher.update((field.len() as u64).to_be_bytes());
+            self.hasher.update(field);
+        }
+        self.hasher.update(document.part_index.to_be_bytes());
+        self.seen = self
+            .seen
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("provenance export inventory count overflow"))?;
+        if self.seen > self.expected_count {
+            bail!("provenance export inventory exceeds its declared count");
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<String> {
+        if self.seen != self.expected_count {
+            bail!("provenance export inventory count does not match its declaration");
+        }
+        Ok(hex::encode(self.hasher.finalize()))
+    }
+}
+
 fn note_part(
     logical: &GitProvenanceNote,
     document_id: &str,
@@ -784,6 +910,13 @@ fn canonical_project_root(root: &Path) -> Result<PathBuf> {
         })
 }
 
+fn canonical_git_root(root: &Path) -> Result<PathBuf> {
+    bbox_corpus_core::git::git_root_for_path(root)
+        .ok_or_else(|| anyhow!("{} is not inside a Git repository", root.display()))?
+        .canonicalize()
+        .with_context(|| "canonicalizing provenance repository root")
+}
+
 fn lock_repository(root: &Path) -> Result<std::fs::File> {
     let common_dir = bbox_corpus_core::git::git_common_dir(root)
         .ok_or_else(|| anyhow!("provenance project has no Git common directory"))?;
@@ -803,22 +936,7 @@ fn commit_exists(root: &Path, commit: &str) -> Result<bool> {
     if !is_commit_id(commit) {
         return Ok(false);
     }
-    let object = format!("{commit}^{{commit}}");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["cat-file", "-e", &object])
-        .output()
-        .with_context(|| format!("checking provenance commit in {}", root.display()))?;
-    Ok(output.status.success())
-}
-
-fn git_check_ref_format(notes_ref: &str) -> bool {
-    Command::new("git")
-        .args(["check-ref-format", notes_ref])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    Ok(bbox_corpus_core::git::verify_commit_oid_with_alternate(root, commit, None).is_ok())
 }
 
 fn is_safe_notes_namespace(namespace: &str) -> bool {
@@ -826,6 +944,10 @@ fn is_safe_notes_namespace(namespace: &str) -> bool {
         && namespace != "."
         && namespace != ".."
         && !namespace.starts_with('-')
+        && !namespace.starts_with('.')
+        && !namespace.ends_with('.')
+        && !namespace.to_ascii_lowercase().ends_with(".lock")
+        && !namespace.contains("..")
         && namespace
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -846,6 +968,7 @@ const fn v1_schema_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
 
     use super::*;
 
@@ -892,6 +1015,30 @@ mod tests {
         git(&root, &["commit", "-qm", "initial"]);
         let commit = git(&root, &["rev-parse", "HEAD"]);
         (dir, root, commit)
+    }
+
+    #[test]
+    fn ordered_export_commitment_binds_order_and_document_hashes() {
+        let first_note =
+            GitProvenanceNote::new_v2("1".repeat(40), ProducedBy::default(), vec![], vec![]);
+        let second_note =
+            GitProvenanceNote::new_v2("2".repeat(40), ProducedBy::default(), vec![], vec![]);
+        let first = ProvenanceExportDocument::from_note(&first_note).unwrap();
+        let second = ProvenanceExportDocument::from_note(&second_note).unwrap();
+        let documents = vec![first.clone(), second.clone()];
+        let commitment = ordered_document_commitment(&documents).unwrap();
+        assert_eq!(commitment, ordered_document_commitment(&documents).unwrap());
+        assert!(ordered_document_commitment(&[second, first]).is_err());
+
+        let plan = ProvenanceExportPlan::new(
+            PublishedScope::try_new("repo", ".").unwrap(),
+            "project",
+            "refs/notes/bbox/provenance",
+            documents,
+        )
+        .unwrap();
+        assert_eq!(plan.document_count(), 2);
+        assert_eq!(plan.ordered_document_commitment().unwrap(), commitment);
     }
 
     fn call(project_id: &str, payload_len: usize) -> NoteToolCall {
@@ -1052,6 +1199,9 @@ mod tests {
         for invalid in [
             "refs/notes/../provenance",
             "refs/notes/-bbox/provenance",
+            "refs/notes/.bbox/provenance",
+            "refs/notes/bbox./provenance",
+            "refs/notes/bbox.lock/provenance",
             "refs/notes/bbox/other",
             "refs/heads/main",
             "refs/notes/b box/provenance",

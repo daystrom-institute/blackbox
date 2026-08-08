@@ -84,6 +84,173 @@ pub struct Edge {
     pub project_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedEdgeLaneSnapshotV1 {
+    /// Cheap identity used to invalidate an in-memory export plan. It binds
+    /// the opened inode and mutation timestamps, while `content_sha256` binds
+    /// the exact bytes that were parsed.
+    pub version_token: String,
+    pub content_sha256: String,
+    pub source_bytes: u64,
+    pub lines_seen: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedEdgeLaneVersionV1 {
+    pub version_token: String,
+    pub source_bytes: u64,
+}
+
+/// Probe the current observed lane without reading its contents. This is the
+/// continuation/receipt fast path: an unchanged token lets the daemon reuse a
+/// bounded cached plan instead of re-scanning a potentially large lane.
+pub fn observed_edge_lane_version(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<ObservedEdgeLaneVersionV1> {
+    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
+        .context("validating observed edge lane project id")?;
+    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("observed"))? else {
+        return Ok(absent_observed_lane_version());
+    };
+    let Some(file) =
+        directory.open_regular(&format!("{project_id}.jsonl"), "observed edge lane")?
+    else {
+        return Ok(absent_observed_lane_version());
+    };
+    observed_version_from_metadata(&file.metadata()?)
+}
+
+/// Stream the exact direct-observation lane through `visitor` with bounded
+/// resident memory. A source-size check happens before the first read, which
+/// is deliberately what makes a pathological multi-gigabyte sidecar a fast,
+/// explicit refusal instead of a daemon-sized allocation.
+pub fn visit_observed_edge_lane(
+    edges_dir: &Path,
+    project_id: &str,
+    max_source_bytes: u64,
+    max_line_bytes: usize,
+    mut visitor: impl FnMut(Edge) -> Result<()>,
+) -> Result<ObservedEdgeLaneSnapshotV1> {
+    use std::io::Read as _;
+
+    if max_source_bytes == 0 || max_line_bytes == 0 {
+        anyhow::bail!("observed edge lane limits must be nonzero");
+    }
+    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
+        .context("validating observed edge lane project id")?;
+    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("observed"))? else {
+        return Ok(empty_observed_lane_snapshot());
+    };
+    let name = format!("{project_id}.jsonl");
+    let Some(mut file) = directory.open_regular(&name, "observed edge lane")? else {
+        return Ok(empty_observed_lane_snapshot());
+    };
+    let initial = observed_version_from_metadata(&file.metadata()?)?;
+    if initial.source_bytes > max_source_bytes {
+        anyhow::bail!(
+            "observed edge lane is {} bytes, exceeding the {}-byte export scan limit",
+            initial.source_bytes,
+            max_source_bytes
+        );
+    }
+
+    let mut remaining = initial.source_bytes;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0_u8; STREAMED_CHUNK_BYTES];
+    let mut splitter = StreamedLineSplitterV1::new(max_line_bytes);
+    let mut lines_seen = 0_u64;
+    let mut callback_error = None;
+    let mut on_line = |content: &[u8], _terminator: &[u8]| {
+        lines_seen = lines_seen.saturating_add(1);
+        let parsed = serde_json::from_slice::<Edge>(content)
+            .context("decoding observed edge lane row")
+            .and_then(&mut visitor);
+        if let Err(error) = parsed {
+            callback_error = Some(error);
+            return Err("observed_edge_lane_row_invalid");
+        }
+        Ok(())
+    };
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(STREAMED_CHUNK_BYTES as u64))
+            .expect("streamed chunk bound fits usize");
+        let read = match file.read(&mut chunk[..wanted]) {
+            Ok(0) => anyhow::bail!("observed edge lane became shorter while it was read"),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("reading observed edge lane"),
+        };
+        remaining -= read as u64;
+        hasher.update(&chunk[..read]);
+        if let Err(code) = splitter.push_chunk(&chunk[..read], &mut on_line) {
+            if let Some(error) = callback_error.take() {
+                return Err(error);
+            }
+            anyhow::bail!("{code}");
+        }
+    }
+    if let Err(code) = splitter.finish(&mut on_line) {
+        if let Some(error) = callback_error.take() {
+            return Err(error);
+        }
+        anyhow::bail!("{code}");
+    }
+
+    let current = observed_edge_lane_version(edges_dir, project_id.as_str())?;
+    if current != initial {
+        anyhow::bail!("observed edge lane changed while the export plan was built");
+    }
+    Ok(ObservedEdgeLaneSnapshotV1 {
+        version_token: initial.version_token,
+        content_sha256: hex::encode(hasher.finalize()),
+        source_bytes: initial.source_bytes,
+        lines_seen,
+    })
+}
+
+fn empty_observed_lane_snapshot() -> ObservedEdgeLaneSnapshotV1 {
+    ObservedEdgeLaneSnapshotV1 {
+        version_token: absent_observed_lane_version().version_token,
+        content_sha256: hex::encode(Sha256::digest([])),
+        source_bytes: 0,
+        lines_seen: 0,
+    }
+}
+
+fn absent_observed_lane_version() -> ObservedEdgeLaneVersionV1 {
+    ObservedEdgeLaneVersionV1 {
+        version_token: hex::encode(Sha256::digest(b"bbox-observed-edge-lane-absent-v1")),
+        source_bytes: 0,
+    }
+}
+
+fn observed_version_from_metadata(metadata: &fs::Metadata) -> Result<ObservedEdgeLaneVersionV1> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bbox-observed-edge-lane-version-v1");
+    hasher.update(metadata.len().to_be_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        hasher.update(metadata.dev().to_be_bytes());
+        hasher.update(metadata.ino().to_be_bytes());
+        hasher.update(metadata.mtime().to_be_bytes());
+        hasher.update(metadata.mtime_nsec().to_be_bytes());
+        hasher.update(metadata.ctime().to_be_bytes());
+        hasher.update(metadata.ctime_nsec().to_be_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
+        hasher.update(modified.as_secs().to_be_bytes());
+        hasher.update(modified.subsec_nanos().to_be_bytes());
+    }
+    Ok(ObservedEdgeLaneVersionV1 {
+        version_token: hex::encode(hasher.finalize()),
+        source_bytes: metadata.len(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgeKey {
     source: EntityRef,
@@ -2020,6 +2187,59 @@ mod project_catalog_snapshot_tests {
     use bbox_corpus_core::project_catalog_snapshot::{
         OwnerSnapshotLimitsV1, OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
     };
+
+    #[test]
+    fn observed_lane_reader_streams_exact_rows_and_refuses_oversized_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        let observed = root.join("observed");
+        std::fs::create_dir_all(&observed).unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let edge = Edge {
+            source: EntityRef::parse("task:one").unwrap(),
+            kind: "RAN_BASH".into(),
+            target: EntityRef::parse("task:two").unwrap(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: Some(project_id.into()),
+        };
+        let bytes = format!("{}\n", serde_json::to_string(&edge).unwrap()).into_bytes();
+        std::fs::write(observed.join(format!("{project_id}.jsonl")), &bytes).unwrap();
+
+        let mut rows = Vec::new();
+        let snapshot =
+            visit_observed_edge_lane(&root, project_id, bytes.len() as u64, 1024 * 1024, |edge| {
+                rows.push(edge);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, vec![edge]);
+        assert_eq!(snapshot.source_bytes, bytes.len() as u64);
+        assert_eq!(snapshot.lines_seen, 1);
+        assert_eq!(snapshot.content_sha256, hex::encode(Sha256::digest(&bytes)));
+        assert_eq!(
+            observed_edge_lane_version(&root, project_id)
+                .unwrap()
+                .version_token,
+            snapshot.version_token
+        );
+
+        let error =
+            visit_observed_edge_lane(&root, project_id, bytes.len() as u64 - 1, 1024, |_| Ok(()))
+                .unwrap_err();
+        assert!(error.to_string().contains("export scan limit"));
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(observed.join(format!("{project_id}.jsonl")))
+            .unwrap();
+        file.set_len(94 * 1024 * 1024 * 1024).unwrap();
+        let error =
+            visit_observed_edge_lane(&root, project_id, 2 * 1024 * 1024 * 1024, 1024, |_| Ok(()))
+                .unwrap_err();
+        assert!(error.to_string().contains("100931731456 bytes"));
+    }
 
     #[test]
     fn migration_snapshot_is_no_create_and_captures_only_literal_cwd() {

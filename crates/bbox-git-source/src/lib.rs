@@ -564,6 +564,46 @@ pub struct ProvenanceExportPullRequestV1 {
     pub generation: Option<String>,
 }
 
+/// Transport envelope for one page. The embedded page deliberately remains
+/// the landed interactive MCP/CLI contract; plan-wide receipt evidence lives
+/// beside it so adding authenticated transport does not change those bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceExportPageResponseV1 {
+    pub schema_version: u32,
+    pub page: bbox_provenance::ProvenanceExportPage,
+    pub document_count: u64,
+    pub logical_bytes: u64,
+    pub ordered_document_commitment: String,
+}
+
+impl ProvenanceExportPageResponseV1 {
+    pub fn validate(&self, limits: GitSourceLimits) -> Result<(), ContractError> {
+        validate_schema(self.schema_version)?;
+        self.page
+            .scope
+            .validate()
+            .map_err(|_| ContractError::InvalidScope)?;
+        validate_notes_ref(&self.page.notes_ref)?;
+        validate_sha256(&self.page.generation)?;
+        validate_sha256(&self.ordered_document_commitment)?;
+        if self.document_count > limits.max_provenance_documents
+            || self.logical_bytes > limits.max_provenance_logical_bytes
+            || self.page.documents.len() as u64 > self.document_count
+        {
+            return Err(ContractError::ProvenanceLimitExceeded);
+        }
+        for document in &self.page.documents {
+            if document.document.len() as u64 > MAX_PROVENANCE_DOCUMENT_BYTES
+                || document.document_sha256 != bbox_provenance::document_sha256(&document.document)
+            {
+                return Err(ContractError::ProvenanceCommitmentMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceExportReceiptV1 {
@@ -587,7 +627,13 @@ impl ProvenanceExportReceiptV1 {
         validate_sha256(&self.generation)?;
         validate_notes_ref(&self.notes_ref)?;
         validate_sha256(&self.ordered_document_commitment)?;
-        validate_any_object_id(&self.local_notes_tip)?;
+        if self.local_notes_tip.is_empty() {
+            if self.document_count != 0 {
+                return Err(ContractError::InvalidObjectId);
+            }
+        } else {
+            validate_any_object_id(&self.local_notes_tip)?;
+        }
         if self.document_count > limits.max_provenance_documents
             || self.written.checked_add(self.unchanged) != Some(self.document_count)
         {
@@ -1094,5 +1140,37 @@ mod tests {
             ),
             Err(ContractError::ProvenanceCommitmentMismatch)
         );
+    }
+
+    #[test]
+    fn provenance_export_transport_envelope_and_empty_receipt_validate() {
+        let plan = bbox_provenance::ProvenanceExportPlan::new(
+            scope(),
+            "project",
+            "refs/notes/bbox/provenance",
+            Vec::new(),
+        )
+        .unwrap();
+        let response = ProvenanceExportPageResponseV1 {
+            schema_version: SCHEMA_VERSION,
+            page: plan.page(Vec::new(), None),
+            document_count: 0,
+            logical_bytes: 0,
+            ordered_document_commitment: plan.ordered_document_commitment().unwrap(),
+        };
+        response.validate(GitSourceLimits::default()).unwrap();
+        ProvenanceExportReceiptV1 {
+            schema_version: SCHEMA_VERSION,
+            scope: response.page.scope.clone(),
+            generation: response.page.generation.clone(),
+            notes_ref: response.page.notes_ref.clone(),
+            document_count: 0,
+            ordered_document_commitment: response.ordered_document_commitment,
+            local_notes_tip: String::new(),
+            written: 0,
+            unchanged: 0,
+        }
+        .validate(GitSourceLimits::default())
+        .unwrap();
     }
 }
