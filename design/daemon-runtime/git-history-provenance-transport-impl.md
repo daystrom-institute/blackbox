@@ -18,6 +18,19 @@ History dependencies: [`durable-project-catalog-phase3-impl.md`](../../../../../
 Provenance predecessor: [`checkout-provenance-export-impl.md`](../../../../../design/daemon-runtime/checkout-provenance-export-impl.md).
 Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). This plan uses slice-local decisions `GH-FD-*`. GH-C records the certified P3-F caller-list and selector-source amendment as a new Decision Ledger entry at implementation time; this plan assumes no entry number.
 
+> **Rebaseline required before implementation.** The locality inventory was
+> reverified on 2026-08-08 at `beta/blackbox-v2` `055071aa`. The immutable
+> history substrate and code-collector authority described here have since
+> landed, but typed Git/provenance producer routes have not: blackboxd still
+> acquires `GitHistory` and `ProvenanceNoteIo` leases. This plan remains the
+> starting contract, not a current caller/owner map. Reconcile every named
+> Phase 3-6 owner, selector transition, cutover row, and test fixture with
+> current code before splitting implementation cells; do not recreate a
+> planned type whose landed owner now has another name. The current program
+> order and retirement gates live in
+> [locality-first-decomposition.md](locality-first-decomposition.md) sections
+> 3 and 6.
+
 ## 1. Required outcome
 At this slice's exit gate, proved against strict catalog state after Phases 3 through 6 have landed:
 1. A scope-authorized producer publishes one complete reachable Git-history snapshot without the corpus host opening a checkout or invoking Git.
