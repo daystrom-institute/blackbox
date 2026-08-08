@@ -373,6 +373,14 @@ fn capture_partition_from_snapshot(
     if snapshot.schema_version != VECTOR_SNAPSHOT_VERSION || snapshot.route != route {
         return corrupt_partition(route, "vector_partition_snapshot_identity_mismatch");
     }
+    // This path is reached only when the WAL is exactly absent. A snapshot
+    // that records a nonzero WAL prefix is therefore ahead of the available
+    // authority. Runtime recovery rejects the same shape and rebuilds from
+    // the (empty) WAL; inventory must not claim the stale snapshot's rows as
+    // complete migration evidence.
+    if snapshot.wal_len_bytes > 0 {
+        return corrupt_partition(route, "vector_partition_snapshot_ahead_of_wal");
+    }
     snapshot.slab.rebuild_active_index();
     let active_keys = snapshot
         .slab
@@ -778,6 +786,42 @@ mod tests {
             capture_migration_snapshot_no_create(&root, VectorMigrationSnapshotLimitsV1::default());
         assert_eq!(discharged.project_scoped_ref_count, 0);
         assert_eq!(discharged.commit_namespaces.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_that_names_a_missing_wal_is_corrupt() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = VectorStore::open(&root).unwrap();
+        store
+            .upsert(
+                "route-a",
+                "project_file:project-a:path:chunk:0",
+                "content-a",
+                vec![1.0, 0.0],
+            )
+            .unwrap();
+        store.rebuild("route-a").unwrap();
+        drop(store);
+
+        let wal = root.join("route-a").join(WAL_FILE);
+        assert!(wal.is_file());
+        std::fs::remove_file(wal).unwrap();
+        let snapshot =
+            capture_migration_snapshot_no_create(&root, VectorMigrationSnapshotLimitsV1::default());
+
+        assert_eq!(
+            snapshot.state,
+            VectorMigrationSourceStateV1::Corrupt {
+                diagnostic_code: "vector_partition_corrupt"
+            }
+        );
+        assert!(snapshot.partitions.iter().any(|partition| {
+            partition.state
+                == VectorMigrationSourceStateV1::Corrupt {
+                    diagnostic_code: "vector_partition_snapshot_ahead_of_wal",
+                }
+        }));
     }
 
     #[cfg(unix)]
