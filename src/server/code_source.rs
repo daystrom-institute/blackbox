@@ -2138,8 +2138,7 @@ fn clear_cutback_health_if_converged(
     if persisted.is_some()
         || !matches!(
             (desired, effective),
-            (DesiredAssignment::Local, EffectiveSource::Local)
-                | (DesiredAssignment::Collected, EffectiveSource::Collected)
+            (DesiredAssignment::Local, EffectiveSource::Local) | (DesiredAssignment::Collected, _)
         )
     {
         return;
@@ -2165,15 +2164,16 @@ const CUTBACK_HEALTH_CODES: [&str; 5] = [
 ];
 
 /// Clear health rows left behind by an older daemon after cutback authority
-/// has already converged. Some steady local projects have no startup reducer
-/// event, so limiting this cleanup to the reducer's `NoOp` arm leaves those
-/// durable warnings stuck across every restart.
+/// has converged or a collected reassignment made the cutback obsolete. Some
+/// steady projects have no startup reducer event, so limiting this cleanup to
+/// the reducer's `NoOp` arm leaves those durable warnings stuck across every
+/// restart.
 ///
 /// Only projects which currently carry a cutback-specific health row are
 /// inspected. The same authority predicate as the live reducer applies: no
-/// persisted cutback state and desired/effective sources must agree. Any
-/// unresolved cutback, unavailable materialization, or unrelated health row
-/// remains untouched.
+/// persisted cutback state, and either local authority has converged or a
+/// collected assignment has made the prior cutback direction obsolete. An
+/// unresolved local cutback or unrelated health row remains untouched.
 fn clear_converged_cutback_health_at_startup(
     store: &CodeSourceStore,
     code_sources: &CodeSourceRuntime,
@@ -6912,6 +6912,9 @@ mod tests {
         store
             .record_health_failure("unresolved-project", "cutback_pending", "keep")
             .unwrap();
+        store
+            .record_health_failure("reassigned-project", "cutback_pending", "stale")
+            .unwrap();
 
         clear_cutback_health_if_converged(
             &store,
@@ -6925,6 +6928,13 @@ mod tests {
             "unresolved-project",
             DesiredAssignment::Local,
             EffectiveSource::Collected,
+            None,
+        );
+        clear_cutback_health_if_converged(
+            &store,
+            "reassigned-project",
+            DesiredAssignment::Collected,
+            EffectiveSource::Unavailable,
             None,
         );
 
