@@ -10,11 +10,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bbox_chunker::EdgeConfidence;
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{
-    NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow, canonical_store_lock_path,
+    NofollowDirectory, StoreLockGuard, acquire_store_lock_nofollow_with_timeout,
+    canonical_store_lock_path,
 };
 use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use bbox_gaps::gaps::{BlockingLevel, GapImpact, GapKind, GapNote, GapResolution};
@@ -36,6 +38,7 @@ pub(crate) const MAX_ACCEPTED_PUBLICATION_ENTRIES_PER_LANE: usize = 100_000;
 pub(crate) const MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const MAX_ACCEPTED_PUBLICATION_POINTER_BYTES: usize = 64 * 1024;
+const ACCEPTED_PUBLICATION_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) type AcceptedPublicationStoreResult<T> = Result<T, AcceptedPublicationStoreError>;
 
@@ -738,12 +741,14 @@ pub(crate) struct AcceptedPublicationLockGuard {
 pub(crate) fn acquire_accepted_publication_lock(
     paths: &AcceptedPublicationStorePaths,
 ) -> AcceptedPublicationStoreResult<AcceptedPublicationLockGuard> {
-    let guard = acquire_store_lock_nofollow(paths.anchor()).map_err(|error| {
-        AcceptedPublicationStoreError::new(
-            "error.accepted_publication_io",
-            format!("acquiring accepted-publication lock failed: {error}"),
-        )
-    })?;
+    let guard =
+        acquire_store_lock_nofollow_with_timeout(paths.anchor(), ACCEPTED_PUBLICATION_LOCK_TIMEOUT)
+            .map_err(|error| {
+                AcceptedPublicationStoreError::new(
+                    "error.accepted_publication_io",
+                    format!("acquiring accepted-publication lock failed: {error}"),
+                )
+            })?;
     Ok(AcceptedPublicationLockGuard {
         anchor: paths.anchor.clone(),
         _guard: guard,

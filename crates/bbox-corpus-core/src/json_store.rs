@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -472,6 +473,59 @@ fn read_bounded(file: &mut File, max_bytes: usize, label: &str) -> Result<Vec<u8
 /// The lock file is never truncated. Keeping its inode stable is load-bearing:
 /// all compatible store writers must contend on the same advisory lock.
 pub fn acquire_store_lock_nofollow(store_path: &Path) -> Result<StoreLockGuard> {
+    let (file, lock_path) = open_valid_store_lock(store_path)?;
+    file.lock_exclusive().with_context(|| {
+        format!(
+            "failed to acquire exclusive lock on {}",
+            lock_path.display()
+        )
+    })?;
+    Ok(StoreLockGuard { file })
+}
+
+/// Acquire the canonical no-follow store lock with a hard wait deadline.
+///
+/// This is for request-path authorities whose holder can perform other bounded
+/// I/O while locked. A wedged or foreign process must degrade the request after
+/// the deadline rather than parking every reader forever.
+pub fn acquire_store_lock_nofollow_with_timeout(
+    store_path: &Path,
+    timeout: Duration,
+) -> Result<StoreLockGuard> {
+    let (file, lock_path) = open_valid_store_lock(store_path)?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(StoreLockGuard { file }),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                if started.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "timed out after {} ms acquiring exclusive lock on {}",
+                        timeout.as_millis(),
+                        lock_path.display()
+                    );
+                }
+                let remaining = timeout.saturating_sub(started.elapsed());
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to acquire exclusive lock on {}",
+                        lock_path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn open_valid_store_lock(store_path: &Path) -> Result<(File, PathBuf)> {
     let lock_path = canonical_store_lock_path(store_path);
     let file = open_lock_path_nofollow(&lock_path)?;
     if !file
@@ -483,13 +537,7 @@ pub fn acquire_store_lock_nofollow(store_path: &Path) -> Result<StoreLockGuard> 
         anyhow::bail!("store lock is not a regular file: {}", lock_path.display());
     }
 
-    file.lock_exclusive().with_context(|| {
-        format!(
-            "failed to acquire exclusive lock on {}",
-            lock_path.display()
-        )
-    })?;
-    Ok(StoreLockGuard { file })
+    Ok((file, lock_path))
 }
 
 pub fn canonical_store_lock_path(store_path: &Path) -> std::path::PathBuf {
@@ -841,6 +889,20 @@ mod tests {
         for i in 0..20 {
             assert!(vec.contains(&i));
         }
+    }
+
+    #[test]
+    fn bounded_store_lock_times_out_while_another_guard_is_held() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().canonicalize().unwrap().join("store.json");
+        let _held = acquire_store_lock_nofollow(&store_path).unwrap();
+        let started = Instant::now();
+        let error =
+            acquire_store_lock_nofollow_with_timeout(&store_path, Duration::from_millis(30))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
