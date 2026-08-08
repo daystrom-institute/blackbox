@@ -410,6 +410,10 @@ pub const OWNER_SOURCE_MISSING: &str = "owner_source_missing";
 pub const OWNER_SOURCE_INVALID: &str = "owner_source_invalid";
 /// The owner source could not be read (unsafe parent, symlink, oversize).
 pub const OWNER_SOURCE_UNREADABLE: &str = "owner_source_unreadable";
+/// The rewritten owner source would exceed the same byte ceiling enforced by
+/// capture and verify. Refuse before replacement so stamping cannot write a
+/// store that every subsequent read rejects as oversized.
+pub const OWNER_SOURCE_BYTE_LIMIT: &str = "owner_source_byte_limit";
 /// The rewritten owner source could not be committed to disk.
 pub const OWNER_SOURCE_UNWRITABLE: &str = "owner_source_unwritable";
 /// The owner source CHANGED between the stamper's read and its atomic
@@ -563,6 +567,9 @@ pub fn stamp_json_owner_row(
             }
             OwnerSourceEditV1::Rewrite(rewritten) => rewritten,
         };
+        if rewritten.len() > limits.max_source_bytes {
+            return Ok(Err(OwnerRowStampError::new(OWNER_SOURCE_BYTE_LIMIT)));
+        }
         match crate::json_store::atomic_write_bytes_locked(store_path, &rewritten) {
             Ok(()) => Ok(Ok(OwnerRowStampOutcomeV1::Stamped)),
             Err(_) => Ok(Err(OwnerRowStampError::new(OWNER_SOURCE_UNWRITABLE))),
@@ -2682,5 +2689,26 @@ mod proposal_owner_row_stamping {
 
         assert!(stamp(&fixture, &fixture.row_a, "a1b2c3d4").is_err());
         assert!(!fixture.root.exists());
+    }
+
+    #[test]
+    fn an_oversize_rewrite_refuses_before_replacing_the_owner_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("owner.json");
+        let original = br#"{"id":"row"}"#;
+        std::fs::write(&path, original).unwrap();
+        let limits = OwnerSnapshotLimitsV1 {
+            max_source_bytes: original.len() + 1,
+            ..OwnerSnapshotLimitsV1::default()
+        };
+
+        let error = stamp_json_owner_row(&path, "owner", "owner:file", limits, |_| {
+            Ok(OwnerSourceEditV1::Rewrite(vec![b'x'; original.len() + 2]))
+        })
+        .expect_err("a rewrite beyond the read ceiling must refuse");
+
+        assert_eq!(error.code, OWNER_SOURCE_BYTE_LIMIT);
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 }
