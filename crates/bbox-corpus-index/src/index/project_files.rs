@@ -134,6 +134,7 @@ enum ProjectIndexPublication {
         project_id: String,
         edges: Vec<Edge>,
         deleted_rel_hashes: std::collections::HashSet<String>,
+        replace_all: bool,
         compact_legacy: bool,
     },
     GitHistory(super::git_history::GitHistoryPublication),
@@ -212,20 +213,30 @@ impl ProjectIndexPublicationBundle {
                     project_id,
                     edges,
                     deleted_rel_hashes,
+                    replace_all,
                     compact_legacy,
                 } => {
-                    bbox_edge_sidecar::edge_sidecar::replace_materialized_edges_incremental(
-                        &edges_dir,
-                        "project",
-                        &project_id,
-                        &edges,
-                    )?;
-                    bbox_edge_sidecar::edge_sidecar::purge_managed_edges_for_path_hashes(
-                        &edges_dir,
-                        "project",
-                        &project_id,
-                        &deleted_rel_hashes,
-                    )?;
+                    if replace_all {
+                        bbox_edge_sidecar::edge_sidecar::replace_materialized_edges(
+                            &edges_dir,
+                            "project",
+                            &project_id,
+                            &edges,
+                        )?;
+                    } else {
+                        bbox_edge_sidecar::edge_sidecar::replace_materialized_edges_incremental(
+                            &edges_dir,
+                            "project",
+                            &project_id,
+                            &edges,
+                        )?;
+                        bbox_edge_sidecar::edge_sidecar::purge_managed_edges_for_path_hashes(
+                            &edges_dir,
+                            "project",
+                            &project_id,
+                            &deleted_rel_hashes,
+                        )?;
+                    }
                     if compact_legacy
                         && let Err(error) = bbox_edge_sidecar::edge_sidecar::compact_legacy_sidecar(
                             &edges_dir,
@@ -1943,6 +1954,17 @@ fn index_project(
         .map_or(base_mat_version.clone(), |snapshot_id| {
             format!("{base_mat_version}+ref-snapshot:{snapshot_id}")
         });
+    // A materialization-version change alters the meaning of every derived
+    // edge. Incremental preservation would carry the outgoing generation's
+    // symbol-only edges forward because those rows have no rel_path_hash to
+    // invalidate. The publication must replace the complete managed lane.
+    let mut replace_all_project_edges = ctx.force_git_full
+        || ctx.meta.iter().any(|(key, meta)| {
+            bbox_code_source::parse_project_file_meta_key(key).is_some_and(|(project_id, _, _)| {
+                project_id == project.project_id
+                    && meta.mat_version.as_deref() != Some(&mat_version)
+            })
+        });
     // On-disk freshness-key set for this project, captured before `files` is
     // moved. Keyed by the P3-E composite (plan section 4.6), the same key the
     // meta map now uses, so the deletion detection below compares like with
@@ -1967,7 +1989,11 @@ fn index_project(
             source_kind,
             &relative_path,
         );
-        match classify_project_file(ctx.meta.get(meta_key.as_str()), mtime, size, &mat_version) {
+        let previous = ctx.meta.get(meta_key.as_str());
+        if previous.is_some_and(|meta| meta.mat_version.as_deref() != Some(&mat_version)) {
+            replace_all_project_edges = true;
+        }
+        match classify_project_file(previous, mtime, size, &mat_version) {
             ProjectFileAction::Skip => {
                 ctx.stats.skipped += 1;
                 continue;
@@ -2121,7 +2147,8 @@ fn index_project(
         })
         .collect();
     let has_deletions = !deleted_rel_hashes.is_empty();
-    if !project_edges.is_empty() || has_deletions || ctx.force_git_full {
+    if !project_edges.is_empty() || has_deletions || ctx.force_git_full || replace_all_project_edges
+    {
         ctx.stats
             .publication
             .actions
@@ -2130,7 +2157,8 @@ fn index_project(
                 project_id: project.project_id.clone(),
                 edges: project_edges,
                 deleted_rel_hashes,
-                compact_legacy: ctx.force_git_full,
+                replace_all: replace_all_project_edges,
+                compact_legacy: replace_all_project_edges,
             });
     }
 
@@ -2903,6 +2931,42 @@ mod tests {
                 "the first staged transaction must remain under rollback ownership"
             );
         }
+    }
+
+    #[test]
+    fn materialization_version_cut_replaces_and_deduplicates_managed_lane() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let managed =
+            bbox_edge_sidecar::edge_sidecar::managed_derived_edges_dir(&edges_dir).join("project");
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(managed.join("p1.jsonl"), b"outgoing generation\n").unwrap();
+
+        let edge = Edge {
+            source: EntityRef::Knowledge {
+                id: "source".into(),
+            },
+            kind: "RELATES_TO".into(),
+            target: EntityRef::Knowledge {
+                id: "target".into(),
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        let mut bundle = ProjectIndexPublicationBundle::default();
+        bundle.actions.push(ProjectIndexPublication::ProjectEdges {
+            edges_dir: edges_dir.clone(),
+            project_id: "p1".into(),
+            edges: vec![edge.clone(), edge],
+            deleted_rel_hashes: Default::default(),
+            replace_all: true,
+            compact_legacy: false,
+        });
+        bundle.publish().unwrap();
+
+        let content = fs::read_to_string(managed.join("p1.jsonl")).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert!(!content.contains("outgoing generation"));
     }
 
     #[test]

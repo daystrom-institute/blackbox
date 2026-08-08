@@ -26,6 +26,13 @@ use bbox_corpus_core::git_overlay::GitOverlaySelector;
 // new fields).
 const INDEXER_VERSION: &str = "project-index-v2-path-free";
 const CHUNKER_VERSION: &str = "chunker-v1";
+// Changes to the durable derived-edge set semantics belong here rather than
+// in INDEXER_VERSION: they must invalidate per-file materialization freshness
+// and snapshot ids, but they do not require a Tantivy schema replacement.
+// v2 makes managed materialization set-like; the outgoing writer preserved
+// duplicate symbol-only edges on every incremental pass, growing two live
+// projects to 33.5 million JSONL rows for about 1.2 million unique edges.
+const EDGE_MATERIALIZATION_VERSION: &str = "edge-set-v2-deduplicated";
 const DIRTY_OVERLAY_DIRNAME: &str = "dirty-current";
 const PENDING_LOCAL_ACTIVATIONS_FILENAME: &str = "pending-local-activations.json";
 /// R28F2: the v2 GC pin representation is one confined file per project under
@@ -586,10 +593,11 @@ pub(crate) fn write_materialized_file_atomic(
 /// parser version is included because it changes the derived edge entity refs.
 pub fn current_materialization_version() -> String {
     format!(
-        "{}+{}+{}",
+        "{}+{}+{}+{}",
         INDEXER_VERSION,
         CHUNKER_VERSION,
-        bbox_corpus_core::entity_ref::PARSER_VERSION
+        bbox_corpus_core::entity_ref::PARSER_VERSION,
+        EDGE_MATERIALIZATION_VERSION,
     )
 }
 
@@ -600,6 +608,7 @@ pub fn clean_snapshot_id(repo_id: &str, project_id: &str, head_sha: &str) -> Str
     hasher.update(head_sha.as_bytes());
     hasher.update(INDEXER_VERSION.as_bytes());
     hasher.update(CHUNKER_VERSION.as_bytes());
+    hasher.update(EDGE_MATERIALIZATION_VERSION.as_bytes());
     let hash = hasher.finalize();
     let sha_prefix = &head_sha[..head_sha.len().min(12)];
     format!("head-{}-{}", sha_prefix, hex::encode(&hash[..8]))
@@ -611,6 +620,7 @@ pub fn nongit_snapshot_id(project_id: &str, source_tree_fingerprint: &str) -> St
     hasher.update(source_tree_fingerprint.as_bytes());
     hasher.update(INDEXER_VERSION.as_bytes());
     hasher.update(CHUNKER_VERSION.as_bytes());
+    hasher.update(EDGE_MATERIALIZATION_VERSION.as_bytes());
     let hash = hasher.finalize();
     format!("nongit-{}", hex::encode(&hash[..16]))
 }

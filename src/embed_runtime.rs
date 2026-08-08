@@ -1458,6 +1458,30 @@ pub(crate) fn status_response_for_state(state: &SharedState) -> Result<EmbedStat
     Ok(response)
 }
 
+/// Bounded health snapshot for `bbox_doctor`.
+///
+/// The full status surface intentionally computes exact coverage by walking
+/// every embedding-source document. On a production corpus that took 142
+/// seconds and made a nominal health read indistinguishable from a daemon
+/// outage. Doctor reports live queue/provider state and marks coverage as
+/// guarded; callers that explicitly request embed status still get the exact
+/// corpus scan.
+pub(crate) fn status_response_for_doctor() -> EmbedStatusResponse {
+    let mut response = status_response();
+    let router = EmbeddingRouter::load_default().unwrap_or_default();
+    backfill_visual_route_metadata(&router, &mut response);
+    queue::normalize_route_statuses(&mut response);
+    for status in response.routes.values_mut() {
+        if status.coverage_ratio.is_none() {
+            status.coverage_state = Some(
+                "guarded: bbox_doctor does not run full-corpus embedding coverage; use bbox_embed_status for an explicit coverage scan"
+                    .into(),
+            );
+        }
+    }
+    response
+}
+
 pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
     let response = status_response_for_state(state)?;
     Ok(serde_json::to_string_pretty(&response)?)

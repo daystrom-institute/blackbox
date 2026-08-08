@@ -381,7 +381,9 @@ Add daemon-owned retention policy:
     "keep_recent_per_workspace": 3,
     "keep_recent_per_repo": 10,
     "branch_switch_grace_minutes": 60,
-    "max_age_days": 14
+    "max_age_days": 14,
+    "max_count_per_workspace": 32,
+    "max_total_bytes_per_workspace": 8589934592
   },
   "dirty_overlays": {
     "keep_active_only": true

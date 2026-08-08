@@ -867,7 +867,7 @@ impl BlackboxServer {
                 None
             } else {
                 let result = server.state.index_writer.run_reindex_pass(false, true)?;
-                server.rebuild_edge_index_from_stores()?;
+                server.state.nudge_edge_index_rebuild();
                 Some(result)
             };
 

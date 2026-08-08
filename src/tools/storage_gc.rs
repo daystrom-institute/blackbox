@@ -59,15 +59,14 @@ pub(crate) struct StorageGcParams {
     /// Maximum age in days for inactive snapshots. Default 14.
     #[serde(default = "default_snapshot_max_age_days")]
     pub max_snapshot_age_days: Option<u64>,
-    /// Count budget for retained inactive snapshots per workspace. Bounds the
-    /// age-based keep (floors always retain and consume the budget): at
-    /// multi-agent commit rates, age-only retention reaches ~100 GB steady
-    /// state. Default 32.
+    /// Hard count budget for retained inactive snapshots per workspace.
+    /// Recent/repo/grace rules prioritize which snapshots consume it but do
+    /// not override the ceiling. Default 32.
     #[serde(default = "default_snapshot_max_count")]
     pub max_snapshots_per_workspace: Option<u64>,
-    /// Byte budget for retained inactive snapshots per workspace, consumed
-    /// newest-first; bounds the age-based keep like the count budget.
-    /// Default 16 GiB.
+    /// Hard byte budget for retained inactive snapshots per workspace,
+    /// consumed newest-first. Recent/repo/grace rules prioritize candidates
+    /// but cannot override this ceiling. Default 8 GiB.
     #[serde(default = "default_snapshot_max_total_bytes")]
     pub max_snapshot_total_bytes_per_workspace: Option<u64>,
     /// Auto-prune dangling_path and legacy_unknown orphans after this many

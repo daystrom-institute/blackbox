@@ -1287,7 +1287,7 @@ impl BlackboxServer {
                 let imported = mcp_tools::provenance::publish_prepared_provenance_import(
                     prepared, &edges_dir,
                 )?;
-                server.rebuild_edge_index_from_stores()?;
+                server.state.nudge_edge_index_rebuild();
                 drop(publication);
                 imported
             };

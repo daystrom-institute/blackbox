@@ -1243,15 +1243,13 @@ pub struct SnapshotRetentionPolicy {
     pub branch_switch_grace_minutes: u64,
     pub max_age_days: Option<u64>,
     /// Hard cap on retained inactive snapshot directories per workspace.
-    /// Bounds the age-based keep: a snapshot under `max_age_days` is only
-    /// retained while the workspace's retained count stays under this cap
-    /// (floors — recent/grace — always retain and consume the cap). Without
-    /// a count/byte budget, age-only retention reaches ~100 GB steady state
-    /// at multi-agent commit rates (gap-efd270dd).
+    /// Recent/repo/grace rules prioritize which snapshots consume the budget;
+    /// they do not override it. Without a hard cap, the ten-recent repo rule
+    /// alone retained ten 5 GiB generations for one production workspace.
     pub max_count_per_workspace: Option<u64>,
     /// Total byte budget for retained inactive snapshots per workspace,
-    /// consumed newest-first. Bounds the age-based keep the same way as
-    /// `max_count_per_workspace`; floors always retain even over budget.
+    /// consumed newest-first. This is a real ceiling for inactive snapshots:
+    /// active snapshots are classified separately and never consume it.
     pub max_total_bytes_per_workspace: Option<u64>,
 }
 
@@ -1271,8 +1269,8 @@ impl Default for SnapshotRetentionPolicy {
 
 /// Default count budget for retained inactive snapshots per workspace.
 pub const DEFAULT_SNAPSHOT_MAX_COUNT_PER_WORKSPACE: u64 = 32;
-/// Default byte budget for retained inactive snapshots per workspace (16 GiB).
-pub const DEFAULT_SNAPSHOT_MAX_TOTAL_BYTES_PER_WORKSPACE: u64 = 16 * 1024 * 1024 * 1024;
+/// Default byte budget for retained inactive snapshots per workspace (8 GiB).
+pub const DEFAULT_SNAPSHOT_MAX_TOTAL_BYTES_PER_WORKSPACE: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupRetentionPolicy {
@@ -1697,10 +1695,9 @@ fn plan_snapshot_gc(
     let grace_secs = policy.branch_switch_grace_minutes * 60;
 
     // Walk each workspace's snapshot dirs newest-first, consuming the
-    // count/byte budgets. Floors (recent workspace/repo, grace) always
-    // retain and consume budget; the age-based keep applies only while
-    // budget remains — that bound is what keeps steady-state disk usage
-    // finite at high commit rates (gap-efd270dd).
+    // count/byte budgets. Recent workspace/repo and grace rules are retention
+    // priorities, not budget exemptions: an exemption here made the 16 GiB
+    // setting cosmetic while the ten-recent repo floor retained ~50 GiB.
     let mut by_workspace: HashMap<&str, Vec<(&String, &DirAgg)>> = HashMap::new();
     for (dir, agg) in &dirs {
         by_workspace
@@ -1735,6 +1732,31 @@ fn plan_snapshot_gc(
                     })
                 });
 
+            let over_count = policy
+                .max_count_per_workspace
+                .is_some_and(|cap| count_used >= cap);
+            let over_bytes = policy
+                .max_total_bytes_per_workspace
+                .is_some_and(|cap| bytes_used.saturating_add(agg.bytes) > cap);
+            if over_count || over_bytes {
+                dir_fate.insert(
+                    dir.clone(),
+                    (
+                        true,
+                        format!(
+                            "snapshot_prunable_over_budget(priority={},count_used={},max_count={:?},bytes_used={},dir_bytes={},max_bytes={:?})",
+                            floor_reason.as_deref().unwrap_or("age"),
+                            count_used,
+                            policy.max_count_per_workspace,
+                            bytes_used,
+                            agg.bytes,
+                            policy.max_total_bytes_per_workspace
+                        ),
+                    ),
+                );
+                continue;
+            }
+
             if let Some(rule) = floor_reason {
                 count_used += 1;
                 bytes_used = bytes_used.saturating_add(agg.bytes);
@@ -1755,30 +1777,6 @@ fn plan_snapshot_gc(
                             policy.max_age_days,
                             policy.keep_recent_per_workspace,
                             policy.keep_recent_per_repo
-                        ),
-                    ),
-                );
-                continue;
-            }
-
-            let over_count = policy
-                .max_count_per_workspace
-                .is_some_and(|cap| count_used >= cap);
-            let over_bytes = policy
-                .max_total_bytes_per_workspace
-                .is_some_and(|cap| bytes_used.saturating_add(agg.bytes) > cap);
-            if over_count || over_bytes {
-                dir_fate.insert(
-                    dir.clone(),
-                    (
-                        true,
-                        format!(
-                            "snapshot_prunable_over_budget(count_used={},max_count={:?},bytes_used={},dir_bytes={},max_bytes={:?})",
-                            count_used,
-                            policy.max_count_per_workspace,
-                            bytes_used,
-                            agg.bytes,
-                            policy.max_total_bytes_per_workspace
                         ),
                     ),
                 );
@@ -2872,11 +2870,10 @@ mod tests {
         }
     }
 
-    /// The byte budget prunes under-age snapshots once the workspace's
-    /// retained bytes exceed the ceiling — but floors always win over the
-    /// budget (never delete the recent floor to satisfy bytes).
+    /// The byte budget is a real ceiling. Recent/grace rules choose the first
+    /// snapshots admitted, but cannot retain even one oversized inactive tree.
     #[test]
-    fn inactive_snapshot_byte_budget_bounds_age_keep_but_floors_win() {
+    fn inactive_snapshot_byte_budget_overrides_recent_floor() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path().join("edges");
         fs::create_dir_all(&edges_dir).unwrap();
@@ -2918,8 +2915,8 @@ mod tests {
                     branch_switch_grace_minutes: 0,
                     max_age_days: Some(10_000),
                     max_count_per_workspace: None,
-                    // Smaller than a single snapshot file: the floor still
-                    // retains; everything else is over budget.
+                    // Smaller than a single snapshot file: even the recent
+                    // priority cannot defeat the configured ceiling.
                     max_total_bytes_per_workspace: Some(1),
                 },
                 ..GcPolicy::default()
@@ -2931,9 +2928,12 @@ mod tests {
             .iter()
             .find(|c| c.path.contains("head-recent"))
             .expect("recent snapshot is a candidate");
+        assert!(recent_candidate.deletable);
         assert!(
-            !recent_candidate.deletable,
-            "floor-retained snapshot survives even over the byte budget: {}",
+            recent_candidate
+                .rule
+                .starts_with("snapshot_prunable_over_budget"),
+            "recent priority must be named in the budget refusal: {}",
             recent_candidate.rule
         );
         let older_candidate = candidates
@@ -2951,6 +2951,81 @@ mod tests {
                 .starts_with("snapshot_prunable_over_budget"),
             "rule must name the budget: {}",
             older_candidate.rule
+        );
+    }
+
+    #[test]
+    fn repo_recent_priority_cannot_retain_ten_snapshots_over_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        let active = write_snapshot_jsonl(&edges_dir, "p1", "head-active");
+        set_mtime_days_old(&active, 0);
+        let mut inactive_bytes = 0;
+        for index in 0..10 {
+            let path = write_snapshot_jsonl(&edges_dir, "p1", &format!("head-{index:02}"));
+            set_mtime_days_old(&path, index + 1);
+            inactive_bytes = fs::metadata(&path).unwrap().len();
+        }
+        write_workspace_manifest(
+            &edges_dir,
+            "p1",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "p1", "head-active");
+
+        let registered: HashSet<String> = ["p1".to_string()].into_iter().collect();
+        let candidates = plan_gc_with_policy(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: true,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+            &GcPolicy {
+                materialized_snapshots: SnapshotRetentionPolicy {
+                    keep_active: true,
+                    keep_recent_per_workspace: 3,
+                    keep_recent_per_repo: 10,
+                    branch_switch_grace_minutes: 60,
+                    max_age_days: Some(14),
+                    max_count_per_workspace: Some(32),
+                    max_total_bytes_per_workspace: Some(inactive_bytes * 2),
+                },
+                ..GcPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let inactive = candidates
+            .iter()
+            .filter(|candidate| candidate.kind == FileKind::InactiveSnapshot)
+            .collect::<Vec<_>>();
+        assert_eq!(inactive.len(), 10);
+        assert_eq!(
+            inactive
+                .iter()
+                .filter(|candidate| !candidate.deletable)
+                .count(),
+            2,
+            "the hard byte ceiling admits only two inactive trees"
+        );
+        assert_eq!(
+            inactive
+                .iter()
+                .filter(|candidate| candidate.deletable)
+                .count(),
+            8,
+            "the ten-recent repo priority must not bypass the ceiling"
         );
     }
 

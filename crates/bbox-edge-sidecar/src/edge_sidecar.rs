@@ -1117,36 +1117,48 @@ pub fn replace_project_edges(
         pid = std::process::id(),
         seq = writer_temp_sequence()
     ));
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
-    // Buffered: one syscall per ~8KiB instead of one per serialized fragment
-    // (the unbuffered loop dominated reindex project phases; thread-935b467d).
-    let mut writer = BufWriter::new(file);
-    for edge in edges {
-        let persisted = Edge {
-            source: edge.source.clone(),
-            kind: edge.kind.clone(),
-            target: edge.target.clone(),
-            provenance: edge.provenance,
-            confidence: edge.confidence,
-            metadata: BTreeMap::new(),
-            // Chunker-derived edges carry no catalog authority; only the
-            // Phase 6 backfill stamps a project onto an existing row.
-            project_id: None,
-        };
-        serde_json::to_writer(&mut writer, &persisted)?;
-        writer.write_all(b"\n")?;
-    }
-    let file = writer.into_inner().map_err(|err| err.into_error())?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(err) = fs::rename(&tmp_path, &path) {
+    let result = (|| -> Result<()> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        // Buffered: one syscall per ~8KiB instead of one per serialized
+        // fragment (the unbuffered loop dominated reindex project phases;
+        // thread-935b467d).
+        let mut writer = BufWriter::new(file);
+        let mut seen = HashSet::new();
+        for edge in edges {
+            let persisted = managed_edge(edge);
+            if !seen.insert(persisted.dedup_key()) {
+                continue;
+            }
+            serde_json::to_writer(&mut writer, &persisted)?;
+            writer.write_all(b"\n")?;
+        }
+        let file = writer.into_inner().map_err(|err| err.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
-        return Err(err.into());
     }
-    Ok(())
+    result
+}
+
+fn managed_edge(edge: &bbox_chunker::Edge) -> Edge {
+    Edge {
+        source: edge.source.clone(),
+        kind: edge.kind.clone(),
+        target: edge.target.clone(),
+        provenance: edge.provenance,
+        confidence: edge.confidence,
+        metadata: BTreeMap::new(),
+        // Chunker-derived edges carry no catalog authority; only the Phase 6
+        // backfill stamps a project onto an existing row.
+        project_id: None,
+    }
 }
 
 pub fn append_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
@@ -1558,21 +1570,75 @@ pub fn replace_materialized_edges_incremental(
         return Ok(());
     }
     let stale_hashes = rel_path_hashes_of(new_edges);
-    let existing = read_managed_derived_edges(edges_dir, namespace, project_id)?;
-    let preserved: Vec<bbox_chunker::Edge> = existing
-        .into_iter()
-        .filter(|e| !edge_touches_any_path_hash(e, &stale_hashes))
-        .map(|e| bbox_chunker::Edge {
-            source: e.source,
-            kind: e.kind,
-            target: e.target,
-            provenance: e.provenance,
-            confidence: e.confidence,
-        })
-        .collect();
-    let mut merged = preserved;
-    merged.extend_from_slice(new_edges);
-    replace_project_edges(edges_dir, namespace, project_id, &merged)
+    let dir = managed_derived_edges_dir(edges_dir).join(namespace);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{project_id}.jsonl"));
+    let tmp_path = dir.join(format!(
+        "{project_id}.jsonl.tmp.{pid}.{seq}",
+        pid = std::process::id(),
+        seq = writer_temp_sequence()
+    ));
+
+    // Stream the outgoing lane instead of collecting it wholesale. The old
+    // incremental writer accumulated exact symbol-only duplicates and then
+    // loaded all 33.5 million rows into a Vec during the next pass, producing
+    // multi-gigabyte abandoned temp files and process-wide memory pressure.
+    // The key set scales with UNIQUE edges; the input row count is irrelevant.
+    let result = (|| -> Result<()> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        let mut seen: HashSet<EdgeKey> = HashSet::new();
+
+        let existing = match fs::File::open(&path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(file) = existing {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                let Ok(edge) = serde_json::from_str::<Edge>(&line) else {
+                    continue;
+                };
+                if edge_touches_any_path_hash(&edge, &stale_hashes)
+                    || !seen.insert(edge.dedup_key())
+                {
+                    continue;
+                }
+                let normalized = managed_edge(&bbox_chunker::Edge {
+                    source: edge.source,
+                    kind: edge.kind,
+                    target: edge.target,
+                    provenance: edge.provenance,
+                    confidence: edge.confidence,
+                });
+                serde_json::to_writer(&mut writer, &normalized)?;
+                writer.write_all(b"\n")?;
+            }
+        }
+
+        for edge in new_edges {
+            let persisted = managed_edge(edge);
+            if !seen.insert(persisted.dedup_key()) {
+                continue;
+            }
+            serde_json::to_writer(&mut writer, &persisted)?;
+            writer.write_all(b"\n")?;
+        }
+        let file = writer.into_inner().map_err(|err| err.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 /// Drop managed derived edges whose source or target is a project file in

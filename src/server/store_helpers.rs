@@ -3,6 +3,7 @@ use anyhow::Context;
 use crate::embed_queue;
 use crate::packets::apply_with as apply_packet_with;
 use crate::server::BlackboxServer;
+#[cfg(test)]
 use crate::server::routes::rebuild_edge_index_from_shared;
 
 impl BlackboxServer {
@@ -159,6 +160,7 @@ impl BlackboxServer {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn rebuild_edge_index_from_stores(&self) -> anyhow::Result<()> {
         // Store mutations only affect structured edges. Re-projecting all
         // Tantivy docs here is a multi-GB path and can stack under concurrent

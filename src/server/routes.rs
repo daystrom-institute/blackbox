@@ -1878,7 +1878,10 @@ pub(crate) fn persist_agent_provenance_edges(
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     let written = edge_index::append_explicit_edges(&edges_dir, "agents", &edges)?;
     if written > 0 {
-        rebuild_edge_index_from_shared(state, false)?;
+        // Persist first and wake the single-flight watcher. An artifact tool
+        // must never synchronously parse the complete project graph merely to
+        // publish a handful of provenance edges.
+        state.nudge_edge_index_rebuild();
     }
     Ok(())
 }
@@ -1948,12 +1951,47 @@ pub(crate) fn rebuild_edge_index_from_shared(
     state: &SharedState,
     include_tantivy_projection: bool,
 ) -> anyhow::Result<()> {
-    if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
-        let rebuilt = build_edge_index_from_shared(state, include_tantivy_projection)?;
+    let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+    let registered_project_ids = state.corpus_registered_project_ids();
+    let prepared = (|| -> anyhow::Result<_> {
+        let authority = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
+        let max_bytes = edge_index_rebuild_max_input_bytes();
+        if authority.signature.bytes > max_bytes {
+            anyhow::bail!(
+                "edge-index rebuild refused: active sidecar input is {} bytes (limit {}); compact/rematerialize the active edge set before retrying",
+                authority.signature.bytes,
+                max_bytes
+            );
+        }
+        let rebuilt = build_edge_index_from_shared_at_authority(
+            state,
+            include_tantivy_projection,
+            &authority.manifest,
+        )?;
         let (selectors, searcher) = {
             let index = state.idx.read();
             (index.refresh_active_code_selectors()?, index.searcher())
         };
+        Ok((authority, rebuilt, selectors, searcher))
+    })();
+    let (authority, rebuilt, selectors, searcher) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = state.code_sources.store().record_health_failure(
+                "_edge_index",
+                "rebuild_failed",
+                &error.to_string(),
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = bbox_edge_sidecar::snapshot::with_manifest_coordinator(|| {
+        let current = capture_edge_rebuild_authority(&edges_dir, Some(&registered_project_ids))?;
+        if current != authority {
+            anyhow::bail!(
+                "edge-index rebuild input changed while it was being parsed; refusing stale publication"
+            );
+        }
         *state.code_read_view.write() = std::sync::Arc::new(super::CodeReadView {
             active_selectors: selectors,
             searcher,
@@ -1964,10 +2002,6 @@ pub(crate) fn rebuild_edge_index_from_shared(
                 &state.store_dir,
             ),
         });
-        state
-            .code_sources
-            .store()
-            .clear_health_failure("_edge_index", "rebuild_failed")?;
         Ok(())
     }) {
         let _ = state.code_sources.store().record_health_failure(
@@ -1978,22 +2012,23 @@ pub(crate) fn rebuild_edge_index_from_shared(
         tracing::error!(%error, "edge-index rebuild manifest coordination failed");
         return Err(error);
     }
+    state
+        .code_sources
+        .store()
+        .clear_health_failure("_edge_index", "rebuild_failed")?;
     Ok(())
 }
 
-pub(crate) fn build_edge_index_from_shared(
+fn build_edge_index_from_shared_at_authority(
     state: &SharedState,
     include_tantivy_projection: bool,
+    authority: &edge_index::SidecarManifestAuthority,
 ) -> anyhow::Result<edge_index::EdgeIndex> {
     let started = std::time::Instant::now();
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
     // F3: the COMPLETE catalog id set, through the one shared accessor that
     // also seeds startup, the storage tools, and the background GC pass.
     let registered_project_ids = state.corpus_registered_project_ids();
-    match bbox_edge_sidecar::manifest::try_load_manifest_index(&edges_dir) {
-        Ok(_) | Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {}
-        Err(reason) => anyhow::bail!("edge manifest is unavailable: {reason:?}"),
-    }
     // The store read-locks cover ONLY the in-memory store projections (fast).
     // The sidecar load below is a multi-GB disk parse and must run with NO
     // store guards held: parking_lot is fair, so a writer queued behind these
@@ -2033,9 +2068,42 @@ pub(crate) fn build_edge_index_from_shared(
         })
         // all store read-guards drop here
     };
-    rebuilt.load_sidecar_edges(&edges_dir, Some(&registered_project_ids), &mut seen, true)?;
+    rebuilt.load_sidecar_edges_from_authority(
+        &edges_dir,
+        Some(&registered_project_ids),
+        &mut seen,
+        true,
+        authority,
+    )?;
     rebuilt.log_rebuilt(include_tantivy_projection, started);
     Ok(rebuilt)
+}
+
+const DEFAULT_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES: usize = 250_000;
+
+fn edge_index_rebuild_max_input_bytes() -> u64 {
+    std::env::var("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES)
+}
+
+fn edge_index_nudge_max_current_edges() -> usize {
+    std::env::var("BLACKBOX_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES)
+}
+
+fn should_rebuild_edge_index(
+    nudged: bool,
+    sidecars_changed: bool,
+    published_edge_count: usize,
+    nudge_limit: usize,
+) -> bool {
+    sidecars_changed || nudged && published_edge_count <= nudge_limit
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2043,69 +2111,156 @@ struct EdgeSidecarSignature {
     files: u64,
     bytes: u64,
     modified_nanos: u128,
+    path_identity: u64,
 }
 
-fn edge_sidecar_signature(edges_dir: &std::path::Path) -> EdgeSidecarSignature {
+#[derive(Debug, Clone, PartialEq)]
+struct EdgeRebuildAuthority {
+    manifest: edge_index::SidecarManifestAuthority,
+    signature: EdgeSidecarSignature,
+}
+
+fn fold_sidecar_path(
+    signature: &mut EdgeSidecarSignature,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    path: &std::path::Path,
+) {
+    use std::hash::{Hash, Hasher};
+
+    if !seen.insert(path.to_path_buf()) {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    signature.files += 1;
+    signature.bytes = signature.bytes.saturating_add(meta.len());
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    signature.modified_nanos = signature.modified_nanos.wrapping_add(modified);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.dev().hash(&mut hasher);
+        meta.ino().hash(&mut hasher);
+    }
+    signature.path_identity ^= hasher.finish();
+}
+
+fn sidecar_project_is_admitted(
+    path: &std::path::Path,
+    registered_project_ids: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let Some(registered) = registered_project_ids else {
+        return true;
+    };
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|project_id| project_id == "agents" || registered.contains(project_id))
+}
+
+fn fold_jsonl_dir(
+    signature: &mut EdgeSidecarSignature,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    dir: &std::path::Path,
+    registered_project_ids: Option<&std::collections::HashSet<String>>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+            && sidecar_project_is_admitted(&path, registered_project_ids)
+        {
+            fold_sidecar_path(signature, seen, &path);
+        }
+    }
+}
+
+fn capture_edge_rebuild_authority(
+    edges_dir: &std::path::Path,
+    registered_project_ids: Option<&std::collections::HashSet<String>>,
+) -> anyhow::Result<EdgeRebuildAuthority> {
+    let manifest = edge_index::SidecarManifestAuthority::capture(edges_dir)?;
     let mut sig = EdgeSidecarSignature {
         files: 0,
         bytes: 0,
         modified_nanos: 0,
+        path_identity: 0,
     };
-    let mut stack = vec![edges_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_dir() {
-                // Skip in-progress materialization temp dirs (`*.write-tmp`):
-                // the overlay/snapshot writer builds the new files there before
-                // an atomic rename, so counting them makes the watcher observe
-                // mid-write churn and rebuild against a half-written overlay.
-                // (Original fix by @benstpierre in PR #3, incorporated here.)
-                if path.extension().is_some_and(|ext| ext == "write-tmp") {
-                    continue;
+    let mut seen = std::collections::HashSet::new();
+
+    match &manifest {
+        edge_index::SidecarManifestAuthority::Manifest(index) => {
+            for loadable in index.active_paths_for_loader(edges_dir)? {
+                fold_sidecar_path(&mut sig, &mut seen, &loadable.path);
+            }
+            // Manifest mode still unions post-migration explicit/observed and
+            // top-level compatibility lanes. No inactive materialized tree is
+            // an input and therefore none belongs in the watcher signature.
+            fold_jsonl_dir(&mut sig, &mut seen, edges_dir, registered_project_ids);
+            fold_jsonl_dir(
+                &mut sig,
+                &mut seen,
+                &edges_dir.join("explicit"),
+                registered_project_ids,
+            );
+            fold_jsonl_dir(
+                &mut sig,
+                &mut seen,
+                &edges_dir.join("observed"),
+                registered_project_ids,
+            );
+        }
+        edge_index::SidecarManifestAuthority::LegacyMissing => {
+            fold_jsonl_dir(&mut sig, &mut seen, edges_dir, registered_project_ids);
+            for lane in ["derived", "explicit", "observed"] {
+                let lane_dir = edges_dir.join(lane);
+                fold_jsonl_dir(&mut sig, &mut seen, &lane_dir, registered_project_ids);
+                if let Ok(entries) = std::fs::read_dir(&lane_dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        if entry.path().is_dir() {
+                            fold_jsonl_dir(
+                                &mut sig,
+                                &mut seen,
+                                &entry.path(),
+                                registered_project_ids,
+                            );
+                        }
+                    }
                 }
-                stack.push(path);
-                continue;
             }
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            sig.files += 1;
-            sig.bytes = sig.bytes.saturating_add(meta.len());
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            sig.modified_nanos = sig.modified_nanos.wrapping_add(modified);
         }
     }
     // Fold in the manifest-index, which records *which* snapshot/overlay is
-    // active per workspace. A branch switch flips the active pointer between two
-    // already-materialized snapshots without changing any `.jsonl` mtime, so the
-    // recursive scan above is blind to it and the in-memory graph would go
-    // stale. The materialization writer rewrites this file exactly when the
-    // active workspace graph changes (writer-side idempotency guard), making its
-    // mtime/len a precise active-pointer change signal. It is `.json`, so the
-    // scan above skipped it — no double counting.
-    if let Ok(meta) = std::fs::metadata(crate::manifest::manifest_index_path(edges_dir)) {
-        sig.bytes = sig.bytes.saturating_add(meta.len());
-        let modified = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        sig.modified_nanos = sig.modified_nanos.wrapping_add(modified);
-    }
-    sig
+    // active per workspace. A branch switch can change only this authority
+    // file while every already-materialized JSONL member keeps its metadata.
+    fold_sidecar_path(
+        &mut sig,
+        &mut seen,
+        &crate::manifest::manifest_index_path(edges_dir),
+    );
+    Ok(EdgeRebuildAuthority {
+        manifest,
+        signature: sig,
+    })
+}
+
+#[cfg(test)]
+fn edge_sidecar_signature(edges_dir: &std::path::Path) -> anyhow::Result<EdgeSidecarSignature> {
+    capture_edge_rebuild_authority(edges_dir, None).map(|authority| authority.signature)
 }
 
 /// Watcher thread that rebuilds the EdgeIndex when edge sidecars change.
@@ -2128,7 +2283,12 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             std::thread::sleep(std::time::Duration::from_secs(20));
             let mut last_seen: u64 = state.idx.read().num_docs();
             let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
-            let mut last_signature = edge_sidecar_signature(&edges_dir);
+            let mut last_signature = capture_edge_rebuild_authority(
+                &edges_dir,
+                Some(&state.corpus_registered_project_ids()),
+            )
+            .ok()
+            .map(|authority| authority.signature);
             loop {
                 let nudged = match &nudge_rx {
                     Some(rx) => match rx.recv_timeout(interval) {
@@ -2143,8 +2303,34 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                     }
                 };
                 let current = state.idx.read().num_docs();
-                let signature = edge_sidecar_signature(&edges_dir);
-                if nudged || signature != last_signature {
+                let registered_project_ids = state.corpus_registered_project_ids();
+                let signature = match capture_edge_rebuild_authority(
+                    &edges_dir,
+                    Some(&registered_project_ids),
+                ) {
+                    Ok(authority) => authority.signature,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            nudged,
+                            "edge-index watcher authority capture failed; keeping the last published graph"
+                        );
+                        last_seen = current;
+                        continue;
+                    }
+                };
+                let sidecars_changed = Some(signature) != last_signature;
+                let published_edge_count = state
+                    .code_read_view
+                    .read()
+                    .edge_index
+                    .edge_count();
+                if should_rebuild_edge_index(
+                    nudged,
+                    sidecars_changed,
+                    published_edge_count,
+                    edge_index_nudge_max_current_edges(),
+                ) {
                     let started = std::time::Instant::now();
                     match rebuild_edge_index_from_shared(&state, false) {
                         Ok(()) => {
@@ -2154,10 +2340,21 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                                 sidecar_files = signature.files,
                                 sidecar_bytes = signature.bytes,
                                 nudged,
+                                sidecars_changed,
                                 elapsed_ms = started.elapsed().as_millis(),
                                 "edge-index watcher: sidecars changed or store nudge, EdgeIndex rebuilt"
                             );
-                            last_signature = signature;
+                            last_signature = capture_edge_rebuild_authority(
+                                &edges_dir,
+                                Some(&state.corpus_registered_project_ids()),
+                            )
+                            .ok()
+                            .map(|authority| authority.signature)
+                            .or(Some(signature));
+                            let _ = state.code_sources.store().clear_health_failure(
+                                "_edge_index",
+                                "store_refresh_deferred",
+                            );
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -2168,6 +2365,21 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                             );
                         }
                     }
+                } else if nudged {
+                    let detail = format!(
+                        "structured-edge refresh deferred: the published graph has {published_edge_count} edges (nudge rebuild limit {}) and sidecar authority did not change",
+                        edge_index_nudge_max_current_edges()
+                    );
+                    let _ = state.code_sources.store().record_health_failure(
+                        "_edge_index",
+                        "store_refresh_deferred",
+                        &detail,
+                    );
+                    tracing::warn!(
+                        published_edge_count,
+                        limit = edge_index_nudge_max_current_edges(),
+                        "edge-index watcher deferred a store-only nudge to avoid rebuilding a large unchanged sidecar graph"
+                    );
                 } else if current != last_seen {
                     let searcher = { state.idx.read().searcher() };
                     state.publish_code_read_searcher(searcher);
@@ -3484,17 +3696,53 @@ mod tests {
         handle.join().unwrap();
     }
 
+    fn signature_test_edge(kind: &str) -> edge_index::Edge {
+        edge_index::Edge {
+            source: entity_ref::EntityRef::Knowledge {
+                id: "source".into(),
+            },
+            kind: kind.into(),
+            target: entity_ref::EntityRef::Knowledge {
+                id: "target".into(),
+            },
+            provenance: chunker::EdgeProvenance::Derived,
+            confidence: chunker::EdgeConfidence::Exact,
+            metadata: Default::default(),
+            project_id: None,
+        }
+    }
+
     #[test]
-    fn edge_sidecar_signature_ignores_write_tmp_dirs() {
+    fn edge_sidecar_signature_ignores_inactive_snapshots_and_write_tmp_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
-        let mat = edges_dir.join("materialized/workspace/p");
-        std::fs::create_dir_all(&mat).unwrap();
-        std::fs::write(mat.join("dirty-current/project.jsonl"), "x").unwrap_or(());
-        std::fs::create_dir_all(mat.join("dirty-current")).unwrap();
-        std::fs::write(mat.join("dirty-current/project.jsonl"), "committed").unwrap();
-        let base = edge_sidecar_signature(edges_dir);
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let base = edge_sidecar_signature(edges_dir).unwrap();
 
+        bbox_edge_sidecar::snapshot::write_snapshot_files(
+            edges_dir,
+            "p",
+            "head-inactive",
+            &[("project.jsonl", &[signature_test_edge("INACTIVE")])],
+        )
+        .unwrap();
+        assert_eq!(
+            base,
+            edge_sidecar_signature(edges_dir).unwrap(),
+            "inactive snapshot bytes are not rebuild inputs"
+        );
+
+        let mat = edges_dir.join("materialized/workspace/p");
         // An in-progress temp dir's jsonl must not move the signature.
         std::fs::create_dir_all(mat.join("dirty-current.write-tmp")).unwrap();
         std::fs::write(
@@ -3504,7 +3752,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             base,
-            edge_sidecar_signature(edges_dir),
+            edge_sidecar_signature(edges_dir).unwrap(),
             "*.write-tmp jsonl must not affect the signature"
         );
     }
@@ -3513,31 +3761,80 @@ mod tests {
     fn edge_sidecar_signature_tracks_manifest_index_active_pointers() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
-        let mi = crate::manifest::manifest_index_path(edges_dir);
-        std::fs::create_dir_all(mi.parent().unwrap()).unwrap();
-
         // Baseline: no manifest-index present.
-        let sig0 = edge_sidecar_signature(edges_dir);
-
-        std::fs::write(&mi, br#"{"version":1,"workspaces":{}}"#).unwrap();
-        let sig1 = edge_sidecar_signature(edges_dir);
-        assert_ne!(
-            sig0, sig1,
-            "manifest-index presence must register in the signature"
-        );
+        let sig0 = edge_sidecar_signature(edges_dir).unwrap();
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("A")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let sig1 = edge_sidecar_signature(edges_dir).unwrap();
+        assert_ne!(sig0, sig1);
 
         // A different active-pointer set — e.g. a branch switch flipping
         // active_snapshot between two already-materialized snapshots — changes
         // no `.jsonl` mtime, so only the manifest-index fold catches it.
-        std::fs::write(
-            &mi,
-            br#"{"version":1,"workspaces":{"p":{"manifest":"m","active_snapshot":"workspace/p/snapshots/head-x"}}}"#,
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            edges_dir,
+            "p",
+            "repo",
+            Some("feature"),
+            "head-b",
+            vec![signature_test_edge("B")],
+            vec![],
+            vec![],
         )
         .unwrap();
-        let sig2 = edge_sidecar_signature(edges_dir);
+        let sig2 = edge_sidecar_signature(edges_dir).unwrap();
         assert_ne!(
             sig1, sig2,
             "active-pointer change must change the signature even with no .jsonl change"
+        );
+    }
+
+    #[test]
+    fn edge_rebuild_refuses_oversized_active_input_before_parsing() {
+        let _env = crate::util::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = SharedState::for_test(&dir.path().join("bro"));
+        let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
+        bbox_edge_sidecar::snapshot::switch_to_clean_snapshot(
+            &edges_dir,
+            "p",
+            "repo",
+            Some("main"),
+            "head-a",
+            vec![signature_test_edge("ACTIVE")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
+        }
+        let error = rebuild_edge_index_from_shared(&state, false).unwrap_err();
+        unsafe {
+            std::env::remove_var("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES");
+        }
+        assert!(
+            error.to_string().contains("active sidecar input"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn store_only_nudge_does_not_rebuild_a_large_unchanged_graph() {
+        assert!(!should_rebuild_edge_index(true, false, 250_001, 250_000));
+        assert!(should_rebuild_edge_index(true, false, 250_000, 250_000));
+        assert!(
+            should_rebuild_edge_index(false, true, usize::MAX, 0),
+            "authority changes still require a rebuild regardless of current graph size"
         );
     }
 

@@ -2543,13 +2543,16 @@ fn resolve_code_project_identity(
 /// landed. The active selector map is already correct (the activation set
 /// it); only the edge index and searcher move.
 fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
-    let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
     let index = state.idx.write();
     let selectors = index.active_code_selectors();
     *state.code_read_view.write() = Arc::new(super::CodeReadView {
         active_selectors: selectors,
         searcher: index.searcher(),
-        edge_index: Arc::new(rebuilt),
+        // Fail closed until the bounded watcher parses the newly selected
+        // sidecars. Keeping the outgoing graph here would expose edges from a
+        // selector this view no longer names; rebuilding inline made this
+        // post-activation path a multi-minute blocking operation.
+        edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
         catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
         // Read AFTER the overlay selector landed in the manifest: this
         // republish is what makes the freshly staged overlay visible to
@@ -2560,6 +2563,7 @@ fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
             &state.store_dir,
         ),
     });
+    state.nudge_edge_index_rebuild();
     Ok(())
 }
 
@@ -4909,7 +4913,6 @@ fn cutback_to_local_single_attempt(
             .worktree_dirty
             .then_some(staged.dirty_fingerprint.as_str()),
         || {
-            let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
             let index = state.idx.write();
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), staged.selector.clone());
@@ -4917,7 +4920,11 @@ fn cutback_to_local_single_attempt(
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
                 searcher: index.searcher(),
-                edge_index: Arc::new(rebuilt),
+                // The callback executes under the manifest coordinator. A
+                // complete sidecar parse here starved every other manifest
+                // publisher in production. Publish no stale graph, release
+                // the coordinator, and let the bounded watcher fill it.
+                edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
                 catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
@@ -4927,6 +4934,7 @@ fn cutback_to_local_single_attempt(
             Ok(())
         },
     )?;
+    state.nudge_edge_index_rebuild();
     if let Some(activation) = store.load_activation_mixed(project_id)? {
         if let Ok(generation) = store.find_generation_mixed(activation.generation_id()) {
             let gen_scope = generation.descriptor().scope.clone();
@@ -5234,7 +5242,6 @@ fn cutback_to_local(
             .worktree_dirty
             .then_some(staged.dirty_fingerprint.as_str()),
         || {
-            let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
             let index = state.idx.write();
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), staged.selector.clone());
@@ -5242,7 +5249,7 @@ fn cutback_to_local(
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
                 searcher: index.searcher(),
-                edge_index: Arc::new(rebuilt),
+                edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
                 catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                 // Inside the manifest coordinator, so this reads the entry
                 // the activation just wrote: the atomic overlay clear.
@@ -5254,6 +5261,7 @@ fn cutback_to_local(
             Ok(())
         },
     )?;
+    state.nudge_edge_index_rebuild();
     if let Some(activation) = store.load_activation_mixed(project_id)? {
         if let Ok(generation) = store.find_generation_mixed(activation.generation_id()) {
             let scope = generation.descriptor().scope.clone();
@@ -5645,7 +5653,6 @@ fn activate_desired_loop(
             &staged.selector,
             &staged.snapshot_id,
             || {
-                let rebuilt = super::routes::build_edge_index_from_shared(state, false)?;
                 let index = state.idx.write();
                 let mut selectors = index.active_code_selectors();
                 selectors.insert(project_id.to_string(), staged.selector.clone());
@@ -5653,7 +5660,7 @@ fn activate_desired_loop(
                 *state.code_read_view.write() = Arc::new(super::CodeReadView {
                     active_selectors: selectors,
                     searcher: index.searcher(),
-                    edge_index: Arc::new(rebuilt),
+                    edge_index: Arc::new(crate::edge_index::EdgeIndex::default()),
                     catalog_epoch: state.records_provider.records_snapshot().authority_epoch,
                     // Inside the manifest coordinator, so this reads the
                     // entry the activation just wrote: activating a new code
@@ -5668,6 +5675,7 @@ fn activate_desired_loop(
                 Ok(())
             },
         )?;
+        state.nudge_edge_index_rebuild();
         tracing::info!(
             project_id,
             generation = %desired_generation_id,

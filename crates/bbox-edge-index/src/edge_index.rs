@@ -66,6 +66,27 @@ pub struct EdgeStoreRefs<'a> {
     pub include_observed: bool,
 }
 
+/// Manifest authority captured for one sidecar rebuild. Rebuild callers can
+/// parse immutable snapshot members outside the global manifest coordinator,
+/// then compare this value with a fresh capture before publishing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SidecarManifestAuthority {
+    Manifest(bbox_edge_sidecar::manifest::ManifestIndex),
+    LegacyMissing,
+}
+
+impl SidecarManifestAuthority {
+    pub fn capture(edges_dir: &Path) -> Result<Self> {
+        match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
+            Ok(index) => Ok(Self::Manifest(index)),
+            Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {
+                Ok(Self::LegacyMissing)
+            }
+            Err(reason) => anyhow::bail!("active edge manifest is unavailable: {reason:?}"),
+        }
+    }
+}
+
 impl EdgeIndex {
     pub fn rebuild(stores: &EdgeStoreRefs<'_>) -> Result<Self> {
         Self::rebuild_admitting_fully_absent(stores, &BTreeSet::new())
@@ -155,8 +176,46 @@ impl EdgeIndex {
         include_observed: bool,
         admitted_absent_projects: &BTreeSet<String>,
     ) -> Result<()> {
-        match bbox_edge_sidecar::manifest::try_load_manifest_index(edges_dir) {
-            Ok(manifest_index) => {
+        let authority = SidecarManifestAuthority::capture(edges_dir)?;
+        self.load_sidecar_edges_from_authority_admitting_fully_absent(
+            edges_dir,
+            registered_project_ids,
+            seen,
+            include_observed,
+            admitted_absent_projects,
+            &authority,
+        )
+    }
+
+    pub fn load_sidecar_edges_from_authority(
+        &mut self,
+        edges_dir: &Path,
+        registered_project_ids: Option<&HashSet<String>>,
+        seen: &mut HashSet<EdgeKey>,
+        include_observed: bool,
+        authority: &SidecarManifestAuthority,
+    ) -> Result<()> {
+        self.load_sidecar_edges_from_authority_admitting_fully_absent(
+            edges_dir,
+            registered_project_ids,
+            seen,
+            include_observed,
+            &BTreeSet::new(),
+            authority,
+        )
+    }
+
+    fn load_sidecar_edges_from_authority_admitting_fully_absent(
+        &mut self,
+        edges_dir: &Path,
+        registered_project_ids: Option<&HashSet<String>>,
+        seen: &mut HashSet<EdgeKey>,
+        include_observed: bool,
+        admitted_absent_projects: &BTreeSet<String>,
+        authority: &SidecarManifestAuthority,
+    ) -> Result<()> {
+        match authority {
+            SidecarManifestAuthority::Manifest(manifest_index) => {
                 let loadable = manifest_index.active_paths_for_loader_admitting_fully_absent(
                     edges_dir,
                     admitted_absent_projects,
@@ -173,7 +232,7 @@ impl EdgeIndex {
                     "loaded edges via manifest-index"
                 );
             }
-            Err(bbox_edge_sidecar::manifest::ManifestFallbackReason::MissingNotMigrated) => {
+            SidecarManifestAuthority::LegacyMissing => {
                 self.project_sidecar_edges(
                     edges_dir,
                     registered_project_ids,
@@ -181,7 +240,6 @@ impl EdgeIndex {
                     include_observed,
                 );
             }
-            Err(reason) => anyhow::bail!("active edge manifest is unavailable: {reason:?}"),
         }
         Ok(())
     }
@@ -2222,7 +2280,11 @@ mod tests {
 
         replace_materialized_edges(dir.path(), "project", "p1", &[second.clone(), second]).unwrap();
         let content2 = fs::read_to_string(&sidecar_path).unwrap();
-        assert_eq!(content2.lines().count(), 2, "replacement must not append");
+        assert_eq!(
+            content2.lines().count(),
+            1,
+            "managed replacement is a set and must not persist duplicates"
+        );
     }
 
     #[test]
@@ -2348,6 +2410,42 @@ mod tests {
             content.lines().count(),
             1,
             "repeated replacement must not grow line count"
+        );
+    }
+
+    #[test]
+    fn incremental_materialized_replace_stream_deduplicates_preserved_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let managed = managed_derived_edges_dir(edges_dir).join("project");
+        fs::create_dir_all(&managed).unwrap();
+
+        let preserved = Edge {
+            source: EntityRef::Knowledge { id: "old".into() },
+            kind: "RELATES_TO".into(),
+            target: EntityRef::Knowledge {
+                id: "target".into(),
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: Default::default(),
+            project_id: None,
+        };
+        let serialized = serde_json::to_string(&preserved).unwrap();
+        fs::write(
+            managed.join("p1.jsonl"),
+            format!("{serialized}\n{serialized}\n{serialized}\n"),
+        )
+        .unwrap();
+
+        let new_edge = derived_chunker_edge("CALLS");
+        replace_materialized_edges_incremental(edges_dir, "project", "p1", &[new_edge]).unwrap();
+
+        let content = fs::read_to_string(managed.join("p1.jsonl")).unwrap();
+        assert_eq!(
+            content.lines().count(),
+            2,
+            "three duplicate preserved rows collapse to one beside the new edge"
         );
     }
 

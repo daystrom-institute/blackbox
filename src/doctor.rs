@@ -1061,24 +1061,18 @@ fn index_section(state: &crate::server::state::SharedState) -> SectionReport {
     }
 }
 
-fn vectors_section(state: &crate::server::state::SharedState) -> SectionReport {
-    let mut findings = match crate::embed_runtime::status_response_for_state(state) {
-        Ok(response) => {
-            if response.routes.is_empty() {
-                vec![Finding::info("no embedding routes active yet")]
-            } else {
-                response
-                    .routes
-                    .iter()
-                    .map(|(route, status)| classify_embed_route(route, status))
-                    .collect()
-            }
-        }
-        Err(err) => vec![Finding::warn(format!(
-            "embedding status unavailable: {err:#}"
-        ))],
+fn vectors_section(_state: &crate::server::state::SharedState) -> SectionReport {
+    let response = crate::embed_runtime::status_response_for_doctor();
+    let mut findings = if response.routes.is_empty() {
+        vec![Finding::info("no embedding routes active yet")]
+    } else {
+        response
+            .routes
+            .iter()
+            .map(|(route, status)| classify_embed_route(route, status))
+            .collect()
     };
-    match bbox_vectors::try_metrics() {
+    match bbox_vectors::metrics_nonblocking() {
         // No installed vector store means there is no loaded partition
         // inventory to diagnose yet. This is the same cold/empty state as the
         // embedding status above, not a route whose health was fabricated.
@@ -1087,7 +1081,7 @@ fn vectors_section(state: &crate::server::state::SharedState) -> SectionReport {
             let routes = metrics.into_keys().take(64).collect::<Vec<_>>();
             match bbox_vectors::try_diagnostics_bounded(
                 &routes,
-                std::time::Duration::from_millis(2_000),
+                std::time::Duration::from_millis(250),
             ) {
                 None => findings.push(Finding::warn(
                     "vector connectivity diagnostics unavailable: store is warming up",

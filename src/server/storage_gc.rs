@@ -4,6 +4,7 @@ use crate::server::SharedState;
 use crate::storage_health;
 
 const DEFAULT_STORAGE_GC_INTERVAL_SECS: u64 = 6 * 60 * 60;
+const DEFAULT_STORAGE_GC_INITIAL_DELAY_SECS: u64 = 5;
 
 /// Age floor for the maintenance pass's inactive-snapshot pruning. The
 /// interactive `bbox_storage_gc` default (14d) let per-commit snapshot churn
@@ -22,6 +23,14 @@ pub(crate) fn storage_gc_interval_from_env() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+fn storage_gc_initial_delay_from_env() -> std::time::Duration {
+    let secs = std::env::var("BLACKBOX_STORAGE_GC_INITIAL_DELAY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STORAGE_GC_INITIAL_DELAY_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// `BLACKBOX_STORAGE_GC_SNAPSHOT_MAX_AGE_DAYS` overrides the maintenance
 /// pass's snapshot age floor. `0` disables age-based retention entirely
 /// (keep-recent rules still protect the newest snapshots).
@@ -37,9 +46,11 @@ pub(crate) fn spawn_storage_gc_thread(state: Arc<SharedState>, interval: std::ti
         .name("blackbox-storage-gc".into())
         .spawn(move || {
             let _scope = crate::util::BlockingScope::enter();
-            // Avoid competing with startup rebuilds, watcher initialization, and
-            // client handshakes. Operators can still run bbox_storage_gc manually.
-            std::thread::sleep(interval);
+            // Bound retained caches before the edge watcher takes its initial
+            // signature. Sleeping the full six-hour maintenance interval let
+            // an already-oversized sidecar estate drive the first rebuild into
+            // memory pressure long before GC got a chance to act.
+            std::thread::sleep(storage_gc_initial_delay_from_env());
             loop {
                 if let Err(err) = run_storage_gc_pass(&state) {
                     tracing::warn!(error = %err, "storage GC maintenance pass failed");
