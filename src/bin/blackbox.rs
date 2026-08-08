@@ -165,6 +165,9 @@ struct ScopeMigrateArgs {
     /// The offline unattached channel. The only supported mode.
     #[arg(long, required = true)]
     operator_attested: bool,
+    /// Validate the complete post-image pair without committing it.
+    #[arg(long)]
+    dry_run: bool,
     #[arg(long, value_name = "PROJECT_ID")]
     project: String,
     #[arg(long, value_name = "REPO_ID")]
@@ -2280,10 +2283,15 @@ fn execute_scope_migrate(args: ScopeMigrateArgs) -> Result<serde_json::Value, Co
         epoch,
         &request,
         args.acknowledge_unattached_scope_migration,
+        args.dry_run,
     )?;
     Ok(serde_json::json!({
-        "scope_migration_id": receipt.scope_migration_id.as_str(),
-        "epoch": receipt.commit.epoch,
+        "status": if receipt.is_some() { "applied" } else { "dry_run" },
+        "dry_run": args.dry_run,
+        "scope_migration_id": receipt
+            .as_ref()
+            .map(|receipt| receipt.scope_migration_id.as_str()),
+        "epoch": receipt.as_ref().map(|receipt| receipt.commit.epoch),
     }))
 }
 

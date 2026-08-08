@@ -599,6 +599,53 @@ fn admin_subcommands_round_trip_on_an_isolated_v2_store() {
     ]));
     assert_eq!(accepted["result"]["accepted"], Value::Bool(true));
 
+    // The attested channel supports the runbook's mandatory rehearsal and
+    // leaves the exact catalog pair untouched.
+    let dry = success_json(&run(&[
+        "project-catalog",
+        "scope-migrate",
+        "--projects-path",
+        projects,
+        "--operator-attested",
+        "--dry-run",
+        "--project",
+        &project_id,
+        "--expected-old-repo",
+        "clifamily",
+        "--expected-old-relpath",
+        ".",
+        "--new-repo",
+        "clifamily",
+        "--new-relpath",
+        "svc/api",
+        "--kind",
+        "relpath-move",
+        "--acknowledge-unattached-scope-migration",
+        "--reason",
+        "relocating the remote-only service root",
+        "--migrated-at",
+        "2026-07-24T00:00:02Z",
+        "--config",
+        config,
+    ]));
+    assert_eq!(dry["result"]["status"], "dry_run");
+    assert_eq!(dry["result"]["dry_run"], true);
+    let after_dry_run = ProjectCatalogStore::open_existing(&projects_path)
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(after_dry_run.catalog().scope_migrations.is_empty());
+    assert!(matches!(
+        &after_dry_run
+            .catalog()
+            .projects
+            .get(&ProjectId::parse(project_id.clone()).unwrap())
+            .unwrap()
+            .scope,
+        bbox_corpus_core::project_catalog::ProjectScope::Published(scope)
+            if scope.bbox_root_relpath() == "."
+    ));
+
     // Attested relpath move on the remote-only project.
     let migrated = success_json(&run(&[
         "project-catalog",

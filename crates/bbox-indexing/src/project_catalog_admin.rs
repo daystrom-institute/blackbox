@@ -1888,7 +1888,8 @@ pub fn scope_migrate_attested(
     expected_epoch: u64,
     request: &ScopeMigrationRequest,
     acknowledge_unattached_scope_migration: bool,
-) -> AdminResult<ScopeTransitionReceipt> {
+    dry_run: bool,
+) -> AdminResult<Option<ScopeTransitionReceipt>> {
     use bbox_corpus_core::project_catalog::{
         RecordedRepoAuthority, RepoHistoryAuthority, ScopeMigrationAuthorityProvenance,
         ScopeMigrationId, ScopeMigrationKind, ScopeMigrationRecord,
@@ -1916,7 +1917,13 @@ pub fn scope_migrate_attested(
     let migration_id = ScopeMigrationId::mint();
     let receipt_id = migration_id.clone();
     let request = request.clone();
-    let commit = store.transact(expected_epoch, move |catalog, attachments| {
+    fn apply_attested_scope_migration(
+        catalog: &mut bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+        attachments: &mut bbox_corpus_core::project_catalog::AttachmentSnapshotV1,
+        request: &ScopeMigrationRequest,
+        receipt_id: &ScopeMigrationId,
+        new_epoch: u64,
+    ) -> AdminResult<()> {
         if attachments.attachments.values().any(|row| {
             row.status == AttachmentStatus::Attached && row.project_id == request.project_id
         }) {
@@ -2035,11 +2042,45 @@ pub fn scope_migrate_attested(
             },
         );
         Ok(())
+    }
+
+    if dry_run {
+        let state = store.snapshot()?;
+        if state.epoch() != expected_epoch {
+            return Err(admin_error(
+                "error.project_catalog_stale_epoch",
+                "expected epoch does not match the current catalog epoch",
+            ));
+        }
+        let mut catalog = (**state.catalog()).clone();
+        let mut attachments = (**state.attachments()).clone();
+        apply_attested_scope_migration(
+            &mut catalog,
+            &mut attachments,
+            &request,
+            &receipt_id,
+            new_epoch,
+        )?;
+        catalog.epoch = new_epoch;
+        attachments.epoch = new_epoch;
+        catalog
+            .validate()
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+        attachments
+            .validate()
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+        bbox_corpus_core::project_catalog::validate_catalog_attachments(&catalog, &attachments)
+            .map_err(|error| admin_error(error.code(), error.to_string()))?;
+        return Ok(None);
+    }
+
+    let commit = store.transact(expected_epoch, move |catalog, attachments| {
+        apply_attested_scope_migration(catalog, attachments, &request, &receipt_id, new_epoch)
     })?;
-    Ok(ScopeTransitionReceipt {
+    Ok(Some(ScopeTransitionReceipt {
         scope_migration_id: migration_id,
         commit,
-    })
+    }))
 }
 
 /// Bridge-clear transaction: null `code_bridge_generation` on a
@@ -5501,19 +5542,31 @@ mod tests {
         };
 
         // Acknowledgement and reason are both mandatory.
-        let error =
-            scope_migrate_attested(&store, current_epoch(&store), &request, false).unwrap_err();
+        let error = scope_migrate_attested(&store, current_epoch(&store), &request, false, false)
+            .unwrap_err();
         assert_eq!(
             error.code(),
             "error.project_catalog_admin_acknowledgement_required"
         );
-        let error =
-            scope_migrate_attested(&store, current_epoch(&store), &request, true).unwrap_err();
+        let error = scope_migrate_attested(&store, current_epoch(&store), &request, true, false)
+            .unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_admin_reason_required");
 
         request.operator_reason = Some("relocating the remote-only service root".into());
-        let receipt =
-            scope_migrate_attested(&store, current_epoch(&store), &request, true).unwrap();
+        let before = store.snapshot().unwrap();
+        assert!(
+            scope_migrate_attested(&store, before.epoch(), &request, true, true)
+                .unwrap()
+                .is_none()
+        );
+        let after_dry_run = store.snapshot().unwrap();
+        assert_eq!(after_dry_run.epoch(), before.epoch());
+        assert_eq!(after_dry_run.catalog_sha256(), before.catalog_sha256());
+        assert!(after_dry_run.catalog().scope_migrations.is_empty());
+
+        let receipt = scope_migrate_attested(&store, current_epoch(&store), &request, true, false)
+            .unwrap()
+            .expect("non-dry attested migration commits");
         let state = store.snapshot().unwrap();
         let record = state
             .catalog()
@@ -5550,8 +5603,14 @@ mod tests {
         let mut attached_request = request.clone();
         attached_request.project_id = legacy_id;
         attached_request.expected_old_scope = new_scope.clone();
-        let error = scope_migrate_attested(&store, current_epoch(&store), &attached_request, true)
-            .unwrap_err();
+        let error = scope_migrate_attested(
+            &store,
+            current_epoch(&store),
+            &attached_request,
+            true,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(
             error.code(),
             "error.project_catalog_admin_attachments_active"
