@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use bbox_util::util;
 
+const MAX_COMMITTED_PROJECT_CONFIG_BYTES: usize = 1024 * 1024;
+
 /// Default configuration path: $XDG_CONFIG_HOME/blackbox/config.toml
 pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("blackbox").join("config.toml"))
@@ -1180,13 +1182,18 @@ fn committed_project_config_source(
 ) -> Result<(String, String, String)> {
     let git_root = bbox_corpus_core::git::git_root_for_path(project_root)
         .with_context(|| format!("{} is not inside a git repository", project_root.display()))?;
-    let commit =
-        bbox_corpus_core::git::resolve_commit(&git_root, reference).with_context(|| {
-            format!(
-                "project authority ref {reference} does not resolve to a commit in {}",
-                git_root.display()
-            )
-        })?;
+    let git_root_directory =
+        bbox_corpus_core::json_store::NofollowDirectory::open_existing(&git_root)?
+            .with_context(|| format!("Git root {} disappeared", git_root.display()))?;
+    let repository = bbox_corpus_core::git::open_stable_git_repository(&git_root_directory)?
+        .with_context(|| format!("{} is not a stable Git repository", git_root.display()))?;
+    let commit = repository.resolve_commit_oid(reference)?.with_context(|| {
+        format!(
+            "project authority ref {reference} does not resolve to a commit in {}",
+            git_root.display()
+        )
+    })?;
+    let verified_commit = repository.verify_commit_oid(&commit)?;
     let bbox_root_relpath = bbox_corpus_core::identity::bbox_root_relpath(&git_root, project_root)
         .with_context(|| {
             format!(
@@ -1200,11 +1207,14 @@ fn committed_project_config_source(
     } else {
         format!("{bbox_root_relpath}/.bbox/config.toml")
     };
-    let bytes =
-        bbox_corpus_core::git::read_committed_file_bytes(&git_root, &commit, &config_relpath)
-            .with_context(|| {
-                format!("committed project config {config_relpath} is missing at {commit}")
-            })?;
+    let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+        &verified_commit,
+        &config_relpath,
+        MAX_COMMITTED_PROJECT_CONFIG_BYTES,
+    )
+    .with_context(|| {
+        format!("committed project config {config_relpath} is missing or unsafe at {commit}")
+    })?;
     let source = String::from_utf8(bytes)
         .with_context(|| format!("decoding committed project config {config_relpath}@{commit}"))?;
     Ok((source, config_relpath, commit))

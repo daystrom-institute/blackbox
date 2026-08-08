@@ -246,6 +246,35 @@ impl StableGitRepository {
         }
     }
 
+    /// Return one commit reachable from any repository ref, when one exists.
+    ///
+    /// This is the empty-repository proof used by durable identity minting:
+    /// an unreadable or unborn HEAD permits a random id only when the captured
+    /// repository authority has no commit reachable from any ref.
+    pub fn any_commit_oid(&self) -> Result<Option<String>> {
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            let bytes = run_stable_repository_stdout_bounded(
+                &self.authority,
+                &["rev-list", "--max-count=1", "--all"],
+                "proving whether stable repository history is empty",
+                128,
+            )?;
+            let oid = std::str::from_utf8(&bytes)
+                .context("stable repository history probe is not UTF-8")?
+                .trim();
+            if oid.is_empty() {
+                return Ok(None);
+            }
+            validate_full_object_id(oid)?;
+            Ok(Some(oid.to_string()))
+        }
+    }
+
     pub fn snapshot_notes_bounded(
         &self,
         notes_ref: &str,
@@ -532,6 +561,37 @@ pub fn git_first_commit_for_path(path: &Path) -> Option<String> {
         return None;
     }
     git_first_commit_from_stdout(&output.stdout)
+}
+
+/// Derive the first commit for durable identity minting without collapsing a
+/// Git failure into an empty repository.
+///
+/// `Ok(None)` is returned only after an exact-environment `--all` probe proves
+/// that the repository contains no commits. Replacement objects and ambient
+/// Git authority are disabled, so a repository cannot choose a different
+/// durable family id through `refs/replace` or inherited process state.
+pub fn git_first_commit_for_path_strict(path: &Path) -> Result<Option<String>> {
+    let directory = NofollowDirectory::open_existing(path)?
+        .with_context(|| format!("repository root {} disappeared", path.display()))?;
+    let repository = open_stable_git_repository(&directory)?
+        .with_context(|| format!("{} is not a stable Git repository", path.display()))?;
+    if let Some(head) = repository.verified_head()? {
+        return Ok(Some(
+            repository
+                .first_commit_oid(head.oid())?
+                .context("Git reported a commit HEAD but no first commit")?,
+        ));
+    }
+
+    // An unborn HEAD is the only state that may lawfully mint a random id.
+    // Prove the whole captured repository has no commits; if any ref is
+    // readable, the absent HEAD is corruption and minting refuses.
+    if repository.any_commit_oid()?.is_some() {
+        anyhow::bail!(
+            "HEAD could not be read even though the repository contains commits; refusing to mint repo_id"
+        );
+    }
+    Ok(None)
 }
 
 pub fn git_first_commit_from_stdout(stdout: &[u8]) -> Option<String> {
@@ -862,6 +922,11 @@ pub fn open_stable_git_repository(
                     let objects = git_dir
                         .open_directory_optional("objects", "stable Git object directory")?
                         .context("stable Git object directory is missing")?;
+                    if configured_alternates_exist(&objects)? {
+                        anyhow::bail!(
+                            "stable repository reads do not honor repository-configured object alternates"
+                        );
+                    }
                     break Some(StableRepositoryAuthority {
                         root: worktree.path.clone(),
                         worktree,
@@ -2814,6 +2879,7 @@ pub fn parse_commit_log(stdout: &[u8]) -> Result<Vec<GitCommit>> {
 /// every metadata/log invocation these helpers make against healthy repos.
 const GIT_OUTPUT_TIMEOUT: Duration = Duration::from_secs(10);
 const GIT_STDERR_RETAINED_LIMIT: usize = 64 * 1024;
+const GIT_STDOUT_RETAINED_LIMIT: usize = 128 * 1024 * 1024;
 
 struct BoundedGitOutput {
     status: std::process::ExitStatus,
@@ -2986,7 +3052,23 @@ fn git_output_strings(path: &Path, args: &[String], action: &'static str) -> Opt
 // I/O (writer actor passes, resolver memo fills) - never a tokio worker
 // hot path; the deadline is the point of this helper.
 fn run_git_bounded(cmd: Command, path: &Path, action: &'static str) -> Option<Output> {
-    run_bounded_with_timeout(cmd, path, action, GIT_OUTPUT_TIMEOUT)
+    let output = run_bounded_with_timeout_and_stdout_limit(
+        cmd,
+        path,
+        action,
+        GIT_OUTPUT_TIMEOUT,
+        Some(GIT_STDOUT_RETAINED_LIMIT),
+    )?;
+    if output.stdout_overflowed {
+        tracing::warn!(
+            path = %path.display(),
+            action,
+            limit_bytes = GIT_STDOUT_RETAINED_LIMIT,
+            "git stdout exceeded the compatibility helper limit"
+        );
+        return None;
+    }
+    Some(output.into_output())
 }
 
 fn run_git_bounded_with_stdin(
@@ -3001,9 +3083,21 @@ fn run_git_bounded_with_stdin(
         action,
         GIT_OUTPUT_TIMEOUT,
         Some(stdin),
-        None,
+        Some(GIT_STDOUT_RETAINED_LIMIT),
     )
-    .map(BoundedGitOutput::into_output)
+    .and_then(|output| {
+        if output.stdout_overflowed {
+            tracing::warn!(
+                path = %path.display(),
+                action,
+                limit_bytes = GIT_STDOUT_RETAINED_LIMIT,
+                "git stdout exceeded the compatibility helper limit"
+            );
+            None
+        } else {
+            Some(output.into_output())
+        }
+    })
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -4372,6 +4466,22 @@ mod tests {
         fs::write(root.join(".git"), "gitdir: /outside/repository\n").unwrap();
         let authority = NofollowDirectory::open_existing(&root).unwrap().unwrap();
         assert!(open_stable_git_repository(&authority).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_repository_rejects_configured_object_alternates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        init_repo(&root);
+        let info = root.join(".git/objects/info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("alternates"), "/outside/objects\n").unwrap();
+
+        let authority = NofollowDirectory::open_existing(&root).unwrap().unwrap();
+        let error = open_stable_git_repository(&authority)
+            .expect_err("configured alternates must not enter stable authority");
+        assert!(error.to_string().contains("object alternates"), "{error}");
     }
 
     #[cfg(unix)]

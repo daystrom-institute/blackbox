@@ -69,6 +69,10 @@ pub enum RepoIdMintError {
     /// The path is not inside a git repository, so there is no first commit to
     /// anchor a repo-family id.
     NotAGitRepo,
+    /// Git could not prove either a first commit or an actually empty
+    /// repository. Minting random authority here would turn a transient read
+    /// failure into a permanent cross-host identity split.
+    GitAuthorityUnavailable(String),
 }
 
 impl std::fmt::Display for RepoIdMintError {
@@ -82,6 +86,10 @@ impl std::fmt::Display for RepoIdMintError {
             RepoIdMintError::NotAGitRepo => {
                 f.write_str("refusing to mint repo_id: path is not inside a git repository")
             }
+            RepoIdMintError::GitAuthorityUnavailable(detail) => write!(
+                f,
+                "refusing to mint repo_id because Git authority is unavailable: {detail}"
+            ),
         }
     }
 }
@@ -112,7 +120,9 @@ pub fn mint_repo_id(git_root: &Path) -> std::result::Result<RepoIdMint, RepoIdMi
     if git::is_shallow_repository(git_root) {
         return Err(RepoIdMintError::Shallow);
     }
-    match git::git_first_commit_for_path(git_root) {
+    match git::git_first_commit_for_path_strict(git_root)
+        .map_err(|error| RepoIdMintError::GitAuthorityUnavailable(error.to_string()))?
+    {
         Some(sha) => Ok(RepoIdMint::FirstCommit(sha)),
         None => Ok(RepoIdMint::Random(random_hex())),
     }
@@ -486,6 +496,17 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn output(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
     #[test]
     fn mint_returns_full_first_commit_sha() {
         let dir = tempfile::tempdir().unwrap();
@@ -519,6 +540,33 @@ mod tests {
             RepoIdMint::Random(v) => assert_eq!(v.len(), 32),
             other => panic!("expected Random, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mint_refuses_an_unreadable_head_when_other_commits_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_git_repo(&root, false, true);
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/missing\n").unwrap();
+
+        let error = mint_repo_id(&root).expect_err("a Git failure must not mint random authority");
+        assert!(matches!(error, RepoIdMintError::GitAuthorityUnavailable(_)));
+    }
+
+    #[test]
+    fn mint_ignores_replacement_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        init_git_repo(&root, false, true);
+        let RepoIdMint::FirstCommit(first) = mint_repo_id(&root).expect("initial mint") else {
+            panic!("committed repository must mint from history");
+        };
+        std::fs::write(root.join("f.txt"), "second").unwrap();
+        run(&root, &["commit", "-q", "-am", "second"]);
+        let second = output(&root, &["rev-parse", "HEAD"]);
+        run(&root, &["replace", &first, &second]);
+
+        assert_eq!(mint_repo_id(&root), Ok(RepoIdMint::FirstCommit(first)));
     }
 
     #[test]
