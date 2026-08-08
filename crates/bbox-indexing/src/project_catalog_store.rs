@@ -38,8 +38,9 @@ use bbox_corpus_core::project_catalog::{
     AttachmentId, AttachmentSnapshotV1, AttachmentStatus, CatalogOriginV2, CatalogSnapshotV2,
     CheckoutAttachment, MAX_LEGACY_PROJECT_STORE_BYTES, MAX_PROJECT_CATALOG_BYTES,
     MAX_PROJECT_CATALOG_ENTRIES, ProjectCatalogTransactionId, ProjectId, ProjectScope,
-    decode_attachment_snapshot, decode_catalog_snapshot, decode_legacy_project_store,
-    encode_attachment_snapshot, encode_catalog_snapshot, validate_catalog_attachments,
+    RepoHistoryId, decode_attachment_snapshot, decode_catalog_snapshot,
+    decode_legacy_project_store, encode_attachment_snapshot, encode_catalog_snapshot,
+    validate_catalog_attachments,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -89,6 +90,90 @@ const MAX_LEGACY_PUBLISHER_REF_SOURCE_BYTES: usize = MAX_PROJECT_CATALOG_BYTES;
 const MAX_LEGACY_COMMIT_NAMESPACE_INVENTORY_ASSET_BYTES: usize = MAX_PROJECT_CATALOG_BYTES;
 
 pub type ProjectCatalogStoreResult<T> = Result<T, ProjectCatalogStoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoHistoryMembershipProjectionRow {
+    project_id: ProjectId,
+    scope: ProjectScope,
+    repo_history_id: RepoHistoryId,
+}
+
+fn repo_history_membership_projection(
+    catalog: &CatalogSnapshotV2,
+) -> BTreeMap<RepoHistoryId, Vec<RepoHistoryMembershipProjectionRow>> {
+    let mut projection = BTreeMap::<RepoHistoryId, Vec<RepoHistoryMembershipProjectionRow>>::new();
+    for (project_id, project) in &catalog.projects {
+        let Some(repo_history_id) = project.repo_history.as_ref() else {
+            continue;
+        };
+        projection.entry(repo_history_id.clone()).or_default().push(
+            RepoHistoryMembershipProjectionRow {
+                project_id: project_id.clone(),
+                scope: project.scope.clone(),
+                repo_history_id: repo_history_id.clone(),
+            },
+        );
+    }
+    projection
+}
+
+fn advance_repo_history_membership_generations(
+    before: &CatalogSnapshotV2,
+    after: &mut CatalogSnapshotV2,
+) -> ProjectCatalogStoreResult<()> {
+    for (repo_history_id, before_record) in &before.repo_histories {
+        if let Some(after_record) = after.repo_histories.get(repo_history_id)
+            && after_record.membership_generation != before_record.membership_generation
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_owner_field_mutation",
+                format!(
+                    "transaction closure changed membership_generation for repo history {repo_history_id}"
+                ),
+            ));
+        }
+    }
+    for (repo_history_id, after_record) in &after.repo_histories {
+        if !before.repo_histories.contains_key(repo_history_id)
+            && after_record.membership_generation != 0
+        {
+            return Err(ProjectCatalogStoreError::new(
+                "error.project_catalog_owner_field_mutation",
+                format!(
+                    "new repo history {repo_history_id} did not enter with membership_generation zero"
+                ),
+            ));
+        }
+    }
+
+    let before_projection = repo_history_membership_projection(before);
+    let after_projection = repo_history_membership_projection(after);
+    let affected = before_projection
+        .keys()
+        .chain(after_projection.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for repo_history_id in affected {
+        if before_projection.get(&repo_history_id) == after_projection.get(&repo_history_id) {
+            continue;
+        }
+        let Some(record) = after.repo_histories.get_mut(&repo_history_id) else {
+            continue;
+        };
+        record.membership_generation = record
+            .membership_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_membership_generation_overflow",
+                    format!(
+                        "membership generation cannot be incremented for repo history {repo_history_id}"
+                    ),
+                )
+            })?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MigrationMutationDispositionV1 {
@@ -831,6 +916,7 @@ impl ProjectCatalogStore {
                 "transaction closure changed owner-controlled fields",
             ));
         }
+        advance_repo_history_membership_generations(&base.catalog, &mut catalog)?;
         let new_project_ids: BTreeSet<ProjectId> = catalog.projects.keys().cloned().collect();
         let old_project_ids: BTreeSet<ProjectId> = old_projects.keys().cloned().collect();
         // Compute changed project ids before catalog moves into candidate
@@ -10178,9 +10264,10 @@ mod tests {
         ATTACHMENT_VERSION_V1, AttachmentCapabilities, AttachmentId, AttachmentKind,
         AttachmentStatus, CATALOG_VERSION_V2, CheckoutAttachment, CorpusProject,
         LegacyPathBindingId, LegacyPathBindingStatus, LegacyPathLedgerEntry, LegacyProjectRecordV1,
-        LegacyProjectStoreV1, ProjectScope, ScopeMigrationAttachmentProof,
-        ScopeMigrationAuthorityProvenance, ScopeMigrationId, ScopeMigrationKind,
-        ScopeMigrationRecord,
+        LegacyProjectStoreV1, ProjectScope, RecordedRepoAuthority, RepoHistoryAuthority,
+        RepoHistoryGenerationId, RepoHistoryMaterialization, RepoHistoryRecord,
+        ScopeMigrationAttachmentProof, ScopeMigrationAuthorityProvenance, ScopeMigrationId,
+        ScopeMigrationKind, ScopeMigrationRecord,
     };
     use bbox_stores::store_persister::StorePersister;
 
@@ -10663,6 +10750,43 @@ mod tests {
             },
         );
         Ok(())
+    }
+
+    fn membership_history(
+        repo_history_id: RepoHistoryId,
+        authority: &str,
+        namespace: &str,
+    ) -> RepoHistoryRecord {
+        RepoHistoryRecord {
+            repo_history_id,
+            membership_generation: 0,
+            authority: RepoHistoryAuthority::Recorded(
+                RecordedRepoAuthority::parse(authority).unwrap(),
+            ),
+            primary_namespace: bbox_corpus_core::project_catalog::CommitNamespace::parse(namespace)
+                .unwrap(),
+            compatibility_namespaces: BTreeSet::new(),
+            materialization: RepoHistoryMaterialization::NotBuilt,
+        }
+    }
+
+    fn membership_project(
+        project_id: ProjectId,
+        repo_history_id: RepoHistoryId,
+        authority: &str,
+        relpath: &str,
+    ) -> CorpusProject {
+        CorpusProject {
+            project_id,
+            scope: ProjectScope::Published(PublishedScope::try_new(authority, relpath).unwrap()),
+            operator_aliases: BTreeSet::new(),
+            nominated_aliases: BTreeSet::new(),
+            display_name: "Membership fixture".into(),
+            created_at: "2026-08-08T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: Some(repo_history_id),
+            languages: BTreeSet::new(),
+        }
     }
 
     fn basic_migration_draft(
@@ -12256,6 +12380,213 @@ mod tests {
                 .legacy_path_bindings
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn transact_owns_repo_history_membership_generation() {
+        let (_directory, path) = projects_path();
+        let store = ProjectCatalogStore::initialize_empty(path).unwrap();
+        let first_history = RepoHistoryId::parse("rh_00000000000000000000000000000011").unwrap();
+        let second_history = RepoHistoryId::parse("rh_00000000000000000000000000000022").unwrap();
+        let first_project = ProjectId::parse("membership-one").unwrap();
+        let second_project = ProjectId::parse("membership-two").unwrap();
+
+        let history = membership_history(first_history.clone(), "repo-one", "repo-one");
+        let project = membership_project(
+            first_project.clone(),
+            first_history.clone(),
+            "repo-one",
+            ".",
+        );
+        store
+            .transact(1, |catalog, _| {
+                catalog
+                    .repo_histories
+                    .insert(first_history.clone(), history);
+                catalog.projects.insert(first_project.clone(), project);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().catalog().repo_histories[&first_history]
+                .membership_generation,
+            1,
+            "a new member-bearing history starts at generation one"
+        );
+
+        let attachment_id = AttachmentId::parse("att_11111111111111111111111111111112").unwrap();
+        let attachment_project = first_project.clone();
+        let attachment_scope = PublishedScope::try_new("repo-one", ".").unwrap();
+        store
+            .transact(2, |_, attachments| {
+                attachments.attachments.insert(
+                    attachment_id.clone(),
+                    CheckoutAttachment {
+                        attachment_id: attachment_id.clone(),
+                        project_id: attachment_project.clone(),
+                        checkout_id: "22222222222222222222222222222222".into(),
+                        checkout_dir: "/tmp/membership-one".into(),
+                        checkout_project_dir: "/tmp/membership-one".into(),
+                        project_root_relpath: ".".into(),
+                        kind: AttachmentKind::Base,
+                        validated_scope: Some(attachment_scope.clone()),
+                        computed_repo_hint: None,
+                        branch_ref: None,
+                        capabilities: AttachmentCapabilities::default(),
+                        status: AttachmentStatus::Attached,
+                        attached_at: "2026-08-08T00:00:00Z".into(),
+                        detached_at: None,
+                    },
+                );
+                attachments
+                    .default_attachments
+                    .insert(attachment_project.clone(), attachment_id.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().catalog().repo_histories[&first_history]
+                .membership_generation,
+            1,
+            "attachment-only changes do not advance membership"
+        );
+
+        store
+            .transact(3, |catalog, _| {
+                catalog
+                    .projects
+                    .get_mut(&first_project)
+                    .unwrap()
+                    .operator_aliases
+                    .insert("membership-alias".into());
+                catalog
+                    .repo_histories
+                    .get_mut(&first_history)
+                    .unwrap()
+                    .materialization = RepoHistoryMaterialization::Ready {
+                    generation_id: RepoHistoryGenerationId::parse(format!(
+                        "rhg_{}",
+                        "a".repeat(64)
+                    ))
+                    .unwrap(),
+                };
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().catalog().repo_histories[&first_history]
+                .membership_generation,
+            1,
+            "aliases and materialization do not advance membership"
+        );
+
+        let second = membership_project(
+            second_project.clone(),
+            first_history.clone(),
+            "repo-one",
+            "member-two",
+        );
+        store
+            .transact(4, |catalog, _| {
+                catalog.projects.insert(second_project.clone(), second);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().catalog().repo_histories[&first_history]
+                .membership_generation,
+            2,
+            "adding a member advances the referenced history exactly once"
+        );
+
+        let replacement = membership_history(second_history.clone(), "repo-two", "repo-two");
+        store
+            .transact(5, |catalog, _| {
+                catalog
+                    .repo_histories
+                    .insert(second_history.clone(), replacement);
+                let project = catalog.projects.get_mut(&second_project).unwrap();
+                project.repo_history = Some(second_history.clone());
+                project.scope = ProjectScope::Published(
+                    PublishedScope::try_new("repo-two", "member-two").unwrap(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(
+            snapshot.catalog().repo_histories[&first_history].membership_generation,
+            3,
+            "moving a member advances the source history"
+        );
+        assert_eq!(
+            snapshot.catalog().repo_histories[&second_history].membership_generation,
+            1,
+            "moving a member into a new history publishes its first generation"
+        );
+        drop(snapshot);
+
+        store
+            .transact(6, |catalog, _| {
+                catalog.projects.remove(&second_project);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().catalog().repo_histories[&second_history]
+                .membership_generation,
+            2,
+            "removing a member advances its surviving history"
+        );
+
+        let error = store
+            .transact(7, |catalog, _| {
+                catalog
+                    .repo_histories
+                    .get_mut(&first_history)
+                    .unwrap()
+                    .membership_generation += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_owner_field_mutation");
+        assert_eq!(store.snapshot().unwrap().epoch(), 7);
+    }
+
+    #[test]
+    fn membership_generation_overflow_refuses_before_publication() {
+        let history_id = RepoHistoryId::parse("rh_00000000000000000000000000000033").unwrap();
+        let first_project = ProjectId::parse("overflow-one").unwrap();
+        let second_project = ProjectId::parse("overflow-two").unwrap();
+        let mut before = CatalogSnapshotV2::empty(1).unwrap();
+        let mut history = membership_history(history_id.clone(), "overflow-repo", "overflow-repo");
+        history.membership_generation = u64::MAX;
+        before.repo_histories.insert(history_id.clone(), history);
+        before.projects.insert(
+            first_project.clone(),
+            membership_project(first_project, history_id.clone(), "overflow-repo", "."),
+        );
+        let mut after = before.clone();
+        after.projects.insert(
+            second_project.clone(),
+            membership_project(second_project, history_id, "overflow-repo", "two"),
+        );
+
+        let error = advance_repo_history_membership_generations(&before, &mut after).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_membership_generation_overflow"
+        );
+        assert_eq!(
+            after
+                .repo_histories
+                .values()
+                .next()
+                .unwrap()
+                .membership_generation,
+            u64::MAX,
+            "overflow refusal leaves the candidate watermark unchanged"
         );
     }
 

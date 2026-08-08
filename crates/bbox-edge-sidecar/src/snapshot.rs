@@ -7559,6 +7559,7 @@ mod tests {
 
         let local = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::mint(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LocalProject(
                 bbox_corpus_core::project_catalog::ProjectId::parse("p_local").unwrap(),
             ),
@@ -7574,6 +7575,7 @@ mod tests {
 
         let imported = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::mint(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LegacyNamespace(
                 CommitNamespace::parse("legacy-namespace").unwrap(),
             ),
@@ -7589,6 +7591,7 @@ mod tests {
 
         let recorded = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::mint(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-a").unwrap(),
             ),

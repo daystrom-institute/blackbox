@@ -478,6 +478,7 @@ mod tests {
             id.clone(),
             RepoHistoryRecord {
                 repo_history_id: id,
+                membership_generation: 0,
                 authority: RepoHistoryAuthority::Recorded(
                     RecordedRepoAuthority::parse("repo-authority".to_string()).unwrap(),
                 ),

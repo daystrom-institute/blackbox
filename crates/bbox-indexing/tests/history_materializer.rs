@@ -350,6 +350,7 @@ fn fresh_fixture(owned: &[(&str, u8)], ambiguous: Option<&str>) -> FreshFixture 
                     id.clone(),
                     RepoHistoryRecord {
                         repo_history_id: id,
+                        membership_generation: 0,
                         authority: RepoHistoryAuthority::LegacyNamespace(
                             CommitNamespace::parse(namespace.to_string()).unwrap(),
                         ),
@@ -1403,6 +1404,7 @@ fn drift_mode_a_namespace_minted_after_migration_classifies_with_no_asset_constr
                 id.clone(),
                 RepoHistoryRecord {
                     repo_history_id: id,
+                    membership_generation: 0,
                     authority: RepoHistoryAuthority::LegacyNamespace(
                         CommitNamespace::parse(minted).unwrap(),
                     ),

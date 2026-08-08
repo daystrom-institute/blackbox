@@ -95,6 +95,7 @@ fn refresh_fixture(namespace: &str) -> RefreshFixture {
                     id.clone(),
                     RepoHistoryRecord {
                         repo_history_id: id.clone(),
+                        membership_generation: 0,
                         authority: RepoHistoryAuthority::LegacyNamespace(primary.clone()),
                         primary_namespace: primary.clone(),
                         compatibility_namespaces: BTreeSet::new(),

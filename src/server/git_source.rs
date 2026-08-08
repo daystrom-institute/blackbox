@@ -1302,6 +1302,7 @@ mod tests {
             repo_history_id.clone(),
             RepoHistoryRecord {
                 repo_history_id: repo_history_id.clone(),
+                membership_generation: 0,
                 authority: RepoHistoryAuthority::Recorded(
                     RecordedRepoAuthority::parse("git-http-repo").unwrap(),
                 ),

@@ -429,6 +429,7 @@ pub fn promote_project(
                             id.clone(),
                             RepoHistoryRecord {
                                 repo_history_id: id.clone(),
+                                membership_generation: 0,
                                 authority: RepoHistoryAuthority::Recorded(authority),
                                 primary_namespace: primary,
                                 compatibility_namespaces: Default::default(),
@@ -1253,6 +1254,7 @@ fn insert_new_project(
                 history_id.clone(),
                 RepoHistoryRecord {
                     repo_history_id: history_id.clone(),
+                    membership_generation: 0,
                     authority: RepoHistoryAuthority::LocalProject(project_id.clone()),
                     primary_namespace: namespace,
                     compatibility_namespaces: Default::default(),
@@ -1281,6 +1283,7 @@ fn insert_new_project(
                         id.clone(),
                         RepoHistoryRecord {
                             repo_history_id: id.clone(),
+                            membership_generation: 0,
                             authority: RepoHistoryAuthority::Recorded(authority),
                             primary_namespace: primary,
                             compatibility_namespaces: Default::default(),

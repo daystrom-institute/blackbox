@@ -281,6 +281,7 @@ mod tests {
             history_id(),
             RepoHistoryRecord {
                 repo_history_id: history_id(),
+                membership_generation: 0,
                 authority: RepoHistoryAuthority::Recorded(
                     RecordedRepoAuthority::parse(authority.to_string()).unwrap(),
                 ),

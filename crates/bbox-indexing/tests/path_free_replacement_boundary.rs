@@ -207,6 +207,7 @@ fn fixture(namespace: &str, commits: usize) -> Fixture {
                 id.clone(),
                 RepoHistoryRecord {
                     repo_history_id: id,
+                    membership_generation: 0,
                     authority: RepoHistoryAuthority::LegacyNamespace(parsed.clone()),
                     primary_namespace: parsed,
                     compatibility_namespaces: BTreeSet::new(),

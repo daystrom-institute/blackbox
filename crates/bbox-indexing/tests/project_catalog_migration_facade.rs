@@ -2363,6 +2363,7 @@ fn acceptance_retirement_journaled_refuses_ready_materialization() {
                 history_id.clone(),
                 RepoHistoryRecord {
                     repo_history_id: history_id.clone(),
+                    membership_generation: 0,
                     authority: RepoHistoryAuthority::LocalProject(project_id.clone()),
                     primary_namespace: CommitNamespace::parse(
                         "local_33333333333333333333333333333333",

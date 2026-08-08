@@ -137,6 +137,7 @@ mod tests {
     fn catalog_arm_carries_project_scope_and_resolved_history() {
         let history = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::mint(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-a").unwrap(),
             ),

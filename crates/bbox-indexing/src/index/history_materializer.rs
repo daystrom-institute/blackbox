@@ -1061,6 +1061,7 @@ mod tests {
             id.clone(),
             RepoHistoryRecord {
                 repo_history_id: id.clone(),
+                membership_generation: 0,
                 authority: RepoHistoryAuthority::LegacyNamespace(namespace(primary)),
                 primary_namespace: namespace(primary),
                 compatibility_namespaces: compatibility
@@ -1075,6 +1076,7 @@ mod tests {
             second.clone(),
             RepoHistoryRecord {
                 repo_history_id: second.clone(),
+                membership_generation: 0,
                 authority: RepoHistoryAuthority::LegacyNamespace(namespace("second-primary")),
                 primary_namespace: namespace("second-primary"),
                 compatibility_namespaces: BTreeSet::new(),

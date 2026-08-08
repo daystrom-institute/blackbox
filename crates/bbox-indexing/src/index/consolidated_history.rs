@@ -510,6 +510,7 @@ mod tests {
             history.clone(),
             RepoHistoryRecord {
                 repo_history_id: history.clone(),
+                membership_generation: 0,
                 authority: RepoHistoryAuthority::Recorded(
                     bbox_corpus_core::project_catalog::RecordedRepoAuthority::parse(
                         "repo-authority".to_string(),

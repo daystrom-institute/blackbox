@@ -2714,6 +2714,7 @@ fn build_base_post_images(
             group.planned_history_id.clone(),
             RepoHistoryRecord {
                 repo_history_id: group.planned_history_id.clone(),
+                membership_generation: 0,
                 authority,
                 primary_namespace: group.planned_primary_namespace.clone(),
                 compatibility_namespaces: group.planned_compatibility_namespaces.clone(),

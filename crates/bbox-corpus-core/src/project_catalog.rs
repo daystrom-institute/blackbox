@@ -396,6 +396,11 @@ pub enum RepoHistoryQuarantineMaterialization {
 #[serde(deny_unknown_fields)]
 pub struct RepoHistoryRecord {
     pub repo_history_id: RepoHistoryId,
+    /// Monotonic watermark for the ordered set of catalog projects that
+    /// reference this repository history, including each project's scope.
+    /// Older v2 catalog bytes decode as the pre-watermark generation zero.
+    #[serde(default)]
+    pub membership_generation: u64,
     pub authority: RepoHistoryAuthority,
     pub primary_namespace: CommitNamespace,
     #[serde(deserialize_with = "deserialize_unique_btree_set")]
@@ -2331,6 +2336,7 @@ mod tests {
             RepoHistoryId::parse("rh_22222222222222222222222222222222").unwrap();
         let history = RepoHistoryRecord {
             repo_history_id: history_id,
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -2434,6 +2440,7 @@ mod tests {
         let history_id = RepoHistoryId::parse("rh_22222222222222222222222222222222").unwrap();
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LocalProject(id("missing")),
             primary_namespace: CommitNamespace::parse("local_33333333333333333333333333333333")
                 .unwrap(),
@@ -2455,6 +2462,7 @@ mod tests {
         let authority = RecordedRepoAuthority::parse("repo-1").unwrap();
         let first = RepoHistoryRecord {
             repo_history_id: first_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(authority.clone()),
             primary_namespace: CommitNamespace::parse("namespace-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
@@ -2462,6 +2470,7 @@ mod tests {
         };
         let second = RepoHistoryRecord {
             repo_history_id: second_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(authority),
             primary_namespace: CommitNamespace::parse("namespace-two").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
@@ -2483,6 +2492,7 @@ mod tests {
         let shared = CommitNamespace::parse("shared-namespace").unwrap();
         let first = RepoHistoryRecord {
             repo_history_id: first_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -2492,6 +2502,7 @@ mod tests {
         };
         let second = RepoHistoryRecord {
             repo_history_id: second_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-2").unwrap(),
             ),
@@ -2511,6 +2522,7 @@ mod tests {
         let namespace = CommitNamespace::parse("repeated-namespace").unwrap();
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-3").unwrap(),
             ),
@@ -2532,6 +2544,7 @@ mod tests {
         let missing_id = RepoHistoryId::parse("rh_22222222222222222222222222222222").unwrap();
         let history = RepoHistoryRecord {
             repo_history_id: present_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -2562,6 +2575,7 @@ mod tests {
         let namespace = CommitNamespace::parse("shared-namespace").unwrap();
         let first = RepoHistoryRecord {
             repo_history_id: first_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -2571,6 +2585,7 @@ mod tests {
         };
         let second = RepoHistoryRecord {
             repo_history_id: second_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-2").unwrap(),
             ),
@@ -2603,6 +2618,7 @@ mod tests {
         sibling.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LocalProject(owner.project_id.clone()),
             primary_namespace: CommitNamespace::parse("local_33333333333333333333333333333333")
                 .unwrap(),
@@ -2626,6 +2642,7 @@ mod tests {
         published.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LegacyNamespace(
                 CommitNamespace::parse("legacy-one").unwrap(),
             ),
@@ -2653,6 +2670,7 @@ mod tests {
         legacy.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -2676,6 +2694,7 @@ mod tests {
         owner.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LocalProject(owner.project_id.clone()),
             primary_namespace: CommitNamespace::parse("legacy-one").unwrap(),
             compatibility_namespaces: BTreeSet::new(),
@@ -2697,6 +2716,7 @@ mod tests {
         published.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LocalProject(published.project_id.clone()),
             primary_namespace: CommitNamespace::parse("local_55555555555555555555555555555555")
                 .unwrap(),
@@ -2723,6 +2743,7 @@ mod tests {
         promoted.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -3201,6 +3222,7 @@ mod tests {
         project.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -3270,6 +3292,7 @@ mod tests {
         project.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -3398,6 +3421,7 @@ mod tests {
         let project_id = project.project_id.clone();
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-1").unwrap(),
             ),
@@ -3458,6 +3482,7 @@ mod tests {
         project.repo_history = Some(history_id.clone());
         let history = RepoHistoryRecord {
             repo_history_id: history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::LegacyNamespace(
                 CommitNamespace::parse("deadbeef").unwrap(),
             ),
@@ -3566,9 +3591,10 @@ mod tests {
     }
 
     #[test]
-    fn repo_history_and_ambiguous_materialization_default_to_not_built_from_legacy_bytes() {
+    fn repo_history_additive_fields_default_from_legacy_bytes() {
         let history_a = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::parse("rh_11111111111111111111111111111111").unwrap(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-a").unwrap(),
             ),
@@ -3578,6 +3604,7 @@ mod tests {
         };
         let history_b = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::parse("rh_22222222222222222222222222222222").unwrap(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-b").unwrap(),
             ),
@@ -3607,17 +3634,18 @@ mod tests {
         catalog.validate().unwrap();
         let encoded = encode_catalog_snapshot(&catalog).unwrap();
 
-        // Simulate pre-Phase-3 bytes: strip the materialization field from
-        // both record kinds and confirm strict decode still succeeds,
-        // defaulting to NotBuilt (deny_unknown_fields stays intact for every
-        // other field).
+        // Simulate bytes from before the additive history fields: strict
+        // decode still succeeds while every missing field takes its defined
+        // compatibility default.
         let mut value: Value = serde_json::from_slice(&encoded).unwrap();
         for history in value["repo_histories"]
             .as_object_mut()
             .unwrap()
             .values_mut()
         {
-            history.as_object_mut().unwrap().remove("materialization");
+            let history = history.as_object_mut().unwrap();
+            history.remove("materialization");
+            history.remove("membership_generation");
         }
         for ambiguous in value["ambiguous_namespaces"]
             .as_object_mut()
@@ -3629,6 +3657,7 @@ mod tests {
         let stripped = serde_json::to_vec(&value).unwrap();
         let decoded = decode_catalog_snapshot(&stripped).unwrap();
         for history in decoded.repo_histories.values() {
+            assert_eq!(history.membership_generation, 0);
             assert_eq!(
                 history.materialization,
                 RepoHistoryMaterialization::NotBuilt
@@ -3647,6 +3676,7 @@ mod tests {
         let repo_history_id = RepoHistoryId::parse("rh_11111111111111111111111111111111").unwrap();
         let mut history = RepoHistoryRecord {
             repo_history_id: repo_history_id.clone(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-a").unwrap(),
             ),
@@ -3680,6 +3710,7 @@ mod tests {
     fn ready_ambiguous_generation_id_must_satisfy_validate_catalog_and_candidate_rules() {
         let history_a = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::parse("rh_11111111111111111111111111111111").unwrap(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-a").unwrap(),
             ),
@@ -3689,6 +3720,7 @@ mod tests {
         };
         let history_b = RepoHistoryRecord {
             repo_history_id: RepoHistoryId::parse("rh_22222222222222222222222222222222").unwrap(),
+            membership_generation: 0,
             authority: RepoHistoryAuthority::Recorded(
                 RecordedRepoAuthority::parse("repo-b").unwrap(),
             ),

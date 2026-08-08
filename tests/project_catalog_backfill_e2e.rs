@@ -2976,6 +2976,7 @@ fn bind_rebuild_history_records(layout: &ProjectCatalogMigrationResolvedLayoutV1
                 owned.clone(),
                 RepoHistoryRecord {
                     repo_history_id: owned.clone(),
+                    membership_generation: 0,
                     authority: RepoHistoryAuthority::LegacyNamespace(namespace(
                         REBUILD_OWNED_NAMESPACE,
                     )),
