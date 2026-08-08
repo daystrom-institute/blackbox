@@ -4085,7 +4085,7 @@ fn namespace_attribution(
     legacy: &LegacyProjectsCaptureV1,
     first_commit_repo_ids: &BTreeMap<String, BTreeSet<ProjectId>>,
 ) -> LegacyCommitNamespaceAttributionV1 {
-    let proved = legacy
+    let recorded_authority = legacy
         .observations
         .iter()
         .filter_map(|project| {
@@ -4095,36 +4095,48 @@ fn namespace_attribution(
                 .flatten()
         })
         .collect::<BTreeSet<_>>();
-    if !proved.is_empty() {
-        return LegacyCommitNamespaceAttributionV1::Proved {
-            project_ids: proved,
-        };
-    }
     // A v1-era commit namespace is the checkout's derived repo id (the hash
     // of its first commit). Re-deriving the token from the LIVE checkout's
     // captured first commit and matching through the derivation is
     // first-commit evidence per the grouping rules; matching the registry's
     // recorded repo_id string alone (below) is the weak-namespace shortcut
     // the design forbids for proof and is kept only to surface ambiguity.
-    if let Some(project_ids) = first_commit_repo_ids.get(namespace)
-        && !project_ids.is_empty()
-    {
-        return LegacyCommitNamespaceAttributionV1::Proved {
-            project_ids: project_ids.clone(),
-        };
-    }
-    let candidates = legacy
+    let rederived_or_lineage = first_commit_repo_ids
+        .get(namespace)
+        .cloned()
+        .unwrap_or_default();
+    let weak_recorded_repo_id = legacy
         .observations
         .iter()
         .filter(|project| project.record.repo_id.as_deref() == Some(namespace))
         .filter_map(|project| ProjectId::parse(project.record.project_id.clone()).ok())
         .collect::<BTreeSet<_>>();
-    if candidates.len() >= 2 {
-        LegacyCommitNamespaceAttributionV1::Ambiguous {
-            candidate_project_ids: candidates,
-        }
-    } else {
+    // Strength orders what may PROVE, never which claimants are visible. A
+    // previous early return let a recorded-authority or rederived claimant
+    // silently erase a distinct weaker rival, bypassing the collision and
+    // quarantine path. Union every class first; any cross-project claim is
+    // ambiguous regardless of which class is strongest.
+    let all_claimants = recorded_authority
+        .iter()
+        .chain(rederived_or_lineage.iter())
+        .chain(weak_recorded_repo_id.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if all_claimants.len() > 1 {
+        return LegacyCommitNamespaceAttributionV1::Ambiguous {
+            candidate_project_ids: all_claimants,
+        };
+    }
+    let proved = recorded_authority
+        .union(&rederived_or_lineage)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if proved.is_empty() {
         LegacyCommitNamespaceAttributionV1::Unclaimed
+    } else {
+        LegacyCommitNamespaceAttributionV1::Proved {
+            project_ids: proved,
+        }
     }
 }
 
@@ -4283,12 +4295,13 @@ fn capture_git_metadata_lane(
             continue;
         };
         if let Ok(Some(first_commit)) = repository.first_commit_oid(head.oid()) {
-            first_commit_repo_ids
-                .entry(bbox_corpus_core::entity_ref::repo_id_for_first_commit(
-                    &first_commit,
-                ))
-                .or_default()
-                .insert(attachment.project_id.clone());
+            let repo_token = bbox_corpus_core::entity_ref::repo_id_for_first_commit(&first_commit);
+            if namespace_membership_proven(corpus, &repo_token, repository, head.oid()) {
+                first_commit_repo_ids
+                    .entry(repo_token)
+                    .or_default()
+                    .insert(attachment.project_id.clone());
+            }
         }
         if let Some(repo_token) = record_repo_id_by_project.get(attachment.project_id.as_str())
             && let Some(cursor_sha) = ingest_cursor_by_project.get(attachment.project_id.as_str())
@@ -6294,6 +6307,28 @@ mod tests {
             LegacyCommitNamespaceAttributionV1::Proved {
                 project_ids: BTreeSet::from([project]),
             }
+        );
+    }
+
+    #[test]
+    fn namespace_attribution_unions_rivals_across_evidence_strengths() {
+        let mut legacy = namespace_legacy_capture();
+        let project_a = ProjectId::parse("project-a").unwrap();
+        let project_b = ProjectId::parse("project-b").unwrap();
+        let mut rival = legacy.observations[0].clone();
+        rival.observation_id = "legacy-project-b".to_string();
+        rival.record.project_id = project_b.to_string();
+        rival.committed_authority = None;
+        legacy.observations.push(rival);
+
+        let rederived =
+            BTreeMap::from([("repo-one".to_string(), BTreeSet::from([project_b.clone()]))]);
+        assert_eq!(
+            namespace_attribution("repo-one", &legacy, &rederived),
+            LegacyCommitNamespaceAttributionV1::Ambiguous {
+                candidate_project_ids: BTreeSet::from([project_a, project_b]),
+            },
+            "a strong recorded-authority claimant must not hide a distinct rederived/weak rival"
         );
     }
 
