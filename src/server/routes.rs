@@ -2343,6 +2343,14 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                     edge_index_nudge_max_current_edges(),
                 ) {
                     let started = std::time::Instant::now();
+                    tracing::info!(
+                        current_docs = current,
+                        sidecar_files = signature.files,
+                        sidecar_bytes = signature.bytes,
+                        nudged,
+                        sidecars_changed,
+                        "edge-index watcher rebuild started"
+                    );
                     match rebuild_edge_index_from_shared(&state, false) {
                         Ok(()) => {
                             tracing::info!(
