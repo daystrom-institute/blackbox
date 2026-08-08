@@ -1193,3 +1193,54 @@ until a later entry explicitly supersedes it.
   stays exact, and the Phase 6 cut evidence in
   `design/daemon-runtime/durable-project-catalog-phase6-handoff.md`
   section 3.5 depends on `active_compatibility_lanes`, which is unnarrowed.
+
+## D-042: Post-cut lifecycle and transition callbacks carry intent, not write authority
+
+- Date: 2026-08-07
+- Phase: durable project catalog, Phase 6 post-cut repair
+- Status: recorded before the post-cut transition repair lands; requires the
+  frozen closing review
+- Decision: Durable checkout and code-source mutations remain owned by one
+  guarded authority per domain. Checkout lifecycle admission is a
+  writer-preferring shared/exclusive state machine; an existing write lease
+  promotes its publication pin instead of reacquiring behind itself. Registry
+  registration preflights identity, then compare-applies the exact token after
+  lifecycle authority is acquired. Catalog cutback workers capture an exact
+  activation plus catalog/assignment revision fence and submit one typed
+  outcome to a store-locked compare-and-apply operation; callback origins only
+  enqueue reducer intent. Selector retirement is owned by one daemon-lifetime,
+  keyed coordinator, and selector-key enqueue refuses a different durable
+  identity instead of overwriting it.
+- Evidence:
+  - A zeroing reader counter can admit new readers ahead of a waiting writer,
+    lose pins, and make an already-held write lease refuse its own nested
+    publication fence.
+  - The previous registration adapter decided unchanged/changed from a stale
+    snapshot before taking registry authority, allowing an intervening commit
+    to invalidate the decision.
+  - Cutback redrive previously loaded, modified, and wrote typed state across
+    separate lock acquisitions. Authority or activation replacement during
+    staging could therefore be overwritten, and caller-side retry increments
+    could race.
+  - One retirement thread per row slept and retried independently. Active rows
+    had no primary authority-change wake, and enqueue replaced an existing row
+    sharing the selector key even when its snapshot or generation differed.
+- Rationale: Notifications, readiness callbacks, and slow staging results are
+  stale by construction. Treating them as write authority duplicates the
+  registry/store state machines and creates exactly the lost-update and
+  self-deadlock failures the catalog cut was intended to remove. A closed
+  intent/event surface plus a final guarded compare keeps durable mutation at
+  the authority that can still prove the preconditions.
+- Rejected alternatives:
+  - Letting a callback repair `CutbackStateV2` directly after a readiness or
+    retirement event. This bypasses origin policy and can release manual or
+    terminal state.
+  - Resetting lifecycle readers to zero for writer progress. This destroys pin
+    ownership rather than waiting for it.
+  - Treating selector-key replacement as idempotence. The selector is only the
+    queue key; project, snapshot, and generation are the durable identity.
+- Revisit only if: checkout lifecycle and registry mutation move under one
+  stronger transaction owner, cutback authority becomes a single transactional
+  store with catalog assignment, or selector retirement moves to an external
+  durable scheduler that preserves the same exact-key and completion-event
+  contracts.
