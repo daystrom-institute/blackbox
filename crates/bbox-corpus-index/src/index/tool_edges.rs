@@ -712,7 +712,7 @@ mod tests {
         assert!(!edge.metadata.contains_key("anchor.commit_sha_at_edit"));
 
         assert_eq!(ctx.emit_event_edges(&event, "claude", 10, 0).unwrap(), 1);
-        let observed = root.join("edges").join("project-1.jsonl");
+        let observed = root.join("edges/observed/project-1.jsonl");
         assert!(
             !observed.exists(),
             "observed edges must remain staged before final publication"

@@ -487,6 +487,7 @@ dependencies = [
  "bbox-chunker",
  "bbox-code-source",
  "bbox-corpus-core",
+ "fs2",
  "hex",
  "libc",
  "serde",

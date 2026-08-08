@@ -29,6 +29,37 @@ use bbox_corpus_core::project_catalog_snapshot::{
 
 static COMPACTION_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Cross-process serialization for one project's compatibility, explicit,
+/// and observed lanes. Migration holds this for its entire source-to-lanes
+/// transaction; lifecycle writers take the same lock around each append so an
+/// atomic lane replacement cannot discard a concurrent event.
+pub struct ProjectEdgeMutationLock {
+    file: fs::File,
+}
+
+impl Drop for ProjectEdgeMutationLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+pub fn lock_project_edge_mutation(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<ProjectEdgeMutationLock> {
+    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
+        .context("validating edge sidecar project id")?;
+    let lock_dir = edges_dir.join(".locks");
+    fs::create_dir_all(&lock_dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_dir.join(format!("{project_id}.edge.lock")))?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(ProjectEdgeMutationLock { file })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Edge {
     pub source: EntityRef,
@@ -1397,6 +1428,7 @@ pub fn compact_legacy_sidecar(
 ) -> Result<EdgeSidecarCompactionStats> {
     let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
         .context("validating edge sidecar project id")?;
+    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id.as_str())?;
     let path = edges_dir.join(format!("{project_id}.jsonl"));
     let mut stats = EdgeSidecarCompactionStats {
         project_id: project_id.to_string(),
@@ -1629,7 +1661,8 @@ pub fn append_explicit_edges(edges_dir: &Path, project_id: &str, edges: &[Edge])
             e.source,
         );
     }
-    append_edges_dedup(edges_dir, project_id, edges)
+    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
+    append_edges_dedup(&edges_dir.join("explicit"), project_id, edges)
 }
 
 pub fn append_observed_edges(edges_dir: &Path, project_id: &str, edges: &[Edge]) -> Result<()> {
@@ -1641,7 +1674,25 @@ pub fn append_observed_edges(edges_dir: &Path, project_id: &str, edges: &[Edge])
             e.source,
         );
     }
-    append_edges(edges_dir, project_id, edges)
+    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
+    append_edges(&edges_dir.join("observed"), project_id, edges)
+}
+
+pub fn append_observed_edges_dedup(
+    edges_dir: &Path,
+    project_id: &str,
+    edges: &[Edge],
+) -> Result<usize> {
+    for e in edges {
+        debug_assert!(
+            e.provenance != EdgeProvenance::Derived,
+            "append_observed_edges_dedup: rejected Derived edge kind={} source={:?}",
+            e.kind,
+            e.source,
+        );
+    }
+    let _mutation_lock = lock_project_edge_mutation(edges_dir, project_id)?;
+    append_edges_dedup(&edges_dir.join("observed"), project_id, edges)
 }
 
 pub fn replace_materialized_edges(

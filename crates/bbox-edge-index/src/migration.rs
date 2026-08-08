@@ -1,8 +1,9 @@
+use std::cmp::Reverse;
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::BinaryHeap;
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,8 @@ use crate::edge_index::Edge;
 use bbox_chunker::EdgeProvenance;
 
 const MIGRATION_VERSION: u32 = 1;
+const SORT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const MERGE_FAN_IN: usize = 32;
 
 pub fn explicit_lane_path(edges_dir: &Path, project_id: &str) -> PathBuf {
     edges_dir
@@ -69,6 +72,7 @@ pub struct QuarantineLine {
     pub error: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct ExtractionResult {
     pub explicit_edges: Vec<Edge>,
@@ -78,6 +82,7 @@ pub struct ExtractionResult {
     pub total_lines: u64,
 }
 
+#[cfg(test)]
 pub fn extract_legacy_sidecar(edges_dir: &Path, project_id: &str) -> Result<ExtractionResult> {
     let legacy_path = edges_dir.join(format!("{project_id}.jsonl"));
     if !legacy_path.exists() {
@@ -133,14 +138,126 @@ pub fn extract_legacy_sidecar(edges_dir: &Path, project_id: &str) -> Result<Extr
     Ok(result)
 }
 
+#[derive(Debug, Default)]
+struct StagedExtraction {
+    source_hash: String,
+    explicit_count: u64,
+    observed_count: u64,
+    derived_dropped: u64,
+    quarantined_count: u64,
+}
+
+/// Stream one unbounded legacy lane into bounded staging files. The source
+/// digest is folded from the exact bytes consumed so the caller can reject a
+/// lane that changed between planning and extraction.
+fn stage_legacy_sidecar(
+    legacy_path: &Path,
+    staging_dir: &Path,
+    quarantine_path: &Path,
+    has_replacement: bool,
+) -> Result<StagedExtraction> {
+    fs::create_dir_all(staging_dir)?;
+    let mut explicit = None::<std::io::BufWriter<fs::File>>;
+    let mut observed = None::<std::io::BufWriter<fs::File>>;
+    let mut quarantine = None::<std::io::BufWriter<fs::File>>;
+    let mut result = StagedExtraction::default();
+    let mut digest = Sha256::new();
+    let mut reader = std::io::BufReader::new(fs::File::open(legacy_path)?);
+    let mut bytes = Vec::new();
+    let mut line_number = 0u64;
+
+    loop {
+        bytes.clear();
+        let read = reader.read_until(b'\n', &mut bytes)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&bytes);
+        line_number += 1;
+        let raw = std::str::from_utf8(&bytes)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Edge>(trimmed) {
+            Ok(edge) => {
+                let observed_lane = match edge.provenance {
+                    EdgeProvenance::Derived if has_replacement => {
+                        result.derived_dropped += 1;
+                        continue;
+                    }
+                    EdgeProvenance::Explicit
+                        if edge.kind == "READ_FILE"
+                            || edge.kind == "EDITED_FILE"
+                            || edge.kind == "RAN_BASH" =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                let (destination, name) = if observed_lane {
+                    result.observed_count += 1;
+                    (&mut observed, "observed.jsonl")
+                } else {
+                    result.explicit_count += 1;
+                    (&mut explicit, "explicit.jsonl")
+                };
+                if destination.is_none() {
+                    *destination = Some(std::io::BufWriter::new(fs::File::create(
+                        staging_dir.join(name),
+                    )?));
+                }
+                let writer = destination.as_mut().expect("staging writer initialized");
+                serde_json::to_writer(&mut *writer, &edge)?;
+                writer.write_all(b"\n")?;
+            }
+            Err(error) => {
+                result.quarantined_count += 1;
+                if quarantine.is_none() {
+                    if let Some(parent) = quarantine_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    quarantine = Some(std::io::BufWriter::new(fs::File::create(quarantine_path)?));
+                }
+                let row = QuarantineLine {
+                    source_path: legacy_path.display().to_string(),
+                    line_number,
+                    raw: trimmed.to_string(),
+                    error: error.to_string(),
+                };
+                let writer = quarantine.as_mut().expect("quarantine writer initialized");
+                serde_json::to_writer(&mut *writer, &row)?;
+                writer.write_all(b"\n")?;
+            }
+        }
+    }
+
+    for writer in [&mut explicit, &mut observed, &mut quarantine]
+        .into_iter()
+        .flatten()
+    {
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+    result.source_hash = hex::encode(digest.finalize());
+    Ok(result)
+}
+
 pub fn compute_source_hash(edges_dir: &Path, project_id: &str) -> Result<String> {
     let legacy_path = edges_dir.join(format!("{project_id}.jsonl"));
     if !legacy_path.exists() {
         return Ok(String::new());
     }
-    let data = fs::read(&legacy_path)?;
     let mut hasher = Sha256::new();
-    hasher.update(&data);
+    let mut file = fs::File::open(&legacy_path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -257,6 +374,8 @@ pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationMa
     }
 
     let _lock = acquire_migration_lock(edges_dir, project_id)?;
+    let _mutation_lock =
+        bbox_edge_sidecar::edge_sidecar::lock_project_edge_mutation(edges_dir, project_id)?;
 
     let source_hash = compute_source_hash(edges_dir, project_id)?;
     if let Some(existing) = find_committed_migration(edges_dir, project_id)? {
@@ -270,49 +389,25 @@ pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationMa
         }
     }
 
-    let extraction = extract_legacy_sidecar(edges_dir, project_id)?;
     let migration_id = generate_migration_id(project_id, &source_hash);
     let migration_dir = migrations_dir(edges_dir).join(&migration_id);
     let staging_dir = migration_dir.join("staging");
-
-    fs::create_dir_all(&staging_dir)?;
-    fs::create_dir_all(edges_dir.join("explicit"))?;
-    fs::create_dir_all(edges_dir.join("observed"))?;
-
-    if !extraction.explicit_edges.is_empty() {
-        let path = staging_dir.join("explicit.jsonl");
-        let mut file = fs::File::create(&path)?;
-        for edge in &extraction.explicit_edges {
-            serde_json::to_writer(&mut file, edge)?;
-            file.write_all(b"\n")?;
-        }
-        file.sync_all()?;
-    }
-
-    if !extraction.observed_edges.is_empty() {
-        let path = staging_dir.join("observed.jsonl");
-        let mut file = fs::File::create(&path)?;
-        for edge in &extraction.observed_edges {
-            serde_json::to_writer(&mut file, edge)?;
-            file.write_all(b"\n")?;
-        }
-        file.sync_all()?;
-    }
-
-    if !extraction.quarantine.is_empty() {
-        let q_dir = quarantine_dir(edges_dir, project_id);
-        fs::create_dir_all(&q_dir)?;
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let q_path = q_dir.join(format!("{ts}.jsonl"));
-        let mut file = fs::File::create(&q_path)?;
-        for ql in &extraction.quarantine {
-            serde_json::to_writer(&mut file, ql)?;
-            file.write_all(b"\n")?;
-        }
-        file.sync_all()?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let extraction = stage_legacy_sidecar(
+        &legacy_path,
+        &staging_dir,
+        &quarantine_dir(edges_dir, project_id).join(format!("{ts}.jsonl")),
+        true,
+    )?;
+    if extraction.source_hash != source_hash {
+        let _ = fs::remove_dir_all(&migration_dir);
+        anyhow::bail!(
+            "legacy sidecar changed during migration staging for project {}; retry after active writers quiesce",
+            project_id
+        );
     }
 
     let manifest = MigrationManifest {
@@ -322,10 +417,10 @@ pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationMa
         source_path: legacy_path.display().to_string(),
         source_hash: source_hash.clone(),
         status: MigrationStatus::Pending,
-        explicit_count: extraction.explicit_edges.len() as u64,
-        observed_count: extraction.observed_edges.len() as u64,
+        explicit_count: extraction.explicit_count,
+        observed_count: extraction.observed_count,
         derived_dropped: extraction.derived_dropped,
-        quarantined_count: extraction.quarantine.len() as u64,
+        quarantined_count: extraction.quarantined_count,
         backup_path: None,
         created_at: Some(epoch_to_rfc3339()),
         committed_at: None,
@@ -334,10 +429,6 @@ pub fn apply_migration(edges_dir: &Path, project_id: &str) -> Result<MigrationMa
 
     install_lane_outputs(edges_dir, project_id, &staging_dir)?;
 
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let backup_path = edges_dir.join(format!("{project_id}.jsonl.bak-migrated-{ts}"));
     fs::rename(&legacy_path, &backup_path)?;
 
@@ -365,60 +456,54 @@ fn install_lane_outputs(edges_dir: &Path, project_id: &str, staging_dir: &Path) 
 }
 
 fn merge_staging_into_lane(staging_path: PathBuf, lane_path: PathBuf) -> Result<()> {
+    merge_staging_into_lane_with_chunk_bytes(staging_path, lane_path, SORT_CHUNK_BYTES)
+}
+
+fn merge_staging_into_lane_with_chunk_bytes(
+    staging_path: PathBuf,
+    lane_path: PathBuf,
+    chunk_bytes: usize,
+) -> Result<()> {
     if !staging_path.exists() {
         return Ok(());
     }
-
-    let mut existing_keys: HashSet<String> = HashSet::new();
-    let mut merged: Vec<Edge> = Vec::new();
-
-    if lane_path.exists() {
-        let file = fs::File::open(&lane_path)?;
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(edge) = serde_json::from_str::<Edge>(trimmed) {
-                let key = edge_import_key_no_meta(&edge);
-                existing_keys.insert(key);
-                merged.push(edge);
-            }
-        }
+    let work_dir = staging_path.with_extension("merge-runs");
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir)?;
     }
+    fs::create_dir_all(&work_dir)?;
+    let inputs = [(lane_path.as_path(), 0u8), (staging_path.as_path(), 1u8)];
+    let mut runs = build_sorted_runs(&inputs, &work_dir, chunk_bytes)?;
+    let sorted = merge_sorted_runs(&mut runs, &work_dir)?;
 
-    let staging_file = fs::File::open(&staging_path)?;
-    let staging_reader = std::io::BufReader::new(staging_file);
-    for line in staging_reader.lines().map_while(Result::ok) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(edge) = serde_json::from_str::<Edge>(trimmed) {
-            let key = edge_import_key_no_meta(&edge);
-            if existing_keys.insert(key) {
-                merged.push(edge);
-            }
-        }
-    }
-
-    if merged.is_empty() {
+    let Some(sorted) = sorted else {
         if lane_path.exists() {
             fs::remove_file(&lane_path)?;
         }
+        fs::remove_dir_all(&work_dir)?;
         return Ok(());
-    }
+    };
 
-    let tmp = lane_path.with_extension("jsonl.tmp");
-    {
-        let mut file = fs::File::create(&tmp)?;
-        for edge in &merged {
-            serde_json::to_writer(&mut file, edge)?;
-            file.write_all(b"\n")?;
-        }
-        file.sync_all()?;
+    if let Some(parent) = lane_path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    let tmp = lane_path.with_extension("jsonl.migrate.tmp");
+    let mut reader = std::io::BufReader::new(fs::File::open(&sorted)?);
+    let mut writer = std::io::BufWriter::new(fs::File::create(&tmp)?);
+    let mut record = String::new();
+    while reader.read_line(&mut record)? != 0 {
+        let trimmed = record.trim_end_matches(['\n', '\r']);
+        let json = trimmed
+            .splitn(4, '\t')
+            .nth(3)
+            .ok_or_else(|| anyhow::anyhow!("invalid migration sort record"))?;
+        writer.write_all(json.as_bytes())?;
+        writer.write_all(b"\n")?;
+        record.clear();
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
     // POSIX rename replaces an existing regular-file lane atomically. Never
     // remove the destination first: a kill in that gap used to leave the live
     // lane absent, after which recovery discarded the only complete staging
@@ -428,7 +513,140 @@ fn merge_staging_into_lane(staging_path: PathBuf, lane_path: PathBuf) -> Result<
     if let Some(parent) = lane_path.parent() {
         fs::File::open(parent)?.sync_all()?;
     }
+    fs::remove_dir_all(&work_dir)?;
     Ok(())
+}
+
+fn build_sorted_runs(
+    inputs: &[(&Path, u8)],
+    work_dir: &Path,
+    chunk_bytes: usize,
+) -> Result<Vec<PathBuf>> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut chunk = Vec::<String>::new();
+    let mut buffered_bytes = 0usize;
+    let mut run_paths = Vec::new();
+    let mut sequence = 0u64;
+
+    for (path, priority) in inputs {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(edge) = serde_json::from_str::<Edge>(trimmed) else {
+                continue;
+            };
+            let key = edge_import_key_no_meta(&edge);
+            let json = serde_json::to_string(&edge)?;
+            let record = format!("{key}\t{priority}\t{sequence:020}\t{json}");
+            sequence = sequence.wrapping_add(1);
+            buffered_bytes = buffered_bytes.saturating_add(record.len());
+            chunk.push(record);
+            if buffered_bytes >= chunk_bytes {
+                flush_sorted_run(&mut chunk, work_dir, &mut run_paths)?;
+                buffered_bytes = 0;
+            }
+        }
+    }
+    flush_sorted_run(&mut chunk, work_dir, &mut run_paths)?;
+    Ok(run_paths)
+}
+
+fn flush_sorted_run(
+    chunk: &mut Vec<String>,
+    work_dir: &Path,
+    run_paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    chunk.sort_unstable();
+    let path = work_dir.join(format!("run-{:08}.txt", run_paths.len()));
+    let mut writer = std::io::BufWriter::new(fs::File::create(&path)?);
+    let mut prior_key = None::<String>;
+    for record in chunk.drain(..) {
+        let key = sort_record_key(&record);
+        if prior_key.as_deref() == Some(key) {
+            continue;
+        }
+        writer.write_all(record.as_bytes())?;
+        writer.write_all(b"\n")?;
+        prior_key = Some(key.to_string());
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    run_paths.push(path);
+    Ok(())
+}
+
+fn merge_sorted_runs(runs: &mut Vec<PathBuf>, work_dir: &Path) -> Result<Option<PathBuf>> {
+    let mut round = 0usize;
+    while runs.len() > 1 {
+        let prior = std::mem::take(runs);
+        for (group_index, group) in prior.chunks(MERGE_FAN_IN).enumerate() {
+            let output = work_dir.join(format!("merge-{round:04}-{group_index:08}.txt"));
+            if group.len() == 1 {
+                fs::rename(&group[0], &output)?;
+            } else {
+                merge_run_group(group, &output)?;
+                for input in group {
+                    fs::remove_file(input)?;
+                }
+            }
+            runs.push(output);
+        }
+        round += 1;
+    }
+    Ok(runs.pop())
+}
+
+fn merge_run_group(inputs: &[PathBuf], output: &Path) -> Result<()> {
+    let mut readers = inputs
+        .iter()
+        .map(|path| fs::File::open(path).map(std::io::BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::<Reverse<(String, usize)>>::new();
+    for (index, reader) in readers.iter_mut().enumerate() {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? != 0 {
+            heap.push(Reverse((trim_record_line(line), index)));
+        }
+    }
+
+    let mut writer = std::io::BufWriter::new(fs::File::create(output)?);
+    let mut prior_key = None::<String>;
+    while let Some(Reverse((record, reader_index))) = heap.pop() {
+        let key = sort_record_key(&record);
+        if prior_key.as_deref() != Some(key) {
+            writer.write_all(record.as_bytes())?;
+            writer.write_all(b"\n")?;
+            prior_key = Some(key.to_string());
+        }
+        let mut next = String::new();
+        if readers[reader_index].read_line(&mut next)? != 0 {
+            heap.push(Reverse((trim_record_line(next), reader_index)));
+        }
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn trim_record_line(mut line: String) -> String {
+    let trimmed = line.trim_end_matches(['\n', '\r']).len();
+    line.truncate(trimmed);
+    line
+}
+
+fn sort_record_key(record: &str) -> &str {
+    record.split_once('\t').map_or(record, |(key, _)| key)
 }
 
 fn edge_import_key_no_meta(edge: &Edge) -> String {
@@ -998,6 +1216,46 @@ mod tests {
             backup_name.contains("migrated"),
             "backup name must contain 'migrated': {backup_name}"
         );
+    }
+
+    #[test]
+    fn lane_install_external_merge_is_bounded_and_prefers_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let lane_path = dir.path().join("explicit/p1.jsonl");
+        let staging_path = dir.path().join("migrations/m1/staging/explicit.jsonl");
+        fs::create_dir_all(lane_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(staging_path.parent().unwrap()).unwrap();
+
+        let mut existing = explicit_edge("k_existing", "DESCRIBES", "k_target");
+        existing.metadata.insert("owner".into(), "existing".into());
+        let mut duplicate = existing.clone();
+        duplicate.metadata.insert("owner".into(), "staged".into());
+        let new = explicit_edge("k_new", "DESCRIBES", "k_target");
+        fs::write(
+            &lane_path,
+            format!("{}\n", serde_json::to_string(&existing).unwrap()),
+        )
+        .unwrap();
+        fs::write(
+            &staging_path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&duplicate).unwrap(),
+                serde_json::to_string(&new).unwrap(),
+                serde_json::to_string(&new).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        // One byte forces every row into its own initial run, exercising the
+        // bounded multi-run merge rather than the in-memory fast path.
+        merge_staging_into_lane_with_chunk_bytes(staging_path, lane_path.clone(), 1).unwrap();
+
+        let content = fs::read_to_string(lane_path).unwrap();
+        assert_eq!(content.lines().count(), 2);
+        assert!(content.contains("existing"));
+        assert!(!content.contains("staged"));
+        assert_eq!(content.matches("k_new").count(), 1);
     }
 
     #[test]

@@ -2336,6 +2336,11 @@ mod tests {
         assert_eq!(n, 1);
         let n2 = append_explicit_edges(dir.path(), "p1", &[e]).unwrap();
         assert_eq!(n2, 0, "dedup must skip reimport");
+        assert!(dir.path().join("explicit/p1.jsonl").is_file());
+        assert!(
+            !dir.path().join("p1.jsonl").exists(),
+            "lifecycle writes must not regrow the legacy compatibility lane"
+        );
     }
 
     #[test]
@@ -2343,8 +2348,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let e = observed_tool_edge("READ_FILE");
         append_observed_edges(dir.path(), "p1", &[e]).unwrap();
-        let sidecar = fs::read_to_string(dir.path().join("p1.jsonl")).unwrap();
+        let sidecar = fs::read_to_string(dir.path().join("observed/p1.jsonl")).unwrap();
         assert_eq!(sidecar.lines().count(), 1);
+        assert!(
+            !dir.path().join("p1.jsonl").exists(),
+            "lifecycle writes must not regrow the legacy compatibility lane"
+        );
     }
 
     #[test]

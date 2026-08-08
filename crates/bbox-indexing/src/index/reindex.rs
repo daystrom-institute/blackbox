@@ -1135,8 +1135,7 @@ pub fn backfill_tool_edges_for_project<G>(
         return Ok(0);
     }
 
-    let observed_dir = edges_dir.join("observed");
-    bbox_edge_index::edge_index::append_edges_dedup(&observed_dir, project_id, &collected)
+    bbox_edge_index::edge_index::append_observed_edges_dedup(&edges_dir, project_id, &collected)
 }
 
 #[cfg(test)]
