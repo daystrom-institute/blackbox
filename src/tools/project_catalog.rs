@@ -27,8 +27,12 @@ use bbox_corpus_core::project_catalog::{
 };
 use bbox_corpus_core::project_selector::{ProjectResolveError, ProjectSelectorRequest};
 use bbox_indexing::accepted_publication_runtime::{
-    AcceptedPublicationScopeAgreement, AcceptedPublicationState, PublishSourceFile, PublishSources,
-    PublisherPublishMode,
+    AcceptedPublicationScopeAgreement, AcceptedPublicationState, PublishError, PublishSourceFile,
+    PublishSources, PublisherPublishMode,
+};
+use bbox_indexing::checkout_access::{
+    CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
+    CheckoutAttachmentSelector,
 };
 use bbox_indexing::project_catalog_admin;
 use bbox_indexing::project_catalog_store::ProjectCatalogStore;
@@ -905,6 +909,7 @@ impl BlackboxServer {
             return Self::err_text(&catalog_inactive());
         };
         let (projects_path, _state_dir) = self.catalog_paths();
+        let checkout_access = self.state.checkout_access.clone();
         let bound_project = match parse_project_id(&p.project_id) {
             Ok(project_id) => project_id,
             Err(error) => return Self::err_text(&format!("Error: {error}")),
@@ -921,11 +926,35 @@ impl BlackboxServer {
                     state.epoch()
                 );
             }
-            let Some(row) = state.attachments().attachments.get(&attachment_id).cloned() else {
+            let Some(_row) = state.attachments().attachments.get(&attachment_id) else {
                 anyhow::bail!(
                     "error.project_catalog_admin_unknown_attachment: {attachment_id} is not in the store"
                 );
             };
+            let Some(project) = state.catalog().projects.get(&project_id) else {
+                anyhow::bail!(
+                    "error.project_catalog_admin_unknown_project: {project_id} is not in the catalog"
+                );
+            };
+            let ProjectScope::Published(catalog_scope) = &project.scope else {
+                anyhow::bail!(
+                    "error.project_catalog_admin_scope_required: publisher binding requires a published project"
+                );
+            };
+            let lease = Arc::new(
+                checkout_access
+                    .acquire(CheckoutAccessRequest {
+                        project_id: project_id.to_string(),
+                        attachment: CheckoutAttachmentSelector::AttachmentId(
+                            attachment_id.to_string(),
+                        ),
+                        expected_scope: Some(catalog_scope.clone()),
+                        kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                        intent: CheckoutAccessIntent::Read,
+                        source_lane: CheckoutAccessSourceLane::NativeAttachment,
+                    })
+                    .map_err(anyhow::Error::new)?,
+            );
             let Some(accepted_commit) = accepted_commit_for(&projects_path, &project_id)? else {
                 anyhow::bail!(
                     "error.project_catalog_admin_pointer_missing: project {project_id} has no accepted \
@@ -936,8 +965,13 @@ impl BlackboxServer {
             let probe = project_catalog_admin::PublisherBindProbe {
                 accepted_commit_present: commit_present_in_checkout(
                     &accepted_commit,
-                    Path::new(&row.checkout_project_dir),
+                    lease.project_root(),
                 ),
+                revalidate_checkout: {
+                    let checkout_access = checkout_access.clone();
+                    let lease = Arc::clone(&lease);
+                    Box::new(move || checkout_access.revalidate(&lease).is_ok())
+                },
             };
             // The domain op revalidates the epoch and the attachment's
             // Attached status inside the publication-lock critical section
@@ -1003,6 +1037,7 @@ impl BlackboxServer {
             Err(error) => return Self::err_text(&format!("Error: {error}")),
         };
         let committed = project_id.clone();
+        let checkout_access = self.state.checkout_access.clone();
         let dry_run = p.dry_run;
         let swap_uncertain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swap_uncertain_inner = swap_uncertain.clone();
@@ -1015,20 +1050,36 @@ impl BlackboxServer {
             // ref or read committed trees: it learns only that it was
             // denied. The domain layer re-reads these same gates, so this
             // is an early refusal, not the authority of record.
-            project_catalog_admin::preflight_publish_authority(
+            let catalog_scope = project_catalog_admin::preflight_publish_authority(
                 &store,
                 p.expected_catalog_epoch,
                 &committed,
                 &attachment_id,
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
-            let Some(row) = state.attachments().attachments.get(&attachment_id).cloned() else {
-                anyhow::bail!(
-                    "error.project_catalog_admin_unknown_attachment: {attachment_id} is not in the store"
-                );
-            };
-            let probe = publisher_publish_probe(&row, &p.full_ref)?;
+            let lease = Arc::new(
+                checkout_access
+                    .acquire(CheckoutAccessRequest {
+                        project_id: committed.to_string(),
+                        attachment: CheckoutAttachmentSelector::AttachmentId(
+                            attachment_id.to_string(),
+                        ),
+                        expected_scope: Some(catalog_scope),
+                        kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                        intent: CheckoutAccessIntent::Read,
+                        source_lane: CheckoutAccessSourceLane::NativeAttachment,
+                    })
+                    .map_err(anyhow::Error::new)?,
+            );
+            let probe = publisher_publish_probe(lease.project_root(), &p.full_ref, {
+                let checkout_access = checkout_access.clone();
+                let lease = Arc::clone(&lease);
+                Box::new(move || {
+                    checkout_access.revalidate(&lease).map_err(|error| {
+                        PublishError::refusal(error.code.as_str(), error.to_string())
+                    })
+                })
+            })?;
             let receipt = project_catalog_admin::publish_accepted_publication(
                 &store,
                 runtime.as_ref(),
@@ -1467,10 +1518,11 @@ fn publish_mode_from_params(
 /// re-resolver is what the commit path calls inside the publication lock.
 #[allow(clippy::disallowed_methods)] // reached only from run_blocking closures
 fn publisher_publish_probe(
-    row: &bbox_corpus_core::project_catalog::CheckoutAttachment,
+    project_dir: &Path,
     full_ref: &str,
+    revalidate_checkout: Box<dyn Fn() -> Result<(), PublishError> + Send + Sync>,
 ) -> anyhow::Result<project_catalog_admin::PublisherPublishProbe> {
-    let project_dir = PathBuf::from(&row.checkout_project_dir);
+    let project_dir = project_dir.to_path_buf();
     let git_root = bbox_corpus_core::git::git_root_for_path(&project_dir)
         .unwrap_or_else(|| project_dir.clone());
     let Some(resolved_commit) = bbox_corpus_core::git::resolve_commit(&git_root, full_ref) else {
@@ -1540,6 +1592,7 @@ fn publisher_publish_probe(
                 })
                 .collect(),
         },
+        revalidate_checkout,
         revalidate_ref: Box::new(move || {
             bbox_corpus_core::git::resolve_commit(&revalidation_root, &revalidation_ref)
         }),
@@ -2201,7 +2254,12 @@ mod tests {
 
         // Success: the ref resolves, the committed identity at that commit
         // supplies the scope, and both lanes are captured.
-        let probe = publisher_publish_probe(&row, "refs/heads/main").unwrap();
+        let probe = publisher_publish_probe(
+            Path::new(&row.checkout_project_dir),
+            "refs/heads/main",
+            Box::new(|| Ok(())),
+        )
+        .unwrap();
         assert_eq!(probe.resolved_commit.len(), 40);
         assert_eq!(
             probe.committed_scope,
@@ -2220,9 +2278,13 @@ mod tests {
         );
 
         // A ref that does not exist.
-        let error = publisher_publish_probe(&row, "refs/heads/does-not-exist")
-            .err()
-            .expect("an unresolvable ref refuses");
+        let error = publisher_publish_probe(
+            Path::new(&row.checkout_project_dir),
+            "refs/heads/does-not-exist",
+            Box::new(|| Ok(())),
+        )
+        .err()
+        .expect("an unresolvable ref refuses");
         assert!(
             error
                 .to_string()
@@ -2240,9 +2302,13 @@ mod tests {
             format!("{}\n", "0".repeat(39) + "1"),
         )
         .unwrap();
-        let error = publisher_publish_probe(&row, "refs/heads/dangling")
-            .err()
-            .expect("a dangling ref refuses");
+        let error = publisher_publish_probe(
+            Path::new(&row.checkout_project_dir),
+            "refs/heads/dangling",
+            Box::new(|| Ok(())),
+        )
+        .err()
+        .expect("a dangling ref refuses");
         assert!(
             error
                 .to_string()
@@ -2264,9 +2330,13 @@ mod tests {
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-m", "drop the committed repo id"]);
 
-        let error = publisher_publish_probe(&row, "refs/heads/identityless")
-            .err()
-            .expect("a commit without committed identity refuses");
+        let error = publisher_publish_probe(
+            Path::new(&row.checkout_project_dir),
+            "refs/heads/identityless",
+            Box::new(|| Ok(())),
+        )
+        .err()
+        .expect("a commit without committed identity refuses");
         assert!(
             error
                 .to_string()

@@ -829,6 +829,10 @@ pub struct PublisherPublishProbe {
     /// that commit.
     pub committed_scope: PublishedScope,
     pub sources: PublishSources,
+    /// Revalidates the exact native checkout lease from inside the
+    /// publication lock. The tool owns checkout authority; admin owns the
+    /// ordering point immediately before the pointer operation.
+    pub revalidate_checkout: Box<dyn Fn() -> Result<(), PublishError> + Send + Sync>,
     /// Re-resolves the full ref immediately before the pointer swap, from
     /// inside the publication lock (plan §7.3 step 6). `None` means the ref
     /// no longer resolves at all.
@@ -944,6 +948,7 @@ pub fn publish_accepted_publication(
     let attachment_id = request.attachment_id.clone();
     let catalog_scope = catalog_scope.clone();
     let resolved_commit = probe.resolved_commit.clone();
+    let revalidate_checkout = probe.revalidate_checkout;
     let revalidate_ref = probe.revalidate_ref;
     runtime.commit_publish(prepared, &mut || {
         let fresh = store
@@ -956,6 +961,7 @@ pub fn publish_accepted_publication(
             ));
         }
         validate_publisher_attachment(&fresh, &project_id, &attachment_id, &catalog_scope)?;
+        revalidate_checkout()?;
         // A ref that moved after preparation would install a generation
         // naming a commit the ref no longer points at.
         match revalidate_ref() {
@@ -1012,9 +1018,11 @@ fn validate_publisher_attachment(
 /// Daemon-probed publisher-bind evidence: the tool layer proved the new
 /// attachment's object database contains the pointer's accepted commit
 /// (the containment a later advance and overlay recomputation need).
-#[derive(Debug, Clone)]
 pub struct PublisherBindProbe {
     pub accepted_commit_present: bool,
+    /// Same lease boundary as publisher Advance, rechecked under the
+    /// publication lock immediately before the binding replacement.
+    pub revalidate_checkout: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 #[derive(Debug, Clone)]
@@ -1135,6 +1143,12 @@ pub fn bind_publisher_attachment(
                 "the attachment detached while the publisher binding was being validated",
             ));
         }
+    }
+    if !(probe.revalidate_checkout)() {
+        return Err(admin_error(
+            "error.checkout_lease_stale",
+            "the publisher attachment lease changed before the binding replacement",
+        ));
     }
     // The store refuses before mutating when the expected scope disagrees
     // with the pointer's accepted scope, so no restore path exists.
@@ -7200,6 +7214,7 @@ mod publisher_publish_tests {
                             .unwrap(),
                     }],
                 },
+                revalidate_checkout: Box::new(|| Ok(())),
                 revalidate_ref: Box::new(move || Some(revalidated.clone())),
             }
         }
@@ -7262,6 +7277,27 @@ mod publisher_publish_tests {
                 .accepted_commit(),
             COMMIT_TWO
         );
+    }
+
+    #[test]
+    fn publish_revalidates_the_checkout_lease_at_the_swap_boundary() {
+        let fixture = fixture();
+        let mut probe = fixture.probe(&scope("."), COMMIT_ONE);
+        probe.revalidate_checkout = Box::new(|| {
+            Err(PublishError::refusal(
+                "error.checkout_lease_stale",
+                "injected stale lease",
+            ))
+        });
+        let error = publish_accepted_publication(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.request(PublisherPublishMode::Establish, ATTACHMENT),
+            probe,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.checkout_lease_stale");
+        assert!(fixture.runtime.load_verified(&project_id()).is_err());
     }
 
     #[test]
@@ -7417,6 +7453,7 @@ mod publisher_publish_tests {
                 &attachment_id(ATTACHMENT),
                 &PublisherBindProbe {
                     accepted_commit_present,
+                    revalidate_checkout: Box::new(|| true),
                 },
             )
             .unwrap_err();
@@ -7544,6 +7581,7 @@ mod publisher_publish_tests {
             &attachment_id(ATTACHMENT),
             &PublisherBindProbe {
                 accepted_commit_present: false,
+                revalidate_checkout: Box::new(|| true),
             },
         )
         .unwrap_err();
@@ -7551,6 +7589,25 @@ mod publisher_publish_tests {
             error.code(),
             "error.project_catalog_admin_commit_not_present"
         );
+    }
+
+    #[test]
+    fn bind_revalidates_the_checkout_lease_at_the_replace_boundary() {
+        let fixture = fixture();
+        fixture.establish(COMMIT_ONE).unwrap();
+        let error = bind_publisher_attachment(
+            &fixture.store,
+            &fixture.projects_path,
+            fixture.epoch(),
+            &project_id(),
+            &attachment_id(ATTACHMENT),
+            &PublisherBindProbe {
+                accepted_commit_present: true,
+                revalidate_checkout: Box::new(|| false),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.checkout_lease_stale");
     }
 
     #[test]
