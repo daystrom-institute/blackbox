@@ -363,9 +363,6 @@ impl ManifestIndex {
     }
 
     pub fn upsert_workspace(&mut self, project_id: &str, entry: WorkspaceIndexEntry) {
-        if self.workspaces.get(project_id) == Some(&entry) {
-            return;
-        }
         self.updated_at = Some(chrono_now_rfc3339());
         self.workspaces.insert(project_id.to_string(), entry);
     }
@@ -804,15 +801,16 @@ fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Res
     if bytes.len() > MAX_MANIFEST_INDEX_BYTES {
         anyhow::bail!("manifest-index exceeds its byte limit");
     }
-    // Reindex passes may rediscover exactly the authority already published.
-    // Replacing the file anyway changes its inode/mtime, which used to make
-    // the edge watcher treat a no-op pass as a new multi-GB graph input.
-    // A concurrent writer that lands after this read is also safe: returning
-    // preserves its newer publication instead of replacing it with ours.
+    // Reindex passes may rediscover exactly the authority already published
+    // while refreshing only `updated_at`. Replacing the file anyway changes
+    // its inode/mtime, which used to make the edge watcher treat a no-op pass
+    // as a new multi-GB graph input. A concurrent writer that lands after this
+    // read is also safe: returning preserves its newer publication instead of
+    // replacing it with ours.
     if read_manifest_index_confined(edges_dir)
         .ok()
         .as_deref()
-        .is_some_and(|existing| existing == bytes.as_slice())
+        .is_some_and(|existing| manifest_index_semantically_matches(existing, index))
     {
         return Ok(());
     }
@@ -1382,7 +1380,7 @@ fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Res
     if read_manifest_index_confined(edges_dir)
         .ok()
         .as_deref()
-        .is_some_and(|existing| existing == bytes.as_slice())
+        .is_some_and(|existing| manifest_index_semantically_matches(existing, index))
     {
         return Ok(());
     }
@@ -1391,6 +1389,16 @@ fn write_manifest_index_confined(edges_dir: &Path, index: &ManifestIndex) -> Res
     fs::rename(temp, manifest_index_path(edges_dir))?;
     fs::File::open(&dir)?.sync_all()?;
     Ok(())
+}
+
+fn manifest_index_semantically_matches(existing: &[u8], desired: &ManifestIndex) -> bool {
+    let Ok(mut existing) = serde_json::from_slice::<ManifestIndex>(existing) else {
+        return false;
+    };
+    let mut desired = desired.clone();
+    existing.updated_at = None;
+    desired.updated_at = None;
+    existing == desired
 }
 
 fn append_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) {
@@ -1564,30 +1572,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn identical_workspace_upsert_preserves_manifest_timestamp() {
-        let entry = WorkspaceIndexEntry {
-            manifest: "workspace/proj1234/manifest.json".into(),
-            active_snapshot: Some("workspace/proj1234/snapshots/head-abc".into()),
-            dirty_overlay: None,
-            repo_materialization: None,
-            code_source_selector: None,
-            code_source_generation: None,
-            git_overlay: None,
-            git_overlay_managed: false,
-        };
-        let mut index = ManifestIndex::new();
-        index.upsert_workspace("proj1234", entry.clone());
-        index.updated_at = Some("stable-timestamp".into());
-
-        index.upsert_workspace("proj1234", entry);
-
-        assert_eq!(index.updated_at.as_deref(), Some("stable-timestamp"));
-    }
-
     #[cfg(unix)]
     #[test]
-    fn identical_manifest_index_write_preserves_file_identity() {
+    fn timestamp_only_manifest_index_write_preserves_file_identity() {
         use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1595,7 +1582,9 @@ mod tests {
         index.write_atomic(dir.path()).unwrap();
         let before = std::fs::metadata(manifest_index_path(dir.path())).unwrap();
 
-        index.write_atomic(dir.path()).unwrap();
+        let mut timestamp_only = index;
+        timestamp_only.updated_at = Some("timestamp-only-rewrite".into());
+        timestamp_only.write_atomic(dir.path()).unwrap();
         let after = std::fs::metadata(manifest_index_path(dir.path())).unwrap();
 
         assert_eq!(before.dev(), after.dev());
