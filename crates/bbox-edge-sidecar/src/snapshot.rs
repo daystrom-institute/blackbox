@@ -2470,6 +2470,37 @@ fn is_reclaimable_orphan_txn_token(value: &str) -> bool {
     generated || legacy
 }
 
+/// Whether `name` is exactly the atomic writer temporary for a transaction
+/// journal: `.<txn-token>.journal.json.<pid>.<sequence>.tmp`.
+///
+/// A crash between the temporary write and `renameat` leaves this sibling in
+/// the transaction directory. It is writer residue, not a journal or staging
+/// token, but every segment is validated so arbitrary dot-prefixed entries
+/// still fail closed.
+fn is_snapshot_txn_journal_temporary(name: &str) -> bool {
+    let Some(dotless) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(body) = dotless.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((head, sequence)) = body.rsplit_once('.') else {
+        return false;
+    };
+    if sequence.parse::<u64>().is_err() {
+        return false;
+    }
+    let Some((journal_leaf, pid)) = head.rsplit_once('.') else {
+        return false;
+    };
+    if pid.parse::<u32>().is_err() {
+        return false;
+    }
+    journal_leaf
+        .strip_suffix(".journal.json")
+        .is_some_and(is_reclaimable_orphan_txn_token)
+}
+
 #[cfg(test)]
 thread_local! {
     static STAGING_FAILURE_POINT: std::cell::RefCell<Option<&'static str>> =
@@ -2791,6 +2822,16 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
                 if s.ends_with(".journal.json") {
                     continue;
                 }
+                if is_snapshot_txn_journal_temporary(s) {
+                    let entry_c = std::ffi::CString::new(s.as_bytes())?;
+                    let stat = fstatat_nofollow(txn_dir.as_raw_fd(), &entry_c)?;
+                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                        anyhow::bail!(
+                            "inventory: journal writer temporary {s} for {project_id} is not a regular file"
+                        );
+                    }
+                    continue;
+                }
                 if !journal_tokens.contains(s) {
                     anyhow::bail!("inventory: unexpected entry {s} in txn dir for {project_id}");
                 }
@@ -2846,6 +2887,15 @@ pub fn validate_journal_inventory(edges_dir: &Path) -> Result<Vec<String>> {
                     anyhow::anyhow!("inventory: non-UTF-8 filename in txn dir for {project_id}")
                 })?;
                 if s.ends_with(".journal.json") {
+                    continue;
+                }
+                if is_snapshot_txn_journal_temporary(s) {
+                    let metadata = fs::symlink_metadata(entry.path())?;
+                    if !metadata.is_file() || metadata.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "inventory: journal writer temporary {s} for {project_id} is not a safe regular file"
+                        );
+                    }
                     continue;
                 }
                 if !journal_tokens.contains(s) {
@@ -4542,12 +4592,24 @@ fn recover_pending_transactions_for_project(
     // directory without a journal is the defined crash-before-journal orphan.
     // It is reclaimed only after the complete directory inventory proves that
     // no unknown entry is present.
+    let mut journal_temporaries = Vec::new();
     let mut orphan_tokens = Vec::new();
     for name in &entries {
         let s = name.to_str().ok_or_else(|| {
             anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
         })?;
         if s.ends_with(".journal.json") {
+            continue;
+        }
+        if is_snapshot_txn_journal_temporary(s) {
+            let temporary_c = std::ffi::CString::new(s.as_bytes())?;
+            let stat = fstatat_nofollow(txn_dir.as_raw_fd(), &temporary_c)?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                anyhow::bail!(
+                    "recovery: journal writer temporary {s} is not a regular file for {project_id}"
+                );
+            }
+            journal_temporaries.push(s.to_string());
             continue;
         }
         if !journal_tokens.contains(s) && !is_reclaimable_orphan_txn_token(s) {
@@ -4570,7 +4632,21 @@ fn recover_pending_transactions_for_project(
             orphan_tokens.push(s.to_string());
         }
     }
-    let had_orphans = !orphan_tokens.is_empty();
+    let had_reclaimable_residue = !journal_temporaries.is_empty() || !orphan_tokens.is_empty();
+    for temporary in journal_temporaries {
+        let temporary_c = std::ffi::CString::new(temporary.as_bytes())?;
+        if unsafe { libc::unlinkat(txn_dir.as_raw_fd(), temporary_c.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
+        }
+        tracing::info!(
+            project_id,
+            temporary,
+            "recovery: reclaimed crash-left transaction journal temporary"
+        );
+    }
     for orphan_token in orphan_tokens {
         let orphan_c = std::ffi::CString::new(orphan_token.as_bytes())?;
         unlinkat_tree(txn_dir.as_raw_fd(), &orphan_c)?;
@@ -4580,7 +4656,7 @@ fn recover_pending_transactions_for_project(
             "recovery: reclaimed crash-before-journal staging directory"
         );
     }
-    if had_orphans {
+    if had_reclaimable_residue {
         txn_dir.sync_all()?;
     }
     // R21F4+F2+F6: Phase 3 - process each decoded journal.
@@ -4828,6 +4904,7 @@ fn recover_pending_transactions_for_project(
         });
     }
 
+    let mut journal_temporary_paths = Vec::new();
     let mut orphan_paths = Vec::new();
     for entry in &entries {
         let name = entry.file_name();
@@ -4835,6 +4912,16 @@ fn recover_pending_transactions_for_project(
             anyhow::anyhow!("recovery: non-UTF-8 filename in txn dir for {project_id}")
         })?;
         if name_str.ends_with(".journal.json") {
+            continue;
+        }
+        if is_snapshot_txn_journal_temporary(name_str) {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "recovery: journal writer temporary {name_str} is not a safe regular file for {project_id}"
+                );
+            }
+            journal_temporary_paths.push((name_str.to_string(), entry.path()));
             continue;
         }
         if !journal_tokens.contains(name_str) && !is_reclaimable_orphan_txn_token(name_str) {
@@ -4858,6 +4945,18 @@ fn recover_pending_transactions_for_project(
             }
             orphan_paths.push((name_str.to_string(), entry.path()));
         }
+    }
+    for (temporary, path) in journal_temporary_paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        tracing::info!(
+            project_id,
+            temporary,
+            "recovery: reclaimed crash-left transaction journal temporary"
+        );
     }
     for (orphan_token, orphan_path) in orphan_paths {
         fs::remove_dir_all(&orphan_path)?;
@@ -9368,6 +9467,62 @@ mod tests {
         let error =
             carry_forward_commitments(&edges_dir, None, &[handle.commitment.clone()]).unwrap_err();
         assert!(format!("{error:#}").contains("no exact validated journal"));
+    }
+
+    #[test]
+    fn r31_crash_left_journal_temporary_is_reclaimed_before_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+        let journal = txn_dir.join(format!("{}.journal.json", handle.txn_token));
+        let temporary = txn_dir.join(format!(
+            ".{}.journal.json.{}.999.tmp",
+            handle.txn_token,
+            std::process::id()
+        ));
+        fs::rename(&journal, &temporary).unwrap();
+
+        recover_pending_transactions_prebind(&edges_dir, None).unwrap();
+
+        assert!(!temporary.exists());
+        assert!(!txn_dir.join(&handle.txn_token).exists());
+    }
+
+    #[test]
+    fn r31_journal_inventory_ignores_exact_writer_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = directory.path().canonicalize().unwrap();
+        let snapshot_id = overlay_fixture(&edges_dir, "p_1", "gen-a");
+        let git_edges = vec![explicit_edge("git", "mentions", "target")];
+        let handle = write_snapshot_members_transaction(
+            &edges_dir,
+            "p_1",
+            &snapshot_id,
+            &[("git-current.jsonl", &git_edges)],
+        )
+        .unwrap();
+        let txn_dir = materialized_dir(&edges_dir).join("workspace/p_1/txn");
+        let temporary = txn_dir.join(format!(
+            ".{}.journal.json.{}.1000.tmp",
+            handle.txn_token,
+            std::process::id()
+        ));
+        fs::write(&temporary, b"partial journal bytes").unwrap();
+
+        assert_eq!(
+            validate_journal_inventory(&edges_dir).unwrap(),
+            vec![handle.commitment]
+        );
+        assert!(temporary.is_file());
     }
 
     #[test]
