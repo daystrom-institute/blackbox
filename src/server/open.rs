@@ -633,6 +633,21 @@ pub(super) fn open_shared_state(
     )
     .context("pre-bind transaction recovery failed")?;
 
+    // Legacy-lane migration commits retain their manifest and rollback
+    // backup, but their extraction staging is disposable once the committed
+    // status is durable. Recover crash-window transactions and reclaim any
+    // committed staging residue before graph authority is captured; older
+    // daemons left a second full copy of every migrated lane here.
+    for message in crate::migration::recover_pending_migrations(&edges_dir)
+        .context("pre-bind legacy edge migration recovery failed")?
+    {
+        if message.starts_with("WARNING:") {
+            tracing::warn!(%message, "legacy edge migration recovery warning");
+        } else {
+            tracing::info!(%message, "legacy edge migration recovery completed");
+        }
+    }
+
     // Pre-bind catalog-mode recovery (P4-F section 10.1 steps 5-8):
     // once-only classification, relationship chain validation,
     // retirement-journal detection, and startup reducer sweep. All run
