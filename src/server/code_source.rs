@@ -2019,6 +2019,13 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
 
                     match action {
                         ReducerAction::NoOp => {
+                            clear_cutback_health_if_converged(
+                                &store,
+                                &project_id,
+                                desired,
+                                effective,
+                                persisted.as_ref(),
+                            );
                             // Crash-window convergence (exit row 12.4): if
                             // the manifest entry is local:<project_id> but the
                             // activation record is still collected, the daemon
@@ -2119,6 +2126,40 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
     // exits. The background task is a daemon-lifetime thread; it is NOT
     // a tokio task and does NOT hold any sync lock across slow work.
     *state.reconciler_shutdown.write() = shutdown.clone();
+}
+
+fn clear_cutback_health_if_converged(
+    store: &CodeSourceStore,
+    project_id: &str,
+    desired: DesiredAssignment,
+    effective: EffectiveSource,
+    persisted: Option<&CutbackStateV2>,
+) {
+    if persisted.is_some()
+        || !matches!(
+            (desired, effective),
+            (DesiredAssignment::Local, EffectiveSource::Local)
+                | (DesiredAssignment::Collected, EffectiveSource::Collected)
+        )
+    {
+        return;
+    }
+    for code in [
+        "cutback_pending",
+        "cutback_manual_retry_required",
+        "cutback_terminal",
+        "cutback_waiting_readiness",
+        "cutback_waiting_selector_retirement",
+    ] {
+        if let Err(error) = store.clear_health_failure(project_id, code) {
+            tracing::warn!(
+                project_id,
+                code,
+                %error,
+                "reducer: failed to clear resolved cutback health"
+            );
+        }
+    }
 }
 
 fn gate_transient_deadline(
@@ -6763,6 +6804,55 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
             .unwrap()
+    }
+
+    #[test]
+    fn converged_reducer_clears_stale_cutback_health_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("code-source");
+        let store = CodeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let project_id = "health-project";
+        for code in [
+            "cutback_pending",
+            "cutback_manual_retry_required",
+            "cutback_terminal",
+            "cutback_waiting_readiness",
+            "cutback_waiting_selector_retirement",
+        ] {
+            store
+                .record_health_failure(project_id, code, "stale")
+                .unwrap();
+        }
+        store
+            .record_health_failure(project_id, "unrelated_failure", "keep")
+            .unwrap();
+        store
+            .record_health_failure("unresolved-project", "cutback_pending", "keep")
+            .unwrap();
+
+        clear_cutback_health_if_converged(
+            &store,
+            project_id,
+            DesiredAssignment::Local,
+            EffectiveSource::Local,
+            None,
+        );
+        clear_cutback_health_if_converged(
+            &store,
+            "unresolved-project",
+            DesiredAssignment::Local,
+            EffectiveSource::Collected,
+            None,
+        );
+
+        let records = store.health_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| {
+            record.project_id == project_id && record.code == "unrelated_failure"
+        }));
+        assert!(records.iter().any(|record| {
+            record.project_id == "unresolved-project" && record.code == "cutback_pending"
+        }));
     }
 
     #[test]
