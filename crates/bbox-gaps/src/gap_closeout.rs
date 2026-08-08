@@ -105,7 +105,11 @@ pub fn render_checks(checks: &[GapTrailerCheck]) -> String {
 
 fn scan_git_trailers(repo: &Path, range: Option<&str>) -> Result<Vec<GapTrailerRef>> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo).arg("log").arg("--format=%B");
+    cmd.arg("-C")
+        .arg(repo)
+        .arg("log")
+        .arg("--format=%B")
+        .arg("--end-of-options");
     if let Some(range) = range.filter(|s| !s.trim().is_empty()) {
         cmd.arg(range);
     } else {
@@ -134,6 +138,16 @@ mod tests {
     use super::*;
     use crate::gaps::{GapFileParams, GapStore};
     use tempfile::tempdir;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
 
     fn file_gap(store: &mut GapStore, slug: &str) -> String {
         store
@@ -195,6 +209,19 @@ mod tests {
         // no longer resolve against the gap store.
         let refs = scan_commit_trailers("Addresses-Gap-Note: note-a1b2c3d4");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn git_range_cannot_inject_options() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+
+        let error = scan_git_trailers(&root, Some("--all")).unwrap_err();
+        assert!(error.to_string().contains("git log failed"));
     }
 
     #[test]

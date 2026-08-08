@@ -1843,7 +1843,13 @@ fn insert_overlay_item(
     );
     let mut entry = (**entry).clone();
     match project {
-        OverlayRowProject::LegacyPath(path) => entry.project = Some(path.to_string()),
+        OverlayRowProject::LegacyPath(path) => {
+            // Legacy checkout bytes are repo-owned project knowledge. They
+            // cannot assert global render authority or a catalog project id.
+            entry.scope = Scope::Project;
+            entry.project = Some(path.to_string());
+            entry.project_id = None;
+        }
         OverlayRowProject::Catalog(project_id) => {
             entry.project = None;
             entry.project_id = Some(project_id.to_string());
@@ -1993,7 +1999,10 @@ mod tests {
         git(&base, &["add", "README.md"]);
         git(&base, &["commit", "-q", "-m", "seed"]);
         let repo_id = crate::config::ensure_recorded_repo_id(&base).unwrap();
-        write_entry(&base, &entry("shared", "PUBLISHED_CONTENT"));
+        let mut hostile_published = entry("shared", "PUBLISHED_CONTENT");
+        hostile_published.scope = Scope::Global;
+        hostile_published.project_id = Some("forged-published-project".into());
+        write_entry(&base, &hostile_published);
         write_entry(&base, &entry("deleted", "PUBLISHED_DELETE_TARGET"));
         git(&base, &["add", ".bbox"]);
         git(&base, &["commit", "-q", "-m", "published knowledge"]);
@@ -2031,10 +2040,13 @@ mod tests {
         write_entry(&base, &entry("shared", "OWN_CONTENT"));
         std::fs::remove_file(base.join(".bbox/knowledge/deleted.json")).unwrap();
         let mut peer_values = BTreeMap::new();
+        let mut hostile_peer = entry("shared", "PEER_CONTENT");
+        hostile_peer.scope = Scope::Global;
+        hostile_peer.project_id = Some("forged-peer-project".into());
         peer_values.insert(
             "shared".into(),
             OverlayValue::Upsert {
-                entry: Box::new(entry("shared", "PEER_CONTENT")),
+                entry: Box::new(hostile_peer),
                 content_hash: "peer-hash".into(),
             },
         );
@@ -2075,6 +2087,14 @@ mod tests {
         assert_eq!(
             published.knowledge.entry("shared").unwrap().content,
             "PUBLISHED_CONTENT"
+        );
+        assert_eq!(
+            published.knowledge.entry("shared").unwrap().scope,
+            Scope::Project
+        );
+        assert_eq!(
+            published.knowledge.entry("shared").unwrap().project_id,
+            None
         );
         assert!(published.knowledge.entry("deleted").is_some());
         std::fs::create_dir_all(base.join(".bbox/local")).unwrap();
@@ -2136,6 +2156,11 @@ mod tests {
         assert!(all.knowledge.entry("shared").is_some());
         assert!(all.knowledge.entry(&own_ref).is_some());
         assert!(all.knowledge.entry(&peer_ref).is_some());
+        assert_eq!(
+            all.knowledge.entry(&peer_ref).unwrap().scope,
+            Scope::Project
+        );
+        assert_eq!(all.knowledge.entry(&peer_ref).unwrap().project_id, None);
         assert_eq!(all.built_from.len(), 3);
         let published_stamp_ref = all
             .knowledge

@@ -15,7 +15,7 @@ use bbox_corpus_core::project_record::ResolvedCheckoutScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::knowledge::KnowledgeEntry;
+use crate::knowledge::{KnowledgeEntry, Scope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -517,7 +517,12 @@ pub fn load_published_snapshot_at_commit_unhydrated(
                 entry.id
             );
         }
+        // Repository-owned knowledge is always project-scoped. Committed
+        // bytes are untrusted input and may not promote themselves into the
+        // operator's global rendered memory or assert catalog identity.
+        entry.scope = Scope::Project;
         entry.project = Some(durable_project.to_string());
+        entry.project_id = None;
         let id = entry.id.clone();
         if entries
             .insert(
@@ -1206,6 +1211,37 @@ mod tests {
             }
         }
         WorkingKnowledgeSnapshot::new(files).unwrap()
+    }
+
+    #[test]
+    fn published_repo_entries_cannot_assert_global_or_catalog_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "-q", "-b", "main"]);
+        run(&root, &["config", "user.email", "t@example.com"]);
+        run(&root, &["config", "user.name", "Test"]);
+        let mut hostile = entry("hostile", "repo bytes");
+        hostile.scope = Scope::Global;
+        hostile.project_id = Some("forged-project".into());
+        write_entry(&root, &hostile);
+        run(&root, &["add", ".bbox/knowledge"]);
+        run(&root, &["commit", "-q", "-m", "hostile knowledge"]);
+        let commit = git::current_head(&root).unwrap();
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+
+        let snapshot = load_published_snapshot_at_commit_unhydrated(
+            &root,
+            "refs/heads/main",
+            &commit,
+            &scope,
+            "/durable/project",
+        )
+        .unwrap();
+        let loaded = &snapshot.entries["hostile"].entry;
+        assert_eq!(loaded.scope, Scope::Project);
+        assert_eq!(loaded.project.as_deref(), Some("/durable/project"));
+        assert_eq!(loaded.project_id, None);
     }
 
     // ── Catalog overlay baseline path (plan section 13.4) ────────────

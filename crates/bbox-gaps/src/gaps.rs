@@ -765,12 +765,13 @@ fn load_repo_gap_entries(project_dir: &Path, durable_project: &str) -> Result<Ve
 /// committed files whose gap has been reassigned away from this dir
 /// (generation semantics for write_dir migrations / project moves).
 ///
-/// `known_ids` is the full set of gap ids the store currently holds, across
-/// every scope. A file whose id the store does NOT hold is never deleted:
-/// it arrived out-of-band (git pull, peer commit, hand-authoring) or failed
-/// to deserialize at load — in both cases the in-memory set is not
-/// authoritative for it, and deleting it destroys committed repo-owned
-/// knowledge (this exact clobber shipped once; see gap-1f3894cc).
+/// `known_ids` is the set of gap ids successfully loaded from this concrete
+/// carrier. A file whose id was not accepted from this carrier is never
+/// deleted: it arrived out-of-band (git pull, peer commit, hand-authoring),
+/// failed to deserialize, or collided with another scope at load. In every
+/// case the in-memory set is not authoritative for it, and deleting it would
+/// destroy committed repo-owned gap state (this exact clobber shipped once;
+/// see gap-1f3894cc).
 ///
 /// `redirected_ids` are gaps whose durable project IS this dir but whose
 /// rewrite was redirected into a worktree this save (session write-
@@ -985,6 +986,11 @@ pub struct GapStore {
     repo_write: Option<Arc<dyn GapRepoWrite>>,
     repo_owned_projects: BTreeSet<String>,
     repo_owned_carriers: BTreeSet<String>,
+    /// Successfully loaded ids by concrete carrier. Generation purge may
+    /// remove only these files, so malformed, unsafe, symlinked, or
+    /// cross-project-shadowed records remain protected even if another scope
+    /// happens to use the same logical id.
+    repo_loaded_ids: BTreeMap<String, BTreeSet<String>>,
     /// Store-layer enforcement for the monotonic path-authority cut.
     path_fallback_cut: bool,
     view_metadata: BTreeMap<String, GapViewMetadata>,
@@ -1064,6 +1070,7 @@ impl GapStore {
             repo_write: None,
             repo_owned_projects: BTreeSet::new(),
             repo_owned_carriers: BTreeSet::new(),
+            repo_loaded_ids: BTreeMap::new(),
             path_fallback_cut: false,
             view_metadata: BTreeMap::new(),
         };
@@ -1121,6 +1128,7 @@ impl GapStore {
         }
         self.repo_owned_projects.clear();
         self.repo_owned_carriers.clear();
+        self.repo_loaded_ids.clear();
         self.load_project_entries()?;
         Ok(())
     }
@@ -1139,10 +1147,29 @@ impl GapStore {
                 self.repo_owned_carriers.insert(carrier.carrier_id.clone());
             }
             for entry in entries {
+                let loaded_id = entry.id.clone();
+                let mut accepted = false;
                 if let Some(existing) = self.data.gaps.iter_mut().find(|g| g.id == entry.id) {
-                    *existing = entry;
+                    if existing.project.as_deref() == Some(carrier.project.as_str()) {
+                        *existing = entry;
+                        accepted = true;
+                    } else {
+                        tracing::warn!(
+                            id = %entry.id,
+                            project = %carrier.project,
+                            existing_project = ?existing.project,
+                            "gaps load: refusing cross-project gap id shadow"
+                        );
+                    }
                 } else {
                     self.data.gaps.push(entry);
+                    accepted = true;
+                }
+                if accepted {
+                    self.repo_loaded_ids
+                        .entry(carrier.carrier_id.clone())
+                        .or_default()
+                        .insert(loaded_id);
                 }
             }
         }
@@ -1288,11 +1315,18 @@ impl GapStore {
             .iter()
             .map(|carrier| carrier.carrier_id.as_str())
             .collect::<BTreeSet<_>>();
-        let known_ids: BTreeSet<&str> = self.data.gaps.iter().map(|g| g.id.as_str()).collect();
         let no_redirects = BTreeSet::new();
+        let no_loaded_ids = BTreeSet::new();
         for (carrier, entries) in &by_project {
             let purge = loaded.contains(carrier.carrier_id.as_str());
             let redirected_ids = redirected.get(carrier).unwrap_or(&no_redirects);
+            let known_ids = self
+                .repo_loaded_ids
+                .get(&carrier.carrier_id)
+                .unwrap_or(&no_loaded_ids)
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
             self.with_repo_write(carrier, |root| {
                 persist_repo_gap_entries(root, entries, purge, &known_ids, redirected_ids)
             })?;
@@ -1364,6 +1398,7 @@ impl GapStore {
             repo_write: None,
             repo_owned_projects: BTreeSet::new(),
             repo_owned_carriers: BTreeSet::new(),
+            repo_loaded_ids: BTreeMap::new(),
             path_fallback_cut: true,
             view_metadata,
         }
@@ -2487,6 +2522,73 @@ mod tests {
             broken.exists(),
             "purge must keep files whose id the store does not hold"
         );
+    }
+
+    #[test]
+    fn repo_gap_id_collision_cannot_shadow_or_delete_another_project() {
+        let dir_a = tempdir().unwrap();
+        let root_a = dir_a.path().canonicalize().unwrap();
+        let dir_b = tempdir().unwrap();
+        let root_b = dir_b.path().canonicalize().unwrap();
+        fs::create_dir_all(repo_gaps_dir(&root_a)).unwrap();
+        fs::create_dir_all(repo_gaps_dir(&root_b)).unwrap();
+
+        let seed_dir = tempdir().unwrap();
+        let mut seed = GapStore::open(&seed_dir.path().join("gaps.json")).unwrap();
+        seed.file(&file_params(
+            "seed",
+            "tooling/test-domain/cross-project-collision",
+        ))
+        .unwrap();
+        let mut first = seed.all()[0].clone();
+        first.id = "gap-shared-id".into();
+        first.title = "first project truth".into();
+        let mut collision = first.clone();
+        collision.title = "must not shadow".into();
+        let mut stayer = first.clone();
+        stayer.id = "gap-stayer".into();
+        stayer.title = "keeps second-project purge active".into();
+
+        let first_path = repo_gaps_dir(&root_a).join("gap-shared-id.json");
+        let collision_path = repo_gaps_dir(&root_b).join("gap-shared-id.json");
+        let stayer_path = repo_gaps_dir(&root_b).join("gap-stayer.json");
+        fs::write(&first_path, committed_gap_note_bytes(&first).unwrap()).unwrap();
+        fs::write(
+            &collision_path,
+            committed_gap_note_bytes(&collision).unwrap(),
+        )
+        .unwrap();
+        fs::write(&stayer_path, committed_gap_note_bytes(&stayer).unwrap()).unwrap();
+
+        let central = tempdir().unwrap();
+        let mut store = GapStore::open(&central.path().join("gaps.json")).unwrap();
+        store
+            .set_project_roots(vec![root_a.clone(), root_b.clone()])
+            .unwrap();
+
+        let visible = store
+            .all()
+            .iter()
+            .find(|gap| gap.id == "gap-shared-id")
+            .unwrap();
+        assert_eq!(visible.title, "first project truth");
+        assert_eq!(visible.project.as_deref(), root_a.to_str());
+
+        store
+            .data
+            .gaps
+            .iter_mut()
+            .find(|gap| gap.id == "gap-stayer")
+            .unwrap()
+            .notes = Some("trigger save".into());
+        store.save().unwrap();
+
+        assert!(first_path.exists());
+        assert!(
+            collision_path.exists(),
+            "cross-project collision rejected at load must remain purge-protected"
+        );
+        assert!(stayer_path.exists());
     }
 
     #[test]

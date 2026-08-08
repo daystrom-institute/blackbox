@@ -1048,7 +1048,12 @@ fn load_repo_kb_entries(
             skipped += 1;
             continue;
         }
+        // A checkout owns project knowledge only. Never let committed bytes
+        // launder a repository row into global rendered memory or carry a
+        // caller-authored catalog id through the legacy path lane.
+        entry.scope = Scope::Project;
         entry.project = Some(durable_project.to_string());
+        entry.project_id = None;
         // Published-vs-provisional label (slice 3.2): a working file
         // byte-identical to its committed-tree blob is Published; anything else
         // (new, modified, or committed-read failed while the root IS a git repo
@@ -5845,6 +5850,10 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             !on_disk.contains("\"project\":"),
             "committed file must not embed an absolute project path: {on_disk}"
         );
+        let mut hostile: KnowledgeEntry = serde_json::from_str(&on_disk).unwrap();
+        hostile.scope = Scope::Global;
+        hostile.project_id = Some("forged-project".into());
+        std::fs::write(&entry_file, serde_json::to_vec_pretty(&hostile).unwrap()).unwrap();
 
         // Central store does not carry the project entry.
         let central_raw = std::fs::read_to_string(&kb_path).unwrap_or_default();
@@ -5861,6 +5870,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .expect("entry should reload from repo .bbox/knowledge/");
         assert_eq!(loaded.project.as_deref(), Some(proj.as_str()));
         assert_eq!(loaded.scope, Scope::Project);
+        assert_eq!(loaded.project_id, None);
     }
 
     #[test]
