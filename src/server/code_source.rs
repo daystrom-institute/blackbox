@@ -2144,13 +2144,7 @@ fn clear_cutback_health_if_converged(
     {
         return;
     }
-    for code in [
-        "cutback_pending",
-        "cutback_manual_retry_required",
-        "cutback_terminal",
-        "cutback_waiting_readiness",
-        "cutback_waiting_selector_retirement",
-    ] {
+    for code in CUTBACK_HEALTH_CODES {
         if let Err(error) = store.clear_health_failure(project_id, code) {
             tracing::warn!(
                 project_id,
@@ -2159,6 +2153,78 @@ fn clear_cutback_health_if_converged(
                 "reducer: failed to clear resolved cutback health"
             );
         }
+    }
+}
+
+const CUTBACK_HEALTH_CODES: [&str; 5] = [
+    "cutback_pending",
+    "cutback_manual_retry_required",
+    "cutback_terminal",
+    "cutback_waiting_readiness",
+    "cutback_waiting_selector_retirement",
+];
+
+/// Clear health rows left behind by an older daemon after cutback authority
+/// has already converged. Some steady local projects have no startup reducer
+/// event, so limiting this cleanup to the reducer's `NoOp` arm leaves those
+/// durable warnings stuck across every restart.
+///
+/// Only projects which currently carry a cutback-specific health row are
+/// inspected. The same authority predicate as the live reducer applies: no
+/// persisted cutback state and desired/effective sources must agree. Any
+/// unresolved cutback, unavailable materialization, or unrelated health row
+/// remains untouched.
+fn clear_converged_cutback_health_at_startup(
+    store: &CodeSourceStore,
+    code_sources: &CodeSourceRuntime,
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+) {
+    let health = match store.health_records() {
+        Ok(health) => health,
+        Err(error) => {
+            tracing::warn!(%error, "startup sweep: loading code-source health failed");
+            return;
+        }
+    };
+    let project_ids = health
+        .into_iter()
+        .filter(|record| CUTBACK_HEALTH_CODES.contains(&record.code.as_str()))
+        .map(|record| record.project_id)
+        .collect::<BTreeSet<_>>();
+    if project_ids.is_empty() {
+        return;
+    }
+    let assigned = code_sources
+        .assignments()
+        .into_iter()
+        .map(|(_scope, project_id)| project_id)
+        .collect::<BTreeSet<_>>();
+    for project_id in project_ids {
+        let activation = match store.load_activation_mixed(&project_id) {
+            Ok(activation) => activation,
+            Err(error) => {
+                tracing::warn!(
+                    project_id,
+                    %error,
+                    "startup sweep: loading activation for health convergence failed"
+                );
+                continue;
+            }
+        };
+        let desired = if assigned.contains(&project_id) {
+            DesiredAssignment::Collected
+        } else {
+            DesiredAssignment::Local
+        };
+        let effective =
+            determine_effective_source_from_manifest(activation.as_ref(), manifest, &project_id);
+        clear_cutback_health_if_converged(
+            store,
+            &project_id,
+            desired,
+            effective,
+            activation.as_ref().and_then(|record| record.cutback()),
+        );
     }
 }
 
@@ -4029,6 +4095,12 @@ pub(crate) fn pre_bind_catalog_recovery(
     // case where a live-written record has cutback: None.
     enqueue_desired_effective_mismatches(store, code_sources);
 
+    // Health is durable independently of the reducer queue. A project which
+    // was already local/local before this process started has no mismatch or
+    // persisted-state event to drive a NoOp reduction, so clear only those
+    // cutback rows whose authority is already converged.
+    clear_converged_cutback_health_at_startup(store, code_sources, &reconstructed_manifest);
+
     Ok(pending_first_republish)
 }
 
@@ -4211,14 +4283,22 @@ fn is_bridge_open(
 /// Determine the effective activation source for a project.
 fn determine_effective_source(state: &Arc<SharedState>, project_id: &str) -> EffectiveSource {
     let store = state.code_sources.store();
-    let activation = store.load_activation_mixed(project_id).ok().flatten();
-    let Some(activation) = activation else {
-        return EffectiveSource::Unavailable;
-    };
     let edges_dir = crate::edge_index::edges_dir_from_bro_store(&state.store_dir);
     let manifest = match bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir) {
         Ok(m) => m,
         Err(_) => return EffectiveSource::Unavailable,
+    };
+    let activation = store.load_activation_mixed(project_id).ok().flatten();
+    determine_effective_source_from_manifest(activation.as_ref(), &manifest, project_id)
+}
+
+fn determine_effective_source_from_manifest(
+    activation: Option<&MixedActivationRecord>,
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+    project_id: &str,
+) -> EffectiveSource {
+    let Some(activation) = activation else {
+        return EffectiveSource::Unavailable;
     };
     let selector = manifest
         .workspaces
@@ -6852,6 +6932,95 @@ mod tests {
         }));
         assert!(records.iter().any(|record| {
             record.project_id == "unresolved-project" && record.code == "cutback_pending"
+        }));
+    }
+
+    #[test]
+    fn startup_sweep_clears_converged_cutback_health_without_a_reducer_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let converged_id = "p_0000000000000000000000000000hc1";
+        let unresolved_id = "p_0000000000000000000000000000hc2";
+        let converged_scope = PublishedScope::try_new("health-converged", ".").unwrap();
+        let unresolved_scope = PublishedScope::try_new("health-unresolved", ".").unwrap();
+        let converged_generation = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(converged_scope.clone(), &"a".repeat(40)),
+        );
+        let unresolved_generation = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(unresolved_scope.clone(), &"a".repeat(40)),
+        );
+        p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            converged_id,
+            &converged_scope,
+            &converged_generation,
+            None,
+            false,
+        );
+        let unresolved = p4f_seed_activation(
+            &store,
+            &root.join("code-sources"),
+            unresolved_id,
+            &unresolved_scope,
+            &unresolved_generation,
+            None,
+            false,
+        );
+
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            converged_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{converged_id}/manifest.json"),
+                active_snapshot: Some(format!("workspace/{converged_id}/snapshots/local-health")),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(bbox_code_source::local_selector(converged_id)),
+                code_source_generation: Some("local".to_string()),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+        manifest.workspaces.insert(
+            unresolved_id.to_string(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{unresolved_id}/manifest.json"),
+                active_snapshot: Some(format!(
+                    "workspace/{unresolved_id}/snapshots/collected-health"
+                )),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(unresolved.selector),
+                code_source_generation: Some(unresolved_generation),
+                git_overlay: None,
+                git_overlay_managed: false,
+            },
+        );
+
+        store
+            .record_health_failure(converged_id, "cutback_manual_retry_required", "stale")
+            .unwrap();
+        store
+            .record_health_failure(converged_id, "unrelated_failure", "keep")
+            .unwrap();
+        store
+            .record_health_failure(unresolved_id, "cutback_pending", "keep")
+            .unwrap();
+
+        clear_converged_cutback_health_at_startup(&store, &runtime, &manifest);
+
+        let records = store.health_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| {
+            record.project_id == converged_id && record.code == "unrelated_failure"
+        }));
+        assert!(records.iter().any(|record| {
+            record.project_id == unresolved_id && record.code == "cutback_pending"
         }));
     }
 
