@@ -4297,16 +4297,23 @@ fn determine_effective_source_from_manifest(
     manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
     project_id: &str,
 ) -> EffectiveSource {
-    let Some(activation) = activation else {
-        return EffectiveSource::Unavailable;
-    };
     let selector = manifest
         .workspaces
         .get(project_id)
         .and_then(|entry| entry.code_source_selector.as_deref());
+    // Local authority has no activation journal by design: that journal is
+    // the recovery root for collected generations. Read the manifest before
+    // requiring one, otherwise every steady local project with no journal is
+    // misclassified as Unavailable and stale cutback health survives forever.
+    if selector.is_some_and(|selector| !selector.starts_with("collected:")) {
+        return EffectiveSource::Local;
+    }
+    let Some(activation) = activation else {
+        return EffectiveSource::Unavailable;
+    };
     match selector {
         Some(s) if s.starts_with("collected:") => EffectiveSource::Collected,
-        Some(_) => EffectiveSource::Local,
+        Some(_) => unreachable!("local selectors return before activation lookup"),
         // When the workspace entry is absent (the pending-first-republish
         // state for a migrated or never-booted root), the activation record
         // itself is the durable evidence of the project's effective source.
@@ -6956,24 +6963,10 @@ mod tests {
         let store = runtime.store();
         let converged_id = "p_0000000000000000000000000000hc1";
         let unresolved_id = "p_0000000000000000000000000000hc2";
-        let converged_scope = PublishedScope::try_new("health-converged", ".").unwrap();
         let unresolved_scope = PublishedScope::try_new("health-unresolved", ".").unwrap();
-        let converged_generation = compute_generation_id(
-            "p4f-producer",
-            &empty_generation_descriptor(converged_scope.clone(), &"a".repeat(40)),
-        );
         let unresolved_generation = compute_generation_id(
             "p4f-producer",
             &empty_generation_descriptor(unresolved_scope.clone(), &"a".repeat(40)),
-        );
-        p4f_seed_activation(
-            &store,
-            &root.join("code-sources"),
-            converged_id,
-            &converged_scope,
-            &converged_generation,
-            None,
-            false,
         );
         let unresolved = p4f_seed_activation(
             &store,
