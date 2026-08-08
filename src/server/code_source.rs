@@ -11822,14 +11822,14 @@ mod tests {
     #[test]
     fn regression_effective_source_uses_activation_selector_when_workspace_absent() {
         let src = self_source();
-        let body = extract_fn_body_again(&src, "determine_effective_source");
+        let body = extract_fn_body_again(&src, "determine_effective_source_from_manifest");
         assert!(
             body.contains("activation.selector()"),
-            "determine_effective_source must consult the activation record's own selector when the workspace entry is absent (property 1)"
+            "effective-source classification must consult the activation record's own selector when the workspace entry is absent (property 1)"
         );
         assert!(
             body.contains("activation_selector.starts_with(\"collected:\")"),
-            "determine_effective_source must classify a collected activation record as EffectiveSource::Collected when the workspace entry is absent"
+            "effective-source classification must classify a collected activation record as EffectiveSource::Collected when the workspace entry is absent"
         );
     }
 
