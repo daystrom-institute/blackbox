@@ -31,7 +31,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bbox_code_source::{
     GenerationDescriptor, GenerationState, ManifestEntry, SCHEMA_VERSION, WALKER_POLICY_VERSION,
@@ -49,7 +49,8 @@ use bbox_corpus_core::project_catalog::{
     ProjectId, ProjectScope,
 };
 use bbox_corpus_core::project_catalog_snapshot::{
-    LegacySelectorMembersV1, OwnerRowRequestV1, singleton_selector_members,
+    LegacySelectorMembersV1, OwnerRowRequestV1, OwnerSnapshotRowValueV1,
+    singleton_selector_members, stable_subsource_id,
 };
 use bbox_corpus_index::index::TranscriptIndex;
 use bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause;
@@ -61,9 +62,9 @@ use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
 use bbox_indexing::project_catalog_backfill::{
     ATTACHMENT_RELOCATION_SOURCE, DurableBackfillApplyOutcomeV1, DurableBackfillApplyRequestV1,
     DurableBackfillPreflightRequestV1, DurableBackfillStatusV1, DurableBackfillVerifyReceiptV1,
-    DurableBackfillVerifyRequestV1, LegacyRowObservationV1, LegacyRowOwnerReaderV1,
-    LegacyRowStampCoverageV1, LegacyRowStampOutcomeV1, LegacyRowStamperV1,
-    ProjectCatalogDurableBackfillFacadeV1,
+    DurableBackfillVerifyRequestV1, ERROR_STALE_POST_IMAGE, LegacyRowObservationV1,
+    LegacyRowOwnerReaderV1, LegacyRowStampCoverageV1, LegacyRowStampOutcomeV1, LegacyRowStamperV1,
+    ProjectCatalogDurableBackfillFacadeV1, legacy_store_token,
 };
 use bbox_indexing::project_catalog_inventory::{
     LegacyPathStoreKindV1, ProjectCatalogMigrationStatusV1, QuarantineCollectedV1,
@@ -668,6 +669,21 @@ fn write_owner(path: &Path, array_field: &str, row: serde_json::Value) {
     .unwrap();
 }
 
+fn transcript_edge_row(task_id: &str, selector: &str, project_id: Option<&str>) -> String {
+    let mut row = serde_json::json!({
+        "source": {"type": "task", "task_id": task_id},
+        "kind": "RAN_BASH",
+        "target": {"type": "task", "task_id": format!("{task_id}-target")},
+        "provenance": "explicit",
+        "confidence": "exact",
+        "metadata": {"cwd": selector},
+    });
+    if let Some(project_id) = project_id {
+        row["project_id"] = serde_json::Value::String(project_id.to_string());
+    }
+    format!("{}\n", serde_json::to_string(&row).unwrap())
+}
+
 #[derive(Clone, Copy)]
 enum Owner {
     Knowledge,
@@ -1025,6 +1041,259 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Add one REAL aggregate owner obligation: two transcript-edge lane rows
+    /// carrying the same legacy selector and therefore one selector-group row
+    /// in the ledger with a two-member ordered commitment.
+    fn seed_aggregate_transcript_edge_owner(&self) -> (PathBuf, String, LegacySelectorMembersV1) {
+        let owners = self.layout.stamper_owner_paths();
+        fs::create_dir_all(&owners.transcript_edge_root).unwrap();
+        let lane = owners.transcript_edge_root.join("tool.jsonl");
+        let selector = "/legacy/aggregate";
+        fs::write(
+            &lane,
+            format!(
+                "{}{}",
+                transcript_edge_row("aggregate-1", selector, None),
+                transcript_edge_row("aggregate-2", selector, None)
+            ),
+        )
+        .unwrap();
+        let snapshot = bbox_edge_sidecar::edge_sidecar::capture_project_catalog_owner_snapshot(
+            &owners.transcript_edge_root,
+            Default::default(),
+        )
+        .unwrap();
+        let observation = snapshot
+            .rows
+            .into_iter()
+            .find(|row| {
+                matches!(
+                    &row.value,
+                    OwnerSnapshotRowValueV1::LegacyProjectSelector {
+                        literal_selector,
+                        ..
+                    } if literal_selector == selector
+                )
+            })
+            .expect("aggregate selector observation");
+        let OwnerSnapshotRowValueV1::LegacyProjectSelector { members, .. } = observation.value
+        else {
+            unreachable!("the selected observation is a legacy selector");
+        };
+        assert_eq!(members.row_count, 2, "fixture must exercise a real group");
+        let row_id = observation.stable_row_id;
+
+        let store = ProjectCatalogStore::open_existing(self.layout.projects_path()).unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        let project = self.project.clone();
+        let row_id_for_ledger = row_id.clone();
+        let members_for_ledger = members.clone();
+        store
+            .transact(epoch, |_catalog, attachments| {
+                let entry = LegacyPathLedgerEntry {
+                    legacy_path_binding_id: LegacyPathBindingId::parse(format!("lpb_{:032x}", 50))
+                        .unwrap(),
+                    historical_path: selector.to_string(),
+                    source_store: "transcript-edge".to_string(),
+                    source_row_id: row_id_for_ledger,
+                    member_row_count: members_for_ledger.row_count,
+                    member_commitment_sha256: members_for_ledger.commitment_sha256,
+                    inventory_epoch: 1,
+                    status: LegacyPathBindingStatus::Mapped {
+                        project_id: project,
+                        relationship: LegacyPathRelationship::Root,
+                    },
+                };
+                attachments
+                    .legacy_path_bindings
+                    .insert(entry.legacy_path_binding_id.clone(), entry);
+                Ok(())
+            })
+            .unwrap();
+        (lane, row_id, members)
+    }
+
+    /// Populate every remaining writable owner with one mapped singleton row.
+    /// Together with the fixture's knowledge/thread rows and the aggregate
+    /// transcript-edge row, this drives all thirteen production stamp/read
+    /// dispatches (provenance is the sole by-construction exemption).
+    fn seed_every_remaining_writable_owner(&self) {
+        let owners = self.layout.stamper_owner_paths();
+        write_owner(
+            &owners.gap_store_path,
+            "gaps",
+            serde_json::json!({"id": "gap1", "project": "/legacy/gap"}),
+        );
+        write_owner(
+            &owners.pin_store_path,
+            "pins",
+            serde_json::json!({"id": "pin1", "project": "/legacy/pin"}),
+        );
+        write_owner(
+            &owners.roadmap_store_path,
+            "items",
+            serde_json::json!({"id": "road1", "project": "/legacy/roadmap"}),
+        );
+
+        // The base note is quarantined to force a pair mutation. Add a second,
+        // independently mapped note so the note owner also takes the real
+        // stamp/read path in the all-owner proof.
+        let mut notes: serde_json::Value =
+            serde_json::from_slice(&fs::read(&owners.note_store_path).unwrap()).unwrap();
+        notes["notes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "nt-mapped",
+                "kind": "learned",
+                "body": "mapped fixture note",
+                "project": "/legacy/note-mapped",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }));
+        fs::write(&owners.note_store_path, serde_json::to_vec(&notes).unwrap()).unwrap();
+
+        fs::create_dir_all(&owners.packet_root).unwrap();
+        fs::write(
+            owners.packet_root.join("packet.json"),
+            br#"{"id":"packet1","project":"/legacy/packet"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&owners.proposal_root).unwrap();
+        let proposal_relative = Path::new("proposal.json");
+        fs::write(
+            owners.proposal_root.join(proposal_relative),
+            br#"{"id":"proposal1","project_dir":"/legacy/proposal"}"#,
+        )
+        .unwrap();
+        let proposal_row = format!(
+            "{}:proposal1",
+            stable_subsource_id("proposal", proposal_relative)
+        );
+
+        fs::create_dir_all(&owners.slack_store_root).unwrap();
+        fs::write(
+            owners
+                .slack_store_root
+                .join("slack-channel-bindings.json"),
+            br#"{"bindings":{"one":{"team_id":"T1","channel_id":"C1","project_dir":"/legacy/slack"}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&owners.whiteboard_root).unwrap();
+        fs::write(
+            owners.whiteboard_root.join("whiteboard.json"),
+            br#"{"id":"whiteboard1","project":"/legacy/whiteboard"}"#,
+        )
+        .unwrap();
+
+        let artifact_relative = Path::new("artifact-one/metadata.json");
+        fs::create_dir_all(
+            owners
+                .artifact_root
+                .join(artifact_relative.parent().unwrap()),
+        )
+        .unwrap();
+        fs::write(
+            owners.artifact_root.join(artifact_relative),
+            br#"{"kind":"agent","name":"fixture","version":"1","source":"fixture","installed_at":"2026-01-01T00:00:00Z","project_path":"/legacy/artifact"}"#,
+        )
+        .unwrap();
+        let artifact_row = format!(
+            "{}:legacy-path",
+            stable_subsource_id("artifact", artifact_relative)
+        );
+
+        fs::write(
+            &owners.task_store_path,
+            br#"[{"id":"task1","cwd":"/legacy/task"}]"#,
+        )
+        .unwrap();
+
+        let rows = vec![
+            (
+                LegacyPathStoreKindV1::Gap,
+                "gap1".to_string(),
+                "/legacy/gap",
+            ),
+            (
+                LegacyPathStoreKindV1::Pin,
+                "pin1".to_string(),
+                "/legacy/pin",
+            ),
+            (
+                LegacyPathStoreKindV1::Roadmap,
+                "road1".to_string(),
+                "/legacy/roadmap",
+            ),
+            (
+                LegacyPathStoreKindV1::Note,
+                "nt-mapped".to_string(),
+                "/legacy/note-mapped",
+            ),
+            (
+                LegacyPathStoreKindV1::Packet,
+                "packet1".to_string(),
+                "/legacy/packet",
+            ),
+            (
+                LegacyPathStoreKindV1::Proposal,
+                proposal_row,
+                "/legacy/proposal",
+            ),
+            (
+                LegacyPathStoreKindV1::SlackBinding,
+                "T1:C1".to_string(),
+                "/legacy/slack",
+            ),
+            (
+                LegacyPathStoreKindV1::Whiteboard,
+                "whiteboard1".to_string(),
+                "/legacy/whiteboard",
+            ),
+            (
+                LegacyPathStoreKindV1::Artifact,
+                artifact_row,
+                "/legacy/artifact",
+            ),
+            (
+                LegacyPathStoreKindV1::Task,
+                "task1".to_string(),
+                "/legacy/task",
+            ),
+        ];
+        let store = ProjectCatalogStore::open_existing(self.layout.projects_path()).unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        let project = self.project.clone();
+        store
+            .transact(epoch, |_catalog, attachments| {
+                for (offset, (kind, row_id, historical_path)) in rows.into_iter().enumerate() {
+                    let members = singleton_selector_members(&row_id);
+                    let entry = LegacyPathLedgerEntry {
+                        legacy_path_binding_id: LegacyPathBindingId::parse(format!(
+                            "lpb_{:032x}",
+                            60 + offset
+                        ))
+                        .unwrap(),
+                        historical_path: historical_path.to_string(),
+                        source_store: legacy_store_token(kind).to_string(),
+                        source_row_id: row_id,
+                        member_row_count: members.row_count,
+                        member_commitment_sha256: members.commitment_sha256,
+                        inventory_epoch: 1,
+                        status: LegacyPathBindingStatus::Mapped {
+                            project_id: project.clone(),
+                            relationship: LegacyPathRelationship::Root,
+                        },
+                    };
+                    attachments
+                        .legacy_path_bindings
+                        .insert(entry.legacy_path_binding_id.clone(), entry);
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// Append the ledger binding an attachment RELOCATION mints, byte for byte
     /// as `project_catalog_admin` writes one when a checkout moves.
     ///
@@ -1130,6 +1399,72 @@ impl LegacyRowStamperV1 for TornStamper {
     }
 }
 
+struct AggregateMovingStamper {
+    inner: Arc<dyn LegacyRowStamperV1>,
+    lane: PathBuf,
+    moved: AtomicBool,
+}
+
+impl LegacyRowStamperV1 for AggregateMovingStamper {
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+        self.inner.coverage(store_kind)
+    }
+
+    fn stamp(
+        &self,
+        store_kind: LegacyPathStoreKindV1,
+        source_row_id: &str,
+        expected_members: &LegacySelectorMembersV1,
+        project_id: &ProjectId,
+    ) -> Result<LegacyRowStampOutcomeV1, ProjectCatalogMigrationError> {
+        if store_kind == LegacyPathStoreKindV1::TranscriptEdge
+            && !self.moved.swap(true, Ordering::SeqCst)
+        {
+            let mut moved = fs::read_to_string(&self.lane).unwrap();
+            moved.push_str(&transcript_edge_row(
+                "aggregate-late",
+                "/legacy/aggregate",
+                None,
+            ));
+            fs::write(&self.lane, moved).unwrap();
+        }
+        self.inner
+            .stamp(store_kind, source_row_id, expected_members, project_id)
+    }
+}
+
+struct AggregateMovingReader {
+    inner: Arc<dyn LegacyRowOwnerReaderV1>,
+    lane: PathBuf,
+    project_id: String,
+    moved: AtomicBool,
+}
+
+impl LegacyRowOwnerReaderV1 for AggregateMovingReader {
+    fn coverage(&self, store_kind: LegacyPathStoreKindV1) -> LegacyRowStampCoverageV1 {
+        self.inner.coverage(store_kind)
+    }
+
+    fn observe(
+        &self,
+        store_kind: LegacyPathStoreKindV1,
+        rows: &OwnerRowRequestV1,
+    ) -> Result<BTreeMap<String, LegacyRowObservationV1>, ProjectCatalogMigrationError> {
+        if store_kind == LegacyPathStoreKindV1::TranscriptEdge
+            && !self.moved.swap(true, Ordering::SeqCst)
+        {
+            let mut moved = fs::read_to_string(&self.lane).unwrap();
+            moved.push_str(&transcript_edge_row(
+                "aggregate-late",
+                "/legacy/aggregate",
+                Some(&self.project_id),
+            ));
+            fs::write(&self.lane, moved).unwrap();
+        }
+        self.inner.observe(store_kind, rows)
+    }
+}
+
 /// The happy path: preflight, apply, verify against a real migrated root with
 /// the production stamper, across two different owner stores.
 #[test]
@@ -1162,6 +1497,117 @@ fn the_production_stamper_backfills_two_stores_end_to_end() {
     let verify = fixture.verify().unwrap();
     assert_eq!(verify.journal_stamp_total, 2);
     assert_eq!(verify.observed_mappable_total, 2);
+}
+
+#[test]
+fn aggregate_member_evidence_refuses_moved_groups_during_apply_and_verify() {
+    // APPLY: the reviewed two-member group grows before stamping. The
+    // production transcript-edge stamper must refold the live lane and refuse
+    // before writing any project id into that group.
+    let apply_fixture = Fixture::new();
+    let (apply_lane, _row_id, reviewed) = apply_fixture.seed_aggregate_transcript_edge_owner();
+    assert_eq!(reviewed.row_count, 2);
+    assert_eq!(
+        apply_fixture
+            .preflight(apply_fixture.production_stamper())
+            .unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    apply_fixture.convert_the_quarantined_binding();
+    assert_eq!(
+        apply_fixture
+            .preflight(apply_fixture.production_stamper())
+            .unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    let moving_stamper = Arc::new(AggregateMovingStamper {
+        inner: apply_fixture.production_stamper(),
+        lane: apply_lane.clone(),
+        moved: AtomicBool::new(false),
+    });
+    let apply_error = apply_fixture
+        .apply(moving_stamper)
+        .expect_err("moved aggregate membership must refuse stamping");
+    assert_eq!(apply_error.code, ERROR_STALE_POST_IMAGE);
+    assert!(
+        apply_error.message.contains("owner_row_members_moved"),
+        "aggregate diagnostic lost: {}",
+        apply_error.message
+    );
+    assert!(
+        !fs::read_to_string(&apply_lane)
+            .unwrap()
+            .contains("project_id"),
+        "membership must be rederived before the aggregate write"
+    );
+
+    // VERIFY: a clean two-member group is stamped first, then a third member
+    // carrying the SAME stable project id is appended. Uniform stamps are not
+    // enough: the production reader must still reject the changed membership.
+    let verify_fixture = Fixture::new();
+    let (verify_lane, _row_id, reviewed) = verify_fixture.seed_aggregate_transcript_edge_owner();
+    assert_eq!(reviewed.row_count, 2);
+    assert_eq!(
+        verify_fixture
+            .preflight(verify_fixture.production_stamper())
+            .unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    verify_fixture.convert_the_quarantined_binding();
+    assert_eq!(
+        verify_fixture
+            .preflight(verify_fixture.production_stamper())
+            .unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        verify_fixture
+            .apply(verify_fixture.production_stamper())
+            .unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    let moving_reader = Arc::new(AggregateMovingReader {
+        inner: verify_fixture.production_owner_reader(),
+        lane: verify_lane,
+        project_id: verify_fixture.project.as_str().to_string(),
+        moved: AtomicBool::new(false),
+    });
+    let verify_error =
+        ProjectCatalogDurableBackfillFacadeV1::verify(DurableBackfillVerifyRequestV1 {
+            layout: verify_fixture.layout.clone(),
+            target_selection: ProjectCatalogTargetSelectionV1::Rehearsal,
+            owner_reader: moving_reader,
+        })
+        .expect_err("moved aggregate membership must refuse verify");
+    assert_eq!(verify_error.code, ERROR_STALE_POST_IMAGE);
+    assert!(
+        verify_error.message.contains("owner_row_members_moved"),
+        "aggregate verify diagnostic lost: {}",
+        verify_error.message
+    );
+}
+
+#[test]
+fn every_writable_owner_stamps_and_reads_back_through_the_durable_facade() {
+    let fixture = Fixture::new();
+    fixture.seed_aggregate_transcript_edge_owner();
+    fixture.seed_every_remaining_writable_owner();
+
+    assert_eq!(
+        fixture.preflight(fixture.production_stamper()).unwrap(),
+        DurableBackfillStatusV1::Clean
+    );
+    assert_eq!(
+        fixture.apply(fixture.production_stamper()).unwrap(),
+        DurableBackfillApplyOutcomeV1::Applied
+    );
+    let verify = fixture.verify().unwrap();
+
+    // 2 base mapped rows + 10 singleton owners + 1 aggregate owner. The
+    // quarantined base note is not a stamping obligation; the separately
+    // mapped note above proves its owner.
+    assert_eq!(verify.journal_stamp_total, 13);
+    assert_eq!(verify.observed_mappable_total, 13);
 }
 
 /// R2-2. A host that has ever RELOCATED an attachment can still run its
