@@ -3089,8 +3089,13 @@ mod tests {
             false,
         );
         assert!(!repair.is_empty(), "a missing member must be repaired");
-        repair.publish().unwrap().finalize_publications().unwrap();
-        assert!(member.is_file(), "repair must publish the live member");
+        let mut publication = repair.publish().unwrap();
+        assert_eq!(
+            publication.pending_snapshot_finalizations.len(),
+            1,
+            "repair must stage exactly one committed-index-bound transaction"
+        );
+        publication.rollback_pending().unwrap();
 
         let mut no_attachment = ProjectIndexPublicationBundle::default();
         no_attachment.stage_collected_snapshot_git_current_if_needed(
