@@ -290,7 +290,6 @@ name = "bbox-artifacts"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "axum",
  "bbox-corpus-core",
  "bbox-util",
  "hex",
@@ -1215,6 +1214,7 @@ name = "bro-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "axum",
  "bbox-corpus-core",
  "bbox-provenance",
  "bro-fleet-client",
@@ -1224,12 +1224,14 @@ dependencies = [
  "dirs",
  "fs2",
  "futures-util",
+ "hex",
  "insta",
  "ratatui",
  "ratatui-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "syntect",
  "tempfile",
  "textwrap",

@@ -6,6 +6,7 @@ use bro_rpc::ServiceToken;
 use clap::Args;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::mcp_call::{McpClient, default_base_url};
 
@@ -33,6 +34,11 @@ pub(crate) struct BlameArgs {
     /// One-based source line.
     #[arg(long)]
     line: Option<u64>,
+    /// Execute the legacy daemon adapter once and persist an authenticated
+    /// equality/mismatch observation. Use only during the declared overlap
+    /// window before cutover.
+    #[arg(long)]
+    verify_overlap: bool,
 }
 
 #[derive(Deserialize)]
@@ -86,25 +92,55 @@ pub(crate) async fn run(args: BlameArgs) -> anyhow::Result<()> {
     if response.status != "blame_locality_plan" {
         bail!("daemon returned an unexpected blame planning status");
     }
-    let fact = execute_plan_in_workspace(
-        &response.plan,
-        &workspace_root,
-        &project_root,
-        &scope,
-        &workspace_id,
-    )?;
-    let mut resolve_arguments = public_arguments;
+    let plan = response.plan;
+    let fact =
+        execute_plan_in_workspace(&plan, &workspace_root, &project_root, &scope, &workspace_id)?;
+    let mut resolve_arguments = public_arguments.clone();
     insert_locality(
         &mut resolve_arguments,
         json!({
             "phase": "resolve",
-            "plan": response.plan,
-            "fact": fact,
+            "plan": plan.clone(),
+            "fact": fact.clone(),
         }),
     )?;
     let result: Value = client.call_tool_json(BLAME_TOOL, resolve_arguments).await?;
+    if args.verify_overlap {
+        let mut legacy_arguments = public_arguments.clone();
+        if let Some(relative) = legacy_arguments
+            .get("file")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            legacy_arguments["file"] =
+                Value::String(project_root.join(relative).to_string_lossy().into_owned());
+        }
+        let mut legacy_client = McpClient::connect(&base_url, Some(&project_root)).await?;
+        let legacy_result: Value = legacy_client
+            .call_tool_json(BLAME_TOOL, legacy_arguments)
+            .await?;
+        let legacy_response_sha256 = response_sha256(&legacy_result)?;
+        let mut compare_arguments = public_arguments;
+        insert_locality(
+            &mut compare_arguments,
+            json!({
+                "phase": "compare",
+                "plan": plan,
+                "fact": fact,
+                "legacy_response_sha256": legacy_response_sha256,
+            }),
+        )?;
+        let compared: Value = client.call_tool_json(BLAME_TOOL, compare_arguments).await?;
+        if compared != result || legacy_result != result {
+            bail!("checkout-local and legacy blame responses differ");
+        }
+    }
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn response_sha256(value: &Value) -> anyhow::Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
 }
 
 fn public_arguments(
@@ -385,6 +421,7 @@ mod tests {
             file: Some(PathBuf::from("src/lib.rs")),
             entity_ref: None,
             line: Some(1),
+            verify_overlap: false,
         })
         .await
         .unwrap();

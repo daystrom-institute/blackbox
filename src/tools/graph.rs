@@ -31,6 +31,7 @@ use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const REF_SIZE_CAP: usize = 500;
 
@@ -638,6 +639,7 @@ struct SessionBlameAuthority {
     project_id: String,
     scope: PublishedScope,
     workspace_id: String,
+    observation_authority: bbox_indexing::blame_locality_observations::BlameLocalityAuthorityV1,
 }
 
 fn session_blame_authority(server: &BlackboxServer) -> Result<SessionBlameAuthority> {
@@ -649,6 +651,8 @@ fn session_blame_authority(server: &BlackboxServer) -> Result<SessionBlameAuthor
             project_id: grant.project_id.clone(),
             scope: grant.scope.clone(),
             workspace_id: grant.workspace_id.as_str().to_string(),
+            observation_authority:
+                bbox_indexing::blame_locality_observations::BlameLocalityAuthorityV1::ManagedWorkspace,
         });
     }
     if let Some(grant) = server.authoritative_operator_blame_binding() {
@@ -656,6 +660,8 @@ fn session_blame_authority(server: &BlackboxServer) -> Result<SessionBlameAuthor
             project_id: grant.project_id.clone(),
             scope: grant.scope.clone(),
             workspace_id: grant.workspace_id.as_str().to_string(),
+            observation_authority:
+                bbox_indexing::blame_locality_observations::BlameLocalityAuthorityV1::Operator,
         });
     }
     bail!("error.blame_locality_binding: blame locality requires checkout-side authority")
@@ -728,6 +734,19 @@ fn workspace_blame_plan(
     };
     plan.validate()?;
     Ok(plan)
+}
+
+fn blame_observation_target(
+    plan: &bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
+) -> bbox_indexing::blame_locality_observations::BlameLocalityTargetV1 {
+    match &plan.target {
+        bbox_corpus_core::blame_transport::BlamePlanTargetV1::WorkspacePath { .. } => {
+            bbox_indexing::blame_locality_observations::BlameLocalityTargetV1::Path
+        }
+        bbox_corpus_core::blame_transport::BlamePlanTargetV1::ProjectSnapshot { .. } => {
+            bbox_indexing::blame_locality_observations::BlameLocalityTargetV1::Entity
+        }
+    }
 }
 
 /// The project ids one legacy Git-note operation covers.
@@ -1174,7 +1193,44 @@ impl BlackboxServer {
                         );
                     }
                     fact.validate_against(&current)?;
-                    return mcp_tools::blame::enrich_fact(&fact, edge_index);
+                    let result = mcp_tools::blame::enrich_fact(&fact, edge_index)?;
+                    let authority = session_blame_authority(&server)?;
+                    server.state.blame_locality_observations.record_completed(
+                        &current.project_id,
+                        authority.observation_authority,
+                        blame_observation_target(&current),
+                    )?;
+                    return Ok(result);
+                }
+                Some(mcp_tools::blame::BlameLocalityRequestV1::Compare {
+                    plan,
+                    fact,
+                    legacy_response_sha256,
+                }) => {
+                    let current = workspace_blame_plan(&server, &target, &read_view.git_overlays)?;
+                    if plan != current {
+                        bail!(
+                            "error.blame_plan_stale: corpus blame authority changed after the checkout plan was issued"
+                        );
+                    }
+                    fact.validate_against(&current)?;
+                    let result = mcp_tools::blame::enrich_fact(&fact, edge_index)?;
+                    let canonical_result: serde_json::Value = serde_json::from_str(&result)?;
+                    let local_response_sha256 = hex::encode(Sha256::digest(
+                        serde_json::to_vec(&canonical_result)?,
+                    ));
+                    server.state.blame_locality_observations.record_comparison(
+                        &current.project_id,
+                        blame_observation_target(&current),
+                        &local_response_sha256,
+                        &legacy_response_sha256,
+                    )?;
+                    if local_response_sha256 != legacy_response_sha256 {
+                        bail!(
+                            "error.blame_locality_mismatch: checkout-local and legacy blame responses differ"
+                        );
+                    }
+                    return Ok(result);
                 }
                 None
                     if server.authoritative_session_workspace_binding().is_some()
@@ -1572,11 +1628,52 @@ mod tests {
                 file: Some("src/lib.rs".into()),
                 line: Some(7),
                 entity_ref: None,
-                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Resolve { plan, fact }),
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Resolve {
+                    plan: plan.clone(),
+                    fact: fact.clone(),
+                }),
             }))
             .await;
         assert_ne!(resolved.is_error, Some(true), "{}", extract_text(&resolved));
-        assert!(extract_text(&resolved).contains("error.not_found"));
+        let resolved_text = extract_text(&resolved);
+        assert!(resolved_text.contains("error.not_found"));
+        let resolved_value: serde_json::Value = serde_json::from_str(&resolved_text).unwrap();
+        let resolved_sha256 =
+            hex::encode(Sha256::digest(serde_json::to_vec(&resolved_value).unwrap()));
+
+        let compared = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Compare {
+                    plan: plan.clone(),
+                    fact: fact.clone(),
+                    legacy_response_sha256: resolved_sha256,
+                }),
+            }))
+            .await;
+        assert_ne!(compared.is_error, Some(true), "{}", extract_text(&compared));
+        assert_eq!(extract_text(&compared), resolved_text);
+
+        let mismatch = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Compare {
+                    plan,
+                    fact,
+                    legacy_response_sha256: "d".repeat(64),
+                }),
+            }))
+            .await;
+        assert_eq!(mismatch.is_error, Some(true));
+        assert!(extract_text(&mismatch).contains("error.blame_locality_mismatch"));
+        let observations = server.state.blame_locality_observations.snapshot();
+        assert_eq!(observations.sequence, 3);
+        assert_eq!(observations.comparisons.len(), 1);
+        assert!(!observations.comparisons[0].equal);
         assert_eq!(server.state.checkout_access.health().sequence, before);
 
         let fallback = server

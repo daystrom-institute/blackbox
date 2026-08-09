@@ -303,6 +303,10 @@ pub(super) fn open_shared_state(
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
             store_dir.join("knowledge-transport-observations.json"),
         )?;
+    let blame_locality_observations =
+        bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::open(
+            store_dir.join("blame-locality-observations.json"),
+        )?;
     // Bridge-only handles stay `Option` so catalog mode never constructs a
     // version-1 registry or its persister.
     let mut projects_store: Option<Arc<RwLock<ProjectRegistry>>> = None;
@@ -867,6 +871,7 @@ pub(super) fn open_shared_state(
         ),
         checkout_access,
         knowledge_transport_observations,
+        blame_locality_observations,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
         // corrupt pins fail-closed even though the checkout census below is a

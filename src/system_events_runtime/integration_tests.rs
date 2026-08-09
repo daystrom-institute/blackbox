@@ -120,6 +120,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         checkout_access,
         knowledge_transport_observations:
             bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
+        blame_locality_observations:
+            bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::in_memory(),
         publisher_refs: RwLock::new(
             bbox_indexing::publisher::PublisherRefStore::open(
                 tmp.path().join("publisher-refs.json"),

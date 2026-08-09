@@ -50,6 +50,8 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4"
+hex = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

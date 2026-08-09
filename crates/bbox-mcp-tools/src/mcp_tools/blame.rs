@@ -35,6 +35,11 @@ pub enum BlameLocalityRequestV1 {
         plan: bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
         fact: bbox_corpus_core::blame_transport::BlameFactV1,
     },
+    Compare {
+        plan: bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
+        fact: bbox_corpus_core::blame_transport::BlameFactV1,
+        legacy_response_sha256: String,
+    },
 }
 
 /// Corpus identity and an untrusted indexed path hint extracted from caller

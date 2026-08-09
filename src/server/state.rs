@@ -137,6 +137,10 @@ pub(crate) struct SharedState {
     /// proves the remote result matched its overlap reference.
     pub(crate) knowledge_transport_observations:
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1,
+    /// Durable positive-use and shadow-parity evidence for checkout-local
+    /// blame execution. Contains identity and response checksums only.
+    pub(crate) blame_locality_observations:
+        bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1,
     /// Host-local symbolic branch pins defining published truth per scope.
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
     /// Session-authorized provisional snapshots keyed by scope and checkout.
@@ -935,6 +939,8 @@ impl SharedState {
             checkout_access,
             knowledge_transport_observations:
                 bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
+            blame_locality_observations:
+                bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::in_memory(),
             publisher_refs: RwLock::new(
                 bbox_indexing::publisher::PublisherRefStore::open(
                     store_dir.join("publisher-refs.json"),
