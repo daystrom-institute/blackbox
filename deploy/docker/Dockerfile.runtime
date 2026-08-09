@@ -37,7 +37,7 @@ COPY system-defaults/memories /usr/local/share/blackbox/memories
 ENV HOME=/home/blackbox \
     BLACKBOX_STATE_DIR=/var/lib/blackbox/state \
     TRANSCRIPT_SEARCH_INDEX_PATH=/var/lib/blackbox/index \
-    BLACKBOX_VECTORS_PATH=/var/lib/blackbox/vectors \
+    BLACKBOX_VECTORS_PATH=/var/lib/blackbox/state/vectors \
     XDG_STATE_HOME=/var/lib/blackbox/xdg-state \
     XDG_DATA_HOME=/var/lib/blackbox/xdg-data \
     BLACKBOX_DEFAULTS_DIR=/usr/local/share/blackbox \

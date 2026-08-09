@@ -123,6 +123,9 @@ where
             if matcher(&message) {
                 return message;
             }
+            if let FleetdToDaemon::Error { code, message, .. } = &message {
+                panic!("fleetd returned {code} while waiting for a matching message: {message}");
+            }
         }
         panic!("expected message never arrived");
     }
@@ -251,7 +254,7 @@ async fn authenticated_tcp_connection_uses_the_same_owner_and_spawn_contract() {
     let stub = write_stub(
         &harness.root,
         "remote-child.sh",
-        "printf '{\"type\":\"assistant\",\"seq\":1}\\n'\nexit 0\n",
+        "#!/bin/sh\nprintf '{\"type\":\"assistant\",\"seq\":1}\\n'\nexit 0\n",
     );
     let log = harness.root.join("remote.events.jsonl");
     daemon
