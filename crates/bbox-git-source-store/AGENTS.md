@@ -28,7 +28,10 @@
   source remains last-good until the newer activation itself commits.
 - Provenance publication journals are monotonic
   `Prepared -> EdgesPublished -> Committed`, with `Superseded` and
-  `Quarantined` terminal.
+  `Quarantined` terminal for autonomous background redrive. Re-finalizing the
+  exact immutable upload is an authenticated explicit retry: it reopens only
+  that source and activation replaces the terminal journal with a plan pinned
+  to the current catalog and code selector.
   They bind the immutable source evidence and exact pinned code selector;
   `EdgesPublished` also binds the ordered edge-key commitment. Retries re-prove
   source bytes, rebuild only through the bounded background lane, and verify

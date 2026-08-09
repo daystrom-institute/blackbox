@@ -1079,7 +1079,7 @@ impl GitSourceStore {
             MAX_GENERATION_RECORD_BYTES,
             "stored provenance import",
         )?;
-        let source = if let Some(existing) = existing {
+        let source = if let Some(mut existing) = existing {
             if existing.version != STORE_VERSION
                 || existing.import_generation_id != upload.import_generation_id
                 || existing.accepted_sequence == 0
@@ -1090,6 +1090,17 @@ impl GitSourceStore {
                     != manifest
             {
                 bail!(StoreRequestError::InvalidInput);
+            }
+            // Quarantine is terminal for autonomous background redrive, but
+            // finalizing the same fully verified immutable upload again is an
+            // authenticated, explicit retry. Reopen only that exact source;
+            // the activation worker replaces its terminal journal with a new
+            // plan pinned to the current catalog and code selector.
+            if existing.state == ProvenanceImportStateV1::Quarantined {
+                existing.state = ProvenanceImportStateV1::Ready;
+                existing.edges_imported = 0;
+                existing.diagnostic = None;
+                self.write_provenance_source(&existing)?;
             }
             existing
         } else {

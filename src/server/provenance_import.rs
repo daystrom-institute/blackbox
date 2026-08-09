@@ -107,6 +107,16 @@ pub(crate) fn activate_import(state: &Arc<SharedState>, import_generation_id: &s
     }
 
     let mut journal = match store.read_provenance_import_journal(&source.project_id)? {
+        Some(journal)
+            if journal.import_generation_id == import_generation_id
+                && journal.stage == ProvenanceImportStageV1::Quarantined =>
+        {
+            // A quarantined source can reach this arm only after an explicit
+            // authenticated re-finalize reopened the exact immutable
+            // generation. Replace the terminal attempt with a plan pinned to
+            // the current read view; background redrive alone cannot do this.
+            prepare_journal(state, &source)?
+        }
         Some(journal) if journal.import_generation_id == import_generation_id => journal,
         Some(journal) if !journal.stage.terminal() => {
             bail!("an earlier provenance import is still publishing for this project")
@@ -600,7 +610,7 @@ mod tests {
         project_id: &str,
         commit: &str,
         document: &str,
-    ) -> VerifiedProvenanceImportV1 {
+    ) -> (VerifiedProvenanceImportV1, String) {
         let manifest = vec![ProvenanceImportManifestEntryV1 {
             note_commit: commit.to_string(),
             document_ordinal: 0,
@@ -644,9 +654,12 @@ mod tests {
         let finalized = store
             .finalize_provenance_import(producer_id, &begun.upload_id)
             .unwrap();
-        store
-            .verified_provenance_import(&finalized.import_generation_id)
-            .unwrap()
+        (
+            store
+                .verified_provenance_import(&finalized.import_generation_id)
+                .unwrap(),
+            begun.upload_id,
+        )
     }
 
     #[test]
@@ -810,7 +823,8 @@ mod tests {
             "knowledge_writes": []
         })
         .to_string();
-        let source = install_import(&state, scope, &producer_id, &project_id, &commit, &document);
+        let (source, _) =
+            install_import(&state, scope, &producer_id, &project_id, &commit, &document);
         activate_import(&state, &source.import_generation_id).unwrap();
         let status = state
             .git_sources
@@ -836,6 +850,102 @@ mod tests {
     }
 
     #[test]
+    fn explicit_refinalize_retries_quarantine_against_current_observed_edges() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (state, scope, producer_id, project_id) = state_with_active_project(&root);
+        let commit = "4".repeat(40);
+        let target = EntityRef::ProjectFile {
+            project_id: project_id.clone(),
+            rel_path_hash: "b".repeat(64),
+            chunk_hash: "c".repeat(64),
+            occurrence_idx: 0,
+        };
+        let document = serde_json::json!({
+            "schema_version": 2,
+            "commit": commit,
+            "part": {
+                "document_id": "d".repeat(64),
+                "part_index": 0,
+                "part_count": 1
+            },
+            "produced_by": {},
+            "tool_calls": [{
+                "tool": "Read",
+                "source_ref": "transcript:test:session:1:0",
+                "target_ref": target.to_string(),
+                "file": "src/legacy.rs"
+            }],
+            "knowledge_writes": []
+        })
+        .to_string();
+        let (source, upload_id) =
+            install_import(&state, scope, &producer_id, &project_id, &commit, &document);
+        activate_import(&state, &source.import_generation_id).unwrap();
+        let store = state.git_sources.store();
+        assert_eq!(
+            store
+                .provenance_import_status(&producer_id, &source.import_generation_id)
+                .unwrap()
+                .state,
+            ProvenanceImportStateV1::Quarantined
+        );
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("anchor.project_id".into(), project_id.clone());
+        let observed = Edge {
+            source: EntityRef::Transcript {
+                provider: "test".into(),
+                session_id: "session".into(),
+                line_offset: 1,
+                event_idx: 0,
+            },
+            kind: "READ_FILE".into(),
+            target,
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata,
+            project_id: Some(project_id.clone()),
+        };
+        let prior = state.code_read_view.read().clone();
+        *state.code_read_view.write() = Arc::new(CodeReadView {
+            active_selectors: prior.active_selectors.clone(),
+            searcher: prior.searcher.clone(),
+            edge_index: Arc::new(EdgeIndex::from_edges_for_tests(vec![observed])),
+            catalog_epoch: prior.catalog_epoch,
+            git_overlays: prior.git_overlays.clone(),
+        });
+
+        let retried = store
+            .finalize_provenance_import(&producer_id, &upload_id)
+            .unwrap();
+        assert_eq!(retried.import_generation_id, source.import_generation_id);
+        assert_eq!(
+            store
+                .provenance_import_status(&producer_id, &source.import_generation_id)
+                .unwrap()
+                .state,
+            ProvenanceImportStateV1::Ready
+        );
+        activate_import(&state, &source.import_generation_id).unwrap();
+        assert_eq!(
+            store
+                .provenance_import_status(&producer_id, &source.import_generation_id)
+                .unwrap()
+                .state,
+            ProvenanceImportStateV1::Active
+        );
+        assert_eq!(
+            store
+                .read_provenance_import_journal(&project_id)
+                .unwrap()
+                .unwrap()
+                .stage,
+            ProvenanceImportStageV1::Committed
+        );
+    }
+
+    #[test]
     fn oversized_edge_estate_refuses_before_parse_and_remains_recoverable() {
         let mut env = crate::util::TestEnvGuard::new();
         let directory = tempfile::tempdir().unwrap();
@@ -855,7 +965,8 @@ mod tests {
             "knowledge_writes": []
         })
         .to_string();
-        let source = install_import(&state, scope, &producer_id, &project_id, &commit, &document);
+        let (source, _) =
+            install_import(&state, scope, &producer_id, &project_id, &commit, &document);
 
         env.set("BLACKBOX_EDGE_INDEX_REBUILD_MAX_INPUT_BYTES", "1");
         let error = activate_import(&state, &source.import_generation_id).unwrap_err();
