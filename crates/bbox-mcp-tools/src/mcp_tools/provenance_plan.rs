@@ -91,8 +91,9 @@ pub fn build_plan_from_observed_edges<'a>(
     }
 
     let mut documents = Vec::new();
+    let mut session_relations = BTreeMap::new();
     for (commit, edges) in grouped {
-        let note = note_from_edges(&commit, &edges, edge_index);
+        let note = note_from_edges_with_cache(&commit, &edges, edge_index, &mut session_relations);
         let parts = fragment_note(&note, MAX_NOTE_DOCUMENT_BYTES).map_err(fragment_error)?;
         for part in parts {
             documents.push(ProvenanceExportDocument::from_note(&part)?);
@@ -106,7 +107,16 @@ pub(crate) fn note_from_edges(
     edges: &[&Edge],
     edge_index: &EdgeIndex,
 ) -> bbox_provenance::GitProvenanceNote {
-    let produced_by = produced_by_from_edges(edges, edge_index);
+    note_from_edges_with_cache(commit, edges, edge_index, &mut BTreeMap::new())
+}
+
+fn note_from_edges_with_cache(
+    commit: &str,
+    edges: &[&Edge],
+    edge_index: &EdgeIndex,
+    session_relations: &mut BTreeMap<(String, String), SessionRelations>,
+) -> bbox_provenance::GitProvenanceNote {
+    let produced_by = produced_by_from_edges(edges, edge_index, session_relations);
     let mut tool_calls = edges
         .iter()
         .map(|edge| tool_call_from_edge(edge))
@@ -134,9 +144,20 @@ pub(crate) fn note_from_edges(
     bbox_provenance::GitProvenanceNote::new_v2(commit, produced_by, tool_calls, Vec::new())
 }
 
-fn produced_by_from_edges(edges: &[&Edge], edge_index: &EdgeIndex) -> ProducedBy {
+#[derive(Debug, Default)]
+struct SessionRelations {
+    brofiles: BTreeSet<String>,
+    arc_thread_ids: BTreeSet<String>,
+}
+
+fn produced_by_from_edges(
+    edges: &[&Edge],
+    edge_index: &EdgeIndex,
+    session_relations: &mut BTreeMap<(String, String), SessionRelations>,
+) -> ProducedBy {
     let mut providers = BTreeSet::new();
     let mut session_ids = BTreeSet::new();
+    let mut sessions = BTreeSet::new();
     let mut brofiles = BTreeSet::new();
     let mut arc_thread_ids = BTreeSet::new();
     for edge in edges {
@@ -150,24 +171,38 @@ fn produced_by_from_edges(edges: &[&Edge], edge_index: &EdgeIndex) -> ProducedBy
         };
         providers.insert(provider.clone());
         session_ids.insert(session_id.clone());
-        let session_ref = EntityRef::Session {
-            provider: provider.clone(),
-            session_id: session_id.clone(),
-        };
-        brofiles.extend(
-            edge_index
-                .forward_edges(&session_ref)
-                .iter()
-                .filter(|edge| edge.kind == "SESSION_USED_BROFILE")
-                .map(|edge| edge.target.to_string()),
-        );
-        arc_thread_ids.extend(
-            edge_index
-                .reverse_edges(&session_ref)
-                .iter()
-                .filter(|edge| edge.kind == "THREAD_HAS_SESSION")
-                .map(|edge| edge.source.to_string()),
-        );
+        sessions.insert((provider.clone(), session_id.clone()));
+    }
+    // One session commonly produces hundreds or thousands of file edges across
+    // many commits. Relation lookup allocates an edge vector, so doing it once
+    // per file edge or commit amplifies both work and memory until even health
+    // probes starve. The plan-wide cache makes the lookup once per distinct
+    // session while preserving the set semantics of the provenance fields.
+    for (provider, session_id) in sessions {
+        let relations = session_relations
+            .entry((provider.clone(), session_id.clone()))
+            .or_insert_with(|| {
+                let session_ref = EntityRef::Session {
+                    provider,
+                    session_id,
+                };
+                SessionRelations {
+                    brofiles: edge_index
+                        .forward_edges(&session_ref)
+                        .iter()
+                        .filter(|edge| edge.kind == "SESSION_USED_BROFILE")
+                        .map(|edge| edge.target.to_string())
+                        .collect(),
+                    arc_thread_ids: edge_index
+                        .reverse_edges(&session_ref)
+                        .iter()
+                        .filter(|edge| edge.kind == "THREAD_HAS_SESSION")
+                        .map(|edge| edge.source.to_string())
+                        .collect(),
+                }
+            });
+        brofiles.extend(relations.brofiles.iter().cloned());
+        arc_thread_ids.extend(relations.arc_thread_ids.iter().cloned());
     }
     ProducedBy {
         provider: providers.into_iter().next(),
@@ -366,6 +401,18 @@ mod tests {
         }
     }
 
+    fn relation_edge(source: EntityRef, kind: &str, target: EntityRef) -> Edge {
+        Edge {
+            source,
+            kind: kind.into(),
+            target,
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        }
+    }
+
     fn scope() -> PublishedScope {
         PublishedScope::try_new("repo", ".").unwrap()
     }
@@ -497,6 +544,50 @@ mod tests {
         .unwrap();
         assert_eq!(plan.documents.len(), 1);
         assert_eq!(plan.documents[0].commit, commit(1));
+    }
+
+    #[test]
+    fn repeated_file_edges_resolve_session_relations_once_semantically() {
+        let provider = "test";
+        let session_id = "shared-session";
+        let session = EntityRef::Session {
+            provider: provider.into(),
+            session_id: session_id.into(),
+        };
+        let brofile = EntityRef::Brofile {
+            name: "shared-brofile".into(),
+        };
+        let thread = EntityRef::Thread {
+            thread_id: "shared-thread".into(),
+        };
+        let file_edges = (1..=256)
+            .map(|turn| {
+                let mut edge = edge("project", &commit(1), turn, 10);
+                edge.source = EntityRef::Transcript {
+                    provider: provider.into(),
+                    session_id: session_id.into(),
+                    line_offset: u64::from(turn),
+                    event_idx: 0,
+                };
+                edge
+            })
+            .collect::<Vec<_>>();
+        let mut indexed = file_edges.clone();
+        indexed.push(relation_edge(
+            session.clone(),
+            "SESSION_USED_BROFILE",
+            brofile.clone(),
+        ));
+        indexed.push(relation_edge(thread.clone(), "THREAD_HAS_SESSION", session));
+        let index = EdgeIndex::from_edges_for_tests(indexed);
+        let edge_refs = file_edges.iter().collect::<Vec<_>>();
+
+        let produced_by = produced_by_from_edges(&edge_refs, &index, &mut BTreeMap::new());
+
+        assert_eq!(produced_by.provider.as_deref(), Some(provider));
+        assert_eq!(produced_by.session_ids, vec![session_id.to_string()]);
+        assert_eq!(produced_by.brofiles, vec![brofile.to_string()]);
+        assert_eq!(produced_by.arc_thread_ids, vec![thread.to_string()]);
     }
 
     #[test]
