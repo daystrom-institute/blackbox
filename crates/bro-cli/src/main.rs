@@ -926,4 +926,22 @@ mod tests {
         ]);
         assert!(matches!(cli.command, BroCommand::Blame(_)));
     }
+
+    #[test]
+    fn clap_routes_blame_overlap_to_an_explicit_legacy_daemon() {
+        let cli = BroCli::parse_from([
+            "bro",
+            "blame",
+            "--token-file",
+            "/tmp/token",
+            "--file",
+            "src/lib.rs",
+            "--line",
+            "7",
+            "--verify-overlap",
+            "--legacy-daemon-url",
+            "http://127.0.0.1:17265",
+        ]);
+        assert!(matches!(cli.command, BroCommand::Blame(_)));
+    }
 }

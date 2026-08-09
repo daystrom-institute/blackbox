@@ -39,6 +39,11 @@ pub(crate) struct BlameArgs {
     /// window before cutover.
     #[arg(long)]
     verify_overlap: bool,
+    /// Loopback daemon that still serves the legacy checkout adapter. Used
+    /// only with --verify-overlap; the checkout path is never sent to the
+    /// primary daemon.
+    #[arg(long, value_name = "URL", requires = "verify_overlap")]
+    legacy_daemon_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +111,11 @@ pub(crate) async fn run(args: BlameArgs) -> anyhow::Result<()> {
     )?;
     let result: Value = client.call_tool_json(BLAME_TOOL, resolve_arguments).await?;
     if args.verify_overlap {
+        let legacy_base_url = args
+            .legacy_daemon_url
+            .as_deref()
+            .unwrap_or(base_url.as_str());
+        validate_legacy_overlap_base_url(legacy_base_url)?;
         let mut legacy_arguments = public_arguments.clone();
         if let Some(relative) = legacy_arguments
             .get("file")
@@ -115,7 +125,7 @@ pub(crate) async fn run(args: BlameArgs) -> anyhow::Result<()> {
             legacy_arguments["file"] =
                 Value::String(project_root.join(relative).to_string_lossy().into_owned());
         }
-        let mut legacy_client = McpClient::connect(&base_url, Some(&project_root)).await?;
+        let mut legacy_client = McpClient::connect(legacy_base_url, Some(&project_root)).await?;
         let legacy_result: Value = legacy_client
             .call_tool_json(BLAME_TOOL, legacy_arguments)
             .await?;
@@ -136,6 +146,15 @@ pub(crate) async fn run(args: BlameArgs) -> anyhow::Result<()> {
         }
     }
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn validate_legacy_overlap_base_url(base_url: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(base_url).context("parsing legacy overlap daemon URL")?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    if !loopback || !matches!(url.scheme(), "http" | "https") {
+        bail!("legacy overlap daemon URL must use HTTP(S) on loopback");
+    }
     Ok(())
 }
 
@@ -229,6 +248,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("exactly one")
+        );
+    }
+
+    #[test]
+    fn legacy_overlap_endpoint_is_confined_to_loopback() {
+        validate_legacy_overlap_base_url("http://127.0.0.1:17265").unwrap();
+        validate_legacy_overlap_base_url("https://localhost:17265").unwrap();
+        assert!(
+            validate_legacy_overlap_base_url("https://daemon.example.invalid")
+                .unwrap_err()
+                .to_string()
+                .contains("loopback")
         );
     }
 
@@ -447,6 +478,7 @@ mod tests {
             entity_ref: None,
             line: Some(1),
             verify_overlap: true,
+            legacy_daemon_url: None,
         })
         .await
         .unwrap();
