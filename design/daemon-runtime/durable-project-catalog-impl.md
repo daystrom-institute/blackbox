@@ -1624,18 +1624,22 @@ accepted aliases without opening a checkout.
 ## 14. Remaining checkout-side adapters
 
 The following may remain after the identity cut only as explicit lease
-consumers:
+consumers. KT-E closed the catalog publisher and watcher acquisition routes for
+knowledge-transport-covered Published rows; KT-F re-inventoried and proved that
+boundary. Their shared local implementations remain reachable only for bridge,
+uncovered, and `LegacyLocal` compatibility; they are not a fallback for a
+covered row.
 
 | Surface | Corpus identity | Checkout behavior without attachment |
 |---|---|---|
 | Local source walker | `project_id` + generation | source unavailable or retained last-good view |
-| Repo knowledge/gap publisher | project + scope + accepted commit | retain last accepted snapshot, report unavailable |
+| Repo knowledge/gap publisher | project + scope + accepted commit | covered Published: remote accepted source only; compatibility lanes retain last accepted snapshot and report unavailable |
 | Git history | project/repo + code generation | no current-file overlay, stale commit docs labeled |
 | Blame | project + relative path + requested commit | `attachment_required` or commit mismatch |
 | Render/file provider | project + relative refs | `attachment_required` |
 | Provenance note import/export | stable project refs | `attachment_required` for Git note I/O |
 | Init/eject/mutation/refactor | stable project selection | `attachment_required` or write-gate denial |
-| Artifacts/watchers | project-stamped artifacts | no watcher; retain durable catalog metadata |
+| Artifacts/watchers | project-stamped artifacts | covered Published: no carrier or local checkout operation; compatibility lanes retain durable catalog metadata |
 | Tool/transcript edges | catalog project id + relative anchor | unresolvable path event is diagnosed, never re-id'd |
 
 Blame must verify that the selected attachment contains the requested commit or

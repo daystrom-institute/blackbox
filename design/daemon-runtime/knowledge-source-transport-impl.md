@@ -1,7 +1,7 @@
 ---
 title: "Remote knowledge source transport: published candidates and provisional workspaces"
 kind: design
-lifecycle: proposed
+lifecycle: complete
 corpus: blackbox-design
 topic:
   - daemon-runtime
@@ -14,10 +14,10 @@ brief: "Move repo-owned knowledge and gap acquisition to checkout owners without
 
 # Remote knowledge source transport
 
-> **Status: proposed; implementation through KT-E verified 2026-08-09.** The
-> measured overlap and strict cutover runtime is complete for operator-cutover
-> covered Published rows; KT-F adapter retirement and parent-plan closeout is
-> next. This consumes the shipped accepted-publication store, project-scoped
+> **Status: complete; implementation through KT-F verified 2026-08-09.** The
+> measured overlap, strict cutover runtime, covered-adapter retirement proof,
+> and parent-plan closeout are complete for operator-cutover covered Published
+> rows. This consumes the shipped accepted-publication store, project-scoped
 > producer grants, typed Git transport, checkout identity, provisional overlay
 > model, and knowledge/gap merge gate. It does not reopen those semantics.
 
@@ -48,7 +48,11 @@ This is a typed source boundary, not a remote filesystem. No route accepts a
 path, directory listing, Git pack, object database, caller-selected project
 id, caller-computed overlay, or arbitrary corpus record.
 
-## 1. Current-HEAD inventory
+## 1. Implementation-start inventory
+
+This section records the checkout dependencies the implementation started
+from. The KT-F closeout state is recorded in sections 8 and 11 and in the
+governing locality inventory; it must not be read as a current runtime map.
 
 ### 1.1 What is already path-free
 
@@ -646,6 +650,24 @@ authorization.
 
 ### KT-F: Adapter retirement and parent-plan closeout
 
+Status: complete.
+
+The KT-F audit found no second, independently deletable "covered" publisher or
+watcher implementation after KT-E. Runtime classification already routes a
+covered Published row away before publisher binding/attachment advance,
+watcher projection/registration, overlay capture, mutation, recovery,
+schema-marker, or startup carrier acquisition. The remaining local adapter
+bodies are shared only by bridge, uncovered, and `LegacyLocal` compatibility
+lanes; deleting them here would retire behavior outside this plan's authority.
+
+Closeout therefore records the covered adapter as an already-retired
+executable route, not a separately deletable implementation. The watcher and
+publisher regression tests are non-vacuous: each first drives a real uncovered
+checkout lease, then installs coverage and proves the covered path adds no
+checkout-broker operation. The covered publisher returns
+`error.knowledge_transport_authoritative`; the covered watcher projects no
+carrier. The broker's strict capability policy remains as defense in depth.
+
 1. Remove covered catalog publisher/watcher acquisition code only after KT-E.
 2. Preserve bridge and uncovered `LegacyLocal` adapters until their own gate.
 3. Update the locality inventory, knowledge design status, operations docs,
@@ -706,6 +728,7 @@ remote knowledge source named by
 [`locality-first-decomposition.md`](./locality-first-decomposition.md). It
 consumes the semantics of
 [`checkout-identity-and-provisional-knowledge.md`](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md)
-without superseding that design. GH-G and KT-A are complete and are no longer
-the next locality arc. KT-A through KT-E are complete; KT-F adapter retirement
-and parent-plan closeout is next.
+without superseding that design. GH-G and KT-A through KT-F are complete and
+are no longer the next locality arc. The locality program continues with the
+typed blame boundary, followed by project render and the remaining local
+project-file walk retirement gates.

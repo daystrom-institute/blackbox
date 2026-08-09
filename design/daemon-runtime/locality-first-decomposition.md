@@ -9,7 +9,7 @@ topic:
   - corpus
   - knowledge
 tags: [decomposition, satellite, harness, worktrees, knowledge-seam, collector, render, provenance, indexing]
-brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, fleetd, typed Git-history/provenance transport, and remote knowledge transport through strict covered-project cutover are complete. Knowledge adapter retirement is next, followed by blame, project render, and remaining project-file walks."
+brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, fleetd, typed Git-history/provenance transport, and remote knowledge transport through covered-adapter retirement are complete. Blame is next, followed by project render and remaining project-file walks."
 ---
 
 # Locality-first decomposition: the checkout plane and the corpus plane
@@ -20,13 +20,14 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 > bidirectional authenticated provenance transport, GH-F overlap proof, and
 > GH-G strict cutover are implemented. Covered published repositories no
 > longer fall back to daemon-side Git/provenance leases; bridge, uncovered,
-> and `LegacyLocal` adapters remain intentionally scoped. KT-A through KT-E are
+> and `LegacyLocal` adapters remain intentionally scoped. KT-A through KT-F are
 > implemented: authenticated committed and provisional knowledge sources,
 > harness-local mutation, durable remote `own`/`all`, measured overlap, and an
 > offline strict-cutover marker. For an operator-cutover covered Published row,
 > blackboxd no longer watches, reads, writes, or falls back to the checkout for
-> project `.bbox/` state. The adapter bodies remain for KT-F and for bridge,
-> uncovered, and `LegacyLocal` lanes. Daemon-side local project walking remains
+> project `.bbox/` state. The shared local adapter bodies now have no covered
+> route and remain only for bridge, uncovered, and `LegacyLocal` lanes.
+> Daemon-side local project walking remains
 > an active source rung; blame and project render writes still reach into an
 > attached checkout. Section 3 is the current code-verified inventory and
 > section 6 is the dependency and retirement map. Line cites rot; reverify
@@ -188,13 +189,13 @@ path-free durable identity does not by itself make the operation local.
 | `bbox_blame` | `bbox_blame` still executes in blackboxd. Both path mode and corpus-entity mode open an attached Git object database and run blame; catalog mode correctly pins the corpus generation and commit but does not change the execution locus. | A checkout-side binding returns a typed blame fact at an explicit commit or working-tree state. The corpus-side query joins that fact to anchors, sessions, brofiles, and threads. A checkout path never becomes corpus authority. | Path and entity-mode parity, dirty/committed-state tests, scope and commit binding, bounded payloads, and a measured zero-use window for the daemon adapter. |
 | Project-scope render | `bbox_render` resolves an attachment, takes a write `RenderFileProvider` lease, and invokes the shared `bbox-knowledge` renderer inside blackboxd. The immutable-candidate merge gate already invokes `render --check` semantics. No `bro render` or harness-native equivalent exists. | `bro render` and/or a harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs and explicit provisional view from the corpus. Global render remains operator-host local. | Byte/output parity through the shared renderer, target-confinement tests, published/own/all view tests, candidate-tree gate parity, and a measured zero-use window before removing daemon write authority. |
 | Project source indexing | `bbox-code-collector`, its authenticated manifest/blob endpoint, immutable generations, activation, health, and cutback are implemented. An active collected generation suppresses local walking. `LocalProjectWalk` remains live for local/unassigned projects and as the explicit cutback destination. | Checkout owners walk, hash, and ship raw capped bytes; the corpus chunks and indexes them. Every intended project uses an active collected source. No daemon source rung opens a checkout. | Configured producer coverage, successful active generations, restart/rebuild recovery, bounded observation with no local-walk attempts, and an explicit decision about replacing or deleting local cutback before `LocalProjectWalk` retires. |
-| Repo-owned `.bbox/` read and mutation path | KT-A through KT-E are implemented. Authenticated committed candidates and leased provisional workspaces feed the existing accepted and overlay models; managed project mutation runs in the harness; remote `own`/`all` survives restart. For an operator-cutover covered Published row, the marker closes daemon watcher refresh plus local read/write/schema-marker acquisition with no fallback. Adapter bodies survive for KT-F and for bridge, uncovered, and `LegacyLocal` lanes. | A harness reads and mutates its own branch state directly. Published and deliberately shared provisional inputs reach the corpus through the authenticated checkout-source contract; corpus coordination, validation, promotion, and indexing remain central. | KT-E's covered-row runtime gate is complete. KT-F removes only the covered acquisition adapters and closes the parent record; bridge, uncovered, and `LegacyLocal` retirement remains separately authorized. |
+| Repo-owned `.bbox/` read and mutation path | KT-A through KT-F are implemented. Authenticated committed candidates and leased provisional workspaces feed the existing accepted and overlay models; managed project mutation runs in the harness; remote `own`/`all` survives restart. For an operator-cutover covered Published row, the marker closes daemon watcher refresh plus local read/write/schema-marker acquisition with no fallback. Non-vacuous publisher and watcher probes prove the covered route performs no checkout-broker operation. Shared local bodies remain only for bridge, uncovered, and `LegacyLocal` lanes. | A harness reads and mutates its own branch state directly. Published and deliberately shared provisional inputs reach the corpus through the authenticated checkout-source contract; corpus coordination, validation, promotion, and indexing remain central. | Complete for covered Published rows. Bridge, uncovered, and `LegacyLocal` retirement remains separately authorized. |
 | Git history ingest | Authenticated complete reachable-history capture, resumable intake, certified P3 materialization, producer overlays, health, recovery, GC, rebuild, overlap proof, and GH-G strict cutover are implemented. Covered published repositories use producer state only and record no post-boundary `GitHistory` lease. The local refresh adapter remains only for named uncovered, bridge, and `LegacyLocal` categories. | The scope-authorized producer owns Git acquisition for covered published projects; corpus-side generation publication, selectors, indexing, and graph construction stay central. | Complete for GH-G-covered published projects. Later retirement must preserve the named surviving categories until their own gates. |
 
 The rebaseline result is therefore:
 
 - **Complete:** durable project/scope/checkout identity, slice 5's fleetd
-  extraction, and KT-A through KT-E remote knowledge transport. For an
+  extraction, and KT-A through KT-F remote knowledge transport. For an
   operator-cutover covered Published row, accepted and selected provisional
   source is remote and restart-durable, and local watcher/read/write fallback
   is closed.
@@ -204,9 +205,8 @@ The rebaseline result is therefore:
   uncovered, and `LegacyLocal` categories.
 - **Partial:** slice 2's render merge gate; slice 4's collector transport,
   immutable code generations, and activation/cutback authority.
-- **Not relocated or retired:** blame, project-scope render, the remaining
-  local project-file source rung, and the covered knowledge acquisition
-  adapter bodies scheduled for KT-F. Bridge, uncovered, and `LegacyLocal`
+- **Not relocated or retired:** blame, project-scope render, and the remaining
+  local project-file source rung. Bridge, uncovered, and `LegacyLocal`
   `.bbox/` access remains intentionally local.
 
 Non-normative operator snapshot, taken during this rebaseline: the current
@@ -273,8 +273,8 @@ of scope here.
   `LegacyLocal` rows retain their local adapters.
 
 The knowledge seam no longer needs another identity or visibility redesign.
-KT-F now retires the covered acquisition adapters and closes the parent record;
-it does not widen the marker to bridge, uncovered, or `LegacyLocal` rows.
+KT-F retired the covered acquisition route and closed the parent record; it did
+not widen the marker to bridge, uncovered, or `LegacyLocal` rows.
 
 ### 4.2 The principle, applied
 
@@ -394,8 +394,8 @@ monolith:
 | Slice | Current state | What remains |
 |---|---|---|
 | 1. Identity contract | Complete | The existing reuse-safe checkout marker is typed as `WorkspaceId` and transported through worker/fleet protocol state. Later session capability binding consumes this identity without redefining it. |
-| 2. Harness-ward moves | Partial | Provenance export/import strict cutover, candidate render checking, and remote knowledge through KT-E strict covered-row cutover are live. KT-F adapter retirement is next, followed by blame and render writes. |
-| 3. Knowledge seam | Complete through strict covered-row cutover | KT-F removes the covered acquisition adapters and closes documentation. Bridge, uncovered, and `LegacyLocal` behavior remains. |
+| 2. Harness-ward moves | Partial | Provenance export/import strict cutover, candidate render checking, and remote knowledge through KT-F covered-adapter retirement are live. Blame is next, followed by render writes. |
+| 3. Knowledge seam | Complete for covered Published rows | KT-A through KT-F are closed. Bridge, uncovered, and `LegacyLocal` behavior remains. |
 | 4. Code-corpus collector | Partial | Cut over intended projects, remove the local-walk/cutback dependency, and stop coupling collected activation to daemon-side Git acquisition. |
 | 5. Fleetd | Complete | No locality-program work remains. |
 | 6. Corpus off-host | Pending | Blocked on slices 2 and 4 plus a separately reviewed bridge-retirement gate. |
@@ -411,17 +411,18 @@ The executable dependency map from this rebaseline is:
    unattended provenance-export receipt without granting callers arbitrary
    graph-write authority. It removes the `GitHistory` and
    `ProvenanceNoteIo` dependencies that raw-file collection cannot solve.
-2. **Retire the covered remote-knowledge adapters.** KT-A through KT-E are
-   complete; continue with KT-F from
+2. **Remote knowledge transport: complete through KT-F.** See
    [knowledge-source-transport-impl.md](knowledge-source-transport-impl.md).
    Operator-accepted committed publication candidates, leased provisional
    workspaces, harness-native project knowledge/gap mutations, durable
-   `WorkspaceId` binding, and strict watcher/read/write cutover are live. KT-F
-   removes the now-closed covered acquisition code and updates the all-adapter
-   closeout record without retiring bridge, uncovered, or `LegacyLocal` lanes.
+   `WorkspaceId` binding, strict watcher/read/write cutover, and the
+   covered-route retirement proof are live. Shared local implementations remain
+   only for bridge, uncovered, or `LegacyLocal` lanes.
 3. **Finish the remaining interactive checkout bindings.** Move blame
-   execution and project render writes into the harness/CLI after the
-   knowledge source is path-free.
+   execution into a typed checkout-side fact boundary next, then move project
+   render writes into the harness/CLI. Blame goes first because it is a bounded
+   read result at an explicit commit/working state; render is a mutating target
+   with broader published/own/all input and confinement parity gates.
 4. **Complete collector cutover and observe every adapter.** Establish active
    collected coverage for every intended project, replace or delete the
    local cutback destination, and run the per-surface retirement gates from
@@ -444,13 +445,13 @@ The executable dependency map from this rebaseline is:
    authenticated notes import, and candidate-tree render checking are
    implemented. Git/provenance strict cutover is complete for covered published
    repositories. Remote knowledge strict cutover is complete for
-   operator-cutover covered Published rows. Blame, project render writes, and
-   KT-F covered-adapter retirement remain under their section 3 gates.
-3. **Knowledge seam — complete through strict covered-row cutover.** The
+   operator-cutover covered Published rows. Blame and project render writes
+   remain under their section 3 gates.
+3. **Knowledge seam — complete for covered Published rows.** The
    provisional lane, explicit visibility, promotion, lifecycle, gap
    convergence, authenticated transport, harness-local mutation, and no-local-
-   fallback marker are live. KT-F is code retirement and closeout, not another
-   semantic seam rewrite.
+   fallback marker and covered-route retirement proof are live. Bridge,
+   uncovered, and `LegacyLocal` retirement remains separate.
 4. **Code-corpus collector — partial.** The producer, ingest endpoint,
    generations, activation, health, and cutback machinery are live. Complete
    producer coverage, replace the local cutback destination, move Git

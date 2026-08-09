@@ -234,6 +234,38 @@ bbox_thread_list(status="open")          # investigation continuity
 bbox_embed_status()                      # confirm no embedding errors
 ```
 
+### Knowledge transport cutover (offline and operator-authorized)
+
+The knowledge cutover ceremony is an offline catalog mutation. Preflight is
+read-only and writes reviewable report and resolution artifacts; apply installs
+only the exact reviewed marker; verify checks the configured marker and writes
+its receipt. Stop the selected daemon first and obtain explicit operator
+authorization before `--apply`. Never stop a shared daemon merely to run
+preflight.
+
+```bash
+blackbox project-catalog knowledge-transport-cutover --preflight \
+  --report /absolute/path/knowledge-report.json \
+  --resolution /absolute/path/knowledge-resolution.json
+
+blackbox project-catalog knowledge-transport-cutover --apply \
+  --report /absolute/path/knowledge-report.json \
+  --resolution /absolute/path/knowledge-resolution.json \
+  --configured
+
+blackbox project-catalog knowledge-transport-cutover --verify --configured
+```
+
+After the authorized daemon starts, `bbox_doctor(format="summary")` reports
+catalog-scoped `knowledge_transport` findings. A current covered row must use
+remote accepted/provisional sources and has no publisher, watcher, overlay,
+mutation, recovery, or schema-marker fallback to a checkout. Producer removal,
+grant drift, scope migration, accepted-source change, or remote corruption
+degrades/refuses and requires a new reviewed cutover; it never reopens the
+local adapter. Bridge, uncovered, and `LegacyLocal` rows remain outside this
+marker. Back up the state directory's cutover marker and receipt with the
+catalog authority.
+
 ### After a daemon upgrade (no schema change)
 
 ```bash
