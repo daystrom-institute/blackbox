@@ -811,40 +811,31 @@ mod tests {
         };
         let upload = store.begin_upload("producer", descriptor).unwrap();
         store
-            .put_manifest_page("producer", &upload.upload_id, 0, &entries)
-            .unwrap();
-        store
             .complete_manifest("producer", &upload.upload_id)
             .unwrap();
         let generation = store
-            .finalize_upload("producer", &upload.upload_id)
+            .finalize_upload_mixed("producer", &upload.upload_id)
             .unwrap();
+        let generation_id = generation.generation_id().to_string();
         let inventory = "b".repeat(64);
         store
-            .record_materialization_mixed(&scope, &generation.generation_id, 0, inventory.clone())
+            .record_materialization_mixed(&scope, &generation_id, 0, inventory.clone())
             .unwrap();
         store
-            .mark_generation_state_mixed(
-                &scope,
-                &generation.generation_id,
-                GenerationState::Active,
-                None,
-            )
+            .mark_generation_state_mixed(&scope, &generation_id, GenerationState::Active, None)
             .unwrap();
         let selector = crate::index::project_files::collected_materialization_selector(
             project_id.as_str(),
-            &generation.generation_id,
+            &generation_id,
         );
-        let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(
-            project_id.as_str(),
-            &generation.generation_id,
-        );
+        let snapshot_id =
+            bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id.as_str(), &generation_id);
         store
             .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
                 version: bbox_code_source_store::MIGRATION_STORE_VERSION,
                 project_id: project_id.clone(),
                 published_scope: scope.clone(),
-                generation_id: generation.generation_id.clone(),
+                generation_id: generation_id.clone(),
                 selector: selector.clone(),
                 snapshot_id: snapshot_id.clone(),
                 document_count: 0,
@@ -869,7 +860,7 @@ mod tests {
             project_id.as_str(),
             scope.repo_id(),
             &head_commit,
-            &generation.generation_id,
+            &generation_id,
             &selector,
             &snapshot_id,
         )
@@ -1053,6 +1044,9 @@ mod tests {
             CodeSourceLocalityCutoverVerifyRequestV1 { layout, config },
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("changed after cutover"));
+        assert!(
+            format!("{error:#}").contains("changed after cutover"),
+            "unexpected verification error: {error:#}"
+        );
     }
 }

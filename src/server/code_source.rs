@@ -6742,15 +6742,25 @@ mod tests {
             ),
         )
         .unwrap();
-        let original_revision = runtime.assignment_revision();
+        let original_revision = runtime
+            .assignment_revision
+            .load(std::sync::atomic::Ordering::Acquire);
 
         let mut removed = config;
         removed.code_collection.enabled = false;
         removed.code_collection.producers.clear();
-        let error = runtime.reload(&removed, &[]).unwrap_err();
+        let error = runtime
+            .reload(&removed, &[])
+            .err()
+            .expect("assignment removal must fail closed");
 
         assert!(format!("{error:#}").contains("must retain producer"));
-        assert_eq!(runtime.assignment_revision(), original_revision);
+        assert_eq!(
+            runtime
+                .assignment_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            original_revision
+        );
         assert_eq!(
             runtime.producer_auth().assignment_map().get(&scope),
             Some(&(project_id.to_string(), "producer".to_string())),

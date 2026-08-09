@@ -1825,7 +1825,8 @@ fn validate_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Result<()>
 fn is_cutover_target_kind(kind: CheckoutAccessKind) -> bool {
     matches!(
         kind,
-        CheckoutAccessKind::GitHistory
+        CheckoutAccessKind::LocalProjectWalk
+            | CheckoutAccessKind::GitHistory
             | CheckoutAccessKind::Blame
             | CheckoutAccessKind::RenderFileProvider
             | CheckoutAccessKind::ProvenanceNoteIo
