@@ -6,6 +6,8 @@ pub mod accepted_publication_runtime;
 pub mod accepted_publication_store;
 pub mod blame_locality_cutover;
 pub mod blame_locality_observations;
+pub mod code_source_locality_cutover;
+pub mod code_source_locality_observations;
 // Test-only accepted-publication installation. `#[cfg(test)]` does not cross
 // crate boundaries, so downstream tests enable `test-support` through a
 // dev-dependency feature. Off by default: no production build carries it.
