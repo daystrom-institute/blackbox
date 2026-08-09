@@ -1487,7 +1487,20 @@ mod tests {
             line: Some(7),
             byte_offset: 0,
         };
-        let foreign_overlays = overlay_map("project-foreign", &"b".repeat(40));
+        let foreign_overlays = std::collections::BTreeMap::from([(
+            "project-foreign".to_string(),
+            bbox_corpus_core::git_overlay::GitOverlaySelector {
+                project_id: "project-foreign".into(),
+                code_generation: "cg_test".into(),
+                repo_history_generation: "rhg_test".into(),
+                source: bbox_corpus_core::git_overlay::GitOverlaySourceV1::Attachment {
+                    attachment_id: "attachment-foreign".into(),
+                },
+                repo_head: "b".repeat(40),
+                commit_namespace: "ns".into(),
+                overlay_generation: 1,
+            },
+        )]);
         let foreign_error = workspace_blame_plan(&server, &foreign, &foreign_overlays).unwrap_err();
         assert!(format!("{foreign_error:#}").contains("different project"));
 
