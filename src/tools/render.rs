@@ -1,7 +1,7 @@
 use crate::knowledge::{
     AbsorbParams, BootstrapParams, PROJECT_RENDER_TRANSPORT_SCOPE,
     PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderLocalityRequestV1, ProjectRenderPlanV1,
-    ProjectRenderViewV1, RenderParams, ReviewParams, Scope,
+    ProjectRenderViewV1, RenderParams, ReviewParams,
 };
 use crate::server::BlackboxServer;
 
@@ -49,26 +49,15 @@ fn workspace_project_render_plan(
     }
 
     let view = server.session_knowledge_view(Some(&grant.project_id), p.provisional.as_deref())?;
-    let canonical_path = server
-        .state
-        .records_provider
-        .records_snapshot()
-        .records
-        .iter()
-        .find(|record| record.project_id == grant.project_id)
-        .map(|record| record.canonical_path.clone());
     let mut entries = view
-        .knowledge
-        .all_entries()
+        .items
         .iter()
-        .filter(|entry| {
-            entry.scope == Scope::Project
-                && (entry.project_id.as_deref() == Some(grant.project_id.as_str())
-                    || canonical_path
-                        .as_deref()
-                        .is_some_and(|path| entry.project.as_deref() == Some(path)))
+        .filter(|item| {
+            item.entry.scope == Scope::Project
+                && (item.entry.project_id.as_deref() == Some(grant.project_id.as_str())
+                    || item.metadata.published_scope.as_ref() == Some(&grant.scope))
         })
-        .cloned()
+        .map(|item| item.entry.clone())
         .collect::<Vec<_>>();
     for entry in &mut entries {
         entry.project = Some(PROJECT_RENDER_TRANSPORT_SCOPE.into());
