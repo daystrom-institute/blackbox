@@ -1,7 +1,7 @@
 use crate::knowledge::{
     AbsorbParams, BootstrapParams, PROJECT_RENDER_TRANSPORT_SCOPE,
     PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderLocalityRequestV1, ProjectRenderPlanV1,
-    RenderParams, ReviewParams, Scope,
+    ProjectRenderViewV1, RenderParams, ReviewParams, Scope,
 };
 use crate::server::BlackboxServer;
 
@@ -82,6 +82,7 @@ fn workspace_project_render_plan(
         workspace_id: grant.workspace_id.as_str().to_string(),
         provider: p.provider.clone(),
         dry_run: p.dry_run.unwrap_or(false),
+        view: ProjectRenderViewV1::parse(p.provisional.as_deref())?,
         requested_scope: requested_scope.to_string(),
         entries,
         diagnostics: view.diagnostics_text(),
@@ -200,6 +201,10 @@ impl BlackboxServer {
                         );
                     }
                     receipt.validate_against(&current)?;
+                    server
+                        .state
+                        .render_locality_observations
+                        .record_completed(&current, &receipt)?;
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "status": "render_locality_complete",
                         "diagnostics": current.diagnostics,
@@ -1055,6 +1060,7 @@ mod catalog_render_tests {
         let value: serde_json::Value = serde_json::from_str(&text(&planned)).unwrap();
         let plan: ProjectRenderPlanV1 = serde_json::from_value(value["plan"].clone()).unwrap();
         assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.view, ProjectRenderViewV1::Published);
         assert_eq!(
             plan.entries[0].project.as_deref(),
             Some(PROJECT_RENDER_TRANSPORT_SCOPE)
@@ -1091,6 +1097,13 @@ mod catalog_render_tests {
             .await;
         assert!(!is_error(&completed), "{}", text(&completed));
         assert_eq!(server.state.checkout_access.health().sequence, before);
+        let observations = server.state.render_locality_observations.snapshot();
+        assert_eq!(observations.completions.len(), 1);
+        assert_eq!(observations.completions[0].project_id, PROJECT);
+        assert_eq!(
+            observations.completions[0].view,
+            ProjectRenderViewV1::Published
+        );
     }
 
     #[tokio::test]

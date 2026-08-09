@@ -32,3 +32,4 @@ pub mod project_catalog_store;
 pub mod project_resolver;
 pub mod projects;
 pub mod publisher;
+pub mod render_locality_observations;

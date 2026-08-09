@@ -1418,6 +1418,7 @@ mod tests {
             workspace_id: runtime.workspace_id.as_str().to_string(),
             provider: Some("claude".into()),
             dry_run: false,
+            view: bbox_knowledge::knowledge::ProjectRenderViewV1::Own,
             requested_scope: "project".into(),
             entries: vec![entry],
             diagnostics: None,

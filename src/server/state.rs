@@ -141,6 +141,10 @@ pub(crate) struct SharedState {
     /// blame execution. Contains identity and response checksums only.
     pub(crate) blame_locality_observations:
         bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1,
+    /// Durable exact-receipt evidence for checkout-owned project renders,
+    /// keyed by project and explicit published/own/all view.
+    pub(crate) render_locality_observations:
+        bbox_indexing::render_locality_observations::RenderLocalityObservationsV1,
     /// Host-local symbolic branch pins defining published truth per scope.
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
     /// Session-authorized provisional snapshots keyed by scope and checkout.
@@ -946,6 +950,8 @@ impl SharedState {
                 bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
             blame_locality_observations:
                 bbox_indexing::blame_locality_observations::BlameLocalityObservationsV1::in_memory(),
+            render_locality_observations:
+                bbox_indexing::render_locality_observations::RenderLocalityObservationsV1::in_memory(),
             publisher_refs: RwLock::new(
                 bbox_indexing::publisher::PublisherRefStore::open(
                     store_dir.join("publisher-refs.json"),

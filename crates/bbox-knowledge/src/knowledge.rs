@@ -224,11 +224,41 @@ pub struct ProjectRenderPlanV1 {
     pub workspace_id: String,
     pub provider: Option<String>,
     pub dry_run: bool,
+    pub view: ProjectRenderViewV1,
     /// Normalized public request scope: `project` or `both`.
     pub requested_scope: String,
     pub entries: Vec<KnowledgeEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRenderViewV1 {
+    Published,
+    Own,
+    All,
+}
+
+impl ProjectRenderViewV1 {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("own") {
+            "published" => Ok(Self::Published),
+            "own" => Ok(Self::Own),
+            "all" => Ok(Self::All),
+            value => anyhow::bail!(
+                "invalid project render provisional view {value:?}; expected published, own, or all"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Own => "own",
+            Self::All => "all",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5097,6 +5127,7 @@ mod tests {
             workspace_id: "workspace-render-locality".into(),
             provider: provider.map(str::to_owned),
             dry_run,
+            view: ProjectRenderViewV1::Own,
             requested_scope: "project".into(),
             entries: vec![rendered],
             diagnostics: None,
