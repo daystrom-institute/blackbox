@@ -231,7 +231,7 @@ pub struct ProjectRenderPlanV1 {
     pub diagnostics: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum ProjectRenderLocalityRequestV1 {
     Plan,
