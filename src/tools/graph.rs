@@ -634,6 +634,33 @@ fn snapshot_commit_for_blame(
     })
 }
 
+struct SessionBlameAuthority {
+    project_id: String,
+    scope: PublishedScope,
+    workspace_id: String,
+}
+
+fn session_blame_authority(server: &BlackboxServer) -> Result<SessionBlameAuthority> {
+    if let Some(grant) = server.authoritative_session_workspace_binding() {
+        if !grant.is_live_now() {
+            bail!("error.blame_locality_binding: workspace binding has expired");
+        }
+        return Ok(SessionBlameAuthority {
+            project_id: grant.project_id.clone(),
+            scope: grant.scope.clone(),
+            workspace_id: grant.workspace_id.as_str().to_string(),
+        });
+    }
+    if let Some(grant) = server.authoritative_operator_blame_binding() {
+        return Ok(SessionBlameAuthority {
+            project_id: grant.project_id.clone(),
+            scope: grant.scope.clone(),
+            workspace_id: grant.workspace_id.as_str().to_string(),
+        });
+    }
+    bail!("error.blame_locality_binding: blame locality requires checkout-side authority")
+}
+
 /// Build the checkout owner's blame plan from corpus identity only.
 ///
 /// Unlike `snapshot_commit_for_blame`, this does not prove the commit through
@@ -651,12 +678,7 @@ fn workspace_blame_plan(
         BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlamePlanTargetV1,
     };
 
-    let grant = server.authoritative_session_workspace_binding().context(
-        "error.blame_locality_binding: blame locality requires a live workspace binding",
-    )?;
-    if !grant.is_live_now() {
-        bail!("error.blame_locality_binding: workspace binding has expired");
-    }
+    let grant = session_blame_authority(server)?;
     let target = match target {
         mcp_tools::blame::BlameTargetIdentity::ProjectFile {
             project_id,
@@ -699,9 +721,9 @@ fn workspace_blame_plan(
     };
     let plan = BlameExecutionPlanV1 {
         version: BLAME_TRANSPORT_VERSION,
-        project_id: grant.project_id.clone(),
-        scope: grant.scope.clone(),
-        workspace_id: grant.workspace_id.as_str().to_string(),
+        project_id: grant.project_id,
+        scope: grant.scope,
+        workspace_id: grant.workspace_id,
         target,
     };
     plan.validate()?;
@@ -1154,7 +1176,10 @@ impl BlackboxServer {
                     fact.validate_against(&current)?;
                     return mcp_tools::blame::enrich_fact(&fact, edge_index);
                 }
-                None if server.authoritative_session_workspace_binding().is_some() => {
+                None
+                    if server.authoritative_session_workspace_binding().is_some()
+                        || server.authoritative_operator_blame_binding().is_some() =>
+                {
                     bail!(
                         "error.blame_locality_required: a workspace-bound blame must execute in its checkout owner"
                     );
@@ -1598,6 +1623,74 @@ mod tests {
             expired_server.state.checkout_access.health().sequence,
             expired_before
         );
+    }
+
+    #[tokio::test]
+    async fn operator_blame_authority_is_locality_only_and_never_acquires_a_checkout() {
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameExecutionV1, BlameFactV1,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        assert!(
+            server
+                .session_operator_blame_binding
+                .set(Some(Arc::new(
+                    crate::server::blame_authority::OperatorBlameGrant {
+                        project_id: "project-bound".into(),
+                        scope: PublishedScope::try_new("repo-bound", ".").unwrap(),
+                        workspace_id: bro_core::WorkspaceId::parse("a".repeat(32)).unwrap(),
+                    },
+                )))
+                .is_ok()
+        );
+        let before = server.state.checkout_access.health().sequence;
+        let planned = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Plan),
+            }))
+            .await;
+        assert_ne!(planned.is_error, Some(true), "{}", extract_text(&planned));
+        let planned: serde_json::Value = serde_json::from_str(&extract_text(&planned)).unwrap();
+        let plan: bbox_corpus_core::blame_transport::BlameExecutionPlanV1 =
+            serde_json::from_value(planned["plan"].clone()).unwrap();
+        let fact = BlameFactV1 {
+            version: BLAME_TRANSPORT_VERSION,
+            project_id: plan.project_id.clone(),
+            scope: plan.scope.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            git_relative_path: "src/lib.rs".into(),
+            display_path: "src/lib.rs".into(),
+            line: 7,
+            execution: BlameExecutionV1::WorkspaceCurrent { head_commit: None },
+            attribution: None,
+        };
+        let resolved = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Resolve { plan, fact }),
+            }))
+            .await;
+        assert_ne!(resolved.is_error, Some(true), "{}", extract_text(&resolved));
+        assert!(extract_text(&resolved).contains("error.not_found"));
+
+        let fallback = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: None,
+            }))
+            .await;
+        assert_eq!(fallback.is_error, Some(true));
+        assert!(extract_text(&fallback).contains("error.blame_locality_required"));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 
     #[derive(Clone)]

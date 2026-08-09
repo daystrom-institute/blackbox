@@ -1,4 +1,10 @@
 use anyhow::{Context, bail};
+use bbox_corpus_core::blame_transport::{
+    OPERATOR_BLAME_REPO_ID_HEADER, OPERATOR_BLAME_ROOT_RELPATH_HEADER,
+    OPERATOR_BLAME_WORKSPACE_ID_HEADER,
+};
+use bbox_corpus_core::identity::PublishedScope;
+use bro_rpc::ServiceToken;
 use clap::{Args, Subcommand};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap};
 use serde::de::DeserializeOwned;
@@ -94,6 +100,51 @@ impl McpClient {
         base_url: &str,
         project_root: Option<&Path>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_initialization_headers(base_url, project_root, HeaderMap::new()).await
+    }
+
+    pub(crate) async fn connect_with_operator_blame(
+        base_url: &str,
+        token: &ServiceToken,
+        scope: &PublishedScope,
+        workspace_id: &str,
+    ) -> anyhow::Result<Self> {
+        validate_credentialed_base_url(base_url)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", token.expose_secret())
+                .parse()
+                .context("encoding operator blame authorization")?,
+        );
+        headers.insert(
+            OPERATOR_BLAME_REPO_ID_HEADER,
+            scope
+                .repo_id()
+                .parse()
+                .context("encoding operator blame repo id")?,
+        );
+        headers.insert(
+            OPERATOR_BLAME_ROOT_RELPATH_HEADER,
+            scope
+                .bbox_root_relpath()
+                .parse()
+                .context("encoding operator blame root relative path")?,
+        );
+        headers.insert(
+            OPERATOR_BLAME_WORKSPACE_ID_HEADER,
+            workspace_id
+                .parse()
+                .context("encoding operator blame workspace id")?,
+        );
+        Self::connect_with_initialization_headers(base_url, None, headers).await
+    }
+
+    async fn connect_with_initialization_headers(
+        base_url: &str,
+        project_root: Option<&Path>,
+        initialization_headers: HeaderMap,
+    ) -> anyhow::Result<Self> {
         let raw_url = format!("{}/mcp", base_url.trim_end_matches('/'));
         let mut mcp_url = reqwest::Url::parse(&raw_url)
             .with_context(|| format!("parsing daemon MCP URL {raw_url}"))?;
@@ -102,7 +153,14 @@ impl McpClient {
             mcp_url.query_pairs_mut().append_pair("project", root);
         }
         let mcp_url = mcp_url.to_string();
-        let client = reqwest::Client::new();
+        let client = if initialization_headers.is_empty() {
+            reqwest::Client::new()
+        } else {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .context("building credentialed MCP client")?
+        };
 
         let initialize = json!({
             "jsonrpc": "2.0",
@@ -117,8 +175,14 @@ impl McpClient {
                 },
             },
         });
-        let (init_response, session_id) =
-            post_json_rpc(&client, &mcp_url, None, &initialize).await?;
+        let (init_response, session_id) = post_json_rpc(
+            &client,
+            &mcp_url,
+            None,
+            &initialize,
+            Some(&initialization_headers),
+        )
+        .await?;
         ensure_json_rpc_response_id(&init_response, 1, "initialize")?;
         ensure_json_rpc_success(&init_response, "initialize")?;
 
@@ -162,11 +226,21 @@ impl McpClient {
             &self.mcp_url,
             self.session_id.as_deref(),
             &tool_call,
+            None,
         )
         .await?;
         ensure_json_rpc_response_id(&response, id, "tools/call")?;
         Ok(response)
     }
+}
+
+fn validate_credentialed_base_url(base_url: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(base_url).context("parsing credentialed daemon URL")?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        bail!("credentialed daemon URL must use HTTPS unless it is loopback HTTP");
+    }
+    Ok(())
 }
 
 pub(crate) fn default_base_url() -> String {
@@ -186,6 +260,7 @@ async fn post_json_rpc(
     url: &str,
     session_id: Option<&str>,
     body: &Value,
+    extra_headers: Option<&HeaderMap>,
 ) -> anyhow::Result<(Value, Option<String>)> {
     let mut request = client
         .post(url)
@@ -195,6 +270,9 @@ async fn post_json_rpc(
         .json(body);
     if let Some(session_id) = session_id {
         request = request.header("Mcp-Session-Id", session_id);
+    }
+    if let Some(headers) = extra_headers {
+        request = request.headers(headers.clone());
     }
 
     let response = request

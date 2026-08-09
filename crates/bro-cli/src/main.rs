@@ -24,6 +24,7 @@ use bro_fleet_client::Provider;
 use clap::{Args, Parser, Subcommand};
 use ratatui::prelude::{Color, Line, Modifier, Span, Style};
 
+mod blame;
 mod fleet_classifier;
 mod fleet_tui;
 mod logging;
@@ -61,6 +62,8 @@ enum BroCommand {
     Mcp(mcp_call::McpArgs),
     /// Checkout-local provenance commands
     Provenance(provenance::ProvenanceArgs),
+    /// Checkout-local Git blame with central corpus enrichment
+    Blame(blame::BlameArgs),
     /// Fleet cockpit — dispatch and live-drive many top-level agents
     Fleet(FleetArgs),
     /// Single-agent cockpit — launch one agent into the Fleet transcript view
@@ -692,6 +695,7 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Orchestrate(args) => rt.block_on(run_orchestrate(args)),
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
         BroCommand::Provenance(args) => rt.block_on(provenance::run(args)),
+        BroCommand::Blame(args) => rt.block_on(blame::run(args)),
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
             rt.block_on(fleet_tui::run(args.cwd, args.daemon_url, args.force))

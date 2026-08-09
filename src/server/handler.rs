@@ -99,7 +99,7 @@ impl ServerHandler for BlackboxServer {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        let (surface_str, project_raw, workspace_binding) =
+        let (surface_str, project_raw, workspace_binding, operator_blame_binding) =
             if let Some(parts) = context.extensions.get::<http::request::Parts>() {
                 let project =
                     server::surface::extract_decoded_query_param(parts.uri.query(), "project")
@@ -134,13 +134,27 @@ impl ServerHandler for BlackboxServer {
                         }
                         None => None,
                     };
+                let operator_blame_binding =
+                    server::blame_authority::authenticate_operator_blame_binding(
+                        self.state.as_ref(),
+                        &parts.headers,
+                    )
+                    .map_err(|message| ErrorData::new(ErrorCode::INVALID_REQUEST, message, None))?;
+                if workspace_binding.is_some() && operator_blame_binding.is_some() {
+                    return Err(ErrorData::new(
+                        ErrorCode::INVALID_REQUEST,
+                        "managed workspace and operator blame authorities are mutually exclusive",
+                        None,
+                    ));
+                }
                 (
                     server::surface::extract_surface_from_uri(parts.uri.query()),
                     project,
                     workspace_binding,
+                    operator_blame_binding,
                 )
             } else {
-                ("default", None, None)
+                ("default", None, None, None)
             };
         // Resolve the project selector (alias / id / path) through the
         // shared engine (phase-2 §9.2, Filter class) to the base canonical
@@ -148,8 +162,16 @@ impl ServerHandler for BlackboxServer {
         // parity with bbox_mcp_surface. A catalog-mode identity with no
         // attachment pins the stable project id: identity without a host
         // path. Blocking fs (canonicalize / git probes) → blocking pool.
-        let project = match workspace_binding.as_ref() {
-            Some(grant) => Some(grant.project_id.clone()),
+        let authority_project = workspace_binding
+            .as_ref()
+            .map(|grant| grant.project_id.clone())
+            .or_else(|| {
+                operator_blame_binding
+                    .as_ref()
+                    .map(|grant| grant.project_id.clone())
+            });
+        let project = match authority_project {
+            Some(project_id) => Some(project_id),
             None => match project_raw.clone() {
                 Some(raw) => {
                     let server = self.clone();
@@ -204,6 +226,9 @@ impl ServerHandler for BlackboxServer {
         let _ = self
             .session_workspace_binding
             .set(workspace_binding.map(Arc::new));
+        let _ = self
+            .session_operator_blame_binding
+            .set(operator_blame_binding.map(Arc::new));
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }

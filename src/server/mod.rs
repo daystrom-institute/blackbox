@@ -1,4 +1,5 @@
 mod background;
+pub(crate) mod blame_authority;
 mod bridge_parity;
 mod built_from;
 /// Phase 5 plan section 14.4: the bridge parity proof. Test-only.
@@ -94,6 +95,7 @@ impl BlackboxServer {
             surface_project: std::sync::OnceLock::new(),
             session_checkout: std::sync::OnceLock::new(),
             session_workspace_binding: std::sync::OnceLock::new(),
+            session_operator_blame_binding: std::sync::OnceLock::new(),
         }
     }
 

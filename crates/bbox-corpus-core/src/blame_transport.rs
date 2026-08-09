@@ -13,6 +13,9 @@ pub const MAX_BLAME_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_BLAME_AUTHOR_BYTES: usize = 512;
 pub const MAX_BLAME_TIME_BYTES: usize = 128;
 pub const MAX_BLAME_PROJECT_ID_BYTES: usize = 256;
+pub const OPERATOR_BLAME_REPO_ID_HEADER: &str = "x-blackbox-blame-repo-id";
+pub const OPERATOR_BLAME_ROOT_RELPATH_HEADER: &str = "x-blackbox-blame-root-relpath";
+pub const OPERATOR_BLAME_WORKSPACE_ID_HEADER: &str = "x-blackbox-blame-workspace-id";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlameExecutionPlanV1 {
@@ -179,6 +182,125 @@ impl BlameFactV1 {
         }
         Ok(())
     }
+}
+
+/// Execute one daemon-authored plan inside the checkout that owns its files
+/// and Git object database. Both the managed harness and the attended CLI use
+/// this leaf so path confinement and snapshot semantics cannot drift.
+pub fn execute_plan_in_workspace(
+    plan: &BlameExecutionPlanV1,
+    workspace_root: &Path,
+    project_root: &Path,
+    expected_scope: &PublishedScope,
+    expected_workspace_id: &str,
+) -> Result<BlameFactV1> {
+    plan.validate()?;
+    if &plan.scope != expected_scope || plan.workspace_id != expected_workspace_id {
+        bail!("blame plan is outside the bound workspace authority");
+    }
+    let workspace_root = workspace_root
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("canonicalizing bound Git root: {error}"))?;
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("canonicalizing bound project root: {error}"))?;
+    if !project_root.starts_with(&workspace_root) {
+        bail!("error.checkout_path_invalid: bound project root is outside the Git root");
+    }
+
+    let (git_relative_path, display_path, line, execution, blame) = match &plan.target {
+        BlamePlanTargetV1::WorkspacePath { input_path, line } => {
+            let input = Path::new(input_path);
+            if input
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            {
+                bail!("error.checkout_path_invalid: blame path contains parent traversal");
+            }
+            let requested = if input.is_absolute() {
+                input.to_path_buf()
+            } else {
+                project_root.join(input)
+            };
+            let file = requested
+                .canonicalize()
+                .map_err(|error| anyhow::anyhow!("canonicalizing bound blame path: {error}"))?;
+            if !file.is_file() || !file.starts_with(&project_root) {
+                bail!(
+                    "error.checkout_attachment_not_found: blame path is outside the bound project"
+                );
+            }
+            let display = file
+                .strip_prefix(&project_root)
+                .map_err(|error| anyhow::anyhow!("deriving project-relative blame path: {error}"))?
+                .to_path_buf();
+            let git_relative = file
+                .strip_prefix(&workspace_root)
+                .map_err(|error| anyhow::anyhow!("deriving Git-relative blame path: {error}"))?
+                .to_path_buf();
+            let blame = crate::git::blame_for_line_in_root(&workspace_root, &git_relative, *line)?;
+            (
+                slash_path(&git_relative),
+                slash_path(&display),
+                *line,
+                BlameExecutionV1::WorkspaceCurrent {
+                    head_commit: crate::git::current_head(&workspace_root),
+                },
+                blame,
+            )
+        }
+        BlamePlanTargetV1::ProjectSnapshot {
+            project_relative_path,
+            display_path,
+            line,
+            byte_offset,
+            commit,
+        } => {
+            let project_prefix = project_root
+                .strip_prefix(&workspace_root)
+                .map_err(|error| anyhow::anyhow!("deriving bound project Git prefix: {error}"))?;
+            let git_relative = project_prefix.join(project_relative_path);
+            let (resolved_line, blame) = crate::git::blame_for_line_or_offset_at_commit(
+                &workspace_root,
+                &git_relative,
+                commit,
+                *line,
+                *byte_offset,
+            )?;
+            (
+                slash_path(&git_relative),
+                display_path.clone(),
+                resolved_line,
+                BlameExecutionV1::Snapshot {
+                    commit: commit.clone(),
+                },
+                blame,
+            )
+        }
+    };
+    let attribution = blame.map(|blame| BlameAttributionV1 {
+        commit_sha: blame.commit_sha,
+        author: blame.author,
+        author_time: blame.author_time,
+        git_relative_path: blame.rel_path,
+    });
+    let fact = BlameFactV1 {
+        version: BLAME_TRANSPORT_VERSION,
+        project_id: plan.project_id.clone(),
+        scope: expected_scope.clone(),
+        workspace_id: expected_workspace_id.to_string(),
+        git_relative_path,
+        display_path,
+        line,
+        execution,
+        attribution,
+    };
+    fact.validate_against(plan)?;
+    Ok(fact)
+}
+
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn validate_common(

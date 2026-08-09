@@ -359,112 +359,13 @@ impl LocalProjectRuntime {
         &self,
         plan: &bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
     ) -> Result<bbox_corpus_core::blame_transport::BlameFactV1> {
-        use bbox_corpus_core::blame_transport::{
-            BLAME_TRANSPORT_VERSION, BlameAttributionV1, BlameExecutionV1, BlameFactV1,
-            BlamePlanTargetV1,
-        };
-
-        plan.validate()?;
-        if plan.scope != self.scope || plan.workspace_id != self.workspace_id.as_str() {
-            bail!("blame plan is outside the bound workspace authority");
-        }
-
-        let (git_relative_path, display_path, line, execution, blame) = match &plan.target {
-            BlamePlanTargetV1::WorkspacePath { input_path, line } => {
-                let input = Path::new(input_path);
-                if input
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-                {
-                    bail!("error.checkout_path_invalid: blame path contains parent traversal");
-                }
-                let requested = if input.is_absolute() {
-                    input.to_path_buf()
-                } else {
-                    self.project_root.join(input)
-                };
-                let file = requested
-                    .canonicalize()
-                    .context("canonicalizing bound blame path")?;
-                if !file.is_file() || !file.starts_with(&self.project_root) {
-                    bail!(
-                        "error.checkout_attachment_not_found: blame path is outside the bound project"
-                    );
-                }
-                let display = file
-                    .strip_prefix(&self.project_root)
-                    .context("deriving project-relative blame path")?
-                    .to_path_buf();
-                let git_relative = file
-                    .strip_prefix(&self.workspace_root)
-                    .context("deriving Git-relative blame path")?
-                    .to_path_buf();
-                let blame = bbox_corpus_core::git::blame_for_line_in_root(
-                    &self.workspace_root,
-                    &git_relative,
-                    *line,
-                )?;
-                (
-                    slash_path(&git_relative),
-                    slash_path(&display),
-                    *line,
-                    BlameExecutionV1::WorkspaceCurrent {
-                        head_commit: bbox_corpus_core::git::current_head(&self.workspace_root),
-                    },
-                    blame,
-                )
-            }
-            BlamePlanTargetV1::ProjectSnapshot {
-                project_relative_path,
-                display_path,
-                line,
-                byte_offset,
-                commit,
-            } => {
-                let project_relative = Path::new(project_relative_path);
-                let project_prefix = self
-                    .project_root
-                    .strip_prefix(&self.workspace_root)
-                    .context("deriving bound project Git prefix")?;
-                let git_relative = project_prefix.join(project_relative);
-                let (resolved_line, blame) =
-                    bbox_corpus_core::git::blame_for_line_or_offset_at_commit(
-                        &self.workspace_root,
-                        &git_relative,
-                        commit,
-                        *line,
-                        *byte_offset,
-                    )?;
-                (
-                    slash_path(&git_relative),
-                    display_path.clone(),
-                    resolved_line,
-                    BlameExecutionV1::Snapshot {
-                        commit: commit.clone(),
-                    },
-                    blame,
-                )
-            }
-        };
-        let attribution = blame.map(|blame| BlameAttributionV1 {
-            commit_sha: blame.commit_sha,
-            author: blame.author,
-            author_time: blame.author_time,
-            git_relative_path: blame.rel_path,
-        });
-        let fact = BlameFactV1 {
-            version: BLAME_TRANSPORT_VERSION,
-            project_id: plan.project_id.clone(),
-            scope: self.scope.clone(),
-            workspace_id: self.workspace_id.as_str().to_string(),
-            git_relative_path,
-            display_path,
-            line,
-            execution,
-            attribution,
-        };
-        fact.validate_against(plan)?;
-        Ok(fact)
+        bbox_corpus_core::blame_transport::execute_plan_in_workspace(
+            plan,
+            &self.workspace_root,
+            &self.project_root,
+            &self.scope,
+            self.workspace_id.as_str(),
+        )
     }
 
     fn mutate(&self, kind: MutationKind, input: Value) -> Result<Option<ToolResult>> {
@@ -756,10 +657,6 @@ impl LocalProjectRuntime {
             runtime.retry_active.store(false, Ordering::Release);
         });
     }
-}
-
-fn slash_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
 }
 
 struct BoundRepoIo {

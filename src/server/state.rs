@@ -2651,6 +2651,11 @@ pub(crate) struct BlackboxServer {
     /// self-MCP header. A raw query parameter can never populate this slot.
     pub(crate) session_workspace_binding:
         OnceLock<Option<Arc<super::knowledge_source::WorkspaceBindingGrant>>>,
+    /// Scope-bound attended blame authority authenticated from producer
+    /// bearer plus path-free identity headers. Other harness-local tools do
+    /// not consult this slot.
+    pub(crate) session_operator_blame_binding:
+        OnceLock<Option<Arc<super::blame_authority::OperatorBlameGrant>>>,
 }
 
 /// Catalog-mode view fixtures shared by the published knowledge and gap
