@@ -15,8 +15,9 @@ use bbox_corpus_core::identity::PublishedScope;
 use bbox_gaps::gaps::{GapFileParams, GapResolveParams, GapStore, GapUpdateParams};
 use bbox_gaps::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 use bbox_knowledge::knowledge::{
-    DecideParams, ForgetParams, Knowledge, KnowledgeLinkParams, LearnParams, RememberParams,
-    ResponseFormat, ReviewParams,
+    DecideParams, ForgetParams, Knowledge, KnowledgeLinkParams, LearnParams,
+    ProjectRenderExecutionV1, ProjectRenderPlanV1, RememberParams, ResponseFormat, ReviewParams,
+    execute_project_render_plan,
 };
 use bbox_knowledge::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 use bbox_knowledge_source_client::{CaptureOutcome, WorkspaceCaptureClient};
@@ -25,6 +26,7 @@ use serde_json::{Value, json};
 
 const RETRY_DELAYS_SECS: &[u64] = &[1, 2, 4, 8, 16];
 const MAX_SYNC_ERROR_CHARS: usize = 600;
+const BOUND_WORKSPACE_RENDER_SELECTOR: &str = "$bound-workspace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationKind {
@@ -119,6 +121,12 @@ pub async fn install_project_mutation_routes(
                     runtime: runtime.clone(),
                 }) as Arc<dyn Tool>;
             }
+            if upstream.name() == format!("mcp__{capability_server}__bbox_render") {
+                return Arc::new(LocalRenderTool {
+                    upstream,
+                    runtime: runtime.clone(),
+                }) as Arc<dyn Tool>;
+            }
             upstream
         })
         .collect())
@@ -133,6 +141,180 @@ struct ProjectMutationTool {
 struct LocalBlameTool {
     upstream: Arc<dyn Tool>,
     runtime: Arc<LocalProjectRuntime>,
+}
+
+struct LocalRenderTool {
+    upstream: Arc<dyn Tool>,
+    runtime: Arc<LocalProjectRuntime>,
+}
+
+#[async_trait]
+impl Tool for LocalRenderTool {
+    fn name(&self) -> &str {
+        self.upstream.name()
+    }
+
+    fn description(&self) -> &str {
+        self.upstream.description()
+    }
+
+    fn input_schema(&self) -> Value {
+        self.upstream.input_schema()
+    }
+
+    fn freeform_grammar(&self) -> Option<FreeformGrammar> {
+        self.upstream.freeform_grammar()
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        self.upstream.annotations()
+    }
+
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        self.upstream.namespace_binding()
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let mut public = match input {
+            Value::Object(object) => object,
+            _ => serde_json::Map::new(),
+        };
+        public.remove("_render_locality");
+        let project_render = public.get("project").and_then(Value::as_str).is_some()
+            && matches!(
+                public
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .unwrap_or("both"),
+                "project" | "both"
+            );
+        if !project_render {
+            return self.upstream.call(Value::Object(public), cx).await;
+        }
+
+        let requested = public
+            .get("project")
+            .and_then(Value::as_str)
+            .expect("project render has a selector");
+        let selector = match self.runtime.render_selector(requested) {
+            Ok(selector) => selector,
+            Err(error) => {
+                return ToolResult::Error(format!(
+                    "local project render target refused: {error:#}"
+                ));
+            }
+        };
+        public.insert("project".into(), Value::String(selector));
+
+        let mut plan_input = public.clone();
+        plan_input.insert("_render_locality".into(), json!({ "phase": "plan" }));
+        let (plan, global_result) =
+            match parse_render_plan(self.upstream.call(Value::Object(plan_input), cx).await) {
+                Ok(plan) => plan,
+                Err(result) => return result,
+            };
+        let runtime = self.runtime.clone();
+        let execution_plan = plan.clone();
+        let execution =
+            match tokio::task::spawn_blocking(move || runtime.execute_render_plan(&execution_plan))
+                .await
+            {
+                Ok(Ok(execution)) => execution,
+                Ok(Err(error)) => {
+                    return ToolResult::Error(format!("local project render failed: {error:#}"));
+                }
+                Err(error) => {
+                    return ToolResult::Error(format!("local project render task failed: {error}"));
+                }
+            };
+
+        let mut complete_input = public;
+        complete_input.insert(
+            "_render_locality".into(),
+            json!({
+                "phase": "complete",
+                "plan": plan,
+                "receipt": execution.receipt,
+            }),
+        );
+        let diagnostics = match parse_render_completion(
+            self.upstream.call(Value::Object(complete_input), cx).await,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(result) => return result,
+        };
+        let mut output = match global_result {
+            Some(global) if !global.is_empty() => format!("{global}\n\n{}", execution.output),
+            _ => execution.output,
+        };
+        if let Some(diagnostics) = diagnostics {
+            output.push('\n');
+            output.push_str(&diagnostics);
+        }
+        ToolResult::Text(output)
+    }
+}
+
+fn parse_render_plan(
+    result: ToolResult,
+) -> std::result::Result<(ProjectRenderPlanV1, Option<String>), ToolResult> {
+    let value = parse_json_tool_result(result, "project render plan")?;
+    if value.get("status").and_then(Value::as_str) != Some("render_locality_plan") {
+        return Err(ToolResult::Error(
+            "daemon returned an unexpected project render plan status".into(),
+        ));
+    }
+    let plan: ProjectRenderPlanV1 =
+        serde_json::from_value(value.get("plan").cloned().ok_or_else(|| {
+            ToolResult::Error("daemon project render response omitted plan".into())
+        })?)
+        .map_err(|error| {
+            ToolResult::Error(format!("daemon returned an invalid render plan: {error}"))
+        })?;
+    plan.validate().map_err(|error| {
+        ToolResult::Error(format!("daemon returned an invalid render plan: {error:#}"))
+    })?;
+    let global_result = value
+        .get("global_result")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                ToolResult::Error("daemon returned an invalid global render result".into())
+            })
+        })
+        .transpose()?;
+    Ok((plan, global_result))
+}
+
+fn parse_render_completion(result: ToolResult) -> std::result::Result<Option<String>, ToolResult> {
+    let value = parse_json_tool_result(result, "project render completion")?;
+    if value.get("status").and_then(Value::as_str) != Some("render_locality_complete") {
+        return Err(ToolResult::Error(
+            "daemon returned an unexpected project render completion status".into(),
+        ));
+    }
+    value
+        .get("diagnostics")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                ToolResult::Error("daemon returned invalid render diagnostics".into())
+            })
+        })
+        .transpose()
+}
+
+fn parse_json_tool_result(
+    result: ToolResult,
+    label: &str,
+) -> std::result::Result<Value, ToolResult> {
+    match result {
+        ToolResult::Json(value) => Ok(value),
+        ToolResult::Text(text) => serde_json::from_str(&text).map_err(|error| {
+            ToolResult::Error(format!("daemon returned an invalid {label}: {error}"))
+        }),
+        error @ ToolResult::Error(_) => Err(error),
+    }
 }
 
 #[async_trait]
@@ -362,6 +544,44 @@ impl LocalProjectRuntime {
         bbox_corpus_core::blame_transport::execute_plan_in_workspace(
             plan,
             &self.workspace_root,
+            &self.project_root,
+            &self.scope,
+            self.workspace_id.as_str(),
+        )
+    }
+
+    fn render_selector(&self, requested: &str) -> Result<String> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            bail!("project render target is empty");
+        }
+        let path = Path::new(requested);
+        let path_shaped = path.is_absolute()
+            || requested == "."
+            || requested == ".."
+            || requested.starts_with("./")
+            || requested.starts_with("../")
+            || requested.contains(std::path::MAIN_SEPARATOR)
+            || self.workspace_root.join(path).exists();
+        if !path_shaped {
+            return Ok(requested.to_string());
+        }
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workspace_root.join(path)
+        }
+        .canonicalize()
+        .context("resolving requested project render target")?;
+        if candidate != self.project_root {
+            bail!("project render target does not match the bound workspace scope");
+        }
+        Ok(BOUND_WORKSPACE_RENDER_SELECTOR.to_string())
+    }
+
+    fn execute_render_plan(&self, plan: &ProjectRenderPlanV1) -> Result<ProjectRenderExecutionV1> {
+        execute_project_render_plan(
+            plan,
             &self.project_root,
             &self.scope,
             self.workspace_id.as_str(),
@@ -1131,6 +1351,114 @@ mod tests {
                 .unwrap()
                 .contains(root.to_str().unwrap()),
             "locality transport must not expose the absolute checkout root"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_wrapper_keeps_checkout_path_local_and_writes_shared_projection() {
+        struct FakeDaemonRender {
+            plan: ProjectRenderPlanV1,
+            calls: Arc<Mutex<Vec<Value>>>,
+        }
+
+        #[async_trait]
+        impl Tool for FakeDaemonRender {
+            fn name(&self) -> &str {
+                "mcp__blackbox__bbox_render"
+            }
+
+            fn description(&self) -> &str {
+                "fake render"
+            }
+
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+
+            async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+                self.calls.lock().unwrap().push(input.clone());
+                match input["_render_locality"]["phase"].as_str() {
+                    Some("plan") => ToolResult::Json(json!({
+                        "status": "render_locality_plan",
+                        "plan": self.plan,
+                        "global_result": null,
+                    })),
+                    Some("complete") => ToolResult::Json(json!({
+                        "status": "render_locality_complete",
+                        "diagnostics": null,
+                    })),
+                    other => ToolResult::Error(format!("unexpected phase {other:?}")),
+                }
+            }
+        }
+
+        let (_directory, root, runtime) = runtime();
+        runtime
+            .mutate(
+                MutationKind::Learn,
+                json!({
+                    "content": "PROJECT_RENDER_HARNESS_MARKER",
+                    "category": "convention",
+                    "scope": "project",
+                    "project": root,
+                }),
+            )
+            .unwrap();
+        let mut entry = {
+            let mut knowledge = runtime.knowledge.lock().unwrap();
+            knowledge.reload().unwrap();
+            knowledge.all_entries()[0].clone()
+        };
+        entry.project = Some(bbox_knowledge::knowledge::PROJECT_RENDER_TRANSPORT_SCOPE.into());
+        entry.project_id = Some("project-render-locality".into());
+        let plan = ProjectRenderPlanV1 {
+            version: bbox_knowledge::knowledge::PROJECT_RENDER_TRANSPORT_VERSION,
+            project_id: "project-render-locality".into(),
+            scope: runtime.scope.clone(),
+            workspace_id: runtime.workspace_id.as_str().to_string(),
+            provider: Some("claude".into()),
+            dry_run: false,
+            requested_scope: "project".into(),
+            entries: vec![entry],
+            diagnostics: None,
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let tool = LocalRenderTool {
+            upstream: Arc::new(FakeDaemonRender {
+                plan,
+                calls: calls.clone(),
+            }),
+            runtime,
+        };
+        let response = tool
+            .call(
+                json!({
+                    "provider": "claude",
+                    "project": root,
+                    "scope": "project",
+                    "_render_locality": { "phase": "caller-forged" }
+                }),
+                &tool_cx(&root),
+            )
+            .await;
+        assert!(matches!(response, ToolResult::Text(ref text) if text.contains("Wrote project")));
+        assert!(
+            fs::read_to_string(root.join("CLAUDE.md"))
+                .unwrap()
+                .contains("PROJECT_RENDER_HARNESS_MARKER")
+        );
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["_render_locality"]["phase"], "plan");
+        assert_eq!(calls[1]["_render_locality"]["phase"], "complete");
+        assert_eq!(calls[0]["project"], BOUND_WORKSPACE_RENDER_SELECTOR);
+        assert!(calls[1]["_render_locality"]["receipt"].is_object());
+        assert!(
+            !serde_json::to_string(&*calls)
+                .unwrap()
+                .contains(root.to_str().unwrap()),
+            "project render transport must not expose the absolute checkout root"
         );
     }
 

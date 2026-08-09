@@ -1,4 +1,8 @@
-use crate::knowledge::{AbsorbParams, BootstrapParams, RenderParams, ReviewParams};
+use crate::knowledge::{
+    AbsorbParams, BootstrapParams, PROJECT_RENDER_TRANSPORT_SCOPE,
+    PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderLocalityRequestV1, ProjectRenderPlanV1,
+    RenderParams, ReviewParams, Scope,
+};
 use crate::server::BlackboxServer;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -8,6 +12,84 @@ use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::render_tools()
+}
+
+pub(crate) const BOUND_WORKSPACE_RENDER_SELECTOR: &str = "$bound-workspace";
+
+fn workspace_project_render_plan(
+    server: &BlackboxServer,
+    p: &RenderParams,
+) -> anyhow::Result<(
+    ProjectRenderPlanV1,
+    crate::server::knowledge_view::SessionKnowledgeView,
+)> {
+    let grant = server
+        .authoritative_session_workspace_binding()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "error.render_locality_binding: project render locality requires a bound workspace"
+            )
+        })?;
+    if !grant.is_live_now() {
+        anyhow::bail!("error.render_locality_binding: workspace binding has expired");
+    }
+    let requested = p
+        .project
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("project render locality requires a project selector"))?;
+    if requested != BOUND_WORKSPACE_RENDER_SELECTOR {
+        let project_id = server.validate_project_selection(requested)?;
+        if project_id != grant.project_id {
+            anyhow::bail!(
+                "error.render_locality_scope: project render target differs from the bound workspace"
+            );
+        }
+    }
+    let requested_scope = p.scope.as_deref().unwrap_or("both");
+    if !matches!(requested_scope, "project" | "both") {
+        anyhow::bail!("project render locality requires scope=project or scope=both");
+    }
+
+    let view = server.session_knowledge_view(Some(&grant.project_id), p.provisional.as_deref())?;
+    let canonical_path = server
+        .state
+        .records_provider
+        .records_snapshot()
+        .records
+        .iter()
+        .find(|record| record.project_id == grant.project_id)
+        .map(|record| record.canonical_path.clone());
+    let mut entries = view
+        .knowledge
+        .all_entries()
+        .iter()
+        .filter(|entry| {
+            entry.scope == Scope::Project
+                && (entry.project_id.as_deref() == Some(grant.project_id.as_str())
+                    || canonical_path
+                        .as_deref()
+                        .is_some_and(|path| entry.project.as_deref() == Some(path)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for entry in &mut entries {
+        entry.project = Some(PROJECT_RENDER_TRANSPORT_SCOPE.into());
+        entry.project_id = Some(grant.project_id.clone());
+    }
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    let plan = ProjectRenderPlanV1 {
+        version: PROJECT_RENDER_TRANSPORT_VERSION,
+        project_id: grant.project_id.clone(),
+        scope: grant.scope.clone(),
+        workspace_id: grant.workspace_id.as_str().to_string(),
+        provider: p.provider.clone(),
+        dry_run: p.dry_run.unwrap_or(false),
+        requested_scope: requested_scope.to_string(),
+        entries,
+        diagnostics: view.diagnostics_text(),
+    };
+    plan.validate()?;
+    Ok((plan, view))
 }
 
 /// Rescope a project render request through worktree→base project resolution.
@@ -89,6 +171,50 @@ impl BlackboxServer {
             let mut p = p;
             let project_render = p.project.is_some()
                 && matches!(p.scope.as_deref().unwrap_or("both"), "project" | "both");
+            match p.locality.clone() {
+                Some(ProjectRenderLocalityRequestV1::Plan) => {
+                    let (plan, view) = workspace_project_render_plan(&server, &p)?;
+                    let global_result = if plan.requested_scope == "both" {
+                        Some(view.knowledge.render(&RenderParams {
+                            provider: plan.provider.clone(),
+                            project: None,
+                            scope: Some("global".into()),
+                            dry_run: Some(plan.dry_run),
+                            provisional: None,
+                            scope_project: None,
+                            locality: None,
+                        })?)
+                    } else {
+                        None
+                    };
+                    return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "render_locality_plan",
+                        "plan": plan,
+                        "global_result": global_result,
+                    }))?);
+                }
+                Some(ProjectRenderLocalityRequestV1::Complete { plan, receipt }) => {
+                    let (current, _) = workspace_project_render_plan(&server, &p)?;
+                    if plan != current {
+                        anyhow::bail!(
+                            "error.render_plan_stale: project render authority changed after the checkout plan was issued"
+                        );
+                    }
+                    receipt.validate_against(&current)?;
+                    return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "render_locality_complete",
+                        "diagnostics": current.diagnostics,
+                    }))?);
+                }
+                None if project_render
+                    && server.authoritative_session_workspace_binding().is_some() =>
+                {
+                    anyhow::bail!(
+                        "error.render_locality_required: a workspace-bound project render must execute in its checkout owner"
+                    );
+                }
+                None => {}
+            }
             let rendered = if project_render {
                 let raw = p.project.clone().expect("project render has a target");
                 // Project identity is resolved before any render target is
@@ -634,13 +760,50 @@ mod tests {
 #[cfg(test)]
 mod catalog_render_tests {
     use super::*;
-    use crate::server::state::catalog_fixture::CatalogFixture;
+    use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
+    use bbox_knowledge::knowledge::{Approval, Category, Priority, Status};
     use rmcp::handler::server::wrapper::Parameters;
 
     const PROJECT: &str = "p_000000000000000000000000000000a1";
 
     fn is_error(result: &rmcp::model::CallToolResult) -> bool {
         result.is_error == Some(true)
+    }
+
+    fn text(result: &rmcp::model::CallToolResult) -> String {
+        let value = serde_json::to_value(result).unwrap();
+        value["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    fn render_entry() -> crate::knowledge::KnowledgeEntry {
+        crate::knowledge::KnowledgeEntry {
+            id: "render-locality-entry".into(),
+            title: "Project render locality".into(),
+            content: "DAEMON_RENDER_LOCALITY_MARKER".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            project_id: Some(PROJECT.into()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: vec![],
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-08-09T00:00:00Z".into(),
+            updated_at: "2026-08-09T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
     }
 
     /// Global render is attachment-free: it writes host-level provider files,
@@ -836,5 +999,82 @@ mod catalog_render_tests {
             .map(|operation| operation.granted)
             .sum();
         assert_eq!(granted, 0, "a refused render must open no checkout");
+    }
+
+    #[tokio::test]
+    async fn bound_project_render_plan_and_completion_open_no_daemon_checkout() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(PROJECT, &scope, COMMIT_ONE, &[render_entry()], &[]);
+        let server = fixture.server();
+        let workspace_id = bro_core::WorkspaceId::parse("a".repeat(32)).unwrap();
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(std::sync::Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "render-locality-task".into(),
+                        session_id: "render-locality-session".into(),
+                        project_id: PROJECT.into(),
+                        scope: scope.clone(),
+                        workspace_id: workspace_id.clone(),
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
+        let before = server.state.checkout_access.health().sequence;
+        let planned = server
+            .bbox_render(Parameters(RenderParams {
+                provider: Some("claude".into()),
+                project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+                provisional: Some("published".into()),
+                scope_project: None,
+                locality: Some(ProjectRenderLocalityRequestV1::Plan),
+            }))
+            .await;
+        assert!(!is_error(&planned), "{}", text(&planned));
+        let value: serde_json::Value = serde_json::from_str(&text(&planned)).unwrap();
+        let plan: ProjectRenderPlanV1 = serde_json::from_value(value["plan"].clone()).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].project.as_deref(),
+            Some(PROJECT_RENDER_TRANSPORT_SCOPE)
+        );
+        assert_eq!(server.state.checkout_access.health().sequence, before);
+
+        let local = tempfile::tempdir().unwrap();
+        let local_root = local.path().canonicalize().unwrap();
+        let execution = bbox_knowledge::knowledge::execute_project_render_plan(
+            &plan,
+            &local_root,
+            &scope,
+            workspace_id.as_str(),
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(local_root.join("CLAUDE.md"))
+                .unwrap()
+                .contains("DAEMON_RENDER_LOCALITY_MARKER")
+        );
+        let completed = server
+            .bbox_render(Parameters(RenderParams {
+                provider: Some("claude".into()),
+                project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                scope: Some("project".into()),
+                dry_run: Some(false),
+                provisional: Some("published".into()),
+                scope_project: None,
+                locality: Some(ProjectRenderLocalityRequestV1::Complete {
+                    plan,
+                    receipt: execution.receipt,
+                }),
+            }))
+            .await;
+        assert!(!is_error(&completed), "{}", text(&completed));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 }

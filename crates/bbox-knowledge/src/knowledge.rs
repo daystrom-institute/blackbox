@@ -9,9 +9,11 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use bbox_chunker::EdgeConfidence;
 use bbox_corpus_core::entity_ref::EntityRef;
+use bbox_corpus_core::identity::PublishedScope;
 use bbox_stores::store_persister::StoreSnapshot;
 
 use bbox_corpus_core::query::{QueryAtom, QueryNode, parse_query};
@@ -197,6 +199,290 @@ pub struct RenderParams {
     /// worktree checkout.
     #[serde(skip)]
     pub scope_project: Option<String>,
+    /// Harness-internal project-render transport. It is intentionally absent
+    /// from the public tool schema and accepted only on a live workspace-bound
+    /// MCP session by the daemon adapter.
+    #[serde(default, rename = "_render_locality")]
+    #[schemars(skip)]
+    pub locality: Option<ProjectRenderLocalityRequestV1>,
+}
+
+pub const PROJECT_RENDER_TRANSPORT_VERSION: u32 = 1;
+pub const PROJECT_RENDER_TRANSPORT_SCOPE: &str = "project-render-transport-v1";
+const MAX_PROJECT_RENDER_ENTRIES: usize = 4_096;
+const MAX_PROJECT_RENDER_PLAN_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROJECT_RENDER_DIAGNOSTICS_BYTES: usize = 64 * 1024;
+
+/// Exact authorized knowledge snapshot sent to the checkout owner for a
+/// project render. No checkout path crosses this boundary: every project row
+/// is rebound to [`PROJECT_RENDER_TRANSPORT_SCOPE`] before transport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectRenderPlanV1 {
+    pub version: u32,
+    pub project_id: String,
+    pub scope: PublishedScope,
+    pub workspace_id: String,
+    pub provider: Option<String>,
+    pub dry_run: bool,
+    /// Normalized public request scope: `project` or `both`.
+    pub requested_scope: String,
+    pub entries: Vec<KnowledgeEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum ProjectRenderLocalityRequestV1 {
+    Plan,
+    Complete {
+        plan: ProjectRenderPlanV1,
+        receipt: ProjectRenderReceiptV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRenderReceiptV1 {
+    pub version: u32,
+    pub project_id: String,
+    pub scope: PublishedScope,
+    pub workspace_id: String,
+    pub project_doc_nonempty: bool,
+    pub projections: Vec<ProjectRenderProjectionReceiptV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRenderDispositionV1 {
+    Skipped,
+    DryRun,
+    DryRunRefused,
+    Written,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRenderProjectionReceiptV1 {
+    pub provider: String,
+    pub file_name: String,
+    pub disposition: ProjectRenderDispositionV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRenderExecutionV1 {
+    pub output: String,
+    pub receipt: ProjectRenderReceiptV1,
+}
+
+impl ProjectRenderPlanV1 {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != PROJECT_RENDER_TRANSPORT_VERSION {
+            anyhow::bail!(
+                "unsupported project render transport version {}",
+                self.version
+            );
+        }
+        if self.project_id.trim().is_empty() || self.workspace_id.trim().is_empty() {
+            anyhow::bail!("project render plan authority is incomplete");
+        }
+        self.scope.validate()?;
+        if !matches!(self.requested_scope.as_str(), "project" | "both") {
+            anyhow::bail!(
+                "invalid project render request scope {:?}",
+                self.requested_scope
+            );
+        }
+        validated_project_render_providers(self.provider.as_deref())?;
+        if self.entries.len() > MAX_PROJECT_RENDER_ENTRIES {
+            anyhow::bail!(
+                "project render plan has {} entries; limit is {}",
+                self.entries.len(),
+                MAX_PROJECT_RENDER_ENTRIES
+            );
+        }
+        for entry in &self.entries {
+            if entry.scope != Scope::Project
+                || entry.project.as_deref() != Some(PROJECT_RENDER_TRANSPORT_SCOPE)
+                || entry.project_id.as_deref() != Some(self.project_id.as_str())
+            {
+                anyhow::bail!(
+                    "project render plan entry {} is outside its normalized project authority",
+                    entry.id
+                );
+            }
+        }
+        if self
+            .diagnostics
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_PROJECT_RENDER_DIAGNOSTICS_BYTES)
+        {
+            anyhow::bail!("project render diagnostics exceed the transport bound");
+        }
+        if serde_json::to_vec(self)?.len() > MAX_PROJECT_RENDER_PLAN_BYTES {
+            anyhow::bail!("project render plan exceeds the transport byte bound");
+        }
+        Ok(())
+    }
+
+    pub fn validate_authority(
+        &self,
+        expected_scope: &PublishedScope,
+        expected_workspace_id: &str,
+    ) -> Result<()> {
+        self.validate()?;
+        if &self.scope != expected_scope || self.workspace_id != expected_workspace_id {
+            anyhow::bail!("project render plan does not belong to the bound workspace");
+        }
+        Ok(())
+    }
+
+    fn detached_knowledge(&self) -> Knowledge {
+        Knowledge::detached_view(self.entries.clone(), BTreeMap::new())
+    }
+
+    fn expected_projections(
+        &self,
+        project_doc_nonempty: bool,
+    ) -> Result<Vec<ProjectRenderProjectionReceiptV1>> {
+        let view = self.detached_knowledge();
+        validated_project_render_providers(self.provider.as_deref())?
+            .into_iter()
+            .map(|provider| {
+                let projection = view.project_projection_with_include(
+                    provider,
+                    PROJECT_RENDER_TRANSPORT_SCOPE,
+                    project_doc_nonempty,
+                )?;
+                Ok(ProjectRenderProjectionReceiptV1 {
+                    provider: provider.to_string(),
+                    file_name: project_target_file(provider)?.to_string(),
+                    disposition: if projection.is_some() {
+                        if self.dry_run {
+                            ProjectRenderDispositionV1::DryRun
+                        } else {
+                            ProjectRenderDispositionV1::Written
+                        }
+                    } else {
+                        ProjectRenderDispositionV1::Skipped
+                    },
+                    projection_sha256: projection
+                        .as_ref()
+                        .map(|content| format!("{:x}", Sha256::digest(content.as_bytes()))),
+                    projection_bytes: projection.as_ref().map(String::len),
+                })
+            })
+            .collect()
+    }
+}
+
+impl ProjectRenderReceiptV1 {
+    pub fn validate_against(&self, plan: &ProjectRenderPlanV1) -> Result<()> {
+        plan.validate()?;
+        if self.version != PROJECT_RENDER_TRANSPORT_VERSION
+            || self.project_id != plan.project_id
+            || self.scope != plan.scope
+            || self.workspace_id != plan.workspace_id
+        {
+            anyhow::bail!("project render receipt authority does not match its plan");
+        }
+        let expected = plan.expected_projections(self.project_doc_nonempty)?;
+        if self.projections.len() != expected.len() {
+            anyhow::bail!("project render receipt has the wrong provider cardinality");
+        }
+        for (actual, expected) in self.projections.iter().zip(expected) {
+            if actual.provider != expected.provider
+                || actual.file_name != expected.file_name
+                || actual.projection_sha256 != expected.projection_sha256
+                || actual.projection_bytes != expected.projection_bytes
+            {
+                anyhow::bail!(
+                    "project render receipt projection does not match provider {}",
+                    expected.provider
+                );
+            }
+            let disposition_valid = match expected.disposition {
+                ProjectRenderDispositionV1::Skipped => {
+                    actual.disposition == ProjectRenderDispositionV1::Skipped
+                }
+                ProjectRenderDispositionV1::DryRun => matches!(
+                    actual.disposition,
+                    ProjectRenderDispositionV1::DryRun | ProjectRenderDispositionV1::DryRunRefused
+                ),
+                ProjectRenderDispositionV1::Written => matches!(
+                    actual.disposition,
+                    ProjectRenderDispositionV1::Written | ProjectRenderDispositionV1::Refused
+                ),
+                ProjectRenderDispositionV1::DryRunRefused | ProjectRenderDispositionV1::Refused => {
+                    false
+                }
+            };
+            if !disposition_valid {
+                anyhow::bail!(
+                    "project render receipt has an invalid disposition for provider {}",
+                    expected.provider
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Execute an authorized project render inside the checkout owner's already
+/// verified root. The shared renderer never receives a daemon path and every
+/// destination is one fixed provider filename directly under `project_root`.
+pub fn execute_project_render_plan(
+    plan: &ProjectRenderPlanV1,
+    project_root: &Path,
+    expected_scope: &PublishedScope,
+    expected_workspace_id: &str,
+) -> Result<ProjectRenderExecutionV1> {
+    plan.validate_authority(expected_scope, expected_workspace_id)?;
+    let canonical_root = project_root
+        .canonicalize()
+        .context("canonicalizing project render root")?;
+    if canonical_root != project_root || !canonical_root.is_dir() {
+        anyhow::bail!("project render root is not the stable bound directory");
+    }
+    let project_doc_nonempty = project_doc_nonempty(&canonical_root);
+    let mut projections = plan.expected_projections(project_doc_nonempty)?;
+    for projection in &mut projections {
+        if projection.projection_sha256.is_none() {
+            continue;
+        }
+        let target = canonical_root.join(&projection.file_name);
+        let writable = should_write_project_projection(&target)?;
+        projection.disposition = match (plan.dry_run, writable) {
+            (true, true) => ProjectRenderDispositionV1::DryRun,
+            (true, false) => ProjectRenderDispositionV1::DryRunRefused,
+            (false, true) => ProjectRenderDispositionV1::Written,
+            (false, false) => ProjectRenderDispositionV1::Refused,
+        };
+    }
+
+    let view = plan.detached_knowledge();
+    let output = view.render(&RenderParams {
+        provider: plan.provider.clone(),
+        project: Some(canonical_root.to_string_lossy().into_owned()),
+        scope: Some("project".into()),
+        dry_run: Some(plan.dry_run),
+        provisional: None,
+        scope_project: Some(PROJECT_RENDER_TRANSPORT_SCOPE.into()),
+        locality: None,
+    })?;
+    let receipt = ProjectRenderReceiptV1 {
+        version: PROJECT_RENDER_TRANSPORT_VERSION,
+        project_id: plan.project_id.clone(),
+        scope: plan.scope.clone(),
+        workspace_id: plan.workspace_id.clone(),
+        project_doc_nonempty,
+        projections,
+    };
+    receipt.validate_against(plan)?;
+    Ok(ProjectRenderExecutionV1 { output, receipt })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -456,7 +742,7 @@ pub enum Approval {
     Imported,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KnowledgeEntry {
     pub id: String,
     pub title: String,
@@ -3202,6 +3488,9 @@ impl Knowledge {
         } else {
             vec!["claude", "agents", "gemini"]
         };
+        if do_project {
+            validated_project_render_providers(provider)?;
+        }
 
         // Validate every global destination before the first one is opened or
         // written. A daemon with an isolated store must not inherit any host
@@ -3296,7 +3585,7 @@ impl Knowledge {
             // path while the files land in the worktree checkout).
             let scope_dir = p.scope_project.as_deref().unwrap_or(dir);
             for prov in &providers {
-                let path = Path::new(dir).join(target_file(prov, project_dir));
+                let path = Path::new(dir).join(project_target_file(prov)?);
                 let Some(full) = self.project_projection(prov, dir, scope_dir)? else {
                     results.push(format!(
                         "Skipped {} (no project-scope entries and no PROJECT.md include)",
@@ -3344,7 +3633,7 @@ impl Knowledge {
         let mut mismatches = Vec::new();
         let providers = ["claude", "agents", "gemini"];
         for provider in providers {
-            let path = project_dir.join(target_file(provider, Some(project.as_ref())));
+            let path = project_dir.join(project_target_file(provider)?);
             let expected = self.project_projection(provider, &project, &project)?;
             let actual = match fs::read(&path) {
                 Ok(actual) => Some(actual),
@@ -3459,6 +3748,19 @@ impl Knowledge {
         project_dir: &str,
         scope_dir: &str,
     ) -> Result<String> {
+        self.render_project_body_with_include(
+            provider,
+            scope_dir,
+            project_doc_nonempty(Path::new(project_dir)),
+        )
+    }
+
+    fn render_project_body_with_include(
+        &self,
+        provider: &str,
+        scope_dir: &str,
+        project_doc_nonempty: bool,
+    ) -> Result<String> {
         let mut body = String::new();
         let filter = ScopeFilter::Project(scope_dir);
 
@@ -3467,11 +3769,11 @@ impl Knowledge {
         // Gemini deprioritizes content at the bottom, so PROJECT.md goes
         // between steerage and memory instead of after both.
         if provider == "gemini" {
-            self.render_project_include(provider, Some(project_dir), &mut body);
+            render_project_include(provider, project_doc_nonempty, &mut body);
             self.render_memory(provider, filter, &mut body);
         } else {
             self.render_memory(provider, filter, &mut body);
-            self.render_project_include(provider, Some(project_dir), &mut body);
+            render_project_include(provider, project_doc_nonempty, &mut body);
         }
 
         Ok(body)
@@ -3484,6 +3786,21 @@ impl Knowledge {
         scope_dir: &str,
     ) -> Result<Option<String>> {
         let body = self.render_project_body(provider, project_dir, scope_dir)?;
+        self.finish_project_projection(body)
+    }
+
+    fn project_projection_with_include(
+        &self,
+        provider: &str,
+        scope_dir: &str,
+        project_doc_nonempty: bool,
+    ) -> Result<Option<String>> {
+        let body =
+            self.render_project_body_with_include(provider, scope_dir, project_doc_nonempty)?;
+        self.finish_project_projection(body)
+    }
+
+    fn finish_project_projection(&self, body: String) -> Result<Option<String>> {
         if body.trim().is_empty() {
             return Ok(None);
         }
@@ -3583,21 +3900,6 @@ impl Knowledge {
                 md.push_str(&format!("## {}\n\n", heading));
                 render_entries_grouped(&sorted, provider, md);
                 md.push('\n');
-            }
-        }
-    }
-
-    fn render_project_include(&self, provider: &str, project_dir: Option<&str>, md: &mut String) {
-        if let Some(dir) = project_dir {
-            let project_md = Path::new(dir).join(PROJECT_DOC_FILE);
-            if project_md.exists() {
-                if fs::metadata(&project_md)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-                {
-                    md.push_str(project_include_instruction(provider));
-                    md.push('\n');
-                }
             }
         }
     }
@@ -4017,12 +4319,37 @@ fn global_common_include_instruction(_provider: &str, common_path: &Path) -> Str
     )
 }
 
-fn target_file(provider: &str, _project_dir: Option<&str>) -> String {
+fn validated_project_render_providers(provider: Option<&str>) -> Result<Vec<&str>> {
+    let providers = provider
+        .map(|provider| vec![provider])
+        .unwrap_or_else(|| vec!["claude", "agents", "gemini"]);
+    for provider in &providers {
+        project_target_file(provider)?;
+    }
+    Ok(providers)
+}
+
+fn project_target_file(provider: &str) -> Result<&'static str> {
     match provider {
-        "claude" => "CLAUDE.md".to_string(),
-        "agents" | "codex" | "vibe" => "AGENTS.md".to_string(),
-        "gemini" => "GEMINI.md".to_string(),
-        other => format!("{}.md", other.to_uppercase()),
+        "claude" => Ok("CLAUDE.md"),
+        "agents" | "codex" | "vibe" => Ok("AGENTS.md"),
+        "gemini" => Ok("GEMINI.md"),
+        other => anyhow::bail!(
+            "unsupported project render provider {other:?}; expected claude, agents, codex, vibe, or gemini"
+        ),
+    }
+}
+
+fn project_doc_nonempty(project_dir: &Path) -> bool {
+    fs::metadata(project_dir.join(PROJECT_DOC_FILE))
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+fn render_project_include(provider: &str, project_doc_nonempty: bool, md: &mut String) {
+    if project_doc_nonempty {
+        md.push_str(project_include_instruction(provider));
+        md.push('\n');
     }
 }
 
@@ -4726,6 +5053,7 @@ mod tests {
                 dry_run: Some(false),
                 provisional: None,
                 scope_project: Some("/registry/base".into()),
+                locality: None,
             })
             .expect("render should succeed");
         assert!(report.contains("Wrote project"), "report: {report}");
@@ -4748,6 +5076,68 @@ mod tests {
             .expect("render should succeed");
         assert!(report.contains("Skipped"), "report: {report}");
         assert!(!other_root.join("CLAUDE.md").exists());
+    }
+
+    fn project_render_plan(provider: Option<&str>, dry_run: bool) -> ProjectRenderPlanV1 {
+        let mut rendered = entry(
+            "render-locality-entry",
+            "Local render",
+            "PROJECT_RENDER_LOCALITY_MARKER",
+            Scope::Project,
+        );
+        rendered.project = Some(PROJECT_RENDER_TRANSPORT_SCOPE.into());
+        rendered.project_id = Some("project-render-locality".into());
+        ProjectRenderPlanV1 {
+            version: PROJECT_RENDER_TRANSPORT_VERSION,
+            project_id: "project-render-locality".into(),
+            scope: PublishedScope::try_new("render-locality", ".").unwrap(),
+            workspace_id: "workspace-render-locality".into(),
+            provider: provider.map(str::to_owned),
+            dry_run,
+            requested_scope: "project".into(),
+            entries: vec![rendered],
+            diagnostics: None,
+        }
+    }
+
+    #[test]
+    fn project_render_transport_executes_shared_renderer_in_bound_root() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        fs::write(root.join(PROJECT_DOC_FILE), "project context\n").unwrap();
+        let plan = project_render_plan(Some("claude"), false);
+
+        let execution =
+            execute_project_render_plan(&plan, &root, &plan.scope, plan.workspace_id.as_str())
+                .unwrap();
+        execution.receipt.validate_against(&plan).unwrap();
+        assert_eq!(execution.receipt.projections.len(), 1);
+        assert_eq!(
+            execution.receipt.projections[0].disposition,
+            ProjectRenderDispositionV1::Written
+        );
+        let rendered = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        assert!(rendered.contains("PROJECT_RENDER_LOCALITY_MARKER"));
+        assert!(rendered.contains("@PROJECT.md"));
+        assert!(execution.output.contains(root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn project_render_transport_rejects_provider_path_injection() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let plan = project_render_plan(Some("../escape"), false);
+        let error =
+            execute_project_render_plan(&plan, &root, &plan.scope, plan.workspace_id.as_str())
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported project render provider"));
+        assert!(!root.parent().unwrap().join("ESCAPE.md").exists());
+    }
+
+    #[test]
+    fn render_locality_transport_is_absent_from_public_schema() {
+        let schema = serde_json::to_string(&rmcp::schemars::schema_for!(RenderParams)).unwrap();
+        assert!(!schema.contains("_render_locality"), "{schema}");
     }
 
     /// A checkout-scoped write keeps the entry keyed to the base scope while
