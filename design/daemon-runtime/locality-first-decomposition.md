@@ -9,18 +9,20 @@ topic:
   - corpus
   - knowledge
 tags: [decomposition, satellite, harness, worktrees, knowledge-seam, collector, render, provenance, indexing]
-brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, the single-host knowledge seam, fleetd, and typed Git-history/provenance transport through strict cutover are complete. The remote knowledge source is next; blame, project render, and remaining project-file walks follow."
+brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, the single-host knowledge seam, fleetd, and typed Git-history/provenance transport through strict cutover are complete. Remote knowledge bottom contracts and its pure overlay core are complete; authenticated store/intake is next, followed by blame, project render, and remaining project-file walks."
 ---
 
 # Locality-first decomposition: the checkout plane and the corpus plane
 
 > **Status: partial; current-HEAD inventory reverified 2026-08-08 at
-> `4b258102db47ede9790c8147ebdf9769cbf6fbdb`.** Durable project identity, the
+> `2e6f2110a55120b1ebdd3294e680fd8db6bedfa8`.** Durable project identity, the
 > single-host knowledge seam, fleetd, authenticated Git-history transport,
 > bidirectional authenticated provenance transport, GH-F overlap proof, and
 > GH-G strict cutover are implemented. Covered published repositories no
 > longer fall back to daemon-side Git/provenance leases; bridge, uncovered,
-> and `LegacyLocal` adapters remain intentionally scoped. Daemon-side local
+> and `LegacyLocal` adapters remain intentionally scoped. KT-A's validated
+> workspace wire identity, bounded knowledge-source contracts, and pure
+> knowledge/gap overlay core are implemented. Daemon-side local
 > project walking remains an active source rung. Blame, project render writes,
 > and the remote knowledge source still reach into an attached checkout from
 > blackboxd. The knowledge model is complete for the monolithic rung, but its
@@ -189,9 +191,10 @@ path-free durable identity does not by itself make the operation local.
 
 The rebaseline result is therefore:
 
-- **Complete:** durable project/scope/checkout identity; slice 3's knowledge
-  semantics on the single-host rung; slice 5's fleetd extraction. The missing
-  checkout-marker-to-`WorkspaceId` wire transport is the KT-A correction.
+- **Complete:** durable project/scope/checkout identity, including the
+  checkout-marker-to-`WorkspaceId` wire transport; slice 3's knowledge
+  semantics on the single-host rung; slice 5's fleetd extraction; and KT-A's
+  bounded source contracts plus source-neutral overlay core.
 - **Complete for covered published repositories:** typed Git-history and
   provenance acquisition/publication through GH-G strict cutover. Runtime
   classification closes local fallback and retains only the named bridge,
@@ -386,8 +389,8 @@ monolith:
 
 | Slice | Current state | What remains |
 |---|---|---|
-| 1. Identity contract | Partial correction | Project/scope/checkout identity is complete, but the existing checkout marker is not yet typed or transported as `WorkspaceId` in `bro-core`/`WorkerSpawnSpec`. |
-| 2. Harness-ward moves | Partial | Provenance export/import strict cutover and candidate render checking are live; the remote knowledge source is next, followed by blame and render writes. |
+| 1. Identity contract | Complete | The existing reuse-safe checkout marker is typed as `WorkspaceId` and transported through worker/fleet protocol state. Later session capability binding consumes this identity without redefining it. |
+| 2. Harness-ward moves | Partial | Provenance export/import strict cutover and candidate render checking are live; remote knowledge KT-A is complete and KT-B store/authenticated intake is next, followed by blame and render writes. |
 | 3. Knowledge seam | Complete on the single-host rung | Move source acquisition without changing the shipped identity, view, promotion, and integration contracts. |
 | 4. Code-corpus collector | Partial | Cut over intended projects, remove the local-walk/cutback dependency, and stop coupling collected activation to daemon-side Git acquisition. |
 | 5. Fleetd | Complete | No locality-program work remains. |
@@ -404,11 +407,12 @@ The executable dependency map from this rebaseline is:
    unattended provenance-export receipt without granting callers arbitrary
    graph-write authority. It removes the `GitHistory` and
    `ProvenanceNoteIo` dependencies that raw-file collection cannot solve.
-2. **Move the remote knowledge source.** Continue from
+2. **Move the remote knowledge source.** KT-A is complete; continue with KT-B
+   from
    [knowledge-source-transport-impl.md](knowledge-source-transport-impl.md).
    It defines operator-accepted committed publication candidates, leased
    provisional workspaces, harness-native project knowledge/gap mutations,
-   the missing `WorkspaceId` transport, and strict watcher/read/write lease
+   the landed `WorkspaceId` transport, and strict watcher/read/write lease
    cutover while preserving the shipped knowledge identities and visibility
    rules. It reuses project-scoped producer authorization but is not a generic
    remote-filesystem RPC.
@@ -428,11 +432,11 @@ The executable dependency map from this rebaseline is:
    corpus plane; blackboxd has no checkout reach-in left to preserve or
    emulate.
 
-1. **Identity contract — project identity complete, workspace transport
-   pending.** `(repo_id, bbox_root_relpath)` identity, reuse-safe checkout
-   markers, and per-view `built_from` stamps are complete. Current code does
-   not define `WorkspaceId` in `bro-core` or carry it in `WorkerSpawnSpec`;
-   KT-A closes that stale ledger claim additively.
+1. **Identity contract — complete.** `(repo_id, bbox_root_relpath)` identity,
+   reuse-safe checkout markers, per-view `built_from` stamps, validated
+   `WorkspaceId`, and additive worker/fleet transport are complete. KT-D later
+   binds that existing identity to short-lived session capabilities; it does
+   not reopen the identity contract.
 2. **Harness-ward moves: partial.** Checkout-local provenance export,
    authenticated notes import, and candidate-tree render checking are
    implemented. Git/provenance strict cutover is complete for covered published

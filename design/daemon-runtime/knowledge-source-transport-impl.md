@@ -531,7 +531,7 @@ errors.
 
 ### KT-A: Bottom contracts and pure overlay core
 
-Status: next.
+Status: complete.
 
 1. Add validated `bro_core::WorkspaceId` and additive protocol fields.
 2. Add `bbox-knowledge-source` with descriptors, manifests, ancestry witness,
@@ -545,6 +545,8 @@ fleet protocol round trips, dependency acceptance, formatter, workspace
 nextest, clippy, and concurrency.
 
 ### KT-B: Store, authenticated intake, and collector capture
+
+Status: next.
 
 1. Add `bbox-knowledge-source-store` with resumable CAS, journals, recovery,
    GC, and lease expiry.
@@ -659,5 +661,5 @@ remote knowledge source named by
 [`locality-first-decomposition.md`](./locality-first-decomposition.md). It
 consumes the semantics of
 [`checkout-identity-and-provisional-knowledge.md`](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md)
-without superseding that design. GH-G is complete and is no longer the next
-locality arc; KT-A is.
+without superseding that design. GH-G and KT-A are complete and are no longer
+the next locality arc; KT-B is.
