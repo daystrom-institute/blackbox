@@ -613,9 +613,7 @@ impl SharedState {
         let assignments = self
             .code_sources
             .producer_auth()
-            .assignments()
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
+            .repo_assignment_producers();
         let accepted = self
             .accepted_publications
             .as_ref()

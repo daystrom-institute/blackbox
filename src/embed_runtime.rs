@@ -294,7 +294,18 @@ fn embed_partitions_with(
 
     // Which buckets claim each partition under the CURRENT config —
     // vector_route_id is the join key on both sides.
-    let mut mapped: BTreeMap<String, (Vec<String>, crate::embed::Route)> = BTreeMap::new();
+    #[derive(Clone)]
+    struct Mapping {
+        labels: Vec<String>,
+        provider: String,
+        endpoint_kind: crate::embed::EmbedEndpointKind,
+        document_model: String,
+        query_model: String,
+        output_dtype: String,
+        compatibility_family: String,
+    }
+
+    let mut mapped: BTreeMap<String, Mapping> = BTreeMap::new();
     for route in router.configured_routes() {
         let label = match &route.project_id {
             Some(project) => format!("{}@{project}", route.bucket.as_str()),
@@ -302,9 +313,35 @@ fn embed_partitions_with(
         };
         mapped
             .entry(route.vector_route_id())
-            .or_insert_with(|| (Vec::new(), route.clone()))
-            .0
+            .or_insert_with(|| Mapping {
+                labels: Vec::new(),
+                provider: route.provider_id.clone(),
+                endpoint_kind: route.endpoint_kind,
+                document_model: route.document_model.clone(),
+                query_model: route.query_model.clone(),
+                output_dtype: route.output_dtype.as_str().to_string(),
+                compatibility_family: route.compatibility_family.clone(),
+            })
+            .labels
             .push(label);
+    }
+    // Visual routes are chunk-kind-keyed rather than Bucket-keyed. They are
+    // still live partition mappings and must participate in both lifecycle
+    // reporting and prune protection.
+    for (route_id, kind, meta) in router.configured_visual_routes() {
+        mapped
+            .entry(route_id)
+            .or_insert_with(|| Mapping {
+                labels: Vec::new(),
+                provider: meta.provider_id.clone(),
+                endpoint_kind: crate::embed::EmbedEndpointKind::Multimodal,
+                document_model: meta.document_model.clone(),
+                query_model: meta.document_model.clone(),
+                output_dtype: meta.output_dtype.as_str().to_string(),
+                compatibility_family: meta.compatibility_family.clone(),
+            })
+            .labels
+            .push(format!("visual:{kind}"));
     }
 
     let partitions = infos
@@ -318,13 +355,13 @@ fn embed_partitions_with(
                 "last_write": info.last_write.map(|ts| ts.to_rfc3339()),
                 "disk_bytes": info.disk_bytes,
                 "mapped": mapping.is_some(),
-                "mapped_buckets": mapping.map(|(buckets, _)| buckets.clone()).unwrap_or_default(),
-                "provider": mapping.map(|(_, r)| r.provider_id.clone()),
-                "endpoint_kind": mapping.map(|(_, r)| r.endpoint_kind),
-                "document_model": mapping.map(|(_, r)| r.document_model.clone()),
-                "query_model": mapping.map(|(_, r)| r.query_model.clone()),
-                "output_dtype": mapping.map(|(_, r)| r.output_dtype.as_str()),
-                "compatibility_family": mapping.map(|(_, r)| r.compatibility_family.clone()),
+                "mapped_buckets": mapping.map(|mapping| mapping.labels.clone()).unwrap_or_default(),
+                "provider": mapping.map(|mapping| mapping.provider.clone()),
+                "endpoint_kind": mapping.map(|mapping| mapping.endpoint_kind),
+                "document_model": mapping.map(|mapping| mapping.document_model.clone()),
+                "query_model": mapping.map(|mapping| mapping.query_model.clone()),
+                "output_dtype": mapping.map(|mapping| mapping.output_dtype.clone()),
+                "compatibility_family": mapping.map(|mapping| mapping.compatibility_family.clone()),
             })
         })
         .collect::<Vec<_>>();
@@ -1827,6 +1864,58 @@ mod tests {
         let orphan = rows.iter().find(|row| row["mapped"] == false).unwrap();
         assert_eq!(orphan["route"], "voyage-old-model-1024-deadbeef");
         assert!(orphan["document_model"].is_null());
+    }
+
+    #[test]
+    fn embed_partitions_list_maps_and_protects_visual_routes() {
+        let router = EmbeddingRouter::from_toml_str(
+            r#"
+[embed.routes.visual]
+image = "voyage_visual"
+pdf_figure = "voyage_visual"
+"#,
+        )
+        .unwrap();
+        let (visual_route, representative_kind, _) = router
+            .configured_visual_routes()
+            .into_iter()
+            .next()
+            .expect("configured visual partition");
+        let now = chrono::Utc::now();
+        let params = EmbedPartitionsParams {
+            action: Some("prune".into()),
+            older_than_days: Some(30),
+            apply: true,
+            route: None,
+        };
+        let mut removed = Vec::new();
+        let rendered = embed_partitions_with(
+            &params,
+            &router,
+            vec![partition_info(&visual_route, 365, now)],
+            now,
+            |route| {
+                removed.push(route.to_string());
+                Ok(true)
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let row = &value["partitions"][0];
+
+        assert_eq!(row["mapped"], true);
+        assert_eq!(row["provider"], "voyage_visual");
+        assert_eq!(row["endpoint_kind"], "multimodal");
+        assert_eq!(row["document_model"], "voyage-multimodal-3.5");
+        assert_eq!(
+            row["mapped_buckets"][0],
+            format!("visual:{representative_kind}")
+        );
+        assert!(
+            removed.is_empty(),
+            "a mapped visual partition is not prunable"
+        );
+        assert!(value["prune_candidates"].as_array().unwrap().is_empty());
     }
 
     #[test]

@@ -728,4 +728,31 @@ mod tests {
             RepoTransportGrantState::Blocked { .. }
         ));
     }
+
+    #[test]
+    fn runtime_exposes_project_and_producer_assignment_views_separately() {
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let auth = ProducerAuthRuntime::for_test(
+            true,
+            true,
+            vec![(
+                ServiceToken::parse("a".repeat(64)).unwrap(),
+                ProducerGrant {
+                    producer_id: "producer-a".into(),
+                    projects: BTreeMap::from([(scope.clone(), "project-a".into())]),
+                },
+            )],
+        );
+
+        assert_eq!(
+            auth.assignments(),
+            vec![(scope.clone(), "project-a".into())],
+            "code-source planning consumes resolved project ids"
+        );
+        assert_eq!(
+            auth.repo_assignment_producers(),
+            BTreeMap::from([(scope, "producer-a".into())]),
+            "transport commitments consume producer ids"
+        );
+    }
 }

@@ -695,9 +695,7 @@ fn knowledge_transport_section(
     let assignments = state
         .code_sources
         .producer_auth()
-        .assignments()
-        .into_iter()
-        .collect::<std::collections::BTreeMap<_, _>>();
+        .repo_assignment_producers();
     let covered_ids = marker
         .rows
         .iter()
