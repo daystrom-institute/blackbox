@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_corpus_core::search::rerank::{self, RerankFeatures};
 use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
-use bbox_embed::embed::queue::EmbedStatusResponse;
 use bbox_embed::embed::rerank::{RerankConfig, RerankHit, rerank_blocking};
 use bbox_embed::embed::{Bucket, EmbeddingRouter, VisualRouteMeta, query_cache};
 use bbox_embed::embed_queue;
@@ -317,22 +316,24 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
     }
 
     let mut degraded = HybridDegraded::default();
-    let partitions = match vectors::try_metrics() {
-        Some(partitions) => partitions,
-        None => {
-            degraded.skipped_partitions.insert(
-                "vector_store".into(),
-                "vector store is still warming; returning BM25-only results".into(),
-            );
-            BTreeMap::new()
-        }
-    };
-    let mut vector_status = HybridVectorStatus {
-        queues: queue_status_for_hybrid(ctx, p.doc_type.as_deref()).routes,
-        partitions,
-        searched_partitions: Vec::new(),
-    };
-    if p.include_vectors.unwrap_or(true) && vector_weight > 0.0 {
+    let mut vector_status = HybridVectorStatus::default();
+    if vectors_requested(p.include_vectors, vector_weight) {
+        // Search is a latency-sensitive hot path. Exact embedding coverage
+        // walks the complete source corpus and belongs only on the explicit
+        // bbox_embed_status surface. Queue-local status is constant-time, and
+        // nonblocking metrics omit a partition currently held by compaction
+        // instead of stalling the query behind its write lock.
+        vector_status.queues = embed_queue::status_response().routes;
+        vector_status.partitions = match vectors::metrics_nonblocking() {
+            Some(partitions) => partitions,
+            None => {
+                degraded.skipped_partitions.insert(
+                    "vector_store".into(),
+                    "vector store is still warming; returning BM25-only results".into(),
+                );
+                BTreeMap::new()
+            }
+        };
         let mut vector_lists = vector_ranked_lists(
             query,
             p.query_vector.as_deref(),
@@ -791,50 +792,8 @@ fn diversify_by_chunk_kind(results: &mut [HybridResult], limit: usize) {
     }
 }
 
-/// Coverage-status hook: the daemon registers
-/// `embed_runtime::status_response_for_buckets` here at SharedState
-/// construction (dependency inversion — coverage walks daemon-side
-/// reembed routing this layer must not name). Unregistered means
-/// queue-local status only.
-type CoverageStatusFn = fn(
-    &bbox_providers::providers::CorpusStores<'_>,
-    &[Bucket],
-) -> anyhow::Result<EmbedStatusResponse>;
-static COVERAGE_STATUS_HOOK: std::sync::OnceLock<CoverageStatusFn> = std::sync::OnceLock::new();
-
-/// Register the embedding coverage-status source. Idempotent; first wins.
-pub fn register_coverage_status_hook(hook: CoverageStatusFn) {
-    let _ = COVERAGE_STATUS_HOOK.set(hook);
-}
-
-fn queue_status_for_hybrid(
-    ctx: &ProviderContext<'_>,
-    doc_type: Option<&str>,
-) -> bbox_embed::embed::queue::EmbedStatusResponse {
-    let Some(stores) = ctx.stores() else {
-        return embed_queue::status_response();
-    };
-    let Some(buckets) = status_buckets_for_doc_type(doc_type) else {
-        return embed_queue::status_response();
-    };
-    (match COVERAGE_STATUS_HOOK.get() {
-        Some(hook) => hook(stores, &buckets),
-        None => Ok(embed_queue::status_response()),
-    }).unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "embedding coverage status failed; falling back to queue-local status");
-        embed_queue::status_response()
-    })
-}
-
-fn status_buckets_for_doc_type(doc_type: Option<&str>) -> Option<Vec<Bucket>> {
-    match doc_type?.trim() {
-        "knowledge" | "roadmap" => Some(vec![Bucket::Knowledge]),
-        "thread" => Some(vec![Bucket::Threads]),
-        "note" => Some(vec![Bucket::Notes]),
-        "commit" => Some(vec![Bucket::GitMessage]),
-        "project_file" => Some(vec![Bucket::Code, Bucket::Docs]),
-        _ => None,
-    }
+fn vectors_requested(include_vectors: Option<bool>, vector_weight: f32) -> bool {
+    include_vectors.unwrap_or(true) && vector_weight > 0.0
 }
 
 fn vector_ranked_lists(
@@ -2067,6 +2026,13 @@ pdf_figure = "voyage_visual"
         let (bm25, vector) = fusion_weights(None);
         assert!((bm25 - 0.4).abs() < f32::EPSILON);
         assert!((vector - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn bm25_only_requests_skip_all_vector_status_work() {
+        assert!(!vectors_requested(None, 0.0));
+        assert!(!vectors_requested(Some(false), 0.6));
+        assert!(vectors_requested(None, 0.6));
     }
 
     #[test]

@@ -645,9 +645,6 @@ pub(super) fn open_shared_state(
     );
     crate::providers::register_extra_providers(crate::providers_ext::extra_providers());
     crate::embed::queue::register_contradiction_hook(crate::embed_runtime::contradiction_hook);
-    crate::mcp_tools::hybrid_search::register_coverage_status_hook(
-        crate::embed_runtime::status_response_for_buckets,
-    );
     tracing::info!("Thread store: {}", th_path.display());
     // Queued on the writer actor: boot no longer races the reindex thread
     // (or a winding-down previous daemon) for tantivy's single-writer lock.

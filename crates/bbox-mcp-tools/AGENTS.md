@@ -31,11 +31,16 @@
   query cache (keyed by exact encoder: provider+query_model+dim+dtype+query
   — a repeat query across vector routes embeds once). Don't introduce async stages mid-pipeline, and don't
   re-add per-call embedding dedup maps — the cache is the dedup.
+- Hybrid search never computes exact embedding coverage. That is a complete
+  source-corpus walk owned by the explicit embed-status surface. BM25-only
+  requests skip vector status entirely; vector-enabled requests use
+  queue-local status and nonblocking partition metrics so compaction cannot
+  stall retrieval.
 - `discover_seed` reuses `hybrid_search_typed` verbatim and differs only in
   post-processing (notable edges). Ranking changes land in one place and
   affect both; do not fork the ranking for one surface.
 - `vector_ranked_lists` searches TWO route families against the same
-  `partitions` map from `vectors::try_metrics()`: `Bucket`-keyed text routes
+  `partitions` map from `vectors::metrics_nonblocking()`: `Bucket`-keyed text routes
   (`route_buckets`) and chunk-kind-keyed visual routes
   (`EmbeddingRouter::configured_visual_routes()`, `[embed.routes.visual]`).
   A partition matching neither falls through to the pre-existing
