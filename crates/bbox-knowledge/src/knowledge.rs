@@ -3203,6 +3203,20 @@ impl Knowledge {
             vec!["claude", "agents", "gemini"]
         };
 
+        // Validate every global destination before the first one is opened or
+        // written. A daemon with an isolated store must not inherit any host
+        // render target implicitly, even when another selected target was
+        // isolated correctly.
+        if do_global {
+            let common_target = crate::render::global_common_target_path()?;
+            crate::render::validate_global_render_authority(&self.store_path, &common_target)?;
+            for prov in &providers {
+                if let Some(target) = crate::render::global_target_path(prov) {
+                    crate::render::validate_global_render_authority(&self.store_path, &target?)?;
+                }
+            }
+        }
+
         let mut results = Vec::new();
 
         // ── Global render: small provider files + one shared include ──

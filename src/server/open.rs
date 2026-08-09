@@ -237,6 +237,22 @@ pub(super) fn open_shared_state(
         instance_locks.covers(&cfg.paths.vectors_path),
         "open_shared_state ran without a claim on the vector root"
     );
+    debug_assert!(
+        instance_locks.covers(&cfg.paths.global_common_md),
+        "open_shared_state ran without a claim on the global common render target"
+    );
+    debug_assert!(
+        instance_locks.covers(&cfg.paths.global_claude_md),
+        "open_shared_state ran without a claim on the global Claude render target"
+    );
+    debug_assert!(
+        instance_locks.covers(&cfg.paths.global_codex_md),
+        "open_shared_state ran without a claim on the global Codex render target"
+    );
+    debug_assert!(
+        instance_locks.covers(&cfg.paths.global_gemini_md),
+        "open_shared_state ran without a claim on the global Gemini render target"
+    );
     // R33F1: install the ONE resolved vector root before anything can reach
     // `vectors::global()`. The warmup thread, the embed queue, and the
     // shutdown flush all open the store through it; without this they would

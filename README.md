@@ -496,7 +496,7 @@ Auto-detection works out of the box for most setups. Override via environment va
 | `BRO_HOME` | `<state-dir>/bro` | Base dir for task store, MCP registry, and Gemini policy tempfiles |
 | `BLACKBOX_REINDEX_INTERVAL_SECS` | `120` | Background reindex interval (seconds) |
 | `BBOX_PORT` / `BRO_PORT` | `7264` | HTTP port for MCP + `/tail` + `/roster` endpoints |
-| `BLACKBOX_GLOBAL_CLAUDE_MD` / `BLACKBOX_GLOBAL_CODEX_MD` / `BLACKBOX_GLOBAL_GEMINI_MD` | provider defaults | Override global render targets; useful for dev instances that must not touch prod memory files |
+| `BLACKBOX_GLOBAL_COMMON_MD` / `BLACKBOX_GLOBAL_CLAUDE_MD` / `BLACKBOX_GLOBAL_CODEX_MD` / `BLACKBOX_GLOBAL_GEMINI_MD` | provider defaults | Override global render targets; required for dev instances with a non-default knowledge store that must not touch prod memory files |
 | `BLACKBOX_BACKUP_DIR` | `~/.local/state/blackbox/backups` | Managed-region backup root for `bbox_render(scope=global)` |
 | `BLACKBOX_RUST_ANALYZER_BIN` (also `BRO_LSP_RUST_ANALYZER_BIN` / `BRO_RUST_ANALYZER_BIN`) | `rust-analyzer` from `$PATH` | rust-analyzer binary for window-0 harness diagnostics - see *Window-0 diagnostics* below |
 | `RUST_LOG` | `blackbox=info` | Tracing filter |

@@ -53,6 +53,54 @@ fn host_global_target_env_key(path: &Path, home: &Path) -> Option<&'static str> 
     .find_map(|(default, env_key)| (path == default).then_some(env_key))
 }
 
+fn default_global_knowledge_source(home: &Path) -> PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| home.join(".local").join("state"))
+        .join("blackbox")
+        .join("blackbox-knowledge.json")
+}
+
+fn paths_name_same_object(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (left.canonicalize(), right.canonicalize()),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+fn env_path_is_explicit(env_key: &str) -> bool {
+    std::env::var_os(env_key).is_some_and(|value| !value.is_empty())
+}
+
+/// Refuse to let an isolated knowledge store publish into a host-default
+/// global guidance file by accident.
+///
+/// A daemon that moves its state or knowledge store is a distinct source
+/// authority. It must move each global render target too, or explicitly bind
+/// that target through its documented environment variable. This catches the
+/// dangerous partial-isolation shape where a throwaway daemon renders its
+/// empty bootstrap view over the operator's production guidance.
+pub fn validate_global_render_authority(knowledge_store: &Path, target: &Path) -> Result<()> {
+    let home = dirs::home_dir().context("home directory not found")?;
+    let Some(target_env_key) = host_global_target_env_key(target, &home) else {
+        return Ok(());
+    };
+    if env_path_is_explicit(target_env_key)
+        || paths_name_same_object(knowledge_store, &default_global_knowledge_source(&home))
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "error.global_render_authority: refusing to render knowledge source {} into the default \
+         host guidance target {}. An isolated daemon must set {} to its own target; set that \
+         variable explicitly only when this non-default knowledge source is intentionally \
+         authoritative for the host target",
+        knowledge_store.display(),
+        target.display(),
+        target_env_key,
+    )
+}
+
 fn refuse_test_host_global_target(path: &Path) -> Result<()> {
     if !running_under_test_harness() {
         return Ok(());
@@ -459,6 +507,52 @@ mod tests {
             error.to_string().contains("refusing test-process access"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn nondefault_knowledge_source_cannot_publish_to_implicit_host_target() {
+        let mut env = bbox_util::util::TestEnvGuard::new();
+        env.remove("BLACKBOX_GLOBAL_COMMON_MD");
+        let home = dirs::home_dir().expect("test host has a home directory");
+        let target = home.join(".blackbox").join("BLACKBOX.md");
+        let source = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("blackbox-knowledge.json");
+
+        let error = validate_global_render_authority(&source, &target)
+            .expect_err("an isolated source must not inherit the host render target");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("error.global_render_authority"),
+            "{message}"
+        );
+        assert!(message.contains("BLACKBOX_GLOBAL_COMMON_MD"), "{message}");
+    }
+
+    #[test]
+    fn explicit_host_target_binding_allows_nondefault_knowledge_source() {
+        let home = dirs::home_dir().expect("test host has a home directory");
+        let target = home.join(".blackbox").join("BLACKBOX.md");
+        let source = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("blackbox-knowledge.json");
+        let mut env = bbox_util::util::TestEnvGuard::new();
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", &target);
+
+        validate_global_render_authority(&source, &target)
+            .expect("an explicit source-to-target binding is operator authority");
+    }
+
+    #[test]
+    fn isolated_target_accepts_isolated_knowledge_source() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("blackbox-knowledge.json");
+        let target = fixture.path().join("BLACKBOX.md");
+
+        validate_global_render_authority(&source, &target)
+            .expect("an isolated source and target do not reach host guidance");
     }
 
     #[test]

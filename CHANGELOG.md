@@ -84,6 +84,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Isolated daemons can no longer publish a partial knowledge store into the
+  production global guidance files. Every daemon now claims its four resolved
+  global render targets against other daemon instances, and `scope=global`
+  refuses any implicit host-default target when the knowledge source is
+  non-default. An intentional non-default source-to-host binding must name the
+  target explicitly.
 - Global guidance renders now fail closed when an incomplete source view would
   replace a substantial managed region with less than half its content. The
   guard catches nonempty bootstrap stubs as well as empty renders before any

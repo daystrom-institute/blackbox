@@ -742,6 +742,72 @@ mod catalog_render_tests {
         assert_eq!(attempted, 0, "global render acquired checkout authority");
     }
 
+    /// The exact partial-isolation failure: a throwaway daemon has its own
+    /// knowledge store but no render overrides, so every target falls back to
+    /// the operator's host files. Refusal happens on source authority before
+    /// any target is planned or opened.
+    #[tokio::test]
+    async fn isolated_daemon_cannot_inherit_host_global_render_targets() {
+        let fixture = CatalogFixture::new();
+        let mut env = crate::util::TestEnvGuard::new();
+        for key in [
+            "BLACKBOX_GLOBAL_COMMON_MD",
+            "BLACKBOX_GLOBAL_CLAUDE_MD",
+            "BLACKBOX_GLOBAL_CODEX_MD",
+            "BLACKBOX_GLOBAL_GEMINI_MD",
+        ] {
+            env.remove(key);
+        }
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                scope: Some("global".into()),
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(is_error(&result), "{result:?}");
+        assert!(
+            format!("{result:?}").contains("error.global_render_authority"),
+            "{result:?}"
+        );
+    }
+
+    /// Authority is preflighted across the complete selected target set. A
+    /// safe common target must remain untouched when a provider target is
+    /// still an implicit host default.
+    #[tokio::test]
+    async fn global_render_preflights_every_target_before_writing_common() {
+        let fixture = CatalogFixture::new();
+        let render_root = fixture.root().join("global-render-mixed-authority");
+        let common_path = render_root.join("BLACKBOX.md");
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", &common_path);
+        env.remove("BLACKBOX_GLOBAL_CLAUDE_MD");
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                provider: Some("claude".into()),
+                scope: Some("global".into()),
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(is_error(&result), "{result:?}");
+        assert!(
+            format!("{result:?}").contains("error.global_render_authority"),
+            "{result:?}"
+        );
+        assert!(
+            !common_path.exists(),
+            "global preflight must complete before the common target is written"
+        );
+    }
+
     /// A project render against a catalog project with no attachment reports
     /// the attachment requirement rather than reaching a checkout. The
     /// refusal is the resolver's, so no record path lookup stands between the

@@ -152,10 +152,12 @@ impl InstanceRoot {
 
 /// Every mutable root the loaded config resolves.
 ///
+/// The rendered global memory files (`BLACKBOX_GLOBAL_*_MD`) are included even
+/// though humans and non-daemon tools may edit them. The advisory claim only
+/// coordinates blackboxd instances. Without it, a partially isolated daemon
+/// can publish its incomplete store into the production guidance files.
+///
 /// Deliberately excluded, with reasons:
-/// - the rendered global memory files (`BLACKBOX_GLOBAL_*_MD`): operator-owned
-///   documents that humans and other tools also edit, not daemon-exclusive
-///   state.
 /// - the defaults / user memory directories and transcript source roots: read
 ///   surfaces, never written by the daemon.
 /// - the rolling log directory: it derives from the platform home / state
@@ -205,6 +207,26 @@ pub fn instance_lock_roots(cfg: &crate::config::Config) -> Vec<InstanceRoot> {
             "knowledge store",
             "BLACKBOX_KNOWLEDGE_PATH",
             paths.knowledge_path.clone(),
+        ),
+        InstanceRoot::file(
+            "global common render target",
+            "BLACKBOX_GLOBAL_COMMON_MD",
+            paths.global_common_md.clone(),
+        ),
+        InstanceRoot::file(
+            "global Claude render target",
+            "BLACKBOX_GLOBAL_CLAUDE_MD",
+            paths.global_claude_md.clone(),
+        ),
+        InstanceRoot::file(
+            "global Codex render target",
+            "BLACKBOX_GLOBAL_CODEX_MD",
+            paths.global_codex_md.clone(),
+        ),
+        InstanceRoot::file(
+            "global Gemini render target",
+            "BLACKBOX_GLOBAL_GEMINI_MD",
+            paths.global_gemini_md.clone(),
         ),
         InstanceRoot::file("gap store", "BLACKBOX_GAPS_PATH", paths.gaps_path.clone()),
         InstanceRoot::file(
@@ -525,6 +547,22 @@ mod tests {
         // varied state root so the test neither contends with the host daemon
         // nor makes two fixture configurations share one vector store.
         env.set("BLACKBOX_VECTORS_PATH", state_dir.join("vectors"));
+        env.set(
+            "BLACKBOX_GLOBAL_COMMON_MD",
+            state_dir.join("render").join("BLACKBOX.md"),
+        );
+        env.set(
+            "BLACKBOX_GLOBAL_CLAUDE_MD",
+            state_dir.join("render").join("CLAUDE.md"),
+        );
+        env.set(
+            "BLACKBOX_GLOBAL_CODEX_MD",
+            state_dir.join("render").join("AGENTS.md"),
+        );
+        env.set(
+            "BLACKBOX_GLOBAL_GEMINI_MD",
+            state_dir.join("render").join("GEMINI.md"),
+        );
         for var in [
             "BRO_HOME",
             "BLACKBOX_PACKETS_DIR",
@@ -774,6 +812,45 @@ mod tests {
         acquire_instance_locks(&second_roots).expect("released roots are claimable again");
     }
 
+    #[test]
+    fn a_shared_global_render_target_refuses_an_otherwise_isolated_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = state_root(&dir);
+        let shared_target = root.join("shared-render").join("BLACKBOX.md");
+        let mut env = crate::util::TestEnvGuard::new();
+
+        let mut first = config_for(
+            &mut env,
+            &root,
+            &root.join("state-a"),
+            &root.join("index-a"),
+        );
+        first.paths.global_common_md = shared_target.clone();
+        let held = acquire_instance_locks(&instance_lock_roots(&first))
+            .expect("the first daemon claims the shared render target");
+
+        let mut second = config_for(
+            &mut env,
+            &root,
+            &root.join("state-b"),
+            &root.join("index-b"),
+        );
+        second.paths.global_common_md = shared_target.clone();
+        let error = acquire_instance_locks(&instance_lock_roots(&second))
+            .expect_err("the second daemon must not share a render target");
+
+        assert_eq!(error.code(), "error.daemon_instance_locked");
+        let contended = error.root().expect("contention names its root");
+        assert_eq!(contended.label, "global common render target");
+        assert_eq!(contended.path, canonical_root_path(&shared_target));
+        let rendered = error.to_string();
+        assert!(rendered.contains("BLACKBOX_GLOBAL_COMMON_MD"), "{rendered}");
+
+        drop(held);
+        acquire_instance_locks(&instance_lock_roots(&second))
+            .expect("released render targets are claimable again");
+    }
+
     /// Every root the daemon opens is claimed. The derivation is what R32F1
     /// turned on: a root missing here is a root two configurations can share.
     #[test]
@@ -794,6 +871,10 @@ mod tests {
             "artifact catalog",
             "backup directory",
             "knowledge store",
+            "global common render target",
+            "global Claude render target",
+            "global Codex render target",
+            "global Gemini render target",
             "gap store",
             "thread store",
             "roadmap store",

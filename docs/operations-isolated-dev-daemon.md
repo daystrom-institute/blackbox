@@ -85,6 +85,15 @@ that moves their defaults as a set — which is what the launcher below does.
 The lock file lives at `<state_dir>/instance.lock` for the state root and at
 `<root>.instance.lock` beside every other claimed root.
 
+The four global render targets are claimed too. This claim coordinates daemon
+instances only; it does not prevent the operator from editing the files. A
+daemon whose knowledge store is non-default also refuses `scope=global` when a
+selected render target still resolves implicitly to the host default. Move
+`BLACKBOX_GLOBAL_COMMON_MD`, `BLACKBOX_GLOBAL_CLAUDE_MD`,
+`BLACKBOX_GLOBAL_CODEX_MD`, and `BLACKBOX_GLOBAL_GEMINI_MD` with the isolated
+store. An explicit target binding is required if a non-default store is
+intentionally authoritative for a host-default target.
+
 One path is deliberately NOT claimed, because it follows the platform home /
 state directory rather than config and macOS moves it only with `$HOME`: the
 rolling log directory. A second daemon shares it unless it isolates `HOME`
