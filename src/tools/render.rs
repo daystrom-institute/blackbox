@@ -220,44 +220,59 @@ impl BlackboxServer {
                 // opened (plan section 8, P5-E render item 1). The write root
                 // below always comes from the acquired lease; no branch
                 // re-derives one from a project record path.
-                let resolution = server.resolve_project_write(&raw)?;
-                let durable_scope = resolution.durable_scope;
-                let resolved_project_id = resolution.project_id;
-                let checkout = resolution.checkout_scope;
-                if let Some(checkout) = checkout.as_ref() {
-                    server.register_dark_knowledge_checkout(checkout)?;
-                }
-                let view = server.session_knowledge_view(
-                    Some(&durable_scope),
-                    p.provisional.as_deref(),
-                )?;
-                let render_scope = if server.state.project_authority.is_bridge() {
-                    durable_scope.clone()
-                } else {
-                    resolved_project_id
-                        .clone()
-                        .unwrap_or_else(|| durable_scope.clone())
-                };
-                let mut render = |root: &std::path::Path| {
-                    p.project = Some(root.to_string_lossy().into_owned());
-                    p.scope_project = Some(render_scope.clone());
-                    view.knowledge.render(&p)
-                };
-                if let Some(checkout) = checkout.as_ref() {
-                    crate::server::checkout_access::with_resolved_checkout_access(
-                        &server.state.checkout_access,
-                        checkout,
+                if !server.state.project_authority.is_bridge() {
+                    // Catalog selection has stable identity already. Going
+                    // through the generic project-mutation resolver would
+                    // take an unrelated `repo_mutation` lease before the real
+                    // `render_output` gate, so render resolves identity and
+                    // acquires its one capability directly.
+                    let project_id = server.validate_project_selection(&raw)?;
+                    let view = server
+                        .session_knowledge_view(Some(&project_id), p.provisional.as_deref())?;
+                    p.scope_project = Some(project_id.clone());
+                    let broker = &server.state.checkout_access;
+                    let lease = crate::server::checkout_access::acquire_catalog_project_lease(
+                        &server,
+                        broker,
+                        &project_id,
                         bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
                         bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
-                        |lease| render(lease.project_root()),
-                    )?
+                    )?;
+                    p.project = Some(lease.project_root().to_string_lossy().into_owned());
+                    let rendered = view.knowledge.render(&p);
+                    broker.revalidate(&lease).map_err(anyhow::Error::new)?;
+                    rendered?
                 } else {
-                    let project_id = resolved_project_id.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "error.attachment_required: project render target is not a registered attachment"
-                        )
-                    })?;
-                    if server.state.project_authority.is_bridge() {
+                    let resolution = server.resolve_project_write(&raw)?;
+                    let durable_scope = resolution.durable_scope;
+                    let resolved_project_id = resolution.project_id;
+                    let checkout = resolution.checkout_scope;
+                    if let Some(checkout) = checkout.as_ref() {
+                        server.register_dark_knowledge_checkout(checkout)?;
+                    }
+                    let view = server.session_knowledge_view(
+                        Some(&durable_scope),
+                        p.provisional.as_deref(),
+                    )?;
+                    let mut render = |root: &std::path::Path| {
+                        p.project = Some(root.to_string_lossy().into_owned());
+                        p.scope_project = Some(durable_scope.clone());
+                        view.knowledge.render(&p)
+                    };
+                    if let Some(checkout) = checkout.as_ref() {
+                        crate::server::checkout_access::with_resolved_checkout_access(
+                            &server.state.checkout_access,
+                            checkout,
+                            bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
+                            bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
+                            |lease| render(lease.project_root()),
+                        )?
+                    } else {
+                        let project_id = resolved_project_id.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "error.attachment_required: project render target is not a registered attachment"
+                            )
+                        })?;
                         crate::server::checkout_access::with_selected_project_access(
                             &server.state.checkout_access,
                             &project_id,
@@ -265,24 +280,6 @@ impl BlackboxServer {
                             bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
                             |lease| render(lease.project_root()),
                         )?
-                    } else {
-                        // Catalog render gates on `render_output` alone. The
-                        // bridge helper first takes a `PublisherConfigTreeRead`
-                        // lease to discover scope, which rides `repo_knowledge`
-                        // (D-032) and would deny a render-capable attachment
-                        // for lacking an unrelated capability; the catalog row
-                        // already carries the scope.
-                        let broker = &server.state.checkout_access;
-                        let lease = crate::server::checkout_access::acquire_catalog_project_lease(
-                            &server,
-                            broker,
-                            &project_id,
-                            bbox_indexing::checkout_access::CheckoutAccessKind::RenderFileProvider,
-                            bbox_indexing::checkout_access::CheckoutAccessIntent::Write,
-                        )?;
-                        let rendered = render(lease.project_root());
-                        broker.revalidate(&lease).map_err(anyhow::Error::new)?;
-                        rendered?
                     }
                 }
             } else {
