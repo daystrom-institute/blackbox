@@ -652,6 +652,41 @@ impl GitSourceStore {
         })
     }
 
+    /// Open an already initialized store without creating any directory.
+    /// Offline cutover preflight is observational and must not make an empty
+    /// transport estate look initialized merely by inspecting it.
+    pub fn open_existing(root: impl Into<PathBuf>, limits: StoreLimits) -> Result<Self> {
+        validate_store_limits(limits)?;
+        let root = root.into();
+        NofollowDirectory::open_existing(&root)?
+            .ok_or_else(|| anyhow!("Git-source store root is missing"))?;
+        for relative in [
+            "uploads",
+            "records",
+            "records/sha256",
+            "repos",
+            "generation-index",
+            "activations",
+            "provenance-receipts",
+            "provenance-imports",
+            "provenance-imports/uploads",
+            "provenance-imports/documents",
+            "provenance-imports/documents/sha256",
+            "provenance-imports/generations",
+            "provenance-imports/generation-index",
+            "provenance-imports/journals",
+            "provenance-imports/projects",
+        ] {
+            NofollowDirectory::open_existing(&root.join(relative))?
+                .ok_or_else(|| anyhow!("Git-source store member {relative} is missing"))?;
+        }
+        Ok(Self {
+            root,
+            limits: RwLock::new(limits),
+            mutation: Mutex::new(()),
+        })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -3806,6 +3841,17 @@ mod tests {
         ProvenanceImportManifestPageV1, SCHEMA_VERSION, encode_history_fragment,
         history_manifest_sha256, provenance_manifest_sha256,
     };
+
+    #[test]
+    fn existing_only_open_never_initializes_a_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("git-sources");
+        assert!(GitSourceStore::open_existing(&root, StoreLimits::default()).is_err());
+        assert!(!root.exists());
+
+        GitSourceStore::open(&root, StoreLimits::default()).unwrap();
+        GitSourceStore::open_existing(&root, StoreLimits::default()).unwrap();
+    }
 
     fn fixture() -> (
         GitHistoryDescriptorV1,

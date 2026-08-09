@@ -36,6 +36,10 @@ const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const MAX_CHUNK_TARGET_KEY_BYTES: usize = 4_096;
 const MAX_MIGRATION_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_STORED_GENERATION_RECORD_BYTES: usize = 64 * 1024;
+/// Maximum encoded size accepted for one durable activation record.
+pub const MAX_ACTIVATION_RECORD_BYTES: usize = MAX_MIGRATION_RECORD_BYTES;
+/// Maximum encoded size accepted for one durable generation metadata record.
+pub const MAX_GENERATION_METADATA_RECORD_BYTES: usize = MAX_STORED_GENERATION_RECORD_BYTES;
 const MAX_COLLISION_RETIREMENT_RECORD_BYTES: usize = 64 * 1024;
 const MAX_RETIREMENT_RECORD_BYTES: usize = 64 * 1024;
 const MAX_MIGRATION_INVENTORY_MANIFEST_BYTES: usize = 512 * 1024 * 1024;

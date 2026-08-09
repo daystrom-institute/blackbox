@@ -15,9 +15,13 @@ use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bbox_code_source::{ErrorResponse, validate_producer_id, validate_scope};
+pub(crate) use bbox_corpus_core::git_transport_cutover::RepoTransportGrant;
+use bbox_corpus_core::git_transport_cutover::{
+    RepoTransportGrantState, derive_repo_transport_grants,
+};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{
-    CatalogSnapshotV2, CommitNamespace, ProjectId, ProjectScope, RepoHistoryId,
+    CatalogSnapshotV2, ProjectId, ProjectScope, RepoHistoryId,
 };
 use bbox_corpus_core::project_record::ProjectRecord;
 use bbox_indexing::checkout_access::{
@@ -39,28 +43,6 @@ pub(crate) struct ProducerGrant {
 struct AuthEntry {
     token: ServiceToken,
     grant: ProducerGrant,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RepoTransportMember {
-    pub(crate) project_id: ProjectId,
-    pub(crate) scope: PublishedScope,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RepoTransportGrant {
-    pub(crate) producer_id: String,
-    pub(crate) authority_scope: PublishedScope,
-    pub(crate) repo_history_id: RepoHistoryId,
-    pub(crate) primary_namespace: CommitNamespace,
-    pub(crate) members: Vec<RepoTransportMember>,
-    pub(crate) commitment: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RepoTransportGrantState {
-    Granted(RepoTransportGrant),
-    Blocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,7 +202,9 @@ impl ProducerAuthRuntime {
 
         let (project_to_repo_history, repo_grants) = match &resolution {
             GrantScopeResolution::Catalog { catalog } => {
-                derive_repo_transport_grants(catalog, &entries)
+                let projection =
+                    derive_repo_transport_grants(catalog, &assignment_producers(&entries));
+                (projection.project_to_repo_history, projection.grants)
             }
             GrantScopeResolution::Bridge { .. } => (BTreeMap::new(), BTreeMap::new()),
         };
@@ -303,16 +287,15 @@ impl ProducerAuthRuntime {
                 )
             })
             .collect();
-        let (project_to_repo_history, repo_grants) =
-            derive_repo_transport_grants(catalog, &entries);
+        let projection = derive_repo_transport_grants(catalog, &assignment_producers(&entries));
         Self {
             enabled: true,
             git_transport_enabled: true,
             entries,
             scope_to_project,
             producer_to_scopes,
-            project_to_repo_history,
-            repo_grants,
+            project_to_repo_history: projection.project_to_repo_history,
+            repo_grants: projection.grants,
             catalog_mode: true,
         }
     }
@@ -401,7 +384,7 @@ impl ProducerAuthRuntime {
             .get(project_id)
             .ok_or(RepoTransportGrantError::RepoHistoryNotFound)?;
         match self.repo_grants.get(repo_history_id) {
-            Some(RepoTransportGrantState::Granted(repo_grant))
+            Some(RepoTransportGrantState::Granted { grant: repo_grant })
                 if repo_grant.producer_id == grant.producer_id =>
             {
                 Ok(repo_grant)
@@ -450,7 +433,9 @@ impl ProducerAuthRuntime {
         repo_history_id: &RepoHistoryId,
     ) -> std::result::Result<&RepoTransportGrant, RepoTransportGrantError> {
         match self.repo_grants.get(repo_history_id) {
-            Some(RepoTransportGrantState::Granted(grant)) if grant.producer_id == producer_id => {
+            Some(RepoTransportGrantState::Granted { grant })
+                if grant.producer_id == producer_id =>
+            {
                 Ok(grant)
             }
             Some(_) => Err(RepoTransportGrantError::RepoHistoryScopeSplit),
@@ -506,14 +491,8 @@ pub(crate) fn resolve_catalog_project(
     Ok((*project_id).clone())
 }
 
-fn derive_repo_transport_grants(
-    catalog: &CatalogSnapshotV2,
-    entries: &[AuthEntry],
-) -> (
-    BTreeMap<ProjectId, RepoHistoryId>,
-    BTreeMap<RepoHistoryId, RepoTransportGrantState>,
-) {
-    let assignments = entries
+fn assignment_producers(entries: &[AuthEntry]) -> BTreeMap<PublishedScope, String> {
+    entries
         .iter()
         .flat_map(|entry| {
             entry
@@ -522,117 +501,7 @@ fn derive_repo_transport_grants(
                 .keys()
                 .map(|scope| (scope.clone(), entry.grant.producer_id.clone()))
         })
-        .collect::<BTreeMap<_, _>>();
-    let mut project_to_repo_history = BTreeMap::new();
-    let mut members_by_history: BTreeMap<RepoHistoryId, Vec<RepoTransportMember>> = BTreeMap::new();
-    for (project_id, project) in &catalog.projects {
-        let (ProjectScope::Published(scope), Some(repo_history_id)) =
-            (&project.scope, &project.repo_history)
-        else {
-            continue;
-        };
-        project_to_repo_history.insert(project_id.clone(), repo_history_id.clone());
-        members_by_history
-            .entry(repo_history_id.clone())
-            .or_default()
-            .push(RepoTransportMember {
-                project_id: project_id.clone(),
-                scope: scope.clone(),
-            });
-    }
-
-    let mut grants = BTreeMap::new();
-    for (repo_history_id, mut members) in members_by_history {
-        members.sort_by(|left, right| left.project_id.cmp(&right.project_id));
-        let producers = members
-            .iter()
-            .filter_map(|member| assignments.get(&member.scope).cloned())
-            .collect::<BTreeSet<_>>();
-        let complete = members
-            .iter()
-            .all(|member| assignments.contains_key(&member.scope));
-        let Some(history) = catalog.repo_histories.get(&repo_history_id) else {
-            grants.insert(repo_history_id, RepoTransportGrantState::Blocked);
-            continue;
-        };
-        if producers.len() != 1 {
-            grants.insert(repo_history_id, RepoTransportGrantState::Blocked);
-            continue;
-        }
-        if !complete {
-            grants.insert(repo_history_id, RepoTransportGrantState::Blocked);
-            continue;
-        }
-        let producer_id = producers.into_iter().next().expect("length checked above");
-        // The capture authority is the shallowest registered scope, not the
-        // first project id. Project-id order is unrelated to monorepo
-        // topology and could otherwise make adding or renaming a member
-        // silently change the source descriptor expected by the server.
-        let authority_scope = members
-            .iter()
-            .min_by(|left, right| {
-                let left_depth = scope_depth(&left.scope);
-                let right_depth = scope_depth(&right.scope);
-                left_depth
-                    .cmp(&right_depth)
-                    .then_with(|| left.scope.cmp(&right.scope))
-                    .then_with(|| left.project_id.cmp(&right.project_id))
-            })
-            .expect("repo transport groups are nonempty")
-            .scope
-            .clone();
-        let commitment = repo_grant_commitment(
-            &producer_id,
-            &repo_history_id,
-            &history.primary_namespace,
-            &members,
-        );
-        grants.insert(
-            repo_history_id.clone(),
-            RepoTransportGrantState::Granted(RepoTransportGrant {
-                producer_id,
-                authority_scope,
-                repo_history_id,
-                primary_namespace: history.primary_namespace.clone(),
-                members,
-                commitment,
-            }),
-        );
-    }
-    (project_to_repo_history, grants)
-}
-
-fn scope_depth(scope: &PublishedScope) -> usize {
-    let relative = scope.bbox_root_relpath();
-    if relative == "." {
-        0
-    } else {
-        relative.split('/').count()
-    }
-}
-
-fn repo_grant_commitment(
-    producer_id: &str,
-    repo_history_id: &RepoHistoryId,
-    primary_namespace: &CommitNamespace,
-    members: &[RepoTransportMember],
-) -> String {
-    let mut hasher = Sha256::new();
-    hash_field(&mut hasher, b"bbox-repo-transport-grant-v1");
-    hash_field(&mut hasher, producer_id.as_bytes());
-    hash_field(&mut hasher, repo_history_id.as_str().as_bytes());
-    hash_field(&mut hasher, primary_namespace.as_str().as_bytes());
-    for member in members {
-        hash_field(&mut hasher, member.project_id.as_str().as_bytes());
-        hash_field(&mut hasher, member.scope.repo_id().as_bytes());
-        hash_field(&mut hasher, member.scope.bbox_root_relpath().as_bytes());
-    }
-    hex::encode(hasher.finalize())
-}
-
-fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_be_bytes());
-    hasher.update(bytes);
+        .collect()
 }
 
 pub(crate) async fn authenticate_code_source_request(
@@ -698,8 +567,8 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 mod tests {
     use super::*;
     use bbox_corpus_core::project_catalog::{
-        CorpusProject, RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryMaterialization,
-        RepoHistoryRecord,
+        CommitNamespace, CorpusProject, RecordedRepoAuthority, RepoHistoryAuthority,
+        RepoHistoryMaterialization, RepoHistoryRecord,
     };
 
     fn project(
@@ -774,17 +643,18 @@ mod tests {
         let root_id = "p_00000000000000000000000000000002";
         let child_id = "p_00000000000000000000000000000001";
 
-        let (_, grants) = derive_repo_transport_grants(
+        let grants = derive_repo_transport_grants(
             &catalog,
-            &[entry(
+            &assignment_producers(&[entry(
                 "producer-a",
                 &[
                     (root_scope.clone(), root_id),
                     (child_scope.clone(), child_id),
                 ],
-            )],
-        );
-        let RepoTransportGrantState::Granted(grant) = &grants[&history_id] else {
+            )]),
+        )
+        .grants;
+        let RepoTransportGrantState::Granted { grant } = &grants[&history_id] else {
             panic!("complete same-producer membership must grant repo transport")
         };
         assert_eq!(grant.producer_id, "producer-a");
@@ -792,19 +662,27 @@ mod tests {
         assert_eq!(grant.authority_scope, root_scope);
         assert_eq!(grant.commitment.len(), 64);
 
-        let (_, missing) = derive_repo_transport_grants(
+        let missing = derive_repo_transport_grants(
             &catalog,
-            &[entry("producer-a", &[(root_scope.clone(), root_id)])],
-        );
-        assert_eq!(missing[&history_id], RepoTransportGrantState::Blocked);
+            &assignment_producers(&[entry("producer-a", &[(root_scope.clone(), root_id)])]),
+        )
+        .grants;
+        assert!(matches!(
+            missing[&history_id],
+            RepoTransportGrantState::Blocked { .. }
+        ));
 
-        let (_, split) = derive_repo_transport_grants(
+        let split = derive_repo_transport_grants(
             &catalog,
-            &[
+            &assignment_producers(&[
                 entry("producer-a", &[(root_scope, root_id)]),
                 entry("producer-b", &[(child_scope, child_id)]),
-            ],
-        );
-        assert_eq!(split[&history_id], RepoTransportGrantState::Blocked);
+            ]),
+        )
+        .grants;
+        assert!(matches!(
+            split[&history_id],
+            RepoTransportGrantState::Blocked { .. }
+        ));
     }
 }

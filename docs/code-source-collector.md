@@ -114,6 +114,21 @@ Run continuously with bounded retry backoff:
 bbox-code-collector --config /path/to/code-collector.toml run
 ```
 
+## FreshV2 cutover rehearsal
+
+The GH-F overlap gate has a throwaway, full-path rehearsal that starts from a
+fresh catalog, publishes code and complete Git history, restarts the isolated
+daemon, transports one nonempty V2 provenance document, and runs the offline
+cutover preflight. Build the three debug binaries first, then run:
+
+```sh
+BBOX_GIT_CUTOVER_SMOKE_ROOT="$(mktemp -d /tmp/bbox-ghf-smoke.XXXXXX)" \
+  scripts/git-transport-cutover-smoke.sh all
+```
+
+The script leaves its review artifacts under the throwaway root and always
+stops its daemon before preflight and exit.
+
 Remote plain HTTP is rejected and redirects are disabled. Loopback HTTP is
 accepted for local smoke tests.
 

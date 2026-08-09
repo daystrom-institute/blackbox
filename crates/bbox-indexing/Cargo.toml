@@ -22,6 +22,7 @@ bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-code-source = { path = "../bbox-code-source" }
 bbox-code-source-store = { path = "../bbox-code-source-store" }
 bbox-git-source-store = { path = "../bbox-git-source-store" }
+bbox-git-source = { path = "../bbox-git-source" }
 bbox-corpus-index = { path = "../bbox-corpus-index" }
 bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
 bbox-artifacts = { path = "../bbox-artifacts" }
@@ -65,7 +66,6 @@ bbox-edge-index = { path = "../bbox-edge-index" }
 bbox-vectors = { path = "../bbox-vectors" }
 
 [dev-dependencies]
-bbox-git-source = { path = "../bbox-git-source" }
 # Enable this crate's own `test-support` feature for its integration tests.
 # `#[cfg(test)]` does not reach an integration test, and the section 13.8
 # fixture set has to install accepted publications through the SAME

@@ -457,11 +457,7 @@ fn edge_kind_for_call(call: &NoteToolCall) -> Option<&str> {
 }
 
 fn authenticated_edge_kind_for_call(call: &NoteToolCall) -> Option<&str> {
-    match edge_kind_for_call(call)? {
-        "READ_FILE" => Some("READ_FILE"),
-        "EDITED_FILE" => Some("EDITED_FILE"),
-        _ => None,
-    }
+    bbox_provenance::authenticated_edge_kind_for_call(call)
 }
 
 #[cfg(test)]

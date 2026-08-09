@@ -819,6 +819,23 @@ impl HistoryGenerationStore {
         Self::open_for_index_with_io(index_path, Arc::new(RealHistoryGenerationIo))
     }
 
+    /// Open an existing generations root without creating it. Offline
+    /// cutover preflight uses this read-only entry point so inspection cannot
+    /// mutate an uninitialized target.
+    pub fn open_existing_for_index(index_path: &Path) -> HistoryGenerationResult<Self> {
+        let root = generations_root_for_index(index_path)?;
+        refuse_symlinked_directory(&root, "history generations root")?;
+        let metadata = fs::symlink_metadata(&root)
+            .map_err(|error| io_error(format!("cannot inspect generations root: {error}")))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io_error("history generations root is not a real directory"));
+        }
+        Ok(Self {
+            root,
+            io: Arc::new(RealHistoryGenerationIo),
+        })
+    }
+
     pub fn open_for_index_with_io(
         index_path: &Path,
         io: Arc<dyn HistoryGenerationIo>,
@@ -1875,6 +1892,19 @@ mod tests {
     use super::*;
 
     use crate::index::INDEX_SCHEMA_VERSION;
+
+    #[test]
+    fn existing_only_open_never_initializes_a_missing_generation_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = root.join("index");
+        let generations = generations_root_for_index(&index).unwrap();
+        assert!(HistoryGenerationStore::open_existing_for_index(&index).is_err());
+        assert!(!generations.exists());
+
+        HistoryGenerationStore::open_for_index(&index).unwrap();
+        HistoryGenerationStore::open_existing_for_index(&index).unwrap();
+    }
 
     fn namespace(value: &str) -> CommitNamespace {
         CommitNamespace::parse(value).unwrap()

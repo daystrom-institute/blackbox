@@ -637,6 +637,9 @@ Verification: V1/V2/multipart/duplicate/conflict/malformed/cross-project/oversiz
 Gate: focused note/store/resolver/sidecar/graph/collector tests, cluster verify, strict catalog smoke.
 
 ### GH-F: Overlap migration and parity proof
+Status: implemented 2026-08-08. The checked-in FreshV2 rehearsal drives code,
+history, P3 activation, producer overlays, a nonempty V2 provenance
+export/import, daemon restart, and offline clean preflight.
 Ownership: `bbox-corpus-core` catalog types, `ProjectCatalogStore::transact`, migration/reporting in `bbox-indexing`, doctor, `src/tools/graph.rs`, operations/smoke fixtures.
 Dependencies: GH-C through GH-E and Phase 6.
 Mechanics:

@@ -18,6 +18,7 @@ pub mod edit;
 pub mod entity_ref;
 pub mod git;
 pub mod git_overlay;
+pub mod git_transport_cutover;
 pub mod identity;
 pub mod json_store;
 pub mod language;

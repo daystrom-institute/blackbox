@@ -197,6 +197,60 @@ fn add_published_project(projects: &str, repo_id: &str, relpath: &str, created_a
     added["result"]["project_id"].as_str().unwrap().to_string()
 }
 
+fn produce_git_transport_cutover_smoke_fixture_at(root: &Path) -> Value {
+    fs::create_dir_all(root).unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(root);
+    let project_id = add_published_project(
+        projects_path.to_str().unwrap(),
+        "neutral-repository",
+        ".",
+        "2026-08-08T00:00:00Z",
+    );
+    let summary = serde_json::json!({
+        "state_dir": state,
+        "projects_path": projects_path,
+        "config_path": config_path,
+        "index_path": index_path,
+        "project_id": project_id,
+        "scope": {
+            "repo_id": "neutral-repository",
+            "bbox_root_relpath": ".",
+        },
+    });
+    write(
+        &root.join("git-transport-cutover-smoke-fixture.json"),
+        &serde_json::to_vec_pretty(&summary).unwrap(),
+    );
+    summary
+}
+
+#[test]
+fn git_transport_cutover_smoke_fixture_is_fresh_v2_and_published() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let summary = produce_git_transport_cutover_smoke_fixture_at(&root);
+    let store =
+        ProjectCatalogStore::open_existing(summary["projects_path"].as_str().unwrap()).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(matches!(
+        snapshot.catalog().origin,
+        bbox_corpus_core::project_catalog::CatalogOriginV2::FreshV2 {}
+    ));
+    assert_eq!(snapshot.catalog().projects.len(), 1);
+    assert_eq!(snapshot.catalog().repo_histories.len(), 1);
+}
+
+#[test]
+#[ignore = "live smoke fixture producer; invoked by the isolated cutover rehearsal"]
+fn produce_git_transport_cutover_smoke_fixture_from_env_root() {
+    let Some(root) = std::env::var_os("BBOX_GIT_CUTOVER_SMOKE_ROOT") else {
+        eprintln!("BBOX_GIT_CUTOVER_SMOKE_ROOT is not set; nothing to produce");
+        return;
+    };
+    let root = PathBuf::from(root).canonicalize().unwrap();
+    produce_git_transport_cutover_smoke_fixture_at(&root);
+}
+
 fn success_json(output: &Output) -> Value {
     assert!(
         output.status.success(),
@@ -262,6 +316,95 @@ fn release_inventory_installs_the_offline_cli_deliberately() {
     ] {
         assert!(install_doc.contains("target/release/blackbox"));
     }
+}
+
+#[test]
+fn git_transport_cutover_preflight_is_read_only_and_reports_missing_parity() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path, index_path) = isolated_state_root(&root);
+    let project_id = add_published_project(
+        projects_path.to_str().unwrap(),
+        "cutover-fixture",
+        ".",
+        "2026-08-08T00:00:00Z",
+    );
+    let token_file = root.join("producer.token");
+    write(&token_file, b"cutover-fixture-token");
+    let vectors = state.join("vectors");
+    write(
+        &config_path,
+        format!(
+            "[paths]\nstate_dir = {state:?}\nvectors_dir = {vectors:?}\n\
+             [code_collection]\nenabled = true\ngit_transport_enabled = true\n\
+             [[code_collection.producers]]\n\
+             producer_id = \"cutover-producer\"\n\
+             token_file = {token_file:?}\n\
+             scopes = [{{ repo_id = \"cutover-fixture\", bbox_root_relpath = \".\" }}]\n"
+        )
+        .as_bytes(),
+    );
+    let review = root.join("review");
+    fs::create_dir_all(&review).unwrap();
+    let report = review.join("report.json");
+    let resolution = review.join("resolution.json");
+    let result = success_json(&run_with_isolated_index(
+        &[
+            "project-catalog",
+            "git-transport-cutover",
+            "--preflight",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--projects-path",
+            projects_path.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--resolution",
+            resolution.to_str().unwrap(),
+        ],
+        &index_path,
+    ));
+    assert_eq!(
+        result["command"],
+        "project_catalog_git_transport_cutover_preflight"
+    );
+    assert_eq!(result["result"]["status"], "refused");
+    assert_eq!(result["result"]["refused_repo_count"], 1);
+    assert!(!state.join("git-sources").exists());
+    assert!(
+        !bbox_corpus_index::index::history_generations::generations_root_for_index(&index_path)
+            .unwrap()
+            .exists()
+    );
+    assert!(!state.join("checkout-access-observations.json").exists());
+
+    let report_bytes = fs::read(&report).unwrap();
+    bbox_indexing::git_transport_cutover::decode_git_transport_cutover_report_v1(&report_bytes)
+        .unwrap();
+    let mut report_json: Value = serde_json::from_slice(&report_bytes).unwrap();
+    assert_eq!(report_json["status"], "refused");
+    assert_eq!(
+        report_json["repos"][0]["projects"][0]["project_id"],
+        project_id
+    );
+    assert_eq!(report_json["repos"][0]["coverage_status"], "refused");
+    let mut status_tampered = report_json.clone();
+    status_tampered["status"] = Value::String("clean".to_string());
+    assert!(
+        bbox_indexing::git_transport_cutover::decode_git_transport_cutover_report_v1(
+            &serde_json::to_vec(&status_tampered).unwrap()
+        )
+        .is_err()
+    );
+    report_json["unexpected"] = Value::Bool(true);
+    assert!(
+        bbox_indexing::git_transport_cutover::decode_git_transport_cutover_report_v1(
+            &serde_json::to_vec(&report_json).unwrap()
+        )
+        .is_err()
+    );
+    assert!(resolution.is_file());
+    assert_redacted(&result, &root);
 }
 
 #[test]

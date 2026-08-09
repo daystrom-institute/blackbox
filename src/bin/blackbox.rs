@@ -9,6 +9,10 @@ use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope, ScopeMigrationK
 use bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1;
 use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
 use bbox_corpus_index::index::migration_inventory as corpus_inventory;
+use bbox_indexing::git_transport_cutover::{
+    GitTransportCutoverError, GitTransportCutoverPreflightRequestV1,
+    ProjectCatalogGitTransportCutoverFacadeV1,
+};
 use bbox_indexing::project_catalog_admin;
 use bbox_indexing::project_catalog_backfill::{
     DurableBackfillApplyRequestV1, DurableBackfillPreflightRequestV1,
@@ -66,6 +70,8 @@ enum ProjectCatalogCommand {
     DurableBackfill(DurableBackfillArgs),
     /// Replace the on-disk index with the path-free schema.
     PathFreeRebuild(PathFreeRebuildArgs),
+    /// Inventory and prove Git history/provenance transport overlap parity.
+    GitTransportCutover(GitTransportCutoverArgs),
     /// Create a catalog project by authoritative scope or as legacy-local.
     Add(AddArgs),
     /// List every catalog project, including remote-only projects.
@@ -264,6 +270,21 @@ struct ConfigArgs {
     /// Override only the source projects.json path. This wins over --state-dir.
     #[arg(long, value_name = "PATH")]
     projects_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct GitTransportCutoverArgs {
+    /// Capture configured state and emit reviewed cutover artifacts.
+    #[arg(long)]
+    preflight: bool,
+    /// Reviewable coverage and parity report output.
+    #[arg(long, value_name = "PATH", requires = "preflight")]
+    report: PathBuf,
+    /// Canonical empty-or-explicit resolution artifact.
+    #[arg(long, value_name = "PATH", requires = "preflight")]
+    resolution: PathBuf,
+    #[command(flatten)]
+    config: ConfigArgs,
 }
 
 /// Target selection on `migrate` uses the ratified two-layer mechanism
@@ -499,6 +520,12 @@ impl From<ProjectCatalogStoreError> for CommandFailure {
     }
 }
 
+impl From<GitTransportCutoverError> for CommandFailure {
+    fn from(error: GitTransportCutoverError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
 #[derive(Serialize)]
 struct SuccessEnvelope<T> {
     version: u32,
@@ -591,6 +618,9 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::PathFreeRebuild(_),
         }) => "project_catalog_path_free_rebuild_verify",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::GitTransportCutover(_),
+        }) => "project_catalog_git_transport_cutover_preflight",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(_),
         }) => "project_catalog_add",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
@@ -640,6 +670,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::PathFreeRebuild(args),
         }) => execute_path_free_rebuild(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::GitTransportCutover(args),
+        }) => execute_git_transport_cutover(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(args),
         }) => execute_add(args),
@@ -1003,6 +1036,34 @@ fn offline_timestamp() -> String {
     format!("unix:{seconds}")
 }
 
+fn execute_git_transport_cutover(
+    args: GitTransportCutoverArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    if !args.preflight {
+        return Err(cli_arguments(
+            "git-transport-cutover currently requires --preflight",
+        ));
+    }
+    let config = load_config(args.config.config)?;
+    let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: args.config.projects_path,
+            state_dir: args.config.state_dir,
+        },
+    )?;
+    let receipt = ProjectCatalogGitTransportCutoverFacadeV1::preflight(
+        GitTransportCutoverPreflightRequestV1 {
+            layout,
+            config,
+            report_path: args.report,
+            resolution_path: args.resolution,
+            generated_at: offline_timestamp(),
+        },
+    )?;
+    serialize_result(&receipt)
+}
+
 fn execute_path_free_rebuild(
     args: PathFreeRebuildArgs,
 ) -> Result<serde_json::Value, CommandFailure> {
@@ -1288,6 +1349,22 @@ mod tests {
 
     #[test]
     fn parser_selects_each_documented_command() {
+        let git_transport_cutover = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "git-transport-cutover",
+            "--preflight",
+            "--report",
+            "/tmp/git-transport-report.json",
+            "--resolution",
+            "/tmp/git-transport-resolution.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_name(&git_transport_cutover),
+            "project_catalog_git_transport_cutover_preflight"
+        );
+
         let preflight = Cli::try_parse_from([
             "blackbox",
             "project-catalog",

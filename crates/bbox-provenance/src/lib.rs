@@ -229,6 +229,25 @@ pub fn parse_note_document(raw: &str) -> Result<GitProvenanceNote> {
     }
 }
 
+/// The closed file-edge classifier shared by authenticated import runtime and
+/// offline parity reconstruction. `RAN_BASH` and arbitrary caller-provided
+/// edge kinds remain intentionally outside the transported provenance lane.
+pub fn authenticated_edge_kind_for_call(call: &NoteToolCall) -> Option<&'static str> {
+    let kind = call
+        .edge_kind
+        .as_deref()
+        .or_else(|| match call.tool.as_str() {
+            "Read" | "read" => Some("READ_FILE"),
+            "Edit" | "edit" | "Write" | "write" => Some("EDITED_FILE"),
+            _ => None,
+        })?;
+    match kind {
+        "READ_FILE" => Some("READ_FILE"),
+        "EDITED_FILE" => Some("EDITED_FILE"),
+        _ => None,
+    }
+}
+
 pub fn split_note_documents(raw: &str) -> Vec<&str> {
     raw.split(bbox_corpus_core::git::NOTE_DOCUMENT_SEPARATOR)
         .map(str::trim)
@@ -1079,6 +1098,23 @@ mod tests {
             documents: vec![document],
             next_cursor: None,
         }
+    }
+
+    #[test]
+    fn authenticated_classifier_is_the_closed_file_edge_set() {
+        let mut note_call = call("p_00000000000000000000000000000001", 1);
+        assert_eq!(
+            authenticated_edge_kind_for_call(&note_call),
+            Some("EDITED_FILE")
+        );
+        note_call.edge_kind = None;
+        note_call.tool = "Read".to_string();
+        assert_eq!(
+            authenticated_edge_kind_for_call(&note_call),
+            Some("READ_FILE")
+        );
+        note_call.edge_kind = Some("RAN_BASH".to_string());
+        assert_eq!(authenticated_edge_kind_for_call(&note_call), None);
     }
 
     #[test]

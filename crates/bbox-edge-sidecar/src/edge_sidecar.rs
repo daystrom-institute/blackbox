@@ -101,6 +101,128 @@ pub struct ObservedEdgeLaneVersionV1 {
     pub source_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitEdgeLaneSnapshotV1 {
+    pub version_token: String,
+    pub content_sha256: String,
+    pub source_bytes: u64,
+    pub lines_seen: u64,
+}
+
+pub fn explicit_edge_lane_version(
+    edges_dir: &Path,
+    project_id: &str,
+) -> Result<ObservedEdgeLaneVersionV1> {
+    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
+        .context("validating explicit edge lane project id")?;
+    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("explicit"))? else {
+        return Ok(absent_observed_lane_version());
+    };
+    let Some(file) =
+        directory.open_regular(&format!("{project_id}.jsonl"), "explicit edge lane")?
+    else {
+        return Ok(absent_observed_lane_version());
+    };
+    observed_version_from_metadata(&file.metadata()?)
+}
+
+/// Stream one project's explicit edge lane through a bounded, no-follow
+/// reader. Cutover preflight uses this to compare legacy and authenticated
+/// provenance keys without loading a potentially large sidecar into memory.
+pub fn visit_explicit_edge_lane(
+    edges_dir: &Path,
+    project_id: &str,
+    max_source_bytes: u64,
+    max_line_bytes: usize,
+    mut visitor: impl FnMut(Edge) -> Result<()>,
+) -> Result<ExplicitEdgeLaneSnapshotV1> {
+    use std::io::Read as _;
+
+    if max_source_bytes == 0 || max_line_bytes == 0 {
+        anyhow::bail!("explicit edge lane limits must be nonzero");
+    }
+    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_owned())
+        .context("validating explicit edge lane project id")?;
+    let Some(directory) = NofollowDirectory::open_existing(&edges_dir.join("explicit"))? else {
+        return Ok(ExplicitEdgeLaneSnapshotV1 {
+            version_token: absent_observed_lane_version().version_token,
+            content_sha256: hex::encode(Sha256::digest([])),
+            source_bytes: 0,
+            lines_seen: 0,
+        });
+    };
+    let Some(mut file) =
+        directory.open_regular(&format!("{project_id}.jsonl"), "explicit edge lane")?
+    else {
+        return Ok(ExplicitEdgeLaneSnapshotV1 {
+            version_token: absent_observed_lane_version().version_token,
+            content_sha256: hex::encode(Sha256::digest([])),
+            source_bytes: 0,
+            lines_seen: 0,
+        });
+    };
+    let initial = observed_version_from_metadata(&file.metadata()?)?;
+    let source_bytes = initial.source_bytes;
+    if source_bytes > max_source_bytes {
+        anyhow::bail!(
+            "explicit edge lane is {source_bytes} bytes, exceeding the {max_source_bytes}-byte cutover scan limit"
+        );
+    }
+
+    let mut remaining = source_bytes;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0_u8; STREAMED_CHUNK_BYTES];
+    let mut splitter = StreamedLineSplitterV1::new(max_line_bytes);
+    let mut lines_seen = 0_u64;
+    let mut callback_error = None;
+    let mut on_line = |content: &[u8], _terminator: &[u8]| {
+        lines_seen = lines_seen.saturating_add(1);
+        let parsed = serde_json::from_slice::<Edge>(content)
+            .context("decoding explicit edge lane row")
+            .and_then(&mut visitor);
+        if let Err(error) = parsed {
+            callback_error = Some(error);
+            return Err("explicit_edge_lane_row_invalid");
+        }
+        Ok(())
+    };
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(STREAMED_CHUNK_BYTES as u64))
+            .expect("streamed chunk bound fits usize");
+        let read = match file.read(&mut chunk[..wanted]) {
+            Ok(0) => anyhow::bail!("explicit edge lane became shorter while it was read"),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("reading explicit edge lane"),
+        };
+        remaining -= read as u64;
+        hasher.update(&chunk[..read]);
+        if let Err(code) = splitter.push_chunk(&chunk[..read], &mut on_line) {
+            if let Some(error) = callback_error.take() {
+                return Err(error);
+            }
+            anyhow::bail!("{code}");
+        }
+    }
+    if let Err(code) = splitter.finish(&mut on_line) {
+        if let Some(error) = callback_error.take() {
+            return Err(error);
+        }
+        anyhow::bail!("{code}");
+    }
+
+    let current = explicit_edge_lane_version(edges_dir, project_id.as_str())?;
+    if current != initial {
+        anyhow::bail!("explicit edge lane changed during cutover scan");
+    }
+    Ok(ExplicitEdgeLaneSnapshotV1 {
+        version_token: initial.version_token,
+        content_sha256: hex::encode(hasher.finalize()),
+        source_bytes,
+        lines_seen,
+    })
+}
+
 /// Probe the current observed lane without reading its contents. This is the
 /// continuation/receipt fast path: an unchanged token lets the daemon reuse a
 /// bounded cached plan instead of re-scanning a potentially large lane.
@@ -2369,6 +2491,50 @@ mod project_catalog_snapshot_tests {
                     .to_string_lossy()
                     .ends_with(".tmp"))
         );
+    }
+
+    #[test]
+    fn cutover_explicit_reader_is_bounded_and_observational() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("edges");
+        let project_id = "p_00000000000000000000000000000001";
+        let edges = [explicit_edge("task:first"), explicit_edge("task:second")];
+        append_explicit_edges(&root, project_id, &edges).unwrap();
+        let before =
+            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl"))).unwrap();
+        let mut seen = Vec::new();
+        let snapshot =
+            visit_explicit_edge_lane(&root, project_id, 1024 * 1024, 1024 * 1024, |edge| {
+                seen.push(edge);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, edges);
+        assert_eq!(snapshot.lines_seen, 2);
+        assert_eq!(snapshot.source_bytes, before.len() as u64);
+        assert_eq!(
+            snapshot.content_sha256,
+            hex::encode(Sha256::digest(&before))
+        );
+        assert!(visit_explicit_edge_lane(&root, project_id, 1, 1024, |_| Ok(())).is_err());
+        let line_error =
+            visit_explicit_edge_lane(&root, project_id, before.len() as u64, 1, |_| Ok(()))
+                .unwrap_err();
+        assert!(line_error.to_string().contains("owner_source_line_limit"));
+        assert_eq!(
+            std::fs::read(root.join("explicit").join(format!("{project_id}.jsonl")),).unwrap(),
+            before
+        );
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("explicit").join(format!("{project_id}.jsonl")))
+            .unwrap();
+        file.set_len(94 * 1024 * 1024 * 1024).unwrap();
+        let oversized =
+            visit_explicit_edge_lane(&root, project_id, 4 * 1024 * 1024 * 1024, 1024, |_| Ok(()))
+                .unwrap_err();
+        assert!(oversized.to_string().contains("100931731456 bytes"));
     }
 
     #[test]

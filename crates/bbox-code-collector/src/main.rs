@@ -291,11 +291,11 @@ async fn publish_project_provenance(
     if committed_scope != project.scope {
         bail!("configured provenance scope does not match committed project identity");
     }
-    let mut resolved_project_id = None;
+    let mut resolved_export = None;
     for restart in 0..=MAX_PROVENANCE_STALE_RESTARTS {
         match publish_project_provenance_attempt(runtime, &root, &project.scope).await {
-            Ok(project_id) => {
-                resolved_project_id = Some(project_id);
+            Ok(export) => {
+                resolved_export = Some(export);
                 break;
             }
             Err(error)
@@ -310,8 +310,8 @@ async fn publish_project_provenance(
             Err(error) => return Err(error),
         }
     }
-    let project_id = resolved_project_id.context("provenance export did not converge")?;
-    let captured = capture_provenance_import(&root, &project.scope, &project_id)?;
+    let (project_id, notes_ref) = resolved_export.context("provenance export did not converge")?;
+    let captured = capture_provenance_import(&root, &project.scope, &project_id, &notes_ref)?;
     publish_provenance_import(runtime, captured, status_timeout).await
 }
 
@@ -319,7 +319,7 @@ async fn publish_project_provenance_attempt(
     runtime: &Runtime,
     root: &Path,
     scope: &PublishedScope,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let mut cursor = None;
     let mut generation = None;
     let mut project_id = None;
@@ -456,7 +456,10 @@ async fn publish_project_provenance_attempt(
         unchanged = receipt.unchanged,
         "provenance export reached durable terminal success"
     );
-    project_id.context("provenance export returned no project id")
+    Ok((
+        project_id.context("provenance export returned no project id")?,
+        receipt.notes_ref,
+    ))
 }
 
 fn require_stable_value<T: Clone + PartialEq>(
@@ -478,19 +481,20 @@ fn capture_provenance_import(
     root: &Path,
     scope: &PublishedScope,
     project_id: &str,
+    notes_ref: &str,
 ) -> Result<CapturedProvenanceImport> {
     let authority = bbox_corpus_core::json_store::NofollowDirectory::open_existing(root)?
         .ok_or_else(|| anyhow!("provenance project root disappeared"))?;
     let repository = bbox_corpus_core::git::open_stable_git_repository(&authority)?
         .ok_or_else(|| anyhow!("provenance project has no stable Git repository"))?;
-    let notes_ref = bbox_corpus_core::git::notes_ref("provenance")?;
+    bbox_provenance::validate_notes_ref(notes_ref)?;
     let limits = GitSourceLimits::default();
     let documents = tempfile::tempdir()?;
     let mut entries = Vec::new();
     let mut logical_bytes = 0_u64;
     let notes_tip = repository
         .visit_notes_generation_bounded(
-            &notes_ref,
+            notes_ref,
             usize::try_from(limits.max_provenance_documents).unwrap_or(usize::MAX),
             usize::try_from(limits.max_provenance_logical_bytes).unwrap_or(usize::MAX),
             |note| {
@@ -539,7 +543,7 @@ fn capture_provenance_import(
     let descriptor = ProvenanceImportDescriptorV1 {
         schema_version: GIT_SOURCE_SCHEMA_VERSION,
         scope: scope.clone(),
-        notes_ref,
+        notes_ref: notes_ref.to_string(),
         notes_tip,
         manifest_sha256: provenance_manifest_sha256(&entries),
         document_count: entries.len() as u64,
@@ -2124,10 +2128,11 @@ mod tests {
             .unwrap()
             .remove(0);
         let document = bbox_provenance::ProvenanceExportDocument::from_note(&part).unwrap();
+        let notes_ref = "refs/notes/bb/provenance";
         let plan = bbox_provenance::ProvenanceExportPlan::new(
             scope.clone(),
             "project",
-            "refs/notes/bbox/provenance",
+            notes_ref,
             vec![document],
         )
         .unwrap();
@@ -2137,10 +2142,11 @@ mod tests {
         // and still produce a valid terminal receipt.
         let first = bbox_provenance::apply_export_page(&root, &page).unwrap();
         assert_eq!(first.written, 1);
-        let captured = capture_provenance_import(&root, &scope, "project").unwrap();
+        let captured = capture_provenance_import(&root, &scope, "project", notes_ref).unwrap();
         assert_eq!(captured.entries.len(), 1);
         assert_eq!(captured.entries[0].note_commit, head);
         assert!(!captured.descriptor.notes_tip.is_empty());
+        assert_eq!(captured.descriptor.notes_ref, notes_ref);
         assert_eq!(
             fs::read_to_string(
                 captured
