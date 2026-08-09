@@ -32,6 +32,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use bro_core::WorkspaceId;
+
 use crate::worker::{REDACTED, WorkerSpawnSpec};
 
 /// The shared-secret bearer token, as it crosses the wire.
@@ -133,6 +135,8 @@ pub enum FleetdToDaemon {
         session_id: String,
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<WorkspaceId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u32>,
     },
     /// One raw harness stdout envelope line, relayed verbatim. `seq` is the
@@ -208,6 +212,8 @@ pub struct SessionSummary {
     pub session_id: String,
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub state: SessionState,
     /// Highest event seq fleetd has observed on this session's stdout. `None`
@@ -232,6 +238,24 @@ mod tests {
         assert_eq!(message, &back);
     }
 
+    #[test]
+    fn legacy_session_started_without_workspace_id_decodes_unbound() {
+        let decoded: FleetdToDaemon = serde_json::from_value(json!({
+            "type": "session_started",
+            "session_id": "sess-1",
+            "task_id": "task-1",
+            "pid": 42
+        }))
+        .unwrap();
+        assert!(matches!(
+            decoded,
+            FleetdToDaemon::SessionStarted {
+                workspace_id: None,
+                ..
+            }
+        ));
+    }
+
     fn round_trip_fleetd(message: &FleetdToDaemon) {
         let text = serde_json::to_string(message).expect("serialize");
         let back: FleetdToDaemon = serde_json::from_str(&text).expect("deserialize");
@@ -242,6 +266,7 @@ mod tests {
         WorkerSpawnSpec {
             task_id: "task-1".to_string(),
             session_id: "sess-1".to_string(),
+            workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
             provider: bro_core::Provider::Glm,
             bin_override: Some("bro-harness".to_string()),
             argv: vec!["--daemon-worker".to_string()],
@@ -293,6 +318,7 @@ mod tests {
             FleetdToDaemon::SessionStarted {
                 session_id: "sess-1".to_string(),
                 task_id: "task-1".to_string(),
+                workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
                 pid: Some(4242),
             },
             FleetdToDaemon::Event {
@@ -314,6 +340,9 @@ mod tests {
                 sessions: vec![SessionSummary {
                     session_id: "sess-1".to_string(),
                     task_id: "task-1".to_string(),
+                    workspace_id: Some(
+                        WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+                    ),
                     pid: Some(4242),
                     state: SessionState::Running,
                     last_seq: Some(7),

@@ -3474,6 +3474,7 @@ fn prepare_harness_child_launch(
     Ok(bro_protocol::WorkerSpawnSpec {
         task_id,
         session_id: supervision_id,
+        workspace_id: workspace_id_for_cwd(cwd)?,
         provider,
         bin_override,
         argv: args,
@@ -3487,6 +3488,31 @@ fn prepare_harness_child_launch(
         bro_home,
         event_log_path,
     })
+}
+
+/// Resolve the portable workspace identity only for an explicitly managed
+/// checkout. An ordinary cwd is never promoted into authority, while an
+/// unsafe marker on a managed checkout fails the dispatch rather than silently
+/// erasing its workspace binding. The create-once identity helper repairs an
+/// empty or malformed marker by minting a fresh, reuse-safe identity.
+fn workspace_id_for_cwd(cwd: Option<&str>) -> anyhow::Result<Option<bro_core::WorkspaceId>> {
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    let Some(checkout) = bbox_corpus_core::git::managed_checkout_root(std::path::Path::new(cwd))
+    else {
+        return Ok(None);
+    };
+    let marker = checkout.join(".bbox/local/checkout-id");
+    let raw = bbox_corpus_core::identity::ensure_checkout_id(&checkout)?;
+    bro_core::WorkspaceId::parse(raw)
+        .map(Some)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid workspace identity marker {}: {error}",
+                marker.display()
+            )
+        })
 }
 
 /// Build the child's transcript location from the pinned spec fields. Returns
@@ -4897,6 +4923,74 @@ mod tests {
     fn test_tail_tx() -> tokio::sync::broadcast::Sender<tail::TailEvent> {
         let (tail_tx, _) = tokio::sync::broadcast::channel(16);
         tail_tx
+    }
+
+    #[test]
+    fn managed_checkout_workspace_id_uses_existing_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(
+            root.join(".git/blackbox-managed-checkout"),
+            format!("{}\n", bbox_corpus_core::git::MANAGED_CHECKOUT_MARKER_V1),
+        )
+        .unwrap();
+        let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&root).unwrap();
+
+        let workspace_id = workspace_id_for_cwd(root.to_str()).unwrap().unwrap();
+        assert_eq!(workspace_id.as_str(), checkout_id);
+    }
+
+    #[test]
+    fn managed_checkout_workspace_id_repairs_bad_marker_with_fresh_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(
+            root.join(".git/blackbox-managed-checkout"),
+            format!("{}\n", bbox_corpus_core::git::MANAGED_CHECKOUT_MARKER_V1),
+        )
+        .unwrap();
+        bbox_corpus_core::identity::ensure_checkout_id(&root).unwrap();
+        std::fs::write(
+            root.join(".bbox/local/checkout-id"),
+            "0123456789abcdef0123456789abcdeF\n",
+        )
+        .unwrap();
+
+        let workspace_id = workspace_id_for_cwd(root.to_str()).unwrap().unwrap();
+        assert_ne!(workspace_id.as_str(), "0123456789abcdef0123456789abcdeF");
+        assert_eq!(
+            bbox_corpus_core::identity::read_checkout_id(&root.join(".bbox/local/checkout-id"))
+                .unwrap()
+                .as_deref(),
+            Some(workspace_id.as_str())
+        );
+    }
+
+    #[test]
+    fn ordinary_checkout_does_not_gain_workspace_authority_from_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        bbox_corpus_core::identity::ensure_checkout_id(&root).unwrap();
+
+        assert_eq!(workspace_id_for_cwd(root.to_str()).unwrap(), None);
     }
 
     #[test]

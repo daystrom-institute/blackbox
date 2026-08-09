@@ -381,6 +381,7 @@ fn dispatch(state: Arc<Fleetd>, body: DaemonToFleetd) {
 async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
     let session_id = spec.session_id.clone();
     let task_id = spec.task_id.clone();
+    let workspace_id = spec.workspace_id.clone();
     let event_log_path = spec.event_log_path.clone();
 
     if state.registry().contains(&session_id) {
@@ -415,6 +416,7 @@ async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
     state.registry().insert(SessionEntry {
         session_id: session_id.clone(),
         task_id: task_id.clone(),
+        workspace_id: workspace_id.clone(),
         pid,
         state: SessionState::Running,
         last_seq: None,
@@ -427,6 +429,7 @@ async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
     state.emit(FleetdToDaemon::SessionStarted {
         session_id: session_id.clone(),
         task_id,
+        workspace_id,
         pid,
     });
 

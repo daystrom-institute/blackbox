@@ -138,6 +138,28 @@ impl WorkingGapSnapshot {
     }
 }
 
+/// Immutable gap bytes at the verified merge base.
+///
+/// Local Git acquisition and remote ancestry/manifest verification both
+/// construct this type before entering the source-neutral overlay core.
+#[derive(Debug, Clone, Default)]
+pub struct BaselineGapSnapshot {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl BaselineGapSnapshot {
+    pub fn new(files: BTreeMap<String, Vec<u8>>) -> Result<Self> {
+        for filename in files.keys() {
+            validate_snapshot_filename(filename, "gap")?;
+        }
+        Ok(Self { files })
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GapOverlayKey {
     pub published_scope: PublishedScope,
@@ -679,8 +701,31 @@ pub fn recompute_catalog_overlay_result(
     let tree_dir = gaps_tree_dir(published.published_scope);
     let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, None)
         .map_err(GapOverlayRecomputeError::transient)?;
+    let baseline =
+        BaselineGapSnapshot::new(baseline).map_err(GapOverlayRecomputeError::invalid_content)?;
+    recompute_catalog_overlay_from_sources(
+        published,
+        &checkout_head,
+        &merge_base,
+        &baseline,
+        working,
+    )
+}
+
+/// Compute a catalog gap overlay from already-verified source facts.
+///
+/// This function performs no filesystem or Git access. Authority adapters
+/// acquire and validate their source material before converging here.
+pub fn recompute_catalog_overlay_from_sources(
+    published: CatalogGapOverlayPublished<'_>,
+    checkout_head: &str,
+    merge_base: &str,
+    baseline: &BaselineGapSnapshot,
+    working: &WorkingGapSnapshot,
+) -> std::result::Result<GapOverlaySnapshot, GapOverlayRecomputeError> {
+    let baseline = &baseline.files;
     let working = &working.files;
-    validate_gap_map(&baseline, "baseline").map_err(GapOverlayRecomputeError::invalid_content)?;
+    validate_gap_map(baseline, "baseline").map_err(GapOverlayRecomputeError::invalid_content)?;
     validate_gap_map(working, "working").map_err(GapOverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(working);
     // A catalog overlay row carries no host path: the gap view stamps
@@ -692,8 +737,8 @@ pub fn recompute_catalog_overlay_result(
         checkout_id: published.checkout_id.to_string(),
         published_ref: published.full_ref.to_string(),
         publisher_commit: published.accepted_commit.to_string(),
-        checkout_head,
-        merge_base,
+        checkout_head: checkout_head.to_string(),
+        merge_base: merge_base.to_string(),
         working_fingerprint,
         accepted_generation: Some(published.accepted_generation.to_string()),
     };
@@ -1301,6 +1346,64 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn catalog_gap_checkout_adapter_matches_source_neutral_core_byte_for_byte() {
+        let fixture = catalog_gap_fixture();
+        write_gap(&fixture.worktree, &gap("gap-11111111", "changed"));
+        write_gap(&fixture.worktree, &gap("gap-33333333", "untracked"));
+        std::fs::remove_file(fixture.worktree.join(".bbox/gaps/gap-22222222.json")).unwrap();
+        let working = working_snapshot(&fixture.worktree);
+
+        let adapter = recompute_catalog_overlay_result(
+            CatalogGapOverlayPublished {
+                published_scope: &fixture.scope,
+                checkout_id: "checkout-1",
+                full_ref: "refs/heads/main",
+                accepted_commit: &fixture.accepted_commit,
+                accepted_generation: "generation-1",
+                published: &fixture.published,
+            },
+            &fixture.worktree,
+            &working,
+        )
+        .unwrap();
+        let checkout_head = bbox_corpus_core::git::current_head(&fixture.worktree).unwrap();
+        let merge_base = bbox_corpus_core::git::merge_base(
+            &fixture.worktree,
+            &checkout_head,
+            &fixture.accepted_commit,
+        )
+        .unwrap();
+        let baseline = read_committed_map(
+            &fixture.worktree,
+            &merge_base,
+            &gaps_tree_dir(&fixture.scope),
+            None,
+        )
+        .unwrap();
+        let baseline = BaselineGapSnapshot::new(baseline).unwrap();
+        let direct = recompute_catalog_overlay_from_sources(
+            CatalogGapOverlayPublished {
+                published_scope: &fixture.scope,
+                checkout_id: "checkout-1",
+                full_ref: "refs/heads/main",
+                accepted_commit: &fixture.accepted_commit,
+                accepted_generation: "generation-1",
+                published: &fixture.published,
+            },
+            &checkout_head,
+            &merge_base,
+            &baseline,
+            &working,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(adapter).unwrap(),
+            serde_json::to_value(direct).unwrap()
+        );
     }
 
     #[test]

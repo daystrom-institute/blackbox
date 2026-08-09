@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use bro_core::Provider;
+use bro_core::{Provider, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -115,6 +115,10 @@ pub struct WorkerSpawnSpec {
     /// this before spawn; a placeholder such as `pending` is possible on legacy
     /// paths until the first stream event.
     pub session_id: String,
+    /// Reuse-safe identity of the concrete workspace this child owns. Cwd is
+    /// still the executor path; this id is the portable session/artifact key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<WorkspaceId>,
     /// Provider lane this worker runs.
     pub provider: Provider,
     /// Binary name/path from `BRO_HARNESS_BIN` or provider config. `None` lets
@@ -168,6 +172,7 @@ mod tests {
         WorkerSpawnSpec {
             task_id: "task-abc".to_string(),
             session_id: "sess-xyz".to_string(),
+            workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
             provider: Provider::Glm,
             bin_override: Some("bro-harness".to_string()),
             argv: vec![
@@ -190,6 +195,14 @@ mod tests {
         let json = serde_json::to_string(&spec).expect("serialize");
         let back: WorkerSpawnSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn legacy_spec_without_workspace_id_decodes_unbound() {
+        let mut value = serde_json::to_value(sample_spec()).unwrap();
+        value.as_object_mut().unwrap().remove("workspace_id");
+        let decoded: WorkerSpawnSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.workspace_id, None);
     }
 
     #[test]

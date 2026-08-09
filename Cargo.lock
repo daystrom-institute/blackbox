@@ -670,6 +670,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-knowledge-source"
+version = "0.0.1"
+dependencies = [
+ "bbox-corpus-core",
+ "bro-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bbox-lsp"
 version = "0.0.1"
 dependencies = [
@@ -1208,6 +1221,7 @@ name = "bro-core"
 version = "0.0.1"
 dependencies = [
  "serde",
+ "serde_json",
  "strum 0.26.3",
 ]
 

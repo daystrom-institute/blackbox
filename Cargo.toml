@@ -34,6 +34,7 @@ members = [
     "crates/bbox-code-collector",
     "crates/bbox-git-source",
     "crates/bbox-git-source-store",
+    "crates/bbox-knowledge-source",
     "crates/bbox-provenance",
     "crates/bbox-corpus-index",
     "crates/bbox-edge-sidecar",

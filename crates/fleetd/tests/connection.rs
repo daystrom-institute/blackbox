@@ -153,6 +153,7 @@ fn spec_for(stub: &Path, session_id: &str, event_log_path: PathBuf) -> WorkerSpa
     WorkerSpawnSpec {
         task_id: format!("task-{session_id}"),
         session_id: session_id.to_string(),
+        workspace_id: None,
         provider: bro_core::Provider::Glm,
         bin_override: Some(stub.to_string_lossy().into_owned()),
         argv: vec![],
@@ -307,10 +308,12 @@ async fn spawn_relays_events_then_the_terminal_outcome() {
         FleetdToDaemon::SessionStarted {
             session_id,
             task_id,
+            workspace_id,
             pid,
         } => {
             assert_eq!(session_id, "sess-1");
             assert_eq!(task_id, "task-sess-1");
+            assert_eq!(workspace_id, None);
             assert!(pid.is_some(), "a spawned child must report a pid");
         }
         other => panic!("expected session_started, got {other:?}"),

@@ -166,6 +166,29 @@ impl WorkingKnowledgeSnapshot {
     }
 }
 
+/// Immutable knowledge bytes at the verified merge base.
+///
+/// The local adapter fills this from the checkout object database. Remote
+/// transport verifies its ancestry and manifest before constructing the same
+/// type, leaving the overlay core independent of Git and host paths.
+#[derive(Debug, Clone, Default)]
+pub struct BaselineKnowledgeSnapshot {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl BaselineKnowledgeSnapshot {
+    pub fn new(files: BTreeMap<String, Vec<u8>>) -> Result<Self> {
+        for filename in files.keys() {
+            validate_snapshot_filename(filename, "knowledge")?;
+        }
+        Ok(Self { files })
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OverlayKey {
     pub published_scope: PublishedScope,
@@ -734,9 +757,32 @@ pub fn recompute_catalog_overlay_result(
     // Baseline is read from the checkout at B, with no alternate.
     let baseline = read_committed_map(checkout_root, &merge_base, &tree_dir, None)
         .map_err(OverlayRecomputeError::transient)?;
+    let baseline =
+        BaselineKnowledgeSnapshot::new(baseline).map_err(OverlayRecomputeError::invalid_content)?;
+    recompute_catalog_overlay_from_sources(
+        published,
+        &checkout_head,
+        &merge_base,
+        &baseline,
+        working,
+    )
+}
+
+/// Compute a catalog overlay from already-verified source facts.
+///
+/// This function performs no filesystem or Git access. Both the checkout
+/// adapter and the remote source adapter converge here after acquiring and
+/// verifying the accepted generation, ancestry, baseline, and working bytes.
+pub fn recompute_catalog_overlay_from_sources(
+    published: CatalogOverlayPublished<'_>,
+    checkout_head: &str,
+    merge_base: &str,
+    baseline: &BaselineKnowledgeSnapshot,
+    working: &WorkingKnowledgeSnapshot,
+) -> std::result::Result<OverlaySnapshot, OverlayRecomputeError> {
+    let baseline = &baseline.files;
     let working = &working.files;
-    validate_knowledge_map(&baseline, "baseline")
-        .map_err(OverlayRecomputeError::invalid_content)?;
+    validate_knowledge_map(baseline, "baseline").map_err(OverlayRecomputeError::invalid_content)?;
     validate_knowledge_map(working, "working").map_err(OverlayRecomputeError::invalid_content)?;
     let working_fingerprint = fingerprint_map(working);
     let values = overlay_values_from_maps(&baseline, published.published, working)?;
@@ -746,8 +792,8 @@ pub fn recompute_catalog_overlay_result(
         checkout_id: published.checkout_id.to_string(),
         published_ref: published.full_ref.to_string(),
         publisher_commit: published.accepted_commit.to_string(),
-        checkout_head,
-        merge_base,
+        checkout_head: checkout_head.to_string(),
+        merge_base: merge_base.to_string(),
         working_fingerprint,
         accepted_generation: Some(published.accepted_generation.to_string()),
     };
@@ -1364,6 +1410,42 @@ mod tests {
         assert_eq!(stamp.merge_base, fixture.accepted_commit);
         assert_eq!(stamp.accepted_generation.as_deref(), Some("generation-1"));
         assert_eq!(snapshot.key.checkout_id, "checkout-1");
+    }
+
+    #[test]
+    fn catalog_checkout_adapter_matches_source_neutral_core_byte_for_byte() {
+        let fixture = catalog_fixture();
+        write_entry(&fixture.worktree, &entry("keep", "changed"));
+        write_entry(&fixture.worktree, &entry("new", "untracked"));
+        std::fs::remove_file(fixture.worktree.join(".bbox/knowledge/remove.json")).unwrap();
+        let working = working_snapshot(&fixture.worktree);
+
+        let adapter =
+            recompute_catalog_overlay_result(fixture.input(), &fixture.worktree, &working).unwrap();
+        let checkout_head = git::current_head(&fixture.worktree).unwrap();
+        let merge_base =
+            git::merge_base(&fixture.worktree, &checkout_head, &fixture.accepted_commit).unwrap();
+        let baseline = read_committed_map(
+            &fixture.worktree,
+            &merge_base,
+            &knowledge_tree_dir(&fixture.scope),
+            None,
+        )
+        .unwrap();
+        let baseline = BaselineKnowledgeSnapshot::new(baseline).unwrap();
+        let direct = recompute_catalog_overlay_from_sources(
+            fixture.input(),
+            &checkout_head,
+            &merge_base,
+            &baseline,
+            &working,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(adapter).unwrap(),
+            serde_json::to_value(direct).unwrap()
+        );
     }
 
     #[test]

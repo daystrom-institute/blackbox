@@ -18,6 +18,7 @@ name = "fleetd"
 path = "src/main.rs"
 
 [dependencies]
+bro-core = { path = "../bro-core" }
 bro-protocol = { path = "../bro-protocol" }
 bro-rpc = { path = "../bro-rpc" }
 
@@ -39,7 +40,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-bro-core = { path = "../bro-core" }
 serde_json = "1"
 tempfile = "3"
 

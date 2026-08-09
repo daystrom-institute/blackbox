@@ -484,6 +484,7 @@ mod tests {
         WorkerSpawnSpec {
             task_id: "task-1".to_string(),
             session_id: "sess-1".to_string(),
+            workspace_id: None,
             provider: bro_core::Provider::Glm,
             bin_override: None,
             argv: vec![],
