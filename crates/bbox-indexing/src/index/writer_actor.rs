@@ -3250,7 +3250,7 @@ mod tests {
             None,
             ProjectLeasePurpose::Reindex,
             &HashMap::new(),
-            &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
         )
         .unwrap();
         assert!(matches!(

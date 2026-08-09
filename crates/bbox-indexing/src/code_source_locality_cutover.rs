@@ -224,7 +224,7 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
         ));
         let row = CodeSourceLocalityCutoverRowV1 {
             project_id: project_id.clone(),
-            scope,
+            scope: scope.clone(),
             producer_id: "producer".into(),
             generation,
             startup_recovery: observation(CodeSourceLocalityEvidenceKindV1::StartupRecovery),
@@ -725,8 +725,8 @@ mod tests {
         };
         let startup = observation(CodeSourceLocalityEvidenceKindV1::StartupRecovery, 1);
         CodeSourceLocalityCutoverRowV1 {
-            project_id,
-            scope,
+            project_id: project_id.clone(),
+            scope: scope.clone(),
             producer_id: "producer".into(),
             generation: generation_from_observation(&startup),
             startup_recovery: startup,
