@@ -4241,7 +4241,10 @@ impl<'a> ScopeFilter<'a> {
     fn matches(&self, entry: &KnowledgeEntry) -> bool {
         match (self, &entry.scope) {
             (ScopeFilter::Global, Scope::Global) => true,
-            (ScopeFilter::Project(dir), Scope::Project) => entry.project.as_deref() == Some(*dir),
+            (ScopeFilter::Project(selector), Scope::Project) => {
+                entry.project.as_deref() == Some(*selector)
+                    || entry.project_id.as_deref() == Some(*selector)
+            }
             _ => false,
         }
     }

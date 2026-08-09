@@ -231,9 +231,16 @@ impl BlackboxServer {
                     Some(&durable_scope),
                     p.provisional.as_deref(),
                 )?;
+                let render_scope = if server.state.project_authority.is_bridge() {
+                    durable_scope.clone()
+                } else {
+                    resolved_project_id
+                        .clone()
+                        .unwrap_or_else(|| durable_scope.clone())
+                };
                 let mut render = |root: &std::path::Path| {
                     p.project = Some(root.to_string_lossy().into_owned());
-                    p.scope_project = Some(durable_scope.clone());
+                    p.scope_project = Some(render_scope.clone());
                     view.knowledge.render(&p)
                 };
                 if let Some(checkout) = checkout.as_ref() {
@@ -1024,6 +1031,18 @@ mod catalog_render_tests {
                 .is_ok()
         );
         let before = server.state.checkout_access.health().sequence;
+        let legacy = server
+            .bbox_render(Parameters(RenderParams {
+                project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                scope: Some("project".into()),
+                provisional: Some("published".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(is_error(&legacy), "{}", text(&legacy));
+        assert!(text(&legacy).contains("error.render_locality_required"));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
+
         let planned = server
             .bbox_render(Parameters(RenderParams {
                 provider: Some("claude".into()),
@@ -1075,5 +1094,47 @@ mod catalog_render_tests {
             .await;
         assert!(!is_error(&completed), "{}", text(&completed));
         assert_eq!(server.state.checkout_access.health().sequence, before);
+    }
+
+    #[tokio::test]
+    async fn catalog_compat_render_keeps_accepted_project_entries_visible() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(PROJECT, &scope, COMMIT_ONE, &[render_entry()], &[]);
+        let checkout = fixture.root().join("render-compat-checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let attachment = "att_00000000000000000000000000000e21";
+        fixture.attach_overlay_checkout(
+            PROJECT,
+            &scope,
+            &checkout,
+            attachment,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaae21",
+            true,
+        );
+        fixture.grant_capabilities(
+            attachment,
+            bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                render_output: true,
+                ..Default::default()
+            },
+        );
+        let server = fixture.server_with_checkout_authority();
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                project: Some(PROJECT.into()),
+                scope: Some("project".into()),
+                provisional: Some("published".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(!is_error(&result), "{}", text(&result));
+        assert!(
+            std::fs::read_to_string(checkout.join("CLAUDE.md"))
+                .unwrap()
+                .contains("DAEMON_RENDER_LOCALITY_MARKER")
+        );
     }
 }
