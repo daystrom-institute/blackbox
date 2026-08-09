@@ -383,8 +383,19 @@ fn observed_provenance_target_is_member(
 ) -> bool {
     edge_index.any_reverse_edge(target, |edge| {
         matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE")
-            && edge.project_id.as_deref() == Some(project_id)
             && edge.metadata.get("anchor.project_id").map(String::as_str) == Some(project_id)
+            // Observed rows written before the catalog-owner backfill have
+            // no typed project_id. Their per-project lane and anchor remain
+            // valid historical authority. Authenticated import rows also
+            // omit project_id, so exclude their durable generation marker to
+            // prevent one import from recursively authorizing another.
+            && edge
+                .project_id
+                .as_deref()
+                .is_none_or(|owner| owner == project_id)
+            && !edge
+                .metadata
+                .contains_key("provenance.import_generation_id")
     })
 }
 
@@ -489,8 +500,16 @@ mod tests {
             &target,
         ));
 
-        let mut imported = observed;
-        imported.project_id = None;
+        let mut legacy_unstamped = observed;
+        legacy_unstamped.project_id = None;
+        let legacy_index = EdgeIndex::from_edges_for_tests(vec![legacy_unstamped.clone()]);
+        assert!(observed_provenance_target_is_member(
+            &legacy_index,
+            project_id,
+            &target,
+        ));
+
+        let mut imported = legacy_unstamped;
         imported.metadata.insert(
             "provenance.import_generation_id".into(),
             "pis_fixture".into(),
