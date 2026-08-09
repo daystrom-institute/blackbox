@@ -465,11 +465,86 @@ mod tests {
     use super::*;
     use bbox_chunker::{EdgeConfidence, EdgeProvenance};
     use std::collections::BTreeMap;
+    use std::process::Command;
 
     #[test]
     fn locality_transport_is_absent_from_the_public_blame_schema() {
         let schema = serde_json::to_string(&rmcp::schemars::schema_for!(BlameParams)).unwrap();
         assert!(!schema.contains("_blame_locality"), "{schema}");
+    }
+
+    #[test]
+    fn locality_fact_preserves_the_legacy_blame_response_exactly() {
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameAttributionV1, BlameExecutionV1, BlameFactV1,
+        };
+        use bbox_corpus_core::identity::PublishedScope;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let contents = b"fn main() {}\n";
+        std::fs::write(root.join("src/main.rs"), contents).unwrap();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Blackbox Test",
+                "-c",
+                "user.email=blackbox@example.invalid",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        );
+
+        let index = EdgeIndex::from_edges_for_tests(Vec::new());
+        let legacy = blame(
+            ValidatedBlameTarget {
+                git_root: root.clone(),
+                git_relative_path: PathBuf::from("src/main.rs"),
+                display_path: "src/main.rs".into(),
+                line: Some(1),
+                byte_offset: None,
+                source: BlameSource::WorkingTree {
+                    content: contents.to_vec(),
+                },
+            },
+            &index,
+        )
+        .unwrap();
+        let attribution = bbox_corpus_core::git::blame_for_line_in_root(
+            &root,
+            std::path::Path::new("src/main.rs"),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let fact = BlameFactV1 {
+            version: BLAME_TRANSPORT_VERSION,
+            project_id: "project".into(),
+            scope: PublishedScope::try_new("repo", ".").unwrap(),
+            workspace_id: "a".repeat(32),
+            git_relative_path: attribution.rel_path.clone(),
+            display_path: "src/main.rs".into(),
+            line: 1,
+            execution: BlameExecutionV1::WorkspaceCurrent {
+                head_commit: Some(attribution.commit_sha.clone()),
+            },
+            attribution: Some(BlameAttributionV1 {
+                commit_sha: attribution.commit_sha,
+                author: attribution.author,
+                author_time: attribution.author_time,
+                git_relative_path: attribution.rel_path,
+            }),
+        };
+
+        let locality = enrich_fact(&fact, &index).unwrap();
+
+        assert_eq!(locality, legacy);
+        assert!(!locality.contains(root.to_str().unwrap()));
     }
 
     #[test]
@@ -577,6 +652,21 @@ mod tests {
                 .get("anchor.file_path")
                 .map(String::as_str),
             Some("src/recent.rs")
+        );
+    }
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
