@@ -18,8 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bro_protocol::{
-    BearerToken, DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState,
-    WorkerSpawnSpec,
+    BearerToken, DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SecretEnv, SessionState,
+    WORKSPACE_BINDING_ENV, WORKSPACE_SCOPE_ENV, WorkerSpawnSpec, WorkerWorkspaceScope,
+    WorkspaceInspectionOutcome, WorkspaceInspectionRequest,
 };
 use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceToken};
 use fleetd::server::{Fleetd, bind_listener, bind_tcp_listener, build_identity, serve, serve_tcp};
@@ -199,11 +200,22 @@ fn write_stub(root: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+fn git(root: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .expect("run git fixture command");
+    assert!(status.success(), "git fixture command failed: {args:?}");
+}
+
 fn spec_for(stub: &Path, session_id: &str, event_log_path: PathBuf) -> WorkerSpawnSpec {
     WorkerSpawnSpec {
         task_id: format!("task-{session_id}"),
         session_id: session_id.to_string(),
         workspace_id: None,
+        workspace_scope: None,
         provider: bro_core::Provider::Glm,
         bin_override: Some(stub.to_string_lossy().into_owned()),
         argv: vec![],
@@ -239,6 +251,119 @@ async fn authenticated_connection_becomes_the_owner() {
     let generation = daemon.authenticate().await;
     assert_eq!(generation, 1, "first connection gets generation 1");
     assert!(harness.state.has_owner());
+}
+
+#[tokio::test]
+async fn workspace_inspection_proves_managed_checkout_scope_and_stable_identity() {
+    let harness = start_fleetd().await;
+    let workspace = harness.root.join("managed-workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    git(
+        &workspace,
+        &["config", "user.email", "test@example.invalid"],
+    );
+    git(&workspace, &["config", "user.name", "Fleetd Test"]);
+    std::fs::create_dir_all(workspace.join(".bbox")).unwrap();
+    std::fs::write(
+        workspace.join(".bbox/config.toml"),
+        "[project]\nrepo_id = \"repo-fixture\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    git(&workspace, &["add", ".bbox/config.toml", "src/lib.rs"]);
+    git(&workspace, &["commit", "-q", "-m", "fixture"]);
+    std::fs::write(
+        workspace.join(".git/blackbox-managed-checkout"),
+        "blackbox-managed-checkout-v1\n",
+    )
+    .unwrap();
+
+    let scope = WorkerWorkspaceScope::try_new("repo-fixture", ".").unwrap();
+    let mut daemon = FakeDaemon::connect(&harness.socket).await.expect("connect");
+    daemon.authenticate().await;
+    daemon
+        .send(DaemonToFleetd::InspectWorkspace {
+            request_id: "inspect-1".to_string(),
+            request: WorkspaceInspectionRequest {
+                cwd: workspace.join("src").to_string_lossy().into_owned(),
+                candidate_scopes: vec![scope.clone()],
+            },
+        })
+        .await;
+    let first_id = match daemon.expect().await {
+        FleetdToDaemon::WorkspaceInspected {
+            request_id,
+            outcome: WorkspaceInspectionOutcome::Managed { identity },
+        } => {
+            assert_eq!(request_id, "inspect-1");
+            assert_eq!(identity.scope, scope);
+            identity.workspace_id
+        }
+        other => panic!("expected managed workspace identity, got {other:?}"),
+    };
+
+    daemon
+        .send(DaemonToFleetd::InspectWorkspace {
+            request_id: "inspect-2".to_string(),
+            request: WorkspaceInspectionRequest {
+                cwd: workspace.to_string_lossy().into_owned(),
+                candidate_scopes: vec![WorkerWorkspaceScope::try_new("another-repo", ".").unwrap()],
+            },
+        })
+        .await;
+    match daemon.expect().await {
+        FleetdToDaemon::WorkspaceInspected {
+            request_id,
+            outcome: WorkspaceInspectionOutcome::Refused { code, .. },
+        } => {
+            assert_eq!(request_id, "inspect-2");
+            assert_eq!(code, "workspace.scope_unrecognized");
+        }
+        other => panic!("expected scope refusal, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.join(".bbox/local/checkout-id"))
+            .unwrap()
+            .trim(),
+        first_id.as_str()
+    );
+}
+
+#[tokio::test]
+async fn spawn_refuses_a_binding_whose_environment_scope_disagrees() {
+    let harness = start_fleetd().await;
+    let stub = write_stub(&harness.root, "never-spawn.sh", "#!/bin/sh\nexit 0\n");
+    let mut spec = spec_for(
+        &stub,
+        "scope-mismatch",
+        harness.root.join("scope-mismatch.events.jsonl"),
+    );
+    spec.workspace_id =
+        Some(bro_core::WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap());
+    spec.workspace_scope = Some(WorkerWorkspaceScope::try_new("repo-one", ".").unwrap());
+    spec.env = SecretEnv::new(std::collections::BTreeMap::from([
+        (WORKSPACE_BINDING_ENV.to_string(), "b".repeat(64)),
+        (
+            WORKSPACE_SCOPE_ENV.to_string(),
+            serde_json::to_string(&WorkerWorkspaceScope::try_new("repo-two", ".").unwrap())
+                .unwrap(),
+        ),
+    ]));
+
+    let mut daemon = FakeDaemon::connect(&harness.socket).await.expect("connect");
+    daemon.authenticate().await;
+    daemon
+        .send(DaemonToFleetd::Spawn {
+            spec: Box::new(spec),
+        })
+        .await;
+    match daemon.expect().await {
+        FleetdToDaemon::Error { code, .. } => assert_eq!(code, "workspace_scope.mismatch"),
+        other => panic!("expected workspace scope mismatch, got {other:?}"),
+    }
+    assert!(harness.state.registry().is_empty());
 }
 
 #[tokio::test]

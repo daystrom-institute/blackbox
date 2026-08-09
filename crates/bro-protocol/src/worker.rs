@@ -26,6 +26,136 @@ use bro_core::{Provider, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Dependency-clean wire form of one durable published project scope.
+///
+/// This deliberately mirrors the validation contract of
+/// `bbox_corpus_core::identity::PublishedScope` without depending on a corpus
+/// crate. fleetd may verify checkout-local facts, but it must remain below the
+/// daemon's catalog and policy crates in the dependency graph.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct WorkerWorkspaceScope {
+    repo_id: String,
+    bbox_root_relpath: String,
+}
+
+impl WorkerWorkspaceScope {
+    pub fn try_new(
+        repo_id: impl Into<String>,
+        bbox_root_relpath: impl Into<String>,
+    ) -> Result<Self, InvalidWorkerWorkspaceScope> {
+        let scope = Self {
+            repo_id: repo_id.into(),
+            bbox_root_relpath: bbox_root_relpath.into(),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+
+    pub fn bbox_root_relpath(&self) -> &str {
+        &self.bbox_root_relpath
+    }
+
+    fn validate(&self) -> Result<(), InvalidWorkerWorkspaceScope> {
+        if !valid_scope_authority(&self.repo_id) {
+            return Err(InvalidWorkerWorkspaceScope { field: "repo_id" });
+        }
+        if self.bbox_root_relpath != "." && !valid_scope_relative_path(&self.bbox_root_relpath) {
+            return Err(InvalidWorkerWorkspaceScope {
+                field: "bbox_root_relpath",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerWorkspaceScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            repo_id: String,
+            bbox_root_relpath: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.repo_id, wire.bbox_root_relpath).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidWorkerWorkspaceScope {
+    field: &'static str,
+}
+
+impl std::fmt::Display for InvalidWorkerWorkspaceScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid worker workspace scope {}", self.field)
+    }
+}
+
+impl std::error::Error for InvalidWorkerWorkspaceScope {}
+
+fn valid_scope_authority(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn valid_scope_relative_path(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte == b':' && value.as_bytes()[0].is_ascii_alphabetic())
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return false;
+    }
+    value.split('/').all(|component| {
+        !component.is_empty() && !matches!(component, "." | "..") && component.len() <= 255
+    })
+}
+
+/// Exact managed-workspace identity established on the worker host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerWorkspaceIdentity {
+    pub workspace_id: WorkspaceId,
+    pub scope: WorkerWorkspaceScope,
+}
+
+/// Bounded daemon request for worker-local workspace inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceInspectionRequest {
+    pub cwd: String,
+    #[serde(default)]
+    pub candidate_scopes: Vec<WorkerWorkspaceScope>,
+}
+
+/// Worker-local facts returned to the daemon. A managed checkout that cannot
+/// prove one daemon-supplied scope is a refusal, never an unbound downgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum WorkspaceInspectionOutcome {
+    Unmanaged,
+    Managed { identity: WorkerWorkspaceIdentity },
+    Refused { code: String, message: String },
+}
+
 /// Harness environment key carrying the opaque managed-workspace capability.
 ///
 /// The value rides [`SecretEnv`], never argv. The harness may resolve it into
@@ -215,6 +345,10 @@ pub struct WorkerSpawnSpec {
     /// still the executor path; this id is the portable session/artifact key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<WorkspaceId>,
+    /// Durable project scope proved alongside `workspace_id` on the worker
+    /// host. Retained by fleetd so daemon re-adoption never reopens remote cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_scope: Option<WorkerWorkspaceScope>,
     /// Provider lane this worker runs.
     pub provider: Provider,
     /// Binary name/path from `BRO_HARNESS_BIN` or provider config. `None` lets
@@ -269,6 +403,7 @@ mod tests {
             task_id: "task-abc".to_string(),
             session_id: "sess-xyz".to_string(),
             workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
+            workspace_scope: Some(WorkerWorkspaceScope::try_new("repo-1", "services/api").unwrap()),
             provider: Provider::Glm,
             bin_override: Some("bro-harness".to_string()),
             argv: vec![
@@ -297,8 +432,26 @@ mod tests {
     fn legacy_spec_without_workspace_id_decodes_unbound() {
         let mut value = serde_json::to_value(sample_spec()).unwrap();
         value.as_object_mut().unwrap().remove("workspace_id");
+        value.as_object_mut().unwrap().remove("workspace_scope");
         let decoded: WorkerSpawnSpec = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.workspace_id, None);
+        assert_eq!(decoded.workspace_scope, None);
+    }
+
+    #[test]
+    fn workspace_scope_rejects_path_and_authority_escapes() {
+        for (repo_id, relpath) in [
+            ("", "."),
+            ("repo/escape", "."),
+            ("repo", "../escape"),
+            ("repo", "/absolute"),
+            ("repo", "nested//empty"),
+            ("repo", "nested\\windows"),
+        ] {
+            assert!(WorkerWorkspaceScope::try_new(repo_id, relpath).is_err());
+        }
+        assert!(WorkerWorkspaceScope::try_new("repo-1", ".").is_ok());
+        assert!(WorkerWorkspaceScope::try_new("repo-1", "services/api").is_ok());
     }
 
     #[test]

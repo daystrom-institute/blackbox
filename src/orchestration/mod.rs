@@ -203,20 +203,23 @@ struct ReadoptionEnv {
 /// Daemon-owned authority for the path-free capability a managed harness uses
 /// to select its exact workspace over the self-MCP transport.
 pub(crate) trait WorkspaceBindingAuthority: Send + Sync {
+    /// Durable scopes the worker host is allowed to prove for a managed cwd.
+    /// This keeps catalog policy daemon-side while permitting remote
+    /// filesystem inspection.
+    fn candidate_scopes(&self) -> anyhow::Result<Vec<bro_protocol::WorkerWorkspaceScope>>;
+
     fn mint(
         &self,
         task_id: &str,
         session_id: &str,
-        cwd: &str,
-        workspace_id: &bro_core::WorkspaceId,
+        identity: &bro_protocol::WorkerWorkspaceIdentity,
     ) -> anyhow::Result<MintedWorkspaceBinding>;
 
     fn restore(
         &self,
         task_id: &str,
         session_id: &str,
-        cwd: &str,
-        workspace_id: &bro_core::WorkspaceId,
+        identity: &bro_protocol::WorkerWorkspaceIdentity,
         token: &bro_protocol::WorkspaceBindingToken,
     ) -> anyhow::Result<()>;
 
@@ -239,6 +242,7 @@ pub struct ReadoptedSession {
     pub session_id: String,
     pub task_id: String,
     pub workspace_id: Option<bro_core::WorkspaceId>,
+    pub workspace_scope: Option<bro_protocol::WorkerWorkspaceScope>,
     pub workspace_binding_token: Option<bro_protocol::WorkspaceBindingToken>,
     pub pid: Option<u32>,
     pub state: bro_protocol::SessionState,
@@ -264,6 +268,7 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
         session_id,
         task_id,
         workspace_id,
+        workspace_scope,
         workspace_binding_token,
         pid,
         state,
@@ -275,8 +280,8 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
     let env = readoption_env().get()?;
     let task = env.task_store.read().get(&task_id)?;
 
-    match (&workspace_id, &workspace_binding_token) {
-        (Some(workspace_id), Some(token)) => {
+    match (&workspace_id, &workspace_scope, &workspace_binding_token) {
+        (Some(workspace_id), Some(workspace_scope), Some(token)) => {
             let Some(authority) = env.workspace_binding_authority.as_ref() else {
                 tracing::warn!(
                     session_id = %session_id,
@@ -286,17 +291,11 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
                 );
                 return None;
             };
-            let Some(cwd) = task.inner.lock().cwd.clone() else {
-                tracing::warn!(
-                    session_id = %session_id,
-                    task_id = %task_id,
-                    workspace_id = %workspace_id,
-                    "refusing workspace-bound session re-adoption without task cwd"
-                );
-                return None;
+            let identity = bro_protocol::WorkerWorkspaceIdentity {
+                workspace_id: workspace_id.clone(),
+                scope: workspace_scope.clone(),
             };
-            if let Err(error) = authority.restore(&task_id, &session_id, &cwd, workspace_id, token)
-            {
+            if let Err(error) = authority.restore(&task_id, &session_id, &identity, token) {
                 tracing::warn!(
                     session_id = %session_id,
                     task_id = %task_id,
@@ -307,11 +306,11 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
                 return None;
             }
         }
-        (None, Some(_)) => {
+        (None, _, Some(_)) | (_, None, Some(_)) => {
             tracing::warn!(
                 session_id = %session_id,
                 task_id = %task_id,
-                "refusing workspace binding token without workspace identity"
+                "refusing workspace binding token without complete workspace identity"
             );
             return None;
         }
@@ -3355,24 +3354,50 @@ async fn spawn_harness_child_task(
         .ok()
         .filter(|url| !url.is_empty())
         .map(|url| crate::dispatch_mcp::dispatch_mcp_url_for_origin(&url, origin));
-    // Compose the fully-resolved spawn spec (prompt-free argv, SecretEnv,
-    // env_unset scrub list, initial_messages, pinned bro_home/event_log_path).
-    let spec = match prepare_harness_child_launch(
-        task_id.clone(),
-        session_id.clone(),
-        provider,
-        args,
-        cwd.as_deref(),
-        env_overrides,
-        shell_env,
-        tool_placement,
-        tool_defaults,
-        &store_dir,
-        self_mcp_url.as_deref(),
-        readoption_env()
-            .get()
-            .and_then(|env| env.workspace_binding_authority.as_deref()),
-    ) {
+    // Resolve workspace identity on the machine that owns cwd, then compose
+    // the fully-resolved spawn spec. Remote fleetd therefore returns local
+    // facts before the daemon mints any authority and the daemon never opens a
+    // worker-local path.
+    let workspace_binding_authority = readoption_env()
+        .get()
+        .and_then(|env| env.workspace_binding_authority.as_deref());
+    let spec_result: anyhow::Result<_> = async {
+        let workspace_identity = match (cwd.as_deref(), workspace_binding_authority) {
+            (Some(cwd), Some(authority)) => {
+                let request = bro_protocol::WorkspaceInspectionRequest {
+                    cwd: cwd.to_string(),
+                    candidate_scopes: authority.candidate_scopes()?,
+                };
+                match harness_executor().inspect_workspace(request).await? {
+                    bro_protocol::WorkspaceInspectionOutcome::Unmanaged => None,
+                    bro_protocol::WorkspaceInspectionOutcome::Managed { identity } => {
+                        Some(identity)
+                    }
+                    bro_protocol::WorkspaceInspectionOutcome::Refused { code, message } => {
+                        anyhow::bail!("{code}: {message}")
+                    }
+                }
+            }
+            _ => None,
+        };
+        prepare_harness_child_launch(
+            task_id.clone(),
+            session_id.clone(),
+            provider,
+            args,
+            cwd.as_deref(),
+            env_overrides,
+            shell_env,
+            tool_placement,
+            tool_defaults,
+            &store_dir,
+            self_mcp_url.as_deref(),
+            workspace_binding_authority,
+            workspace_identity,
+        )
+    }
+    .await;
+    let spec = match spec_result {
         Ok(spec) => spec,
         Err(error) => {
             if let Some(authority) = readoption_env()
@@ -3571,6 +3596,7 @@ fn prepare_harness_child_launch(
     store_dir: &std::path::Path,
     self_mcp_url: Option<&str>,
     workspace_binding_authority: Option<&dyn WorkspaceBindingAuthority>,
+    workspace_identity: Option<bro_protocol::WorkerWorkspaceIdentity>,
 ) -> anyhow::Result<bro_protocol::WorkerSpawnSpec> {
     let initial_prompt = take_cli_value_arg(&mut args, "-p")
         .or_else(|| take_cli_value_arg(&mut args, "--prompt"))
@@ -3607,16 +3633,14 @@ fn prepare_harness_child_launch(
     } else {
         session_id.clone()
     };
-    let workspace_id = workspace_id_for_cwd(cwd)?;
-    let workspace_binding = match (&workspace_id, self_mcp_url) {
-        (Some(workspace_id), Some(_)) => {
+    let workspace_binding = match (&workspace_identity, self_mcp_url) {
+        (Some(identity), Some(_)) => {
             let authority = workspace_binding_authority.ok_or_else(|| {
                 anyhow::anyhow!(
                     "managed workspace dispatch requires daemon workspace binding authority"
                 )
             })?;
-            let cwd = cwd.ok_or_else(|| anyhow::anyhow!("managed workspace has no cwd"))?;
-            Some(authority.mint(&task_id, &supervision_id, cwd, workspace_id)?)
+            Some(authority.mint(&task_id, &supervision_id, identity)?)
         }
         _ => None,
     };
@@ -3694,7 +3718,10 @@ fn prepare_harness_child_launch(
     Ok(bro_protocol::WorkerSpawnSpec {
         task_id,
         session_id: supervision_id,
-        workspace_id,
+        workspace_id: workspace_identity
+            .as_ref()
+            .map(|identity| identity.workspace_id.clone()),
+        workspace_scope: workspace_identity.map(|identity| identity.scope),
         provider,
         bin_override,
         argv: args,
@@ -3715,6 +3742,7 @@ fn prepare_harness_child_launch(
 /// unsafe marker on a managed checkout fails the dispatch rather than silently
 /// erasing its workspace binding. The create-once identity helper repairs an
 /// empty or malformed marker by minting a fresh, reuse-safe identity.
+#[cfg(test)]
 fn workspace_id_for_cwd(cwd: Option<&str>) -> anyhow::Result<Option<bro_core::WorkspaceId>> {
     let Some(cwd) = cwd else {
         return Ok(None);
@@ -5300,12 +5328,18 @@ mod tests {
     struct FixedWorkspaceBindingAuthority;
 
     impl WorkspaceBindingAuthority for FixedWorkspaceBindingAuthority {
+        fn candidate_scopes(&self) -> anyhow::Result<Vec<bro_protocol::WorkerWorkspaceScope>> {
+            Ok(vec![bro_protocol::WorkerWorkspaceScope::try_new(
+                "test-repo",
+                ".",
+            )?])
+        }
+
         fn mint(
             &self,
             _task_id: &str,
             _session_id: &str,
-            _cwd: &str,
-            _workspace_id: &bro_core::WorkspaceId,
+            _identity: &bro_protocol::WorkerWorkspaceIdentity,
         ) -> anyhow::Result<MintedWorkspaceBinding> {
             Ok(MintedWorkspaceBinding {
                 token: bro_protocol::WorkspaceBindingToken::parse("a".repeat(64)).unwrap(),
@@ -5318,8 +5352,7 @@ mod tests {
             &self,
             _task_id: &str,
             _session_id: &str,
-            _cwd: &str,
-            _workspace_id: &bro_core::WorkspaceId,
+            _identity: &bro_protocol::WorkerWorkspaceIdentity,
             _token: &bro_protocol::WorkspaceBindingToken,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -5348,6 +5381,13 @@ mod tests {
             "BLACKBOX_CONFIG",
             root.join("missing.toml").to_str().unwrap(),
         );
+        let workspace_identity = bro_protocol::WorkerWorkspaceIdentity {
+            workspace_id: bro_core::WorkspaceId::parse(
+                bbox_corpus_core::identity::ensure_checkout_id(&root).unwrap(),
+            )
+            .unwrap(),
+            scope: bro_protocol::WorkerWorkspaceScope::try_new("test-repo", ".").unwrap(),
+        };
 
         let spec = prepare_harness_child_launch(
             "task-bound".to_string(),
@@ -5362,6 +5402,7 @@ mod tests {
             &root,
             Some("http://127.0.0.1:7264/mcp?surface=agent-internal"),
             Some(&FixedWorkspaceBindingAuthority),
+            Some(workspace_identity),
         )
         .unwrap();
 
@@ -5440,6 +5481,7 @@ mod tests {
             &store,
             None, // self_mcp_url
             None, // workspace_binding_authority
+            None, // workspace_identity
         )
         .expect("compose spec");
 
@@ -5676,6 +5718,7 @@ mod tests {
             )])),
             &root,
             Some("http://127.0.0.1:7264/mcp?surface=default"),
+            None,
             None,
         )
         .unwrap();
@@ -6121,6 +6164,7 @@ mod tests {
             session_id: "adopt-session".to_string(),
             task_id: "adopt-task".to_string(),
             workspace_id: None,
+            workspace_scope: None,
             workspace_binding_token: None,
             pid: Some(4242),
             state: bro_protocol::SessionState::Running,
@@ -6187,6 +6231,7 @@ mod tests {
             session_id: "ghost-session".to_string(),
             task_id: "ghost-task".to_string(),
             workspace_id: None,
+            workspace_scope: None,
             workspace_binding_token: None,
             pid: Some(9999),
             state: bro_protocol::SessionState::Running,

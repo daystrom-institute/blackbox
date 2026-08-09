@@ -21,6 +21,7 @@ pub mod registry;
 pub mod replay;
 pub mod server;
 pub mod spawn;
+pub mod workspace;
 
 pub use paths::{FleetdPaths, default_state_dir};
 pub use registry::{Registry, SessionEntry};

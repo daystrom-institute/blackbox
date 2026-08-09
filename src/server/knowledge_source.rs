@@ -241,28 +241,79 @@ impl DaemonWorkspaceBindingAuthority {
         &self,
         task_id: &str,
         session_id: &str,
-        cwd: &str,
-        workspace_id: &WorkspaceId,
+        identity: &bro_protocol::WorkerWorkspaceIdentity,
     ) -> Result<WorkspaceBindingGrant> {
-        let server = super::BlackboxServer::new(self.state.clone());
-        let resolution = server.resolve_project_write(cwd)?;
-        let checkout = resolution.checkout_scope.ok_or_else(|| {
-            anyhow::anyhow!("managed workspace did not resolve to checkout authority")
+        let scope = bbox_corpus_core::identity::PublishedScope::try_new(
+            identity.scope.repo_id().to_string(),
+            identity.scope.bbox_root_relpath().to_string(),
+        )?;
+        let project_id = self.project_id_for_scope(&scope)?.ok_or_else(|| {
+            anyhow::anyhow!("managed workspace scope is not present in current project authority")
         })?;
-        if checkout.checkout_id != workspace_id.as_str() {
-            bail!("managed workspace identity does not match resolved checkout authority");
-        }
-        if checkout.project_id.is_empty() {
-            bail!("managed workspace resolved without project identity");
-        }
         Ok(WorkspaceBindingGrant {
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
-            project_id: checkout.project_id,
-            scope: checkout.published_scope,
-            workspace_id: workspace_id.clone(),
+            project_id,
+            scope,
+            workspace_id: identity.workspace_id.clone(),
             expires_unix_secs: now_unix_secs().saturating_add(WORKSPACE_BINDING_TTL_SECS),
         })
+    }
+
+    fn published_scopes(&self) -> Result<Vec<bbox_corpus_core::identity::PublishedScope>> {
+        let mut scopes = BTreeMap::<bbox_corpus_core::identity::PublishedScope, ()>::new();
+        if let Some(store) = self.state.project_authority.catalog_store() {
+            let snapshot = store.snapshot()?;
+            for project in snapshot.catalog().projects.values() {
+                if let bbox_corpus_core::project_catalog::ProjectScope::Published(scope) =
+                    &project.scope
+                {
+                    scopes.insert(scope.clone(), ());
+                }
+            }
+        } else {
+            let records = self.state.records_provider.records_snapshot();
+            for record in records.records.iter() {
+                if let Some(scope) = super::checkout_access::published_scope_for_project(
+                    &self.state.checkout_access,
+                    &record.project_id,
+                )? {
+                    scopes.insert(scope, ());
+                }
+            }
+        }
+        Ok(scopes.into_keys().collect())
+    }
+
+    fn project_id_for_scope(
+        &self,
+        expected: &bbox_corpus_core::identity::PublishedScope,
+    ) -> Result<Option<String>> {
+        if let Some(store) = self.state.project_authority.catalog_store() {
+            let snapshot = store.snapshot()?;
+            let mut matched = None;
+            for (project_id, project) in &snapshot.catalog().projects {
+                if matches!(
+                    &project.scope,
+                    bbox_corpus_core::project_catalog::ProjectScope::Published(scope)
+                        if scope == expected
+                ) {
+                    if matched.replace(project_id.to_string()).is_some() {
+                        bail!("managed workspace scope resolves to more than one catalog project");
+                    }
+                }
+            }
+            return Ok(matched);
+        }
+        let records = self.state.records_provider.records_snapshot();
+        super::checkout_access::project_id_for_published_scope(
+            &self.state.checkout_access,
+            records
+                .records
+                .iter()
+                .map(|record| record.project_id.clone()),
+            expected,
+        )
     }
 
     fn install(
@@ -340,14 +391,26 @@ impl DaemonWorkspaceBindingAuthority {
 }
 
 impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingAuthority {
+    fn candidate_scopes(&self) -> Result<Vec<bro_protocol::WorkerWorkspaceScope>> {
+        self.published_scopes()?
+            .into_iter()
+            .map(|scope| {
+                bro_protocol::WorkerWorkspaceScope::try_new(
+                    scope.repo_id().to_string(),
+                    scope.bbox_root_relpath().to_string(),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .collect()
+    }
+
     fn mint(
         &self,
         task_id: &str,
         session_id: &str,
-        cwd: &str,
-        workspace_id: &WorkspaceId,
+        identity: &bro_protocol::WorkerWorkspaceIdentity,
     ) -> Result<crate::orchestration::MintedWorkspaceBinding> {
-        let grant = self.grant(task_id, session_id, cwd, workspace_id)?;
+        let grant = self.grant(task_id, session_id, identity)?;
         let secret = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
@@ -363,11 +426,10 @@ impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingA
         &self,
         task_id: &str,
         session_id: &str,
-        cwd: &str,
-        workspace_id: &WorkspaceId,
+        identity: &bro_protocol::WorkerWorkspaceIdentity,
         token: &bro_protocol::WorkspaceBindingToken,
     ) -> Result<()> {
-        let grant = self.grant(task_id, session_id, cwd, workspace_id)?;
+        let grant = self.grant(task_id, session_id, identity)?;
         self.install(grant, token)
     }
 

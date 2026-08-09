@@ -19,6 +19,11 @@ into a binary that changes a few times a year is the fix.
   fleetd have two sources of truth for dispatch composition and the seam is
   worthless. Final binary path resolution is the ONLY thing derived
   executor-side, and only because it depends on fleetd's own login-shell PATH.
+  Worker workspace inspection is the second explicit locality operation:
+  the daemon supplies a bounded set of catalog-approved durable scopes, and
+  fleetd verifies only worker-local cwd, managed-checkout marker, committed
+  `HEAD` project identity, and the create-once checkout id. It never discovers
+  or widens the daemon's candidate set and never maps scope to project policy.
   An off-host executor also pins `BRO_HOME` and the event-log path to the
   explicitly configured worker roots. That is path localization, not policy
   derivation, and prevents a container-local path from crossing machines.

@@ -180,6 +180,7 @@ mod smoke {
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
             workspace_id: None,
+            workspace_scope: None,
             provider: bro_core::Provider::Glm,
             bin_override: Some(bin.to_string()),
             argv: Vec::new(),

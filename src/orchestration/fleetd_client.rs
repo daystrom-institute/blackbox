@@ -55,7 +55,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use bro_protocol::{
     BearerToken, DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState,
-    SessionSummary, WorkerSpawnSpec,
+    SessionSummary, WorkerSpawnSpec, WorkspaceInspectionOutcome, WorkspaceInspectionRequest,
 };
 use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceToken};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -79,6 +79,8 @@ const AUTOSTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// fleetd resolves the binary through a login shell, which on a cold macOS
 /// host can take a noticeable fraction of a second.
 const SPAWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Worker inspection executes a handful of local Git and filesystem reads.
+const WORKSPACE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The one fleetd this daemon owns. Multi-fleet routing is deliberately not
 /// hidden in this type: v1 has one endpoint and therefore one owner/fencing
@@ -311,6 +313,9 @@ struct Shared {
     sessions: Mutex<HashMap<String, SessionSlot>>,
     /// Waiters for the next `Sessions` answer, in FIFO order.
     list_waiters: Mutex<Vec<oneshot::Sender<Vec<SessionSummary>>>>,
+    /// Workspace inspection replies are request-id correlated because more
+    /// than one dispatch may inspect concurrently over the owner connection.
+    workspace_waiters: Mutex<HashMap<String, oneshot::Sender<WorkspaceInspectionOutcome>>>,
     message_counter: AtomicU64,
 }
 
@@ -336,6 +341,7 @@ impl FleetdExecutor {
                 config,
                 sessions: Mutex::new(HashMap::new()),
                 list_waiters: Mutex::new(Vec::new()),
+                workspace_waiters: Mutex::new(HashMap::new()),
                 message_counter: AtomicU64::new(0),
             }),
             connection: tokio::sync::Mutex::new(None),
@@ -493,6 +499,42 @@ impl FleetdExecutor {
 impl HarnessExecutor for FleetdExecutor {
     fn worker_locality(&self) -> Option<&WorkerLocality> {
         self.shared.config.worker_locality.as_ref()
+    }
+
+    async fn inspect_workspace(
+        &self,
+        request: WorkspaceInspectionRequest,
+    ) -> anyhow::Result<WorkspaceInspectionOutcome> {
+        let commands = self.commands().await?;
+        let request_id = self.shared.next_message_id();
+        let (tx, rx) = oneshot::channel();
+        self.shared
+            .workspace_waiters
+            .lock()
+            .insert(request_id.clone(), tx);
+        if commands
+            .send(DaemonToFleetd::InspectWorkspace {
+                request_id: request_id.clone(),
+                request,
+            })
+            .is_err()
+        {
+            self.shared.workspace_waiters.lock().remove(&request_id);
+            anyhow::bail!("fleetd connection dropped before workspace inspection was sent");
+        }
+        match tokio::time::timeout(WORKSPACE_INSPECTION_TIMEOUT, rx).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(_)) => {
+                anyhow::bail!("fleetd connection dropped before workspace inspection completed")
+            }
+            Err(_) => {
+                self.shared.workspace_waiters.lock().remove(&request_id);
+                anyhow::bail!(
+                    "fleetd did not answer workspace inspection within {}s",
+                    WORKSPACE_INSPECTION_TIMEOUT.as_secs()
+                )
+            }
+        }
     }
 
     async fn spawn(&self, mut spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
@@ -653,6 +695,7 @@ where
             slot.started.take();
         }
         shared.list_waiters.lock().clear();
+        shared.workspace_waiters.lock().clear();
     });
 }
 
@@ -704,6 +747,17 @@ fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon) {
             let waiter = shared.list_waiters.lock().pop();
             if let Some(waiter) = waiter {
                 let _ = waiter.send(sessions);
+            }
+        }
+        FleetdToDaemon::WorkspaceInspected {
+            request_id,
+            outcome,
+        } => {
+            let waiter = shared.workspace_waiters.lock().remove(&request_id);
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(outcome);
+            } else {
+                tracing::debug!(%request_id, "late or unknown workspace inspection reply");
             }
         }
         FleetdToDaemon::ReplayComplete {
@@ -827,6 +881,7 @@ fn readopt_one(
         session_id: summary.session_id.clone(),
         task_id: summary.task_id.clone(),
         workspace_id: summary.workspace_id.clone(),
+        workspace_scope: summary.workspace_scope.clone(),
         workspace_binding_token: summary.workspace_binding_token.clone(),
         pid: summary.pid,
         state: summary.state,
@@ -1117,6 +1172,7 @@ mod tests {
             config: FleetdConfig::in_state_dir("/state/x"),
             sessions: Mutex::new(HashMap::new()),
             list_waiters: Mutex::new(Vec::new()),
+            workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
         });
         let (commands_tx, mut commands_rx) = mpsc::unbounded_channel::<DaemonToFleetd>();
@@ -1184,6 +1240,7 @@ mod tests {
             config: FleetdConfig::in_state_dir("/state/x"),
             sessions: Mutex::new(HashMap::new()),
             list_waiters: Mutex::new(Vec::new()),
+            workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
         });
         let (commands_tx, _commands_rx) = mpsc::unbounded_channel::<DaemonToFleetd>();
@@ -1223,6 +1280,7 @@ mod tests {
             config: FleetdConfig::in_state_dir("/state/x"),
             sessions: Mutex::new(HashMap::new()),
             list_waiters: Mutex::new(Vec::new()),
+            workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
         };
         let first = shared.next_message_id();

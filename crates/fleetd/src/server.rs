@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use bro_protocol::{
     DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState, WORKSPACE_BINDING_ENV,
-    WorkerSpawnSpec, WorkspaceBindingToken,
+    WORKSPACE_SCOPE_ENV, WorkerSpawnSpec, WorkerWorkspaceScope, WorkspaceBindingToken,
 };
 use bro_rpc::{
     BuildIdentity, ConnectionBinding, Envelope, HandshakeOptions, NegotiatedIo, RpcError,
@@ -401,6 +401,18 @@ fn dispatch(state: Arc<Fleetd>, body: DaemonToFleetd) {
         DaemonToFleetd::Spawn { spec } => {
             tokio::spawn(handle_spawn(state, *spec));
         }
+        DaemonToFleetd::InspectWorkspace {
+            request_id,
+            request,
+        } => {
+            tokio::spawn(async move {
+                let outcome = crate::workspace::inspect_workspace(request).await;
+                state.emit(FleetdToDaemon::WorkspaceInspected {
+                    request_id,
+                    outcome,
+                });
+            });
+        }
         DaemonToFleetd::Control {
             session_id,
             message,
@@ -449,6 +461,7 @@ async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
     let session_id = spec.session_id.clone();
     let task_id = spec.task_id.clone();
     let workspace_id = spec.workspace_id.clone();
+    let workspace_scope = spec.workspace_scope.clone();
     let workspace_binding_token = match spec.env.as_map().get(WORKSPACE_BINDING_ENV) {
         Some(token) => match WorkspaceBindingToken::parse(token.clone()) {
             Ok(token) => Some(token),
@@ -463,11 +476,50 @@ async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
         },
         None => None,
     };
-    if workspace_binding_token.is_some() && workspace_id.is_none() {
+    let environment_scope = match spec.env.as_map().get(WORKSPACE_SCOPE_ENV) {
+        Some(scope) => match serde_json::from_str::<WorkerWorkspaceScope>(scope) {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                state.emit(FleetdToDaemon::Error {
+                    session_id: Some(session_id),
+                    code: "workspace_scope.invalid".to_string(),
+                    message: format!("workspace scope environment is invalid: {error}"),
+                });
+                return;
+            }
+        },
+        None => None,
+    };
+    if workspace_binding_token.is_some() && (workspace_id.is_none() || workspace_scope.is_none()) {
         state.emit(FleetdToDaemon::Error {
             session_id: Some(session_id),
             code: "workspace_binding.unbound".to_string(),
-            message: "workspace binding token requires a workspace id".to_string(),
+            message: "workspace binding token requires a workspace id and durable scope"
+                .to_string(),
+        });
+        return;
+    }
+    if workspace_binding_token.is_some() && environment_scope.as_ref() != workspace_scope.as_ref() {
+        state.emit(FleetdToDaemon::Error {
+            session_id: Some(session_id),
+            code: "workspace_scope.mismatch".to_string(),
+            message: "workspace binding scope does not match the spawn identity".to_string(),
+        });
+        return;
+    }
+    if workspace_binding_token.is_none() && environment_scope.is_some() {
+        state.emit(FleetdToDaemon::Error {
+            session_id: Some(session_id),
+            code: "workspace_scope.unbound".to_string(),
+            message: "workspace scope environment requires a binding token".to_string(),
+        });
+        return;
+    }
+    if workspace_scope.is_some() && workspace_id.is_none() {
+        state.emit(FleetdToDaemon::Error {
+            session_id: Some(session_id),
+            code: "workspace_scope.unbound".to_string(),
+            message: "workspace scope requires a workspace id".to_string(),
         });
         return;
     }
@@ -506,6 +558,7 @@ async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
         session_id: session_id.clone(),
         task_id: task_id.clone(),
         workspace_id: workspace_id.clone(),
+        workspace_scope,
         workspace_binding_token,
         pid,
         state: SessionState::Running,

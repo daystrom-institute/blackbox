@@ -34,7 +34,10 @@ use serde_json::Value;
 
 use bro_core::WorkspaceId;
 
-use crate::worker::{REDACTED, WorkerSpawnSpec, WorkspaceBindingToken};
+use crate::worker::{
+    REDACTED, WorkerSpawnSpec, WorkerWorkspaceScope, WorkspaceBindingToken,
+    WorkspaceInspectionOutcome, WorkspaceInspectionRequest,
+};
 
 /// The shared-secret bearer token, as it crosses the wire.
 ///
@@ -96,6 +99,14 @@ pub enum DaemonToFleetd {
     /// Spawn a supervised worker child from a fully-resolved spec. fleetd
     /// re-derives no policy from it beyond final binary path resolution.
     Spawn { spec: Box<WorkerSpawnSpec> },
+    /// Ask the worker host to prove whether `cwd` belongs to an explicitly
+    /// managed checkout and, if so, which daemon-supplied durable scope it
+    /// contains. fleetd verifies local facts only; candidate policy remains
+    /// daemon-owned.
+    InspectWorkspace {
+        request_id: String,
+        request: WorkspaceInspectionRequest,
+    },
     /// Deliver one control-lane message (user turn, `control_request`, ...) to
     /// a live session's stdin as an NDJSON line.
     Control { session_id: String, message: Value },
@@ -138,6 +149,11 @@ pub enum FleetdToDaemon {
         workspace_id: Option<WorkspaceId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u32>,
+    },
+    /// Answer to [`DaemonToFleetd::InspectWorkspace`].
+    WorkspaceInspected {
+        request_id: String,
+        outcome: WorkspaceInspectionOutcome,
     },
     /// One raw harness stdout envelope line, relayed verbatim. `seq` is the
     /// line's own top-level `seq` field when it carries one; fleetd does not
@@ -213,6 +229,10 @@ pub struct SessionSummary {
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<WorkspaceId>,
+    /// Durable scope proved with the workspace id at spawn time. This lets a
+    /// restarted daemon restore the binding without opening worker-local cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_scope: Option<WorkerWorkspaceScope>,
     /// Opaque session/workspace capability retained by fleetd solely so a
     /// restarted daemon can restore the exact binding the live harness still
     /// presents. Debug is redacted by the token newtype.
@@ -278,6 +298,7 @@ mod tests {
             panic!("expected sessions message");
         };
         assert_eq!(sessions[0].workspace_binding_token, None);
+        assert_eq!(sessions[0].workspace_scope, None);
     }
 
     fn round_trip_fleetd(message: &FleetdToDaemon) {
@@ -291,6 +312,7 @@ mod tests {
             task_id: "task-1".to_string(),
             session_id: "sess-1".to_string(),
             workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
+            workspace_scope: Some(WorkerWorkspaceScope::try_new("repo-1", ".").unwrap()),
             provider: bro_core::Provider::Glm,
             bin_override: Some("bro-harness".to_string()),
             argv: vec!["--daemon-worker".to_string()],
@@ -311,6 +333,13 @@ mod tests {
             },
             DaemonToFleetd::Spawn {
                 spec: Box::new(sample_spec()),
+            },
+            DaemonToFleetd::InspectWorkspace {
+                request_id: "inspect-1".to_string(),
+                request: WorkspaceInspectionRequest {
+                    cwd: "/repo/x".to_string(),
+                    candidate_scopes: vec![WorkerWorkspaceScope::try_new("repo-1", ".").unwrap()],
+                },
             },
             DaemonToFleetd::Control {
                 session_id: "sess-1".to_string(),
@@ -345,6 +374,16 @@ mod tests {
                 workspace_id: Some(WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap()),
                 pid: Some(4242),
             },
+            FleetdToDaemon::WorkspaceInspected {
+                request_id: "inspect-1".to_string(),
+                outcome: WorkspaceInspectionOutcome::Managed {
+                    identity: crate::WorkerWorkspaceIdentity {
+                        workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef")
+                            .unwrap(),
+                        scope: WorkerWorkspaceScope::try_new("repo-1", ".").unwrap(),
+                    },
+                },
+            },
             FleetdToDaemon::Event {
                 session_id: "sess-1".to_string(),
                 seq: Some(7),
@@ -367,6 +406,7 @@ mod tests {
                     workspace_id: Some(
                         WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
                     ),
+                    workspace_scope: Some(WorkerWorkspaceScope::try_new("repo-1", ".").unwrap()),
                     workspace_binding_token: Some(
                         WorkspaceBindingToken::parse("b".repeat(64)).unwrap(),
                     ),

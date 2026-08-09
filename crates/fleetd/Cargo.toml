@@ -6,7 +6,8 @@
 # when the daemon does. It must not link `blackbox`, `bro-harness`,
 # `bro-code-mode`, `bro-capabilities`, any `bbox-*` crate, tantivy, or V8.
 # It talks to the contract bottom (bro-protocol) over the transport substrate
-# (bro-rpc) and spawns processes. That is the entire job.
+# (bro-rpc), verifies bounded worker-local workspace facts supplied by the
+# daemon, and spawns processes. That is the entire job.
 [package]
 name = "fleetd"
 version = "0.0.1"
@@ -36,8 +37,10 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 serde_json = "1"

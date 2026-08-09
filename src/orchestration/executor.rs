@@ -38,7 +38,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
-use bro_protocol::WorkerSpawnSpec;
+use bro_protocol::{
+    WorkerSpawnSpec, WorkerWorkspaceIdentity, WorkspaceInspectionOutcome,
+    WorkspaceInspectionRequest,
+};
 
 use super::open_harness_tee;
 use super::providers::{self, dispatch_prelude::ProviderExec};
@@ -167,6 +170,14 @@ pub trait HarnessExecutor: Send + Sync {
         None
     }
 
+    /// Resolve worker-local managed-checkout identity before spawn. The daemon
+    /// supplies the only durable scopes fleetd may accept; the executor merely
+    /// verifies local filesystem and committed-Git facts.
+    async fn inspect_workspace(
+        &self,
+        request: WorkspaceInspectionRequest,
+    ) -> anyhow::Result<WorkspaceInspectionOutcome>;
+
     /// Spawn the worker described by `spec` and return its handle.
     async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle>;
 }
@@ -176,6 +187,15 @@ pub struct LocalExecutor;
 
 #[async_trait]
 impl HarnessExecutor for LocalExecutor {
+    async fn inspect_workspace(
+        &self,
+        request: WorkspaceInspectionRequest,
+    ) -> anyhow::Result<WorkspaceInspectionOutcome> {
+        tokio::task::spawn_blocking(move || inspect_local_workspace(request))
+            .await
+            .map_err(|error| anyhow::anyhow!("joining local workspace inspection: {error}"))?
+    }
+
     async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
         let provider = spec.provider;
 
@@ -310,6 +330,81 @@ impl HarnessExecutor for LocalExecutor {
             outcome: outcome_rx,
         })
     }
+}
+
+/// Same-host implementation of the worker-local inspection contract. This is
+/// intentionally beside `LocalExecutor`: dispatch composition consumes facts
+/// through the executor seam regardless of which machine owns cwd.
+fn inspect_local_workspace(
+    request: WorkspaceInspectionRequest,
+) -> anyhow::Result<WorkspaceInspectionOutcome> {
+    let cwd = std::path::Path::new(&request.cwd);
+    if !cwd.is_absolute() {
+        return Ok(WorkspaceInspectionOutcome::Refused {
+            code: "workspace.cwd_not_absolute".to_string(),
+            message: "workspace cwd must be absolute".to_string(),
+        });
+    }
+    let cwd = match cwd.canonicalize() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return Ok(WorkspaceInspectionOutcome::Refused {
+                code: "workspace.cwd_unavailable".to_string(),
+                message: format!("workspace cwd is unavailable: {error}"),
+            });
+        }
+    };
+    let Some(checkout) = bbox_corpus_core::git::managed_checkout_root(&cwd) else {
+        return Ok(WorkspaceInspectionOutcome::Unmanaged);
+    };
+
+    let mut matches = request
+        .candidate_scopes
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|scope| {
+            let project_root = if scope.bbox_root_relpath() == "." {
+                checkout.clone()
+            } else {
+                checkout.join(scope.bbox_root_relpath())
+            };
+            let project_root = project_root.canonicalize().ok()?;
+            if !project_root.starts_with(&checkout) || !cwd.starts_with(&project_root) {
+                return None;
+            }
+            let config = crate::config::load_project_at_ref(&project_root, "HEAD").ok()?;
+            (config.project.repo_id.as_deref() == Some(scope.repo_id()))
+                .then_some((project_root.components().count(), scope))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| right.0.cmp(&left.0));
+    let Some((depth, scope)) = matches.first().cloned() else {
+        return Ok(WorkspaceInspectionOutcome::Refused {
+            code: "workspace.scope_unrecognized".to_string(),
+            message: "managed checkout does not prove a daemon-authorized project scope"
+                .to_string(),
+        });
+    };
+    if matches
+        .iter()
+        .skip(1)
+        .any(|(candidate_depth, _)| *candidate_depth == depth)
+    {
+        return Ok(WorkspaceInspectionOutcome::Refused {
+            code: "workspace.scope_ambiguous".to_string(),
+            message: "managed checkout matches more than one equally specific project scope"
+                .to_string(),
+        });
+    }
+    let raw = bbox_corpus_core::identity::ensure_checkout_id(&checkout)?;
+    let workspace_id = bro_core::WorkspaceId::parse(raw)?;
+    Ok(WorkspaceInspectionOutcome::Managed {
+        identity: WorkerWorkspaceIdentity {
+            workspace_id,
+            scope,
+        },
+    })
 }
 
 /// The stdin control writer: serialize each `Value` as an NDJSON line to the
