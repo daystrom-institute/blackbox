@@ -392,7 +392,18 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
             .await
             .unwrap();
-        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
+            let data = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str(&data).unwrap_or_else(|error| {
+                panic!("invalid MCP response {error}: {body}");
+            })
+        });
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let plan: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(plan["status"], "blame_locality_plan");
