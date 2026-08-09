@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::AttachmentStatus;
 use bbox_corpus_core::project_record::{ProjectRecord, ResolvedCheckoutScope};
@@ -1449,19 +1449,21 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        server
-            .session_workspace_binding
-            .set(Some(Arc::new(
-                crate::server::knowledge_source::WorkspaceBindingGrant {
-                    task_id: "task".into(),
-                    session_id: "session".into(),
-                    project_id: "project-bound".into(),
-                    scope: PublishedScope::try_new("repo-bound", ".").unwrap(),
-                    workspace_id: bro_core::WorkspaceId::parse("a".repeat(32)).unwrap(),
-                    expires_unix_secs: u64::MAX,
-                },
-            )))
-            .unwrap();
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "task".into(),
+                        session_id: "session".into(),
+                        project_id: "project-bound".into(),
+                        scope: PublishedScope::try_new("repo-bound", ".").unwrap(),
+                        workspace_id: bro_core::WorkspaceId::parse("a".repeat(32)).unwrap(),
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
         let before = server.state.checkout_access.health().sequence;
 
         let planned = server
