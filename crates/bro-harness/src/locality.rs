@@ -106,15 +106,20 @@ pub async fn install_project_mutation_routes(
     Ok(tools
         .into_iter()
         .map(|upstream| {
-            let Some(kind) = MutationKind::from_tool_name(upstream.name(), capability_server)
-            else {
-                return upstream;
-            };
-            Arc::new(ProjectMutationTool {
-                upstream,
-                runtime: runtime.clone(),
-                kind,
-            }) as Arc<dyn Tool>
+            if let Some(kind) = MutationKind::from_tool_name(upstream.name(), capability_server) {
+                return Arc::new(ProjectMutationTool {
+                    upstream,
+                    runtime: runtime.clone(),
+                    kind,
+                }) as Arc<dyn Tool>;
+            }
+            if upstream.name() == format!("mcp__{capability_server}__bbox_blame") {
+                return Arc::new(LocalBlameTool {
+                    upstream,
+                    runtime: runtime.clone(),
+                }) as Arc<dyn Tool>;
+            }
+            upstream
         })
         .collect())
 }
@@ -123,6 +128,100 @@ struct ProjectMutationTool {
     upstream: Arc<dyn Tool>,
     runtime: Arc<LocalProjectRuntime>,
     kind: MutationKind,
+}
+
+struct LocalBlameTool {
+    upstream: Arc<dyn Tool>,
+    runtime: Arc<LocalProjectRuntime>,
+}
+
+#[async_trait]
+impl Tool for LocalBlameTool {
+    fn name(&self) -> &str {
+        self.upstream.name()
+    }
+
+    fn description(&self) -> &str {
+        self.upstream.description()
+    }
+
+    fn input_schema(&self) -> Value {
+        self.upstream.input_schema()
+    }
+
+    fn freeform_grammar(&self) -> Option<FreeformGrammar> {
+        self.upstream.freeform_grammar()
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        self.upstream.annotations()
+    }
+
+    fn namespace_binding(&self) -> Option<(String, String)> {
+        self.upstream.namespace_binding()
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let mut public = match input {
+            Value::Object(object) => object,
+            _ => serde_json::Map::new(),
+        };
+        // The model never owns the internal transport arm, even if it guesses
+        // the skipped field name and supplies arbitrary JSON.
+        public.remove("_blame_locality");
+
+        let mut plan_input = public.clone();
+        plan_input.insert("_blame_locality".into(), json!({ "phase": "plan" }));
+        let plan_result = self.upstream.call(Value::Object(plan_input), cx).await;
+        let plan = match parse_blame_plan(plan_result) {
+            Ok(plan) => plan,
+            Err(result) => return result,
+        };
+
+        let runtime = self.runtime.clone();
+        let execution_plan = plan.clone();
+        let fact =
+            match tokio::task::spawn_blocking(move || runtime.execute_blame_plan(&execution_plan))
+                .await
+            {
+                Ok(Ok(fact)) => fact,
+                Ok(Err(error)) => {
+                    return ToolResult::Error(format!("local blame execution failed: {error:#}"));
+                }
+                Err(error) => {
+                    return ToolResult::Error(format!("local blame task failed: {error}"));
+                }
+            };
+
+        public.insert(
+            "_blame_locality".into(),
+            json!({
+                "phase": "resolve",
+                "plan": plan,
+                "fact": fact,
+            }),
+        );
+        self.upstream.call(Value::Object(public), cx).await
+    }
+}
+
+fn parse_blame_plan(
+    result: ToolResult,
+) -> std::result::Result<bbox_corpus_core::blame_transport::BlameExecutionPlanV1, ToolResult> {
+    let value = match result {
+        ToolResult::Json(value) => value,
+        ToolResult::Text(text) => serde_json::from_str(&text).map_err(|error| {
+            ToolResult::Error(format!("daemon returned an invalid blame plan: {error}"))
+        })?,
+        error @ ToolResult::Error(_) => return Err(error),
+    };
+    let plan = value
+        .get("plan")
+        .cloned()
+        .ok_or_else(|| ToolResult::Error("daemon blame plan response omitted plan".into()))?;
+    serde_json::from_value(plan).map_err(|error| {
+        ToolResult::Error(format!("daemon returned an invalid blame plan: {error}"))
+    })
 }
 
 #[async_trait]
@@ -173,7 +272,10 @@ struct LocalProjectRuntime {
     knowledge_carrier: KnowledgeRepoCarrier,
     gap_carrier: GapRepoCarrier,
     durable_project: String,
+    workspace_root: PathBuf,
     project_root: PathBuf,
+    scope: PublishedScope,
+    workspace_id: bro_core::WorkspaceId,
     capture: WorkspaceCaptureClient,
     sync_lock: tokio::sync::Mutex<()>,
     retry_active: AtomicBool,
@@ -232,10 +334,10 @@ impl LocalProjectRuntime {
         let capture = WorkspaceCaptureClient::new(
             source_url,
             token,
-            workspace_root,
+            workspace_root.clone(),
             project_root.clone(),
-            workspace_id,
-            scope,
+            workspace_id.clone(),
+            scope.clone(),
         )?;
         Ok(Self {
             knowledge: Mutex::new(knowledge),
@@ -243,11 +345,126 @@ impl LocalProjectRuntime {
             knowledge_carrier,
             gap_carrier,
             durable_project,
+            workspace_root,
             project_root,
+            scope,
+            workspace_id,
             capture,
             sync_lock: tokio::sync::Mutex::new(()),
             retry_active: AtomicBool::new(false),
         })
+    }
+
+    fn execute_blame_plan(
+        &self,
+        plan: &bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
+    ) -> Result<bbox_corpus_core::blame_transport::BlameFactV1> {
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameAttributionV1, BlameExecutionV1, BlameFactV1,
+            BlamePlanTargetV1,
+        };
+
+        plan.validate()?;
+        if plan.scope != self.scope || plan.workspace_id != self.workspace_id.as_str() {
+            bail!("blame plan is outside the bound workspace authority");
+        }
+
+        let (git_relative_path, display_path, line, execution, blame) = match &plan.target {
+            BlamePlanTargetV1::WorkspacePath { input_path, line } => {
+                let input = Path::new(input_path);
+                if input
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    bail!("error.checkout_path_invalid: blame path contains parent traversal");
+                }
+                let requested = if input.is_absolute() {
+                    input.to_path_buf()
+                } else {
+                    self.project_root.join(input)
+                };
+                let file = requested
+                    .canonicalize()
+                    .context("canonicalizing bound blame path")?;
+                if !file.is_file() || !file.starts_with(&self.project_root) {
+                    bail!(
+                        "error.checkout_attachment_not_found: blame path is outside the bound project"
+                    );
+                }
+                let display = file
+                    .strip_prefix(&self.project_root)
+                    .context("deriving project-relative blame path")?
+                    .to_path_buf();
+                let git_relative = file
+                    .strip_prefix(&self.workspace_root)
+                    .context("deriving Git-relative blame path")?
+                    .to_path_buf();
+                let blame = bbox_corpus_core::git::blame_for_line_in_root(
+                    &self.workspace_root,
+                    &git_relative,
+                    *line,
+                )?;
+                (
+                    slash_path(&git_relative),
+                    slash_path(&display),
+                    *line,
+                    BlameExecutionV1::WorkspaceCurrent {
+                        head_commit: bbox_corpus_core::git::current_head(&self.workspace_root),
+                    },
+                    blame,
+                )
+            }
+            BlamePlanTargetV1::ProjectSnapshot {
+                project_relative_path,
+                display_path,
+                line,
+                byte_offset,
+                commit,
+            } => {
+                let project_relative = Path::new(project_relative_path);
+                let project_prefix = self
+                    .project_root
+                    .strip_prefix(&self.workspace_root)
+                    .context("deriving bound project Git prefix")?;
+                let git_relative = project_prefix.join(project_relative);
+                let (resolved_line, blame) =
+                    bbox_corpus_core::git::blame_for_line_or_offset_at_commit(
+                        &self.workspace_root,
+                        &git_relative,
+                        commit,
+                        *line,
+                        *byte_offset,
+                    )?;
+                (
+                    slash_path(&git_relative),
+                    display_path.clone(),
+                    resolved_line,
+                    BlameExecutionV1::Snapshot {
+                        commit: commit.clone(),
+                    },
+                    blame,
+                )
+            }
+        };
+        let attribution = blame.map(|blame| BlameAttributionV1 {
+            commit_sha: blame.commit_sha,
+            author: blame.author,
+            author_time: blame.author_time,
+            git_relative_path: blame.rel_path,
+        });
+        let fact = BlameFactV1 {
+            version: BLAME_TRANSPORT_VERSION,
+            project_id: plan.project_id.clone(),
+            scope: self.scope.clone(),
+            workspace_id: self.workspace_id.as_str().to_string(),
+            git_relative_path,
+            display_path,
+            line,
+            execution,
+            attribution,
+        };
+        fact.validate_against(plan)?;
+        Ok(fact)
     }
 
     fn mutate(&self, kind: MutationKind, input: Value) -> Result<Option<ToolResult>> {
@@ -539,6 +756,10 @@ impl LocalProjectRuntime {
             runtime.retry_active.store(false, Ordering::Release);
         });
     }
+}
+
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 struct BoundRepoIo {
@@ -836,6 +1057,83 @@ mod tests {
             .expect("cross-checkout mutation must fail");
         assert!(format!("{error:#}").contains("does not match the bound workspace"));
         assert!(knowledge_files(&runtime.project_root).is_empty());
+    }
+
+    #[test]
+    fn blame_executes_current_and_snapshot_plans_inside_the_bound_checkout() {
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlameExecutionV1, BlamePlanTargetV1,
+        };
+
+        let (_directory, root, runtime) = runtime();
+        let base = bbox_corpus_core::git::current_head(&root).unwrap();
+        let authority = |target| BlameExecutionPlanV1 {
+            version: BLAME_TRANSPORT_VERSION,
+            project_id: "project-locality".into(),
+            scope: runtime.scope.clone(),
+            workspace_id: runtime.workspace_id.as_str().to_string(),
+            target,
+        };
+
+        let current = authority(BlamePlanTargetV1::WorkspacePath {
+            input_path: "README.md".into(),
+            line: 1,
+        });
+        let current_fact = runtime.execute_blame_plan(&current).unwrap();
+        assert!(matches!(
+            current_fact.execution,
+            BlameExecutionV1::WorkspaceCurrent { .. }
+        ));
+        assert_eq!(current_fact.attribution.as_ref().unwrap().commit_sha, base);
+
+        // Snapshot mode remains bound to the old commit after the working
+        // file changes and then disappears entirely.
+        fs::write(root.join("README.md"), "dirty replacement\n").unwrap();
+        let dirty_fact = runtime.execute_blame_plan(&current).unwrap();
+        assert_eq!(
+            dirty_fact.attribution.as_ref().unwrap().commit_sha,
+            "0".repeat(40),
+            "path mode must report uncommitted working-tree attribution"
+        );
+        fs::remove_file(root.join("README.md")).unwrap();
+        let snapshot = authority(BlamePlanTargetV1::ProjectSnapshot {
+            project_relative_path: "README.md".into(),
+            display_path: "README.md".into(),
+            line: None,
+            byte_offset: 2,
+            commit: base.clone(),
+        });
+        let snapshot_fact = runtime.execute_blame_plan(&snapshot).unwrap();
+        assert_eq!(snapshot_fact.line, 1);
+        assert_eq!(
+            snapshot_fact.execution,
+            BlameExecutionV1::Snapshot {
+                commit: base.clone()
+            }
+        );
+        assert_eq!(snapshot_fact.attribution.as_ref().unwrap().commit_sha, base);
+    }
+
+    #[test]
+    fn blame_refuses_a_path_outside_the_bound_project() {
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlamePlanTargetV1,
+        };
+
+        let (_directory, _root, runtime) = runtime();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let plan = BlameExecutionPlanV1 {
+            version: BLAME_TRANSPORT_VERSION,
+            project_id: "project-locality".into(),
+            scope: runtime.scope.clone(),
+            workspace_id: runtime.workspace_id.as_str().to_string(),
+            target: BlamePlanTargetV1::WorkspacePath {
+                input_path: outside.path().to_string_lossy().into_owned(),
+                line: 1,
+            },
+        };
+        let error = runtime.execute_blame_plan(&plan).unwrap_err();
+        assert!(format!("{error:#}").contains("outside the bound project"));
     }
 
     #[tokio::test]

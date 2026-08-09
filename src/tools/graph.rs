@@ -634,6 +634,77 @@ fn snapshot_commit_for_blame(
     })
 }
 
+/// Build the checkout owner's blame plan from corpus identity only.
+///
+/// Unlike `snapshot_commit_for_blame`, this does not prove the commit through
+/// a daemon-visible object database. The workspace-bound harness is the
+/// checkout owner and performs that proof while executing the plan.
+fn workspace_blame_plan(
+    server: &BlackboxServer,
+    target: &mcp_tools::blame::BlameTargetIdentity,
+    git_overlays: &std::collections::BTreeMap<
+        String,
+        bbox_corpus_core::git_overlay::GitOverlaySelector,
+    >,
+) -> Result<bbox_corpus_core::blame_transport::BlameExecutionPlanV1> {
+    use bbox_corpus_core::blame_transport::{
+        BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlamePlanTargetV1,
+    };
+
+    let grant = server.authoritative_session_workspace_binding().context(
+        "error.blame_locality_binding: blame locality requires a live workspace binding",
+    )?;
+    let target = match target {
+        mcp_tools::blame::BlameTargetIdentity::ProjectFile {
+            project_id,
+            indexed_path_hint,
+            line,
+            byte_offset,
+        } => {
+            validate_explicit_project_selection(server, project_id)?;
+            if project_id != &grant.project_id {
+                bail!(
+                    "error.blame_locality_scope: corpus entity belongs to a different project than the bound workspace"
+                );
+            }
+            if indexed_path_hint.is_absolute() {
+                bail!(
+                    "error.indexed_path_mismatch: project_file path hint is absolute and cannot cross the blame locality boundary"
+                );
+            }
+            let relative = indexed_path_hint.to_string_lossy().replace('\\', "/");
+            let commit = git_overlays
+                .get(project_id)
+                .map(|overlay| overlay.repo_head.clone())
+                .context(
+                    "error.blame_snapshot_unavailable: no Git snapshot evidence is recorded for this project, so blame cannot be bound to the indexed corpus snapshot",
+                )?;
+            BlamePlanTargetV1::ProjectSnapshot {
+                project_relative_path: relative.clone(),
+                display_path: relative,
+                line: *line,
+                byte_offset: *byte_offset,
+                commit,
+            }
+        }
+        mcp_tools::blame::BlameTargetIdentity::File { input_path, line } => {
+            BlamePlanTargetV1::WorkspacePath {
+                input_path: input_path.clone(),
+                line: *line,
+            }
+        }
+    };
+    let plan = BlameExecutionPlanV1 {
+        version: BLAME_TRANSPORT_VERSION,
+        project_id: grant.project_id.clone(),
+        scope: grant.scope.clone(),
+        workspace_id: grant.workspace_id.as_str().to_string(),
+        target,
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
 /// The project ids one legacy Git-note operation covers.
 ///
 /// Catalog mode selects the COMPLETE catalog set, remote-only projects
@@ -1061,6 +1132,33 @@ impl BlackboxServer {
                 Ok(target) => target,
                 Err(error) => return Ok(mcp_tools::blame::bad_input(error.to_string())),
             };
+
+            match p.locality.clone() {
+                Some(mcp_tools::blame::BlameLocalityRequestV1::Plan) => {
+                    let plan = workspace_blame_plan(&server, &target, &read_view.git_overlays)?;
+                    return Ok(serde_json::to_string_pretty(&json!({
+                        "status": "blame_locality_plan",
+                        "plan": plan,
+                    }))?);
+                }
+                Some(mcp_tools::blame::BlameLocalityRequestV1::Resolve { plan, fact }) => {
+                    let current = workspace_blame_plan(&server, &target, &read_view.git_overlays)?;
+                    if plan != current {
+                        bail!(
+                            "error.blame_plan_stale: corpus blame authority changed after the checkout plan was issued"
+                        );
+                    }
+                    fact.validate_against(&current)?;
+                    return mcp_tools::blame::enrich_fact(&fact, edge_index);
+                }
+                None if server.authoritative_session_workspace_binding().is_some() => {
+                    bail!(
+                        "error.blame_locality_required: a workspace-bound blame must execute in its checkout owner"
+                    );
+                }
+                None => {}
+            }
+
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
             let acquired = match target {
                 mcp_tools::blame::BlameTargetIdentity::ProjectFile {
@@ -1341,6 +1439,82 @@ mod tests {
     fn extract_text(result: &CallToolResult) -> String {
         let wire = serde_json::to_value(result).unwrap();
         wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn workspace_blame_plan_and_fact_join_never_acquire_a_checkout() {
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameExecutionV1, BlameFactV1,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server
+            .session_workspace_binding
+            .set(Some(Arc::new(
+                crate::server::knowledge_source::WorkspaceBindingGrant {
+                    task_id: "task".into(),
+                    session_id: "session".into(),
+                    project_id: "project-bound".into(),
+                    scope: PublishedScope::try_new("repo-bound", ".").unwrap(),
+                    workspace_id: bro_core::WorkspaceId::parse("a".repeat(32)).unwrap(),
+                    expires_unix_secs: u64::MAX,
+                },
+            )))
+            .unwrap();
+        let before = server.state.checkout_access.health().sequence;
+
+        let planned = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Plan),
+            }))
+            .await;
+        assert_ne!(planned.is_error, Some(true), "{}", extract_text(&planned));
+        let planned: serde_json::Value = serde_json::from_str(&extract_text(&planned)).unwrap();
+        let plan: bbox_corpus_core::blame_transport::BlameExecutionPlanV1 =
+            serde_json::from_value(planned["plan"].clone()).unwrap();
+        assert_eq!(plan.project_id, "project-bound");
+        assert_eq!(server.state.checkout_access.health().sequence, before);
+
+        let fact = BlameFactV1 {
+            version: BLAME_TRANSPORT_VERSION,
+            project_id: plan.project_id.clone(),
+            scope: plan.scope.clone(),
+            workspace_id: plan.workspace_id.clone(),
+            git_relative_path: "src/lib.rs".into(),
+            display_path: "src/lib.rs".into(),
+            line: 7,
+            execution: BlameExecutionV1::WorkspaceCurrent {
+                head_commit: Some("b".repeat(40)),
+            },
+            attribution: None,
+        };
+        let resolved = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Resolve { plan, fact }),
+            }))
+            .await;
+        assert_ne!(resolved.is_error, Some(true), "{}", extract_text(&resolved));
+        assert!(extract_text(&resolved).contains("error.not_found"));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
+
+        let fallback = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: None,
+            }))
+            .await;
+        assert_eq!(fallback.is_error, Some(true));
+        assert!(extract_text(&fallback).contains("error.blame_locality_required"));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 
     #[derive(Clone)]

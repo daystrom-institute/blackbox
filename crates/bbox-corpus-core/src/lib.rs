@@ -12,6 +12,7 @@
 //! [`git::set_notes_namespace`], which the daemon calls once after it loads
 //! config.
 
+pub mod blame_transport;
 pub mod built_from;
 pub mod code_project_identity;
 pub mod edit;

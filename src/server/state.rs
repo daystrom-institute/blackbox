@@ -3288,6 +3288,7 @@ mod clause_two_proof_a {
                 file: Some("src/lib.rs".into()),
                 line: Some(1),
                 entity_ref: None,
+                locality: None,
             }))
             .await;
         assert_eq!(blame.is_error, Some(true), "{blame:?}");
@@ -3557,6 +3558,7 @@ mod clause_three_exit_proof {
                 file: Some("src/lib.rs".into()),
                 line: Some(1),
                 entity_ref: None,
+                locality: None,
             }))
             .await;
         assert_eq!(blame.is_error, Some(true));

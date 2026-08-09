@@ -919,6 +919,7 @@ mod harness {
                 ),
                 line: Some(1),
                 entity_ref: None,
+                locality: None,
             }))
             .await;
         row("blame", tool_row(&result), &[])

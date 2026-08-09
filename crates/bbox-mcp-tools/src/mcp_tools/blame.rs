@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use bbox_corpus_core::entity_ref::EntityRef;
@@ -19,6 +19,22 @@ pub struct BlameParams {
     pub line: Option<u64>,
     #[serde(default)]
     pub entity_ref: Option<String>,
+    /// Harness-internal locality transport. It is intentionally absent from
+    /// the public tool schema and accepted only on a live workspace-bound MCP
+    /// session by the daemon adapter.
+    #[serde(default, rename = "_blame_locality")]
+    #[schemars(skip)]
+    pub locality: Option<BlameLocalityRequestV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum BlameLocalityRequestV1 {
+    Plan,
+    Resolve {
+        plan: bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
+        fact: bbox_corpus_core::blame_transport::BlameFactV1,
+    },
 }
 
 /// Corpus identity and an untrusted indexed path hint extracted from caller
@@ -121,80 +137,6 @@ pub fn target_identity(p: &BlameParams, ctx: &ProviderContext<'_>) -> Result<Bla
     Ok(BlameTargetIdentity::File { input_path, line })
 }
 
-/// A repository-relative path safe to hand to Git: non-empty, relative, and
-/// free of traversal or root components.
-fn git_safe_relative(path: &std::path::Path) -> Result<String> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        anyhow::bail!("error.blame_path_invalid: blame path must be a safe relative path");
-    }
-    Ok(path.to_string_lossy().replace('\\', "/"))
-}
-
-/// Blame one line at an exact commit, reading the file as that commit had it.
-///
-/// Both halves are pinned deliberately. Blaming at the commit without reading
-/// the committed file would resolve a byte offset against working-tree bytes
-/// and land on the wrong line; reading the committed file without pinning the
-/// blame would attribute that line to current history.
-fn blame_at_commit(
-    git_root: &std::path::Path,
-    git_relative_path: &std::path::Path,
-    commit: &str,
-    line: Option<u64>,
-    byte_offset: Option<u64>,
-) -> Result<(u64, Option<GitBlameLine>)> {
-    let rel_path = git_safe_relative(git_relative_path)?;
-    let content = bbox_corpus_core::git::read_committed_file_bytes(git_root, commit, &rel_path)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "error.blame_snapshot_unavailable: the corpus snapshot commit does not contain this file"
-            )
-        })?;
-    let line = match line {
-        Some(line) => line,
-        None => line_for_byte_offset(&content, byte_offset.unwrap_or_default()),
-    };
-    if line == 0 {
-        anyhow::bail!("error.blame_path_invalid: line must be 1-based");
-    }
-    let line_spec = format!("{line},{line}");
-    let output = bbox_corpus_core::git::git_output(
-        git_root,
-        &[
-            "blame",
-            "--porcelain",
-            "-L",
-            &line_spec,
-            commit,
-            "--",
-            &rel_path,
-        ],
-        "running git blame at the corpus snapshot commit",
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "error.checkout_io_failed: git blame could not read the corpus snapshot commit"
-        )
-    })?;
-    if !output.status.success() {
-        return Ok((line, None));
-    }
-    let parsed = bbox_corpus_core::git::parse_blame_porcelain(
-        &output.stdout,
-        git_root.to_path_buf(),
-        rel_path,
-    )
-    .map_err(|_| {
-        anyhow::anyhow!("error.checkout_io_failed: git blame output could not be parsed")
-    })?;
-    Ok((line, parsed))
-}
-
 pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<String> {
     let (line, blame) = match &target.source {
         BlameSource::WorkingTree { content } => {
@@ -214,18 +156,43 @@ pub fn blame(target: ValidatedBlameTarget, edge_index: &EdgeIndex) -> Result<Str
             })?;
             (line, blame)
         }
-        BlameSource::Snapshot { commit } => blame_at_commit(
-            &target.git_root,
-            &target.git_relative_path,
-            commit,
-            target.line,
-            target.byte_offset,
-        )?,
+        BlameSource::Snapshot { commit } => {
+            bbox_corpus_core::git::blame_for_line_or_offset_at_commit(
+                &target.git_root,
+                &target.git_relative_path,
+                commit,
+                target.line,
+                target.byte_offset.unwrap_or_default(),
+            )?
+        }
     };
-    let target = BlameTarget {
-        display_path: target.display_path,
-        line,
-    };
+    render_blame_result(target.display_path, line, blame, edge_index)
+}
+
+/// Join one validated checkout-side fact to corpus provenance without opening
+/// a checkout or running Git in the daemon.
+pub fn enrich_fact(
+    fact: &bbox_corpus_core::blame_transport::BlameFactV1,
+    edge_index: &EdgeIndex,
+) -> Result<String> {
+    fact.validate()?;
+    let blame = fact.attribution.as_ref().map(|attribution| GitBlameLine {
+        commit_sha: attribution.commit_sha.clone(),
+        author: attribution.author.clone(),
+        author_time: attribution.author_time.clone(),
+        root: PathBuf::new(),
+        rel_path: attribution.git_relative_path.clone(),
+    });
+    render_blame_result(fact.display_path.clone(), fact.line, blame, edge_index)
+}
+
+fn render_blame_result(
+    display_path: String,
+    line: u64,
+    blame: Option<GitBlameLine>,
+    edge_index: &EdgeIndex,
+) -> Result<String> {
+    let target = BlameTarget { display_path, line };
     let Some(blame) = blame else {
         return Ok(serde_json::to_string_pretty(&json!({
             "status": "error.not_found",

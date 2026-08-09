@@ -3195,6 +3195,74 @@ pub fn blame_for_line_in_root(
     parse_blame_porcelain(&output.stdout, root.to_path_buf(), rel_path)
 }
 
+/// Blame one line against one exact commit, resolving an optional corpus byte
+/// offset against the file bytes from that SAME commit.
+///
+/// This is the path-free blame transport's shared checkout-side primitive.
+/// Keeping both the content read and blame revision here makes it impossible
+/// for either runtime implementer to resolve a snapshot offset against dirty
+/// working bytes or to blame a moving `HEAD` after reading an older blob.
+pub fn blame_for_line_or_offset_at_commit(
+    root: &Path,
+    relative_path: &Path,
+    commit: &str,
+    line: Option<u64>,
+    byte_offset: u64,
+) -> Result<(u64, Option<GitBlameLine>)> {
+    if relative_path.as_os_str().is_empty()
+        || relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("error.blame_path_invalid: blame path must be a safe relative path");
+    }
+    let rel_path = relative_path.to_string_lossy().replace('\\', "/");
+    let content = read_committed_file_bytes(root, commit, &rel_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "error.blame_snapshot_unavailable: the corpus snapshot commit does not contain this file"
+        )
+    })?;
+    let line = line.unwrap_or_else(|| {
+        let upto = (byte_offset as usize).min(content.len());
+        content[..upto]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count() as u64
+            + 1
+    });
+    if line == 0 {
+        anyhow::bail!("error.blame_path_invalid: line must be 1-based");
+    }
+    let line_spec = format!("{line},{line}");
+    let output = git_output(
+        root,
+        &[
+            "blame",
+            "--porcelain",
+            "-L",
+            &line_spec,
+            commit,
+            "--",
+            &rel_path,
+        ],
+        "running git blame at the corpus snapshot commit",
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "error.checkout_io_failed: git blame could not read the corpus snapshot commit"
+        )
+    })?;
+    if !output.status.success() {
+        return Ok((line, None));
+    }
+    let parsed =
+        parse_blame_porcelain(&output.stdout, root.to_path_buf(), rel_path).map_err(|_| {
+            anyhow::anyhow!("error.checkout_io_failed: git blame output could not be parsed")
+        })?;
+    Ok((line, parsed))
+}
+
 pub fn parse_blame_porcelain(
     stdout: &[u8],
     root: PathBuf,
