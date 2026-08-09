@@ -36,7 +36,7 @@ impl BlackboxServer {
     /// Session project context for surface evaluation, set at `initialize`
     /// from the `?project` query parameter (gap-310c36b6). `None` for
     /// sessions that did not select a project.
-    fn session_surface_project(&self) -> Option<String> {
+    pub(crate) fn session_surface_project(&self) -> Option<String> {
         self.surface_project
             .get()
             .and_then(|p| p.as_ref().map(|s| s.as_ref().to_string()))

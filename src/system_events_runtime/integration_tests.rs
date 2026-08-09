@@ -165,6 +165,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         knowledge_transport_cutover: Arc::new(
             bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(),
         ),
+        blame_locality_cutover: Arc::new(
+            bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default(),
+        ),
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

@@ -219,6 +219,11 @@ pub(crate) struct SharedState {
     /// monotonic no-fallback boundary even while it is pending re-cutover.
     pub(crate) knowledge_transport_cutover:
         Arc<bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1>,
+    /// Strict per-project blame locality authority. A checksummed marker row
+    /// makes checkout-local execution mandatory before the legacy adapter can
+    /// acquire a daemon-side checkout lease.
+    pub(crate) blame_locality_cutover:
+        Arc<bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1>,
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
@@ -981,6 +986,9 @@ impl SharedState {
             ),
             knowledge_transport_cutover: Arc::new(
                 bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(),
+            ),
+            blame_locality_cutover: Arc::new(
+                bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default(),
             ),
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),

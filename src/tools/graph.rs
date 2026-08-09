@@ -143,6 +143,37 @@ fn validate_explicit_project_selection(
     }
 }
 
+/// Enforce the monotonic blame-locality cut before the legacy adapter can
+/// touch checkout authority. Corpus identity supplies an exact project id.
+/// A path request is governed only when the session carries a stable project
+/// selector; an unscoped raw path remains the explicitly named compatibility
+/// lane until path locality has its own authority contract.
+fn enforce_blame_locality_cutover(
+    server: &crate::server::BlackboxServer,
+    target: &mcp_tools::blame::BlameTargetIdentity,
+) -> Result<()> {
+    if server.state.project_authority.is_bridge() {
+        return Ok(());
+    }
+    let project_id = match target {
+        mcp_tools::blame::BlameTargetIdentity::ProjectFile { project_id, .. } => {
+            Some(project_id.clone())
+        }
+        mcp_tools::blame::BlameTargetIdentity::File { .. } => server
+            .session_surface_project()
+            .and_then(|selector| server.validate_project_selection(&selector).ok()),
+    };
+    if project_id.as_deref().is_some_and(|project_id| {
+        server
+            .state
+            .blame_locality_cutover
+            .transport_governed(project_id)
+    }) {
+        bail!("error.blame_locality_required: this project's blame authority is checkout-local");
+    }
+    Ok(())
+}
+
 /// Internal slice matcher over records the handler boundary has already
 /// validated through the shared engine (phase-2 §9.2): see
 /// `validate_explicit_project_selection` at each explicit-project entry
@@ -1243,6 +1274,7 @@ impl BlackboxServer {
                 None => {}
             }
 
+            enforce_blame_locality_cutover(&server, &target)?;
             let broker = crate::server::checkout_access::checkout_access_broker(&server.state);
             let acquired = match target {
                 mcp_tools::blame::BlameTargetIdentity::ProjectFile {
@@ -2486,6 +2518,12 @@ mod catalog_adapter_tests {
         CommitNamespace, CorpusProject, ProjectId, ProjectScope, RecordedRepoAuthority,
         RepoHistoryAuthority, RepoHistoryId, RepoHistoryMaterialization, RepoHistoryRecord,
     };
+    use bbox_indexing::blame_locality_cutover::{
+        BlameLocalityCutoverMarkerV1, BlameLocalityCutoverRowV1, BlameLocalityCutoverRuntimeV1,
+    };
+    use bbox_indexing::blame_locality_observations::{
+        BlameLocalityComparisonV1, BlameLocalityTargetV1,
+    };
     use bbox_indexing::checkout_access::{
         CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind,
     };
@@ -2671,6 +2709,21 @@ mod catalog_adapter_tests {
         }
 
         fn server_with_cutover(&self, cutover: GitTransportCutoverRuntimeV1) -> BlackboxServer {
+            self.server_with_cutovers(cutover, BlameLocalityCutoverRuntimeV1::default())
+        }
+
+        fn server_with_blame_cutover(
+            &self,
+            cutover: BlameLocalityCutoverRuntimeV1,
+        ) -> BlackboxServer {
+            self.server_with_cutovers(GitTransportCutoverRuntimeV1::default(), cutover)
+        }
+
+        fn server_with_cutovers(
+            &self,
+            git_cutover: GitTransportCutoverRuntimeV1,
+            blame_cutover: BlameLocalityCutoverRuntimeV1,
+        ) -> BlackboxServer {
             let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_path);
             let store = state
                 .project_authority
@@ -2683,9 +2736,61 @@ mod catalog_adapter_tests {
                 ),
                 state.checkout_access_observations.clone(),
             ));
-            state.git_transport_cutover = Arc::new(cutover);
+            state.git_transport_cutover = Arc::new(git_cutover);
+            state.blame_locality_cutover = Arc::new(blame_cutover);
             BlackboxServer::new(Arc::new(state))
         }
+    }
+
+    fn blame_cutover_runtime(
+        project_id: &str,
+        scope: &PublishedScope,
+    ) -> BlameLocalityCutoverRuntimeV1 {
+        let comparison = |target| BlameLocalityComparisonV1 {
+            project_id: project_id.into(),
+            target,
+            local_response_sha256: "a".repeat(64),
+            legacy_response_sha256: "a".repeat(64),
+            equal: true,
+            sequence: 1,
+            observed_at_unix_secs: 1,
+        };
+        let mut marker = BlameLocalityCutoverMarkerV1 {
+            version: 1,
+            applied_at: "unix:1".into(),
+            report_sha256: "b".repeat(64),
+            catalog_epoch: 1,
+            catalog_sha256: "c".repeat(64),
+            rows: vec![BlameLocalityCutoverRowV1 {
+                project_id: ProjectId::parse(project_id).unwrap(),
+                scope: scope.clone(),
+                producer_id: "producer-a".into(),
+                path_comparison: comparison(BlameLocalityTargetV1::Path),
+                entity_comparison: comparison(BlameLocalityTargetV1::Entity),
+                checkout_baselines: Vec::new(),
+            }],
+            checksum_sha256: String::new(),
+        };
+        marker.checksum_sha256 = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(
+                marker.version,
+                &marker.applied_at,
+                &marker.report_sha256,
+                marker.catalog_epoch,
+                &marker.catalog_sha256,
+                &marker.rows,
+            ))
+            .unwrap(),
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join(bbox_indexing::blame_locality_cutover::BLAME_LOCALITY_CUTOVER_MARKER_FILE),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        BlameLocalityCutoverRuntimeV1::open(directory.path()).unwrap()
     }
 
     fn blame_spec<'a>(project_id: &'a str, attachment_id: &'a str, dir: &'a str) -> AttachSpec<'a> {
@@ -3247,6 +3352,66 @@ mod catalog_adapter_tests {
             }),
             "the governed request must be refused before the first target lease observation"
         );
+    }
+
+    #[tokio::test]
+    async fn covered_blame_refuses_path_and_entity_before_checkout_access() {
+        let fixture = CatalogAdapters::new();
+        let scope = CatalogAdapters::scope("repo-one");
+        fixture.add_project(PROJECT_ONE, Some(scope.clone()));
+        let checkout = fixture.attach(blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one"));
+        git(&checkout, &["init", "--initial-branch", "main"]);
+        git(&checkout, &["config", "user.email", "t@example.com"]);
+        git(&checkout, &["config", "user.name", "t"]);
+        std::fs::write(checkout.join("file.rs"), "fn main() {}\n").unwrap();
+        git(&checkout, &["add", "file.rs"]);
+        git(&checkout, &["commit", "-m", "seed"]);
+
+        let governed =
+            fixture.server_with_blame_cutover(blame_cutover_runtime(PROJECT_ONE, &scope));
+        governed
+            .surface_project
+            .set(Some(Arc::from(PROJECT_ONE)))
+            .unwrap();
+        let before = governed.state.checkout_access.health().sequence;
+        let path = governed
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("file.rs".into()),
+                line: Some(1),
+                entity_ref: None,
+                locality: None,
+            }))
+            .await;
+        assert_eq!(path.is_error, Some(true));
+        assert!(extract_text(&path).contains("error.blame_locality_required"));
+        let entity = mcp_tools::blame::BlameTargetIdentity::ProjectFile {
+            project_id: PROJECT_ONE.into(),
+            indexed_path_hint: PathBuf::from("file.rs"),
+            line: Some(1),
+            byte_offset: 0,
+        };
+        let entity_error = enforce_blame_locality_cutover(&governed, &entity)
+            .unwrap_err()
+            .to_string();
+        assert!(entity_error.contains("error.blame_locality_required"));
+        assert_eq!(governed.state.checkout_access.health().sequence, before);
+
+        let uncovered = fixture.server();
+        uncovered
+            .surface_project
+            .set(Some(Arc::from(PROJECT_ONE)))
+            .unwrap();
+        let before = uncovered.state.checkout_access.health().sequence;
+        let result = uncovered
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("file.rs".into()),
+                line: Some(1),
+                entity_ref: None,
+                locality: None,
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
+        assert!(uncovered.state.checkout_access.health().sequence > before);
     }
 
     /// Corpus-identity blame refuses an absolute indexed hint in catalog

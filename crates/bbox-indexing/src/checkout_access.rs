@@ -1824,6 +1824,7 @@ fn is_cutover_target_kind(kind: CheckoutAccessKind) -> bool {
     matches!(
         kind,
         CheckoutAccessKind::GitHistory
+            | CheckoutAccessKind::Blame
             | CheckoutAccessKind::ProvenanceNoteIo
             | CheckoutAccessKind::PublisherConfigTreeRead
             | CheckoutAccessKind::KnowledgeGapOverlayRead
