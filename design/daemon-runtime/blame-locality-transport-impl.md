@@ -13,12 +13,15 @@ brief: "Move Git blame execution to the checkout owner while preserving bbox_bla
 
 # Blame locality transport
 
-> **Status: implementation plan; current-HEAD inventory verified 2026-08-09
-> after KT-F closeout.** This is the next executable arc in
+> **Status: partial implementation; BL-A and the managed-workspace BL-B route
+> are implemented and locally verified as of 2026-08-09.** This is the active
+> executable arc in
 > [locality-first-decomposition.md](locality-first-decomposition.md). It
 > preserves the public `bbox_blame(file,line|entity_ref)` contract and the
 > corpus-owned anchor/session/brofile/thread join. It moves only the Git and
-> working-tree operation to the checkout owner.
+> working-tree operation to the checkout owner. BL-C remains open for the
+> authenticated operator route, measured overlap, and retirement of only the
+> caller categories that route covers.
 
 ## 0. Outcome
 
@@ -42,23 +45,28 @@ downgrade into the other.
 
 ## 1. Current owner and caller map
 
-The executable path is concentrated but currently crosses both locality
-domains in one handler:
+The executable path is now split at the locality boundary:
 
-- `src/tools/graph.rs::bbox_blame` resolves the corpus target, acquires a
-  `CheckoutAccessKind::Blame` lease, selects working-tree versus snapshot
-  semantics, runs the domain helper, revalidates the lease, and returns the
-  response.
-- `crates/bbox-mcp-tools/src/mcp_tools/blame.rs` both executes Git and performs
-  the corpus edge join. `BlameSource::WorkingTree` carries checkout bytes;
-  `BlameSource::Snapshot` opens the selected checkout's object database.
-- `crates/bbox-corpus-core/src/git.rs` owns the hardened Git subprocess and
-  porcelain parser.
-- Managed brofiles call the qualified daemon tool
-  `mcp__blackbox__bbox_blame`; no harness-local blame route exists.
+- `src/tools/graph.rs::bbox_blame` derives a path-free plan for an authenticated
+  workspace-bound session and joins a returned fact without constructing a
+  checkout broker. It re-derives the plan on resolve, rejects stale/cross-scope
+  facts, and refuses a bound request that omits locality transport. Unbound and
+  bridge calls retain the legacy checkout adapter pending BL-C.
+- `crates/bro-harness/src/locality.rs` wraps only the qualified daemon
+  capability tool in a live managed workspace. It strips caller transport
+  fields, executes current or exact-snapshot Git blame inside the bound
+  checkout, and returns the typed fact for central enrichment.
+- `crates/bbox-mcp-tools/src/mcp_tools/blame.rs` retains the public schema and
+  deterministic corpus join. Its internal transport field is omitted from
+  JSON Schema; the legacy Git executor and fact enrichment share one response
+  renderer.
+- `crates/bbox-corpus-core/src/blame_transport.rs` owns the bounded plan/fact
+  contract. `crates/bbox-corpus-core/src/git.rs` owns the hardened current and
+  exact-commit Git subprocesses plus the porcelain parser.
 - Bridge parity, catalog capability, remote-only refusal, exact snapshot,
-  dirty-line, deleted-working-file, path-confinement, and checkout-observation
-  tests already pin the legacy behavior.
+  dirty-line, deleted-working-file, path-confinement, response-parity, expired
+  binding, and zero-checkout-observation tests pin the split and legacy
+  behavior.
 
 The Git-history producer transport cannot answer blame centrally: its bounded
 fragments contain commit metadata and changed paths, not the historical blobs
@@ -145,7 +153,7 @@ not change ranking or output fields.
 
 ## 3. Implementation phases
 
-### BL-A: Pure contract and split domain helper
+### BL-A: Pure contract and split domain helper — complete
 
 1. Add bounded serializable plan/fact types below both runtime implementers.
 2. Move exact-commit line/offset execution into the hardened Git leaf so the
@@ -156,7 +164,11 @@ not change ranking or output fields.
 Gate: contract validation, dirty/committed/not-found fixtures, and existing
 blame tests unchanged.
 
-### BL-B: Managed harness route
+The landed gate validates relative/bounded plans and facts, exact authority
+matching, the shared exact-commit leaf, and byte-for-byte equality between the
+legacy Git response and enrichment of the equivalent typed fact.
+
+### BL-B: Managed harness route — complete for managed workspaces
 
 1. Extend the harness locality wrapper to replace only the daemon capability
    server's `bbox_blame` in a live bound workspace.
@@ -170,7 +182,13 @@ blame tests unchanged.
 Gate: every positive control executes real local Git; the matching bound
 request adds zero `Blame` checkout observations; public response parity holds.
 
-### BL-C: Overlap, operator path, and strict retirement
+The landed gate exercises real current, dirty, exact old-commit, and
+deleted-working-file Git states; outside-project, cross-project, stale-plan,
+expired-binding, and caller-forged transport refusals; absence of the internal
+arm from public schema; absence of absolute checkout roots from the transport;
+and an unchanged checkout-broker observation sequence across plan and resolve.
+
+### BL-C: Overlap, operator path, and strict retirement — pending
 
 1. Add an authenticated scope-bound operator CLI route using the same plan and
    fact types; do not accept unauthenticated facts.
