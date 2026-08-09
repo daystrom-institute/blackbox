@@ -279,7 +279,8 @@ impl ProjectCatalogRenderLocalityCutoverFacadeV1 {
                     row.project_id
                 );
             }
-            if required_completions(&render, row.project_id.as_str())? != row.completions {
+            let current_completions = required_completions(&render, row.project_id.as_str())?;
+            if !same_completion_evidence(&current_completions, &row.completions) {
                 bail!("render locality completion changed during the quiet window");
             }
             if render_checkout_counters(&checkout, row.project_id.as_str())
@@ -428,6 +429,23 @@ fn render_checkout_counters(
         })
         .cloned()
         .collect()
+}
+
+fn same_completion_evidence(
+    current: &[RenderLocalityCompletionV1],
+    baseline: &[RenderLocalityCompletionV1],
+) -> bool {
+    current.len() == baseline.len()
+        && current.iter().zip(baseline).all(|(current, baseline)| {
+            current.project_id == baseline.project_id
+                && current.view == baseline.view
+                && current.receipt_sha256 == baseline.receipt_sha256
+                && current.all_providers == baseline.all_providers
+                && current.dry_run == baseline.dry_run
+                && current.provider_count == baseline.provider_count
+                && current.written_count == baseline.written_count
+                && current.refused_count == baseline.refused_count
+        })
 }
 
 fn validate_report(report: &RenderLocalityCutoverReportV1) -> Result<()> {
@@ -745,6 +763,9 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("quiet window is incomplete"), "{error}");
+        // Repeating an identical checkout-owned render is healthy traffic and
+        // advances only observation sequence/time, not parity evidence.
+        record_completions(&layout, &scope);
         age_report(&report_path);
 
         let checkout_observations = CheckoutAccessObservations::open(

@@ -192,7 +192,7 @@ path-free durable identity does not by itself make the operation local.
 | Provenance export | Authenticated collector page/apply/receipt and GH-G strict cutover are implemented. `bbox_provenance_export_plan` and `bro provenance export` remain interactive checkout-local paths. The legacy mutation refuses before lease for transport-governed published projects; bridge and `LegacyLocal` compatibility stay scoped. | Keep corpus planning and checkout-local apply. The scope-authorized producer pulls the plan and returns a typed receipt; blackboxd never writes the notes ref for covered projects. | Complete for GH-G-covered published projects. Retain the interactive plan and verify later bridge retirement independently. |
 | Provenance import | Authenticated stable snapshot upload, corpus validation, pinned V1 resolution, strict V2 membership, durable replay, quarantine, and GH-G strict cutover are implemented. The legacy import refuses before lease for transport-governed published projects. | Keep typed producer capture and central edge publication. Arbitrary caller-supplied note JSON is not graph authority. | Complete for GH-G-covered published projects. Bridge and `LegacyLocal` retirement remain separate. |
 | `bbox_blame` | Managed harnesses and the scope-authenticated operator CLI execute current or exact-snapshot Git locally and return the same bounded fact for central enrichment. BL-C persists path/entity equality evidence and installs a checksummed project marker only after a minimum five-minute window with unchanged `Blame` checkout counters. Covered entity and stable-session-project path requests refuse before the daemon broker. | A checkout-side binding returns a typed blame fact at an explicit commit or working-tree state. The corpus-side query joins that fact to anchors, sessions, brofiles, and threads. A checkout path never becomes corpus authority. | Complete in code for explicitly marked Published projects. Production apply remains operator-authorized. Bridge and raw unscoped-path lanes remain separately scoped compatibility. |
-| Project-scope render | `bbox_render` resolves an attachment, takes a write `RenderFileProvider` lease, and invokes the shared `bbox-knowledge` renderer inside blackboxd. The immutable-candidate merge gate already invokes `render --check` semantics. No `bro render` or harness-native equivalent exists. | `bro render` and/or a harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs and explicit provisional view from the corpus. Global render remains operator-host local. | Byte/output parity through the shared renderer, target-confinement tests, published/own/all view tests, candidate-tree gate parity, and a measured zero-use window before removing daemon write authority. |
+| Project-scope render | Managed harnesses keep the public `bbox_render` tool but transport a bounded, path-free authorized knowledge snapshot and invoke the shared `bbox-knowledge` renderer inside their own bound checkout. The daemon independently validates the exact projection receipt. Published/own/all completions are durable; a checksummed per-project marker requires all three positive controls plus an unchanged five-minute `RenderFileProvider` checkout baseline. Covered unbound calls refuse before the broker. Global render stays daemon/operator-host local; bridge, uncovered, and `LegacyLocal` project renders retain the compatibility adapter. | A harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs and explicit provisional view from the corpus. Global render remains operator-host local. | Complete in code for explicitly marked Published projects. Production apply remains operator-authorized. Bridge, uncovered, and `LegacyLocal` retirement remain separate. |
 | Project source indexing | `bbox-code-collector`, its authenticated manifest/blob endpoint, immutable generations, activation, health, and cutback are implemented. An active collected generation suppresses local walking. `LocalProjectWalk` remains live for local/unassigned projects and as the explicit cutback destination. | Checkout owners walk, hash, and ship raw capped bytes; the corpus chunks and indexes them. Every intended project uses an active collected source. No daemon source rung opens a checkout. | Configured producer coverage, successful active generations, restart/rebuild recovery, bounded observation with no local-walk attempts, and an explicit decision about replacing or deleting local cutback before `LocalProjectWalk` retires. |
 | Repo-owned `.bbox/` read and mutation path | KT-A through KT-F are implemented. Authenticated committed candidates and leased provisional workspaces feed the existing accepted and overlay models; managed project mutation runs in the harness; remote `own`/`all` survives restart. For an operator-cutover covered Published row, the marker closes daemon watcher refresh plus local read/write/schema-marker acquisition with no fallback. Non-vacuous publisher and watcher probes prove the covered route performs no checkout-broker operation. Shared local bodies remain only for bridge, uncovered, and `LegacyLocal` lanes. | A harness reads and mutates its own branch state directly. Published and deliberately shared provisional inputs reach the corpus through the authenticated checkout-source contract; corpus coordination, validation, promotion, and indexing remain central. | Complete for covered Published rows. Bridge, uncovered, and `LegacyLocal` retirement remains separately authorized. |
 | Git history ingest | Authenticated complete reachable-history capture, resumable intake, certified P3 materialization, producer overlays, health, recovery, GC, rebuild, overlap proof, and GH-G strict cutover are implemented. Covered published repositories use producer state only and record no post-boundary `GitHistory` lease. The local refresh adapter remains only for named uncovered, bridge, and `LegacyLocal` categories. | The scope-authorized producer owns Git acquisition for covered published projects; corpus-side generation publication, selectors, indexing, and graph construction stay central. | Complete for GH-G-covered published projects. Later retirement must preserve the named surviving categories until their own gates. |
@@ -212,11 +212,16 @@ The rebaseline result is therefore:
   path/entity planning, checkout-local current and exact-snapshot Git
   execution, bounded facts, measured response parity, and strict marked-project
   refusal are live with no daemon checkout acquisition or fallback.
-- **Partial:** slice 2's render merge gate; slice 4's collector transport,
-  immutable code generations, and activation/cutback authority.
+- **Complete for covered project render:** managed plan/receipt transport,
+  checkout-owned shared rendering, fixed-target confinement, explicit
+  published/own/all views, candidate-gate parity, measured checkout baselines,
+  and strict marked-project refusal are live. Applying a production marker is
+  still a separate operator ceremony.
+- **Partial:** slice 4's collector transport, immutable code generations, and
+  activation/cutback authority.
 - **Not relocated or retired:** bridge and raw unscoped-path blame
-  compatibility, project-scope render, and the remaining local project-file
-  source rung.
+  compatibility, uncovered/bridge/`LegacyLocal` project render, and the
+  remaining local project-file source rung.
   Bridge, uncovered, and `LegacyLocal` `.bbox/` access remains intentionally
   local.
 
@@ -429,11 +434,11 @@ The executable dependency map from this rebaseline is:
    `WorkspaceId` binding, strict watcher/read/write cutover, and the
    covered-route retirement proof are live. Shared local implementations remain
    only for bridge, uncovered, or `LegacyLocal` lanes.
-3. **Finish the remaining interactive checkout bindings.** BL-C's managed and
-   operator blame fact boundary, overlap evidence, and covered adapter
-   retirement are implemented. Move project render writes into the harness/CLI
-   next. Render is a mutating target with broader published/own/all input and
-   confinement parity gates.
+3. **Interactive checkout bindings: complete for covered projects.** BL-C's
+   blame boundary and the project-render harness plan/receipt boundary are
+   implemented with independent measured cutovers. Production marker apply,
+   bridge retirement, and compatibility lanes remain explicit operator work;
+   they are not implied by the code landing.
 4. **Complete collector cutover and observe every adapter.** Establish active
    collected coverage for every intended project, replace or delete the
    local cutback destination, and run the per-surface retirement gates from
@@ -452,15 +457,16 @@ The executable dependency map from this rebaseline is:
    `WorkspaceId`, and additive worker/fleet transport are complete. KT-D binds
    that existing identity to short-lived session capabilities without
    reopening the identity contract.
-2. **Harness-ward moves: partial.** Checkout-local provenance export,
+2. **Harness-ward moves: complete for covered projects.** Checkout-local provenance export,
    authenticated notes import, and candidate-tree render checking are
    implemented. Git/provenance strict cutover is complete for covered published
    repositories. Remote knowledge strict cutover is complete for
    operator-cutover covered Published rows. Managed and scope-authenticated
    operator blame execution is checkout-local and centrally enriched; BL-C can
-   close the covered Published-project adapter after measured overlap. Bridge,
-   raw unscoped-path blame, and project render remain under their section 3
-   gates.
+   close the covered Published-project adapter after measured overlap. Managed
+   project render is also checkout-owned and has its own published/own/all
+   receipt plus quiet checkout-baseline cutover. Bridge, raw unscoped-path
+   blame, and uncovered render compatibility remain under their own gates.
 3. **Knowledge seam — complete for covered Published rows.** The
    provisional lane, explicit visibility, promotion, lifecycle, gap
    convergence, authenticated transport, harness-local mutation, and no-local-

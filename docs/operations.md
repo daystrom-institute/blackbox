@@ -323,6 +323,62 @@ Bridge calls and raw path calls with no stable project context remain explicit
 compatibility lanes and require their own later retirement decision. A code
 deployment alone does not apply a production marker.
 
+### Project render locality overlap and cutover
+
+Generate positive controls through a live managed bro workspace bound to each
+Published project selected for cutover. Invoke the public tool with
+`scope="project"`, no provider filter, and each explicit view. Running `own`
+last leaves the checkout in its normal session view:
+
+```text
+bbox_render(project="/bound/project", scope="project", provisional="published")
+bbox_render(project="/bound/project", scope="project", provisional="all")
+bbox_render(project="/bound/project", scope="project", provisional="own")
+```
+
+Each call must complete the harness-local write of all three generated
+provider files without a hand-authored-file refusal. The daemon persists the
+exact path-free receipt after independently recomputing every projection hash.
+The absolute checkout path remains inside the harness. Global render is not
+part of this ceremony.
+
+Preflight may run while the daemon is live. It requires explicit catalog
+project IDs, successful all-provider non-dry-run completions for
+`published`/`own`/`all`, and one unique configured producer per scope. It
+captures the exact catalog, producer assignment, completions, and
+project-specific `RenderFileProvider` checkout counters. The quiet window has
+a hard minimum of 300 seconds.
+
+```bash
+blackbox project-catalog render-locality-cutover --preflight --configured \
+  --report /absolute/path/render-locality-report.json \
+  --project-id p_00000000000000000000000000000001
+```
+
+Leave normal managed render traffic running for the declared quiet window.
+Any selected project's daemon-side `RenderFileProvider` checkout attempt, or a
+change to its completion, producer assignment, or catalog authority, makes
+apply refuse and requires a new preflight/window.
+
+Apply and verify are offline catalog operations. Obtain explicit operator
+authorization and stop only the named daemon before running them. Apply takes
+its exact project set from the reviewed report.
+
+```bash
+blackbox project-catalog render-locality-cutover --apply --configured \
+  --report /absolute/path/render-locality-report.json
+
+blackbox project-catalog render-locality-cutover --verify --configured
+```
+
+The installed `render-locality-cutover-marker.json` is checksummed and loaded
+before the listener binds; corrupt bytes fail startup. A covered Published
+project must render through a managed checkout owner. An unbound call refuses
+before the daemon checkout broker, and loss of source or binding authority
+never reopens fallback. Bridge, uncovered, and `LegacyLocal` project renders
+remain explicit compatibility lanes. A code deployment alone does not apply a
+production marker.
+
 ### After a daemon upgrade (no schema change)
 
 ```bash

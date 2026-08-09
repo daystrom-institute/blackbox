@@ -254,5 +254,6 @@ silently retired. The production runbook is in `docs/operations.md`.
 ## 5. Parent-plan effect
 
 BL-A through BL-C remove managed and explicitly covered operator blame
-execution from blackboxd. Project render is next; the local project-file walker
-remains governed by the collector cutover.
+execution from blackboxd. Project render has since moved through its own
+[managed plan/receipt cutover](render-locality-transport-impl.md); the local
+project-file walker remains governed by the collector cutover.
