@@ -19,10 +19,8 @@ pub(crate) const BOUND_WORKSPACE_RENDER_SELECTOR: &str = "$bound-workspace";
 fn workspace_project_render_plan(
     server: &BlackboxServer,
     p: &RenderParams,
-) -> anyhow::Result<(
-    ProjectRenderPlanV1,
-    crate::server::knowledge_view::SessionKnowledgeView,
-)> {
+    render_global: bool,
+) -> anyhow::Result<(ProjectRenderPlanV1, Option<String>)> {
     let grant = server
         .authoritative_session_workspace_binding()
         .ok_or_else(|| {
@@ -89,7 +87,20 @@ fn workspace_project_render_plan(
         diagnostics: view.diagnostics_text(),
     };
     plan.validate()?;
-    Ok((plan, view))
+    let global_result = if render_global && plan.requested_scope == "both" {
+        Some(view.knowledge.render(&RenderParams {
+            provider: plan.provider.clone(),
+            project: None,
+            scope: Some("global".into()),
+            dry_run: Some(plan.dry_run),
+            provisional: None,
+            scope_project: None,
+            locality: None,
+        })?)
+    } else {
+        None
+    };
+    Ok((plan, global_result))
 }
 
 /// Rescope a project render request through worktree→base project resolution.
@@ -173,20 +184,8 @@ impl BlackboxServer {
                 && matches!(p.scope.as_deref().unwrap_or("both"), "project" | "both");
             match p.locality.clone() {
                 Some(ProjectRenderLocalityRequestV1::Plan) => {
-                    let (plan, view) = workspace_project_render_plan(&server, &p)?;
-                    let global_result = if plan.requested_scope == "both" {
-                        Some(view.knowledge.render(&RenderParams {
-                            provider: plan.provider.clone(),
-                            project: None,
-                            scope: Some("global".into()),
-                            dry_run: Some(plan.dry_run),
-                            provisional: None,
-                            scope_project: None,
-                            locality: None,
-                        })?)
-                    } else {
-                        None
-                    };
+                    let (plan, global_result) =
+                        workspace_project_render_plan(&server, &p, true)?;
                     return Ok(serde_json::to_string_pretty(&serde_json::json!({
                         "status": "render_locality_plan",
                         "plan": plan,
@@ -194,7 +193,7 @@ impl BlackboxServer {
                     }))?);
                 }
                 Some(ProjectRenderLocalityRequestV1::Complete { plan, receipt }) => {
-                    let (current, _) = workspace_project_render_plan(&server, &p)?;
+                    let (current, _) = workspace_project_render_plan(&server, &p, false)?;
                     if plan != current {
                         anyhow::bail!(
                             "error.render_plan_stale: project render authority changed after the checkout plan was issued"
