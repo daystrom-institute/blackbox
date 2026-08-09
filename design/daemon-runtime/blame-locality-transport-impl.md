@@ -13,15 +13,16 @@ brief: "Move Git blame execution to the checkout owner while preserving bbox_bla
 
 # Blame locality transport
 
-> **Status: partial implementation; BL-A and the managed-workspace BL-B route
-> are implemented and locally verified as of 2026-08-09.** This is the active
-> executable arc in
+> **Status: BL-A through BL-C are implemented and workspace test-verified as of
+> 2026-08-09.** This is the active executable arc in
 > [locality-first-decomposition.md](locality-first-decomposition.md). It
 > preserves the public `bbox_blame(file,line|entity_ref)` contract and the
 > corpus-owned anchor/session/brofile/thread join. It moves only the Git and
-> working-tree operation to the checkout owner. BL-C remains open for the
-> authenticated operator route, measured overlap, and retirement of only the
-> caller categories that route covers.
+> working-tree operation to the checkout owner. The authenticated operator
+> route, measured overlap store, five-minute quiet-window gate, checksummed
+> marker, restart projection, and covered-request refusal are implemented.
+> Applying a production marker remains a separate operator-authorized
+> ceremony; this document claims no production marker.
 
 ## 0. Outcome
 
@@ -48,10 +49,13 @@ downgrade into the other.
 The executable path is now split at the locality boundary:
 
 - `src/tools/graph.rs::bbox_blame` derives a path-free plan for an authenticated
-  workspace-bound session and joins a returned fact without constructing a
-  checkout broker. It re-derives the plan on resolve, rejects stale/cross-scope
-  facts, and refuses a bound request that omits locality transport. Unbound and
-  bridge calls retain the legacy checkout adapter pending BL-C.
+  workspace-bound or blame-scoped operator session and joins a returned fact
+  without constructing a checkout broker. It re-derives the plan on resolve,
+  rejects stale/cross-scope facts, and refuses a bound request that omits
+  locality transport. After a BL-C marker is applied, corpus-identity requests
+  and stable session-project path requests for covered projects refuse before
+  the legacy broker. Raw unscoped paths and bridge calls remain named
+  compatibility lanes.
 - `crates/bro-harness/src/locality.rs` wraps only the qualified daemon
   capability tool in a live managed workspace. It strips caller transport
   fields, executes current or exact-snapshot Git blame inside the bound
@@ -63,6 +67,16 @@ The executable path is now split at the locality boundary:
 - `crates/bbox-corpus-core/src/blame_transport.rs` owns the bounded plan/fact
   contract. `crates/bbox-corpus-core/src/git.rs` owns the hardened current and
   exact-commit Git subprocesses plus the porcelain parser.
+- `crates/bro-cli/src/blame.rs` is the operator checkout owner. It derives the
+  committed scope and durable workspace id locally, authenticates MCP
+  initialization with the existing scope-bound producer token, executes the
+  shared plan locally, and can run one legacy comparison during overlap.
+- `crates/bbox-indexing/src/blame_locality_observations.rs` persists bounded
+  positive-control and checksum-only parity evidence. The separate
+  `blame_locality_cutover` facade requires path and entity controls, exact
+  equal comparisons, stable producer/catalog authority, and no changed
+  daemon-side `Blame` checkout counter through a minimum five-minute window
+  before writing its checksummed marker.
 - Bridge parity, catalog capability, remote-only refusal, exact snapshot,
   dirty-line, deleted-working-file, path-confinement, response-parity, expired
   binding, and zero-checkout-observation tests pin the split and legacy
@@ -188,7 +202,7 @@ expired-binding, and caller-forged transport refusals; absence of the internal
 arm from public schema; absence of absolute checkout roots from the transport;
 and an unchanged checkout-broker observation sequence across plan and resolve.
 
-### BL-C: Overlap, operator path, and strict retirement — pending
+### BL-C: Overlap, operator path, and strict retirement — complete in code
 
 1. Add an authenticated scope-bound operator CLI route using the same plan and
    fact types; do not accept unauthenticated facts.
@@ -205,6 +219,27 @@ scope/commit binding, restart behavior, zero-use evidence for every retired
 category, exact full cluster verification, and explicit operator authority for
 any production cutover.
 
+The landed route uses a blame-only initialization grant rather than the wider
+managed-workspace capability. The token never enters the URL, result, shell
+environment, or fact. `bro blame --verify-overlap` runs the legacy adapter once
+in a separate unprivileged MCP session, hashes the canonical response, and
+persists only identity plus local/legacy checksums. A mismatch refuses.
+
+The offline preflight accepts an explicit project-id set and requires operator
+positive controls plus equal comparisons for both path and entity targets. It
+captures the catalog identity, unique producer assignment, comparison records,
+and project/kind-specific checkout counters. Apply is unavailable until at
+least 300 seconds have elapsed, holds the offline catalog lifetime claim, and
+refuses any changed catalog, assignment, comparison, or `Blame` checkout
+counter. The marker is checksummed and startup fails closed if it is corrupt.
+Once loaded, its covered-project set is monotonic no-fallback authority.
+
+The covered-request proof exercises the real `bbox_blame` path and demonstrates
+that both a stable-project path request and corpus-entity target refuse before
+the first checkout observation. An uncovered catalog positive control still
+executes the legacy adapter. Bridge and unscoped raw-path compatibility are not
+silently retired. The production runbook is in `docs/operations.md`.
+
 ## 4. Non-goals
 
 - No Git object, pack, patch, diff, repository mirror, or remote filesystem
@@ -218,6 +253,6 @@ any production cutover.
 
 ## 5. Parent-plan effect
 
-BL-A and BL-B remove managed harness blame execution from blackboxd. BL-C is
-the measured adapter-retirement gate. Project render remains next after blame;
-the local project-file walker remains governed by the collector cutover.
+BL-A through BL-C remove managed and explicitly covered operator blame
+execution from blackboxd. Project render is next; the local project-file walker
+remains governed by the collector cutover.

@@ -681,7 +681,7 @@ mod tests {
         }
 
         let report_path = root.join("blame-cutover-report.json");
-        let preflight = || {
+        let preflight = |age: bool| {
             ProjectCatalogBlameLocalityCutoverFacadeV1::preflight(
                 BlameLocalityCutoverPreflightRequestV1 {
                     layout: layout.clone(),
@@ -693,9 +693,22 @@ mod tests {
                 },
             )
             .unwrap();
-            age_report(&report_path);
+            if age {
+                age_report(&report_path);
+            }
         };
-        preflight();
+        preflight(false);
+        let error =
+            ProjectCatalogBlameLocalityCutoverFacadeV1::apply(BlameLocalityCutoverApplyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path: report_path.clone(),
+                applied_at: "unix:2".into(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("quiet window is incomplete"), "{error}");
+        age_report(&report_path);
 
         let checkout_observations = CheckoutAccessObservations::open(
             layout.bro_home.join("checkout-access-observations.json"),
@@ -721,7 +734,7 @@ mod tests {
             .to_string();
         assert!(error.contains("checkout access changed"), "{error}");
 
-        preflight();
+        preflight(true);
         let receipt =
             ProjectCatalogBlameLocalityCutoverFacadeV1::apply(BlameLocalityCutoverApplyRequestV1 {
                 layout: layout.clone(),

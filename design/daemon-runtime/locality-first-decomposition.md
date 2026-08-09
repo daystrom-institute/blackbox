@@ -9,7 +9,7 @@ topic:
   - corpus
   - knowledge
 tags: [decomposition, satellite, harness, worktrees, knowledge-seam, collector, render, provenance, indexing]
-brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, fleetd, typed Git-history/provenance transport, remote knowledge transport through covered-adapter retirement, and managed-workspace blame locality are complete. Blame operator/adapter retirement is next, followed by project render and remaining project-file walks."
+brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. Durable project identity, fleetd, typed Git-history/provenance transport, remote knowledge transport, and blame locality through covered-adapter retirement are complete. Project render and remaining project-file walks are next."
 ---
 
 # Locality-first decomposition: the checkout plane and the corpus plane
@@ -27,10 +27,12 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 > blackboxd no longer watches, reads, writes, or falls back to the checkout for
 > project `.bbox/` state. The shared local adapter bodies now have no covered
 > route and remain only for bridge, uncovered, and `LegacyLocal` lanes.
-> Managed workspace blame now executes Git in the harness and returns a
-> bounded fact for central enrichment without a daemon checkout lease; the
-> unbound/operator and bridge blame adapter remains until BL-C. Daemon-side
-> local project walking remains an active source rung, and project render
+> Managed workspace blame now executes Git in the harness, and the
+> authenticated `bro blame` route does the same for operator checkouts. BL-C's
+> measured overlap, mandatory quiet window, checksummed marker, and strict
+> covered-project refusal are implemented. A production marker is not claimed;
+> bridge and raw unscoped-path blame remain explicit compatibility lanes.
+> Daemon-side local project walking remains an active source rung, and project render
 > writes still reach into an attached checkout. Section 3 is the current
 > code-verified inventory and section 6 is the dependency and retirement map.
 > Line cites rot; reverify
@@ -189,7 +191,7 @@ path-free durable identity does not by itself make the operation local.
 |---|---|---|---|
 | Provenance export | Authenticated collector page/apply/receipt and GH-G strict cutover are implemented. `bbox_provenance_export_plan` and `bro provenance export` remain interactive checkout-local paths. The legacy mutation refuses before lease for transport-governed published projects; bridge and `LegacyLocal` compatibility stay scoped. | Keep corpus planning and checkout-local apply. The scope-authorized producer pulls the plan and returns a typed receipt; blackboxd never writes the notes ref for covered projects. | Complete for GH-G-covered published projects. Retain the interactive plan and verify later bridge retirement independently. |
 | Provenance import | Authenticated stable snapshot upload, corpus validation, pinned V1 resolution, strict V2 membership, durable replay, quarantine, and GH-G strict cutover are implemented. The legacy import refuses before lease for transport-governed published projects. | Keep typed producer capture and central edge publication. Arbitrary caller-supplied note JSON is not graph authority. | Complete for GH-G-covered published projects. Bridge and `LegacyLocal` retirement remain separate. |
-| `bbox_blame` | Managed workspace-bound harnesses wrap the existing tool: blackboxd emits a path-free plan and joins a bounded returned fact, while the harness runs current or exact-snapshot Git locally. Plan/resolve adds zero checkout-broker observations and bound calls cannot fall back. Unbound/operator and bridge callers still use the daemon checkout adapter. | A checkout-side binding returns a typed blame fact at an explicit commit or working-tree state. The corpus-side query joins that fact to anchors, sessions, brofiles, and threads. A checkout path never becomes corpus authority. | Complete for managed workspaces. BL-C still requires an authenticated operator route, caller-category observations and parity, then explicit retirement of each covered legacy category. |
+| `bbox_blame` | Managed harnesses and the scope-authenticated operator CLI execute current or exact-snapshot Git locally and return the same bounded fact for central enrichment. BL-C persists path/entity equality evidence and installs a checksummed project marker only after a minimum five-minute window with unchanged `Blame` checkout counters. Covered entity and stable-session-project path requests refuse before the daemon broker. | A checkout-side binding returns a typed blame fact at an explicit commit or working-tree state. The corpus-side query joins that fact to anchors, sessions, brofiles, and threads. A checkout path never becomes corpus authority. | Complete in code for explicitly marked Published projects. Production apply remains operator-authorized. Bridge and raw unscoped-path lanes remain separately scoped compatibility. |
 | Project-scope render | `bbox_render` resolves an attachment, takes a write `RenderFileProvider` lease, and invokes the shared `bbox-knowledge` renderer inside blackboxd. The immutable-candidate merge gate already invokes `render --check` semantics. No `bro render` or harness-native equivalent exists. | `bro render` and/or a harness binding links the same `bbox-knowledge` renderer and writes only inside its own checkout. It obtains the pinned published/global inputs and explicit provisional view from the corpus. Global render remains operator-host local. | Byte/output parity through the shared renderer, target-confinement tests, published/own/all view tests, candidate-tree gate parity, and a measured zero-use window before removing daemon write authority. |
 | Project source indexing | `bbox-code-collector`, its authenticated manifest/blob endpoint, immutable generations, activation, health, and cutback are implemented. An active collected generation suppresses local walking. `LocalProjectWalk` remains live for local/unassigned projects and as the explicit cutback destination. | Checkout owners walk, hash, and ship raw capped bytes; the corpus chunks and indexes them. Every intended project uses an active collected source. No daemon source rung opens a checkout. | Configured producer coverage, successful active generations, restart/rebuild recovery, bounded observation with no local-walk attempts, and an explicit decision about replacing or deleting local cutback before `LocalProjectWalk` retires. |
 | Repo-owned `.bbox/` read and mutation path | KT-A through KT-F are implemented. Authenticated committed candidates and leased provisional workspaces feed the existing accepted and overlay models; managed project mutation runs in the harness; remote `own`/`all` survives restart. For an operator-cutover covered Published row, the marker closes daemon watcher refresh plus local read/write/schema-marker acquisition with no fallback. Non-vacuous publisher and watcher probes prove the covered route performs no checkout-broker operation. Shared local bodies remain only for bridge, uncovered, and `LegacyLocal` lanes. | A harness reads and mutates its own branch state directly. Published and deliberately shared provisional inputs reach the corpus through the authenticated checkout-source contract; corpus coordination, validation, promotion, and indexing remain central. | Complete for covered Published rows. Bridge, uncovered, and `LegacyLocal` retirement remains separately authorized. |
@@ -206,13 +208,15 @@ The rebaseline result is therefore:
   provenance acquisition/publication through GH-G strict cutover. Runtime
   classification closes local fallback and retains only the named bridge,
   uncovered, and `LegacyLocal` categories.
-- **Complete for managed workspace blame:** path/entity planning, checkout-local
-  current and exact-snapshot Git execution, bounded typed facts, and central
-  enrichment are live with no daemon checkout acquisition or fallback.
+- **Complete for covered blame:** managed and scope-authenticated operator
+  path/entity planning, checkout-local current and exact-snapshot Git
+  execution, bounded facts, measured response parity, and strict marked-project
+  refusal are live with no daemon checkout acquisition or fallback.
 - **Partial:** slice 2's render merge gate; slice 4's collector transport,
   immutable code generations, and activation/cutback authority.
-- **Not relocated or retired:** the unbound/operator and bridge blame adapter,
-  project-scope render, and the remaining local project-file source rung.
+- **Not relocated or retired:** bridge and raw unscoped-path blame
+  compatibility, project-scope render, and the remaining local project-file
+  source rung.
   Bridge, uncovered, and `LegacyLocal` `.bbox/` access remains intentionally
   local.
 
@@ -401,7 +405,7 @@ monolith:
 | Slice | Current state | What remains |
 |---|---|---|
 | 1. Identity contract | Complete | The existing reuse-safe checkout marker is typed as `WorkspaceId` and transported through worker/fleet protocol state. Later session capability binding consumes this identity without redefining it. |
-| 2. Harness-ward moves | Partial | Provenance export/import strict cutover, candidate render checking, remote knowledge through KT-F, and managed-workspace blame locality are live. Complete blame's authenticated operator route and adapter gate, then move render writes. |
+| 2. Harness-ward moves | Partial | Provenance export/import strict cutover, remote knowledge through KT-F, and blame locality through BL-C are live. Move project render writes next. |
 | 3. Knowledge seam | Complete for covered Published rows | KT-A through KT-F are closed. Bridge, uncovered, and `LegacyLocal` behavior remains. |
 | 4. Code-corpus collector | Partial | Cut over intended projects, remove the local-walk/cutback dependency, and stop coupling collected activation to daemon-side Git acquisition. |
 | 5. Fleetd | Complete | No locality-program work remains. |
@@ -425,11 +429,11 @@ The executable dependency map from this rebaseline is:
    `WorkspaceId` binding, strict watcher/read/write cutover, and the
    covered-route retirement proof are live. Shared local implementations remain
    only for bridge, uncovered, or `LegacyLocal` lanes.
-3. **Finish the remaining interactive checkout bindings.** The managed blame
-   fact boundary is live. Complete BL-C's authenticated operator route,
-   caller-category overlap, and covered adapter retirement next, then move
-   project render writes into the harness/CLI. Render is a mutating target with
-   broader published/own/all input and confinement parity gates.
+3. **Finish the remaining interactive checkout bindings.** BL-C's managed and
+   operator blame fact boundary, overlap evidence, and covered adapter
+   retirement are implemented. Move project render writes into the harness/CLI
+   next. Render is a mutating target with broader published/own/all input and
+   confinement parity gates.
 4. **Complete collector cutover and observe every adapter.** Establish active
    collected coverage for every intended project, replace or delete the
    local cutback destination, and run the per-surface retirement gates from
@@ -452,9 +456,11 @@ The executable dependency map from this rebaseline is:
    authenticated notes import, and candidate-tree render checking are
    implemented. Git/provenance strict cutover is complete for covered published
    repositories. Remote knowledge strict cutover is complete for
-   operator-cutover covered Published rows. Managed-workspace blame execution
-   is checkout-local and centrally enriched; its operator/bridge adapter gate
-   and project render writes remain under their section 3 gates.
+   operator-cutover covered Published rows. Managed and scope-authenticated
+   operator blame execution is checkout-local and centrally enriched; BL-C can
+   close the covered Published-project adapter after measured overlap. Bridge,
+   raw unscoped-path blame, and project render remain under their section 3
+   gates.
 3. **Knowledge seam — complete for covered Published rows.** The
    provisional lane, explicit visibility, promotion, lifecycle, gap
    convergence, authenticated transport, harness-local mutation, and no-local-
