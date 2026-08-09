@@ -1531,22 +1531,15 @@ fn capture_publication_parity(
         &source_generation_sha256,
         &verified,
     )?;
-    let (expected_generation_id, expected_pointer_sha256) = accepted
-        .advance_tokens(project_id)
-        .map_err(|cause| error("error.knowledge_transport_cutover_accepted", cause))?
-        .ok_or_else(|| {
-            error(
-                "error.knowledge_transport_cutover_accepted",
-                "accepted publication pointer disappeared",
-            )
-        })?;
+    // This is a content-parity rebuild, not a pointer transition. An advance
+    // would attach the installed generation as the prior arm, then correctly
+    // reject the rebuilt current content because a prior arm must name a
+    // distinct generation. Establish preparation carries no prior arm and a
+    // dry run never attempts the pointer-absence commit precondition.
     let rebuilt = accepted
         .prepare_publish(
             PublishRequest {
-                mode: PublisherPublishMode::Advance {
-                    expected_generation_id,
-                    expected_pointer_sha256,
-                },
+                mode: PublisherPublishMode::Establish,
                 project_id: project_id.clone(),
                 source: AcceptedPublicationSourceBinding::Producer {
                     producer_id: producer_id.to_string(),

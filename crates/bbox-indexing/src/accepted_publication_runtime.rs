@@ -2454,6 +2454,33 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_establish_rebuilds_current_content_for_cutover_parity() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_cutover_parity");
+        let established = run_publish(
+            &runtime,
+            producer_request(&project_id, COMMIT_ONE),
+            "current",
+        )
+        .unwrap();
+        let pointer_before = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let mut request = producer_request(&project_id, COMMIT_ONE);
+        request.dry_run = true;
+
+        let rebuilt = runtime
+            .prepare_publish(request, sources("current"))
+            .unwrap();
+
+        assert_eq!(rebuilt.generation_id(), established.generation_id());
+        assert_eq!(rebuilt.generation_hash(), established.generation_hash());
+        assert_eq!(
+            runtime.advance_tokens(&project_id).unwrap().unwrap(),
+            pointer_before
+        );
+    }
+
+    #[test]
     fn two_concurrent_establishes_leave_exactly_one_winner() {
         let fixture = fixture();
         let project_id = project("p_race_establish");
