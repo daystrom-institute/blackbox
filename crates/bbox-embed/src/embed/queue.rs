@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bbox_visual_store::VisualPayloadRef;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rmcp::schemars;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -552,6 +552,10 @@ pub struct EmbedQueueHandle {
 struct EmbedQueueInner {
     senders: RwLock<BTreeMap<String, mpsc::UnboundedSender<WorkerCommand>>>,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
+    /// Identities admitted but not yet terminally persisted or dropped.
+    /// Vector-store dedup only sees completed writes, so without this set two
+    /// overlapping refill/index passes can enqueue the same provider work.
+    pending: Arc<Mutex<HashSet<PendingKey>>>,
     router: Option<EmbeddingRouter>,
     vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     debounce: Duration,
@@ -581,8 +585,26 @@ struct WorkerSpec {
     debounce: Duration,
     retry_backoff: Duration,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
+    pending: Arc<Mutex<HashSet<PendingKey>>>,
     vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     persist_vectors: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PendingKey {
+    vector_route: String,
+    entity_id: String,
+    chunk_hash: String,
+}
+
+impl PendingKey {
+    fn new(vector_route: &str, request: &EmbedRequest) -> Self {
+        Self {
+            vector_route: vector_route.to_string(),
+            entity_id: request.entity_id.clone(),
+            chunk_hash: request.chunk_hash.clone(),
+        }
+    }
 }
 
 impl EmbedQueueHandle {
@@ -742,6 +764,17 @@ impl EmbedQueueHandle {
             );
             return EnqueueOutcome::Skipped;
         }
+        let pending_key = PendingKey::new(&resolved.vector_route, &request);
+        if !self.inner.pending.lock().insert(pending_key.clone()) {
+            tracing::debug!(
+                route = %resolved.queue_route,
+                vector_route = %resolved.vector_route,
+                entity_id = %request.entity_id,
+                chunk_hash = %request.chunk_hash,
+                "embedding enqueue skipped identity already pending"
+            );
+            return EnqueueOutcome::Skipped;
+        }
         let request_bytes = request.text.len() as u64;
         let max_depth = self
             .inner
@@ -753,6 +786,7 @@ impl EmbedQueueHandle {
             request_bytes,
             max_depth,
         ) {
+            self.inner.pending.lock().remove(&pending_key);
             tracing::warn!(
                 route = %resolved.queue_route,
                 entity_id = %request.entity_id,
@@ -766,6 +800,7 @@ impl EmbedQueueHandle {
             Some(sender) => {
                 let sent = sender.send(WorkerCommand::Enqueue(request)).is_ok();
                 if !sent {
+                    self.inner.pending.lock().remove(&pending_key);
                     release_queue(
                         &self.inner.statuses,
                         &resolved.queue_route,
@@ -782,6 +817,7 @@ impl EmbedQueueHandle {
                 EnqueueOutcome::Enqueued
             }
             None => {
+                self.inner.pending.lock().remove(&pending_key);
                 release_queue(
                     &self.inner.statuses,
                     &resolved.queue_route,
@@ -986,6 +1022,7 @@ impl EmbedQueueHandle {
             debounce: self.inner.debounce,
             retry_backoff: self.inner.retry_backoff,
             statuses: self.inner.statuses.clone(),
+            pending: self.inner.pending.clone(),
             vector_store: self.inner.vector_store.clone(),
             persist_vectors: true,
         };
@@ -1016,6 +1053,7 @@ impl EmbedQueueHandle {
             inner: Arc::new(EmbedQueueInner {
                 senders: RwLock::new(BTreeMap::new()),
                 statuses: Arc::new(RwLock::new(statuses)),
+                pending: Arc::new(Mutex::new(HashSet::new())),
                 router: None,
                 vector_store: None,
                 debounce: DEFAULT_DEBOUNCE,
@@ -1060,6 +1098,7 @@ impl EmbedQueueHandle {
         vector_store: Option<Arc<bbox_vectors::VectorStore>>,
     ) -> Self {
         let statuses = Arc::new(RwLock::new(BTreeMap::new()));
+        let pending = Arc::new(Mutex::new(HashSet::new()));
         let mut senders = BTreeMap::new();
         for (route, provider, rate_limit_per_min, vector_route) in providers {
             let status = provider_route_status(provider.as_ref());
@@ -1073,6 +1112,7 @@ impl EmbedQueueHandle {
                 debounce,
                 retry_backoff,
                 statuses: statuses.clone(),
+                pending: pending.clone(),
                 vector_store: vector_store.clone(),
                 persist_vectors: vector_store.is_some(),
             };
@@ -1083,6 +1123,7 @@ impl EmbedQueueHandle {
             inner: Arc::new(EmbedQueueInner {
                 senders: RwLock::new(senders),
                 statuses,
+                pending,
                 router,
                 vector_store,
                 debounce,
@@ -1265,6 +1306,7 @@ async fn process_batch_outcome(
                 model = spec.provider.document_model(),
                 "embedding vectors persisted"
             );
+            release_pending(spec, &batch);
             mark_success(
                 &spec.statuses,
                 &spec.route,
@@ -1335,6 +1377,7 @@ async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
                 batch.len()
             );
             tracing::warn!(route = %spec.route, dropped = batch.len(), "{message}");
+            release_pending(spec, &batch);
             mark_poison_dropped(
                 &spec.statuses,
                 &spec.route,
@@ -1354,6 +1397,7 @@ async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
                             "vector persistence failed during poison isolation: {sanitized}"
                         );
                         tracing::warn!(route = %spec.route, error = %sanitized, "{message}");
+                        release_pending(spec, &batch);
                         mark_poison_dropped(
                             &spec.statuses,
                             &spec.route,
@@ -1364,6 +1408,7 @@ async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
                         continue;
                     }
                 }
+                release_pending(spec, &batch);
                 mark_success(
                     &spec.statuses,
                     &spec.route,
@@ -1389,6 +1434,7 @@ async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
                         error = %sanitized,
                         "poison embedding payload dropped"
                     );
+                    release_pending(spec, &batch);
                     mark_poison_dropped(
                         &spec.statuses,
                         &spec.route,
@@ -1433,6 +1479,7 @@ async fn schedule_retry_or_drop(
             dropped,
             "embedding batch dropped after retry limit"
         );
+        release_pending(spec, &batch);
         mark_dropped(
             &spec.statuses,
             &spec.route,
@@ -1664,6 +1711,13 @@ fn release_queue(
     let status = statuses.entry(route.to_string()).or_default();
     status.queue_depth = status.queue_depth.saturating_sub(count);
     status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
+}
+
+fn release_pending(spec: &WorkerSpec, batch: &[EmbedRequest]) {
+    let mut pending = spec.pending.lock();
+    for request in batch {
+        pending.remove(&PendingKey::new(&spec.vector_route, request));
+    }
 }
 
 fn mark_success(
@@ -2160,6 +2214,37 @@ mod tests {
             provider.calls.load(Ordering::SeqCst),
             0,
             "a dedup-skipped enqueue must not call the provider"
+        );
+        queue.shutdown();
+    }
+
+    /// Vector-store dedup cannot see an admitted request until its worker
+    /// persists the result. Overlapping refill and live-index passes must
+    /// still collapse that in-flight window to one provider call.
+    #[tokio::test]
+    async fn enqueue_outcome_skips_an_identity_already_pending() {
+        let provider = Arc::new(MockProvider::ok());
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", provider.clone())],
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+        );
+        let req = request(Bucket::Code, "project_file:p:f:h:0", "h1");
+
+        assert_eq!(queue.enqueue_outcome(req.clone()), EnqueueOutcome::Enqueued);
+        assert_eq!(queue.enqueue_outcome(req.clone()), EnqueueOutcome::Skipped);
+        assert_eq!(queue.status().routes["code"].queue_depth, 1);
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(queue.status().routes["code"].queue_depth, 0);
+
+        assert_eq!(queue.enqueue_outcome(req), EnqueueOutcome::Enqueued);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "terminal completion releases the pending identity"
         );
         queue.shutdown();
     }
