@@ -365,6 +365,7 @@ fn open_catalog(
     Ok(ProjectCatalogStore::open_existing(layout.projects_path())?
         .snapshot()?
         .catalog()
+        .as_ref()
         .clone())
 }
 
