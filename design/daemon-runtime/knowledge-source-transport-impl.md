@@ -548,7 +548,11 @@ nextest, clippy, and concurrency.
 
 ### KT-B: Store, authenticated intake, and collector capture
 
-Status: implementation complete; full lane gate pending.
+Status: complete.
+
+Gate evidence: commit `1419468d049b` passed the 82-test focused KT-B matrix
+and cluster workflow `bbox-verify-6qcx2` completed the full nextest, clippy,
+and concurrency gates on that exact SHA.
 
 1. Add `bbox-knowledge-source-store` with resumable CAS, journals, recovery,
    GC, and lease expiry.
