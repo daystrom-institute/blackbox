@@ -6702,6 +6702,62 @@ mod tests {
         assert_eq!(local.denied, 0);
     }
 
+    #[test]
+    fn governed_code_source_reload_refuses_assignment_removal_before_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_CONFIG", root.join("missing-config.toml"));
+        env.set("BLACKBOX_STATE_DIR", &state_dir);
+        let mut config = crate::config::load().unwrap();
+        let project_id = "p_00000000000000000000000000000001";
+        let scope = PublishedScope::try_new("test", ".").unwrap();
+        let token_file = root.join("producer-token");
+        write_service_token(&token_file, 'a');
+        config.code_collection.enabled = true;
+        config.code_collection.producers = vec![CodeCollectionProducerConfig {
+            producer_id: "producer".into(),
+            token_file,
+            scopes: vec![scope.clone()],
+        }];
+        let catalog = catalog_grant_store(
+            &root.join("catalog"),
+            &[(project_id, ProjectScope::Published(scope.clone()))],
+        );
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        ));
+        let runtime = CodeSourceRuntime::open(
+            &config,
+            &[],
+            Some(catalog),
+            broker,
+            Arc::new(
+                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::governed_for_test(
+                    project_id,
+                ),
+            ),
+        )
+        .unwrap();
+        let original_revision = runtime.assignment_revision();
+
+        let mut removed = config;
+        removed.code_collection.enabled = false;
+        removed.code_collection.producers.clear();
+        let error = runtime.reload(&removed, &[]).unwrap_err();
+
+        assert!(format!("{error:#}").contains("must retain producer"));
+        assert_eq!(runtime.assignment_revision(), original_revision);
+        assert_eq!(
+            runtime.producer_auth().assignment_map().get(&scope),
+            Some(&(project_id.to_string(), "producer".to_string())),
+            "the rejected replacement must not swap the live assignment table"
+        );
+    }
+
     fn empty_generation_descriptor(scope: PublishedScope, head: &str) -> GenerationDescriptor {
         GenerationDescriptor {
             schema_version: SCHEMA_VERSION,

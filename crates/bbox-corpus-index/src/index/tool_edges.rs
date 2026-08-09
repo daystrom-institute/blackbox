@@ -306,7 +306,7 @@ impl ToolEdgeContext {
             return Ok(None);
         };
         let access = resolved.access;
-        let relative_anchor = resolved.relative_anchor;
+        let relative_anchor = resolved.relative_anchor.as_str();
         let bytes = match read_resolved_bytes(&resolved) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(None),
@@ -353,7 +353,7 @@ impl ToolEdgeContext {
                 event,
                 tool_call,
                 &access.project_id,
-                &relative_anchor,
+                relative_anchor,
                 resolved.commit_sha().as_deref(),
                 byte_range,
                 &bytes,

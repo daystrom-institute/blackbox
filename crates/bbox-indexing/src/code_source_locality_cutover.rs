@@ -414,6 +414,14 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
         )?;
         let observations = open_observations(&store)?.snapshot();
         let checkout = open_checkout_observations(&request.layout)?.health();
+        for row in &marker.rows {
+            if local_walk_counters(&checkout, row.project_id.as_str()) != row.checkout_baselines {
+                bail!(
+                    "LocalProjectWalk access changed after cutover for {}",
+                    row.project_id
+                );
+            }
+        }
         Ok(receipt(
             "verified",
             Some(marker.checksum_sha256),
@@ -707,6 +715,186 @@ mod tests {
 
     const PROJECT: &str = "p_00000000000000000000000000000001";
 
+    fn current_v2_fixture(
+        root: &Path,
+    ) -> (
+        Config,
+        ProjectCatalogMigrationResolvedLayoutV1,
+        ProjectId,
+        PublishedScope,
+    ) {
+        use bbox_config::config::{CodeCollectionProducerConfig, LoadOptions};
+        use bbox_corpus_core::project_catalog::{CatalogSnapshotV2, CorpusProject};
+
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+                state_dir,
+                state_dir.join("vectors")
+            ),
+        )
+        .unwrap();
+        let mut config = bbox_config::config::load_with(LoadOptions {
+            config_path: Some(config_path),
+            ..Default::default()
+        })
+        .unwrap();
+        config.paths.state_dir = state_dir.clone();
+        config.paths.projects_path = state_dir.join("projects.json");
+        config.paths.bro_home = state_dir.join("bro");
+        config.paths.index_path = state_dir.join("index");
+        config.paths.vectors_path = state_dir.join("vectors");
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let scope = PublishedScope::try_new("fixture-repo", ".").unwrap();
+        config.code_collection.enabled = true;
+        config.code_collection.producers = vec![CodeCollectionProducerConfig {
+            producer_id: "producer".into(),
+            token_file: root.join("producer-token"),
+            scopes: vec![scope.clone()],
+        }];
+        let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+            &config,
+            crate::project_catalog_migration::ProjectCatalogMigrationLayoutOverridesV1 {
+                projects_path: Some(config.paths.projects_path.clone()),
+                state_dir: Some(state_dir.clone()),
+            },
+        )
+        .unwrap();
+        let catalog = ProjectCatalogStore::initialize_empty(layout.projects_path()).unwrap();
+        let epoch = catalog.snapshot().unwrap().epoch();
+        let project_id_for_catalog = project_id.clone();
+        let scope_for_catalog = scope.clone();
+        catalog
+            .transact(
+                epoch,
+                move |catalog: &mut CatalogSnapshotV2, _attachments| {
+                    catalog.projects.insert(
+                        project_id_for_catalog.clone(),
+                        CorpusProject {
+                            project_id: project_id_for_catalog.clone(),
+                            scope: ProjectScope::Published(scope_for_catalog.clone()),
+                            operator_aliases: Default::default(),
+                            nominated_aliases: Default::default(),
+                            display_name: "fixture".into(),
+                            created_at: "2026-08-09T00:00:00Z".into(),
+                            registered_at_compat: None,
+                            repo_history: None,
+                            languages: Default::default(),
+                        },
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let store = CodeSourceStore::open_with_mode(
+            state_dir.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let head_commit = "a".repeat(40);
+        let entries = Vec::new();
+        let descriptor = bbox_code_source::GenerationDescriptor {
+            schema_version: bbox_code_source::SCHEMA_VERSION,
+            walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head_commit.clone(),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head_commit, &entries),
+            manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+            file_count: 0,
+            logical_bytes: 0,
+        };
+        let upload = store.begin_upload("producer", descriptor).unwrap();
+        store
+            .put_manifest_page("producer", &upload.upload_id, 0, &entries)
+            .unwrap();
+        store
+            .complete_manifest("producer", &upload.upload_id)
+            .unwrap();
+        let generation = store
+            .finalize_upload("producer", &upload.upload_id)
+            .unwrap();
+        let inventory = "b".repeat(64);
+        store
+            .record_materialization_mixed(&scope, &generation.generation_id, 0, inventory.clone())
+            .unwrap();
+        store
+            .mark_generation_state_mixed(
+                &scope,
+                &generation.generation_id,
+                GenerationState::Active,
+                None,
+            )
+            .unwrap();
+        let selector = crate::index::project_files::collected_materialization_selector(
+            project_id.as_str(),
+            &generation.generation_id,
+        );
+        let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(
+            project_id.as_str(),
+            &generation.generation_id,
+        );
+        store
+            .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
+                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                project_id: project_id.clone(),
+                published_scope: scope.clone(),
+                generation_id: generation.generation_id.clone(),
+                selector: selector.clone(),
+                snapshot_id: snapshot_id.clone(),
+                document_count: 0,
+                entity_inventory_sha256: inventory,
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: 1,
+                cutback_pending: false,
+                cutback: None,
+                diagnostic: None,
+            })
+            .unwrap();
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(layout.projects_path());
+        std::fs::create_dir_all(bbox_edge_sidecar::snapshot::snapshot_dir(
+            &edges_dir,
+            project_id.as_str(),
+            &snapshot_id,
+        ))
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            project_id.as_str(),
+            scope.repo_id(),
+            &head_commit,
+            &generation.generation_id,
+            &selector,
+            &snapshot_id,
+        )
+        .unwrap();
+        let observations = CodeSourceLocalityObservationsV1::open(
+            observation_path_from_code_source_root(store.root()).unwrap(),
+        )
+        .unwrap();
+        observations
+            .record_verified_activations(
+                &store,
+                layout.projects_path(),
+                CodeSourceLocalityEvidenceKindV1::StartupRecovery,
+            )
+            .unwrap();
+        observations
+            .record_verified_activations(
+                &store,
+                layout.projects_path(),
+                CodeSourceLocalityEvidenceKindV1::FullRebuild,
+            )
+            .unwrap();
+        (config, layout, project_id, scope)
+    }
+
     fn row() -> CodeSourceLocalityCutoverRowV1 {
         let project_id = ProjectId::parse(PROJECT).unwrap();
         let scope = PublishedScope::try_new("repo", ".").unwrap();
@@ -781,5 +969,90 @@ mod tests {
         .unwrap();
         let error = CodeSourceLocalityCutoverRuntimeV1::open(dir.path()).unwrap_err();
         assert!(format!("{error:#}").contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn current_v2_preflight_apply_verify_closes_post_cutover_local_walk() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, _scope) = current_v2_fixture(&root);
+        let report_path = root.join("code-source-locality-report.json");
+
+        let preflight = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::preflight(
+            CodeSourceLocalityCutoverPreflightRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path: report_path.clone(),
+                project_ids: vec![project_id.clone()],
+                min_quiet_secs: MIN_CODE_SOURCE_LOCALITY_QUIET_SECS,
+                generated_at: "2026-08-09T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(preflight.status, "preflight_clean");
+        let mut report: CodeSourceLocalityCutoverReportV1 =
+            read_json_required(&report_path).unwrap();
+        report.generated_at_unix_secs =
+            now_unix_secs().saturating_sub(MIN_CODE_SOURCE_LOCALITY_QUIET_SECS);
+        write_json(&report_path, &report).unwrap();
+
+        let applied = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::apply(
+            CodeSourceLocalityCutoverApplyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path,
+                applied_at: "2026-08-09T00:05:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(applied.status, "applied");
+        assert!(
+            CodeSourceLocalityCutoverRuntimeV1::open(&layout.state_dir)
+                .unwrap()
+                .transport_governed(project_id.as_str())
+        );
+        let verified = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(verified.status, "verified");
+
+        let observation_path = layout.bro_home.join("checkout-access-observations.json");
+        std::fs::create_dir_all(observation_path.parent().unwrap()).unwrap();
+        let counter = CheckoutAccessTargetCounter {
+            project_id: project_id.to_string(),
+            kind: CheckoutAccessKind::LocalProjectWalk,
+            source_lane: crate::checkout_access::CheckoutAccessSourceLane::LegacyProjectRecord,
+            outcome: crate::checkout_access::CheckoutAccessOutcome::Granted,
+            count: 1,
+            last_sequence: 1,
+            last_unix_secs: 1,
+        };
+        std::fs::write(
+            observation_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "sequence": 1,
+                "counters": [{
+                    "kind": "local_project_walk",
+                    "source_lane": "legacy_project_record",
+                    "outcome": "granted",
+                    "count": 1,
+                    "last_sequence": 1,
+                    "last_unix_secs": 1
+                }],
+                "target_counters": [counter]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 { layout, config },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("changed after cutover"));
     }
 }
