@@ -9,7 +9,7 @@ topic:
   - corpus
   - knowledge
 tags: [decomposition, satellite, harness, worktrees, knowledge-seam, collector, render, provenance, indexing]
-brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) only then move the corpus + shared stores off-host. All covered Published-project transports, including render and collected code source, now have measured strict cutovers. Operational coverage and compatibility retirement precede the corpus move."
+brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), not authority. Two moves, strictly ordered: (1) empty the daemon of checkout-coupled acquisition and mutation; (2) move the corpus + shared stores off-host. All intended projects now use collected Published-project transports and the corpus plane runs off-host; compatibility retirement remains separately gated."
 ---
 
 # Locality-first decomposition: the checkout plane and the corpus plane
@@ -36,12 +36,17 @@ brief: "Split the system on LOCALITY (checkout-coupled vs shared/append-only), n
 > For a marked Published project, render writes stay with the checkout owner,
 > collected transport remains authoritative, `LocalProjectWalk` refuses before
 > the broker observes or resolves a path, and transcript tool edges resolve from
-> verified immutable blobs. No production render or code-source marker is
-> claimed. Section 3 is the current
+> verified immutable blobs. The current intended project set is now Published,
+> collected, and served by the off-host corpus deployment. Exact all-route
+> embedding coverage, all-project search/publication/storage validation, and
+> restart re-adoption are green on that topology. Bridge, uncovered, and
+> `LegacyLocal` code paths remain compatibility surfaces with their own
+> retirement gate; the move does not silently delete them. Section 3 is the current
 > code-verified inventory and section 6 is the dependency and retirement map.
 > Line cites rot; reverify
-> symbols and contracts against code before building on this snapshot. No
-> production knowledge marker or deployment is claimed by this inventory.
+> symbols and contracts against code before building on this snapshot. This
+> inventory records the deployed topology; compatibility deletion still
+> requires fresh evidence and explicit authorization.
 
 ## 0. Decision
 
@@ -423,11 +428,11 @@ monolith:
 | Slice | Current state | What remains |
 |---|---|---|
 | 1. Identity contract | Complete | The existing reuse-safe checkout marker is typed as `WorkspaceId` and transported through worker/fleet protocol state. Later session capability binding consumes this identity without redefining it. |
-| 2. Harness-ward moves | Complete in code for covered Published rows | Provenance, knowledge, blame, and project render have independent measured strict cutovers. Apply production coverage and retain named compatibility lanes until separately retired. |
-| 3. Knowledge seam | Complete for covered Published rows | KT-A through KT-F are closed. Bridge, uncovered, and `LegacyLocal` behavior remains. |
-| 4. Code-corpus collector | Complete in code for covered Published rows | Apply intended-project coverage. Migrate or separately retire uncovered, bridge, and `LegacyLocal` local-walk lanes. |
+| 2. Harness-ward moves | Deployed for the current intended Published rows | Provenance, knowledge, blame, and project render have independent measured strict cutovers. Retain named compatibility lanes until separately retired. |
+| 3. Knowledge seam | Deployed for the current intended Published rows | KT-A through KT-F are closed. Bridge, uncovered, and `LegacyLocal` behavior remains. |
+| 4. Code-corpus collector | Deployed for the current intended Published rows | Maintain current-project coverage. Migrate or separately retire uncovered, bridge, and `LegacyLocal` local-walk lanes. |
 | 5. Fleetd | Complete | No locality-program work remains. |
-| 6. Corpus off-host | Pending | Blocked on deployed cutover coverage, compatibility disposition, and an exact all-store and all-MCP topology validation. |
+| 6. Corpus off-host | Deployed for the current intended project set | Keep exact topology/restart gates in the deployment runbook. Retire dormant bridge, uncovered, and `LegacyLocal` compatibility lanes only through their separate evidence gate. |
 
 The executable dependency map from this rebaseline is:
 
@@ -452,19 +457,21 @@ The executable dependency map from this rebaseline is:
    implemented with independent measured cutovers. Production marker apply,
    bridge retirement, and compatibility lanes remain explicit operator work;
    they are not implied by the code landing.
-4. **Deploy collector cutover coverage and observe every adapter.** The strict
-   covered-project implementation, no-local-cutback decision, and
-   feature-parity path are complete. Establish marked coverage for every
-   intended Published project and run the per-surface retirement gates from
-   section 3. An adapter retires because its own gate passes, not because a
-   phase label says the migration is done.
+4. **Deploy collector cutover coverage and observe every adapter: complete for
+   the current intended project set.** The strict covered-project
+   implementation, no-local-cutback decision, feature-parity path, and marked
+   coverage are live. Continue the per-surface observation gates from section
+   3. An adapter retires because its own gate passes, not because a phase label
+   says the migration is done.
 5. **Plan and authorize bridge retirement separately.** Require accepted
    publication coverage, zero bridge-lane observations over a declared
    window, rebuild/restart evidence, and explicit operator approval. Neither
    the catalog implementation nor this inventory authorizes that mutation.
-6. **Move the corpus off-host.** At this point it is a relocation of the
-   corpus plane; blackboxd has no checkout reach-in left to preserve or
-   emulate.
+6. **Move the corpus off-host: complete for the current deployment.** The
+   corpus plane and shared stores run in the cluster, collectors remain with
+   checkout owners, and worker supervision remains on the agent machine. The
+   deployed topology has passed exact all-store, all-project, search, vector,
+   authentication, restart, and re-adoption validation.
 
 1. **Identity contract — complete.** `(repo_id, bbox_root_relpath)` identity,
    reuse-safe checkout markers, per-view `built_from` stamps, validated
@@ -486,11 +493,12 @@ The executable dependency map from this rebaseline is:
    convergence, authenticated transport, harness-local mutation, and no-local-
    fallback marker and covered-route retirement proof are live. Bridge,
    uncovered, and `LegacyLocal` retirement remains separate.
-4. **Code-corpus collector: complete in code for covered Published rows.** The
+4. **Code-corpus collector: deployed for the current intended Published rows.** The
    producer, ingest endpoint, generations, activation, recovery evidence,
    quiet-window cutover, assignment fence, no-local-cutback runtime, and
-   collected tool-edge path are live. Production coverage and explicit
-   disposition of bridge, uncovered, and `LegacyLocal` walking remain.
+   collected tool-edge path are live. Current intended-project coverage is
+   active; explicit disposition of bridge, uncovered, and `LegacyLocal`
+   walking remains.
 5. **Fleet supervisor extraction (`fleetd`) — complete.** Pull worker
    spawn/supervision out of the daemon into a small per-machine binary
    that rarely changes. The contract is a **fully-resolved spawn spec**:
@@ -583,16 +591,17 @@ The executable dependency map from this rebaseline is:
      is deleted, not merely superseded. See
      [`harness-daemon-boundary.md`](../bro-harness/harness-daemon-boundary.md)
      section 15 for the ledger of what that replaced.
-6. **Corpus off-host — pending.** Once the preceding checkout moves and the
-   separate bridge-retirement gate are complete, this is a relocation, not a
-   split: the surviving
+6. **Corpus off-host — deployed for the current intended project set.** The
+   move is a relocation, not a split: the surviving
    daemon surface passes the residency test wholesale. Deployment rides
    `bbox-cage`; state-root resolution derives from one `BLACKBOX_STATE_DIR`
    and fails loud (post-mortem item 6); transcript + code collectors ship
    from satellites; fleetd stays on the agent machine while the full daemon
    reaches one selected fleetd through the authenticated remote control seam.
-   Multi-machine routing remains deferred, but does not block the first corpus
-   move because that deployment has exactly one fleet endpoint.
+   Multi-machine routing remains deferred and does not affect the current
+   single-fleet-endpoint deployment. Dormant compatibility lanes remain
+   subject to the separate bridge-retirement gate rather than being declared
+   deleted by the relocation itself.
 
 ## 7. What this deletes or avoids
 
