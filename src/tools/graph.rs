@@ -2549,6 +2549,11 @@ mod catalog_adapter_tests {
         store: Arc<ProjectCatalogStore>,
     }
 
+    fn extract_text(result: &CallToolResult) -> String {
+        let wire = serde_json::to_value(result).unwrap();
+        wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
     /// Everything an attachment row needs that is not derivable from its
     /// checkout. Spelled out per test so a capability or lifecycle refusal is
     /// visibly the row's, never a default's.
