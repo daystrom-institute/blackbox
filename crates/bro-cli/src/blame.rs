@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use bbox_corpus_core::blame_transport::{BlameExecutionPlanV1, execute_plan_in_workspace};
+use bbox_corpus_core::blame_transport::{
+    BlameExecutionPlanV1, BlameFactV1, execute_plan_in_workspace,
+};
 use bro_rpc::ServiceToken;
 use clap::Args;
 use serde::Deserialize;
@@ -116,15 +118,13 @@ pub(crate) async fn run(args: BlameArgs) -> anyhow::Result<()> {
             .as_deref()
             .unwrap_or(base_url.as_str());
         validate_legacy_overlap_base_url(legacy_base_url)?;
-        let mut legacy_arguments = public_arguments.clone();
-        if let Some(relative) = legacy_arguments
-            .get("file")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        {
-            legacy_arguments["file"] =
-                Value::String(project_root.join(relative).to_string_lossy().into_owned());
-        }
+        // Entity refs include the source selector. The authoritative daemon
+        // and an isolated legacy verifier can therefore name the same code
+        // chunk differently. The authenticated fact is the common semantic
+        // boundary: it has already resolved the entity to an exact local
+        // file and line. Only that loopback-confined path is presented to the
+        // legacy adapter.
+        let legacy_arguments = legacy_arguments_from_fact(&project_root, &fact)?;
         let mut legacy_client = McpClient::connect(legacy_base_url, Some(&project_root)).await?;
         let legacy_result: Value = legacy_client
             .call_tool_json(BLAME_TOOL, legacy_arguments)
@@ -147,6 +147,22 @@ pub(crate) async fn run(args: BlameArgs) -> anyhow::Result<()> {
     }
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn legacy_arguments_from_fact(project_root: &Path, fact: &BlameFactV1) -> anyhow::Result<Value> {
+    fact.validate()?;
+    let relative = Path::new(&fact.display_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("blame fact display path is not a confined project-relative path");
+    }
+    Ok(json!({
+        "file": project_root.join(relative).to_string_lossy(),
+        "line": fact.line,
+    }))
 }
 
 fn validate_legacy_overlap_base_url(base_url: &str) -> anyhow::Result<()> {
@@ -260,6 +276,28 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("loopback")
+        );
+    }
+
+    #[test]
+    fn legacy_overlap_uses_the_resolved_fact_location() {
+        use bbox_corpus_core::blame_transport::{BlameExecutionV1, BlameFactV1};
+        use bbox_corpus_core::identity::PublishedScope;
+
+        let fact = BlameFactV1 {
+            version: bbox_corpus_core::blame_transport::BLAME_TRANSPORT_VERSION,
+            project_id: "project".into(),
+            scope: PublishedScope::try_new("repo", ".").unwrap(),
+            workspace_id: "a".repeat(32),
+            git_relative_path: "src/lib.rs".into(),
+            display_path: "src/lib.rs".into(),
+            line: 7,
+            execution: BlameExecutionV1::WorkspaceCurrent { head_commit: None },
+            attribution: None,
+        };
+        assert_eq!(
+            legacy_arguments_from_fact(Path::new("/checkout"), &fact).unwrap(),
+            json!({"file": "/checkout/src/lib.rs", "line": 7})
         );
     }
 
