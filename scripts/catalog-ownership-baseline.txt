@@ -87,6 +87,7 @@ checkout_root_path	crates/bbox-indexing/src/project_catalog_admin.rs	fn register
 checkout_root_path	crates/bbox-indexing/src/project_catalog_admin.rs	fn relocate_attachment	3	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/project_catalog_inventory_adapters.rs	fn discover_installed_attachment_checkout_roots	1	offline installed-verify discovery reads the attachment carrier pre-lease; collapse into the lease confined readers when the offline lease surface exists
 checkout_root_path	crates/bbox-indexing/src/project_catalog_migration.rs	fn build_base_post_images	2	collapse into the lease confined readers
+checkout_root_path	crates/bbox-indexing/src/project_catalog_probe.rs	fn active_attachment_scopes	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/project_catalog_store.rs	fn prevalidate_checkout_bindings_live	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/project_catalog_store.rs	fn retained_checkout_roots	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-indexing/src/project_catalog_store.rs	fn validate_checkout_bindings	1	collapse into the lease confined readers
@@ -134,7 +135,6 @@ checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_attach	4	collaps
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_catalog_get	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_advance	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn bbox_project_publisher_bind	1	collapse into the lease confined readers
-checkout_root_path	src/tools/project_catalog.rs	fn probe_attachment_scopes	1	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn probe_migration_attachments	2	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn register_catalog_arm	5	collapse into the lease confined readers
 checkout_root_path	src/tools/project_catalog.rs	fn rename_catalog_arm	5	collapse into the lease confined readers
