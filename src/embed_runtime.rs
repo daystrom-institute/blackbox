@@ -200,6 +200,15 @@ fn partition_scrub_plan(
     (mismatched, matched, missing, foreign)
 }
 
+fn project_file_project_id(entity: &str) -> Option<String> {
+    match EntityRef::parse(entity).ok()? {
+        EntityRef::ProjectFile { project_id, .. } | EntityRef::ProjectFileV2 { project_id, .. } => {
+            Some(project_id)
+        }
+        _ => None,
+    }
+}
+
 /// `action="scrub"`: sweep one MAPPED partition for vectors whose entities
 /// attribute to a different route under the current shared code-vs-prose
 /// rule (gap-42fa1d68: attribution changes strand vectors in the wrong
@@ -228,10 +237,7 @@ fn embed_partitions_scrub(
         .collect();
     let idx = state.idx.read();
     let (mismatched, matched, missing, foreign) = partition_scrub_plan(&entities, |entity| {
-        let Some(project_id) = entity
-            .strip_prefix("project_file:")
-            .and_then(|rest| rest.split(':').next())
-        else {
+        let Some(project_id) = project_file_project_id(entity) else {
             return ScrubClass::Foreign;
         };
         let Ok(Some(props)) = idx.entity_properties(entity) else {
@@ -245,7 +251,7 @@ fn embed_partitions_scrub(
         } else {
             Bucket::Docs
         };
-        match router.route(bucket, Some(project_id)) {
+        match router.route(bucket, Some(&project_id)) {
             Ok(expected) if expected.vector_route_id() == route => ScrubClass::Matched,
             Ok(_) => ScrubClass::Mismatched,
             Err(_) => ScrubClass::Missing,
@@ -1975,6 +1981,22 @@ pdf_figure = "voyage_visual"
             });
         assert_eq!(mismatched, vec!["project_file:p1:f:h:1".to_string()]);
         assert_eq!((matched, missing, foreign), (1, 1, 1));
+    }
+
+    #[test]
+    fn scrub_recognizes_legacy_and_collected_project_file_entities() {
+        assert_eq!(
+            project_file_project_id("project_file:p1:pathhash:chunkhash:0").as_deref(),
+            Some("p1")
+        );
+        assert_eq!(
+            project_file_project_id(
+                "project_file_v2:p2:collected-0123456789abcdef:pathhash:chunkhash:0"
+            )
+            .as_deref(),
+            Some("p2")
+        );
+        assert_eq!(project_file_project_id("knowledge:abcd1234"), None);
     }
 
     #[test]
