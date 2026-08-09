@@ -814,6 +814,16 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                     .cloned()
                     .find(|project| project.project_id == activation.project_id())
                 {
+                    if state
+                        .git_transport_governs_project(&project.project_id)
+                        .unwrap_or(true)
+                    {
+                        findings.push(Finding::warn(format!(
+                            "project `{}` Git-history freshness is governed by producer transport; checkout freshness probing is disabled",
+                            activation.project_id(),
+                        )));
+                        continue;
+                    }
                     use bbox_indexing::checkout_access::{
                         CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
                         CheckoutAccessSourceLane, CheckoutAttachmentSelector,
@@ -909,8 +919,8 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
     }
 }
 
-/// The five-state repo-history health model, rendered beside the code-source
-/// findings (Phase 3 plan section 10 item 5).
+/// Repo-history health, rendered beside the code-source findings (Phase 3
+/// plus the Git transport cutover extension).
 ///
 /// Catalog mode only: the model is derived from repo-history records and the
 /// attachment ladder, neither of which the bridge arm has. Every derivation
@@ -965,10 +975,29 @@ fn repo_history_findings(state: &crate::server::state::SharedState) -> Vec<Findi
                 .map(|id| id.as_str().to_string())
         })
         .collect();
+    let assignments = state
+        .code_sources
+        .producer_auth()
+        .repo_assignment_producers();
+    let unavailable_transports = pinned
+        .catalog()
+        .repo_histories
+        .keys()
+        .filter(|repo_history_id| {
+            let coverage = state.git_transport_cutover.classify_repo(
+                pinned.catalog(),
+                &assignments,
+                repo_history_id,
+            );
+            coverage.transport_governed() && !coverage.current()
+        })
+        .map(|repo_history_id| repo_history_id.as_str().to_string())
+        .collect();
     let mut findings = history_gc_findings(state, pinned.catalog(), &overlays);
     let inputs = HistoryHealthInputsV1 {
         overlays,
         failed_refreshes,
+        unavailable_transports,
         ..Default::default()
     };
     findings.extend(
@@ -987,6 +1016,10 @@ fn repo_history_findings(state: &crate::server::state::SharedState) -> Vec<Findi
                 HistoryHealthStateV1::Current => Finding::ok(headline),
                 HistoryHealthStateV1::Lagging
                 | HistoryHealthStateV1::UnavailableNoAttachment => Finding::info(headline),
+                HistoryHealthStateV1::UnavailableNoTransport => Finding::action(
+                    headline,
+                    "restore the exact producer assignment when membership is unchanged, or run a new preflight/apply/verify cutover after repairing a changed membership projection",
+                ),
                 HistoryHealthStateV1::InvalidScope => Finding::action(
                     headline,
                     "re-validate or replace the attachment so its proved repository matches the project's published scope",

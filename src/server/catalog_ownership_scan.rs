@@ -748,7 +748,7 @@ fn absolute_invariants(root: &Path, failures: &mut Vec<String>) -> anyhow::Resul
         ),
         (
             "struct CheckoutAccessObservationSnapshot",
-            "version sequence counters",
+            "version sequence counters target_counters",
         ),
     ] {
         let actual = struct_fields(&access, marker);

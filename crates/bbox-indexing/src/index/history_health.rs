@@ -1,5 +1,5 @@
-//! The five-state repo-history health model (Phase 3 plan section 10 item 5;
-//! governing section 11's closing paragraph).
+//! The repo-history health model (Phase 3 plan section 10 item 5, additively
+//! extended by the Git transport cutover).
 //!
 //! Commit documents are immutable historical facts. They stay searchable
 //! whether or not any checkout is currently attached, so "can I still read
@@ -38,6 +38,12 @@ pub const HISTORY_REFRESH_FAILED_CODE: &str = "history_refresh_failed";
 /// two made every remote-only project look degraded forever.
 pub const HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE: &str = "history_unavailable_no_attachment";
 
+/// Durable health code for a marker-covered Published repository whose
+/// producer transport is not currently usable. Coverage closes checkout
+/// fallback, so this names retained last-good history awaiting producer
+/// recovery or a newer cutover rather than suggesting an attachment repair.
+pub const HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE: &str = "history_unavailable_no_transport";
+
 /// Durable per-project projection of a typed producer activation that has not
 /// converged yet. Kept separate from checkout refresh failures so doctor does
 /// not prescribe restoring an attachment for a transport-owned fault.
@@ -56,6 +62,11 @@ pub enum HistoryHealthStateV1 {
     /// member project. History stays readable; it cannot be refreshed. NOT a
     /// fault for a remote-only project, which is the steady state here.
     UnavailableNoAttachment,
+    /// A durable Git transport cutover row governs this repository, but the
+    /// row is not currently usable. Last-good history remains readable and
+    /// checkout fallback stays closed while producer authority is restored or
+    /// a newer marker is applied.
+    UnavailableNoTransport,
     /// An attachment exists but its validated scope disagrees with the member
     /// project's published scope, so walking it would attribute one
     /// repository's commits to another's namespace. Refusing is the only
@@ -73,6 +84,7 @@ impl HistoryHealthStateV1 {
             Self::Current => "current",
             Self::Lagging => "lagging",
             Self::UnavailableNoAttachment => "unavailable_no_attachment",
+            Self::UnavailableNoTransport => "unavailable_no_transport",
             Self::InvalidScope => "invalid_scope",
             Self::FailedLastRefresh => "failed_last_refresh",
         }
@@ -107,6 +119,9 @@ pub struct HistoryHealthInputsV1 {
     pub observed_heads: BTreeMap<String, String>,
     /// repo history ids whose last refresh failed.
     pub failed_refreshes: BTreeSet<String>,
+    /// Marker-covered repo history ids whose current producer assignment or
+    /// membership projection no longer matches their cutover row.
+    pub unavailable_transports: BTreeSet<String>,
 }
 
 /// Derive one health record per repo-history record with published members.
@@ -146,8 +161,18 @@ fn derive_one(
             RepoHistoryMaterialization::NotBuilt => None,
         });
 
+    // Cutover authority outranks an old failed-refresh record. Prescribing an
+    // attachment retry for a covered repository would be an unsafe fallback.
+    if inputs.unavailable_transports.contains(&repo_history_id) {
+        return finish(
+            HistoryHealthStateV1::UnavailableNoTransport,
+            "the repository is governed by a Git transport cutover row whose current producer authority is unavailable or stale; last-good history remains readable and checkout fallback is disabled"
+                .to_string(),
+        );
+    }
+
     // A failed refresh is a fact about an attempt that already happened, so
-    // it outranks every state derived from the currently selected shape.
+    // it outranks every remaining state derived from the selected shape.
     if inputs.failed_refreshes.contains(&repo_history_id) {
         return finish(
             HistoryHealthStateV1::FailedLastRefresh,
@@ -359,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn health_matrix_covers_all_five_states() {
+    fn health_matrix_covers_all_states() {
         let catalog_ready = catalog("repo-authority", true);
         let attached = attachments(Some("repo-authority"));
 
@@ -403,6 +428,18 @@ mod tests {
                 &HistoryHealthInputsV1::default()
             ),
             HistoryHealthStateV1::UnavailableNoAttachment
+        );
+
+        // unavailable-no-transport: a covered row lost current producer
+        // authority and may not regain checkout fallback.
+        let inputs = HistoryHealthInputsV1 {
+            unavailable_transports: BTreeSet::from([history_id().as_str().to_string()]),
+            failed_refreshes: BTreeSet::from([history_id().as_str().to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            state(&catalog_ready, &attached, &inputs),
+            HistoryHealthStateV1::UnavailableNoTransport
         );
 
         // current: a verified typed producer overlay is refresh authority and

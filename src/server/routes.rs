@@ -2015,6 +2015,8 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
             git_overlays: super::state::read_git_overlays_for_view(
                 &state.project_authority,
                 &edges_dir,
+                &state.git_transport_cutover,
+                &state.code_sources,
             ),
         });
         Ok(())

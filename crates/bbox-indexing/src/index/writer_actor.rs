@@ -615,7 +615,11 @@ pub(super) fn plan_project_sources(
         let record = records.get(project_id).cloned();
         let access = match record {
             Some(record) => Some(acquire_leases_for_record(
-                broker, record, &collected, purpose,
+                broker,
+                record,
+                &collected,
+                purpose,
+                records_provider.git_history_transport_governed(project_id),
             )?),
             None => None,
         };
@@ -792,6 +796,7 @@ fn acquire_leases_for_record(
     project: ProjectRecord,
     collected: &std::collections::BTreeMap<String, super::project_files::ActiveCollectedSource>,
     purpose: ProjectLeasePurpose,
+    git_history_transport_governed: bool,
 ) -> Result<LeasedProjectAccess> {
     let publisher_config = broker.acquire(access_request(
         &project.project_id,
@@ -823,7 +828,7 @@ fn acquire_leases_for_record(
             Err(error) => (None, Some(error.to_string())),
         }
     };
-    let (git, git_denial) = if project.is_git_repo {
+    let (git, git_denial) = if project.is_git_repo && !git_history_transport_governed {
         match broker.acquire(access_request(
             &project.project_id,
             expected_scope.clone(),
@@ -1732,7 +1737,7 @@ fn run_local_stage(
     ctx: &ActorCtx,
     identity: &CodeProjectIdentity,
     scope: &bbox_corpus_core::identity::PublishedScope,
-    store: &bbox_code_source_store::CodeSourceStore,
+    _store: &bbox_code_source_store::CodeSourceStore,
 ) -> Result<super::project_files::CollectedIndexResult> {
     let project_id = identity.project_id.as_str();
     // A catalog identity carries its own published scope; the authorized
@@ -1753,46 +1758,10 @@ fn run_local_stage(
         Some(scope.clone()),
         CheckoutAccessKind::LocalProjectWalk,
     ))?;
-    // A local generation structurally requires Git: its descriptor records
-    // the checkout's HEAD, so there is no git-free local staging to degrade
-    // to (unlike the collected path, where git is an edge overlay). A
-    // denied GitHistory lease therefore records the same
-    // `git_history_unavailable` health failure the collected path records
-    // (review M10: consistent degradation policy) and refuses with that
-    // diagnostic instead of a bare lease error.
-    let git_lease = match ctx.checkout_access.acquire(access_request(
-        project_id,
-        Some(scope.clone()),
-        CheckoutAccessKind::GitHistory,
-    )) {
-        Ok(lease) => {
-            if let Err(error) = store.clear_health_failure(project_id, "git_history_unavailable") {
-                tracing::warn!(
-                    project_id,
-                    error = %error,
-                    "failed to clear GitHistory degradation record"
-                );
-            }
-            lease
-        }
-        Err(error) => {
-            if let Err(record_error) = store.record_health_failure(
-                project_id,
-                "git_history_unavailable",
-                &format!("GitHistory access unavailable: {}", error.code.as_str()),
-            ) {
-                tracing::warn!(
-                    project_id,
-                    error = %record_error,
-                    "failed to persist GitHistory degradation record"
-                );
-            }
-            return Err(anyhow::Error::new(error).context(
-                "local staging requires Git history (the local generation descriptor \
-                 records HEAD); degradation recorded as git_history_unavailable",
-            ));
-        }
-    };
+    // Local code staging needs the checkout HEAD for its descriptor, but it
+    // does not ingest repository history. Reuse the LocalProjectWalk lease so
+    // code cutback cannot manufacture a GitHistory observation after strict
+    // transport cutover.
     let compat = compat_record(ctx, project_id);
     let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
     writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
@@ -1806,7 +1775,7 @@ fn run_local_stage(
         },
         scope,
         local_lease.project_root(),
-        git_lease.checkout_root(),
+        local_lease.checkout_root(),
         ctx.fields,
         &mut writer,
         &edges_dir,
@@ -1829,9 +1798,7 @@ fn run_local_stage(
     // is fixed at write time) while carrying no edges.
     let _ = compat.as_ref();
     publication.stage_snapshot_git_current(&edges_dir, project_id, &result.snapshot_id, false);
-    let _publication_guard = ctx
-        .checkout_access
-        .publication_guard_for([&local_lease, &git_lease])?;
+    let _publication_guard = ctx.checkout_access.publication_guard(&local_lease)?;
     let (publication_result, commit_payload) =
         commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
     publication_result.finalize_publications()?;
@@ -3038,6 +3005,43 @@ mod tests {
             assert_eq!(operation.granted, 1, "{} grants", kind.as_str());
             assert_eq!(operation.denied, 0, "{} denials", kind.as_str());
         }
+
+        drop(plans);
+        let record = records_provider.records_snapshot().records[0].clone();
+        let actor = IndexWriterActor::spawn_for_with_checkout_access(
+            &index,
+            records_provider,
+            broker.clone(),
+        );
+        let store = Arc::new(
+            bbox_code_source_store::CodeSourceStore::open(
+                &index.reindex_config().code_source_store_path,
+                bbox_code_source_store::StoreLimits::default(),
+            )
+            .unwrap(),
+        );
+        let staged = actor
+            .stage_local_generation(
+                bridge_identity(&record.project_id, record.repo_id.as_deref()),
+                bbox_corpus_core::identity::PublishedScope::try_new("repo-family", ".").unwrap(),
+                store,
+            )
+            .unwrap();
+        drop(staged);
+        let health = broker.health();
+        let git = health
+            .operations
+            .iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::GitHistory)
+            .unwrap();
+        let local = health
+            .operations
+            .iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
+            .unwrap();
+        assert_eq!(git.granted, 1, "local code staging must not lease history");
+        assert_eq!(git.denied, 0);
+        assert_eq!(local.granted, 2, "local code staging reuses its walk lease");
     }
 
     #[test]
@@ -4027,6 +4031,7 @@ mod source_planning_tests {
     struct PlanningProvider {
         snapshot: ProjectRecordsSnapshot,
         identities: BTreeMap<String, CodeProjectIdentity>,
+        git_transport_governed: BTreeSet<String>,
     }
 
     impl ProjectRecordsProvider for PlanningProvider {
@@ -4036,6 +4041,10 @@ mod source_planning_tests {
 
         fn code_identities(&self) -> BTreeMap<String, CodeProjectIdentity> {
             self.identities.clone()
+        }
+
+        fn git_history_transport_governed(&self, project_id: &str) -> bool {
+            self.git_transport_governed.contains(project_id)
         }
     }
 
@@ -4155,6 +4164,14 @@ mod source_planning_tests {
         records: Vec<ProjectRecord>,
         corpus_ids: &[&str],
     ) -> Arc<dyn ProjectRecordsProvider> {
+        provider_with_git_transport_governed(records, corpus_ids, &[])
+    }
+
+    fn provider_with_git_transport_governed(
+        records: Vec<ProjectRecord>,
+        corpus_ids: &[&str],
+        governed: &[&str],
+    ) -> Arc<dyn ProjectRecordsProvider> {
         Arc::new(PlanningProvider {
             snapshot: ProjectRecordsSnapshot {
                 records: Arc::new(records),
@@ -4167,6 +4184,10 @@ mod source_planning_tests {
             identities: corpus_ids
                 .iter()
                 .map(|id| ((*id).to_string(), identity(id)))
+                .collect(),
+            git_transport_governed: governed
+                .iter()
+                .map(|project_id| (*project_id).to_string())
                 .collect(),
         })
     }
@@ -4331,6 +4352,29 @@ mod source_planning_tests {
         assert!(attached.is_local_scanned());
         assert!(!purge_exempt_project_ids(&plans).contains(&id));
         assert!(!fixture.has_health(&id, "source_unavailable"));
+    }
+
+    #[test]
+    fn transport_governed_reindex_never_attempts_a_git_history_lease() {
+        let fixture = fixture();
+        let mut record = fixture.attach("covered", &[("lib.rs", "fn main() {}\n")]);
+        record.is_git_repo = true;
+        record.repo_id = Some("repo-family".to_string());
+        let id = record.project_id.clone();
+        let provider = provider_with_git_transport_governed(vec![record], &[&id], &[&id]);
+
+        let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
+        let access = find(&plans, &id).access.as_ref().unwrap();
+        assert!(access.git.is_none());
+        let git_health = fixture
+            .broker
+            .health()
+            .operations
+            .into_iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::GitHistory)
+            .unwrap();
+        assert_eq!(git_health.granted, 0);
+        assert_eq!(git_health.denied, 0);
     }
 
     #[test]
@@ -4830,6 +4874,7 @@ mod source_planning_tests {
                 authority_epoch: 1,
             },
             identities: BTreeMap::new(),
+            git_transport_governed: BTreeSet::new(),
         });
         let plans = plan(&fixture, &provider, None, &HashMap::new(), &BTreeSet::new());
         assert!(matches!(

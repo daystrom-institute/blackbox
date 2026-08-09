@@ -41,9 +41,9 @@ Decision authority: [`DECISION_LEDGER.md`](../../../../../DECISION_LEDGER.md). T
 > plus receipt and uploads one stable notes-ref snapshot; the corpus validates
 > multipart documents, resolves V1 targets against a pinned path-free selector,
 > checks V2 target membership, and publishes explicit edges through a durable
-> replay journal with quarantine and CAS maintenance. Legacy checkout-backed
-> adapters remain intentionally live for the GH-F overlap proof; GH-F parity
-> and GH-G strict cutover are the remaining milestones.
+> replay journal with quarantine and CAS maintenance. GH-F overlap parity and
+> GH-G strict cutover are implemented; the governing section 19 all-adapter
+> gate remains intentionally open.
 
 ## 1. Required outcome
 At this slice's exit gate, proved against strict catalog state after Phases 3 through 6 have landed:
@@ -658,6 +658,10 @@ Verification: complete/missing/split/stale/unresolved/mismatch/corrupt/prepared/
 Gate: migration/doctor tests, cluster full verify, reviewed report fixture.
 
 ### GH-G: Strict catalog cutover
+Status: implemented 2026-08-08. The offline apply/verify marker closes both
+checkout-backed target capabilities per covered repo, row-scoped runtime
+classification retains unrelated authority, reload republishes revocation
+before transition dispatch, and re-cutover carries unchanged rows exactly.
 Ownership: runtime source selection, `code_source.rs`, `graph.rs`, docs, observation assertions, operations.
 Dependencies: accepted current GH-F receipt.
 Mechanics:

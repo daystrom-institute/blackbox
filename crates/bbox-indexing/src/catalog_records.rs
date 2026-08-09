@@ -33,6 +33,7 @@ use crate::project_catalog_store::ProjectCatalogStore;
 
 pub struct CatalogProjectRecordsProvider {
     store: Arc<ProjectCatalogStore>,
+    git_transport_cutover: Arc<crate::git_transport_cutover::GitTransportCutoverRuntimeV1>,
     cache: parking_lot::Mutex<Option<ProjectRecordsSnapshot>>,
     /// Most recent degradation (stale-cache serving, cross-validation
     /// failure, omitted rows), surfaced through doctor/health.
@@ -41,8 +42,19 @@ pub struct CatalogProjectRecordsProvider {
 
 impl CatalogProjectRecordsProvider {
     pub fn new(store: Arc<ProjectCatalogStore>) -> Self {
+        Self::new_with_git_transport_cutover(
+            store,
+            Arc::new(crate::git_transport_cutover::GitTransportCutoverRuntimeV1::default()),
+        )
+    }
+
+    pub fn new_with_git_transport_cutover(
+        store: Arc<ProjectCatalogStore>,
+        git_transport_cutover: Arc<crate::git_transport_cutover::GitTransportCutoverRuntimeV1>,
+    ) -> Self {
         Self {
             store,
+            git_transport_cutover,
             cache: parking_lot::Mutex::new(None),
             degradation: parking_lot::Mutex::new(None),
         }
@@ -142,6 +154,32 @@ impl ProjectRecordsProvider for CatalogProjectRecordsProvider {
         *self.degradation.lock() = (omitted > 0)
             .then(|| format!("compatibility projection omitted {omitted} catalog project(s)"));
         snapshot
+    }
+
+    fn git_history_transport_governed(&self, project_id: &str) -> bool {
+        if self.git_transport_cutover.marker().is_none() {
+            return false;
+        }
+        let Ok(state) = self.store.snapshot() else {
+            // A selected marker proves that some catalog history is governed.
+            // If the catalog cannot map this attached compatibility row back
+            // to its repository, suppressing the speculative lease is the
+            // only fail-closed answer.
+            return true;
+        };
+        let Ok(project_id) = bbox_corpus_core::project_catalog::ProjectId::parse(project_id) else {
+            return true;
+        };
+        let Some(project) = state.catalog().projects.get(&project_id) else {
+            return true;
+        };
+        matches!(
+            project.scope,
+            bbox_corpus_core::project_catalog::ProjectScope::Published(_)
+        ) && project
+            .repo_history
+            .as_ref()
+            .is_some_and(|repo_history_id| self.git_transport_cutover.covers_repo(repo_history_id))
     }
 
     /// Catalog derivation of the planning identity map (Phase 3 plan

@@ -152,6 +152,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         git_sources: Arc::new(crate::server::git_source::GitSourceRuntime::for_test(
             tmp.path(),
         )),
+        git_transport_cutover: Arc::new(
+            bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default(),
+        ),
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

@@ -328,6 +328,14 @@ impl ProducerAuthRuntime {
             .collect()
     }
 
+    /// The exact scope -> producer projection consumed by repository-wide
+    /// transport grant commitments and cutover row classification. This is
+    /// deliberately distinct from `assignments`, whose value is the resolved
+    /// project id used by code-source planning.
+    pub(crate) fn repo_assignment_producers(&self) -> BTreeMap<PublishedScope, String> {
+        assignment_producers(&self.entries)
+    }
+
     pub(crate) fn assignment_map(&self) -> BTreeMap<PublishedScope, (String, String)> {
         self.entries
             .iter()

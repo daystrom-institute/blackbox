@@ -65,6 +65,7 @@ pub(crate) fn recover_prebind(
     project_authority: &ProjectAuthority,
     code_sources: &CodeSourceRuntime,
     git_sources: &GitSourceRuntime,
+    cutover: &bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1,
     index: &bbox_indexing::index::TranscriptIndex,
     index_path: &std::path::Path,
 ) -> Result<()> {
@@ -102,9 +103,24 @@ pub(crate) fn recover_prebind(
 
     let source_store = git_sources.store();
     let auth = code_sources.producer_auth();
+    let assignments = auth.repo_assignment_producers();
     let searcher = index.searcher();
     let fields = index.field_handles();
     for repo_history_id in repos {
+        let coverage = cutover.classify_repo(catalog.catalog(), &assignments, &repo_history_id);
+        if coverage.transport_governed() && !coverage.current() {
+            tracing::warn!(
+                repo_history = %repo_history_id,
+                ?coverage,
+                "covered Git transport row is not current; retaining last-good data but clearing transport exposure"
+            );
+            clears.extend(producer_overlay_clears(
+                &catalog,
+                &manifest,
+                &repo_history_id,
+            ));
+            continue;
+        }
         let journal = source_store.read_activation_journal(&repo_history_id);
         let current = journal
             .as_ref()
@@ -653,6 +669,35 @@ fn finish_activation(
     if let Err(error) = recheck_plan_after_catalog_advance(state, &journal) {
         return supersede(source_store, journal, error);
     }
+    let coverage = state
+        .project_authority
+        .catalog_store()
+        .ok_or_else(|| anyhow!("catalog authority disappeared"))
+        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
+        .map(|catalog| {
+            let assignments = state
+                .code_sources
+                .producer_auth()
+                .repo_assignment_producers();
+            state.git_transport_cutover.classify_repo(
+                catalog.catalog(),
+                &assignments,
+                &journal.repo_history_id,
+            )
+        });
+    match coverage {
+        Ok(coverage) if coverage.transport_governed() && !coverage.current() => {
+            return supersede(
+                source_store,
+                journal,
+                anyhow!(
+                    "covered Git transport row is {coverage:?}; a newer cutover must authorize publication"
+                ),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => return supersede(source_store, journal, error),
+    }
     let mut swaps = journal
         .overlays
         .iter()
@@ -748,6 +793,7 @@ fn clear_transport_health(state: &SharedState, grant: &super::producer_auth::Rep
             bbox_indexing::index::history_health::HISTORY_TRANSPORT_ACTIVATION_FAILED_CODE,
             bbox_indexing::index::history_health::HISTORY_REFRESH_FAILED_CODE,
             bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_ATTACHMENT_CODE,
+            bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE,
             "git_history_unavailable",
         ] {
             let _ = state
@@ -779,6 +825,13 @@ pub(crate) fn reconcile_transport_currency(
     else {
         return Ok(false);
     };
+    if let Some(coverage) = state.git_transport_coverage_for_project(project_id)?
+        && coverage.transport_governed()
+        && !coverage.current()
+    {
+        clear_transport_overlays_for_repo(state, repo_history_id)?;
+        return Ok(false);
+    }
     let source_store = state.git_sources.store();
     let Some(journal) = source_store.read_activation_journal(repo_history_id)? else {
         return Ok(false);

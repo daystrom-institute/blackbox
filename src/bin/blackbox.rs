@@ -10,7 +10,8 @@ use bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1;
 use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
 use bbox_corpus_index::index::migration_inventory as corpus_inventory;
 use bbox_indexing::git_transport_cutover::{
-    GitTransportCutoverError, GitTransportCutoverPreflightRequestV1,
+    GitTransportCutoverApplyRequestV1, GitTransportCutoverError,
+    GitTransportCutoverPreflightRequestV1, GitTransportCutoverVerifyRequestV1,
     ProjectCatalogGitTransportCutoverFacadeV1,
 };
 use bbox_indexing::project_catalog_admin;
@@ -273,16 +274,31 @@ struct ConfigArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("mode")
+        .required(true)
+        .multiple(false)
+        .args(["preflight", "apply", "verify"])
+))]
 struct GitTransportCutoverArgs {
     /// Capture configured state and emit reviewed cutover artifacts.
     #[arg(long)]
     preflight: bool,
+    /// Atomically install the exact reviewed cutover marker while offline.
+    #[arg(long)]
+    apply: bool,
+    /// Verify and receipt the atomically selected current marker while offline.
+    #[arg(long)]
+    verify: bool,
     /// Reviewable coverage and parity report output.
-    #[arg(long, value_name = "PATH", requires = "preflight")]
-    report: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
     /// Canonical empty-or-explicit resolution artifact.
-    #[arg(long, value_name = "PATH", requires = "preflight")]
-    resolution: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    resolution: Option<PathBuf>,
+    /// Select the configured catalog for offline apply or verify.
+    #[arg(long)]
+    configured: bool,
     #[command(flatten)]
     config: ConfigArgs,
 }
@@ -618,8 +634,14 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::PathFreeRebuild(_),
         }) => "project_catalog_path_free_rebuild_verify",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::GitTransportCutover(args),
+        }) if args.preflight => "project_catalog_git_transport_cutover_preflight",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::GitTransportCutover(args),
+        }) if args.apply => "project_catalog_git_transport_cutover_apply",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::GitTransportCutover(_),
-        }) => "project_catalog_git_transport_cutover_preflight",
+        }) => "project_catalog_git_transport_cutover_verify",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(_),
         }) => "project_catalog_add",
@@ -1039,10 +1061,46 @@ fn offline_timestamp() -> String {
 fn execute_git_transport_cutover(
     args: GitTransportCutoverArgs,
 ) -> Result<serde_json::Value, CommandFailure> {
-    if !args.preflight {
-        return Err(cli_arguments(
-            "git-transport-cutover currently requires --preflight",
-        ));
+    let mode = match (args.preflight, args.apply, args.verify) {
+        (true, false, false) => NewVerbModeV1::Preflight,
+        (false, true, false) => NewVerbModeV1::Apply,
+        (false, false, true) => NewVerbModeV1::Verify,
+        _ => {
+            return Err(cli_arguments(
+                "git-transport-cutover requires exactly one mode: --preflight, --apply, or --verify",
+            ));
+        }
+    };
+    let artifacts = match mode {
+        NewVerbModeV1::Preflight | NewVerbModeV1::Apply => {
+            let (Some(report), Some(resolution)) = (args.report, args.resolution) else {
+                return Err(cli_arguments(
+                    "git-transport-cutover --preflight and --apply require both --report and --resolution",
+                ));
+            };
+            Some((report, resolution))
+        }
+        NewVerbModeV1::Verify => {
+            if args.report.is_some() || args.resolution.is_some() {
+                return Err(cli_arguments(
+                    "git-transport-cutover --verify takes no report or resolution artifacts",
+                ));
+            }
+            None
+        }
+    };
+    match mode {
+        NewVerbModeV1::Preflight if args.configured => {
+            return Err(cli_arguments(
+                "git-transport-cutover --preflight already captures configured state and does not accept --configured",
+            ));
+        }
+        NewVerbModeV1::Apply | NewVerbModeV1::Verify if !args.configured => {
+            return Err(cli_arguments(
+                "git-transport-cutover --apply and --verify require --configured",
+            ));
+        }
+        _ => {}
     }
     let config = load_config(args.config.config)?;
     let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
@@ -1052,16 +1110,47 @@ fn execute_git_transport_cutover(
             state_dir: args.config.state_dir,
         },
     )?;
-    let receipt = ProjectCatalogGitTransportCutoverFacadeV1::preflight(
-        GitTransportCutoverPreflightRequestV1 {
-            layout,
-            config,
-            report_path: args.report,
-            resolution_path: args.resolution,
-            generated_at: offline_timestamp(),
-        },
-    )?;
-    serialize_result(&receipt)
+    match mode {
+        NewVerbModeV1::Preflight => {
+            let (report_path, resolution_path) =
+                artifacts.expect("preflight artifacts resolved above");
+            let receipt = ProjectCatalogGitTransportCutoverFacadeV1::preflight(
+                GitTransportCutoverPreflightRequestV1 {
+                    layout,
+                    config,
+                    report_path,
+                    resolution_path,
+                    generated_at: offline_timestamp(),
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Apply => {
+            let (report_path, resolution_path) = artifacts.expect("apply artifacts resolved above");
+            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
+            let receipt = ProjectCatalogGitTransportCutoverFacadeV1::apply(
+                GitTransportCutoverApplyRequestV1 {
+                    layout,
+                    config,
+                    report_path,
+                    resolution_path,
+                    applied_at: offline_timestamp(),
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Verify => {
+            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
+            let receipt = ProjectCatalogGitTransportCutoverFacadeV1::verify(
+                GitTransportCutoverVerifyRequestV1 {
+                    layout,
+                    config,
+                    verified_at: offline_timestamp(),
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+    }
 }
 
 fn execute_path_free_rebuild(

@@ -10,6 +10,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Strict catalog Git transport cutover: the offline
+  `project-catalog git-transport-cutover` workflow now supports checksummed
+  preflight, apply, verify, and row-preserving re-cutover artifacts. Covered
+  Published repositories fail closed on stale membership or producer
+  authority, suppress checkout-backed history and provenance fallback, retain
+  last-good data, expose named health states, and preserve unrelated marker
+  rows. Bridge and never-covered/LegacyLocal adapter paths remain available.
 - Durable project catalog, phases 1-6 (code-complete): corpus project
   identity is path-free and catalog-owned, checkout access is gated behind
   observable capability leases, and collected code survives without a

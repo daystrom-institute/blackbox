@@ -200,6 +200,11 @@ pub(crate) struct SharedState {
     pub(crate) code_read_view: RwLock<Arc<CodeReadView>>,
     pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
     pub(crate) git_sources: Arc<super::git_source::GitSourceRuntime>,
+    /// Strict per-repository Git transport authority loaded from the
+    /// checksummed current cutover marker before the first catalog read view.
+    /// Bridge mode and pre-cutover catalog mode carry an empty runtime.
+    pub(crate) git_transport_cutover:
+        Arc<bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1>,
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
@@ -373,12 +378,40 @@ pub(crate) struct CodeReadView {
 pub(crate) fn read_git_overlays_for_view(
     authority: &ProjectAuthority,
     edges_dir: &std::path::Path,
+    cutover: &bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1,
+    code_sources: &super::code_source::CodeSourceRuntime,
 ) -> BTreeMap<String, bbox_corpus_core::git_overlay::GitOverlaySelector> {
     if !matches!(authority, ProjectAuthority::Catalog { .. }) {
         return BTreeMap::new();
     }
     match bbox_edge_sidecar::snapshot::selected_git_overlays(edges_dir) {
-        Ok(overlays) => overlays,
+        Ok(mut overlays) => {
+            let Some(store) = authority.catalog_store() else {
+                return BTreeMap::new();
+            };
+            let catalog = match store.snapshot() {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "catalog unavailable while filtering Git overlays; refusing every producer arm"
+                    );
+                    overlays.retain(|_, overlay| overlay.source.producer_transport().is_none());
+                    return overlays;
+                }
+            };
+            let assignments = code_sources.producer_auth().repo_assignment_producers();
+            overlays.retain(|project_id, overlay| {
+                git_overlay_visible_under_cutover(
+                    catalog.catalog(),
+                    &assignments,
+                    cutover,
+                    project_id,
+                    overlay,
+                )
+            });
+            overlays
+        }
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -388,6 +421,28 @@ pub(crate) fn read_git_overlays_for_view(
             BTreeMap::new()
         }
     }
+}
+
+fn git_overlay_visible_under_cutover(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    assignments: &BTreeMap<bbox_corpus_core::identity::PublishedScope, String>,
+    cutover: &bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1,
+    project_id: &str,
+    overlay: &bbox_corpus_core::git_overlay::GitOverlaySelector,
+) -> bool {
+    if overlay.source.producer_transport().is_none() {
+        return true;
+    }
+    let repo_history_id =
+        bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())
+            .ok()
+            .and_then(|project_id| catalog.projects.get(&project_id))
+            .and_then(|project| project.repo_history.as_ref());
+    let Some(repo_history_id) = repo_history_id else {
+        return false;
+    };
+    let coverage = cutover.classify_repo(catalog, assignments, repo_history_id);
+    !coverage.transport_governed() || coverage.current()
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -454,6 +509,49 @@ impl SharedState {
         self.records_provider
             .records_snapshot()
             .registered_project_ids()
+    }
+
+    /// Classify one catalog Published project against the current cutover row
+    /// and live assignment/membership projection. `None` means bridge mode,
+    /// LegacyLocal authority, an unknown project, or no repo-history binding.
+    pub(crate) fn git_transport_coverage_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<bbox_indexing::git_transport_cutover::GitTransportRuntimeCoverageV1>>
+    {
+        let Some(store) = self.project_authority.catalog_store() else {
+            return Ok(None);
+        };
+        let project_id =
+            bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())?;
+        let snapshot = store.snapshot()?;
+        let Some(project) = snapshot.catalog().projects.get(&project_id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            project.scope,
+            bbox_corpus_core::project_catalog::ProjectScope::Published(_)
+        ) {
+            return Ok(None);
+        }
+        let Some(repo_history_id) = &project.repo_history else {
+            return Ok(None);
+        };
+        let assignments = self
+            .code_sources
+            .producer_auth()
+            .repo_assignment_producers();
+        Ok(Some(self.git_transport_cutover.classify_repo(
+            snapshot.catalog(),
+            &assignments,
+            repo_history_id,
+        )))
+    }
+
+    pub(crate) fn git_transport_governs_project(&self, project_id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .git_transport_coverage_for_project(project_id)?
+            .is_some_and(|coverage| coverage.transport_governed()))
     }
 
     /// Attach the daemon read-view publisher to the index writer's commit
@@ -815,6 +913,9 @@ impl SharedState {
             })),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             git_sources: Arc::new(super::git_source::GitSourceRuntime::for_test(store_dir)),
+            git_transport_cutover: Arc::new(
+                bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default(),
+            ),
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             )),
@@ -1585,6 +1686,162 @@ mod committed_bytes_parity_tests {
 #[cfg(test)]
 mod code_read_view_tests {
     use super::*;
+
+    #[test]
+    fn covered_noncurrent_repo_suppresses_only_the_producer_overlay() {
+        use bbox_corpus_core::git_overlay::{GitOverlaySelector, GitOverlaySourceV1};
+        use bbox_corpus_core::git_transport_cutover::{
+            RepoTransportGrantState, derive_repo_transport_grants,
+        };
+        use bbox_corpus_core::identity::PublishedScope;
+        use bbox_corpus_core::project_catalog::{
+            CommitNamespace, CorpusProject, ProjectId, ProjectScope, RecordedRepoAuthority,
+            RepoHistoryAuthority, RepoHistoryId, RepoHistoryMaterialization, RepoHistoryRecord,
+        };
+        use bbox_indexing::git_transport_cutover::{
+            GitTransportCutoverMarkerV1, GitTransportCutoverRuntimeV1,
+            PredictedGitTransportCutoverRowV1,
+        };
+        use bbox_indexing::project_catalog_inventory::Sha256ValueV1;
+
+        let project_id = ProjectId::parse("p_0000000000000000000000000000cf01").unwrap();
+        let repo_history_id = RepoHistoryId::parse("rh_0000000000000000000000000000cf01").unwrap();
+        let scope = PublishedScope::try_new("neutral-cutover", ".").unwrap();
+        let mut catalog = bbox_corpus_core::project_catalog::CatalogSnapshotV2::empty(1).unwrap();
+        catalog.repo_histories.insert(
+            repo_history_id.clone(),
+            RepoHistoryRecord {
+                repo_history_id: repo_history_id.clone(),
+                membership_generation: 1,
+                authority: RepoHistoryAuthority::Recorded(
+                    RecordedRepoAuthority::parse("neutral-cutover").unwrap(),
+                ),
+                primary_namespace: CommitNamespace::parse("neutral-cutover").unwrap(),
+                compatibility_namespaces: Default::default(),
+                materialization: RepoHistoryMaterialization::NotBuilt,
+            },
+        );
+        catalog.projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id: project_id.clone(),
+                scope: ProjectScope::Published(scope.clone()),
+                operator_aliases: Default::default(),
+                nominated_aliases: Default::default(),
+                display_name: "Neutral cutover fixture".to_string(),
+                created_at: "unix:1".to_string(),
+                registered_at_compat: None,
+                repo_history: Some(repo_history_id.clone()),
+                languages: Default::default(),
+            },
+        );
+        catalog.validate().unwrap();
+        let assignments = BTreeMap::from([(scope, "producer-a".to_string())]);
+        let projection = derive_repo_transport_grants(&catalog, &assignments);
+        let RepoTransportGrantState::Granted { grant } = &projection.grants[&repo_history_id]
+        else {
+            panic!("fixture grant must be complete")
+        };
+        let marker = GitTransportCutoverMarkerV1 {
+            version: 1,
+            applied_at: "unix:2".to_string(),
+            report_artifact_hash: Sha256ValueV1::digest(b"report"),
+            resolution_artifact_hash: Sha256ValueV1::digest(b"resolution"),
+            predecessor_marker_checksum: None,
+            predecessor_catalog_epoch: 1,
+            inventory_hash: Sha256ValueV1::digest(b"inventory"),
+            aggregate_grant_hash: Sha256ValueV1::digest(b"grants"),
+            zero_prepared_history_journals: true,
+            zero_prepared_provenance_journals: true,
+            rows: vec![PredictedGitTransportCutoverRowV1 {
+                repo_history_id: repo_history_id.clone(),
+                grant_commitment: grant.commitment.clone(),
+                membership_generation: 1,
+                source_generation_id: "source-one".to_string(),
+                p3_generation_id: format!("rhg_{}", "a".repeat(64)),
+                history_parity_commitment: Sha256ValueV1::digest(b"history"),
+                provenance_import_generations: BTreeMap::from([(
+                    project_id.clone(),
+                    "import-one".to_string(),
+                )]),
+                provenance_export_generations: BTreeMap::from([(
+                    project_id.clone(),
+                    "export-one".to_string(),
+                )]),
+                provenance_parity_commitments: BTreeMap::from([(
+                    project_id.clone(),
+                    Sha256ValueV1::digest(b"provenance"),
+                )]),
+                capability_baselines: Vec::new(),
+            }],
+            checksum_sha256: Sha256ValueV1::digest(b"checksum"),
+        };
+        let cutover = GitTransportCutoverRuntimeV1::from_marker(Some(marker));
+        let producer_overlay = GitOverlaySelector {
+            project_id: project_id.as_str().to_string(),
+            code_generation: "code-one".to_string(),
+            repo_history_generation: format!("rhg_{}", "a".repeat(64)),
+            source: GitOverlaySourceV1::ProducerTransport {
+                producer_id: "producer-a".to_string(),
+                source_generation_id: "source-one".to_string(),
+            },
+            repo_head: "b".repeat(40),
+            commit_namespace: "neutral-cutover".to_string(),
+            overlay_generation: 1,
+        };
+        let mut attachment_overlay = producer_overlay.clone();
+        attachment_overlay.source = GitOverlaySourceV1::Attachment {
+            attachment_id: "att_0000000000000000000000000000cf01".to_string(),
+        };
+
+        assert!(git_overlay_visible_under_cutover(
+            &catalog,
+            &assignments,
+            &GitTransportCutoverRuntimeV1::default(),
+            project_id.as_str(),
+            &producer_overlay,
+        ));
+        assert!(git_overlay_visible_under_cutover(
+            &catalog,
+            &assignments,
+            &cutover,
+            project_id.as_str(),
+            &producer_overlay,
+        ));
+        assert!(!git_overlay_visible_under_cutover(
+            &catalog,
+            &BTreeMap::new(),
+            &cutover,
+            project_id.as_str(),
+            &producer_overlay,
+        ));
+        catalog
+            .repo_histories
+            .get_mut(&repo_history_id)
+            .unwrap()
+            .membership_generation = 2;
+        assert!(!git_overlay_visible_under_cutover(
+            &catalog,
+            &assignments,
+            &cutover,
+            project_id.as_str(),
+            &producer_overlay,
+        ));
+        assert!(git_overlay_visible_under_cutover(
+            &catalog,
+            &assignments,
+            &cutover,
+            project_id.as_str(),
+            &attachment_overlay,
+        ));
+        assert!(!git_overlay_visible_under_cutover(
+            &catalog,
+            &assignments,
+            &cutover,
+            "p_0000000000000000000000000000cf02",
+            &producer_overlay,
+        ));
+    }
 
     fn knowledge_entry(content: &str) -> bbox_knowledge::knowledge::KnowledgeEntry {
         bbox_knowledge::knowledge::KnowledgeEntry {

@@ -82,6 +82,14 @@ pub(crate) fn activate_import(state: &Arc<SharedState>, import_generation_id: &s
     if current_project.as_str() != source.project_id {
         bail!("provenance import project authority changed");
     }
+    if let Some(coverage) = state.git_transport_coverage_for_project(&source.project_id)?
+        && coverage.transport_governed()
+        && !coverage.current()
+    {
+        bail!(
+            "provenance import is retained but cannot publish while the covered repository is {coverage:?}"
+        );
+    }
 
     let current = match store.current_ready_provenance_import_id(&source.project_id)? {
         Some(current) => Some(current),

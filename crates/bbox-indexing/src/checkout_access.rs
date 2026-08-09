@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 const OBSERVATION_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 256;
+const MAX_TARGET_COUNTERS: usize = 1_000_000;
 const DEFAULT_LIFECYCLE_WRITER_WAIT: Duration = Duration::from_millis(500);
 
 /// Closed set of operations permitted to obtain checkout filesystem authority.
@@ -612,6 +613,7 @@ impl CheckoutAccessBroker {
                 Err(error) => {
                     self.observations
                         .record(
+                            &request.project_id,
                             request.kind,
                             request.source_lane,
                             CheckoutAccessOutcome::Denied,
@@ -779,6 +781,7 @@ impl CheckoutAccessBroker {
                     Err(_) => {
                         self.observations
                             .record(
+                                &request.project_id,
                                 request.kind,
                                 request.source_lane,
                                 CheckoutAccessOutcome::Denied,
@@ -795,6 +798,7 @@ impl CheckoutAccessBroker {
                     Err(_) => {
                         self.observations
                             .record(
+                                &request.project_id,
                                 request.kind,
                                 request.source_lane,
                                 CheckoutAccessOutcome::Denied,
@@ -809,6 +813,7 @@ impl CheckoutAccessBroker {
                 let sequence = self
                     .observations
                     .record(
+                        &request.project_id,
                         request.kind,
                         request.source_lane,
                         CheckoutAccessOutcome::Granted,
@@ -837,6 +842,7 @@ impl CheckoutAccessBroker {
             Err(error) => {
                 self.observations
                     .record(
+                        &request.project_id,
                         request.kind,
                         request.source_lane,
                         CheckoutAccessOutcome::Denied,
@@ -1441,9 +1447,34 @@ struct CounterKey {
     outcome: CheckoutAccessOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TargetCounterKey {
+    project_id: String,
+    kind: CheckoutAccessKind,
+    source_lane: CheckoutAccessSourceLane,
+    outcome: CheckoutAccessOutcome,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutAccessCounter {
+    pub kind: CheckoutAccessKind,
+    pub source_lane: CheckoutAccessSourceLane,
+    pub outcome: CheckoutAccessOutcome,
+    pub count: u64,
+    pub last_sequence: u64,
+    pub last_unix_secs: u64,
+}
+
+/// Path-free, project-attributed counters for the two Git transport cutover
+/// capabilities. Aggregate counters remain the stable low-cardinality health
+/// surface; these bounded rows exist so a mixed catalog can prove that a
+/// covered repository stayed at zero while a LegacyLocal or never-covered
+/// repository legitimately used its adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutAccessTargetCounter {
+    pub project_id: String,
     pub kind: CheckoutAccessKind,
     pub source_lane: CheckoutAccessSourceLane,
     pub outcome: CheckoutAccessOutcome,
@@ -1458,6 +1489,8 @@ struct CheckoutAccessObservationSnapshot {
     version: u32,
     sequence: u64,
     counters: Vec<CheckoutAccessCounter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_counters: Vec<CheckoutAccessTargetCounter>,
 }
 
 impl Default for CheckoutAccessObservationSnapshot {
@@ -1466,6 +1499,7 @@ impl Default for CheckoutAccessObservationSnapshot {
             version: OBSERVATION_VERSION,
             sequence: 0,
             counters: Vec::new(),
+            target_counters: Vec::new(),
         }
     }
 }
@@ -1484,12 +1518,19 @@ pub struct CheckoutAccessHealth {
     pub sequence: u64,
     pub operations: Vec<CheckoutAccessOperationHealth>,
     pub counters: Vec<CheckoutAccessCounter>,
+    /// Internal GH-G cutover evidence. The offline cutover facade reads these
+    /// rows directly from the observation handle; they are not part of the
+    /// long-standing aggregate doctor/bridge health wire.
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
+    pub target_counters: Vec<CheckoutAccessTargetCounter>,
     pub active_compatibility_lanes: Vec<CheckoutAccessSourceLane>,
 }
 
 /// Cloneable observation handle shared by all broker instances and doctor.
-/// The persisted key-space is bounded by closed enums and never accepts a path,
-/// project id, attachment id, or other high-cardinality label.
+/// Aggregate persisted keys are bounded by closed enums. The additive target
+/// rows accept only bounded project ids and only for the two cutover
+/// capabilities, with a hard total-row ceiling.
 #[derive(Clone)]
 pub struct CheckoutAccessObservations {
     store_path: Option<Arc<PathBuf>>,
@@ -1529,6 +1570,7 @@ impl CheckoutAccessObservations {
 
     fn record(
         &self,
+        project_id: &str,
         kind: CheckoutAccessKind,
         source_lane: CheckoutAccessSourceLane,
         outcome: CheckoutAccessOutcome,
@@ -1537,13 +1579,14 @@ impl CheckoutAccessObservations {
         let (next, sequence) = if let Some(store_path) = &self.store_path {
             with_store_lock(store_path, || {
                 let current = load_observation_snapshot(store_path)?;
-                let (next, sequence) = record_observation(current, kind, source_lane, outcome)?;
+                let (next, sequence) =
+                    record_observation(current, project_id, kind, source_lane, outcome)?;
                 atomic_write_json_locked(store_path, &next)?;
                 sync_parent_directory(store_path)?;
                 Ok((next, sequence))
             })?
         } else {
-            record_observation(state.clone(), kind, source_lane, outcome)?
+            record_observation(state.clone(), project_id, kind, source_lane, outcome)?
         };
         *state = next;
         Ok(sequence)
@@ -1568,6 +1611,7 @@ fn load_observation_snapshot(store_path: &Path) -> Result<CheckoutAccessObservat
 
 fn record_observation(
     mut next: CheckoutAccessObservationSnapshot,
+    project_id: &str,
     kind: CheckoutAccessKind,
     source_lane: CheckoutAccessSourceLane,
     outcome: CheckoutAccessOutcome,
@@ -1605,6 +1649,41 @@ fn record_observation(
             outcome: counter.outcome,
         });
     }
+    if matches!(
+        kind,
+        CheckoutAccessKind::GitHistory | CheckoutAccessKind::ProvenanceNoteIo
+    ) {
+        if let Some(counter) = next.target_counters.iter_mut().find(|counter| {
+            counter.project_id == project_id
+                && counter.kind == kind
+                && counter.source_lane == source_lane
+                && counter.outcome == outcome
+        }) {
+            counter.count = counter
+                .count
+                .checked_add(1)
+                .context("checkout target access counter exhausted")?;
+            counter.last_sequence = sequence;
+            counter.last_unix_secs = now;
+        } else {
+            next.target_counters.push(CheckoutAccessTargetCounter {
+                project_id: project_id.to_string(),
+                kind,
+                source_lane,
+                outcome,
+                count: 1,
+                last_sequence: sequence,
+                last_unix_secs: now,
+            });
+            next.target_counters
+                .sort_by_key(|counter| TargetCounterKey {
+                    project_id: counter.project_id.clone(),
+                    kind: counter.kind,
+                    source_lane: counter.source_lane,
+                    outcome: counter.outcome,
+                });
+        }
+    }
     validate_snapshot(&next)?;
     Ok((next, sequence))
 }
@@ -1619,6 +1698,9 @@ fn validate_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Result<()>
     let maximum_counters = CheckoutAccessKind::ALL.len() * CheckoutAccessSourceLane::ALL.len() * 2;
     if snapshot.counters.len() > maximum_counters {
         anyhow::bail!("checkout access observation counter set is not bounded");
+    }
+    if snapshot.target_counters.len() > MAX_TARGET_COUNTERS {
+        anyhow::bail!("checkout target observation counter set is not bounded");
     }
     let mut keys = BTreeSet::new();
     for counter in &snapshot.counters {
@@ -1635,6 +1717,31 @@ fn validate_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Result<()>
         };
         if !keys.insert(key) {
             anyhow::bail!("duplicate checkout access observation counter");
+        }
+    }
+    let mut target_keys = BTreeSet::new();
+    for counter in &snapshot.target_counters {
+        if counter.project_id.is_empty()
+            || counter.project_id.len() > MAX_ID_BYTES
+            || counter.project_id.chars().any(char::is_control)
+            || !matches!(
+                counter.kind,
+                CheckoutAccessKind::GitHistory | CheckoutAccessKind::ProvenanceNoteIo
+            )
+            || counter.count == 0
+            || counter.last_sequence == 0
+            || counter.last_sequence > snapshot.sequence
+        {
+            anyhow::bail!("invalid checkout target access observation counter");
+        }
+        let key = TargetCounterKey {
+            project_id: counter.project_id.clone(),
+            kind: counter.kind,
+            source_lane: counter.source_lane,
+            outcome: counter.outcome,
+        };
+        if !target_keys.insert(key) {
+            anyhow::bail!("duplicate checkout target access observation counter");
         }
     }
     Ok(())
@@ -1689,6 +1796,7 @@ fn health_from_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Checkou
         sequence: snapshot.sequence,
         operations,
         counters: snapshot.counters.clone(),
+        target_counters: snapshot.target_counters.clone(),
         active_compatibility_lanes,
     }
 }
@@ -2539,13 +2647,14 @@ mod tests {
     }
 
     #[test]
-    fn observation_snapshot_is_bounded_path_free_and_rolls_forward() {
+    fn observation_snapshot_is_bounded_path_free_and_tracks_cutover_targets() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let path = root.join("checkout-access-observations.json");
         let observations = CheckoutAccessObservations::open(&path).unwrap();
         observations
             .record(
+                "project-1",
                 CheckoutAccessKind::Blame,
                 CheckoutAccessSourceLane::LegacyProjectRecord,
                 CheckoutAccessOutcome::Granted,
@@ -2553,6 +2662,7 @@ mod tests {
             .unwrap();
         observations
             .record(
+                "project-1",
                 CheckoutAccessKind::Blame,
                 CheckoutAccessSourceLane::LegacyProjectRecord,
                 CheckoutAccessOutcome::Denied,
@@ -2564,6 +2674,7 @@ mod tests {
         assert_eq!(reopened.health().sequence, 2);
         reopened
             .record(
+                "project-1",
                 CheckoutAccessKind::GitHistory,
                 CheckoutAccessSourceLane::NativeAttachment,
                 CheckoutAccessOutcome::Granted,
@@ -2579,10 +2690,12 @@ mod tests {
             health.counters.len()
                 <= CheckoutAccessKind::ALL.len() * CheckoutAccessSourceLane::ALL.len() * 2
         );
+        assert_eq!(health.target_counters.len(), 1);
+        assert_eq!(health.target_counters[0].project_id, "project-1");
 
         let persisted = std::fs::read_to_string(path).unwrap();
         assert!(!persisted.contains(root.to_string_lossy().as_ref()));
-        assert!(!persisted.contains("project-1"));
+        assert!(persisted.contains("project-1"));
         assert!(!persisted.contains("attachment-1"));
     }
 
@@ -2596,6 +2709,7 @@ mod tests {
 
         first
             .record(
+                "project-1",
                 CheckoutAccessKind::Blame,
                 CheckoutAccessSourceLane::LegacyProjectRecord,
                 CheckoutAccessOutcome::Granted,
@@ -2603,6 +2717,7 @@ mod tests {
             .unwrap();
         second
             .record(
+                "project-1",
                 CheckoutAccessKind::GitHistory,
                 CheckoutAccessSourceLane::NativeAttachment,
                 CheckoutAccessOutcome::Denied,
@@ -2612,6 +2727,7 @@ mod tests {
         let merged = CheckoutAccessObservations::open(&path).unwrap().health();
         assert_eq!(merged.sequence, 2);
         assert_eq!(merged.counters.len(), 2);
+        assert_eq!(merged.target_counters.len(), 1);
         assert!(
             merged
                 .counters

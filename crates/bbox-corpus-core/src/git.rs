@@ -1531,11 +1531,22 @@ fn parse_stable_history_log(
         index += 1;
         let parents = history_utf8(tokens[index], "parent object ids")?;
         index += 1;
-        let author_name = history_utf8(tokens[index], "author name")?.to_string();
+        // Match `parse_commit_log`, the checkout-backed P3 input. Git's
+        // pretty-printer terminates `%B` with a newline even when the stored
+        // message has no trailing blank line. Carrying that transport-only
+        // delimiter would mint a different content-addressed generation for
+        // the same commit history.
+        let author_name = history_utf8(tokens[index], "author name")?
+            .trim()
+            .to_string();
         index += 1;
-        let author_email = history_utf8(tokens[index], "author email")?.to_string();
+        let author_email = history_utf8(tokens[index], "author email")?
+            .trim()
+            .to_string();
         index += 1;
-        let message = history_utf8(tokens[index], "commit message")?.to_string();
+        let message = history_utf8(tokens[index], "commit message")?
+            .trim()
+            .to_string();
         index += 1;
 
         validate_full_object_id(&oid)?;
@@ -3560,6 +3571,8 @@ mod tests {
         );
         let commits = parse_stable_history_log(bytes.as_bytes(), marker, &head, 2, 4096).unwrap();
         assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].message, "root");
+        assert_eq!(commits[1].message, "head");
         assert_eq!(commits[0].changed_paths, vec!["README.md"]);
         assert_eq!(commits[1].parent_oids, vec![root]);
         assert_eq!(commits[1].changed_paths, vec!["src/lib.rs", "src/main.rs"]);
@@ -3740,6 +3753,28 @@ mod tests {
         assert_eq!(commits[0].author_name, "Alice");
         assert_eq!(commits[0].author_email, "a@example.test");
         assert_eq!(commits[0].message, "subject\n\nbody");
+    }
+
+    #[test]
+    fn stable_and_checkout_history_normalize_commit_metadata_identically() {
+        let head = "1".repeat(40);
+        let marker = "BBOX_GIT_HISTORY_COMMIT_V1";
+        let stable =
+            format!("\0{marker}\0{head}\0\0  Alice  \0  a@example.test  \0\nsubject\n\nbody\n\0");
+        let stable = parse_stable_history_log(stable.as_bytes(), marker, &head, 1, 4096).unwrap();
+        let checkout = parse_commit_log(
+            format!("{head}\x1f\x1f  Alice  \x1f  a@example.test  \x1f\nsubject\n\nbody\n\x1e")
+                .as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(stable.len(), 1);
+        assert_eq!(checkout.len(), 1);
+        assert_eq!(stable[0].oid, checkout[0].sha);
+        assert_eq!(stable[0].parent_oids, checkout[0].parent_shas);
+        assert_eq!(stable[0].author_name, checkout[0].author_name);
+        assert_eq!(stable[0].author_email, checkout[0].author_email);
+        assert_eq!(stable[0].message, checkout[0].message);
     }
 
     #[test]

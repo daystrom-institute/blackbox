@@ -381,6 +381,14 @@ impl ProjectRecordsSnapshot {
 pub trait ProjectRecordsProvider: Send + Sync {
     fn records_snapshot(&self) -> ProjectRecordsSnapshot;
 
+    /// Whether a durable producer-transport cutover row closes checkout Git
+    /// history for this project. Bridge and offline providers retain the
+    /// default `false`; catalog runtime providers override it from their
+    /// checksummed marker and live project-to-repository binding.
+    fn git_history_transport_governed(&self, _project_id: &str) -> bool {
+        false
+    }
+
     /// Per-project code identity for the COMPLETE corpus id set (Phase 3
     /// plan section 7 item 1). Source planning needs an identity for every
     /// catalog project, including one with zero attachments, so it cannot

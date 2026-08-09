@@ -2466,6 +2466,8 @@ pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
         git_overlays: super::state::read_git_overlays_for_view(
             &state.project_authority,
             &edges_dir,
+            &state.git_transport_cutover,
+            &state.code_sources,
         ),
     });
     state.nudge_edge_index_rebuild();
@@ -2723,6 +2725,36 @@ fn stage_git_current_overlay_after_activation(
             %error,
             "Git-history transport currency could not be proved; attachment refresh remains eligible"
         ),
+    }
+    match state.git_transport_governs_project(project_id) {
+        Ok(true) => {
+            if let Err(error) = store.record_health_failure(
+                project_id,
+                bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE,
+                "Git transport coverage is authoritative and no current producer overlay is available; checkout fallback is closed",
+            ) {
+                tracing::warn!(
+                    project_id,
+                    error = %error,
+                    "failed to persist the no-transport history record"
+                );
+            }
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                %error,
+                "Git transport coverage could not be classified; refusing checkout fallback"
+            );
+            let _ = store.record_health_failure(
+                project_id,
+                bbox_indexing::index::history_health::HISTORY_UNAVAILABLE_NO_TRANSPORT_CODE,
+                "Git transport coverage classification failed; checkout fallback is closed",
+            );
+            return;
+        }
     }
     let record = state
         .records_provider
@@ -3089,7 +3121,7 @@ fn probe_ladder_raw(
         project_id: project_id.to_string(),
         attachment: CheckoutAttachmentSelector::Selected,
         expected_scope: Some(scope),
-        kind: CheckoutAccessKind::GitHistory,
+        kind: CheckoutAccessKind::LocalProjectWalk,
         intent: CheckoutAccessIntent::Read,
         source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
     }) {
@@ -4903,6 +4935,8 @@ fn cutback_to_local_single_attempt(
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
                     &edges_dir,
+                    &state.git_transport_cutover,
+                    &state.code_sources,
                 ),
             });
             Ok(())
@@ -5247,6 +5281,8 @@ fn cutback_to_local(
                 git_overlays: super::state::read_git_overlays_for_view(
                     &state.project_authority,
                     &edges_dir,
+                    &state.git_transport_cutover,
+                    &state.code_sources,
                 ),
             });
             Ok(())
@@ -5661,6 +5697,8 @@ fn activate_desired_loop(
                     git_overlays: super::state::read_git_overlays_for_view(
                         &state.project_authority,
                         &edges_dir,
+                        &state.git_transport_cutover,
+                        &state.code_sources,
                     ),
                 });
                 Ok(())

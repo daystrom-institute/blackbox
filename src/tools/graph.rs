@@ -679,6 +679,25 @@ fn acquire_provenance_projects(
     Vec<mcp_tools::provenance::ProvenanceProject>,
 )> {
     let requested = requested_provenance_projects(server, params, projects)?;
+    // Evaluate the complete target set before acquiring the first lease. A
+    // catalog all-project operation must not partially touch LegacyLocal
+    // checkouts and then discover a marker-covered Published project later in
+    // iteration order.
+    for project_id in &requested {
+        if server
+            .state
+            .git_transport_governs_project(project_id)
+            .map_err(|error| {
+                anyhow!(
+                    "error.provenance_transport_authoritative: cutover authority could not be classified for {project_id}: {error}"
+                )
+            })?
+        {
+            bail!(
+                "error.provenance_transport_authoritative: project {project_id} is governed by producer provenance transport"
+            );
+        }
+    }
     let mut leases = Vec::with_capacity(requested.len());
     let mut inputs = Vec::with_capacity(requested.len());
     for project_id in requested {
@@ -2017,11 +2036,17 @@ mod catalog_adapter_tests {
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_corpus_core::project_catalog::{
         AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus, CheckoutAttachment,
-        CorpusProject, ProjectId, ProjectScope,
+        CommitNamespace, CorpusProject, ProjectId, ProjectScope, RecordedRepoAuthority,
+        RepoHistoryAuthority, RepoHistoryId, RepoHistoryMaterialization, RepoHistoryRecord,
     };
     use bbox_indexing::checkout_access::{
         CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind,
     };
+    use bbox_indexing::git_transport_cutover::{
+        GitTransportCutoverMarkerV1, GitTransportCutoverRuntimeV1,
+        PredictedGitTransportCutoverRowV1,
+    };
+    use bbox_indexing::project_catalog_inventory::Sha256ValueV1;
     use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 
     use super::*;
@@ -2118,6 +2143,32 @@ mod catalog_adapter_tests {
                 .unwrap();
         }
 
+        fn bind_repo_history(&self, project_id: &str, repo_history_id: &str, authority: &str) {
+            let project_id = ProjectId::parse(project_id).unwrap();
+            let repo_history_id = RepoHistoryId::parse(repo_history_id).unwrap();
+            let epoch = self.store.snapshot().unwrap().epoch();
+            self.store
+                .transact(epoch, |catalog, _attachments| {
+                    catalog.repo_histories.insert(
+                        repo_history_id.clone(),
+                        RepoHistoryRecord {
+                            repo_history_id: repo_history_id.clone(),
+                            membership_generation: 0,
+                            authority: RepoHistoryAuthority::Recorded(
+                                RecordedRepoAuthority::parse(authority).unwrap(),
+                            ),
+                            primary_namespace: CommitNamespace::parse(authority).unwrap(),
+                            compatibility_namespaces: Default::default(),
+                            materialization: RepoHistoryMaterialization::NotBuilt,
+                        },
+                    );
+                    catalog.projects.get_mut(&project_id).unwrap().repo_history =
+                        Some(repo_history_id.clone());
+                    Ok(())
+                })
+                .unwrap();
+        }
+
         /// Materialize the checkout, mint its durable identity marker, and
         /// record the attachment. The marker is minted rather than invented:
         /// the catalog authority verifies it on every acquisition.
@@ -2169,6 +2220,10 @@ mod catalog_adapter_tests {
         /// A catalog-authority server over the same durable bytes, with the
         /// REAL catalog checkout authority rather than the deny stub.
         fn server(&self) -> BlackboxServer {
+            self.server_with_cutover(GitTransportCutoverRuntimeV1::default())
+        }
+
+        fn server_with_cutover(&self, cutover: GitTransportCutoverRuntimeV1) -> BlackboxServer {
             let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_path);
             let store = state
                 .project_authority
@@ -2181,6 +2236,7 @@ mod catalog_adapter_tests {
                 ),
                 state.checkout_access_observations.clone(),
             ));
+            state.git_transport_cutover = Arc::new(cutover);
             BlackboxServer::new(Arc::new(state))
         }
     }
@@ -2667,6 +2723,82 @@ mod catalog_adapter_tests {
         assert!(
             error.starts_with("error.project_attachment_required"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn covered_provenance_refuses_before_the_first_checkout_lease() {
+        const REPO_HISTORY: &str = "rh_000000000000000000000000000000a1";
+        let fixture = CatalogAdapters::new();
+        let scope = CatalogAdapters::scope("repo-one");
+        fixture.add_project(PROJECT_ONE, Some(scope.clone()));
+        fixture.bind_repo_history(PROJECT_ONE, REPO_HISTORY, "repo-one");
+        let mut notes = blame_spec(PROJECT_ONE, ATTACHMENT_ONE, "checkout-one");
+        notes.capabilities = capabilities(&[CheckoutAccessKind::ProvenanceNoteIo]);
+        fixture.attach(notes);
+
+        let repo_history_id = RepoHistoryId::parse(REPO_HISTORY).unwrap();
+        let catalog = fixture.store.snapshot().unwrap();
+        let membership_generation =
+            catalog.catalog().repo_histories[&repo_history_id].membership_generation;
+        let marker = GitTransportCutoverMarkerV1 {
+            version: 1,
+            applied_at: "unix:2".to_string(),
+            report_artifact_hash: Sha256ValueV1::digest(b"report"),
+            resolution_artifact_hash: Sha256ValueV1::digest(b"resolution"),
+            predecessor_marker_checksum: None,
+            predecessor_catalog_epoch: catalog.epoch(),
+            inventory_hash: Sha256ValueV1::digest(b"inventory"),
+            aggregate_grant_hash: Sha256ValueV1::digest(b"grants"),
+            zero_prepared_history_journals: true,
+            zero_prepared_provenance_journals: true,
+            rows: vec![PredictedGitTransportCutoverRowV1 {
+                repo_history_id,
+                grant_commitment: "d".repeat(64),
+                membership_generation,
+                source_generation_id: "source-one".to_string(),
+                p3_generation_id: format!("rhg_{}", "a".repeat(64)),
+                history_parity_commitment: Sha256ValueV1::digest(b"history"),
+                provenance_import_generations: Default::default(),
+                provenance_export_generations: Default::default(),
+                provenance_parity_commitments: Default::default(),
+                capability_baselines: Vec::new(),
+            }],
+            checksum_sha256: Sha256ValueV1::digest(b"checksum"),
+        };
+        drop(catalog);
+        let server =
+            fixture.server_with_cutover(GitTransportCutoverRuntimeV1::from_marker(Some(marker)));
+
+        let error = acquire_provenance_projects(
+            &server,
+            &server.state.checkout_access.clone(),
+            &ProvenanceParams {
+                project_id: Some(PROJECT_ONE.to_string()),
+            },
+            &[],
+            CheckoutAccessIntent::Read,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("error.provenance_transport_authoritative"),
+            "{error}"
+        );
+
+        let health = server.state.checkout_access.health();
+        let provenance = health
+            .operations
+            .iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::ProvenanceNoteIo)
+            .unwrap();
+        assert_eq!(provenance.granted, 0);
+        assert_eq!(provenance.denied, 0);
+        assert!(
+            health.target_counters.iter().all(|counter| {
+                counter.kind != CheckoutAccessKind::ProvenanceNoteIo || counter.count == 0
+            }),
+            "the governed request must be refused before the first target lease observation"
         );
     }
 

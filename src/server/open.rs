@@ -289,6 +289,19 @@ pub(super) fn open_shared_state(
     let mut catalog_store: Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>> =
         None;
     let mut projects_needs_persist = false;
+    let git_transport_cutover = Arc::new(
+        if matches!(
+            store_probe,
+            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
+        ) {
+            bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::open(
+                &cfg.paths.state_dir,
+            )
+            .map_err(|error| anyhow::anyhow!("Git transport cutover startup gate: {error}"))?
+        } else {
+            bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default()
+        },
+    );
     let (access_authority, records_provider): (
         Arc<dyn bbox_indexing::checkout_access::CheckoutAccessAuthority>,
         Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
@@ -329,7 +342,12 @@ pub(super) fn open_shared_state(
                         store.clone(),
                     ),
                 ),
-                Arc::new(bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new(store)),
+                Arc::new(
+                    bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new_with_git_transport_cutover(
+                        store,
+                        git_transport_cutover.clone(),
+                    ),
+                ),
             )
         }
     };
@@ -726,6 +744,7 @@ pub(super) fn open_shared_state(
         &project_authority,
         &code_sources,
         &git_sources,
+        &git_transport_cutover,
         &idx,
         &index_path,
     )?;
@@ -766,6 +785,8 @@ pub(super) fn open_shared_state(
             &bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
                 &idx.reindex_config().projects_path,
             ),
+            &git_transport_cutover,
+            &code_sources,
         ),
     };
     // Phase 3 plan section 10 item 4: the derived repo-history reference
@@ -823,6 +844,7 @@ pub(super) fn open_shared_state(
         code_read_view: RwLock::new(Arc::new(code_read_view)),
         code_sources,
         git_sources,
+        git_transport_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),
