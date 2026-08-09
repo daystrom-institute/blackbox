@@ -643,6 +643,7 @@ pub(super) fn open_shared_state(
         checkout_access.clone(),
     )?);
     let git_sources = Arc::new(super::git_source::GitSourceRuntime::open(&cfg)?);
+    let knowledge_sources = Arc::new(super::knowledge_source::KnowledgeSourceRuntime::open(&cfg)?);
 
     // R21F1: unconditional pre-bind transaction recovery. Runs before
     // selector refresh, read-view construction, and edge-index loading.
@@ -860,6 +861,7 @@ pub(super) fn open_shared_state(
         code_read_view: RwLock::new(Arc::new(code_read_view)),
         code_sources,
         git_sources,
+        knowledge_sources,
         git_transport_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),

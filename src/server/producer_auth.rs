@@ -67,6 +67,7 @@ impl RepoTransportGrantError {
 pub(crate) struct ProducerAuthRuntime {
     enabled: bool,
     git_transport_enabled: bool,
+    knowledge_transport_enabled: bool,
     entries: Vec<AuthEntry>,
     scope_to_project: BTreeMap<PublishedScope, ProjectId>,
     #[cfg(test)]
@@ -96,6 +97,9 @@ impl ProducerAuthRuntime {
     ) -> Result<Self> {
         if config.code_collection.git_transport_enabled && !config.code_collection.enabled {
             bail!("Git transport requires code collection to be enabled");
+        }
+        if config.code_collection.knowledge_transport_enabled && !config.code_collection.enabled {
+            bail!("knowledge transport requires code collection to be enabled");
         }
         if config.code_collection.git_transport_enabled
             && (config.code_collection.max_git_history_commits == 0
@@ -147,6 +151,11 @@ impl ProducerAuthRuntime {
             && matches!(resolution, GrantScopeResolution::Bridge { .. })
         {
             bail!("Git transport requires catalog project authority");
+        }
+        if config.code_collection.knowledge_transport_enabled
+            && matches!(resolution, GrantScopeResolution::Bridge { .. })
+        {
+            bail!("knowledge transport requires catalog project authority");
         }
 
         let mut entries = Vec::new();
@@ -212,6 +221,7 @@ impl ProducerAuthRuntime {
         Ok(Self {
             enabled: true,
             git_transport_enabled: config.code_collection.git_transport_enabled,
+            knowledge_transport_enabled: config.code_collection.knowledge_transport_enabled,
             entries,
             scope_to_project,
             #[cfg(test)]
@@ -227,6 +237,7 @@ impl ProducerAuthRuntime {
         Self {
             enabled: false,
             git_transport_enabled: false,
+            knowledge_transport_enabled: false,
             entries: Vec::new(),
             scope_to_project: BTreeMap::new(),
             #[cfg(test)]
@@ -247,6 +258,7 @@ impl ProducerAuthRuntime {
         Self {
             enabled,
             git_transport_enabled,
+            knowledge_transport_enabled: git_transport_enabled,
             entries: entries
                 .into_iter()
                 .map(|(token, grant)| AuthEntry { token, grant })
@@ -291,6 +303,7 @@ impl ProducerAuthRuntime {
         Self {
             enabled: true,
             git_transport_enabled: true,
+            knowledge_transport_enabled: true,
             entries,
             scope_to_project,
             producer_to_scopes,
@@ -306,6 +319,10 @@ impl ProducerAuthRuntime {
 
     pub(crate) fn git_transport_enabled(&self) -> bool {
         self.git_transport_enabled
+    }
+
+    pub(crate) fn knowledge_transport_enabled(&self) -> bool {
+        self.knowledge_transport_enabled
     }
 
     pub(crate) fn authenticate(&self, candidate: &str) -> Option<ProducerGrant> {
@@ -517,7 +534,7 @@ pub(crate) async fn authenticate_code_source_request(
     request: Request,
     next: Next,
 ) -> Response {
-    authenticate_request(state, request, next, false).await
+    authenticate_request(state, request, next, ProducerAuthLane::Code).await
 }
 
 pub(crate) async fn authenticate_git_source_request(
@@ -525,26 +542,44 @@ pub(crate) async fn authenticate_git_source_request(
     request: Request,
     next: Next,
 ) -> Response {
-    authenticate_request(state, request, next, true).await
+    authenticate_request(state, request, next, ProducerAuthLane::Git).await
+}
+
+pub(crate) async fn authenticate_knowledge_source_request(
+    State(state): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authenticate_request(state, request, next, ProducerAuthLane::Knowledge).await
+}
+
+#[derive(Clone, Copy)]
+enum ProducerAuthLane {
+    Code,
+    Git,
+    Knowledge,
 }
 
 async fn authenticate_request(
     state: Arc<SharedState>,
     mut request: Request,
     next: Next,
-    require_git_transport: bool,
+    lane: ProducerAuthLane,
 ) -> Response {
     let auth = state.code_sources.producer_auth();
-    let enabled = if require_git_transport {
-        auth.git_transport_enabled()
-    } else {
-        auth.enabled()
+    let enabled = match lane {
+        ProducerAuthLane::Code => auth.enabled(),
+        ProducerAuthLane::Git => auth.git_transport_enabled(),
+        ProducerAuthLane::Knowledge => auth.knowledge_transport_enabled(),
     };
     if !enabled {
-        let (code, message) = if require_git_transport {
-            ("git_transport_disabled", "Git transport is disabled")
-        } else {
-            ("service_disabled", "code collection is disabled")
+        let (code, message) = match lane {
+            ProducerAuthLane::Code => ("service_disabled", "code collection is disabled"),
+            ProducerAuthLane::Git => ("git_transport_disabled", "Git transport is disabled"),
+            ProducerAuthLane::Knowledge => (
+                "knowledge_transport_disabled",
+                "knowledge transport is disabled",
+            ),
         };
         return error_response(StatusCode::SERVICE_UNAVAILABLE, code, message);
     }

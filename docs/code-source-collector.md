@@ -34,6 +34,7 @@ Add the producer and its exact published scopes to the daemon configuration:
 [code_collection]
 enabled = true
 git_transport_enabled = true
+knowledge_transport_enabled = true
 max_manifest_files = 250000
 max_manifest_logical_bytes = 5368709120
 max_open_uploads_per_producer = 2
@@ -74,6 +75,7 @@ root = "/home/operator/repos/project"
 scope = { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." }
 git_history = true
 provenance = true
+published_knowledge = { full_ref = "refs/heads/main" }
 ```
 
 The configured root must be the main Git worktree for its clone. The committed
@@ -101,6 +103,13 @@ changes during export paging or before receipt, the collector restarts from
 page one; already-written documents are counted as unchanged. Import status is
 polled to `active`/`superseded`, while invalid typed targets are quarantined
 with a durable diagnostic.
+
+`published_knowledge` is also independently opt-in. It names one full
+`refs/heads/*` branch ref. The collector pins that ref, reads both committed
+`.bbox/knowledge` and `.bbox/gaps` through the stable no-follow Git authority,
+uploads the atomic candidate with resumable content-addressed blobs, and then
+re-resolves the ref. Ref movement abandons the capture and retries. Working-tree
+files are never used, and a linked worktree remains ineligible.
 
 Publish once and wait for a terminal generation state:
 

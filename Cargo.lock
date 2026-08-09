@@ -351,6 +351,7 @@ dependencies = [
  "bbox-code-source",
  "bbox-corpus-core",
  "bbox-git-source",
+ "bbox-knowledge-source",
  "bbox-provenance",
  "bro-rpc",
  "clap",
@@ -680,6 +681,22 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bbox-knowledge-source-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-knowledge-source",
+ "bro-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -1065,6 +1082,8 @@ dependencies = [
  "bbox-inbox",
  "bbox-indexing",
  "bbox-knowledge",
+ "bbox-knowledge-source",
+ "bbox-knowledge-source-store",
  "bbox-mcp-tools",
  "bbox-packets",
  "bbox-provenance",

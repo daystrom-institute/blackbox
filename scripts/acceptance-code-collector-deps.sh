@@ -14,6 +14,7 @@ fi
 readonly FORBIDDEN=(
     'blackbox'
     'bbox-code-source-store'
+    'bbox-knowledge-source-store'
     'bbox-corpus-index'
     'bbox-indexing'
     'bbox-chunker'
@@ -51,9 +52,10 @@ if ((failures > 0)); then
     cat >&2 <<'EOF'
 
 bbox-code-collector walks, hashes, and uploads raw bounded files plus typed
-Git-history facts, and applies bounded provenance pages through the leaf local
-writer. Chunking, indexing, vectors, edge materialization, model runtimes, and
-daemon behavior belong on the corpus side of the boundary.
+Git-history and committed knowledge-source facts, and applies bounded
+provenance pages through the leaf local writer. Stores, chunking, indexing,
+vectors, edge materialization, model runtimes, and daemon behavior belong on
+the corpus side of the boundary.
 EOF
     exit 1
 fi

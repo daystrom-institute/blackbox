@@ -12,6 +12,7 @@ anyhow = "1"
 bbox-code-source = { path = "../bbox-code-source" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-git-source = { path = "../bbox-git-source" }
+bbox-knowledge-source = { path = "../bbox-knowledge-source" }
 bbox-provenance = { path = "../bbox-provenance", default-features = false, features = ["local-git"] }
 bro-rpc = { path = "../bro-rpc" }
 clap = { version = "4.5", features = ["derive"] }

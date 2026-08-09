@@ -375,6 +375,7 @@ GET  publication/generations/{id}/status
 
 POST provisional/probe
 POST provisional/uploads
+POST provisional/uploads/{id}/ancestry/{page}
 POST provisional/uploads/{id}/manifest/{class}/{lane}/{page}
 GET  provisional/uploads/{id}/missing
 PUT  provisional/uploads/{id}/blobs/{sha256}
@@ -385,9 +386,10 @@ GET  provisional/generations/{id}/status
 ```
 
 `class` is `baseline` or `working`; `lane` is `knowledge` or `gaps`.
-Manifest order is canonical and pages are contiguous. Missing-blob responses
-make retries resumable. Finalize is idempotent for byte-identical evidence and
-conflicts on the same logical sequence with different bytes.
+Manifest and ancestry-page order is canonical and pages are contiguous.
+Missing-blob responses make retries resumable. Finalize is idempotent for
+byte-identical evidence and conflicts on the same logical sequence with
+different bytes.
 
 ### 3.3 Durable layout
 
@@ -397,9 +399,9 @@ state root:
 ```text
 knowledge-sources/
   publications/uploads/
-  publications/generations/<project>/<generation>.json
+  publications/generations/<project>/<generation>/
   provisional/uploads/
-  provisional/generations/<project>/<workspace>/<generation>.json
+  provisional/generations/<project>/<workspace>/<generation>/
   blobs/sha256/<prefix>/<digest>
   journals/
 ```
@@ -546,7 +548,7 @@ nextest, clippy, and concurrency.
 
 ### KT-B: Store, authenticated intake, and collector capture
 
-Status: next.
+Status: implementation complete; full lane gate pending.
 
 1. Add `bbox-knowledge-source-store` with resumable CAS, journals, recovery,
    GC, and lease expiry.

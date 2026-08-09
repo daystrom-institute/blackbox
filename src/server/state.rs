@@ -200,6 +200,7 @@ pub(crate) struct SharedState {
     pub(crate) code_read_view: RwLock<Arc<CodeReadView>>,
     pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
     pub(crate) git_sources: Arc<super::git_source::GitSourceRuntime>,
+    pub(crate) knowledge_sources: Arc<super::knowledge_source::KnowledgeSourceRuntime>,
     /// Strict per-repository Git transport authority loaded from the
     /// checksummed current cutover marker before the first catalog read view.
     /// Bridge mode and pre-cutover catalog mode carry an empty runtime.
@@ -913,6 +914,9 @@ impl SharedState {
             })),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             git_sources: Arc::new(super::git_source::GitSourceRuntime::for_test(store_dir)),
+            knowledge_sources: Arc::new(super::knowledge_source::KnowledgeSourceRuntime::for_test(
+                store_dir,
+            )),
             git_transport_cutover: Arc::new(
                 bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default(),
             ),

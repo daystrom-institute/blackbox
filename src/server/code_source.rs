@@ -2325,6 +2325,27 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "Git-source maintenance failed"),
                 }
+                match state
+                    .knowledge_sources
+                    .store()
+                    .maintain(&std::collections::BTreeSet::new())
+                {
+                    Ok(report)
+                        if report != bbox_knowledge_source_store::MaintenanceReport::default() =>
+                    {
+                        tracing::info!(
+                            expired_uploads = report.expired_uploads,
+                            expired_leases = report.expired_provisional_leases,
+                            publication_generations = report.retired_publication_generations,
+                            provisional_generations = report.retired_provisional_generations,
+                            blobs = report.deleted_blobs,
+                            bytes = report.deleted_blob_bytes,
+                            "knowledge-source maintenance reclaimed unreferenced data"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "knowledge-source maintenance failed"),
+                }
                 if tick.is_multiple_of(24) {
                     match store.scrub_retained() {
                         Ok(stats) => tracing::info!(

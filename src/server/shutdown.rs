@@ -58,6 +58,13 @@ fn install_config_reload(
         );
         return None;
     }
+    if let Err(error) = super::knowledge_source::KnowledgeSourceRuntime::validate_config(&new_cfg) {
+        tracing::warn!(
+            error = %error,
+            "SIGHUP knowledge-source limit reload rejected"
+        );
+        return None;
+    }
     let projects = shared.records_provider.records_snapshot().records;
     let transitions = match shared.code_sources.reload(&new_cfg, &projects) {
         Ok(transitions) => transitions,
@@ -73,6 +80,13 @@ fn install_config_reload(
         tracing::error!(
             error = %error,
             "SIGHUP Git-source limit reload failed after validated auth reload"
+        );
+        return None;
+    }
+    if let Err(error) = shared.knowledge_sources.update_limits(&new_cfg) {
+        tracing::error!(
+            error = %error,
+            "SIGHUP knowledge-source limit reload failed after validated auth reload"
         );
         return None;
     }

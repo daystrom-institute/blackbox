@@ -28,6 +28,15 @@ use bbox_git_source::{
     ProvenanceImportStateV1, ProvenanceImportStatusV1, SCHEMA_VERSION as GIT_SOURCE_SCHEMA_VERSION,
     encode_history_fragment, history_manifest_sha256, provenance_manifest_sha256,
 };
+use bbox_knowledge_source::{
+    BeginPublicationUploadRequestV1, BeginSourceUploadResponseV1, FinalizeSourceUploadResponseV1,
+    GitObjectFormatV1 as KnowledgeGitObjectFormatV1, KnowledgeSourceLimits,
+    MissingSourceBlobsPageV1, PublicationCandidateDescriptorV1, PublicationCandidateStatusV1,
+    PublicationProbeRequestV1, PublicationProbeResponseV1,
+    SCHEMA_VERSION as KNOWLEDGE_SOURCE_SCHEMA_VERSION, SourceFileManifestEntryV1,
+    SourceGenerationStateV1, SourceLaneV1, SourceManifestDescriptorV1, SourceManifestPageV1,
+    source_file_blob_sha256, source_manifest_sha256,
+};
 use bro_rpc::ServiceToken;
 use clap::{Parser, Subcommand};
 use ignore::{DirEntry, WalkBuilder};
@@ -71,6 +80,14 @@ struct ProjectConfig {
     git_history: bool,
     #[serde(default)]
     provenance: bool,
+    #[serde(default)]
+    published_knowledge: Option<PublishedKnowledgeConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedKnowledgeConfig {
+    full_ref: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,6 +134,13 @@ struct CapturedProvenanceImport {
     descriptor: ProvenanceImportDescriptorV1,
     entries: Vec<ProvenanceImportManifestEntryV1>,
     documents: tempfile::TempDir,
+}
+
+struct CapturedPublicationCandidate {
+    descriptor: PublicationCandidateDescriptorV1,
+    knowledge_entries: Vec<SourceFileManifestEntryV1>,
+    gap_entries: Vec<SourceFileManifestEntryV1>,
+    blobs: tempfile::TempDir,
 }
 
 fn default_interval_secs() -> u64 {
@@ -182,7 +206,23 @@ async fn run_loop(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
         _ = run_code_lane(runtime, config) => unreachable!("code lane is an endless loop"),
         _ = run_history_lane(runtime, config) => unreachable!("history lane is an endless loop"),
         _ = run_provenance_lane(runtime, config) => unreachable!("provenance lane is an endless loop"),
+        _ = run_published_knowledge_lane(runtime, config) => unreachable!("published knowledge lane is an endless loop"),
         _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+async fn run_published_knowledge_lane(runtime: &Runtime, config: &CollectorConfig) {
+    let interval = Duration::from_secs(config.interval_secs.max(1));
+    let mut backoff = interval;
+    loop {
+        match publish_knowledge_projects(runtime, config).await {
+            Ok(()) => backoff = interval,
+            Err(error) => {
+                tracing::error!(error = %error, "published knowledge synchronization failed");
+                backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
+            }
+        }
+        tokio::time::sleep(jittered(backoff)).await;
     }
 }
 
@@ -241,6 +281,7 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     let code = publish_code_projects(runtime, config).await;
     let history = publish_history_repositories(runtime, config).await;
     let provenance = publish_provenance_projects(runtime, config).await;
+    let published_knowledge = publish_knowledge_projects(runtime, config).await;
     let mut failures = Vec::new();
     if let Err(error) = code {
         failures.push(format!("code-source lane failed: {error:#}"));
@@ -251,11 +292,400 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     if let Err(error) = provenance {
         failures.push(format!("provenance lane failed: {error:#}"));
     }
+    if let Err(error) = published_knowledge {
+        failures.push(format!("published knowledge lane failed: {error:#}"));
+    }
     if failures.is_empty() {
         Ok(())
     } else {
         bail!(failures.join("; "))
     }
+}
+
+async fn publish_knowledge_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    for project in config
+        .projects
+        .iter()
+        .filter(|project| project.published_knowledge.is_some())
+    {
+        let captured = capture_publication_candidate(project)?;
+        publish_publication_candidate(
+            runtime,
+            captured,
+            Duration::from_secs(config.status_timeout_secs),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPublicationCandidate> {
+    let publication = config
+        .published_knowledge
+        .as_ref()
+        .context("published knowledge capture was not configured")?;
+    let root = config
+        .root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", config.root.display()))?;
+    require_main_worktree(&root)?;
+    let directory = bbox_corpus_core::json_store::NofollowDirectory::open_existing(&root)?
+        .ok_or_else(|| anyhow!("collector project root disappeared"))?;
+    let repository = bbox_corpus_core::git::open_stable_git_repository(&directory)?
+        .ok_or_else(|| anyhow!("collector project is not a stable Git repository"))?;
+    let publisher_commit = repository
+        .resolve_reference_oid(&publication.full_ref)?
+        .ok_or_else(|| anyhow!("published knowledge ref does not resolve to a commit"))?;
+    let commit = repository.verify_commit_oid(&publisher_commit)?;
+    let actual_scope = resolve_committed_scope(&root, &publisher_commit)?;
+    if actual_scope != config.scope {
+        bail!("configured scope does not match committed project identity");
+    }
+    let object_format = match repository.object_id_hex_len()? {
+        40 => KnowledgeGitObjectFormatV1::Sha1,
+        64 => KnowledgeGitObjectFormatV1::Sha256,
+        _ => bail!("Git repository uses an unsupported object format"),
+    };
+    let limits = KnowledgeSourceLimits::default();
+    let blobs = tempfile::tempdir().context("creating published knowledge blob spool")?;
+    let knowledge_entries = capture_publication_lane(
+        &commit,
+        &actual_scope,
+        SourceLaneV1::Knowledge,
+        &blobs,
+        limits,
+    )?;
+    let gap_entries =
+        capture_publication_lane(&commit, &actual_scope, SourceLaneV1::Gaps, &blobs, limits)?;
+    let knowledge_pages = pack_source_manifest_pages(
+        &knowledge_entries,
+        limits.max_manifest_page_entries as usize,
+        limits.max_manifest_page_bytes as usize,
+    )?;
+    let gap_pages = pack_source_manifest_pages(
+        &gap_entries,
+        limits.max_manifest_page_entries as usize,
+        limits.max_manifest_page_bytes as usize,
+    )?;
+    let descriptor = PublicationCandidateDescriptorV1 {
+        schema_version: KNOWLEDGE_SOURCE_SCHEMA_VERSION,
+        scope: actual_scope,
+        full_ref: publication.full_ref.clone(),
+        publisher_commit: publisher_commit.clone(),
+        object_format,
+        knowledge: source_manifest_descriptor(
+            SourceLaneV1::Knowledge,
+            &knowledge_entries,
+            knowledge_pages.len(),
+        )?,
+        gaps: source_manifest_descriptor(SourceLaneV1::Gaps, &gap_entries, gap_pages.len())?,
+    };
+    bbox_knowledge_source::validate_publication_candidate(
+        &descriptor,
+        &knowledge_entries,
+        &gap_entries,
+        limits,
+    )?;
+    let stable_commit = repository
+        .resolve_reference_oid(&publication.full_ref)?
+        .ok_or_else(|| anyhow!("published knowledge ref disappeared during capture"))?;
+    if stable_commit != publisher_commit {
+        bail!("published knowledge ref moved during capture; restart capture");
+    }
+    Ok(CapturedPublicationCandidate {
+        descriptor,
+        knowledge_entries,
+        gap_entries,
+        blobs,
+    })
+}
+
+fn capture_publication_lane(
+    commit: &bbox_corpus_core::git::VerifiedCommit,
+    scope: &PublishedScope,
+    lane: SourceLaneV1,
+    blobs: &tempfile::TempDir,
+    limits: KnowledgeSourceLimits,
+) -> Result<Vec<SourceFileManifestEntryV1>> {
+    let lane_name = match lane {
+        SourceLaneV1::Knowledge => "knowledge",
+        SourceLaneV1::Gaps => "gaps",
+    };
+    let directory = if scope.bbox_root_relpath() == "." {
+        format!(".bbox/{lane_name}")
+    } else {
+        format!("{}/.bbox/{lane_name}", scope.bbox_root_relpath())
+    };
+    let paths = bbox_corpus_core::git::list_verified_committed_dir_bounded(
+        commit,
+        &directory,
+        usize::try_from(limits.max_files_per_lane).unwrap_or(usize::MAX),
+        usize::try_from(limits.max_lane_bytes).unwrap_or(usize::MAX),
+    )?;
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut logical_bytes = 0_u64;
+    for path in paths {
+        let bytes = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+            commit,
+            &path,
+            usize::try_from(limits.max_file_bytes).unwrap_or(usize::MAX),
+        )?;
+        logical_bytes = logical_bytes
+            .checked_add(bytes.len() as u64)
+            .context("published knowledge lane byte count overflow")?;
+        if logical_bytes > limits.max_lane_bytes {
+            bail!("published knowledge lane exceeds its byte limit");
+        }
+        let hash = source_file_blob_sha256(&bytes);
+        install_captured_source_blob(blobs.path(), &hash, &bytes)?;
+        entries.push(SourceFileManifestEntryV1 {
+            repository_relative_filename: path,
+            encoded_bytes: bytes.len() as u64,
+            content_sha256: hash,
+        });
+    }
+    Ok(entries)
+}
+
+fn install_captured_source_blob(root: &Path, hash: &str, bytes: &[u8]) -> Result<()> {
+    let path = root.join(hash);
+    match fs::read(&path) {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) => bail!("captured knowledge-source blob hash collision"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::write(path, bytes)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn source_manifest_descriptor(
+    lane: SourceLaneV1,
+    entries: &[SourceFileManifestEntryV1],
+    page_count: usize,
+) -> Result<SourceManifestDescriptorV1> {
+    Ok(SourceManifestDescriptorV1 {
+        manifest_sha256: source_manifest_sha256(lane, entries),
+        file_count: entries.len() as u64,
+        logical_bytes: entries.iter().try_fold(0_u64, |total, entry| {
+            total
+                .checked_add(entry.encoded_bytes)
+                .context("published knowledge manifest byte count overflow")
+        })?,
+        page_count: u64::try_from(page_count)?,
+    })
+}
+
+fn pack_source_manifest_pages(
+    entries: &[SourceFileManifestEntryV1],
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<Vec<SourceManifestPageV1>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if max_entries == 0 || max_bytes == 0 {
+        bail!("server returned invalid knowledge-source manifest page limits");
+    }
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    for entry in entries {
+        let page_index = u64::try_from(pages.len())?;
+        let mut candidate = current.clone();
+        candidate.push(entry.clone());
+        let candidate_page = SourceManifestPageV1 {
+            page_index,
+            entries: candidate,
+        };
+        if candidate_page.entries.len() > max_entries
+            || serde_json::to_vec(&candidate_page)?.len() > max_bytes
+        {
+            if current.is_empty() {
+                bail!("one knowledge-source manifest entry exceeds the server page limit");
+            }
+            pages.push(SourceManifestPageV1 {
+                page_index,
+                entries: current,
+            });
+            current = vec![entry.clone()];
+            let next = SourceManifestPageV1 {
+                page_index: u64::try_from(pages.len())?,
+                entries: current.clone(),
+            };
+            if serde_json::to_vec(&next)?.len() > max_bytes {
+                bail!("one knowledge-source manifest entry exceeds the server page limit");
+            }
+        } else {
+            current = candidate_page.entries;
+        }
+    }
+    if !current.is_empty() {
+        pages.push(SourceManifestPageV1 {
+            page_index: u64::try_from(pages.len())?,
+            entries: current,
+        });
+    }
+    Ok(pages)
+}
+
+async fn publish_publication_candidate(
+    runtime: &Runtime,
+    captured: CapturedPublicationCandidate,
+    status_timeout: Duration,
+) -> Result<()> {
+    let probe: PublicationProbeResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/knowledge-source/v1/publication/probe")?,
+            )
+            .json(&PublicationProbeRequestV1 {
+                scope: captured.descriptor.scope.clone(),
+                full_ref: captured.descriptor.full_ref.clone(),
+                publisher_commit: captured.descriptor.publisher_commit.clone(),
+                object_format: captured.descriptor.object_format,
+            }),
+    )
+    .await?;
+    if let Some(current) = probe.current {
+        tracing::info!(
+            source_generation = %current.source_generation_id,
+            knowledge_files = current.knowledge_files,
+            gap_files = current.gap_files,
+            "published knowledge candidate is already current"
+        );
+        return Ok(());
+    }
+
+    let begin: BeginSourceUploadResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/knowledge-source/v1/publication/uploads")?,
+            )
+            .json(&BeginPublicationUploadRequestV1 {
+                descriptor: captured.descriptor.clone(),
+            }),
+    )
+    .await?;
+    for (lane, entries, expected_pages) in [
+        (
+            SourceLaneV1::Knowledge,
+            captured.knowledge_entries.as_slice(),
+            captured.descriptor.knowledge.page_count,
+        ),
+        (
+            SourceLaneV1::Gaps,
+            captured.gap_entries.as_slice(),
+            captured.descriptor.gaps.page_count,
+        ),
+    ] {
+        let pages = pack_source_manifest_pages(
+            entries,
+            begin.max_manifest_page_entries as usize,
+            begin.max_manifest_page_bytes as usize,
+        )?;
+        if pages.len() as u64 != expected_pages {
+            bail!("server page limits changed the committed candidate manifest shape");
+        }
+        let lane_name = match lane {
+            SourceLaneV1::Knowledge => "knowledge",
+            SourceLaneV1::Gaps => "gaps",
+        };
+        for page in pages {
+            let url = runtime.endpoint(&format!(
+                "internal/knowledge-source/v1/publication/uploads/{}/manifest/{lane_name}/{}",
+                begin.upload_id, page.page_index
+            ))?;
+            send_empty(runtime.request(reqwest::Method::POST, url).json(&page)).await?;
+        }
+    }
+    let mut missing: MissingSourceBlobsPageV1 = send_json(runtime.request(
+        reqwest::Method::GET,
+        runtime.endpoint(&format!(
+            "internal/knowledge-source/v1/publication/uploads/{}/missing",
+            begin.upload_id
+        ))?,
+    ))
+    .await?;
+    let entries_by_hash = captured
+        .knowledge_entries
+        .iter()
+        .chain(&captured.gap_entries)
+        .map(|entry| (entry.content_sha256.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    loop {
+        for hash in &missing.hashes {
+            let entry = entries_by_hash
+                .get(hash.as_str())
+                .copied()
+                .ok_or_else(|| anyhow!("server requested an unknown knowledge-source blob"))?;
+            let bytes = fs::read(captured.blobs.path().join(hash))?;
+            if bytes.len() as u64 != entry.encoded_bytes
+                || source_file_blob_sha256(&bytes) != entry.content_sha256
+            {
+                bail!("captured knowledge-source blob changed before upload");
+            }
+            let url = runtime.endpoint(&format!(
+                "internal/knowledge-source/v1/publication/uploads/{}/blobs/{hash}",
+                begin.upload_id
+            ))?;
+            send_empty(
+                runtime
+                    .request(reqwest::Method::PUT, url)
+                    .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                    .body(bytes),
+            )
+            .await?;
+        }
+        let Some(cursor) = missing.next_cursor.as_deref() else {
+            break;
+        };
+        let mut url = runtime.endpoint(&format!(
+            "internal/knowledge-source/v1/publication/uploads/{}/missing",
+            begin.upload_id
+        ))?;
+        url.query_pairs_mut().append_pair("cursor", cursor);
+        missing = send_json(runtime.request(reqwest::Method::GET, url)).await?;
+    }
+    let finalized: FinalizeSourceUploadResponseV1 = send_json(runtime.request(
+        reqwest::Method::POST,
+        runtime.endpoint(&format!(
+            "internal/knowledge-source/v1/publication/uploads/{}/finalize",
+            begin.upload_id
+        ))?,
+    ))
+    .await?;
+    let status_url = runtime.endpoint(finalized.status_url.trim_start_matches('/'))?;
+    with_status_timeout(status_timeout, async {
+        loop {
+            let status: PublicationCandidateStatusV1 =
+                send_json(runtime.request(reqwest::Method::GET, status_url.clone())).await?;
+            match status.state {
+                SourceGenerationStateV1::Ready => {
+                    tracing::info!(
+                        source_generation = %status.source_generation_id,
+                        publisher_commit = %status.publisher_commit,
+                        knowledge_files = status.knowledge_files,
+                        gap_files = status.gap_files,
+                        bytes = status.logical_bytes,
+                        "published knowledge candidate reached durable terminal success"
+                    );
+                    return Ok(());
+                }
+                SourceGenerationStateV1::Failed => {
+                    bail!(
+                        "published knowledge candidate {} failed: {}",
+                        status.source_generation_id,
+                        status.diagnostic.as_deref().unwrap_or("no diagnostic")
+                    );
+                }
+                _ => tokio::time::sleep(Duration::from_secs(1)).await,
+            }
+        }
+    })
+    .await
 }
 
 const MAX_PROVENANCE_STALE_RESTARTS: usize = 3;
@@ -1755,6 +2185,8 @@ fn truncate(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
+    const KNOWLEDGE_BYTES: &[u8] = br#"{"id":"knowledge-1"}"#;
+
     fn git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -1782,6 +2214,132 @@ mod tests {
         assert!(is_skipped_component(".bbox"));
         assert!(is_skipped_component("node_modules"));
         assert!(!is_skipped_component("src"));
+    }
+
+    #[test]
+    fn published_knowledge_capture_is_committed_atomic_and_ignores_working_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "user.name", "Knowledge Fixture"]);
+        git(
+            &root,
+            &["config", "user.email", "knowledge@example.invalid"],
+        );
+        fs::create_dir_all(root.join(".bbox/knowledge")).unwrap();
+        fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"knowledge-capture-fixture\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".bbox/knowledge/knowledge-1.json"),
+            KNOWLEDGE_BYTES,
+        )
+        .unwrap();
+        let gap_bytes = br#"{"id":"gap-11111111"}"#;
+        fs::write(root.join(".bbox/gaps/gap-11111111.json"), gap_bytes).unwrap();
+        git(&root, &["add", ".bbox"]);
+        git(&root, &["commit", "--quiet", "-m", "knowledge source"]);
+
+        fs::write(
+            root.join(".bbox/knowledge/knowledge-1.json"),
+            br#"{"id":"working-tree-change"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".bbox/knowledge/uncommitted.json"),
+            br#"{"id":"uncommitted"}"#,
+        )
+        .unwrap();
+        let captured = capture_publication_candidate(&ProjectConfig {
+            root: root.clone(),
+            scope: PublishedScope::try_new("knowledge-capture-fixture", ".").unwrap(),
+            git_history: false,
+            provenance: false,
+            published_knowledge: Some(PublishedKnowledgeConfig {
+                full_ref: "refs/heads/main".to_string(),
+            }),
+        })
+        .unwrap();
+        assert_eq!(captured.knowledge_entries.len(), 1);
+        assert_eq!(captured.gap_entries.len(), 1);
+        assert_eq!(
+            captured.knowledge_entries[0].content_sha256,
+            source_file_blob_sha256(KNOWLEDGE_BYTES)
+        );
+        assert_eq!(
+            fs::read(
+                captured
+                    .blobs
+                    .path()
+                    .join(&captured.knowledge_entries[0].content_sha256)
+            )
+            .unwrap(),
+            KNOWLEDGE_BYTES
+        );
+        assert_eq!(captured.descriptor.knowledge.page_count, 1);
+        assert_eq!(captured.descriptor.gaps.page_count, 1);
+        assert_eq!(captured.descriptor.full_ref, "refs/heads/main");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_knowledge_capture_refuses_committed_symlinks_and_linked_worktrees() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "user.name", "Knowledge Fixture"]);
+        git(
+            &root,
+            &["config", "user.email", "knowledge@example.invalid"],
+        );
+        fs::create_dir_all(root.join(".bbox/knowledge")).unwrap();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"knowledge-safety-fixture\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("outside.json"), "{}\n").unwrap();
+        symlink("../../outside.json", root.join(".bbox/knowledge/link.json")).unwrap();
+        git(&root, &["add", ".bbox", "outside.json"]);
+        git(&root, &["commit", "--quiet", "-m", "unsafe source"]);
+        let project = ProjectConfig {
+            root: root.clone(),
+            scope: PublishedScope::try_new("knowledge-safety-fixture", ".").unwrap(),
+            git_history: false,
+            provenance: false,
+            published_knowledge: Some(PublishedKnowledgeConfig {
+                full_ref: "refs/heads/main".to_string(),
+            }),
+        };
+        let error = match capture_publication_candidate(&project) {
+            Ok(_) => panic!("committed symlink capture unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("non-regular-file"));
+
+        let linked = directory.path().join("linked");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let mut linked_project = project;
+        linked_project.root = linked.canonicalize().unwrap();
+        let error = match capture_publication_candidate(&linked_project) {
+            Ok(_) => panic!("linked-worktree knowledge capture unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("main worktree"));
     }
 
     #[test]
@@ -1879,6 +2437,7 @@ mod tests {
             scope: PublishedScope::try_new("history-fixture", ".").unwrap(),
             git_history: true,
             provenance: false,
+            published_knowledge: None,
         })
         .unwrap();
         assert_eq!(captured.descriptor.commit_count, 4);
@@ -2004,6 +2563,7 @@ mod tests {
             scope: PublishedScope::try_new("sha256-history-fixture", ".").unwrap(),
             git_history: true,
             provenance: false,
+            published_knowledge: None,
         })
         .unwrap();
         assert_eq!(captured.descriptor.object_format, GitObjectFormatV1::Sha256);
@@ -2046,6 +2606,7 @@ mod tests {
             scope: PublishedScope::try_new("shallow-history-fixture", ".").unwrap(),
             git_history: true,
             provenance: false,
+            published_knowledge: None,
         }) {
             Ok(_) => panic!("shallow Git history capture unexpectedly succeeded"),
             Err(error) => error,

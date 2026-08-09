@@ -14,6 +14,8 @@ pub const MAX_SOURCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_SOURCE_LANE_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_ANCESTRY_NODES: u64 = 2_000_000;
 pub const MAX_ANCESTRY_EDGES: u64 = 8_000_000;
+pub const MAX_ANCESTRY_PAGE_NODES: u64 = 2_000;
+pub const MAX_ANCESTRY_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_MANIFEST_PAGE_ENTRIES: u64 = 2_000;
 pub const MAX_MANIFEST_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_MANIFEST_PAGES: u64 = 100_000;
@@ -29,6 +31,8 @@ pub struct KnowledgeSourceLimits {
     pub max_lane_bytes: u64,
     pub max_ancestry_nodes: u64,
     pub max_ancestry_edges: u64,
+    pub max_ancestry_page_nodes: u64,
+    pub max_ancestry_page_bytes: u64,
     pub max_manifest_page_entries: u64,
     pub max_manifest_page_bytes: u64,
     pub max_manifest_pages: u64,
@@ -44,6 +48,8 @@ impl Default for KnowledgeSourceLimits {
             max_lane_bytes: MAX_SOURCE_LANE_BYTES,
             max_ancestry_nodes: MAX_ANCESTRY_NODES,
             max_ancestry_edges: MAX_ANCESTRY_EDGES,
+            max_ancestry_page_nodes: MAX_ANCESTRY_PAGE_NODES,
+            max_ancestry_page_bytes: MAX_ANCESTRY_PAGE_BYTES,
             max_manifest_page_entries: MAX_MANIFEST_PAGE_ENTRIES,
             max_manifest_page_bytes: MAX_MANIFEST_PAGE_BYTES,
             max_manifest_pages: MAX_MANIFEST_PAGES,
@@ -60,6 +66,8 @@ impl KnowledgeSourceLimits {
         validate_limit(self.max_lane_bytes, MAX_SOURCE_LANE_BYTES)?;
         validate_limit(self.max_ancestry_nodes, MAX_ANCESTRY_NODES)?;
         validate_limit(self.max_ancestry_edges, MAX_ANCESTRY_EDGES)?;
+        validate_limit(self.max_ancestry_page_nodes, MAX_ANCESTRY_PAGE_NODES)?;
+        validate_limit(self.max_ancestry_page_bytes, MAX_ANCESTRY_PAGE_BYTES)?;
         validate_limit(self.max_manifest_page_entries, MAX_MANIFEST_PAGE_ENTRIES)?;
         validate_limit(self.max_manifest_page_bytes, MAX_MANIFEST_PAGE_BYTES)?;
         validate_limit(self.max_manifest_pages, MAX_MANIFEST_PAGES)?;
@@ -83,6 +91,8 @@ pub enum ContractError {
     InvalidDigest,
     #[error("invalid producer id")]
     InvalidProducerId,
+    #[error("knowledge-source input is internally inconsistent")]
+    InvalidInput,
     #[error("invalid repository-relative source filename")]
     InvalidSourceFilename,
     #[error("knowledge-source limit is zero or exceeds its hard ceiling")]
@@ -142,7 +152,7 @@ impl GitObjectFormatV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceLaneV1 {
     Knowledge,
@@ -165,7 +175,7 @@ impl SourceLaneV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotClassV1 {
     Baseline,
@@ -254,6 +264,23 @@ pub struct AncestryDescriptorV1 {
     pub ancestry_sha256: String,
     pub node_count: u64,
     pub edge_count: u64,
+    pub page_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AncestryPageV1 {
+    pub page_index: u64,
+    pub nodes: Vec<AncestryCommitV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StableCaptureV1 {
+    pub transaction_pending_before: bool,
+    pub transaction_pending_after: bool,
+    pub first_working_pair_sha256: String,
+    pub second_working_pair_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -269,10 +296,159 @@ pub struct ProvisionalWorkspaceDescriptorV1 {
     pub merge_base: String,
     pub object_format: GitObjectFormatV1,
     pub ancestry: AncestryDescriptorV1,
+    pub capture: StableCaptureV1,
     pub baseline_knowledge: SourceManifestDescriptorV1,
     pub baseline_gaps: SourceManifestDescriptorV1,
     pub working_knowledge: SourceManifestDescriptorV1,
     pub working_gaps: SourceManifestDescriptorV1,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceGenerationStateV1 {
+    ReceivingManifest,
+    MissingBlobs,
+    Ready,
+    Superseded,
+    Retired,
+    Expired,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BeginSourceUploadResponseV1 {
+    pub upload_id: String,
+    pub max_manifest_page_entries: u64,
+    pub max_manifest_page_bytes: u64,
+    pub max_ancestry_page_nodes: u64,
+    pub max_ancestry_page_bytes: u64,
+    pub max_blob_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationProbeRequestV1 {
+    pub scope: PublishedScope,
+    pub full_ref: String,
+    pub publisher_commit: String,
+    pub object_format: GitObjectFormatV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationProbeResponseV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<PublicationCandidateStatusV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BeginPublicationUploadRequestV1 {
+    pub descriptor: PublicationCandidateDescriptorV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionalProbeRequestV1 {
+    pub scope: PublishedScope,
+    pub workspace_id: WorkspaceId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionalProbeResponseV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<ProvisionalWorkspaceStatusV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BeginProvisionalUploadRequestV1 {
+    pub descriptor: ProvisionalWorkspaceDescriptorV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeProvisionalUploadRequestV1 {
+    pub lease_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenewProvisionalGenerationRequestV1 {
+    pub lease_ttl_secs: u64,
+}
+
+impl PublicationProbeRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_scope(&self.scope)?;
+        validate_full_ref(&self.full_ref)?;
+        validate_object_id(&self.publisher_commit, self.object_format)
+    }
+}
+
+impl ProvisionalProbeRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_scope(&self.scope)?;
+        WorkspaceId::parse(self.workspace_id.as_str()).map_err(|_| ContractError::InvalidInput)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MissingSourceBlobsPageV1 {
+    pub source_generation_id: String,
+    pub hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeSourceUploadResponseV1 {
+    pub source_generation_id: String,
+    pub status_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationCandidateStatusV1 {
+    pub source_generation_id: String,
+    pub state: SourceGenerationStateV1,
+    pub producer_id: String,
+    pub full_ref: String,
+    pub publisher_commit: String,
+    pub object_format: GitObjectFormatV1,
+    pub observed_at_unix_secs: u64,
+    pub knowledge_manifest_sha256: String,
+    pub gap_manifest_sha256: String,
+    pub knowledge_files: u64,
+    pub gap_files: u64,
+    pub logical_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionalWorkspaceStatusV1 {
+    pub source_generation_id: String,
+    pub state: SourceGenerationStateV1,
+    pub workspace_id: WorkspaceId,
+    pub sequence: u64,
+    pub accepted_generation: String,
+    pub checkout_head: String,
+    pub observed_at_unix_secs: u64,
+    pub baseline_knowledge_manifest_sha256: String,
+    pub baseline_gap_manifest_sha256: String,
+    pub working_knowledge_manifest_sha256: String,
+    pub working_gap_manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_unix_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 impl ProvisionalWorkspaceDescriptorV1 {
@@ -284,10 +460,15 @@ impl ProvisionalWorkspaceDescriptorV1 {
         validate_object_id(&self.checkout_head, self.object_format)?;
         validate_object_id(&self.merge_base, self.object_format)?;
         validate_ancestry_descriptor(&self.ancestry, limits)?;
+        self.capture.validate()?;
         self.baseline_knowledge.validate_header(limits)?;
         self.baseline_gaps.validate_header(limits)?;
         self.working_knowledge.validate_header(limits)?;
         self.working_gaps.validate_header(limits)?;
+        let working_pair = working_pair_sha256(&self.working_knowledge, &self.working_gaps);
+        if self.capture.first_working_pair_sha256 != working_pair {
+            return Err(ContractError::InvalidInput);
+        }
         validate_total_bytes(
             [
                 self.baseline_knowledge.logical_bytes,
@@ -300,8 +481,33 @@ impl ProvisionalWorkspaceDescriptorV1 {
     }
 }
 
+impl StableCaptureV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_sha256(&self.first_working_pair_sha256)?;
+        validate_sha256(&self.second_working_pair_sha256)?;
+        if self.transaction_pending_before
+            || self.transaction_pending_after
+            || self.first_working_pair_sha256 != self.second_working_pair_sha256
+        {
+            return Err(ContractError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
 pub fn source_file_blob_sha256(bytes: &[u8]) -> String {
     sha256(bytes)
+}
+
+pub fn working_pair_sha256(
+    knowledge: &SourceManifestDescriptorV1,
+    gaps: &SourceManifestDescriptorV1,
+) -> String {
+    let mut encoded = Vec::new();
+    push_field(&mut encoded, b"bbox-knowledge-working-pair-v1");
+    hash_manifest_descriptor(&mut encoded, knowledge);
+    hash_manifest_descriptor(&mut encoded, gaps);
+    sha256(&encoded)
 }
 
 pub fn validate_source_blob(
@@ -348,6 +554,24 @@ pub fn validate_manifest_page(
         || page.entries.len() as u64 > limits.max_manifest_page_entries
         || encoded_page_bytes == 0
         || encoded_page_bytes > limits.max_manifest_page_bytes
+    {
+        return Err(ContractError::InvalidManifestPage);
+    }
+    Ok(())
+}
+
+pub fn validate_ancestry_page(
+    descriptor: &AncestryDescriptorV1,
+    page: &AncestryPageV1,
+    encoded_page_bytes: u64,
+    limits: KnowledgeSourceLimits,
+) -> Result<(), ContractError> {
+    validate_ancestry_descriptor(descriptor, limits)?;
+    if page.nodes.is_empty()
+        || page.page_index >= descriptor.page_count
+        || page.nodes.len() as u64 > limits.max_ancestry_page_nodes
+        || encoded_page_bytes == 0
+        || encoded_page_bytes > limits.max_ancestry_page_bytes
     {
         return Err(ContractError::InvalidManifestPage);
     }
@@ -568,6 +792,10 @@ pub fn publication_candidate_generation_id(
     Ok(format!("kps_{}", sha256(&encoded)))
 }
 
+pub fn validate_publication_generation_id(value: &str) -> Result<(), ContractError> {
+    validate_prefixed_generation_id(value, "kps_")
+}
+
 pub fn provisional_workspace_generation_id(
     descriptor: &ProvisionalWorkspaceDescriptorV1,
 ) -> Result<String, ContractError> {
@@ -586,6 +814,16 @@ pub fn provisional_workspace_generation_id(
     push_field(&mut encoded, descriptor.merge_base.as_bytes());
     encoded.push(descriptor.object_format.tag());
     hash_ancestry_descriptor(&mut encoded, &descriptor.ancestry);
+    encoded.push(u8::from(descriptor.capture.transaction_pending_before));
+    encoded.push(u8::from(descriptor.capture.transaction_pending_after));
+    push_field(
+        &mut encoded,
+        descriptor.capture.first_working_pair_sha256.as_bytes(),
+    );
+    push_field(
+        &mut encoded,
+        descriptor.capture.second_working_pair_sha256.as_bytes(),
+    );
     hash_manifest_descriptor(&mut encoded, &descriptor.baseline_knowledge);
     hash_manifest_descriptor(&mut encoded, &descriptor.baseline_gaps);
     hash_manifest_descriptor(&mut encoded, &descriptor.working_knowledge);
@@ -593,11 +831,22 @@ pub fn provisional_workspace_generation_id(
     Ok(format!("kws_{}", sha256(&encoded)))
 }
 
+pub fn validate_provisional_generation_id(value: &str) -> Result<(), ContractError> {
+    validate_prefixed_generation_id(value, "kws_")
+}
+
 fn validate_schema(schema_version: u32) -> Result<(), ContractError> {
     if schema_version != SCHEMA_VERSION {
         return Err(ContractError::UnsupportedSchema(schema_version));
     }
     Ok(())
+}
+
+fn validate_prefixed_generation_id(value: &str, prefix: &str) -> Result<(), ContractError> {
+    let Some(digest) = value.strip_prefix(prefix) else {
+        return Err(ContractError::InvalidDigest);
+    };
+    validate_sha256(digest)
 }
 
 fn validate_scope(scope: &PublishedScope) -> Result<(), ContractError> {
@@ -736,6 +985,13 @@ fn validate_ancestry_descriptor(
     if descriptor.node_count == 0
         || descriptor.node_count > limits.max_ancestry_nodes
         || descriptor.edge_count > limits.max_ancestry_edges
+        || descriptor.page_count == 0
+        || descriptor.page_count > descriptor.node_count
+        || descriptor.page_count > limits.max_manifest_pages
+        || descriptor.page_count
+            < descriptor
+                .node_count
+                .div_ceil(limits.max_ancestry_page_nodes)
     {
         return Err(ContractError::AncestryLimitExceeded);
     }
@@ -813,6 +1069,7 @@ fn hash_ancestry_descriptor(encoded: &mut Vec<u8>, descriptor: &AncestryDescript
     push_field(encoded, descriptor.ancestry_sha256.as_bytes());
     encoded.extend_from_slice(&descriptor.node_count.to_be_bytes());
     encoded.extend_from_slice(&descriptor.edge_count.to_be_bytes());
+    encoded.extend_from_slice(&descriptor.page_count.to_be_bytes());
 }
 
 fn is_lower_hex(value: &str) -> bool {
@@ -833,6 +1090,8 @@ fn push_field(output: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type LimitMutation = Box<dyn Fn(&mut KnowledgeSourceLimits)>;
 
     fn scope() -> PublishedScope {
         PublishedScope::try_new("repo-family", ".").unwrap()
@@ -906,6 +1165,7 @@ mod tests {
             ancestry_sha256: ancestry_sha256(format, &nodes),
             node_count: nodes.len() as u64,
             edge_count: 2,
+            page_count: 1,
         };
         (descriptor, nodes)
     }
@@ -925,6 +1185,11 @@ mod tests {
             br#"{"id":"gap-11111111"}"#,
         )];
         let (ancestry, nodes) = ancestry(GitObjectFormatV1::Sha1);
+        let baseline_knowledge = manifest(SourceLaneV1::Knowledge, &knowledge);
+        let baseline_gaps = manifest(SourceLaneV1::Gaps, &gaps);
+        let working_knowledge = manifest(SourceLaneV1::Knowledge, &knowledge);
+        let working_gaps = manifest(SourceLaneV1::Gaps, &gaps);
+        let working_pair = working_pair_sha256(&working_knowledge, &working_gaps);
         let descriptor = ProvisionalWorkspaceDescriptorV1 {
             schema_version: SCHEMA_VERSION,
             scope: scope(),
@@ -936,10 +1201,16 @@ mod tests {
             merge_base: "1".repeat(40),
             object_format: GitObjectFormatV1::Sha1,
             ancestry,
-            baseline_knowledge: manifest(SourceLaneV1::Knowledge, &knowledge),
-            baseline_gaps: manifest(SourceLaneV1::Gaps, &gaps),
-            working_knowledge: manifest(SourceLaneV1::Knowledge, &knowledge),
-            working_gaps: manifest(SourceLaneV1::Gaps, &gaps),
+            capture: StableCaptureV1 {
+                transaction_pending_before: false,
+                transaction_pending_after: false,
+                first_working_pair_sha256: working_pair.clone(),
+                second_working_pair_sha256: working_pair,
+            },
+            baseline_knowledge,
+            baseline_gaps,
+            working_knowledge,
+            working_gaps,
         };
         (descriptor, nodes, knowledge, gaps)
     }
@@ -983,7 +1254,7 @@ mod tests {
         );
         assert_eq!(
             provisional_workspace_generation_id(&descriptor).unwrap(),
-            "kws_f218f735ff68245aefea8848e8785ca28db93f1487aea094445cb6f4e4818370"
+            "kws_b2ef389d2c997a9c6aac48af0c7af608412d26f4dabf682e7b293b36e5feb37a"
         );
     }
 
@@ -1085,12 +1356,14 @@ mod tests {
     fn limits_accept_the_cap_and_reject_zero_or_cap_plus_one() {
         let caps = KnowledgeSourceLimits::default();
         caps.validate().unwrap();
-        let mutations: Vec<Box<dyn Fn(&mut KnowledgeSourceLimits)>> = vec![
+        let mutations: Vec<LimitMutation> = vec![
             Box::new(|limits| limits.max_files_per_lane = MAX_SOURCE_FILES_PER_LANE + 1),
             Box::new(|limits| limits.max_file_bytes = MAX_SOURCE_FILE_BYTES + 1),
             Box::new(|limits| limits.max_lane_bytes = MAX_SOURCE_LANE_BYTES + 1),
             Box::new(|limits| limits.max_ancestry_nodes = MAX_ANCESTRY_NODES + 1),
             Box::new(|limits| limits.max_ancestry_edges = MAX_ANCESTRY_EDGES + 1),
+            Box::new(|limits| limits.max_ancestry_page_nodes = MAX_ANCESTRY_PAGE_NODES + 1),
+            Box::new(|limits| limits.max_ancestry_page_bytes = MAX_ANCESTRY_PAGE_BYTES + 1),
             Box::new(|limits| limits.max_manifest_page_entries = MAX_MANIFEST_PAGE_ENTRIES + 1),
             Box::new(|limits| limits.max_manifest_page_bytes = MAX_MANIFEST_PAGE_BYTES + 1),
             Box::new(|limits| limits.max_manifest_pages = MAX_MANIFEST_PAGES + 1),
@@ -1121,6 +1394,16 @@ mod tests {
                 KnowledgeSourceLimits::default(),
             )
             .unwrap();
+            validate_ancestry_page(
+                &descriptor,
+                &AncestryPageV1 {
+                    page_index: 0,
+                    nodes: nodes.clone(),
+                },
+                1024,
+                KnowledgeSourceLimits::default(),
+            )
+            .unwrap();
 
             let mut incomplete = nodes.clone();
             incomplete.remove(0);
@@ -1128,6 +1411,7 @@ mod tests {
                 ancestry_sha256: ancestry_sha256(format, &incomplete),
                 node_count: incomplete.len() as u64,
                 edge_count: 2,
+                page_count: 1,
             };
             assert_eq!(
                 validate_ancestry(
@@ -1163,6 +1447,7 @@ mod tests {
             ancestry_sha256: ancestry_sha256(format, &cycle),
             node_count: 2,
             edge_count: 2,
+            page_count: 1,
         };
         assert_eq!(
             validate_ancestry(
@@ -1191,6 +1476,7 @@ mod tests {
             ancestry_sha256: ancestry_sha256(format, &duplicate_parent),
             node_count: 2,
             edge_count: 2,
+            page_count: 1,
         };
         assert_eq!(
             validate_ancestry(
@@ -1252,7 +1538,32 @@ mod tests {
         assert_ne!(base, provisional_workspace_generation_id(&changed).unwrap());
         let mut changed = provisional.clone();
         changed.working_gaps.manifest_sha256 = "b".repeat(64);
+        let changed_pair = working_pair_sha256(&changed.working_knowledge, &changed.working_gaps);
+        changed.capture.first_working_pair_sha256 = changed_pair.clone();
+        changed.capture.second_working_pair_sha256 = changed_pair;
         assert_ne!(base, provisional_workspace_generation_id(&changed).unwrap());
+    }
+
+    #[test]
+    fn provisional_capture_requires_a_stable_nontransactional_pair() {
+        let (descriptor, _, _, _) = provisional();
+        descriptor
+            .validate_header(KnowledgeSourceLimits::default())
+            .unwrap();
+
+        let mut pending = descriptor.clone();
+        pending.capture.transaction_pending_before = true;
+        assert_eq!(
+            pending.validate_header(KnowledgeSourceLimits::default()),
+            Err(ContractError::InvalidInput)
+        );
+
+        let mut moved = descriptor;
+        moved.capture.second_working_pair_sha256 = "b".repeat(64);
+        assert_eq!(
+            moved.validate_header(KnowledgeSourceLimits::default()),
+            Err(ContractError::InvalidInput)
+        );
     }
 
     #[test]

@@ -272,6 +272,22 @@ impl StableGitRepository {
         }
     }
 
+    /// Resolve one full reference through this already-held repository
+    /// authority. Unlike the commitish helper, this refuses abbreviated
+    /// names, revisions, and caller-supplied expression syntax.
+    pub fn resolve_reference_oid(&self, reference: &str) -> Result<Option<String>> {
+        validate_stable_reference(reference)?;
+        #[cfg(not(unix))]
+        {
+            let _ = reference;
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            resolve_stable_repository_ref(&self.authority, reference)
+        }
+    }
+
     pub fn verify_commit_oid(&self, oid: &str) -> Result<VerifiedCommit> {
         #[cfg(not(unix))]
         {

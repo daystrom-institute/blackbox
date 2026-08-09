@@ -155,6 +155,7 @@ pub(super) fn build_http_app(
         .route("/admin/team/upsert", axum::routing::post(admin_team_upsert))
         .merge(super::code_source::router(shared.clone()))
         .merge(super::git_source::router(shared.clone()))
+        .merge(super::knowledge_source::router(shared.clone()))
         .with_state(shared)
         .nest_service("/mcp", mcp_service)
 }

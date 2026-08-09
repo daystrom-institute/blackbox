@@ -15,6 +15,7 @@ pub(crate) mod history_activation;
 pub mod instance_lock;
 mod knowledge_lifecycle;
 mod knowledge_merge_gate;
+pub(crate) mod knowledge_source;
 mod knowledge_view;
 mod mcp;
 mod open;

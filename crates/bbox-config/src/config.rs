@@ -129,6 +129,8 @@ struct RawCodeCollectionConfig {
     pub enabled: bool,
     #[serde(default)]
     pub git_transport_enabled: bool,
+    #[serde(default)]
+    pub knowledge_transport_enabled: bool,
     #[serde(default = "default_code_collection_max_manifest_files")]
     pub max_manifest_files: u64,
     #[serde(default = "default_code_collection_max_manifest_logical_bytes")]
@@ -168,6 +170,7 @@ impl Default for RawCodeCollectionConfig {
         Self {
             enabled: false,
             git_transport_enabled: false,
+            knowledge_transport_enabled: false,
             max_manifest_files: default_code_collection_max_manifest_files(),
             max_manifest_logical_bytes: default_code_collection_max_manifest_logical_bytes(),
             max_open_uploads_per_producer: default_code_collection_max_open_uploads(),
@@ -574,6 +577,7 @@ pub struct IndexConfig {
 pub struct CodeCollectionConfig {
     pub enabled: bool,
     pub git_transport_enabled: bool,
+    pub knowledge_transport_enabled: bool,
     pub max_manifest_files: u64,
     pub max_manifest_logical_bytes: u64,
     pub max_open_uploads_per_producer: usize,
@@ -987,6 +991,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         code_collection: CodeCollectionConfig {
             enabled: raw.code_collection.enabled,
             git_transport_enabled: raw.code_collection.git_transport_enabled,
+            knowledge_transport_enabled: raw.code_collection.knowledge_transport_enabled,
             max_manifest_files: raw.code_collection.max_manifest_files,
             max_manifest_logical_bytes: raw.code_collection.max_manifest_logical_bytes,
             max_open_uploads_per_producer: raw.code_collection.max_open_uploads_per_producer,
@@ -2822,6 +2827,7 @@ state_dir = "~"
         let config = CodeCollectionConfig {
             enabled: false,
             git_transport_enabled: false,
+            knowledge_transport_enabled: false,
             max_manifest_files: 0,
             max_manifest_logical_bytes: 0,
             max_open_uploads_per_producer: 0,
