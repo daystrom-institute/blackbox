@@ -568,6 +568,8 @@ capture races, crash/restart recovery, expiry, and collector dependency ceiling.
 
 ### KT-C: Operator-accepted remote publication
 
+Status: complete.
+
 1. Land pointer V2 source binding with strict V1 decode.
 2. Extend status, dry-run, establish, advance, prior fallback, rebind, and GC.
 3. Accept only explicit ready candidate ids under existing operator CAS.
@@ -575,6 +577,14 @@ capture races, crash/restart recovery, expiry, and collector dependency ceiling.
 
 Gate: V1/V2/current/prior/corrupt matrices, candidate staleness, epoch and
 pointer races, source loss, rollback, and public tool docs.
+
+Evidence: code commit `adcbaf807b8a` passed the exact-tip workspace default
+profile (6,290 tests), full profile (6,295 tests across 71 binaries), workspace
+clippy with zero errors, and the concurrency lint over 183 tool handlers in a
+claimed cluster lane. Automated verifier `bbox-verify-ttxkd` was
+infrastructure-red before compilation because the newest chained
+`base-bbox` clone had no free space; this is a verifier-base retention defect,
+not a KT-C gate failure.
 
 ### KT-D: Remote provisional views, local mutations, and session binding
 
