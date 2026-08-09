@@ -443,19 +443,17 @@ pub(super) fn open_shared_state(
             std::time::Duration::from_millis(cfg.daemon.checkout_lifecycle_writer_wait_ms),
         ),
     );
-    checkout_access
-        .install_policy(Arc::new(
+    let checkout_policy = bbox_indexing::checkout_access::CheckoutAccessPolicyChain::new()
+        .with_policy(
             super::knowledge_source::KnowledgeTransportCheckoutPolicy::new(
                 knowledge_transport_cutover.clone(),
             ),
-        ))
-        .map_err(anyhow::Error::new)?;
+        )
+        .with_policy(super::code_source::CodeSourceLocalityCheckoutPolicy::new(
+            code_source_locality_cutover.clone(),
+        ));
     checkout_access
-        .install_policy(Arc::new(
-            super::code_source::CodeSourceLocalityCheckoutPolicy::new(
-                code_source_locality_cutover.clone(),
-            ),
-        ))
+        .install_policy(Arc::new(checkout_policy))
         .map_err(anyhow::Error::new)?;
     if let Some(registry) = &projects_store {
         projects_needs_persist |= backfill_project_languages(registry, &checkout_access);

@@ -301,6 +301,36 @@ pub trait CheckoutAccessPolicy: Send + Sync + 'static {
     ) -> std::result::Result<(), CheckoutAccessError>;
 }
 
+/// One immutable process policy assembled from independent cutover policies.
+/// Policies run in insertion order and the first refusal wins.
+#[derive(Default)]
+pub struct CheckoutAccessPolicyChain {
+    policies: Vec<Arc<dyn CheckoutAccessPolicy>>,
+}
+
+impl CheckoutAccessPolicyChain {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_policy(mut self, policy: impl CheckoutAccessPolicy) -> Self {
+        self.policies.push(Arc::new(policy));
+        self
+    }
+}
+
+impl CheckoutAccessPolicy for CheckoutAccessPolicyChain {
+    fn authorize(
+        &self,
+        request: &CheckoutAccessRequest,
+    ) -> std::result::Result<(), CheckoutAccessError> {
+        for policy in &self.policies {
+            policy.authorize(request)?;
+        }
+        Ok(())
+    }
+}
+
 /// Deterministic remote-shaped probe. It never resolves or touches a path.
 #[derive(Debug, Default)]
 pub struct DenyCheckoutAccess;
@@ -1976,6 +2006,23 @@ mod tests {
         }
     }
 
+    struct RefuseLocalProjectWalk;
+
+    impl CheckoutAccessPolicy for RefuseLocalProjectWalk {
+        fn authorize(
+            &self,
+            request: &CheckoutAccessRequest,
+        ) -> std::result::Result<(), CheckoutAccessError> {
+            if request.kind == CheckoutAccessKind::LocalProjectWalk {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::CodeSourceTransportAuthoritative,
+                    "strict code-source transport owns this project",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     fn scope() -> PublishedScope {
         PublishedScope::try_new("repo-1", ".").unwrap()
     }
@@ -2609,6 +2656,45 @@ mod tests {
             error.code,
             CheckoutAccessErrorCode::KnowledgeTransportAuthoritative
         );
+        let health = broker.health();
+        assert_eq!(health.sequence, 0);
+        assert!(health.counters.is_empty());
+        assert!(health.target_counters.is_empty());
+    }
+
+    #[test]
+    fn policy_chain_installs_once_and_enforces_both_transport_cutovers() {
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(DenyCheckoutAccess),
+            CheckoutAccessObservations::in_memory(),
+        );
+        let policy = CheckoutAccessPolicyChain::new()
+            .with_policy(RefuseKnowledgeTransport)
+            .with_policy(RefuseLocalProjectWalk);
+        broker.install_policy(Arc::new(policy)).unwrap();
+
+        let knowledge = broker
+            .acquire(request(
+                CheckoutAccessKind::KnowledgeGapOverlayRead,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            knowledge.code,
+            CheckoutAccessErrorCode::KnowledgeTransportAuthoritative
+        );
+
+        let code = broker
+            .acquire(request(
+                CheckoutAccessKind::LocalProjectWalk,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            code.code,
+            CheckoutAccessErrorCode::CodeSourceTransportAuthoritative
+        );
+
         let health = broker.health();
         assert_eq!(health.sequence, 0);
         assert!(health.counters.is_empty());
