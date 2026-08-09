@@ -39,10 +39,11 @@ cut without applying v2 bytes to configured operator state:
 3. the complete administration vocabulary split by proof per D-004: MCP
    surfaces for attachment-proved operations (attach, detach, promotion,
    attachment-proved scope migration, publisher binding, default-attachment
-   selection) and offline `blackbox project-catalog` subcommands for proofless
-   authority (catalog add/import, alias accept/reject, operator-attested
-   scope migration, retire/delete), all riding the Phase 1 journaled pair
-   transaction;
+   selection), an offline attachment-proved promotion path for a stopped or
+   remote daemon, and offline `blackbox project-catalog` subcommands for
+   proofless authority (catalog add/import, alias accept/reject,
+   operator-attested scope migration, retire/delete), all riding the Phase 1
+   journaled pair transaction;
 4. converted `bbox_project_register`, `bbox_project_rename`,
    `bbox_project_unregister`, `bbox_project_init`, and `bbox_project_eject`
    semantics: composite register with find-or-create and typed
@@ -814,10 +815,12 @@ Surface split (D-004):
   detach, register composite, promote, attachment-proved scope migration,
   publisher bind/rebind, default-attachment selection, catalog list/get
   (read-only), alias nomination listing (read-only);
-- offline CLI (proofless authority, exclusive lifetime lock, daemon
-  stopped): catalog add/import, alias accept/reject, operator-attested
-  unattached scope migration, retire/delete. Read-only list/get also exists
-  on the CLI for operability.
+- offline CLI (exclusive lifetime lock, daemon stopped): attachment-proved
+  promotion for a host that can read the attachments, plus proofless catalog
+  add/import, alias accept/reject, operator-attested unattached scope
+  migration, and retire/delete. Read-only list/get also exists on the CLI for
+  operability. The promotion command remains attachment-proved and cannot
+  create an operator-attested promotion record.
 
 Epoch discipline is explicit per tool class. The dedicated admin tools
 (attach, detach, promote, scope migration, publisher bind,
@@ -931,6 +934,14 @@ expected_catalog_epoch, audit_reason }` per governing section 7.2:
   sibling authority blocks);
 - preserves every project-id-keyed store untouched (they key by id, which
   does not change).
+
+`blackbox project-catalog promote` drives the same evidence probe and domain
+transaction under the CLI lifetime lock. It exists for a stopped daemon and
+for a remote daemon that cannot read host-local attachment paths. It requires
+the exact epoch, project id, designated attachment, proposed scope, bounded
+reason, and proof timestamp. It does not weaken the proof model: every active
+attachment is still read at `HEAD`, an unreadable attachment still refuses,
+and the resulting migration provenance remains `AttachmentProved`.
 
 ### 7.5 Scope migration
 

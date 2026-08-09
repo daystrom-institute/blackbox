@@ -398,20 +398,7 @@ fn probe_attachment_scopes(
     store: &ProjectCatalogStore,
     project_id: &ProjectId,
 ) -> anyhow::Result<std::collections::BTreeMap<AttachmentId, Option<PublishedScope>>> {
-    let state = store
-        .snapshot()
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let mut scopes = std::collections::BTreeMap::new();
-    for row in state.attachments().attachments.values() {
-        if &row.project_id != project_id || row.status != AttachmentStatus::Attached {
-            continue;
-        }
-        let probed = probe_checkout(&row.checkout_project_dir)
-            .ok()
-            .and_then(|probe| probe.validated_scope);
-        scopes.insert(row.attachment_id.clone(), probed);
-    }
-    Ok(scopes)
+    bbox_indexing::project_catalog_probe::active_attachment_scopes(store, project_id)
 }
 
 // ── Tools ───────────────────────────────────────────────────────────────

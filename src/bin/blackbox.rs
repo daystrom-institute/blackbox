@@ -5,7 +5,9 @@ use std::process::ExitCode;
 
 use bbox_config::config::{self, LoadOptions};
 use bbox_corpus_core::identity::PublishedScope;
-use bbox_corpus_core::project_catalog::{ProjectId, ProjectScope, ScopeMigrationKind};
+use bbox_corpus_core::project_catalog::{
+    AttachmentId, ProjectId, ProjectScope, ScopeMigrationKind,
+};
 use bbox_corpus_core::project_catalog_snapshot::OwnerSnapshotLimitsV1;
 use bbox_corpus_index::index::history_generations::HistoryScanLimitsV1;
 use bbox_corpus_index::index::migration_inventory as corpus_inventory;
@@ -107,6 +109,8 @@ enum ProjectCatalogCommand {
     List(StoreArgs),
     /// Inspect one catalog project.
     Get(GetArgs),
+    /// Promote an attached legacy-local project using committed checkout proof.
+    Promote(PromoteArgs),
     /// Accept or reject one nominated alias.
     Alias(AliasArgs),
     /// Operator-attested unattached scope migration.
@@ -162,6 +166,37 @@ struct GetArgs {
     /// Exact project id.
     #[arg(long, value_name = "PROJECT_ID")]
     project: String,
+}
+
+#[derive(Debug, Args)]
+struct PromoteArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+    /// Exact legacy-local project id.
+    #[arg(long, value_name = "PROJECT_ID")]
+    project: String,
+    /// Active attachment whose proof is recorded on the migration.
+    #[arg(long, value_name = "ATTACHMENT_ID")]
+    attachment_id: String,
+    /// Catalog epoch observed before collecting promotion evidence.
+    #[arg(long, value_name = "EPOCH")]
+    expected_catalog_epoch: u64,
+    /// Recorded repository authority committed at HEAD by every attachment.
+    #[arg(long, value_name = "REPO_ID")]
+    repo_id: String,
+    /// Project root relative to the repository top (`.` at the root).
+    #[arg(long, value_name = "RELPATH")]
+    relpath: String,
+    /// Bounded operator reason recorded on the promotion.
+    #[arg(long, value_name = "REASON")]
+    reason: String,
+    /// Bounded timestamp recorded on the attachment proof and migration.
+    #[arg(long, value_name = "TIMESTAMP")]
+    proved_at: String,
+    /// Load the same configuration file used by blackboxd. Bridge generations
+    /// are probed from the state roots it resolves.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -851,6 +886,9 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::Get(_),
         }) => "project_catalog_get",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::Promote(_),
+        }) => "project_catalog_promote",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command:
                 ProjectCatalogCommand::Alias(AliasArgs {
                     decision: AliasDecision::Accept(_),
@@ -915,6 +953,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Get(args),
         }) => execute_get(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::Promote(args),
+        }) => execute_promote(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Alias(args),
         }) => execute_alias(args),
@@ -2166,6 +2207,32 @@ mod tests {
             "project_catalog_code_source_locality_cutover_preflight"
         );
 
+        let promote = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "promote",
+            "--projects-path",
+            "/tmp/projects.json",
+            "--project",
+            "p_00000000000000000000000000000001",
+            "--attachment-id",
+            "att_00000000000000000000000000000001",
+            "--expected-catalog-epoch",
+            "7",
+            "--repo-id",
+            "recorded-authority",
+            "--relpath",
+            ".",
+            "--reason",
+            "record committed authority",
+            "--proved-at",
+            "2026-08-09T00:00:00Z",
+            "--config",
+            "/tmp/config.toml",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&promote), "project_catalog_promote");
+
         let preflight = Cli::try_parse_from([
             "blackbox",
             "project-catalog",
@@ -2968,6 +3035,30 @@ fn parse_project_id(raw: &str) -> Result<ProjectId, CommandFailure> {
         .map_err(|error| CommandFailure::new(error.code(), "project id is malformed"))
 }
 
+fn parse_attachment_id(raw: &str) -> Result<AttachmentId, CommandFailure> {
+    AttachmentId::parse(raw)
+        .map_err(|error| CommandFailure::new(error.code(), "attachment id is malformed"))
+}
+
+fn bounded_promotion_reason(raw: &str) -> Result<String, CommandFailure> {
+    const MAX_AUDIT_REASON_BYTES: usize = 1024;
+
+    let reason = raw.trim();
+    if reason.is_empty() {
+        return Err(CommandFailure::new(
+            "error.project_catalog_admin_audit_reason",
+            "reason is required",
+        ));
+    }
+    if reason.len() > MAX_AUDIT_REASON_BYTES {
+        return Err(CommandFailure::new(
+            "error.project_catalog_admin_audit_reason",
+            format!("reason exceeds {MAX_AUDIT_REASON_BYTES} bytes"),
+        ));
+    }
+    Ok(reason.to_string())
+}
+
 fn parse_scope(repo: &str, relpath: &str) -> Result<PublishedScope, CommandFailure> {
     PublishedScope::try_new(repo, relpath)
         .map_err(|_| CommandFailure::new("error.project_catalog_cli_arguments", "invalid scope"))
@@ -3091,6 +3182,56 @@ fn execute_get(args: GetArgs) -> Result<serde_json::Value, CommandFailure> {
             "repo_history": project.repo_history.as_ref().map(|id| id.as_str()),
         },
         "host_local_attachments": attachments,
+    }))
+}
+
+fn execute_promote(args: PromoteArgs) -> Result<serde_json::Value, CommandFailure> {
+    let config = load_config(args.config.clone())?;
+    let (_lock, store) = open_admin_store(&args.store.projects_path)?;
+    let project_id = parse_project_id(&args.project)?;
+    let attachment_id = parse_attachment_id(&args.attachment_id)?;
+    let proposed_scope = parse_scope(&args.repo_id, &args.relpath)?;
+    let evidence = project_catalog_admin::PromotionEvidence {
+        attachment_scopes: bbox_indexing::project_catalog_probe::active_attachment_scopes(
+            &store,
+            &project_id,
+        )
+        .map_err(|error| {
+            CommandFailure::new(
+                "error.project_catalog_admin_promotion_probe",
+                format!("failed to probe active attachments: {error}"),
+            )
+        })?,
+        code_bridge_generation: code_bridge_generation(&config.paths.state_dir, &project_id)?,
+        publication_bridge_generation: publication_bridge_generation(
+            &args.store.projects_path,
+            &project_id,
+        )?,
+        operator_invocation: "cli:project-catalog promote".into(),
+        operator_reason: Some(bounded_promotion_reason(&args.reason)?),
+        proved_at: args.proved_at,
+    };
+    let receipt = project_catalog_admin::promote_project(
+        &store,
+        args.expected_catalog_epoch,
+        &project_id,
+        &attachment_id,
+        &proposed_scope,
+        &evidence,
+    )?;
+    Ok(serde_json::json!({
+        "status": "applied",
+        "project_id": project_id.as_str(),
+        "scope_migration_id": receipt.scope_migration_id.as_str(),
+        "scope": {
+            "repo_id": proposed_scope.repo_id(),
+            "bbox_root_relpath": proposed_scope.bbox_root_relpath(),
+        },
+        "code_bridge_generation": evidence.code_bridge_generation,
+        "publication_bridge_generation": evidence.publication_bridge_generation,
+        "epoch": receipt.commit.epoch,
+        "catalog_sha256": receipt.commit.catalog_sha256,
+        "attachments_sha256": receipt.commit.attachments_sha256,
     }))
 }
 

@@ -90,6 +90,29 @@ not come from the normal daemon configuration. Preflight is read-only except
 for the explicit review artifacts. `--include-local-paths` is preflight-only
 and writes a separate owner-sensitive report.
 
+When the daemon is stopped or runs somewhere that cannot read this host's
+attachment paths, promote an attached legacy-local project through the offline
+surface. The command takes the same exclusive catalog lock and uses the same
+committed-`HEAD` attachment proof as the MCP tool:
+
+```bash
+blackbox project-catalog promote \
+  --projects-path /path/to/state/projects.json \
+  --project <project-id> \
+  --attachment-id <attachment-id> \
+  --expected-catalog-epoch <epoch> \
+  --repo-id <recorded-repository-authority> \
+  --relpath . \
+  --reason "record committed repository authority before remote deployment" \
+  --proved-at 2026-01-01T00:00:00Z \
+  --config /path/to/config.toml
+```
+
+Every active attachment must resolve the proposed scope from its committed
+`.bbox/config.toml`; unreadable, unrecorded, or disagreeing attachments make
+the command refuse. The resulting migration remains attachment-proved. This is
+not the operator-attested unattached migration channel.
+
 `fleetd` is one binary for both instances (see "The fleet supervisor"
 below); restart it only when you actually changed it, because restarting it
 kills the workers it is supervising.
