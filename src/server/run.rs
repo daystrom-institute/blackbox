@@ -83,6 +83,8 @@ pub async fn run() -> anyhow::Result<()> {
         store_dir.clone(),
         cfg.daemon.fleetd_endpoint.as_deref(),
         cfg.daemon.fleetd_token_file.as_deref(),
+        cfg.daemon.fleetd_worker_home.as_deref(),
+        cfg.daemon.fleetd_worker_bro_home.as_deref(),
         shared.task_store.clone(),
         shared.tail_tx.clone(),
         Some(shared.system_events.clone()),

@@ -2,7 +2,7 @@
 
 Slice 5 of `design/daemon-runtime/locality-first-decomposition.md`. The daemon
 composes a fully-resolved `WorkerSpawnSpec` and hands it over a narrow typed
-local RPC; fleetd spawns and supervises the harness child, relays its stdio
+Unix or explicitly enabled TCP RPC; fleetd spawns and supervises the harness child, relays its stdio
 lanes, and serves a bounded replay window so live sessions survive daemon
 restarts.
 
@@ -19,6 +19,9 @@ into a binary that changes a few times a year is the fix.
   fleetd have two sources of truth for dispatch composition and the seam is
   worthless. Final binary path resolution is the ONLY thing derived
   executor-side, and only because it depends on fleetd's own login-shell PATH.
+  An off-host executor also pins `BRO_HOME` and the event-log path to the
+  explicitly configured worker roots. That is path localization, not policy
+  derivation, and prevents a container-local path from crossing machines.
 - **Dependency ceiling, enforced by `scripts/acceptance-fleetd-deps.sh`.** No
   `blackbox`, no `bro-harness`/`bro-tools`/`bro-code-mode`/`bro-capabilities`,
   no `bbox-*`, no tantivy, no V8. The script asserts on the resolved
@@ -87,9 +90,8 @@ Deliberate deltas, all documented at their call sites:
 3. **No `open_harness_tee`.** Teeing raw stdio is a daemon-side transcript
    concern, and the harness child already writes its own durable event log
    under the spec's `BRO_HOME`.
-4. **fleetd's spawn is async** (`resolve_bin` runs in `spawn_blocking`). The
-   daemon's `HarnessExecutor` trait is still synchronous; making it async is
-   the cutover slice's job, not this one.
+4. **fleetd's spawn is async** (`resolve_bin` runs in `spawn_blocking`), as is
+   the daemon's `HarnessExecutor` seam.
 
 ## Accepted v1 limits (do not build these here)
 
@@ -139,6 +141,10 @@ paired with invariants above and must not drift:
   paths still pass the literal `"pending"`). Two concurrent pending dispatches
   would otherwise collide on this registry, on the daemon's slot map, and on
   the event-log filename.
+- **Remote worker roots are mandatory and absolute.** The daemon state root,
+  worker HOME, and worker BRO_HOME are three different localities. Provider
+  credential paths and harness replay logs use the worker roots; task stores,
+  transcript mirrors, and corpus indexing use the daemon roots.
 
 Deliberate delta from the "accepted v1 limits" above: for the state-local Unix
 endpoint only, the daemon starts fleetd itself, detached, when the socket is

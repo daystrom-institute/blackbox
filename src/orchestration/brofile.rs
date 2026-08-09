@@ -414,6 +414,7 @@ fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io:
 fn default_claude_compatible_env(
     provider: Provider,
     home_dir: &Path,
+    materialize_on_worker: bool,
 ) -> Option<HashMap<String, String>> {
     let rel_path = match provider {
         Provider::Glm => ".claude-zai",
@@ -425,6 +426,13 @@ fn default_claude_compatible_env(
     let mut env = HashMap::from([("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string())]);
 
     let settings = home_dir.join(rel_path).join("settings.json");
+    if materialize_on_worker {
+        env.insert(
+            "BRO_HARNESS_LOCAL_SETTINGS_FILE".to_string(),
+            settings.to_string_lossy().into_owned(),
+        );
+        return Some(env);
+    }
     if let Ok(body) = std::fs::read_to_string(&settings)
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
     {
@@ -448,7 +456,10 @@ fn default_claude_compatible_env(
 /// operator's `~/.vibe/.env` (where the vibe CLI stores it). The chat-transport
 /// analogue of `default_claude_compatible_env`, and the credential-wiring
 /// template for future OpenAI-compatible chat endpoints.
-fn default_vibe_harness_env(home_dir: &Path) -> HashMap<String, String> {
+fn default_vibe_harness_env(
+    home_dir: &Path,
+    materialize_on_worker: bool,
+) -> HashMap<String, String> {
     let mut env = HashMap::from([
         (
             "BRO_HARNESS_TRANSPORT".to_string(),
@@ -463,6 +474,14 @@ fn default_vibe_harness_env(home_dir: &Path) -> HashMap<String, String> {
             "https://api.mistral.ai/v1".to_string(),
         ),
     ]);
+
+    if materialize_on_worker {
+        env.insert(
+            "BRO_HARNESS_LOCAL_DOTENV_FILE".to_string(),
+            home_dir.join(".vibe/.env").to_string_lossy().into_owned(),
+        );
+        return env;
+    }
 
     if let Some(key) = std::env::var("MISTRAL_API_KEY")
         .ok()
@@ -565,9 +584,28 @@ pub fn resolve_provider_env(
 fn resolve_provider_env_inner(
     provider: Provider,
     account_name: Option<&str>,
+    model: Option<&str>,
+    store_dir: &Path,
+    brofile_context: Option<&BrofileContext>,
+) -> Option<HashMap<String, String>> {
+    let worker_locality = super::harness_worker_locality();
+    resolve_provider_env_for_locality(
+        provider,
+        account_name,
+        model,
+        store_dir,
+        brofile_context,
+        worker_locality.as_ref(),
+    )
+}
+
+fn resolve_provider_env_for_locality(
+    provider: Provider,
+    account_name: Option<&str>,
     _model: Option<&str>,
     store_dir: &Path,
     brofile_context: Option<&BrofileContext>,
+    worker_locality: Option<&super::executor::WorkerLocality>,
 ) -> Option<HashMap<String, String>> {
     if !provider.is_dispatchable() {
         return None;
@@ -577,10 +615,14 @@ fn resolve_provider_env_inner(
         .and_then(|c| c.provider_defaults)
         .map(ProviderDefaultsMode::suppresses)
         .unwrap_or(false);
+    let materialize_on_worker = worker_locality.is_some();
+    let execution_home = worker_locality
+        .map(|locality| locality.home.clone())
+        .or_else(dirs::home_dir);
     let mut env = match provider {
-        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => dirs::home_dir()
+        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Kimi => execution_home
             .as_deref()
-            .and_then(|home| default_claude_compatible_env(provider, home))
+            .and_then(|home| default_claude_compatible_env(provider, home, materialize_on_worker))
             .unwrap_or_default(),
         // Brodex rides the harness on the OpenAI Responses transport against
         // the Codex/ChatGPT backend; CODEX_HOME (for OAuth) is supplied by the
@@ -592,9 +634,9 @@ fn resolve_provider_env_inner(
         // vibe-bh rides the harness on the OpenAI chat-completions transport
         // against the Mistral API; base URL + reasoning profile are fixed and
         // the key comes from MISTRAL_API_KEY (env / ~/.vibe/.env).
-        Provider::VibeBh => dirs::home_dir()
+        Provider::VibeBh => execution_home
             .as_deref()
-            .map(default_vibe_harness_env)
+            .map(|home| default_vibe_harness_env(home, materialize_on_worker))
             .unwrap_or_default(),
         Provider::Workflow => HashMap::new(),
     };
@@ -608,7 +650,7 @@ fn resolve_provider_env_inner(
                 | Provider::Kimi
                 | Provider::VibeBh
         ) {
-            if let Some(account_env) = dirs::home_dir()
+            if let Some(account_env) = execution_home
                 .as_deref()
                 .and_then(|home| synthesized_account_env_for_home(provider, account_name, home))
             {
@@ -627,21 +669,32 @@ fn resolve_provider_env_inner(
         let base_home = env
             .get("CODEX_HOME")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+            .or_else(|| execution_home.map(|home| home.join(".codex")));
         if let Some(base_home) = base_home {
-            match prepare_codex_suppressed_home(&base_home, store_dir) {
-                Ok(overlay) => {
-                    env.insert(
-                        "CODEX_HOME".to_string(),
-                        overlay.to_string_lossy().into_owned(),
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        base_home = %base_home.display(),
-                        error = %err,
-                        "failed to prepare Codex suppressed home overlay"
-                    );
+            if materialize_on_worker {
+                env.insert(
+                    "CODEX_HOME".to_string(),
+                    base_home.to_string_lossy().into_owned(),
+                );
+                env.insert(
+                    "BRO_HARNESS_SUPPRESS_CODEX_INSTRUCTIONS".to_string(),
+                    "1".to_string(),
+                );
+            } else {
+                match prepare_codex_suppressed_home(&base_home, store_dir) {
+                    Ok(overlay) => {
+                        env.insert(
+                            "CODEX_HOME".to_string(),
+                            overlay.to_string_lossy().into_owned(),
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            base_home = %base_home.display(),
+                            error = %err,
+                            "failed to prepare Codex suppressed home overlay"
+                        );
+                    }
                 }
             }
         }
@@ -1823,6 +1876,64 @@ mod tests {
         assert_eq!(
             resolved.get("OPENAI_API_KEY").map(String::as_str),
             Some("test-mistral-key")
+        );
+    }
+
+    #[test]
+    fn remote_provider_state_is_materialized_from_worker_paths() {
+        let store = temp_store();
+        let worker = temp_store();
+        let worker_home = worker.path().canonicalize().unwrap();
+        let locality = super::super::executor::WorkerLocality {
+            home: worker_home.clone(),
+            bro_home: worker_home.join("state/bro"),
+        };
+
+        let glm = resolve_provider_env_for_locality(
+            Provider::Glm,
+            None,
+            None,
+            store.path(),
+            None,
+            Some(&locality),
+        )
+        .unwrap();
+        assert_eq!(
+            glm.get("BRO_HARNESS_LOCAL_SETTINGS_FILE")
+                .map(String::as_str),
+            Some(
+                worker_home
+                    .join(".claude-zai/settings.json")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(!glm.contains_key("ANTHROPIC_AUTH_TOKEN"));
+
+        let brodex = resolve_provider_env_for_locality(
+            Provider::Brodex,
+            None,
+            None,
+            store.path(),
+            Some(&BrofileContext {
+                provider_defaults: Some(ProviderDefaultsMode::SuppressWhenSupported),
+            }),
+            Some(&locality),
+        )
+        .unwrap();
+        assert_eq!(
+            brodex.get("CODEX_HOME").map(String::as_str),
+            Some(worker_home.join(".codex").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            brodex
+                .get("BRO_HARNESS_SUPPRESS_CODEX_INSTRUCTIONS")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            !store.path().join("generated").exists(),
+            "the off-host daemon must not build a symlink overlay from its own HOME"
         );
     }
 }

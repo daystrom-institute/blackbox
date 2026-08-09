@@ -29,6 +29,7 @@
 
 use async_trait::async_trait;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,6 +42,16 @@ use bro_protocol::WorkerSpawnSpec;
 
 use super::open_harness_tee;
 use super::providers::{self, dispatch_prelude::ProviderExec};
+
+/// Filesystem roots belonging to the machine that actually runs a worker.
+/// `None` means the executor shares the daemon's filesystem. Remote fleetd
+/// supplies explicit roots so spawn composition never leaks container-local
+/// HOME/BRO_HOME paths into a worker on another machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerLocality {
+    pub home: PathBuf,
+    pub bro_home: PathBuf,
+}
 
 /// Where a [`WorkerKill`] sends its one signal. The two executors reach the
 /// child by different routes, but the daemon-side registry stores one type and
@@ -151,6 +162,11 @@ pub struct WorkerHandle {
 /// can hold an executor behind `dyn`.
 #[async_trait]
 pub trait HarnessExecutor: Send + Sync {
+    /// Worker filesystem roots when they differ from the daemon's roots.
+    fn worker_locality(&self) -> Option<&WorkerLocality> {
+        None
+    }
+
     /// Spawn the worker described by `spec` and return its handle.
     async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle>;
 }

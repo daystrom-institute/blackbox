@@ -21,6 +21,7 @@ RUN apt-get update \
         ca-certificates \
         git \
         openssh-client \
+        tar \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 10001 blackbox \

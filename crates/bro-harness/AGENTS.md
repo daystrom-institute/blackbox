@@ -78,6 +78,13 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
 - Provider credentials stay in the harness child. Shell children receive only
   the dedicated non-secret shell env and scrub the daemon/session keys named
   by `BRO_HARNESS_SPAWN_SCRUB`.
+- With an off-host fleetd, provider policy remains daemon-composed but
+  filesystem materialization is worker-local. At standalone startup the
+  harness may lift only the allowlisted provider keys from an explicitly named
+  settings file, lift one explicitly named dotenv credential, and build the
+  Codex instruction-suppressed overlay under worker `BRO_HOME`. Never make
+  fleetd read provider config, and never resolve these paths against the
+  daemon container's HOME.
 - Tests must not touch real `$HOME`/`$BRO_HOME` state: `EventLog::disabled()`
   / explicit paths exist for exactly this; the sessions dir resolves from
   `BRO_HOME`, so a leaked env var writes into the operator's real session

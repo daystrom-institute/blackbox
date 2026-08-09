@@ -139,6 +139,8 @@ mod smoke {
                 &self.state_dir,
                 Some(&format!("tcp://{address}")),
                 Some(&self.state_dir.join("fleetd.token")),
+                Some(&self.state_dir),
+                Some(&self.state_dir),
             )
             .expect("valid remote config")
         }
@@ -340,12 +342,16 @@ mod smoke {
         let root = tmp.path().canonicalize().expect("canonical tempdir");
         let fleetd = FleetdProcess::start_tcp(&root.join("state")).await;
         let log = root.join("remote.events.jsonl");
+        let observed_bro_home = root.join("observed-bro-home.txt");
         let stub = write_stub(
             &root,
             "remote.sh",
             &[r#"{"type":"assistant","seq":1}"#],
             &log,
-            "exit 0\n",
+            &format!(
+                "printf '%s' \"$BRO_HOME\" > '{}'\nexit 0\n",
+                observed_bro_home.display()
+            ),
         );
 
         let executor = FleetdExecutor::new(fleetd.remote_config());
@@ -365,6 +371,11 @@ mod smoke {
             .expect("remote outcome within deadline")
             .expect("remote outcome published");
         assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(observed_bro_home).unwrap(),
+            fleetd.state_dir.to_string_lossy(),
+            "the remote executor must overwrite daemon-local BRO_HOME with the worker root"
+        );
     }
 
     #[tokio::test]
@@ -380,6 +391,8 @@ mod smoke {
             &root,
             Some(&format!("tcp://{address}")),
             Some(&token),
+            Some(&root),
+            Some(&root),
         )
         .expect("valid remote config");
         let executor = FleetdExecutor::new(config);
@@ -511,6 +524,7 @@ mod smoke {
             bro_core::Provider::Glm,
             "drill-task".to_string(),
             root.clone(),
+            None,
             tail_tx.clone(),
             None,
             live.events,

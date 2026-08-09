@@ -11,6 +11,11 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() {
+    if let Err(error) = bro_harness::worker_local_env::materialize_process_env() {
+        eprintln!("harness worker-local environment error: {error:#}");
+        std::process::exit(1);
+    }
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

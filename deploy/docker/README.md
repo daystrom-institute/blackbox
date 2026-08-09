@@ -25,11 +25,16 @@ The full daemon selects a remote fleet with:
 executor = "fleetd"
 fleetd_endpoint = "tcp://fleetd-egress.blackbox.svc.cluster.local:7265"
 fleetd_token_file = "/var/lib/blackbox/secrets/fleetd.token"
+fleetd_worker_home = "/home/on-agent-host"
+fleetd_worker_bro_home = "/state/on-agent-host/bro"
 ```
 
 The egress Service is expected to be a Tailscale operator `ExternalName`
 Service targeting the agent machine. fleetd must bind its tailnet address with
 the explicit non-loopback grant. Plain non-loopback TCP is unsupported.
+The pod must also set `BLACKBOX_MCP_URL` to the daemon's tailnet ingress MCP
+URL. A bind-derived `127.0.0.1` URL points back at the agent host when the
+harness consumes it and is therefore invalid for off-host execution.
 
 The image defaults to loopback HTTP. Kubernetes must set `BBOX_BIND=0.0.0.0`
 and `BBOX_ALLOW_NONLOOPBACK_BIND=1` together, then use `/readyz` and `/healthz`

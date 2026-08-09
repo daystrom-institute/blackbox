@@ -32,3 +32,4 @@ pub mod registry;
 pub mod report;
 pub mod session;
 pub mod transport;
+pub mod worker_local_env;

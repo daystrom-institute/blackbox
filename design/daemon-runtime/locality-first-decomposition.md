@@ -534,7 +534,10 @@ The executable dependency map from this rebaseline is:
      encrypted ACL boundary. It never creates the token, auto-starts fleetd,
      or falls back to the local executor. Unix retains its independent
      peer-uid check. Non-loopback TCP bind is disabled without a second
-     explicit server grant.
+     explicit server grant. Remote startup also requires absolute worker HOME
+     and worker BRO_HOME roots plus a worker-reachable daemon MCP URL. Harness
+     replay state stays worker-local; relayed envelopes are mirrored into the
+     daemon BRO_HOME for local corpus indexing.
    - *Replay:* no in-memory replay buffer. The session's existing
      event-log JSONL in the task store is the replay source; the daemon
      is the authority on its own cursor (last-ingested seq per session)

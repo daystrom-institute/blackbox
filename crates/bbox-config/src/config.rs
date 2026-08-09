@@ -303,6 +303,16 @@ struct RawDaemonConfig {
     /// creates a remote transport token.
     #[serde(default)]
     pub fleetd_token_file: Option<PathBuf>,
+    /// Filesystem home on the machine that runs a remote fleetd worker. This
+    /// is deliberately distinct from the daemon container's HOME: provider
+    /// credentials and checkout paths remain worker-local.
+    #[serde(default)]
+    pub fleetd_worker_home: Option<PathBuf>,
+    /// BRO_HOME on the remote fleetd machine. Harness snapshots, replay logs,
+    /// and spill artifacts are written here by the worker, never under the
+    /// off-host daemon's state root.
+    #[serde(default)]
+    pub fleetd_worker_bro_home: Option<PathBuf>,
 }
 
 /// Which executor turns a resolved spawn spec into a supervised worker.
@@ -574,6 +584,8 @@ pub struct DaemonConfig {
     pub executor: ExecutorKind,
     pub fleetd_endpoint: Option<String>,
     pub fleetd_token_file: Option<PathBuf>,
+    pub fleetd_worker_home: Option<PathBuf>,
+    pub fleetd_worker_bro_home: Option<PathBuf>,
 }
 
 /// Index configuration
@@ -684,6 +696,8 @@ impl Config {
                 executor: default_daemon_executor(),
                 fleetd_endpoint: None,
                 fleetd_token_file: None,
+                fleetd_worker_home: None,
+                fleetd_worker_bro_home: None,
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -801,6 +815,16 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !path.trim().is_empty()
     {
         raw.daemon.fleetd_token_file = Some(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var("BLACKBOX_FLEETD_WORKER_HOME")
+        && !path.trim().is_empty()
+    {
+        raw.daemon.fleetd_worker_home = Some(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var("BLACKBOX_FLEETD_WORKER_BRO_HOME")
+        && !path.trim().is_empty()
+    {
+        raw.daemon.fleetd_worker_bro_home = Some(PathBuf::from(path));
     }
 
     // poller_min_interval_secs
@@ -1000,6 +1024,10 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         .as_ref()
         .map(|path| expand_tilde(&path.to_string_lossy(), &home))
         .transpose()?;
+    // These paths name a different machine. Never expand `~` against the
+    // daemon container's HOME; remote locality requires explicit absolutes.
+    let fleetd_worker_home = raw.daemon.fleetd_worker_home;
+    let fleetd_worker_bro_home = raw.daemon.fleetd_worker_bro_home;
 
     // Build final config
     Ok(Config {
@@ -1015,6 +1043,8 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             executor: raw.daemon.executor,
             fleetd_endpoint: raw.daemon.fleetd_endpoint,
             fleetd_token_file,
+            fleetd_worker_home,
+            fleetd_worker_bro_home,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,
@@ -1767,6 +1797,10 @@ mod tests {
         unsafe {
             env::remove_var("BLACKBOX_FLEETD_TOKEN_FILE");
         }
+        unsafe {
+            env::remove_var("BLACKBOX_FLEETD_WORKER_HOME");
+            env::remove_var("BLACKBOX_FLEETD_WORKER_BRO_HOME");
+        }
 
         let config = load().unwrap();
 
@@ -1779,6 +1813,8 @@ mod tests {
         assert_eq!(config.daemon.checkout_lifecycle_writer_wait_ms, 500);
         assert_eq!(config.daemon.fleetd_endpoint, None);
         assert_eq!(config.daemon.fleetd_token_file, None);
+        assert_eq!(config.daemon.fleetd_worker_home, None);
+        assert_eq!(config.daemon.fleetd_worker_bro_home, None);
 
         assert_eq!(config.index.reindex_interval_secs, 120);
         assert!(!config.index.edge_index_boot_rebuild);
@@ -1885,11 +1921,13 @@ bind = "0.0.0.0"
             env::remove_var("BLACKBOX_CONFIG");
             env::remove_var("BLACKBOX_FLEETD_ENDPOINT");
             env::remove_var("BLACKBOX_FLEETD_TOKEN_FILE");
+            env::remove_var("BLACKBOX_FLEETD_WORKER_HOME");
+            env::remove_var("BLACKBOX_FLEETD_WORKER_BRO_HOME");
         }
         let config_path = home.join("remote.toml");
         std::fs::write(
             &config_path,
-            "[daemon]\nfleetd_endpoint = \"tcp://agent.tailnet:7265\"\nfleetd_token_file = \"~/secrets/fleetd.token\"\n",
+            "[daemon]\nfleetd_endpoint = \"tcp://agent.tailnet:7265\"\nfleetd_token_file = \"~/secrets/fleetd.token\"\nfleetd_worker_home = \"/worker/home\"\nfleetd_worker_bro_home = \"/worker/state/bro\"\n",
         )
         .unwrap();
 
@@ -1906,11 +1944,21 @@ bind = "0.0.0.0"
             config.daemon.fleetd_token_file,
             Some(home.join("secrets/fleetd.token"))
         );
+        assert_eq!(
+            config.daemon.fleetd_worker_home,
+            Some(PathBuf::from("/worker/home"))
+        );
+        assert_eq!(
+            config.daemon.fleetd_worker_bro_home,
+            Some(PathBuf::from("/worker/state/bro"))
+        );
 
         let env_token = home.join("mounted/remote.token");
         unsafe {
             env::set_var("BLACKBOX_FLEETD_ENDPOINT", "tcp://override.tailnet:8265");
             env::set_var("BLACKBOX_FLEETD_TOKEN_FILE", &env_token);
+            env::set_var("BLACKBOX_FLEETD_WORKER_HOME", "/override/home");
+            env::set_var("BLACKBOX_FLEETD_WORKER_BRO_HOME", "/override/state/bro");
         }
         let overridden = load_with(LoadOptions {
             config_path: Some(config_path),
@@ -1922,6 +1970,14 @@ bind = "0.0.0.0"
             Some("tcp://override.tailnet:8265")
         );
         assert_eq!(overridden.daemon.fleetd_token_file, Some(env_token));
+        assert_eq!(
+            overridden.daemon.fleetd_worker_home,
+            Some(PathBuf::from("/override/home"))
+        );
+        assert_eq!(
+            overridden.daemon.fleetd_worker_bro_home,
+            Some(PathBuf::from("/override/state/bro"))
+        );
     }
 
     #[test]

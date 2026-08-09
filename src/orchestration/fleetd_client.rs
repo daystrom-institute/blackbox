@@ -61,7 +61,7 @@ use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceTo
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
-use super::executor::{HarnessExecutor, WorkerHandle, WorkerKill, WorkerOutcome};
+use super::executor::{HarnessExecutor, WorkerHandle, WorkerKill, WorkerLocality, WorkerOutcome};
 
 /// Socket file name inside the state dir. Must match `fleetd::paths`, which
 /// the daemon deliberately does not link (fleetd's dependency ceiling runs the
@@ -113,6 +113,9 @@ pub struct FleetdConfig {
     pub state_dir: PathBuf,
     /// Explicit fleetd binary. `None` means resolve at start time.
     pub binary: Option<PathBuf>,
+    /// Explicit roots on an off-host fleetd machine. Same-host Unix operation
+    /// leaves this absent because daemon and worker paths are identical.
+    pub worker_locality: Option<WorkerLocality>,
 }
 
 impl FleetdConfig {
@@ -126,6 +129,7 @@ impl FleetdConfig {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .map(PathBuf::from),
+            worker_locality: None,
         }
     }
 
@@ -136,12 +140,14 @@ impl FleetdConfig {
         state_dir: impl AsRef<Path>,
         endpoint: Option<&str>,
         token_file: Option<&Path>,
+        worker_home: Option<&Path>,
+        worker_bro_home: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let state_dir = state_dir.as_ref().to_path_buf();
         let Some(endpoint) = endpoint.map(str::trim).filter(|value| !value.is_empty()) else {
-            if token_file.is_some() {
+            if token_file.is_some() || worker_home.is_some() || worker_bro_home.is_some() {
                 anyhow::bail!(
-                    "daemon.fleetd_token_file requires daemon.fleetd_endpoint; refusing an ambiguous token override"
+                    "remote fleetd token/worker paths require daemon.fleetd_endpoint; refusing ambiguous off-host settings on the state-local Unix executor"
                 );
             }
             return Ok(Self::in_state_dir(state_dir));
@@ -157,13 +163,46 @@ impl FleetdConfig {
                 "remote fleetd endpoint `{endpoint}` requires daemon.fleetd_token_file or BLACKBOX_FLEETD_TOKEN_FILE"
             )
         })?;
+        let worker_home =
+            required_absolute_worker_path(endpoint, "daemon.fleetd_worker_home", worker_home)?;
+        let worker_bro_home = required_absolute_worker_path(
+            endpoint,
+            "daemon.fleetd_worker_bro_home",
+            worker_bro_home,
+        )?;
         Ok(Self {
             endpoint: FleetdEndpoint::Tcp(address.to_string()),
             token: token.to_path_buf(),
             state_dir,
             binary: None,
+            worker_locality: Some(WorkerLocality {
+                home: worker_home,
+                bro_home: worker_bro_home,
+            }),
         })
     }
+}
+
+fn required_absolute_worker_path(
+    endpoint: &str,
+    setting: &str,
+    path: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let path = path
+        .ok_or_else(|| anyhow::anyhow!("remote fleetd endpoint `{endpoint}` requires {setting}"))?;
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "{setting} must be an absolute worker-local path, got {}",
+            path.display()
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("{setting} must not contain `..`, got {}", path.display());
+    }
+    Ok(path.to_path_buf())
 }
 
 fn validate_tcp_address(endpoint: &str, address: &str) -> anyhow::Result<()> {
@@ -452,7 +491,22 @@ impl FleetdExecutor {
 
 #[async_trait]
 impl HarnessExecutor for FleetdExecutor {
-    async fn spawn(&self, spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
+    fn worker_locality(&self) -> Option<&WorkerLocality> {
+        self.shared.config.worker_locality.as_ref()
+    }
+
+    async fn spawn(&self, mut spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
+        // Defense in depth at the process boundary: even if a future dispatch
+        // composer accidentally derives these from the daemon container,
+        // remote fleetd never receives an off-host BRO_HOME. The supervision
+        // id is already the canonical event-log filename key.
+        if let Some(locality) = self.shared.config.worker_locality.as_ref() {
+            spec.bro_home = locality.bro_home.clone();
+            spec.event_log_path = locality
+                .bro_home
+                .join("harness-sessions")
+                .join(format!("{}.events.jsonl", spec.session_id));
+        }
         let commands = self.commands().await?;
         let session_id = spec.session_id.clone();
 
@@ -927,8 +981,14 @@ mod tests {
 
     #[test]
     fn remote_endpoint_requires_an_explicit_token_file() {
-        let error = FleetdConfig::resolve("/state/cage", Some("tcp://fleet.tailnet:7265"), None)
-            .unwrap_err();
+        let error = FleetdConfig::resolve(
+            "/state/cage",
+            Some("tcp://fleet.tailnet:7265"),
+            None,
+            Some(Path::new("/worker/home")),
+            Some(Path::new("/worker/state/bro")),
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -939,6 +999,8 @@ mod tests {
             "/state/cage",
             Some("tcp://fleet.tailnet:7265"),
             Some(Path::new("/run/secrets/fleetd-token")),
+            Some(Path::new("/worker/home")),
+            Some(Path::new("/worker/state/bro")),
         )
         .unwrap();
         assert_eq!(
@@ -947,6 +1009,40 @@ mod tests {
         );
         assert_eq!(config.token, PathBuf::from("/run/secrets/fleetd-token"));
         assert!(config.binary.is_none());
+        assert_eq!(
+            config.worker_locality,
+            Some(WorkerLocality {
+                home: PathBuf::from("/worker/home"),
+                bro_home: PathBuf::from("/worker/state/bro"),
+            })
+        );
+    }
+
+    #[test]
+    fn remote_endpoint_requires_absolute_worker_roots() {
+        for (home, bro_home) in [
+            (None, Some(Path::new("/worker/state/bro"))),
+            (Some(Path::new("/worker/home")), None),
+            (
+                Some(Path::new("relative/home")),
+                Some(Path::new("/worker/state/bro")),
+            ),
+            (
+                Some(Path::new("/worker/home")),
+                Some(Path::new("relative/state/bro")),
+            ),
+        ] {
+            assert!(
+                FleetdConfig::resolve(
+                    "/state/cage",
+                    Some("tcp://fleet.tailnet:7265"),
+                    Some(Path::new("/run/secrets/fleetd-token")),
+                    home,
+                    bro_home,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -955,13 +1051,11 @@ mod tests {
             "/state/local",
             None,
             Some(Path::new("/run/secrets/ambiguous")),
+            None,
+            None,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires daemon.fleetd_endpoint")
-        );
+        assert!(error.to_string().contains("require daemon.fleetd_endpoint"));
     }
 
     #[test]
@@ -979,6 +1073,8 @@ mod tests {
                     "/state/cage",
                     Some(endpoint),
                     Some(Path::new("/run/secrets/fleetd-token")),
+                    Some(Path::new("/worker/home")),
+                    Some(Path::new("/worker/state/bro")),
                 )
                 .is_err(),
                 "{endpoint} must fail before daemon startup completes"
@@ -988,6 +1084,8 @@ mod tests {
             "/state/cage",
             Some("tcp://[2001:db8::1]:7265"),
             Some(Path::new("/run/secrets/fleetd-token")),
+            Some(Path::new("/worker/home")),
+            Some(Path::new("/worker/state/bro")),
         )
         .expect("bracketed IPv6 with a nonzero port is valid");
     }

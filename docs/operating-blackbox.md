@@ -216,12 +216,24 @@ the same bounded, generation-fenced protocol:
 executor = "fleetd"
 fleetd_endpoint = "tcp://agent-host.tailnet:7265"
 fleetd_token_file = "/run/secrets/fleetd-token"
+fleetd_worker_home = "/home/on-agent-host"
+fleetd_worker_bro_home = "/state/on-agent-host/bro"
 ```
 
 The equivalent environment variables are `BLACKBOX_FLEETD_ENDPOINT` and
-`BLACKBOX_FLEETD_TOKEN_FILE`. The token file must already exist, be owned by
-the daemon uid, and have no group or other permission bits. A remote client
-never creates that file, starts fleetd, or falls back to a local worker.
+`BLACKBOX_FLEETD_TOKEN_FILE`, plus `BLACKBOX_FLEETD_WORKER_HOME` and
+`BLACKBOX_FLEETD_WORKER_BRO_HOME`. Both worker paths are mandatory absolute
+paths for TCP because they name the filesystem where fleetd actually starts
+the harness. The token file must already exist, be owned by the daemon uid,
+and have no group or other permission bits. A remote client never creates that
+file, starts fleetd, or falls back to a local worker.
+
+An off-host worker also needs a reachable daemon capability URL. Set
+`BLACKBOX_MCP_URL` on blackboxd to the tailnet ingress URL, including the MCP
+path, instead of the bind-derived loopback default. Worker event logs remain
+authoritative under worker BRO_HOME for replay and resume; blackboxd mirrors
+the relayed envelope stream into its own BRO_HOME so corpus indexing remains
+daemon-local.
 
 TCP listening is disabled by default. A loopback listener is suitable for a
 local encrypted tunnel:

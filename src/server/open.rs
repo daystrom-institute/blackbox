@@ -628,7 +628,7 @@ pub(super) fn open_shared_state(
         tracing::warn!("gaps repository-carrier load at startup: {e:#}");
     }
     load_system_memory_catalog(&cfg)?;
-    configure_dispatch_mcp_env(&cfg);
+    configure_dispatch_mcp_env(&cfg)?;
 
     let kb_store = Arc::new(RwLock::new(kb));
     let kb_persister = StorePersister::spawn("knowledge", kb_store.clone(), kb_path.clone());

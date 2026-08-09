@@ -124,8 +124,21 @@ pub(super) fn resolve_codex_root(cfg: &config::Config, home: &Path) -> Option<Pa
         })
 }
 
-pub(super) fn configure_dispatch_mcp_env(cfg: &config::Config) {
-    let bbox_url = dispatch_mcp_url(&cfg.daemon.bind, cfg.daemon.port);
+pub(super) fn configure_dispatch_mcp_env(cfg: &config::Config) -> anyhow::Result<()> {
+    // Same-host workers use the daemon bind-derived loopback URL. An off-host
+    // fleetd worker needs an operator-supplied reachable URL (normally the
+    // daemon's tailnet ingress); do not rewrite it back to 127.0.0.1 merely
+    // because blackboxd itself binds 0.0.0.0 inside a container.
+    let external = std::env::var("BLACKBOX_MCP_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let bbox_url = external
+        .clone()
+        .unwrap_or_else(|| dispatch_mcp_url(&cfg.daemon.bind, cfg.daemon.port));
+    if !bbox_url.starts_with("http://") && !bbox_url.starts_with("https://") {
+        anyhow::bail!("BLACKBOX_MCP_URL must use http:// or https://, got `{bbox_url}`");
+    }
     let bbox_mcp_name = cfg.daemon.mcp_name.clone();
     // Export for dispatch builders so they can inject typed/CLI MCP config
     // at dispatch time. Provider-owned MCP config files are never
@@ -138,8 +151,10 @@ pub(super) fn configure_dispatch_mcp_env(cfg: &config::Config) {
         std::env::set_var("BLACKBOX_MCP_NAME", &bbox_mcp_name);
     }
     tracing::info!(
+        external = external.is_some(),
         "blackbox MCP dispatch injection configured (name={}, url={})",
         bbox_mcp_name,
         bbox_url
     );
+    Ok(())
 }

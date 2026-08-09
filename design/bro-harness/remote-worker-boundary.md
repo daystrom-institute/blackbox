@@ -229,6 +229,17 @@ pre-existing bearer-token file, and an external encrypted ACL boundary. The
 remote path never creates a token, starts fleetd, or downgrades to a local
 executor. Routing among multiple fleetd instances remains deferred.
 
+Worker filesystem locality is also explicit. A remote endpoint requires
+absolute worker HOME and worker BRO_HOME roots. Spawn composition uses those
+roots for provider homes, harness snapshots, and fleetd replay logs, while the
+daemon keeps its task store and an indexed receipt mirror under daemon
+BRO_HOME. Provider/account/suppression policy is still chosen centrally. The
+standalone harness performs only the bounded worker-local materialization that
+cannot happen in an off-host container: allowlisted settings keys, one named
+dotenv credential, and the Codex instruction-suppressed home overlay. The
+off-host daemon also receives an explicit worker-reachable `BLACKBOX_MCP_URL`;
+the bind-derived loopback URL is invalid across this boundary.
+
 - **Artifact return shape.** Branch push vs EditSet envelope vs both — what is
   the canonical unit the integration boundary accepts? Interacts with
   [`refactor-tools-v2.md`](./refactor-tools-v2.md) §3's EditSet artifact.

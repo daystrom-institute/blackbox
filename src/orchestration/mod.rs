@@ -49,6 +49,11 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "BLACKBOX_GLOBAL_CODEX_MD",
     "BLACKBOX_GLOBAL_GEMINI_MD",
     "BLACKBOX_BACKUP_DIR",
+    "BLACKBOX_EXECUTOR",
+    "BLACKBOX_FLEETD_ENDPOINT",
+    "BLACKBOX_FLEETD_TOKEN_FILE",
+    "BLACKBOX_FLEETD_WORKER_HOME",
+    "BLACKBOX_FLEETD_WORKER_BRO_HOME",
     "BRO_HOME",
     "TRANSCRIPT_SEARCH_ROOTS",
     "TRANSCRIPT_SEARCH_CODEX_ROOT",
@@ -104,6 +109,8 @@ pub fn install_configured_harness_executor(
     store_dir: std::path::PathBuf,
     fleetd_endpoint: Option<&str>,
     fleetd_token_file: Option<&std::path::Path>,
+    fleetd_worker_home: Option<&std::path::Path>,
+    fleetd_worker_bro_home: Option<&std::path::Path>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     system_events: Option<crate::system_events::SharedEventHub>,
@@ -113,9 +120,13 @@ pub fn install_configured_harness_executor(
         bbox_config::config::ExecutorKind::Local => {
             fleetd_client::FleetdConfig::in_state_dir(&store_dir)
         }
-        bbox_config::config::ExecutorKind::Fleetd => {
-            fleetd_client::FleetdConfig::resolve(&store_dir, fleetd_endpoint, fleetd_token_file)?
-        }
+        bbox_config::config::ExecutorKind::Fleetd => fleetd_client::FleetdConfig::resolve(
+            &store_dir,
+            fleetd_endpoint,
+            fleetd_token_file,
+            fleetd_worker_home,
+            fleetd_worker_bro_home,
+        )?,
     };
     Ok(install_harness_executor_with_config(
         kind,
@@ -174,6 +185,10 @@ fn install_harness_executor_with_config(
 fn harness_executor_storage() -> &'static OnceLock<Arc<dyn executor::HarnessExecutor>> {
     static EXECUTOR: OnceLock<Arc<dyn executor::HarnessExecutor>> = OnceLock::new();
     &EXECUTOR
+}
+
+fn harness_worker_locality() -> Option<executor::WorkerLocality> {
+    harness_executor().worker_locality().cloned()
 }
 
 /// Daemon-side state a re-adopted session needs to be reattached to its task.
@@ -340,6 +355,11 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
         provider,
         task_id.clone(),
         env.store_dir.clone(),
+        harness_worker_locality().map(|_| {
+            env.store_dir
+                .join("harness-sessions")
+                .join(format!("{session_id}.events.jsonl"))
+        }),
         env.tail_tx.clone(),
         env.system_events.clone(),
         events,
@@ -3377,10 +3397,20 @@ async fn spawn_harness_child_task(
         }
     };
 
-    // Pin the child's transcript location from the spec's event-log path (the
-    // single derivation both sides now flow from).
-    let transcript_location =
-        harness_transcript_location_from_spec(&spec, &session_id, cwd.as_deref());
+    // The worker keeps its authoritative replay log under worker BRO_HOME.
+    // The daemon keeps a receipt mirror under its own BRO_HOME so indexing and
+    // daemon-side transcript tools remain local after the corpus moves off
+    // host. Same-host execution names the same file and needs no mirror.
+    let daemon_event_log_path = store_dir
+        .join("harness-sessions")
+        .join(format!("{}.events.jsonl", spec.session_id));
+    let mirror_event_log_path = harness_worker_locality().map(|_| daemon_event_log_path.clone());
+    let transcript_location = harness_transcript_location_from_spec(
+        &spec,
+        &session_id,
+        cwd.as_deref(),
+        &daemon_event_log_path,
+    );
 
     // Hand the spec to the executor: it owns the process (login-shell bin
     // resolution, command build, spawn, stdin control writer, stdout/stderr
@@ -3506,6 +3536,7 @@ async fn spawn_harness_child_task(
         provider,
         task_id.clone(),
         store_dir.clone(),
+        mirror_event_log_path,
         tail_tx.clone(),
         system_events.clone(),
         events,
@@ -3649,8 +3680,13 @@ fn prepare_harness_child_launch(
         provider.bin()
     });
 
-    // Single pinned derivation of BRO_HOME and the event-log path.
-    let bro_home = store_dir.to_path_buf();
+    // A same-host executor shares the daemon's BRO_HOME. An off-host fleetd
+    // writes snapshots, replay logs, and spill artifacts under its own
+    // explicit worker-local BRO_HOME. Never send the container-local path to
+    // another machine.
+    let bro_home = harness_worker_locality()
+        .map(|locality| locality.bro_home)
+        .unwrap_or_else(|| store_dir.to_path_buf());
     let event_log_path = bro_home
         .join("harness-sessions")
         .join(format!("{supervision_id}.events.jsonl"));
@@ -3709,6 +3745,7 @@ fn harness_transcript_location_from_spec(
     spec: &bro_protocol::WorkerSpawnSpec,
     provider_session_id: &str,
     cwd: Option<&str>,
+    daemon_event_log_path: &std::path::Path,
 ) -> Option<TranscriptLocation> {
     if spec.session_id.is_empty() {
         return None;
@@ -3716,7 +3753,7 @@ fn harness_transcript_location_from_spec(
     Some(TranscriptLocation {
         source: TranscriptSource::Harness(spec.provider),
         storage: TranscriptStorage::JsonlFile,
-        path: spec.event_log_path.clone(),
+        path: daemon_event_log_path.to_path_buf(),
         account: None,
         session_id: (!provider_session_id.is_empty() && provider_session_id != "pending")
             .then(|| provider_session_id.to_string()),
@@ -3770,16 +3807,73 @@ fn spawn_harness_ingest_loop(
     provider: Provider,
     task_id: String,
     store_dir: std::path::PathBuf,
+    mirror_event_log_path: Option<std::path::PathBuf>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     system_events: Option<crate::system_events::SharedEventHub>,
     mut events: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut mirror = match mirror_event_log_path {
+            Some(path) => {
+                let opened = async {
+                    if let Some(parent) = path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .await
+                }
+                .await;
+                match opened {
+                    Ok(file) => Some((path, file)),
+                    Err(error) => {
+                        tracing::error!(
+                            task_id,
+                            path = %path.display(),
+                            %error,
+                            "cannot open daemon-local remote harness transcript mirror"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let mut disruption_recorded = false;
         while let Some(line) = events.recv().await {
             let Ok(evt) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if let Some((path, file)) = mirror.as_mut() {
+                let record = serde_json::to_vec(&serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    "event": &evt,
+                }))
+                .map(|mut record| {
+                    record.push(b'\n');
+                    record
+                });
+                match record {
+                    Ok(record) => {
+                        if let Err(error) = file.write_all(&record).await {
+                            tracing::error!(
+                                task_id,
+                                path = %path.display(),
+                                %error,
+                                "cannot append daemon-local remote harness transcript mirror"
+                            );
+                            mirror = None;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(task_id, %error, "cannot serialize remote harness transcript mirror record");
+                    }
+                }
+            }
             if !disruption_recorded && let Some(disruption) = provider.detect_disruption(&evt) {
                 disruption_recorded = true;
                 let store_dir = store_dir.clone();
@@ -3814,6 +3908,16 @@ fn spawn_harness_ingest_loop(
                 let mut inner = task.inner.lock();
                 inner.harness_ingest_seq = inner.harness_ingest_seq.max(seq);
             }
+        }
+        if let Some((path, mut file)) = mirror
+            && let Err(error) = file.flush().await
+        {
+            tracing::error!(
+                task_id,
+                path = %path.display(),
+                %error,
+                "cannot flush daemon-local remote harness transcript mirror"
+            );
         }
     })
 }
@@ -5882,6 +5986,7 @@ mod tests {
             Provider::Glm,
             "cursor-task".to_string(),
             root,
+            None,
             tail_tx,
             None,
             events_rx,
@@ -5906,6 +6011,50 @@ mod tests {
             7,
             "cursor is the high-water mark of seq-carrying ingested events"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_ingest_mirrors_worker_events_into_daemon_corpus_state() {
+        let (tail_tx, _rx) = tokio::sync::broadcast::channel(32);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let task = spawn_in_process_task(
+            "mirror-task".to_string(),
+            Provider::Workflow,
+            "mirror-session".to_string(),
+            None,
+            root.clone(),
+            Arc::new(RwLock::new(TaskStore::new())),
+            tail_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            bro_core::Origin::Workflow,
+        );
+        let mirror = root.join("daemon-bro/harness-sessions/mirror.events.jsonl");
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let join = spawn_harness_ingest_loop(
+            task,
+            Provider::Glm,
+            "mirror-task".to_string(),
+            root,
+            Some(mirror.clone()),
+            tail_tx,
+            None,
+            events_rx,
+        );
+        events_tx
+            .send(r#"{"type":"assistant","seq":9,"message":"remote"}"#.to_string())
+            .unwrap();
+        drop(events_tx);
+        join.await.expect("mirror ingest drains");
+
+        let record: Value =
+            serde_json::from_str(std::fs::read_to_string(mirror).unwrap().trim_end()).unwrap();
+        assert!(record["ts"].as_str().is_some());
+        assert_eq!(record["event"]["seq"], 9);
+        assert_eq!(record["event"]["message"], "remote");
     }
 
     /// Re-adoption is the payoff of the whole slice: a task the previous
