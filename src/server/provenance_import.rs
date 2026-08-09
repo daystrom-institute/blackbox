@@ -292,8 +292,10 @@ fn prepare_documents(
     journal: &ProvenanceImportJournalV1,
 ) -> Result<bbox_mcp_tools::mcp_tools::provenance::PreparedProvenanceImport> {
     let searcher = state.code_read_view.read().searcher.clone();
+    let relation_index = state.code_read_view.read().edge_index.clone();
     let exact_selectors =
         BTreeMap::from([(source.project_id.clone(), journal.code_selector.clone())]);
+    let membership_cache = parking_lot::Mutex::new(BTreeMap::<String, bool>::new());
     let mut prepared_import =
         bbox_mcp_tools::mcp_tools::provenance::PreparedProvenanceImport::default();
     let mut prepared_bytes = 0_u64;
@@ -314,11 +316,31 @@ fn prepare_documents(
                     )
             };
             let target_is_member = |target: &bbox_corpus_core::entity_ref::EntityRef| {
-                Ok(state.idx.read().is_active_code_entity_for_with_searcher(
+                let key = target.to_string();
+                if let Some(member) = membership_cache.lock().get(&key).copied() {
+                    return Ok(member);
+                }
+                let active = state.idx.read().is_active_code_entity_for_with_searcher(
                     &target.to_string(),
                     &exact_selectors,
                     &searcher,
-                ))
+                );
+                // Observed provenance is immutable historical evidence. Its
+                // project-file identity can legitimately predate the active
+                // collected snapshot or the ProjectFileV2 schema. Admit that
+                // exact target only when the pinned edge view still contains
+                // a matching observed file edge for this project. Imported
+                // provenance edges have no project_id field, so they cannot
+                // recursively authorize arbitrary targets.
+                let observed = !active
+                    && observed_provenance_target_is_member(
+                        &relation_index,
+                        &source.project_id,
+                        target,
+                    );
+                let member = active || observed;
+                membership_cache.lock().insert(key, member);
+                Ok(member)
             };
             let prepared =
                 bbox_mcp_tools::mcp_tools::provenance::prepare_authenticated_provenance_import(
@@ -342,6 +364,18 @@ fn prepare_documents(
             Ok(())
         })?;
     Ok(prepared_import)
+}
+
+fn observed_provenance_target_is_member(
+    edge_index: &bbox_edge_index::edge_index::EdgeIndex,
+    project_id: &str,
+    target: &bbox_corpus_core::entity_ref::EntityRef,
+) -> bool {
+    edge_index.any_reverse_edge(target, |edge| {
+        matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE")
+            && edge.project_id.as_deref() == Some(project_id)
+            && edge.metadata.get("anchor.project_id").map(String::as_str) == Some(project_id)
+    })
 }
 
 fn is_invalid_import(error: &anyhow::Error) -> bool {
@@ -388,12 +422,15 @@ fn quarantine(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+    use bbox_corpus_core::entity_ref::EntityRef;
     use bbox_corpus_core::identity::PublishedScope;
     use bbox_corpus_core::project_catalog::{
         CatalogSnapshotV2, CommitNamespace, CorpusProject, ProjectId, ProjectScope,
         RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryMaterialization,
         RepoHistoryRecord,
     };
+    use bbox_edge_index::edge_index::{Edge, EdgeIndex};
     use bbox_git_source::{
         ProvenanceImportDescriptorV1, ProvenanceImportManifestEntryV1,
         ProvenanceImportManifestPageV1, SCHEMA_VERSION, provenance_manifest_sha256,
@@ -403,6 +440,58 @@ mod tests {
     use super::*;
     use crate::server::CodeReadView;
     use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
+
+    #[test]
+    fn historical_target_requires_matching_observed_project_edge() {
+        let project_id = "project-one";
+        let target = EntityRef::ProjectFile {
+            project_id: project_id.into(),
+            rel_path_hash: "path".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert("anchor.project_id".into(), project_id.into());
+        let observed = Edge {
+            source: EntityRef::Transcript {
+                provider: "test".into(),
+                session_id: "session".into(),
+                line_offset: 1,
+                event_idx: 0,
+            },
+            kind: "READ_FILE".into(),
+            target: target.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: metadata.clone(),
+            project_id: Some(project_id.into()),
+        };
+        let observed_index = EdgeIndex::from_edges_for_tests(vec![observed.clone()]);
+
+        assert!(observed_provenance_target_is_member(
+            &observed_index,
+            project_id,
+            &target,
+        ));
+        assert!(!observed_provenance_target_is_member(
+            &observed_index,
+            "another-project",
+            &target,
+        ));
+
+        let mut imported = observed;
+        imported.project_id = None;
+        imported.metadata.insert(
+            "provenance.import_generation_id".into(),
+            "pis_fixture".into(),
+        );
+        let imported_index = EdgeIndex::from_edges_for_tests(vec![imported]);
+        assert!(!observed_provenance_target_is_member(
+            &imported_index,
+            project_id,
+            &target,
+        ));
+    }
 
     fn state_with_active_project(
         root: &std::path::Path,

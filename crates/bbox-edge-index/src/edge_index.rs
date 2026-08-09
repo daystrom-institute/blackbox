@@ -268,6 +268,20 @@ impl EdgeIndex {
         edges
     }
 
+    /// Test reverse-edge membership without allocating a vector proportional
+    /// to the target's degree.
+    pub fn any_reverse_edge(
+        &self,
+        target: &EntityRef,
+        mut predicate: impl FnMut(&Edge) -> bool,
+    ) -> bool {
+        self.reverse.get(target).is_some_and(|indices| {
+            indices
+                .iter()
+                .any(|edge_id| predicate(&self.edges[*edge_id]))
+        })
+    }
+
     /// Forward edges for `source`, plus a synthesized `IN_SESSION` edge when
     /// `source` is a transcript ref and no materialized `IN_SESSION` edge
     /// already covers it.
@@ -1127,6 +1141,8 @@ mod tests {
             1
         );
         assert!(index.reverse_edges_filtered(&target, &["CALLS"]).is_empty());
+        assert!(index.any_reverse_edge(&target, |edge| edge.kind == "SUPERSEDES"));
+        assert!(!index.any_reverse_edge(&target, |edge| edge.kind == "CALLS"));
     }
 
     #[test]

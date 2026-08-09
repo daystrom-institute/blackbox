@@ -44,3 +44,8 @@
   The resolver is exact on project id, selector, and repository-relative path;
   it never consults the live checkout or silently crosses into another active
   code generation while an import is being prepared.
+- V2 target membership accepts either an entity in that exact active selector
+  or an exact historical target still backed by a matching observed
+  `READ_FILE`/`EDITED_FILE` edge in the pinned edge view. The historical arm is
+  required across collected-snapshot and ProjectFileV2 migrations; imported
+  provenance edges cannot authorize it recursively.
