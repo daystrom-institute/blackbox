@@ -159,6 +159,8 @@ fn tool_edge_project_access(
     config: &ReindexConfig,
     records_provider: &Arc<dyn ProjectRecordsProvider>,
     plans: &[super::writer_actor::ProjectSourcePlan],
+    transcript_namespaces: &std::collections::BTreeMap<String, String>,
+    mut projects: Vec<ToolEdgeProjectAccess>,
 ) -> Result<Vec<ToolEdgeProjectAccess>> {
     let needs_collected = plans.iter().any(|plan| {
         records_provider.code_source_locality_governed(&plan.project_id)
@@ -177,31 +179,19 @@ fn tool_edge_project_access(
             .map(Arc::new)
         })
         .transpose()?;
-    let mut projects = Vec::new();
     for plan in plans {
+        let governed = records_provider.code_source_locality_governed(&plan.project_id);
+        if !governed {
+            continue;
+        }
         let Some(access) = plan.access.as_ref() else {
             continue;
         };
-        let governed = records_provider.code_source_locality_governed(&plan.project_id);
-        if governed && access.local.is_some() {
+        if access.local.is_some() {
             anyhow::bail!(
                 "governed collected project {} retained a LocalProjectWalk lease",
                 plan.project_id
             );
-        }
-        if let Some(local) = access.local.as_ref() {
-            projects.push(ToolEdgeProjectAccess::local(
-                &plan.project_id,
-                local.project_root().to_path_buf(),
-                access
-                    .git
-                    .as_ref()
-                    .map(|git| git.checkout_root().to_path_buf()),
-            ));
-            continue;
-        }
-        if !governed {
-            continue;
         }
         let super::writer_actor::EffectiveSource::Collected { generation } = &plan.effective else {
             anyhow::bail!(
@@ -236,9 +226,12 @@ fn tool_edge_project_access(
             anyhow::bail!("governed code-source generation is not active");
         }
         let entries = store.load_generation_entries(&activation.published_scope, generation)?;
+        let transcript_namespace = transcript_namespaces
+            .get(&plan.project_id)
+            .context("governed attached project has no transcript namespace")?;
         projects.push(ToolEdgeProjectAccess::collected(
             &plan.project_id,
-            std::path::PathBuf::from(&access.project.canonical_path),
+            std::path::PathBuf::from(transcript_namespace),
             activation.snapshot_id,
             stored.descriptor.head_commit,
             entries,
@@ -366,10 +359,19 @@ pub(super) fn execute_reindex_pass(
             );
         }
     }
-    let unavailable_record_projects = leased
+    let unavailable_record_project_paths = leased
         .iter()
         .filter(|access| access.local.is_none())
-        .map(|access| access.project.canonical_path.clone())
+        .map(|access| {
+            (
+                access.project.project_id.clone(),
+                access.project.canonical_path.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let unavailable_record_projects = unavailable_record_project_paths
+        .values()
+        .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     let unavailable_git_projects = leased
         .iter()
@@ -543,8 +545,31 @@ pub(super) fn execute_reindex_pass(
         .map(|outcome| outcome.commit_documents)
         .unwrap_or_default();
     let mut skipped = 0u64;
+    let local_tool_edge_access = leased
+        .iter()
+        .filter_map(|access| {
+            // Local tool-edge attribution is constructed only from the live
+            // LocalProjectWalk lease retained through publication.
+            access.local.as_ref().map(|local| {
+                ToolEdgeProjectAccess::local(
+                    &access.project.project_id,
+                    local.project_root().to_path_buf(),
+                    access
+                        .git
+                        .as_ref()
+                        .map(|git| git.checkout_root().to_path_buf()),
+                )
+            })
+        })
+        .collect();
     let tool_edges = ToolEdgeContext::with_project_access(
-        tool_edge_project_access(config, records_provider, &plans)?,
+        tool_edge_project_access(
+            config,
+            records_provider,
+            &plans,
+            &unavailable_record_project_paths,
+            local_tool_edge_access,
+        )?,
         edges_dir.clone(),
         !full,
     );
@@ -926,9 +951,15 @@ pub(super) fn execute_reindex_pass(
         }
     }
     if full {
-        let store = bbox_code_source_store::CodeSourceStore::open(
+        let mode = if records_provider.catalog_authority() {
+            bbox_code_source_store::RuntimeRecordMode::CatalogV2
+        } else {
+            bbox_code_source_store::RuntimeRecordMode::BridgeV1
+        };
+        let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
             &config.code_source_store_path,
             bbox_code_source_store::StoreLimits::default(),
+            mode,
         )?;
         let observations =
             crate::code_source_locality_observations::CodeSourceLocalityObservationsV1::open(

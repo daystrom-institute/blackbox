@@ -84,6 +84,10 @@ impl CatalogProjectRecordsProvider {
 }
 
 impl ProjectRecordsProvider for CatalogProjectRecordsProvider {
+    fn catalog_authority(&self) -> bool {
+        true
+    }
+
     fn records_snapshot(&self) -> ProjectRecordsSnapshot {
         let mut cache = self.cache.lock();
         let state = match self.store.snapshot() {

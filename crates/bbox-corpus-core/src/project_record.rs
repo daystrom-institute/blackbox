@@ -381,6 +381,13 @@ impl ProjectRecordsSnapshot {
 pub trait ProjectRecordsProvider: Send + Sync {
     fn records_snapshot(&self) -> ProjectRecordsSnapshot;
 
+    /// True when this provider is backed by the v2 catalog authority. Store
+    /// readers use this injected fact to select strict v2 records without
+    /// probing bytes through the legacy decoder.
+    fn catalog_authority(&self) -> bool {
+        false
+    }
+
     /// Whether a durable producer-transport cutover row closes checkout Git
     /// history for this project. Bridge and offline providers retain the
     /// default `false`; catalog runtime providers override it from their
