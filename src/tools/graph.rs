@@ -661,12 +661,12 @@ fn workspace_blame_plan(
             line,
             byte_offset,
         } => {
-            validate_explicit_project_selection(server, project_id)?;
             if project_id != &grant.project_id {
                 bail!(
                     "error.blame_locality_scope: corpus entity belongs to a different project than the bound workspace"
                 );
             }
+            validate_explicit_project_selection(server, project_id)?;
             if indexed_path_hint.is_absolute() {
                 bail!(
                     "error.indexed_path_mismatch: project_file path hint is absolute and cannot cross the blame locality boundary"
@@ -1481,6 +1481,16 @@ mod tests {
         assert_eq!(plan.project_id, "project-bound");
         assert_eq!(server.state.checkout_access.health().sequence, before);
 
+        let foreign = mcp_tools::blame::BlameTargetIdentity::ProjectFile {
+            project_id: "project-foreign".into(),
+            indexed_path_hint: PathBuf::from("src/lib.rs"),
+            line: Some(7),
+            byte_offset: 0,
+        };
+        let foreign_overlays = overlay_map("project-foreign", &"b".repeat(40));
+        let foreign_error = workspace_blame_plan(&server, &foreign, &foreign_overlays).unwrap_err();
+        assert!(format!("{foreign_error:#}").contains("different project"));
+
         let fact = BlameFactV1 {
             version: BLAME_TRANSPORT_VERSION,
             project_id: plan.project_id.clone(),
@@ -1494,6 +1504,28 @@ mod tests {
             },
             attribution: None,
         };
+        let mut stale_plan = plan.clone();
+        if let bbox_corpus_core::blame_transport::BlamePlanTargetV1::WorkspacePath {
+            line, ..
+        } = &mut stale_plan.target
+        {
+            *line = 8;
+        }
+        let stale = server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Resolve {
+                    plan: stale_plan,
+                    fact: fact.clone(),
+                }),
+            }))
+            .await;
+        assert_eq!(stale.is_error, Some(true));
+        assert!(extract_text(&stale).contains("error.blame_plan_stale"));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
+
         let resolved = server
             .bbox_blame(Parameters(BlameParams {
                 file: Some("src/lib.rs".into()),

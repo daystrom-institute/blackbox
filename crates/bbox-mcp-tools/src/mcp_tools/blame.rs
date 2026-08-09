@@ -467,6 +467,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn locality_transport_is_absent_from_the_public_blame_schema() {
+        let schema = serde_json::to_string(&schemars::schema_for!(BlameParams)).unwrap();
+        assert!(!schema.contains("_blame_locality"), "{schema}");
+    }
+
+    #[test]
     fn matching_anchors_prefers_same_file() {
         let same_commit_other_file = edit_edge("src/lib.rs");
         let same_file = edit_edge("src/main.rs");

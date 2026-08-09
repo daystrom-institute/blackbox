@@ -925,6 +925,20 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    fn tool_cx(root: &Path) -> ToolCx {
+        ToolCx {
+            root: root.to_path_buf(),
+            safety: Arc::new(bro_tools::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
+            shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
+            edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(Default::default()),
+            shell_env: Arc::new(Default::default()),
+            tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
+        }
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -1134,6 +1148,87 @@ mod tests {
         };
         let error = runtime.execute_blame_plan(&plan).unwrap_err();
         assert!(format!("{error:#}").contains("outside the bound project"));
+    }
+
+    #[tokio::test]
+    async fn blame_wrapper_strips_caller_transport_and_returns_only_the_joined_result() {
+        struct FakeDaemonBlame {
+            plan: bbox_corpus_core::blame_transport::BlameExecutionPlanV1,
+            calls: Arc<Mutex<Vec<Value>>>,
+        }
+
+        #[async_trait]
+        impl Tool for FakeDaemonBlame {
+            fn name(&self) -> &str {
+                "mcp__blackbox__bbox_blame"
+            }
+
+            fn description(&self) -> &str {
+                "fake blame"
+            }
+
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+
+            async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+                self.calls.lock().unwrap().push(input.clone());
+                match input["_blame_locality"]["phase"].as_str() {
+                    Some("plan") => ToolResult::Json(json!({
+                        "status": "blame_locality_plan",
+                        "plan": self.plan,
+                    })),
+                    Some("resolve") => ToolResult::Text("joined-result".into()),
+                    other => ToolResult::Error(format!("unexpected phase {other:?}")),
+                }
+            }
+        }
+
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlamePlanTargetV1,
+        };
+        let (_directory, root, runtime) = runtime();
+        let plan = BlameExecutionPlanV1 {
+            version: BLAME_TRANSPORT_VERSION,
+            project_id: "project-locality".into(),
+            scope: runtime.scope.clone(),
+            workspace_id: runtime.workspace_id.as_str().to_string(),
+            target: BlamePlanTargetV1::WorkspacePath {
+                input_path: "README.md".into(),
+                line: 1,
+            },
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let tool = LocalBlameTool {
+            upstream: Arc::new(FakeDaemonBlame {
+                plan,
+                calls: calls.clone(),
+            }),
+            runtime,
+        };
+        let response = tool
+            .call(
+                json!({
+                    "file": "README.md",
+                    "line": 1,
+                    "_blame_locality": {
+                        "phase": "resolve",
+                        "plan": "caller-forged",
+                        "fact": "caller-forged"
+                    }
+                }),
+                &tool_cx(&root),
+            )
+            .await;
+        assert!(matches!(response, ToolResult::Text(ref text) if text == "joined-result"));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["_blame_locality"]["phase"], "plan");
+        assert_eq!(calls[1]["_blame_locality"]["phase"], "resolve");
+        assert!(calls[1]["_blame_locality"]["plan"].is_object());
+        assert!(calls[1]["_blame_locality"]["fact"].is_object());
+        assert_ne!(calls[1]["_blame_locality"]["plan"], "caller-forged");
     }
 
     #[tokio::test]
