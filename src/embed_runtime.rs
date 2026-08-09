@@ -635,6 +635,9 @@ fn record_index_doc_coverage(
             let Some(chunk) = chunk_from_embedding_doc(doc) else {
                 return Ok(());
             };
+            let Some(entity_id) = doc.entity_id.as_deref() else {
+                return Ok(());
+            };
             // The envelope crosses every boundary that compares project-file
             // vector hashes (plan section 9 item 5). The vector record's
             // freshness hash for a text row IS the envelope hash, so comparing
@@ -649,7 +652,7 @@ fn record_index_doc_coverage(
                 active_by_route,
                 bucket,
                 Some(&chunk.project_id),
-                &crate::embed_queue::project_file_entity_id(&chunk),
+                entity_id,
                 &crate::embed_queue::project_file_text_content_hash(&chunk.chunk_hash),
             )
         }
@@ -1215,8 +1218,10 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
         let Some(chunk) = chunk_from_embedding_doc(doc) else {
             return false;
         };
-        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
-        return crate::embed_queue::enqueue_visual_project_file(&chunk, &entity_id);
+        let Some(entity_id) = doc.entity_id.as_deref() else {
+            return false;
+        };
+        return crate::embed_queue::enqueue_visual_project_file(&chunk, entity_id);
     }
     let Some(bucket) = reembed_index_doc_bucket(doc) else {
         return false;
@@ -1229,13 +1234,18 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
             let Some(chunk) = chunk_from_embedding_doc(doc) else {
                 return false;
             };
-            let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+            let Some(entity_id) = doc.entity_id.as_deref() else {
+                return false;
+            };
             // The stored `project` field is the display name after the P3-E
             // cut, so the backfill lane reproduces the same embedding input
             // the index-time enqueue produced. Reading it from the document
             // rather than re-resolving the catalog keeps this pass free of a
             // project-authority dependency.
-            crate::embed_queue::enqueue_project_file_as(&chunk, &doc.project, &entity_id, bucket)
+            // Preserve the stored V2 identity. Reconstructing it from Chunk
+            // would silently drop the snapshot id and deduplicate against a
+            // stale V1 vector instead of embedding the active generation.
+            crate::embed_queue::enqueue_project_file_as(&chunk, &doc.project, entity_id, bucket)
         }
         Bucket::Transcripts => {
             let chunk_hash = doc
@@ -2332,7 +2342,8 @@ pdf_figure = "voyage_visual"
             symbol_exact: None,
             chunk_hash: Some("f".repeat(64)),
             entity_id: Some(format!(
-                "project_file:proj1234:abcd1234:{}:0",
+                "project_file_v2:proj1234:collected-{}:abcd1234:{}:0",
+                "a".repeat(32),
                 "f".repeat(64)
             )),
             content: "figure".into(),
@@ -2433,7 +2444,8 @@ image = "voyage_visual"
             symbol_exact: Some("crate::Helper".into()),
             chunk_hash: Some("f".repeat(64)),
             entity_id: Some(format!(
-                "project_file:proj1234:abcd1234:{}:0",
+                "project_file_v2:proj1234:collected-{}:abcd1234:{}:0",
+                "a".repeat(32),
                 "f".repeat(64)
             )),
             content: "pub struct Helper;".into(),
@@ -2459,7 +2471,7 @@ image = "voyage_visual"
         let router = EmbeddingRouter::from_toml_str("").unwrap();
         let doc = code_embedding_source_doc();
         let chunk = chunk_from_embedding_doc(&doc).unwrap();
-        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        let entity_id = doc.entity_id.clone().unwrap();
         let (_queue_route, vector_route) = code_route(&router);
 
         // The worker stores the vector under the ENVELOPE hash, exactly as the
@@ -2505,7 +2517,7 @@ image = "voyage_visual"
         let router = EmbeddingRouter::from_toml_str("").unwrap();
         let doc = code_embedding_source_doc();
         let chunk = chunk_from_embedding_doc(&doc).unwrap();
-        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        let entity_id = doc.entity_id.clone().unwrap();
         let (_queue_route, vector_route) = code_route(&router);
         crate::vectors::upsert(&vector_route, &entity_id, &chunk.chunk_hash, vec![0.5; 8]).unwrap();
 
@@ -2538,7 +2550,7 @@ image = "voyage_visual"
         let router = EmbeddingRouter::from_toml_str("").unwrap();
         let doc = code_embedding_source_doc();
         let chunk = chunk_from_embedding_doc(&doc).unwrap();
-        let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        let entity_id = doc.entity_id.clone().unwrap();
         let (_queue_route, vector_route) = code_route(&router);
         let enveloped = crate::embed_queue::project_file_text_content_hash(&chunk.chunk_hash);
 
@@ -2556,6 +2568,36 @@ image = "voyage_visual"
             "one active entry per entity id: {for_entity:?}"
         );
         assert_eq!(for_entity[0].1, enveloped);
+    }
+
+    #[test]
+    fn legacy_project_file_vector_does_not_cover_collected_v2_source() {
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store);
+        let router = EmbeddingRouter::from_toml_str("").unwrap();
+        let doc = code_embedding_source_doc();
+        let chunk = chunk_from_embedding_doc(&doc).unwrap();
+        let legacy_entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+        let (_queue_route, vector_route) = code_route(&router);
+        let enveloped = crate::embed_queue::project_file_text_content_hash(&chunk.chunk_hash);
+        crate::vectors::upsert(&vector_route, &legacy_entity_id, &enveloped, vec![0.5; 8]).unwrap();
+
+        let mut coverage = BTreeMap::new();
+        let mut active_by_route = BTreeMap::new();
+        record_index_doc_coverage(
+            &router,
+            &mut coverage,
+            &mut active_by_route,
+            &[Bucket::Code],
+            &doc,
+        )
+        .unwrap();
+        let entry = coverage
+            .values()
+            .find(|entry| entry.source_count > 0)
+            .expect("the code route was counted");
+        assert_eq!(entry.indexed_count, 0);
     }
 
     /// P3-E embed row: the visual lane is OUTSIDE the envelope. Its embedding
