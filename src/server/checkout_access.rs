@@ -875,7 +875,7 @@ mod tests {
             .expect("uncovered capable attachment projects a carrier");
         let access = DaemonArtifactWatchAccess::new(
             server.state.checkout_access.clone(),
-            server.state.project_authority.catalog_store(),
+            server.state.project_authority.catalog_store().cloned(),
         );
         let before_local = server.state.checkout_access.health().sequence;
         access
