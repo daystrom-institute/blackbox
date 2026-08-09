@@ -839,7 +839,7 @@ mod tests {
 mod catalog_render_tests {
     use super::*;
     use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture};
-    use bbox_knowledge::knowledge::{Approval, Category, Priority, Status};
+    use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
     use rmcp::handler::server::wrapper::Parameters;
 
     const PROJECT: &str = "p_000000000000000000000000000000a1";
