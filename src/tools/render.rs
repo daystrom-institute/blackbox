@@ -1,7 +1,7 @@
 use crate::knowledge::{
     AbsorbParams, BootstrapParams, PROJECT_RENDER_TRANSPORT_SCOPE,
     PROJECT_RENDER_TRANSPORT_VERSION, ProjectRenderLocalityRequestV1, ProjectRenderPlanV1,
-    ProjectRenderViewV1, RenderParams, ReviewParams,
+    ProjectRenderViewV1, RenderParams, ReviewParams, Scope,
 };
 use crate::server::BlackboxServer;
 
