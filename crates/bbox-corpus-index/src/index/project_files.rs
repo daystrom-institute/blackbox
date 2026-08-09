@@ -766,18 +766,18 @@ fn is_collected_snapshot_id_shape(value: &str) -> bool {
 pub fn classify_collected_materialization(
     project_id: &str,
     active: &ActiveCollectedSource,
-    activation: &bbox_code_source_store::ActivationRecord,
+    activation: &bbox_code_source_store::MixedActivationRecord,
 ) -> Result<CollectedMaterializationState> {
     let expected_selector = collected_materialization_selector(project_id, &active.generation_id);
     let expected_snapshot =
         bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, &active.generation_id);
-    if active.selector == expected_selector && activation.snapshot_id == expected_snapshot {
+    if active.selector == expected_selector && activation.snapshot_id() == expected_snapshot {
         return Ok(CollectedMaterializationState::Current);
     }
     // A selector at the current suffix whose snapshot id is NOT current (or the
     // reverse) cannot be an outgoing version: both derive from the same version
     // string, so they move together or the state is corrupt.
-    if active.selector == expected_selector || activation.snapshot_id == expected_snapshot {
+    if active.selector == expected_selector || activation.snapshot_id() == expected_snapshot {
         anyhow::bail!("active collected materialization version requires an explicit migration");
     }
     // Shape-only per `validate_collected_materialization_selector`: it accepts
@@ -788,7 +788,7 @@ pub fn classify_collected_materialization(
         &active.selector,
     )
     .is_err()
-        || !is_collected_snapshot_id_shape(&activation.snapshot_id)
+        || !is_collected_snapshot_id_shape(activation.snapshot_id())
     {
         anyhow::bail!("active collected selector requires materialization migration");
     }
@@ -934,10 +934,7 @@ pub fn collect_verified_detached_documents(
             let store = match store.as_ref() {
                 Some(store) => store,
                 None => {
-                    store = Some(bbox_code_source_store::CodeSourceStore::open(
-                        &config.code_source_store_path,
-                        bbox_code_source_store::StoreLimits::default(),
-                    )?);
+                    store = Some(open_code_source_store(config)?);
                     store.as_ref().expect("store was just installed")
                 }
             };
@@ -999,6 +996,16 @@ pub fn active_collected_sources(
         .collect())
 }
 
+fn open_code_source_store(
+    config: &ReindexConfig,
+) -> Result<bbox_code_source_store::CodeSourceStore> {
+    bbox_code_source_store::CodeSourceStore::open_with_mode(
+        &config.code_source_store_path,
+        bbox_code_source_store::StoreLimits::default(),
+        config.code_source_record_mode,
+    )
+}
+
 pub fn collect_preserved_collected_documents(
     index: &Index,
     config: &ReindexConfig,
@@ -1008,29 +1015,25 @@ pub fn collect_preserved_collected_documents(
     if active.is_empty() {
         return Ok(PreservedCollectedDocuments::default());
     }
-    let store = bbox_code_source_store::CodeSourceStore::open(
-        &config.code_source_store_path,
-        bbox_code_source_store::StoreLimits::default(),
-    )?;
+    let store = open_code_source_store(config)?;
     let searcher = index.reader()?.searcher();
     let mut preserved = PreservedCollectedDocuments::default();
     for (project_id, source) in active {
-        let Some(activation) = store.load_activation(&project_id)? else {
+        let Some(activation) = store.load_activation_mixed(&project_id)? else {
             let diagnostic = "active collected source has no activation record";
             store.record_health_failure(&project_id, "preservation_failed", diagnostic)?;
             anyhow::bail!(diagnostic);
         };
-        if activation.selector != source.selector
-            || activation.generation_id != source.generation_id
+        if activation.selector() != source.selector
+            || activation.generation_id() != source.generation_id
         {
             let diagnostic = "active collected source disagrees with its activation record";
             store.record_health_failure(&project_id, "preservation_failed", diagnostic)?;
             anyhow::bail!(diagnostic);
         }
-        let generation = store.find_generation(&source.generation_id)?;
-        if generation.materialized_doc_count != Some(activation.document_count)
-            || generation.entity_inventory_sha256.as_deref()
-                != Some(activation.entity_inventory_sha256.as_str())
+        let generation = store.find_generation_mixed(&source.generation_id)?;
+        if generation.materialized_doc_count() != Some(activation.document_count())
+            || generation.entity_inventory_sha256() != Some(activation.entity_inventory_sha256())
         {
             let diagnostic = "active collected materialization metadata is incomplete";
             store.record_health_failure(&project_id, "preservation_failed", diagnostic)?;
@@ -1041,18 +1044,19 @@ pub fn collect_preserved_collected_documents(
             IndexRecordOption::Basic,
         );
         let count = searcher.search(&query, &Count)?;
-        if count as u64 != activation.document_count {
+        if count as u64 != activation.document_count() {
             store.record_health_failure(
                 &project_id,
                 "preservation_failed",
                 &format!(
                     "active collected document count mismatch: expected {}, observed {}",
-                    activation.document_count, count
+                    activation.document_count(),
+                    count
                 ),
             )?;
             anyhow::bail!(
                 "active collected document count mismatch: expected {}, observed {}",
-                activation.document_count,
+                activation.document_count(),
                 count
             );
         }
@@ -1082,18 +1086,19 @@ pub fn collect_preserved_collected_documents(
             inventory.update(entity_id.as_bytes());
         }
         let observed = hex::encode(inventory.finalize());
-        if observed != activation.entity_inventory_sha256 {
+        if observed != activation.entity_inventory_sha256() {
             store.record_health_failure(
                 &project_id,
                 "preservation_failed",
                 &format!(
                     "active collected entity inventory mismatch: expected {}, observed {}",
-                    activation.entity_inventory_sha256, observed
+                    activation.entity_inventory_sha256(),
+                    observed
                 ),
             )?;
             anyhow::bail!(
                 "active collected entity inventory mismatch: expected {}, observed {}",
-                activation.entity_inventory_sha256,
+                activation.entity_inventory_sha256(),
                 observed
             );
         }
@@ -1224,12 +1229,7 @@ pub fn index_projects_with_access(
         bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
     let git_meta_dir = super::git_history::git_meta_dir_from_projects_path(&config.projects_path);
     let collected = active_collected_sources(config)?;
-    let collected_store = (!collected.is_empty()).then(|| {
-        bbox_code_source_store::CodeSourceStore::open(
-            &config.code_source_store_path,
-            bbox_code_source_store::StoreLimits::default(),
-        )
-    });
+    let collected_store = (!collected.is_empty()).then(|| open_code_source_store(config));
     for access in projects {
         let project_id = access.project_id();
         if let Some(active) = collected.get(project_id) {
@@ -1313,8 +1313,8 @@ pub fn index_projects_with_access(
 fn migrate_collected_materialization(
     project_id: &str,
     active: &ActiveCollectedSource,
-    activation: &bbox_code_source_store::ActivationRecord,
-    stored: &bbox_code_source_store::StoredGeneration,
+    activation: &bbox_code_source_store::MixedActivationRecord,
+    stored: &bbox_code_source_store::MixedStoredGeneration,
     staged: &CollectedIndexResult,
     store: &bbox_code_source_store::CodeSourceStore,
     edges_dir: &Path,
@@ -1325,42 +1325,63 @@ fn migrate_collected_materialization(
         generation = %active.generation_id,
         outgoing_selector = %active.selector,
         selector = %staged.selector,
-        outgoing_snapshot = %activation.snapshot_id,
+        outgoing_snapshot = %activation.snapshot_id(),
         snapshot = %staged.snapshot_id,
         "migrating an active collected generation to the current materialization version"
     );
-    store.record_materialization(
-        &stored.descriptor.scope,
+    store.record_materialization_mixed(
+        stored.published_scope(),
         &active.generation_id,
         staged.document_count,
         staged.entity_inventory_sha256.clone(),
     )?;
-    store.save_activation(&bbox_code_source_store::ActivationRecord {
-        version: 1,
-        project_id: project_id.to_string(),
-        generation_id: active.generation_id.clone(),
-        selector: staged.selector.clone(),
-        snapshot_id: staged.snapshot_id.clone(),
-        document_count: staged.document_count,
-        entity_inventory_sha256: staged.entity_inventory_sha256.clone(),
-        current_chunk_targets: staged.current_chunk_targets.clone().into_iter().collect(),
-        activated_unix_secs: std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or_default(),
-        // Preserved verbatim: a cutback in flight is orthogonal to which
-        // materialization version minted the selector, and clearing it here
-        // would silently complete somebody else's transition.
-        cutback_pending: activation.cutback_pending,
-        diagnostic: activation.diagnostic.clone(),
-    })?;
+    let activated_unix_secs = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    match activation {
+        bbox_code_source_store::MixedActivationRecord::LegacyV1(record) => {
+            store.save_activation(&bbox_code_source_store::ActivationRecord {
+                version: 1,
+                project_id: project_id.to_string(),
+                generation_id: active.generation_id.clone(),
+                selector: staged.selector.clone(),
+                snapshot_id: staged.snapshot_id.clone(),
+                document_count: staged.document_count,
+                entity_inventory_sha256: staged.entity_inventory_sha256.clone(),
+                current_chunk_targets: staged.current_chunk_targets.clone().into_iter().collect(),
+                activated_unix_secs,
+                // Preserved verbatim: a cutback in flight is orthogonal to
+                // which materialization version minted the selector.
+                cutback_pending: record.cutback_pending,
+                diagnostic: record.diagnostic.clone(),
+            })?;
+        }
+        bbox_code_source_store::MixedActivationRecord::CurrentV2(record) => {
+            store.save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
+                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                project_id: record.project_id.clone(),
+                published_scope: record.published_scope.clone(),
+                generation_id: active.generation_id.clone(),
+                selector: staged.selector.clone(),
+                snapshot_id: staged.snapshot_id.clone(),
+                document_count: staged.document_count,
+                entity_inventory_sha256: staged.entity_inventory_sha256.clone(),
+                current_chunk_targets: staged.current_chunk_targets.clone().into_iter().collect(),
+                activated_unix_secs,
+                cutback_pending: record.cutback_pending,
+                cutback: record.cutback.clone(),
+                diagnostic: record.diagnostic.clone(),
+            })?;
+        }
+    }
     // `repo_id` and `head_commit` are advisory manifest metadata from P3-B on:
     // this flip opens no Git, so neither value gates anything it commits.
     bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
         edges_dir,
         project_id,
-        stored.descriptor.scope.repo_id(),
-        &stored.descriptor.head_commit,
+        stored.descriptor().scope.repo_id(),
+        &stored.descriptor().head_commit,
         &active.generation_id,
         &staged.selector,
         &staged.snapshot_id,
@@ -1372,7 +1393,7 @@ fn migrate_collected_materialization(
         version: 1,
         project_id: project_id.to_string(),
         selector: active.selector.clone(),
-        snapshot_id: activation.snapshot_id.clone(),
+        snapshot_id: activation.snapshot_id().to_string(),
         generation_id: Some(active.generation_id.clone()),
     })?;
     stats
@@ -1400,17 +1421,19 @@ fn index_active_collected_project(
     let project_id = identity.project_id.as_str();
     let repo_id = project.and_then(|project| project.repo_id.as_deref());
     let activation = store
-        .load_activation(project_id)?
+        .load_activation_mixed(project_id)?
         .ok_or_else(|| anyhow::anyhow!("active collected selector has no activation record"))?;
     // Unchanged and deliberately BEFORE the classification: an activation
     // record that disagrees with the manifest is inconsistent regardless of
     // which materialization version either was minted under.
-    if activation.generation_id != active.generation_id || activation.selector != active.selector {
+    if activation.generation_id() != active.generation_id
+        || activation.selector() != active.selector
+    {
         anyhow::bail!("active collected selector disagrees with its activation record");
     }
     let materialization = classify_collected_materialization(project_id, active, &activation)?;
-    let stored = store.find_generation(&active.generation_id)?;
-    let entries = store.load_generation_entries(&stored.descriptor.scope, &active.generation_id)?;
+    let stored = store.find_generation_mixed(&active.generation_id)?;
+    let entries = store.load_generation_entries(stored.published_scope(), &active.generation_id)?;
     let blobs_available = !force_full
         || entries.iter().all(|entry| {
             store
@@ -1418,8 +1441,8 @@ fn index_active_collected_project(
                 .is_ok()
         });
     if force_full && !blobs_available {
-        store.mark_generation_state(
-            &stored.descriptor.scope,
+        store.mark_generation_state_mixed(
+            stored.published_scope(),
             &active.generation_id,
             bbox_code_source::GenerationState::MissingBlobData,
             Some("one or more active source blobs are missing or corrupt".to_string()),
@@ -1429,9 +1452,9 @@ fn index_active_collected_project(
             "missing_blob_data",
             "one or more active source blobs are missing or corrupt",
         )?;
-    } else if force_full && stored.state == bbox_code_source::GenerationState::MissingBlobData {
-        store.mark_generation_state(
-            &stored.descriptor.scope,
+    } else if force_full && stored.state() == bbox_code_source::GenerationState::MissingBlobData {
+        store.mark_generation_state_mixed(
+            stored.published_scope(),
             &active.generation_id,
             bbox_code_source::GenerationState::Active,
             None,
@@ -1446,7 +1469,7 @@ fn index_active_collected_project(
         Some(stage_collected_project_generation(
             identity,
             ProjectFileCompatFields { repo_id },
-            &stored.descriptor,
+            stored.descriptor(),
             &active.generation_id,
             &entries,
             f,
@@ -1502,14 +1525,14 @@ fn index_active_collected_project(
         .map(|result| result.current_chunk_targets.clone())
         .unwrap_or_else(|| {
             activation
-                .current_chunk_targets
+                .current_chunk_targets()
                 .clone()
                 .into_iter()
                 .collect()
         });
-    // The Git history walk needs the version-1 record (its own path-bearing
-    // lane, untouched this milestone); a project with no attachment reaches
-    // the degradation arm below instead, exactly as a denied Git lease does.
+    // The Git history walk consumes the activation's version-independent
+    // chunk targets. A project with no attachment reaches the degradation arm
+    // below instead, exactly as a denied Git lease does.
     let git_stats = if let (Some(project), Some(git_root)) = (project, git_root) {
         let mut git_ctx = super::git_history::GitIndexContext {
             f,
@@ -1555,7 +1578,7 @@ fn index_active_collected_project(
     let snapshot_id = staged
         .as_ref()
         .map(|staged| staged.snapshot_id.as_str())
-        .unwrap_or(activation.snapshot_id.as_str());
+        .unwrap_or(activation.snapshot_id());
     stats
         .publication
         .stage_collected_snapshot_git_current_if_needed(
@@ -1568,7 +1591,7 @@ fn index_active_collected_project(
         );
     if let Some(staged) = staged {
         stats.indexed_docs += staged.document_count;
-        stats.indexed_files += stored.descriptor.file_count;
+        stats.indexed_files += stored.descriptor().file_count;
     }
     Ok(())
 }
@@ -4039,20 +4062,22 @@ mod collected_materialization_tests {
         generation_id: &str,
         selector: &str,
         snapshot_id: &str,
-    ) -> bbox_code_source_store::ActivationRecord {
-        bbox_code_source_store::ActivationRecord {
-            version: 1,
-            project_id: project_id.to_string(),
-            generation_id: generation_id.to_string(),
-            selector: selector.to_string(),
-            snapshot_id: snapshot_id.to_string(),
-            document_count: 0,
-            entity_inventory_sha256: "0".repeat(64),
-            current_chunk_targets: Default::default(),
-            activated_unix_secs: 0,
-            cutback_pending: false,
-            diagnostic: None,
-        }
+    ) -> bbox_code_source_store::MixedActivationRecord {
+        bbox_code_source_store::MixedActivationRecord::LegacyV1(
+            bbox_code_source_store::ActivationRecord {
+                version: 1,
+                project_id: project_id.to_string(),
+                generation_id: generation_id.to_string(),
+                selector: selector.to_string(),
+                snapshot_id: snapshot_id.to_string(),
+                document_count: 0,
+                entity_inventory_sha256: "0".repeat(64),
+                current_chunk_targets: Default::default(),
+                activated_unix_secs: 0,
+                cutback_pending: false,
+                diagnostic: None,
+            },
+        )
     }
 
     /// A synthetic OUTGOING selector: the same project and generation, a
@@ -4497,6 +4522,199 @@ mod purge_exemption_tests {
                 .to_string()
                 .contains("preservation inventory mismatch")
         );
+    }
+
+    struct CatalogRecords;
+
+    impl bbox_corpus_core::project_record::ProjectRecordsProvider for CatalogRecords {
+        fn records_snapshot(&self) -> bbox_corpus_core::project_record::ProjectRecordsSnapshot {
+            bbox_corpus_core::project_record::ProjectRecordsSnapshot::empty()
+        }
+
+        fn catalog_authority(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn catalog_v2_activation_survives_the_collected_preservation_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let transcript_index = crate::index::TranscriptIndex::open_or_create_with_records(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(CatalogRecords),
+        )
+        .unwrap();
+        let config = transcript_index.reindex_config();
+        assert_eq!(
+            config.code_source_record_mode,
+            bbox_code_source_store::RuntimeRecordMode::CatalogV2
+        );
+        let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
+            &config.code_source_store_path,
+            bbox_code_source_store::StoreLimits::default(),
+            config.code_source_record_mode,
+        )
+        .unwrap();
+
+        let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(
+            "p_0000000000000000000000000000c0de",
+        )
+        .unwrap();
+        let scope =
+            bbox_corpus_core::identity::PublishedScope::try_new("catalog-v2-repo", ".").unwrap();
+        let bytes = b"pub fn catalog_v2() {}\n";
+        let content_sha256 = hex::encode(Sha256::digest(bytes));
+        let entry = bbox_code_source::ManifestEntry {
+            relative_path: "src/lib.rs".into(),
+            content_sha256: content_sha256.clone(),
+            size: bytes.len() as u64,
+        };
+        let entries = vec![entry];
+        let head_commit = "b".repeat(40);
+        let descriptor = bbox_code_source::GenerationDescriptor {
+            schema_version: bbox_code_source::SCHEMA_VERSION,
+            walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head_commit.clone(),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head_commit, &entries),
+            manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+            file_count: 1,
+            logical_bytes: bytes.len() as u64,
+        };
+        let upload = store
+            .begin_upload("catalog-v2-producer", descriptor)
+            .unwrap();
+        store
+            .put_manifest_page("catalog-v2-producer", &upload.upload_id, 0, &entries)
+            .unwrap();
+        let missing = store
+            .complete_manifest("catalog-v2-producer", &upload.upload_id)
+            .unwrap();
+        assert_eq!(missing.hashes, vec![content_sha256.clone()]);
+        store
+            .install_blob(
+                "catalog-v2-producer",
+                &upload.upload_id,
+                &content_sha256,
+                bytes.len() as u64,
+                bytes.as_slice(),
+            )
+            .unwrap();
+        let generation = store
+            .finalize_upload_mixed("catalog-v2-producer", &upload.upload_id)
+            .unwrap();
+        let generation_id = generation.generation_id().to_string();
+        let selector = collected_materialization_selector(project_id.as_str(), &generation_id);
+        let snapshot_id =
+            bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id.as_str(), &generation_id);
+        let entity_id = "project_file:catalog-v2";
+        let mut inventory = Sha256::new();
+        inventory.update((entity_id.len() as u64).to_be_bytes());
+        inventory.update(entity_id.as_bytes());
+        let entity_inventory_sha256 = hex::encode(inventory.finalize());
+        store
+            .record_materialization_mixed(
+                &scope,
+                &generation_id,
+                1,
+                entity_inventory_sha256.clone(),
+            )
+            .unwrap();
+        store
+            .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
+                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                project_id: project_id.clone(),
+                published_scope: scope.clone(),
+                generation_id: generation_id.clone(),
+                selector: selector.clone(),
+                snapshot_id: snapshot_id.clone(),
+                document_count: 1,
+                entity_inventory_sha256,
+                current_chunk_targets: Default::default(),
+                activated_unix_secs: 1,
+                cutback_pending: false,
+                cutback: None,
+                diagnostic: None,
+            })
+            .unwrap();
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&config.projects_path);
+        let snapshot_dir = bbox_edge_sidecar::snapshot::snapshot_dir(
+            &edges_dir,
+            project_id.as_str(),
+            &snapshot_id,
+        );
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(snapshot_dir.join("project.jsonl"), b"").unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
+            &edges_dir,
+            project_id.as_str(),
+            scope.repo_id(),
+            &head_commit,
+            &generation_id,
+            &selector,
+            &snapshot_id,
+            || Ok(()),
+        )
+        .unwrap();
+
+        let index = transcript_index.index_handle();
+        let fields = transcript_index.field_handles();
+        let mut writer: IndexWriter = index.writer(50_000_000).unwrap();
+        let catalog_project = bbox_corpus_core::project_catalog::CorpusProject {
+            project_id: project_id.clone(),
+            scope: bbox_corpus_core::project_catalog::ProjectScope::Published(scope.clone()),
+            operator_aliases: Default::default(),
+            nominated_aliases: Default::default(),
+            display_name: "catalog v2 test".into(),
+            created_at: "2026-08-09T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: None,
+            languages: Default::default(),
+        };
+        let identity = CodeProjectIdentity::from_catalog(&catalog_project, None);
+        let active = ActiveCollectedSource {
+            selector: selector.clone(),
+            generation_id: generation_id.clone(),
+        };
+        let mut meta = HashMap::new();
+        let mut stats = ProjectIndexStats::default();
+        index_active_collected_project(
+            &identity,
+            None,
+            None,
+            &active,
+            &store,
+            fields,
+            &mut writer,
+            &mut meta,
+            &edges_dir,
+            &root.join("git-meta"),
+            false,
+            false,
+            &mut stats,
+        )
+        .unwrap();
+        let mut document = TantivyDocument::new();
+        document.add_text(fields.doc_type, "project_file");
+        document.add_text(fields.code_source_selector, &selector);
+        document.add_text(fields.entity_id, entity_id);
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+
+        let preserved = collect_preserved_collected_documents(&index, &config, fields).unwrap();
+        assert_eq!(
+            preserved.project_ids,
+            BTreeSet::from([project_id.to_string()])
+        );
+        assert_eq!(preserved.documents.len(), 1);
     }
 
     #[test]

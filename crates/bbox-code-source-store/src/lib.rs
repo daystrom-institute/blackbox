@@ -703,6 +703,13 @@ impl MixedActivationRecord {
         }
     }
 
+    pub fn current_chunk_targets(&self) -> &BTreeMap<String, EntityRef> {
+        match self {
+            Self::LegacyV1(record) => &record.current_chunk_targets,
+            Self::CurrentV2(record) => &record.current_chunk_targets,
+        }
+    }
+
     pub fn activated_unix_secs(&self) -> u64 {
         match self {
             Self::LegacyV1(record) => record.activated_unix_secs,
@@ -729,7 +736,7 @@ impl MixedActivationRecord {
     pub fn is_cutback_pending(&self) -> bool {
         match self {
             Self::CurrentV2(record) => record.cutback_pending,
-            Self::LegacyV1(_) => false,
+            Self::LegacyV1(record) => record.cutback_pending,
         }
     }
 }

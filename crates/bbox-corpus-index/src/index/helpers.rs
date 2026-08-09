@@ -49,6 +49,7 @@ pub fn find_session_file(
         meta_path: PathBuf::new(),
         projects_path: PathBuf::new(),
         code_source_store_path: PathBuf::new(),
+        code_source_record_mode: bbox_code_source_store::RuntimeRecordMode::BridgeV1,
         knowledge_path: PathBuf::new(),
         threads_path: PathBuf::new(),
         roadmap_path: PathBuf::new(),

@@ -599,9 +599,15 @@ pub(super) fn plan_project_sources(
     // Health writes are best-effort per project: a store that cannot be
     // opened must degrade planning to today's warn-only behavior, never fail
     // the pass.
-    let health_store = bbox_code_source_store::CodeSourceStore::open(
+    let record_mode = if records_provider.catalog_authority() {
+        bbox_code_source_store::RuntimeRecordMode::CatalogV2
+    } else {
+        bbox_code_source_store::RuntimeRecordMode::BridgeV1
+    };
+    let health_store = bbox_code_source_store::CodeSourceStore::open_with_mode(
         &config.code_source_store_path,
         bbox_code_source_store::StoreLimits::default(),
+        record_mode,
     )
     .map_err(|error| {
         tracing::warn!(%error, "code-source store unavailable; planning health records skipped");
@@ -626,8 +632,8 @@ pub(super) fn plan_project_sources(
         };
         let cutback_pending = health_store
             .as_ref()
-            .and_then(|store| store.load_activation(project_id).ok().flatten())
-            .is_some_and(|activation| activation.cutback_pending);
+            .and_then(|store| store.load_activation_mixed(project_id).ok().flatten())
+            .is_some_and(|activation| activation.is_cutback_pending());
         let effective = classify_effective_source(
             project_id,
             identity.as_ref(),

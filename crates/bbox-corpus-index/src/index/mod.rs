@@ -167,6 +167,10 @@ pub struct ReindexConfig {
     pub meta_path: PathBuf,
     pub projects_path: PathBuf,
     pub code_source_store_path: PathBuf,
+    /// Record codec selected by the injected project authority. Reindex
+    /// readers must reopen the code-source store with this mode instead of
+    /// defaulting catalog state back to the bridge-v1 decoder.
+    pub code_source_record_mode: bbox_code_source_store::RuntimeRecordMode,
     pub knowledge_path: PathBuf,
     pub threads_path: PathBuf,
     pub roadmap_path: PathBuf,
@@ -424,10 +428,16 @@ impl TranscriptIndex {
         schema_replacement_guard: Option<schema_replacement::SchemaReplacementGuard>,
         replacement_intent: schema_replacement::CatalogReplacementIntentV1,
     ) -> Result<Self> {
+        let code_source_record_mode = if records_provider.catalog_authority() {
+            bbox_code_source_store::RuntimeRecordMode::CatalogV2
+        } else {
+            bbox_code_source_store::RuntimeRecordMode::BridgeV1
+        };
         let replacement = reset_index_on_schema_mismatch(
             index_path,
             &projects_path,
             &code_source_store_path,
+            code_source_record_mode,
             schema_replacement_guard.as_ref(),
             replacement_intent,
         )?;
@@ -494,6 +504,7 @@ impl TranscriptIndex {
             meta_path,
             projects_path,
             code_source_store_path,
+            code_source_record_mode,
             knowledge_path,
             threads_path,
             roadmap_path,
@@ -1301,6 +1312,7 @@ fn reset_index_on_schema_mismatch(
     index_path: &Path,
     projects_path: &Path,
     code_source_store_path: &Path,
+    code_source_record_mode: bbox_code_source_store::RuntimeRecordMode,
     guard: Option<&schema_replacement::SchemaReplacementGuard>,
     intent: schema_replacement::CatalogReplacementIntentV1,
 ) -> Result<schema_replacement::IndexReplacementOutcomeV1> {
@@ -1381,7 +1393,11 @@ fn reset_index_on_schema_mismatch(
         let edges_dir =
             bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
         let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
-        verify_collected_schema_migration_sources(&manifest, code_source_store_path)?;
+        verify_collected_schema_migration_sources(
+            &manifest,
+            code_source_store_path,
+            code_source_record_mode,
+        )?;
         // P3-E: fail closed. Before this milestone the drop below was
         // unconditional for every caller. An absent guard now refuses it
         // outright rather than silently dropping a history population no
@@ -1432,6 +1448,7 @@ fn reset_index_on_schema_mismatch(
 fn verify_collected_schema_migration_sources(
     manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
     code_source_store_path: &Path,
+    code_source_record_mode: bbox_code_source_store::RuntimeRecordMode,
 ) -> Result<()> {
     let collected = manifest
         .workspaces
@@ -1448,28 +1465,28 @@ fn verify_collected_schema_migration_sources(
     if collected.is_empty() {
         return Ok(());
     }
-    let store = bbox_code_source_store::CodeSourceStore::open(
+    let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
         code_source_store_path,
         bbox_code_source_store::StoreLimits::default(),
+        code_source_record_mode,
     )?;
     for (project_id, selector, generation) in collected {
-        let activation = store.load_activation(project_id)?.ok_or_else(|| {
+        let activation = store.load_activation_mixed(project_id)?.ok_or_else(|| {
             anyhow::anyhow!("active collected source has no migration activation record")
         })?;
-        if activation.selector != selector || generation != Some(activation.generation_id.as_str())
-        {
+        if activation.selector() != selector || generation != Some(activation.generation_id()) {
             anyhow::bail!("active collected source migration metadata is inconsistent");
         }
-        let stored = store.find_generation(&activation.generation_id)?;
+        let stored = store.find_generation_mixed(activation.generation_id())?;
         let entries =
-            store.load_generation_entries(&stored.descriptor.scope, &activation.generation_id)?;
+            store.load_generation_entries(stored.published_scope(), activation.generation_id())?;
         for entry in entries {
             store
                 .verified_blob_file(&entry.content_sha256, entry.size)
                 .with_context(|| {
                     format!(
                         "active collected source {} cannot migrate schemas because a source blob is unavailable",
-                        activation.generation_id
+                        activation.generation_id()
                     )
                 })?;
         }
@@ -1496,6 +1513,7 @@ mod tests {
             &dir.path().join("absent-index"),
             &dir.path().join("projects.json"),
             &dir.path().join("code-sources"),
+            bbox_code_source_store::RuntimeRecordMode::BridgeV1,
             None,
             schema_replacement::CatalogReplacementIntentV1::PreserveInterrupted,
         )
