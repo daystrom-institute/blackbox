@@ -1825,6 +1825,7 @@ fn is_cutover_target_kind(kind: CheckoutAccessKind) -> bool {
         kind,
         CheckoutAccessKind::GitHistory
             | CheckoutAccessKind::Blame
+            | CheckoutAccessKind::RenderFileProvider
             | CheckoutAccessKind::ProvenanceNoteIo
             | CheckoutAccessKind::PublisherConfigTreeRead
             | CheckoutAccessKind::KnowledgeGapOverlayRead
@@ -2616,6 +2617,7 @@ mod tests {
         let observations = CheckoutAccessObservations::in_memory();
         let target_kinds = [
             CheckoutAccessKind::Blame,
+            CheckoutAccessKind::RenderFileProvider,
             CheckoutAccessKind::GitHistory,
             CheckoutAccessKind::ProvenanceNoteIo,
             CheckoutAccessKind::PublisherConfigTreeRead,
