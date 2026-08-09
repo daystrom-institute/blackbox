@@ -216,12 +216,21 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     ];
     let checkout_access = state.checkout_access_observations.health();
     sections.push(checkout_access_section(&checkout_access));
-    let knowledge_transport = state.knowledge_transport_observations.snapshot();
-    sections.push(knowledge_transport_section(
-        state,
-        &checkout_access,
-        &knowledge_transport,
-    ));
+    // Knowledge transport is a catalog authority surface. Keeping it out of
+    // bridge reports preserves the frozen bridge-parity response and avoids
+    // presenting cutover controls where no catalog marker can exist.
+    let knowledge_transport = state
+        .project_authority
+        .catalog_store()
+        .is_some()
+        .then(|| state.knowledge_transport_observations.snapshot());
+    if let Some(observations) = &knowledge_transport {
+        sections.push(knowledge_transport_section(
+            state,
+            &checkout_access,
+            observations,
+        ));
+    }
     sections.push(resolver_compat_section(state));
     // Catalog-only project health (plan section 8, P5-G). Each section is
     // observational: it reports what the catalog, the accepted pointer, and
@@ -242,9 +251,11 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
         knowledge_section(state),
         attention_section(state),
     ]);
-    Ok(DoctorReport::from_sections(sections)
-        .with_checkout_access(checkout_access)
-        .with_knowledge_transport(knowledge_transport))
+    let mut report = DoctorReport::from_sections(sections).with_checkout_access(checkout_access);
+    if let Some(observations) = knowledge_transport {
+        report = report.with_knowledge_transport(observations);
+    }
+    Ok(report)
 }
 
 /// How many per-project findings one catalog section emits before it
@@ -1869,7 +1880,6 @@ mod tests {
                 "graph",
                 "projects",
                 "checkout_access",
-                "knowledge_transport",
                 "resolver_compat",
                 "memories",
                 "knowledge",
@@ -1990,7 +2000,7 @@ mod tests {
             serde_json::to_value(&report).unwrap()["checkout_access"],
             projection
         );
-        assert!(serde_json::to_value(&report).unwrap()["knowledge_transport"].is_object());
+        assert!(serde_json::to_value(&report).unwrap()["knowledge_transport"].is_null());
 
         let checkout_section = report
             .sections
@@ -2101,6 +2111,11 @@ mod catalog_health_tests {
         assert!(status.accepted.last_verified_unix_secs.is_some());
 
         let report = run(&server).unwrap();
+        assert!(report.knowledge_transport.is_some());
+        assert_eq!(
+            section(&report, "knowledge_transport").worst(),
+            FindingLevel::Info
+        );
         assert!(
             section(&report, "accepted_publication").worst() == FindingLevel::Ok,
             "{}",
