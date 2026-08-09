@@ -379,6 +379,69 @@ never reopens fallback. Bridge, uncovered, and `LegacyLocal` project renders
 remain explicit compatibility lanes. A code deployment alone does not apply a
 production marker.
 
+### Collected code-source locality cutover
+
+This cutover makes one current collected generation authoritative and closes
+`LocalProjectWalk` plus local cutback for explicitly selected Published
+projects. It does not convert bridge, uncovered, or `LegacyLocal` projects.
+
+First deploy the candidate binary without a code-source locality marker and
+start the selected daemon. Startup records `StartupRecovery` evidence only
+after the current v2 activation and workspace manifest agree. While that daemon
+is live, run one successful full corpus rebuild:
+
+```text
+bbox_reindex(full=true)
+```
+
+The successful commit records `FullRebuild` evidence for the exact same
+generation. Run this control before preflight because an unmarked full rebuild
+may still use the compatibility local-walk lane for transcript attribution.
+Confirm the selected project remains searchable and its code-source health is
+current before continuing.
+
+Preflight requires an explicit project set, a unique configured producer for
+each published scope, a healthy current v2 activation, both exact recovery
+controls, and workspace-manifest agreement. It captures the current catalog,
+assignment, generation, evidence, and project-specific `LocalProjectWalk`
+counters. The quiet window has a hard minimum of 300 seconds.
+
+```bash
+blackbox project-catalog code-source-locality-cutover --preflight --configured \
+  --report /absolute/path/code-source-locality-report.json \
+  --project-id p_00000000000000000000000000000001
+```
+
+Leave normal traffic running for the declared window. Any selected project's
+new daemon-side `LocalProjectWalk` observation, catalog change, producer drift,
+generation change, or recovery-evidence change makes apply refuse. Run a new
+preflight after correcting the cause.
+
+Apply and verify are offline catalog operations. Obtain explicit operator
+authorization and stop only the named daemon before running them. Apply takes
+the exact project set from the reviewed report.
+
+```bash
+blackbox project-catalog code-source-locality-cutover --apply --configured \
+  --report /absolute/path/code-source-locality-report.json
+
+blackbox project-catalog code-source-locality-cutover --verify --configured
+```
+
+The installed `code-source-locality-cutover-marker.json` is checksummed and
+loaded before the listener binds. Corrupt bytes, assignment removal, published
+scope drift, or generation drift fail closed. Config reload validates the
+governed assignment before swapping the live table. The checkout broker refuses
+`LocalProjectWalk` before authority resolution or observation, and the indexer
+resolves transcript project stamps and file-tool edges from verified immutable
+generation blobs instead of checkout bytes.
+
+After the authorized daemon restarts, run a second full rebuild and validate
+search, graph, embeddings, and code-source health. This post-marker rebuild must
+leave every selected project's `LocalProjectWalk` target counters unchanged.
+Stop and investigate if offline verify then reports `changed after cutover`.
+A code deployment alone does not apply a production marker.
+
 ### After a daemon upgrade (no schema change)
 
 ```bash

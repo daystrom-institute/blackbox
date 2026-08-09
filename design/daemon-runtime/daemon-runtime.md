@@ -25,6 +25,7 @@ all of that work.
 - [Locality-first decomposition: the checkout plane and the corpus plane](locality-first-decomposition.md)
 - [Checkout-plane provenance export implementation plan](checkout-provenance-export-impl.md)
 - [Distributed code-source collector implementation plan](distributed-code-source-collector-impl.md)
+- [Code-source locality cutover: collected authority, no checkout fallback](code-source-locality-cutover-impl.md)
 - [Durable corpus project catalog implementation plan](durable-project-catalog-impl.md)
 - [Durable project catalog Phase 1 implementation plan](durable-project-catalog-phase1-impl.md)
 - [Durable project catalog Phase 2 implementation plan](durable-project-catalog-phase2-impl.md)

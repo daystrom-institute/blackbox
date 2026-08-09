@@ -166,6 +166,6 @@ The test gates cover:
 ## 5. Parent-plan effect
 
 Project render is no longer a remaining checkout reach-in for explicitly
-marked Published projects. The next locality arc is collected project-source
-coverage and the explicit replacement or deletion of `LocalProjectWalk` as a
-cutback destination.
+marked Published projects. The collected project-source successor is now
+implemented in
+[code-source-locality-cutover-impl.md](code-source-locality-cutover-impl.md).
