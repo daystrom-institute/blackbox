@@ -1765,11 +1765,11 @@ impl TranscriptIndex {
                     // attribute. Identity comes from the source-neutral
                     // `identity` field, never from a compatibility record.
                     let local_root = access.local_root?;
-                    Some(crate::index::tool_edges::ToolEdgeProjectAccess {
-                        project_id: access.project_id().to_string(),
-                        local_root: local_root.to_path_buf(),
-                        git_root: access.git_root.map(Path::to_path_buf),
-                    })
+                    Some(crate::index::tool_edges::ToolEdgeProjectAccess::local(
+                        access.project_id(),
+                        local_root.to_path_buf(),
+                        access.git_root.map(Path::to_path_buf),
+                    ))
                 })
                 .collect(),
             bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(

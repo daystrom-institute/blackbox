@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -83,19 +85,74 @@ impl ToolEdgePublishBundle {
     }
 }
 
-/// Pure project identity plus the filesystem authority the daemon/indexing
-/// boundary already validated (plan section 4.15).
+/// Pure project identity plus one validated source for transcript attribution.
 ///
-/// The carrier deliberately holds no `ProjectRecord`: the lease that proved
-/// these roots lives in the upper `bbox-indexing` layer, and putting a
-/// path-bearing record here would give this lower crate a second, unleased
-/// way to name a checkout. `local_root` and `git_root` are ephemeral for the
-/// duration of one pass and are valid only while that lease is alive.
-#[derive(Debug, Clone)]
+/// The carrier deliberately holds no `ProjectRecord`. A local source is valid
+/// only while its upper-layer checkout lease is alive. A collected source uses
+/// its attachment path strictly as a lexical transcript namespace: file bytes
+/// come only from the verified immutable generation blobs, never from that
+/// checkout.
+#[derive(Clone)]
 pub struct ToolEdgeProjectAccess {
     pub project_id: String,
-    pub local_root: PathBuf,
-    pub git_root: Option<PathBuf>,
+    pub source: ToolEdgeProjectSource,
+}
+
+#[derive(Clone)]
+pub enum ToolEdgeProjectSource {
+    Local {
+        local_root: PathBuf,
+        git_root: Option<PathBuf>,
+    },
+    Collected {
+        transcript_root: PathBuf,
+        snapshot_id: String,
+        head_commit: String,
+        files: BTreeMap<String, bbox_code_source::ManifestEntry>,
+        store: Arc<bbox_code_source_store::CodeSourceStore>,
+    },
+}
+
+impl ToolEdgeProjectAccess {
+    pub fn local(
+        project_id: impl Into<String>,
+        local_root: PathBuf,
+        git_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            source: ToolEdgeProjectSource::Local {
+                local_root,
+                git_root,
+            },
+        }
+    }
+
+    pub fn collected(
+        project_id: impl Into<String>,
+        transcript_root: PathBuf,
+        snapshot_id: String,
+        head_commit: String,
+        entries: Vec<bbox_code_source::ManifestEntry>,
+        store: Arc<bbox_code_source_store::CodeSourceStore>,
+    ) -> Result<Self> {
+        let mut files = BTreeMap::new();
+        for entry in entries {
+            if files.insert(entry.relative_path.clone(), entry).is_some() {
+                anyhow::bail!("collected tool-edge manifest contains a duplicate path");
+            }
+        }
+        Ok(Self {
+            project_id: project_id.into(),
+            source: ToolEdgeProjectSource::Collected {
+                transcript_root,
+                snapshot_id,
+                head_commit,
+                files,
+                store,
+            },
+        })
+    }
 }
 
 impl ToolEdgeContext {
@@ -149,9 +206,8 @@ impl ToolEdgeContext {
         if let Some(hit) = cache.get(cwd) {
             return hit.clone();
         }
-        let resolved = fs::canonicalize(cwd)
-            .ok()
-            .and_then(|cwd| self.project_for_absolute_path(&cwd))
+        let resolved = self
+            .project_for_cwd_path(cwd)
             .map(|(access, _)| access.project_id.clone());
         cache.insert(cwd.to_string(), resolved.clone());
         resolved
@@ -238,7 +294,7 @@ impl ToolEdgeContext {
         let Some(raw_path) = parser::tool_call_file_path(tool_call) else {
             return Ok(None);
         };
-        let Some((access, root, absolute_path)) = self.resolve_project_path(event, raw_path) else {
+        let Some(resolved) = self.resolve_project_path(event, raw_path) else {
             // Never re-identified against another project: an unattributable
             // path event is counted and dropped (plan section 9).
             self.record_unresolvable_path(event);
@@ -249,33 +305,28 @@ impl ToolEdgeContext {
             );
             return Ok(None);
         };
-        // The anchor is a project-relative path by contract. `absolute_path`
-        // came from `project_for_absolute_path`, so it is under `root`; the
-        // refusal is the guard against a future caller weakening that.
-        let Some(relative_anchor) = normalized_relative_anchor(&root, &absolute_path) else {
-            self.record_unresolvable_path(event);
-            tracing::debug!(
-                path = %absolute_path.display(),
-                "skipping tool-call edge; path is not relative to its authorized root"
-            );
-            return Ok(None);
-        };
-        let bytes = match fs::read(&absolute_path) {
-            Ok(bytes) => bytes,
+        let access = resolved.access;
+        let relative_anchor = resolved.relative_anchor;
+        let bytes = match read_resolved_bytes(&resolved) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
             Err(err) => {
-                tracing::debug!(path = %absolute_path.display(), error = %err, "skipping tool-call edge for unreadable file");
+                tracing::debug!(
+                    project_id = %access.project_id,
+                    path = %relative_anchor,
+                    error = %err,
+                    "skipping tool-call edge for unreadable source content"
+                );
                 return Ok(None);
             }
         };
         let byte_range = byte_range_for_tool(tool_call, &bytes);
-        let Some(target) = project_files::resolve_current_chunk_entity(
-            &access.project_id,
-            &root,
-            &absolute_path,
-            byte_range,
-        )?
-        else {
-            tracing::debug!(path = %absolute_path.display(), "skipping tool-call edge; current chunk target unresolved");
+        let Some(target) = resolve_current_target(&resolved, &bytes, byte_range)? else {
+            tracing::debug!(
+                project_id = %access.project_id,
+                path = %relative_anchor,
+                "skipping tool-call edge; current chunk target unresolved"
+            );
             return Ok(None);
         };
         let source = EntityRef::Transcript {
@@ -303,7 +354,7 @@ impl ToolEdgeContext {
                 tool_call,
                 &access.project_id,
                 &relative_anchor,
-                access.git_root.as_deref(),
+                resolved.commit_sha().as_deref(),
                 byte_range,
                 &bytes,
             ),
@@ -425,13 +476,13 @@ impl ToolEdgeContext {
         Ok(1)
     }
 
-    // index-build path; runs on the IndexWriterActor / reindex thread.
+    // Index-build path; runs on the IndexWriterActor / reindex thread.
     #[allow(clippy::disallowed_methods)]
     fn resolve_project_path<'a>(
         &'a self,
         event: &ParsedEvent,
         raw_path: &str,
-    ) -> Option<(&'a ToolEdgeProjectAccess, PathBuf, PathBuf)> {
+    ) -> Option<ResolvedProjectPath<'a>> {
         let raw = Path::new(raw_path);
         let absolute = if raw.is_absolute() {
             raw.to_path_buf()
@@ -439,30 +490,184 @@ impl ToolEdgeContext {
             let cwd = event.cwd.as_deref()?;
             Path::new(cwd).join(raw)
         };
-        let absolute = fs::canonicalize(absolute).ok()?;
-        let (project, root) = self.project_for_absolute_path(&absolute)?;
-        Some((project, root, absolute))
+        let local = fs::canonicalize(&absolute)
+            .ok()
+            .and_then(|absolute| self.resolved_path_for_source(&absolute, true));
+        let collected = normalize_lexical_absolute(&absolute)
+            .and_then(|absolute| self.resolved_path_for_source(&absolute, false));
+        most_specific_resolved(local, collected)
     }
 
     fn project_for_cwd(&self, event: &ParsedEvent) -> Option<(&ToolEdgeProjectAccess, PathBuf)> {
-        let cwd = event.cwd.as_deref()?;
-        let cwd = fs::canonicalize(cwd).ok()?;
-        self.project_for_absolute_path(&cwd)
+        self.project_for_cwd_path(event.cwd.as_deref()?)
+    }
+
+    fn project_for_cwd_path(&self, cwd: &str) -> Option<(&ToolEdgeProjectAccess, PathBuf)> {
+        let local = fs::canonicalize(cwd)
+            .ok()
+            .and_then(|cwd| self.project_for_absolute_path(&cwd, true));
+        let collected = normalize_lexical_absolute(Path::new(cwd))
+            .and_then(|cwd| self.project_for_absolute_path(&cwd, false));
+        most_specific_project(local, collected)
     }
 
     fn project_for_absolute_path(
         &self,
         absolute: &Path,
+        local: bool,
     ) -> Option<(&ToolEdgeProjectAccess, PathBuf)> {
         self.projects
             .iter()
             .filter_map(|access| {
-                absolute
-                    .starts_with(&access.local_root)
-                    .then_some((access, access.local_root.clone()))
+                let root = match &access.source {
+                    ToolEdgeProjectSource::Local { local_root, .. } if local => local_root,
+                    ToolEdgeProjectSource::Collected {
+                        transcript_root, ..
+                    } if !local => transcript_root,
+                    _ => return None,
+                };
+                absolute.starts_with(root).then_some((access, root.clone()))
             })
             .max_by_key(|(_access, root)| root.as_os_str().len())
     }
+
+    fn resolved_path_for_source<'a>(
+        &'a self,
+        absolute: &Path,
+        local: bool,
+    ) -> Option<ResolvedProjectPath<'a>> {
+        let (access, root) = self.project_for_absolute_path(absolute, local)?;
+        let relative_anchor = normalized_relative_anchor(&root, absolute)?;
+        Some(ResolvedProjectPath {
+            access,
+            root,
+            absolute: absolute.to_path_buf(),
+            relative_anchor,
+        })
+    }
+}
+
+struct ResolvedProjectPath<'a> {
+    access: &'a ToolEdgeProjectAccess,
+    root: PathBuf,
+    absolute: PathBuf,
+    relative_anchor: String,
+}
+
+impl ResolvedProjectPath<'_> {
+    fn commit_sha(&self) -> Option<String> {
+        match &self.access.source {
+            ToolEdgeProjectSource::Local { git_root, .. } => git_root
+                .as_deref()
+                .and_then(bbox_corpus_core::git::current_head),
+            ToolEdgeProjectSource::Collected { head_commit, .. } => Some(head_commit.clone()),
+        }
+    }
+}
+
+fn most_specific_resolved<'a>(
+    left: Option<ResolvedProjectPath<'a>>,
+    right: Option<ResolvedProjectPath<'a>>,
+) -> Option<ResolvedProjectPath<'a>> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if left.root.as_os_str().len() >= right.root.as_os_str().len() {
+                Some(left)
+            } else {
+                Some(right)
+            }
+        }
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn most_specific_project<'a>(
+    left: Option<(&'a ToolEdgeProjectAccess, PathBuf)>,
+    right: Option<(&'a ToolEdgeProjectAccess, PathBuf)>,
+) -> Option<(&'a ToolEdgeProjectAccess, PathBuf)> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if left.1.as_os_str().len() >= right.1.as_os_str().len() {
+                Some(left)
+            } else {
+                Some(right)
+            }
+        }
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn read_resolved_bytes(resolved: &ResolvedProjectPath<'_>) -> Result<Option<Vec<u8>>> {
+    match &resolved.access.source {
+        ToolEdgeProjectSource::Local { .. } => match fs::read(&resolved.absolute) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        },
+        ToolEdgeProjectSource::Collected { files, store, .. } => {
+            let Some(entry) = files.get(&resolved.relative_anchor) else {
+                return Ok(None);
+            };
+            let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+            let capacity = usize::try_from(entry.size)
+                .map_err(|_| anyhow::anyhow!("collected tool-edge blob exceeds address space"))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            file.read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != entry.size {
+                anyhow::bail!("collected tool-edge blob size changed after verification");
+            }
+            Ok(Some(bytes))
+        }
+    }
+}
+
+fn resolve_current_target(
+    resolved: &ResolvedProjectPath<'_>,
+    bytes: &[u8],
+    byte_range: Option<(u64, u64)>,
+) -> Result<Option<EntityRef>> {
+    match &resolved.access.source {
+        ToolEdgeProjectSource::Local { .. } => project_files::resolve_current_chunk_entity(
+            &resolved.access.project_id,
+            &resolved.root,
+            &resolved.absolute,
+            byte_range,
+        ),
+        ToolEdgeProjectSource::Collected { snapshot_id, .. } => {
+            project_files::resolve_collected_chunk_entity(
+                &resolved.access.project_id,
+                Path::new(&resolved.relative_anchor),
+                bytes,
+                snapshot_id,
+                byte_range,
+            )
+        }
+    }
+}
+
+fn normalize_lexical_absolute(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Some(normalized)
 }
 
 /// The project-relative anchor for a path inside an authorized root, with
@@ -488,7 +693,7 @@ fn anchor_metadata(
     tool_call: &ToolCallInfo,
     project_id: &str,
     relative_anchor: &str,
-    git_root: Option<&Path>,
+    commit_sha: Option<&str>,
     byte_range: Option<(u64, u64)>,
     bytes: &[u8],
 ) -> BTreeMap<String, String> {
@@ -500,8 +705,11 @@ fn anchor_metadata(
         metadata.insert("anchor.byte_end".to_string(), end.to_string());
     }
     metadata.insert("anchor.content_hash_at_edit".to_string(), sha256_hex(bytes));
-    if let Some(commit_sha) = git_root.and_then(bbox_corpus_core::git::current_head) {
-        metadata.insert("anchor.commit_sha_at_edit".to_string(), commit_sha);
+    if let Some(commit_sha) = commit_sha {
+        metadata.insert(
+            "anchor.commit_sha_at_edit".to_string(),
+            commit_sha.to_string(),
+        );
     }
     metadata.insert(
         "anchor.edit_timestamp".to_string(),
@@ -679,11 +887,11 @@ mod tests {
         let source = root.join("src.rs");
         fs::write(&source, "pub fn visible() {}\n").unwrap();
         let ctx = ToolEdgeContext::with_project_access(
-            vec![ToolEdgeProjectAccess {
-                project_id: "project-1".into(),
-                local_root: root.clone(),
-                git_root: None,
-            }],
+            vec![ToolEdgeProjectAccess::local(
+                "project-1",
+                root.clone(),
+                None,
+            )],
             root.join("edges"),
             true,
         );
@@ -727,6 +935,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collected_source_resolves_tool_edges_without_reading_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let transcript_root = root.join("checkout-that-does-not-exist");
+        let relative_path = "src/lib.rs";
+        let bytes = b"pub fn collected() {}\n";
+        let hash = sha256_hex(bytes);
+        let store = Arc::new(
+            bbox_code_source_store::CodeSourceStore::open(
+                root.join("code-sources"),
+                bbox_code_source_store::StoreLimits::default(),
+            )
+            .unwrap(),
+        );
+        let blob_path = store.blob_path(&hash);
+        fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        fs::write(&blob_path, bytes).unwrap();
+        let snapshot_id = "collected-00000000000000000000000000000000";
+        let ctx = ToolEdgeContext::with_project_access(
+            vec![
+                ToolEdgeProjectAccess::collected(
+                    "project-1",
+                    transcript_root.clone(),
+                    snapshot_id.into(),
+                    "a".repeat(40),
+                    vec![bbox_code_source::ManifestEntry {
+                        relative_path: relative_path.into(),
+                        content_sha256: hash.clone(),
+                        size: bytes.len() as u64,
+                    }],
+                    store,
+                )
+                .unwrap(),
+            ],
+            root.join("edges"),
+            true,
+        );
+        let event = read_event(
+            "sess-collected",
+            &transcript_root,
+            &transcript_root.join(relative_path),
+        );
+
+        let edge = ctx
+            .build_event_edges(&event, "claude", 10, 0)
+            .unwrap()
+            .expect("verified collected bytes resolve the tool edge");
+        assert!(matches!(
+            edge.target,
+            EntityRef::ProjectFileV2 {
+                ref project_id,
+                ref snapshot_id,
+                ..
+            } if project_id == "project-1"
+                && snapshot_id == "collected-00000000000000000000000000000000"
+        ));
+        assert_eq!(edge.metadata["anchor.file_path"], relative_path);
+        assert_eq!(edge.metadata["anchor.content_hash_at_edit"], hash);
+        assert_eq!(edge.metadata["anchor.commit_sha_at_edit"], "a".repeat(40));
+        assert_eq!(
+            ctx.base_project_id_for_cwd(transcript_root.to_str().unwrap()),
+            Some("project-1".into())
+        );
+        assert!(
+            !transcript_root.exists(),
+            "collected attribution must not materialize or read the checkout"
+        );
+    }
+
     fn read_event(session_id: &str, cwd: &Path, file_path: &Path) -> ParsedEvent {
         ParsedEvent {
             role: MessageRole::ToolUse,
@@ -762,11 +1040,11 @@ mod tests {
         fs::write(&remote_source, "pub fn elsewhere() {}\n").unwrap();
 
         let ctx = ToolEdgeContext::with_project_access(
-            vec![ToolEdgeProjectAccess {
-                project_id: "attached-project".into(),
-                local_root: attached.clone(),
-                git_root: None,
-            }],
+            vec![ToolEdgeProjectAccess::local(
+                "attached-project",
+                attached.clone(),
+                None,
+            )],
             root.join("edges"),
             true,
         );
@@ -829,11 +1107,11 @@ mod tests {
         let source = nested.join("src.rs");
         fs::write(&source, "pub fn nested() {}\n").unwrap();
         let ctx = ToolEdgeContext::with_project_access(
-            vec![ToolEdgeProjectAccess {
-                project_id: "project-1".into(),
-                local_root: root.clone(),
-                git_root: None,
-            }],
+            vec![ToolEdgeProjectAccess::local(
+                "project-1",
+                root.clone(),
+                None,
+            )],
             root.join("edges"),
             true,
         );

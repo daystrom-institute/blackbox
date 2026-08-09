@@ -155,6 +155,99 @@ impl Drop for DirtyRestore<'_> {
     }
 }
 
+fn tool_edge_project_access(
+    config: &ReindexConfig,
+    records_provider: &Arc<dyn ProjectRecordsProvider>,
+    plans: &[super::writer_actor::ProjectSourcePlan],
+) -> Result<Vec<ToolEdgeProjectAccess>> {
+    let needs_collected = plans.iter().any(|plan| {
+        records_provider.code_source_locality_governed(&plan.project_id)
+            && matches!(
+                plan.effective,
+                super::writer_actor::EffectiveSource::Collected { .. }
+            )
+    });
+    let collected_store = needs_collected
+        .then(|| {
+            bbox_code_source_store::CodeSourceStore::open_with_mode(
+                &config.code_source_store_path,
+                bbox_code_source_store::StoreLimits::default(),
+                bbox_code_source_store::RuntimeRecordMode::CatalogV2,
+            )
+            .map(Arc::new)
+        })
+        .transpose()?;
+    let mut projects = Vec::new();
+    for plan in plans {
+        let Some(access) = plan.access.as_ref() else {
+            continue;
+        };
+        let governed = records_provider.code_source_locality_governed(&plan.project_id);
+        if governed && access.local.is_some() {
+            anyhow::bail!(
+                "governed collected project {} retained a LocalProjectWalk lease",
+                plan.project_id
+            );
+        }
+        if let Some(local) = access.local.as_ref() {
+            projects.push(ToolEdgeProjectAccess::local(
+                &plan.project_id,
+                local.project_root().to_path_buf(),
+                access
+                    .git
+                    .as_ref()
+                    .map(|git| git.checkout_root().to_path_buf()),
+            ));
+            continue;
+        }
+        if !governed {
+            continue;
+        }
+        let super::writer_actor::EffectiveSource::Collected { generation } = &plan.effective else {
+            anyhow::bail!(
+                "governed code-source project {} has no active collected generation",
+                plan.project_id
+            );
+        };
+        let store = collected_store
+            .as_ref()
+            .expect("governed collected plans opened the code-source store");
+        let activation = store
+            .load_activation_mixed(&plan.project_id)?
+            .with_context(|| {
+                format!(
+                    "governed code-source project {} has no activation",
+                    plan.project_id
+                )
+            })?;
+        let bbox_code_source_store::MixedActivationRecord::CurrentV2(activation) = activation
+        else {
+            anyhow::bail!("governed code-source project has a legacy activation");
+        };
+        if activation.generation_id != *generation {
+            anyhow::bail!("governed code-source plan and activation generation disagree");
+        }
+        let stored = store.find_generation_mixed(generation)?;
+        let bbox_code_source_store::MixedStoredGeneration::CurrentV2(stored) = stored else {
+            anyhow::bail!("governed code-source project has a legacy generation");
+        };
+        activation.validate_against_generation(&stored)?;
+        if stored.state != bbox_code_source::GenerationState::Active {
+            anyhow::bail!("governed code-source generation is not active");
+        }
+        let entries = store.load_generation_entries(&activation.published_scope, generation)?;
+        projects.push(ToolEdgeProjectAccess::collected(
+            &plan.project_id,
+            std::path::PathBuf::from(&access.project.canonical_path),
+            activation.snapshot_id,
+            stored.descriptor.head_commit,
+            entries,
+            Arc::clone(store),
+        )?);
+    }
+    Ok(projects)
+}
+
 /// Gate + dispatch for one scheduled reindex tick. The cheap speculative
 /// scan runs here on the scheduler thread; the pass itself executes inside
 /// the IndexWriterActor (the daemon's only in-process tantivy writer), so
@@ -451,23 +544,7 @@ pub(super) fn execute_reindex_pass(
         .unwrap_or_default();
     let mut skipped = 0u64;
     let tool_edges = ToolEdgeContext::with_project_access(
-        leased
-            .iter()
-            .filter_map(|access| {
-                // The lower carrier is built ONLY from a live
-                // `LocalProjectWalk` lease, and `leased` holds that lease
-                // alive for the whole pass (plan section 8, tool-edge items
-                // 4 and 5).
-                access.local.as_ref().map(|local| ToolEdgeProjectAccess {
-                    project_id: access.project.project_id.clone(),
-                    local_root: local.project_root().to_path_buf(),
-                    git_root: access
-                        .git
-                        .as_ref()
-                        .map(|git| git.checkout_root().to_path_buf()),
-                })
-            })
-            .collect(),
+        tool_edge_project_access(config, records_provider, &plans)?,
         edges_dir.clone(),
         !full,
     );
@@ -1094,11 +1171,11 @@ pub fn backfill_tool_edges_for_project<G>(
     let edges_dir =
         bbox_edge_index::edge_index::edges_dir_from_projects_path(&config.projects_path);
     let ctx = ToolEdgeContext::for_project_access(
-        ToolEdgeProjectAccess {
-            project_id: project_id.to_string(),
-            local_root: local_root.to_path_buf(),
-            git_root: git_root.map(std::path::Path::to_path_buf),
-        },
+        ToolEdgeProjectAccess::local(
+            project_id,
+            local_root.to_path_buf(),
+            git_root.map(std::path::Path::to_path_buf),
+        ),
         edges_dir.clone(),
     );
     let registry = TranscriptAdapterRegistry::from_reindex_config(config);
