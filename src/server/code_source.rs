@@ -4746,7 +4746,9 @@ impl std::error::Error for StagingSecurityRefusal {}
 fn classify_checkout_error(error: &CheckoutAccessError) -> CutbackAttemptOutcome {
     use bbox_indexing::checkout_access::CheckoutAccessErrorCode as Code;
     let outcome = match error.code {
-        Code::AttachmentNotFound | Code::ObservationUnavailable => {
+        Code::AttachmentNotFound
+        | Code::ObservationUnavailable
+        | Code::KnowledgeTransportAuthoritative => {
             CutbackAttemptOutcome::Structural(CutbackReason::NoLocalAttachment)
         }
         Code::ScopeMismatch => CutbackAttemptOutcome::Structural(CutbackReason::ScopeMismatch),

@@ -118,6 +118,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         checkout_access_observations,
         resolver_compat: crate::server::resolver_compat::ResolverCompatObservations::in_memory(),
         checkout_access,
+        knowledge_transport_observations:
+            bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
         publisher_refs: RwLock::new(
             bbox_indexing::publisher::PublisherRefStore::open(
                 tmp.path().join("publisher-refs.json"),
@@ -157,6 +159,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         ),
         git_transport_cutover: Arc::new(
             bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default(),
+        ),
+        knowledge_transport_cutover: Arc::new(
+            bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(),
         ),
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),

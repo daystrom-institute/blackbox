@@ -535,6 +535,17 @@ impl BlackboxServer {
             let verified = match runtime.load_verified(&target.project_id) {
                 Ok(verified) => verified,
                 Err(error) => {
+                    if self
+                        .state
+                        .knowledge_transport_cutover
+                        .covers_project(&target.project_id)
+                    {
+                        self.observe_knowledge_transport_operation(
+                            target.project_id.as_str(),
+                            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::PublishedGaps,
+                            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                        );
+                    }
                     diagnostics.push(super::knowledge_view::catalog_publication_diagnostic(
                         target.project_id.as_str(),
                         &error,
@@ -542,6 +553,11 @@ impl BlackboxServer {
                     continue;
                 }
             };
+            self.observe_knowledge_transport_operation(
+                target.project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::PublishedGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
+            );
             diagnostics.extend(super::knowledge_view::catalog_publication_degradations(
                 target.project_id.as_str(),
                 &verified,
@@ -617,25 +633,101 @@ impl BlackboxServer {
         built_from: &mut BuiltFromTable,
         diagnostics: &mut Vec<String>,
     ) -> Result<()> {
+        let transport_coverage = self
+            .state
+            .knowledge_transport_coverage_for_project(project_id.as_str())?
+            .unwrap_or(
+                bbox_indexing::knowledge_transport_cutover::KnowledgeTransportRuntimeCoverageV1::Uncovered,
+            );
+        if transport_coverage.transport_governed()
+            && (session_workspace
+                .is_some_and(|workspace| workspace.project_id != project_id.as_str())
+                || session_checkout
+                    .is_some_and(|checkout| checkout.project_id != project_id.as_str()))
+        {
+            return Ok(());
+        }
+        if transport_coverage.transport_governed() && !transport_coverage.current() {
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+            );
+            anyhow::bail!(
+                "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} is pending knowledge transport re-cutover"
+            );
+        }
         if let Some(workspace) =
             session_workspace.filter(|workspace| workspace.project_id == project_id.as_str())
         {
             let pair = self
                 .remote_provisional_overlays(workspace, verified)
                 .map_err(|error| {
+                    self.observe_knowledge_transport_operation(
+                        project_id.as_str(),
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                    );
                     anyhow::anyhow!("{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: {error:#}")
                 })?;
             let pair = pair.ok_or_else(|| {
+                self.observe_knowledge_transport_operation(
+                    project_id.as_str(),
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                );
                 anyhow::anyhow!(
                     "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: no live provisional generation is selected for the bound workspace"
                 )
             })?;
             if pair.gaps.status != GapOverlayStatus::Valid {
+                self.observe_knowledge_transport_operation(
+                    project_id.as_str(),
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                );
                 anyhow::bail!(
                     "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} workspace {}: {}",
                     workspace.workspace_id,
                     pair.gaps.diagnostics.join("; ")
                 );
+            }
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
+            );
+            if !transport_coverage.transport_governed() {
+                let local = self
+                    .catalog_overlay_attachment(project_id, workspace.workspace_id.as_str())
+                    .and_then(|attachment| {
+                        attachment.map_err(super::knowledge_view::provisional_overlay_unavailable)
+                    })
+                    .and_then(|attachment| {
+                        self.refresh_catalog_gap_overlay(verified, &attachment)
+                            .map_err(super::knowledge_view::provisional_overlay_unavailable)
+                    });
+                match local {
+                    Ok(local) if local.status == GapOverlayStatus::Valid => {
+                        self.observe_knowledge_transport_operation(
+                            project_id.as_str(),
+                            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Local,
+                        );
+                        self.observe_knowledge_transport_shadow(
+                            project_id.as_str(),
+                            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                            Some(workspace.workspace_id.as_str()),
+                            &local.snapshot_id,
+                            &pair.gaps.snapshot_id,
+                        );
+                    }
+                    Ok(_) | Err(_) => self.observe_knowledge_transport_operation(
+                        project_id.as_str(),
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                    ),
+                }
             }
             diagnostics.extend(pair.gaps.diagnostics.iter().map(|diagnostic| {
                 format!(
@@ -659,6 +751,16 @@ impl BlackboxServer {
             }
             return Ok(());
         }
+        if transport_coverage.transport_governed() {
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+            );
+            anyhow::bail!(
+                "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} requires a live bound remote workspace"
+            );
+        }
         let Some(own) = session_checkout.filter(|own| own.project_id == project_id.as_str()) else {
             return Ok(());
         };
@@ -680,11 +782,40 @@ impl BlackboxServer {
                 )
             })?;
         if snapshot.status != GapOverlayStatus::Valid {
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+            );
             anyhow::bail!(
                 "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} checkout {}: {}",
                 own.checkout_id,
                 snapshot.diagnostics.join("; ")
             );
+        }
+        self.observe_knowledge_transport_operation(
+            project_id.as_str(),
+            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Local,
+        );
+        if let Some(workspace) = session_workspace.filter(|workspace| {
+            workspace.project_id == project_id.as_str()
+                && workspace.workspace_id.as_str() == own.checkout_id
+        }) {
+            match self.remote_provisional_overlays(workspace, verified) {
+                Ok(Some(remote)) => self.observe_knowledge_transport_shadow(
+                    project_id.as_str(),
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                    Some(workspace.workspace_id.as_str()),
+                    &snapshot.snapshot_id,
+                    &remote.gaps.snapshot_id,
+                ),
+                Ok(None) | Err(_) => self.observe_knowledge_transport_operation(
+                    project_id.as_str(),
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalOwnGaps,
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                ),
+            }
         }
         diagnostics.extend(snapshot.diagnostics.iter().map(|diagnostic| {
             format!(
@@ -722,7 +853,28 @@ impl BlackboxServer {
         diagnostics: &mut Vec<String>,
         degraded_overlays: &mut Vec<OverlayDegradation>,
     ) -> Result<()> {
-        let attachments = self.catalog_active_overlay_attachments(project_id)?;
+        let transport_coverage = self
+            .state
+            .knowledge_transport_coverage_for_project(project_id.as_str())?
+            .unwrap_or(
+                bbox_indexing::knowledge_transport_cutover::KnowledgeTransportRuntimeCoverageV1::Uncovered,
+            );
+        if transport_coverage.transport_governed() && !transport_coverage.current() {
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+            );
+            diagnostics.push(format!(
+                "project {project_id} provisional gap peers are unavailable pending knowledge transport re-cutover"
+            ));
+            return Ok(());
+        }
+        let attachments = if transport_coverage.transport_governed() {
+            Vec::new()
+        } else {
+            self.catalog_active_overlay_attachments(project_id)?
+        };
         let mut seen_checkouts = attachments
             .iter()
             .map(|attachment| attachment.checkout_id.clone())
@@ -730,6 +882,34 @@ impl BlackboxServer {
         for attachment in attachments {
             let degraded = match self.refresh_catalog_gap_overlay(verified, &attachment) {
                 Ok(snapshot) if snapshot.status == GapOverlayStatus::Valid => {
+                    self.observe_knowledge_transport_operation(
+                        project_id.as_str(),
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Local,
+                    );
+                    if let Ok(workspace_id) =
+                        bro_core::WorkspaceId::parse(attachment.checkout_id.clone())
+                    {
+                        match self.remote_provisional_overlays_for_workspace(
+                            project_id.as_str(),
+                            verified.content_stamp().accepted_scope(),
+                            &workspace_id,
+                            verified,
+                        ) {
+                            Ok(Some(remote)) => self.observe_knowledge_transport_shadow(
+                                project_id.as_str(),
+                                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                                Some(workspace_id.as_str()),
+                                &snapshot.snapshot_id,
+                                &remote.gaps.snapshot_id,
+                            ),
+                            Ok(None) | Err(_) => self.observe_knowledge_transport_operation(
+                                project_id.as_str(),
+                                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                            ),
+                        }
+                    }
                     add_catalog_gap_overlay_rows(
                         project_id,
                         &snapshot,
@@ -750,22 +930,52 @@ impl BlackboxServer {
                 },
                 Err(degradation) => degradation,
             };
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+            );
             // The peer is omitted, never faked. The typed row is the
             // report; the diagnostic line renders the same facts for the
             // text surface.
             diagnostics.push(degraded.diagnostic_line());
             degraded_overlays.push(degraded);
         }
-        for workspace in self
+        let remote_workspaces = match self
             .state
             .knowledge_sources
-            .active_workspace_bindings_now()
-            .into_iter()
-            .filter(|workspace| workspace.project_id == project_id.as_str())
-            .filter(|workspace| seen_checkouts.insert(workspace.workspace_id.as_str().to_string()))
+            .store()
+            .selected_provisional_workspace_ids_for_project(project_id.as_str())
         {
-            let degraded = match self.remote_provisional_overlays(&workspace, verified) {
+            Ok(workspaces) => workspaces,
+            Err(error) => {
+                self.observe_knowledge_transport_operation(
+                    project_id.as_str(),
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+                );
+                diagnostics.push(format!(
+                    "project {project_id} remote provisional gap workspace inventory is unavailable: {error:#}"
+                ));
+                return Ok(());
+            }
+        };
+        for workspace_id in remote_workspaces
+            .into_iter()
+            .filter(|workspace| seen_checkouts.insert(workspace.as_str().to_string()))
+        {
+            let degraded = match self.remote_provisional_overlays_for_workspace(
+                project_id.as_str(),
+                verified.content_stamp().accepted_scope(),
+                &workspace_id,
+                verified,
+            ) {
                 Ok(Some(pair)) if pair.gaps.status == GapOverlayStatus::Valid => {
+                    self.observe_knowledge_transport_operation(
+                        project_id.as_str(),
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
+                    );
                     add_catalog_gap_overlay_rows(
                         project_id,
                         &pair.gaps,
@@ -778,7 +988,7 @@ impl BlackboxServer {
                 }
                 Ok(Some(pair)) => OverlayDegradation {
                     project_id: project_id.as_str().to_string(),
-                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    checkout_id: workspace_id.as_str().to_string(),
                     attachment_id: None,
                     code: ERROR_OVERLAY_SNAPSHOT_STALE,
                     detail: pair.gaps.diagnostics.join("; "),
@@ -786,7 +996,7 @@ impl BlackboxServer {
                 },
                 Ok(None) => OverlayDegradation {
                     project_id: project_id.as_str().to_string(),
-                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    checkout_id: workspace_id.as_str().to_string(),
                     attachment_id: None,
                     code: ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE,
                     detail: "no live provisional generation is selected".into(),
@@ -794,13 +1004,18 @@ impl BlackboxServer {
                 },
                 Err(error) => OverlayDegradation {
                     project_id: project_id.as_str().to_string(),
-                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    checkout_id: workspace_id.as_str().to_string(),
                     attachment_id: None,
                     code: ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE,
                     detail: format!("{error:#}"),
                     transient: false,
                 },
             };
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProvisionalAllGaps,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Degraded,
+            );
             diagnostics.push(degraded.diagnostic_line());
             degraded_overlays.push(degraded);
         }

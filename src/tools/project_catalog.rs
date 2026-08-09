@@ -923,6 +923,20 @@ impl BlackboxServer {
             Ok(project_id) => project_id,
             Err(error) => return Self::err_text(&format!("Error: {error}")),
         };
+        if self
+            .state
+            .knowledge_transport_cutover
+            .covers_project(&bound_project)
+        {
+            self.observe_knowledge_transport_operation(
+                bound_project.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::AcceptedPublicationMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
+            );
+            return Self::err_text(
+                "error.knowledge_transport_authoritative: covered projects cannot bind accepted publication to a checkout attachment",
+            );
+        }
         let result = Self::run_blocking("bbox_project_publisher_bind", move || {
             let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let project_id = parse_project_id(&p.project_id)?;
@@ -1046,9 +1060,22 @@ impl BlackboxServer {
             Err(error) => return Self::err_text(&format!("Error: {error}")),
         };
         let committed = project_id.clone();
+        let knowledge_transport_governed = self
+            .state
+            .knowledge_transport_cutover
+            .covers_project(&project_id);
+        if knowledge_transport_governed && p.attachment_id.is_some() {
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::AcceptedPublicationMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
+            );
+        }
+        let producer_auth = self.state.code_sources.producer_auth();
         let checkout_access = self.state.checkout_access.clone();
         let knowledge_sources = self.state.knowledge_sources.store();
         let dry_run = p.dry_run;
+        let remote_candidate_source = p.source_generation_id.is_some();
         let swap_uncertain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let swap_uncertain_inner = swap_uncertain.clone();
         let result =
@@ -1057,6 +1084,11 @@ impl BlackboxServer {
                 let mode = publish_mode_from_params(&p)?;
                 let receipt = match (&p.attachment_id, &p.source_generation_id) {
                 (Some(attachment_id), None) => {
+                    if knowledge_transport_governed {
+                        anyhow::bail!(
+                            "error.knowledge_transport_authoritative: covered projects may advance accepted publication only from a Ready remote candidate"
+                        );
+                    }
                     let attachment_id = parse_attachment_id(attachment_id)?;
                     let full_ref = p.full_ref.as_deref().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -1133,6 +1165,20 @@ impl BlackboxServer {
                         anyhow::bail!(
                             "error.accepted_publication_candidate_required: candidate belongs to \
                              another project"
+                        );
+                    }
+                    let granted_project = producer_auth
+                        .project_transport_grant_for_id(
+                            &candidate.producer_id,
+                            &candidate.descriptor.scope,
+                        )
+                        .map_err(|error| anyhow::anyhow!(
+                            "error.accepted_publication_candidate_required: current producer grant rejected the candidate ({})",
+                            error.code()
+                        ))?;
+                    if granted_project != &committed {
+                        anyhow::bail!(
+                            "error.accepted_publication_candidate_required: current producer grant resolves the candidate to another project"
                         );
                     }
                     let expected_generation = candidate.source_generation_id.clone();
@@ -1259,6 +1305,17 @@ impl BlackboxServer {
             // Binding-only operations never reach this path.
             self.invalidate_catalog_published_content(&project_id);
             self.converge_published_knowledge_index(&project_id);
+        }
+        if succeeded && !dry_run {
+            self.observe_knowledge_transport_operation(
+                project_id.as_str(),
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::AcceptedPublicationMutation,
+                if remote_candidate_source {
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote
+                } else {
+                    bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Local
+                },
+            );
         }
         result
     }

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::json_store::{atomic_write_json_locked, with_store_lock};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -272,6 +272,33 @@ pub trait CheckoutAccessAuthority: Send + Sync + 'static {
         request: &CheckoutAccessRequest,
         candidate: &CheckoutAccessCandidate,
     ) -> std::result::Result<(), CheckoutAccessError>;
+
+    /// Path-free scope identity when the authority already owns a durable
+    /// catalog row. Bridge authorities return `Unavailable` and retain their
+    /// explicit config-tree discovery lease.
+    fn recorded_project_scope(
+        &self,
+        _project_id: &str,
+    ) -> std::result::Result<CheckoutRecordedProjectScope, CheckoutAccessError> {
+        Ok(CheckoutRecordedProjectScope::Unavailable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutRecordedProjectScope {
+    Unavailable,
+    LegacyLocal,
+    Published(PublishedScope),
+}
+
+/// Process-lifetime policy above attachment resolution. It is evaluated
+/// before mutation pins, observation recording, and path resolution, which is
+/// the boundary strict transport cutovers require.
+pub trait CheckoutAccessPolicy: Send + Sync + 'static {
+    fn authorize(
+        &self,
+        request: &CheckoutAccessRequest,
+    ) -> std::result::Result<(), CheckoutAccessError>;
 }
 
 /// Deterministic remote-shaped probe. It never resolves or touches a path.
@@ -318,6 +345,7 @@ pub enum CheckoutAccessErrorCode {
     UnsafeRelativePath,
     WriteIntentRequired,
     LifecycleBusy,
+    KnowledgeTransportAuthoritative,
     DeniedByTestProbe,
     ObservationUnavailable,
 }
@@ -339,6 +367,7 @@ impl CheckoutAccessErrorCode {
             Self::UnsafeRelativePath => "unsafe_relative_path",
             Self::WriteIntentRequired => "write_intent_required",
             Self::LifecycleBusy => "lifecycle_busy",
+            Self::KnowledgeTransportAuthoritative => "knowledge_transport_authoritative",
             Self::DeniedByTestProbe => "denied_by_test_probe",
             Self::ObservationUnavailable => "observation_unavailable",
         }
@@ -576,6 +605,7 @@ fn validate_relative_path(path: &Path) -> std::result::Result<&Path, CheckoutAcc
 /// validation and instrumentation contract remains fixed.
 pub struct CheckoutAccessBroker {
     authority: Arc<dyn CheckoutAccessAuthority>,
+    policy: RwLock<Option<Arc<dyn CheckoutAccessPolicy>>>,
     observations: CheckoutAccessObservations,
     lifecycle_gate: Arc<CheckoutLifecycleGate>,
     lifecycle_writer_wait: Duration,
@@ -596,6 +626,7 @@ impl CheckoutAccessBroker {
     ) -> Self {
         Self {
             authority,
+            policy: RwLock::new(None),
             observations,
             lifecycle_gate: Arc::new(CheckoutLifecycleGate::default()),
             lifecycle_writer_wait,
@@ -606,6 +637,10 @@ impl CheckoutAccessBroker {
         &self,
         request: CheckoutAccessRequest,
     ) -> std::result::Result<ValidatedCheckoutLease, CheckoutAccessError> {
+        // Policy refusal is outside the observation boundary. A strict
+        // transport cutover must prove zero local checkout observations, not
+        // replace granted leases with a stream of denied lease attempts.
+        self.authorize_policy(&request)?;
         let mutation_pin = match request.intent {
             CheckoutAccessIntent::Read => None,
             CheckoutAccessIntent::Write => match self.acquire_mutation_pin() {
@@ -635,6 +670,40 @@ impl CheckoutAccessBroker {
             candidate
         });
         self.finish_acquire(request, result)
+    }
+
+    pub fn recorded_project_scope(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<CheckoutRecordedProjectScope, CheckoutAccessError> {
+        self.authority.recorded_project_scope(project_id)
+    }
+
+    /// Install the process-lifetime authority policy after marker loading and
+    /// before any cutover-governed adapter is configured.
+    pub fn install_policy(
+        &self,
+        policy: Arc<dyn CheckoutAccessPolicy>,
+    ) -> std::result::Result<(), CheckoutAccessError> {
+        let mut installed = self.policy.write();
+        if installed.is_some() {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::LifecycleBusy,
+                "checkout access policy is already installed for this process",
+            ));
+        }
+        *installed = Some(policy);
+        Ok(())
+    }
+
+    fn authorize_policy(
+        &self,
+        request: &CheckoutAccessRequest,
+    ) -> std::result::Result<(), CheckoutAccessError> {
+        match self.policy.read().as_ref() {
+            Some(policy) => policy.authorize(request),
+            None => Ok(()),
+        }
     }
 
     fn acquire_mutation_pin(
@@ -954,6 +1023,7 @@ impl CheckoutAccessBroker {
         &self,
         request: &CheckoutAccessRequest,
     ) -> std::result::Result<CheckoutAccessCandidate, CheckoutAccessError> {
+        self.authorize_policy(request)?;
         validate_request(request)?;
         let candidate = self.authority.resolve(request)?;
         self.validate_candidate_unobserved(request, candidate)
@@ -1466,11 +1536,11 @@ pub struct CheckoutAccessCounter {
     pub last_unix_secs: u64,
 }
 
-/// Path-free, project-attributed counters for the two Git transport cutover
-/// capabilities. Aggregate counters remain the stable low-cardinality health
-/// surface; these bounded rows exist so a mixed catalog can prove that a
-/// covered repository stayed at zero while a LegacyLocal or never-covered
-/// repository legitimately used its adapter.
+/// Path-free, project-attributed counters for capabilities governed by Git or
+/// knowledge transport cutover. Aggregate counters remain the stable
+/// low-cardinality health surface; these bounded rows exist so a mixed catalog
+/// can prove that a covered subject stayed at zero while an uncovered subject
+/// legitimately used its adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckoutAccessTargetCounter {
@@ -1529,8 +1599,8 @@ pub struct CheckoutAccessHealth {
 
 /// Cloneable observation handle shared by all broker instances and doctor.
 /// Aggregate persisted keys are bounded by closed enums. The additive target
-/// rows accept only bounded project ids and only for the two cutover
-/// capabilities, with a hard total-row ceiling.
+/// rows accept only bounded project ids and only for capabilities governed by
+/// a transport cutover, with a hard total-row ceiling.
 #[derive(Clone)]
 pub struct CheckoutAccessObservations {
     store_path: Option<Arc<PathBuf>>,
@@ -1649,10 +1719,7 @@ fn record_observation(
             outcome: counter.outcome,
         });
     }
-    if matches!(
-        kind,
-        CheckoutAccessKind::GitHistory | CheckoutAccessKind::ProvenanceNoteIo
-    ) {
+    if is_cutover_target_kind(kind) {
         if let Some(counter) = next.target_counters.iter_mut().find(|counter| {
             counter.project_id == project_id
                 && counter.kind == kind
@@ -1724,10 +1791,7 @@ fn validate_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Result<()>
         if counter.project_id.is_empty()
             || counter.project_id.len() > MAX_ID_BYTES
             || counter.project_id.chars().any(char::is_control)
-            || !matches!(
-                counter.kind,
-                CheckoutAccessKind::GitHistory | CheckoutAccessKind::ProvenanceNoteIo
-            )
+            || !is_cutover_target_kind(counter.kind)
             || counter.count == 0
             || counter.last_sequence == 0
             || counter.last_sequence > snapshot.sequence
@@ -1745,6 +1809,18 @@ fn validate_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn is_cutover_target_kind(kind: CheckoutAccessKind) -> bool {
+    matches!(
+        kind,
+        CheckoutAccessKind::GitHistory
+            | CheckoutAccessKind::ProvenanceNoteIo
+            | CheckoutAccessKind::PublisherConfigTreeRead
+            | CheckoutAccessKind::KnowledgeGapOverlayRead
+            | CheckoutAccessKind::ArtifactWatchDiscovery
+            | CheckoutAccessKind::RepositoryMutation
+    )
 }
 
 fn health_from_snapshot(snapshot: &CheckoutAccessObservationSnapshot) -> CheckoutAccessHealth {
@@ -1859,6 +1935,29 @@ mod tests {
             _request: &CheckoutAccessRequest,
             _candidate: &CheckoutAccessCandidate,
         ) -> std::result::Result<(), CheckoutAccessError> {
+            Ok(())
+        }
+    }
+
+    struct RefuseKnowledgeTransport;
+
+    impl CheckoutAccessPolicy for RefuseKnowledgeTransport {
+        fn authorize(
+            &self,
+            request: &CheckoutAccessRequest,
+        ) -> std::result::Result<(), CheckoutAccessError> {
+            if matches!(
+                request.kind,
+                CheckoutAccessKind::PublisherConfigTreeRead
+                    | CheckoutAccessKind::KnowledgeGapOverlayRead
+                    | CheckoutAccessKind::ArtifactWatchDiscovery
+                    | CheckoutAccessKind::RepositoryMutation
+            ) {
+                return Err(CheckoutAccessError::new(
+                    CheckoutAccessErrorCode::KnowledgeTransportAuthoritative,
+                    "strict knowledge transport owns this project",
+                ));
+            }
             Ok(())
         }
     }
@@ -2460,6 +2559,81 @@ mod tests {
         assert_eq!(operation.granted, 0);
         assert_eq!(operation.denied, 1);
         assert_eq!(operation.last_success_unix_secs, None);
+    }
+
+    #[test]
+    fn strict_policy_refusal_precedes_authority_and_records_no_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(authority(
+                &root,
+                CheckoutAccessKind::KnowledgeGapOverlayRead,
+            )),
+            CheckoutAccessObservations::in_memory(),
+        );
+        broker
+            .install_policy(Arc::new(RefuseKnowledgeTransport))
+            .unwrap();
+        assert_eq!(
+            broker
+                .install_policy(Arc::new(RefuseKnowledgeTransport))
+                .unwrap_err()
+                .code,
+            CheckoutAccessErrorCode::LifecycleBusy
+        );
+
+        let error = broker
+            .acquire(request(
+                CheckoutAccessKind::KnowledgeGapOverlayRead,
+                CheckoutAccessIntent::Read,
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            CheckoutAccessErrorCode::KnowledgeTransportAuthoritative
+        );
+        let health = broker.health();
+        assert_eq!(health.sequence, 0);
+        assert!(health.counters.is_empty());
+        assert!(health.target_counters.is_empty());
+    }
+
+    #[test]
+    fn every_transport_cutover_capability_has_project_attributed_counters() {
+        let observations = CheckoutAccessObservations::in_memory();
+        let target_kinds = [
+            CheckoutAccessKind::GitHistory,
+            CheckoutAccessKind::ProvenanceNoteIo,
+            CheckoutAccessKind::PublisherConfigTreeRead,
+            CheckoutAccessKind::KnowledgeGapOverlayRead,
+            CheckoutAccessKind::ArtifactWatchDiscovery,
+            CheckoutAccessKind::RepositoryMutation,
+        ];
+        for kind in target_kinds {
+            observations
+                .record(
+                    "project-1",
+                    kind,
+                    CheckoutAccessSourceLane::NativeAttachment,
+                    CheckoutAccessOutcome::Granted,
+                )
+                .unwrap();
+        }
+
+        let health = observations.health();
+        assert_eq!(health.sequence, target_kinds.len() as u64);
+        assert_eq!(health.target_counters.len(), target_kinds.len());
+        assert_eq!(
+            health
+                .target_counters
+                .iter()
+                .map(|counter| counter.kind)
+                .collect::<BTreeSet<_>>(),
+            target_kinds.into_iter().collect()
+        );
     }
 
     #[test]

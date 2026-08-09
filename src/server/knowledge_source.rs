@@ -29,8 +29,8 @@ use bbox_knowledge_source::{
     SourceManifestPageV1,
 };
 use bbox_knowledge_source_store::{
-    KnowledgeSourceStore, ProvisionalAuthorityV1, PublicationAuthorityV1, ReadyPublicationFile,
-    StoreLimits, StoreRequestError,
+    KnowledgeSourceStore, ProvisionalAuthorityV1, PublicationAuthorityV1,
+    ReadyProvisionalWorkspace, ReadyPublicationFile, StoreLimits, StoreRequestError,
 };
 use bro_core::WorkspaceId;
 use bro_rpc::ServiceToken;
@@ -64,6 +64,44 @@ struct WorkspaceBindingEntry {
 pub(crate) struct KnowledgeSourceRuntime {
     store: Arc<KnowledgeSourceStore>,
     workspace_bindings: parking_lot::RwLock<Vec<WorkspaceBindingEntry>>,
+}
+
+pub(crate) struct KnowledgeTransportCheckoutPolicy {
+    cutover: Arc<bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1>,
+}
+
+impl KnowledgeTransportCheckoutPolicy {
+    pub(crate) fn new(
+        cutover: Arc<
+            bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1,
+        >,
+    ) -> Self {
+        Self { cutover }
+    }
+}
+
+impl bbox_indexing::checkout_access::CheckoutAccessPolicy for KnowledgeTransportCheckoutPolicy {
+    fn authorize(
+        &self,
+        request: &bbox_indexing::checkout_access::CheckoutAccessRequest,
+    ) -> std::result::Result<(), bbox_indexing::checkout_access::CheckoutAccessError> {
+        use bbox_indexing::checkout_access::{CheckoutAccessError, CheckoutAccessErrorCode};
+
+        let governed_capability = matches!(
+            request.kind,
+            bbox_indexing::checkout_access::CheckoutAccessKind::PublisherConfigTreeRead
+                | bbox_indexing::checkout_access::CheckoutAccessKind::KnowledgeGapOverlayRead
+                | bbox_indexing::checkout_access::CheckoutAccessKind::ArtifactWatchDiscovery
+                | bbox_indexing::checkout_access::CheckoutAccessKind::RepositoryMutation
+        );
+        if governed_capability && self.cutover.covers_project_str(&request.project_id) {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::KnowledgeTransportAuthoritative,
+                "error.knowledge_transport_authoritative: project checkout authority is closed by the knowledge transport cutover",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl KnowledgeSourceRuntime {
@@ -140,14 +178,11 @@ impl KnowledgeSourceRuntime {
         bindings.push(WorkspaceBindingEntry { token, grant });
     }
 
+    #[cfg(test)]
     pub(crate) fn active_workspace_bindings(&self, now: u64) -> Vec<WorkspaceBindingGrant> {
         let mut bindings = self.workspace_bindings.write();
         bindings.retain(|entry| entry.grant.expires_unix_secs > now);
         bindings.iter().map(|entry| entry.grant.clone()).collect()
-    }
-
-    pub(crate) fn active_workspace_bindings_now(&self) -> Vec<WorkspaceBindingGrant> {
-        self.active_workspace_bindings(now_unix_secs())
     }
 
     fn extend_workspace_binding(&self, task_id: &str, session_id: &str, now: u64) {
@@ -372,6 +407,48 @@ pub(crate) struct RemoteProvisionalOverlayPair {
 }
 
 impl super::BlackboxServer {
+    pub(crate) fn observe_knowledge_transport_operation(
+        &self,
+        project_id: &str,
+        operation: bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1,
+        outcome: bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1,
+    ) {
+        if let Err(error) = self
+            .state
+            .knowledge_transport_observations
+            .record(project_id, operation, outcome)
+        {
+            tracing::warn!(
+                project_id,
+                error = %error,
+                "knowledge transport operation observation could not be persisted"
+            );
+        }
+    }
+
+    pub(crate) fn observe_knowledge_transport_shadow(
+        &self,
+        project_id: &str,
+        operation: bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1,
+        workspace_id: Option<&str>,
+        reference_snapshot_id: &str,
+        transport_snapshot_id: &str,
+    ) {
+        if let Err(error) = self.state.knowledge_transport_observations.record_shadow(
+            project_id,
+            operation,
+            workspace_id,
+            reference_snapshot_id,
+            transport_snapshot_id,
+        ) {
+            tracing::warn!(
+                project_id,
+                error = %error,
+                "knowledge transport shadow observation could not be persisted"
+            );
+        }
+    }
+
     /// Materialize the exact selected remote generation and converge both
     /// knowledge and gap lanes through the same source-neutral overlay cores
     /// used by local checkouts. The accepted generation must still be the one
@@ -386,7 +463,26 @@ impl super::BlackboxServer {
         {
             bail!("workspace binding does not match accepted project content");
         }
-        let authority = provisional_authority(grant);
+        self.remote_provisional_overlays_for_workspace(
+            &grant.project_id,
+            &grant.scope,
+            &grant.workspace_id,
+            verified,
+        )
+    }
+
+    pub(crate) fn remote_provisional_overlays_for_workspace(
+        &self,
+        project_id: &str,
+        scope: &bbox_corpus_core::identity::PublishedScope,
+        workspace_id: &WorkspaceId,
+        verified: &bbox_indexing::accepted_publication_runtime::VerifiedAcceptedPublication,
+    ) -> Result<Option<RemoteProvisionalOverlayPair>> {
+        let authority = ProvisionalAuthorityV1 {
+            project_id: project_id.to_string(),
+            scope: scope.clone(),
+            workspace_id: workspace_id.clone(),
+        };
         let Some(source) = self
             .state
             .knowledge_sources
@@ -395,10 +491,24 @@ impl super::BlackboxServer {
         else {
             return Ok(None);
         };
+        if source.project_id != project_id
+            || source.descriptor.scope != *scope
+            || source.descriptor.workspace_id != *workspace_id
+        {
+            bail!("selected workspace generation does not match its binding authority");
+        }
+        self.remote_provisional_overlays_from_source(source, verified)
+            .map(Some)
+    }
+
+    pub(crate) fn remote_provisional_overlays_from_source(
+        &self,
+        source: ReadyProvisionalWorkspace,
+        verified: &bbox_indexing::accepted_publication_runtime::VerifiedAcceptedPublication,
+    ) -> Result<RemoteProvisionalOverlayPair> {
         let accepted = verified.content_stamp();
-        if source.project_id != grant.project_id
-            || source.descriptor.scope != grant.scope
-            || source.descriptor.workspace_id != grant.workspace_id
+        if source.project_id != accepted.project_id().as_str()
+            || source.descriptor.scope != *accepted.accepted_scope()
             || source.descriptor.accepted_generation != accepted.generation_id()
             || source.descriptor.accepted_commit != accepted.accepted_commit()
         {
@@ -406,6 +516,8 @@ impl super::BlackboxServer {
                 "error.provisional_snapshot_stale: selected workspace generation does not match accepted content"
             );
         }
+        let scope = &source.descriptor.scope;
+        let workspace_id = source.descriptor.workspace_id.as_str();
 
         let baseline_knowledge = bbox_knowledge::overlay::BaselineKnowledgeSnapshot::new(
             provisional_file_map(&source.baseline_knowledge, "knowledge")?,
@@ -416,8 +528,8 @@ impl super::BlackboxServer {
         let knowledge_digests = super::knowledge_view::accepted_knowledge_digests(verified);
         let knowledge = bbox_knowledge::overlay::recompute_catalog_overlay_from_sources(
             bbox_knowledge::overlay::CatalogOverlayPublished {
-                published_scope: &grant.scope,
-                checkout_id: grant.workspace_id.as_str(),
+                published_scope: scope,
+                checkout_id: workspace_id,
                 full_ref: accepted.full_ref(),
                 accepted_commit: accepted.accepted_commit(),
                 accepted_generation: accepted.generation_id(),
@@ -441,8 +553,8 @@ impl super::BlackboxServer {
         let gap_digests = super::gap_view::accepted_gap_digests(verified);
         let gaps = bbox_gaps::overlay::recompute_catalog_overlay_from_sources(
             bbox_gaps::overlay::CatalogGapOverlayPublished {
-                published_scope: &grant.scope,
-                checkout_id: grant.workspace_id.as_str(),
+                published_scope: scope,
+                checkout_id: workspace_id,
                 full_ref: accepted.full_ref(),
                 accepted_commit: accepted.accepted_commit(),
                 accepted_generation: accepted.generation_id(),
@@ -455,7 +567,7 @@ impl super::BlackboxServer {
         )
         .map_err(|error| anyhow::anyhow!("{error:#}"))?;
 
-        Ok(Some(RemoteProvisionalOverlayPair { knowledge, gaps }))
+        Ok(RemoteProvisionalOverlayPair { knowledge, gaps })
     }
 }
 
@@ -948,6 +1060,22 @@ async fn finalize_provisional_upload(
         store.finalize_provisional_upload(&authority, &upload_id, request.lease_ttl_secs)
     })
     .await?;
+    for operation in [
+        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
+        bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
+    ] {
+        if let Err(error) = state.knowledge_transport_observations.record(
+            &grant.project_id,
+            operation,
+            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
+        ) {
+            tracing::warn!(
+                project_id = %grant.project_id,
+                error = %error,
+                "knowledge transport provisional-finalize observation could not be persisted"
+            );
+        }
+    }
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -1870,6 +1998,23 @@ mod tests {
             .unwrap();
         assert_eq!(gap.title, "changed remotely");
         assert_eq!(gap.project_id.as_deref(), Some(PROJECT));
+
+        // `all` is a durable project view, not a projection of the daemon's
+        // in-memory session-token cache. A restart clears that cache while the
+        // source-store selection remains authoritative and live.
+        server
+            .state
+            .knowledge_sources
+            .workspace_bindings
+            .write()
+            .clear();
+        assert!(
+            server
+                .state
+                .knowledge_sources
+                .active_workspace_bindings(now_unix_secs())
+                .is_empty()
+        );
         let all_knowledge = server.session_knowledge_view(None, Some("all")).unwrap();
         assert!(all_knowledge.items.iter().any(|item| {
             item.entry.id == "remote-knowledge" && item.entry.content == "changed remotely"

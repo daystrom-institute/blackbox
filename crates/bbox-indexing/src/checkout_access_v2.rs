@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use bbox_corpus_core::project_catalog::{
     AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus, CheckoutAttachment,
-    ProjectId,
+    ProjectId, ProjectScope,
 };
 use bbox_corpus_core::project_selector::{
     ProjectSelectorRequest, ResolvedAttachment, SelectorClass,
@@ -34,7 +34,7 @@ use bbox_corpus_core::project_selector::{
 use crate::checkout_access::{
     CheckoutAccessAuthority, CheckoutAccessCandidate, CheckoutAccessError, CheckoutAccessErrorCode,
     CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
-    CheckoutAttachmentSelector, CheckoutAttachmentStatus,
+    CheckoutAttachmentSelector, CheckoutAttachmentStatus, CheckoutRecordedProjectScope,
 };
 use crate::project_catalog_store::{ProjectCatalogState, ProjectCatalogStore};
 use crate::project_resolver::ProjectResolverEngine;
@@ -97,6 +97,26 @@ impl CheckoutAccessAuthority for V2CatalogCheckoutAccessAuthority {
             ));
         }
         Ok(())
+    }
+
+    fn recorded_project_scope(
+        &self,
+        project_id: &str,
+    ) -> std::result::Result<CheckoutRecordedProjectScope, CheckoutAccessError> {
+        let project_id = parse_project_id(project_id)?;
+        let state = self.state()?;
+        let project = state.catalog().projects.get(&project_id).ok_or_else(|| {
+            access_error(
+                CheckoutAccessErrorCode::AttachmentNotFound,
+                "project is not in the catalog",
+            )
+        })?;
+        Ok(match &project.scope {
+            ProjectScope::Published(scope) => {
+                CheckoutRecordedProjectScope::Published(scope.clone())
+            }
+            ProjectScope::LegacyLocal => CheckoutRecordedProjectScope::LegacyLocal,
+        })
     }
 }
 

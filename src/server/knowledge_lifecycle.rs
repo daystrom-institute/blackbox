@@ -503,6 +503,20 @@ impl BlackboxServer {
         {
             anyhow::bail!("provisional knowledge ref does not belong to the session checkout");
         }
+        if self
+            .state
+            .knowledge_transport_cutover
+            .covers_project_str(&checkout.project_id)
+        {
+            self.observe_knowledge_transport_operation(
+                &checkout.project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
+            );
+            anyhow::bail!(
+                "error.knowledge_transport_authoritative: covered project knowledge must be mutated by the checkout-owner harness"
+            );
+        }
         if self.checkout_has_pending_transaction(&checkout)? {
             anyhow::bail!(
                 "checkout {} has a pending knowledge transaction; restart recovery or finish it before mutating",
@@ -566,6 +580,13 @@ impl BlackboxServer {
         let rows = self.state.checkout_registry.read().rows().to_vec();
         let mut recovered = 0;
         for row in rows {
+            if row.project_id.as_deref().is_some_and(|project_id| {
+                self.state
+                    .knowledge_transport_cutover
+                    .covers_project_str(project_id)
+            }) {
+                continue;
+            }
             let Some(scope) = row.published_scope() else {
                 continue;
             };
@@ -665,6 +686,14 @@ impl BlackboxServer {
         let mut stale = BTreeSet::new();
         for row in &prior_rows {
             let key = registry_key(row);
+            if row.project_id.as_deref().is_some_and(|project_id| {
+                self.state
+                    .knowledge_transport_cutover
+                    .covers_project_str(project_id)
+            }) {
+                valid.insert(key);
+                continue;
+            }
             match self.resolve_registered_checkout(row) {
                 Ok(Some(_)) => {
                     valid.insert(key);
@@ -752,6 +781,13 @@ impl BlackboxServer {
             .collect::<BTreeSet<_>>();
         let mut discovery = Vec::new();
         for project in projects.iter() {
+            if self
+                .state
+                .knowledge_transport_cutover
+                .covers_project_str(&project.project_id)
+            {
+                continue;
+            }
             match super::checkout_access::acquire_selected_project_access(
                 &self.state.checkout_access,
                 &project.project_id,
@@ -818,6 +854,13 @@ impl BlackboxServer {
         let rows = self.state.checkout_registry.read().rows().to_vec();
         let mut refreshed = 0;
         for row in rows {
+            if row.project_id.as_deref().is_some_and(|project_id| {
+                self.state
+                    .knowledge_transport_cutover
+                    .covers_project_str(project_id)
+            }) {
+                continue;
+            }
             let Ok(Some(checkout)) = self.resolve_registered_checkout(&row) else {
                 continue;
             };
@@ -973,8 +1016,19 @@ impl BlackboxServer {
     ) -> Result<bbox_knowledge::inventory::PersistedInventoryReport> {
         let entries = self.state.kb.read().all_entries().to_vec();
         let inputs = super::repo_io::CatalogBaseTargets::read_consistent_for_state(&self.state)?;
+        let local_records = inputs
+            .records
+            .iter()
+            .filter(|project| {
+                !self
+                    .state
+                    .knowledge_transport_cutover
+                    .covers_project_str(&project.project_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let carriers = super::repo_io::RepoIoAuthority::knowledge_base_carriers(
-            &inputs.records,
+            &local_records,
             inputs.targets.as_ref(),
         )?;
         let repo_io = super::repo_io::RepoIoAuthority::new(self.state.checkout_access.clone());
@@ -1005,6 +1059,15 @@ impl BlackboxServer {
             .collect::<Vec<_>>();
         if projects.len() != 1 {
             anyhow::bail!("schema marker target must be one exact registered project attachment");
+        }
+        if self
+            .state
+            .knowledge_transport_cutover
+            .covers_project_str(&projects[0].project_id)
+        {
+            anyhow::bail!(
+                "error.knowledge_transport_authoritative: covered project schema markers must be written by the checkout-owner harness"
+            );
         }
         let carriers = super::repo_io::RepoIoAuthority::knowledge_base_carriers(
             &projects,
@@ -1179,6 +1242,18 @@ impl BlackboxServer {
     }
 
     pub(crate) fn watch_resolved_dark_knowledge_checkout(&self, checkout: &ResolvedCheckoutScope) {
+        if self
+            .state
+            .knowledge_transport_cutover
+            .covers_project_str(&checkout.project_id)
+        {
+            self.observe_knowledge_transport_operation(
+                &checkout.project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::WatcherRefresh,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
+            );
+            return;
+        }
         let mut watcher = self.state.bbox_watcher.lock().unwrap();
         let Some(watcher) = watcher.as_mut() else {
             return;
@@ -1197,12 +1272,19 @@ impl BlackboxServer {
                 return;
             }
         };
-        if let Err(err) = watcher.watch_repo_store(carrier) {
-            tracing::warn!(
-                checkout_id = %checkout.checkout_id,
-                error = %err,
-                "provisional knowledge watcher registration failed"
-            );
+        match watcher.watch_repo_store(carrier) {
+            Ok(_) => self.observe_knowledge_transport_operation(
+                &checkout.project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::WatcherRefresh,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Local,
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    checkout_id = %checkout.checkout_id,
+                    error = %err,
+                    "provisional knowledge watcher registration failed"
+                );
+            }
         }
     }
 

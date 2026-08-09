@@ -622,6 +622,7 @@ dependencies = [
  "bbox-indexing",
  "bbox-knowledge",
  "bbox-knowledge-source",
+ "bbox-knowledge-source-store",
  "bbox-packets",
  "bbox-provenance",
  "bbox-slack",

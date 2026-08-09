@@ -299,6 +299,10 @@ pub(super) fn open_shared_state(
         bbox_indexing::checkout_access::CheckoutAccessObservations::open(
             store_dir.join("checkout-access-observations.json"),
         )?;
+    let knowledge_transport_observations =
+        bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::open(
+            store_dir.join("knowledge-transport-observations.json"),
+        )?;
     // Bridge-only handles stay `Option` so catalog mode never constructs a
     // version-1 registry or its persister.
     let mut projects_store: Option<Arc<RwLock<ProjectRegistry>>> = None;
@@ -316,6 +320,20 @@ pub(super) fn open_shared_state(
             .map_err(|error| anyhow::anyhow!("Git transport cutover startup gate: {error}"))?
         } else {
             bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default()
+        },
+    );
+    let knowledge_transport_cutover = Arc::new(
+        if matches!(
+            store_probe,
+            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
+        ) {
+            bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::open(
+                &cfg.paths.state_dir,
+            )
+            .map_err(|error| anyhow::anyhow!("knowledge transport cutover startup gate: {error}"))?
+        } else {
+            bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(
+            )
         },
     );
     let (access_authority, records_provider): (
@@ -374,6 +392,13 @@ pub(super) fn open_shared_state(
             std::time::Duration::from_millis(cfg.daemon.checkout_lifecycle_writer_wait_ms),
         ),
     );
+    checkout_access
+        .install_policy(Arc::new(
+            super::knowledge_source::KnowledgeTransportCheckoutPolicy::new(
+                knowledge_transport_cutover.clone(),
+            ),
+        ))
+        .map_err(anyhow::Error::new)?;
     if let Some(registry) = &projects_store {
         projects_needs_persist |= backfill_project_languages(registry, &checkout_access);
     }
@@ -508,11 +533,16 @@ pub(super) fn open_shared_state(
     )?;
     let registered_projects = carrier_inputs.records.clone();
     let catalog_base_targets = carrier_inputs.targets;
+    let local_repo_projects = registered_projects
+        .iter()
+        .filter(|project| !knowledge_transport_cutover.covers_project_str(&project.project_id))
+        .cloned()
+        .collect::<Vec<_>>();
     if let Err(e) = kb.configure_repo_io(
         repo_io.clone(),
         repo_io.clone(),
         super::repo_io::RepoIoAuthority::knowledge_base_carriers(
-            &registered_projects,
+            &local_repo_projects,
             catalog_base_targets.as_ref(),
         )?,
     ) {
@@ -533,7 +563,7 @@ pub(super) fn open_shared_state(
         repo_io.clone(),
         repo_io,
         super::repo_io::RepoIoAuthority::gap_base_carriers(
-            &registered_projects,
+            &local_repo_projects,
             catalog_base_targets.as_ref(),
         )?,
     ) {
@@ -836,6 +866,7 @@ pub(super) fn open_shared_state(
             store_dir.join("resolver-compat-observations.json"),
         ),
         checkout_access,
+        knowledge_transport_observations,
         // Publisher refs define authority and cannot be reconstructed from
         // checkout discovery without silently moving published truth. Keep
         // corrupt pins fail-closed even though the checkout census below is a
@@ -863,6 +894,7 @@ pub(super) fn open_shared_state(
         git_sources,
         knowledge_sources,
         git_transport_cutover,
+        knowledge_transport_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

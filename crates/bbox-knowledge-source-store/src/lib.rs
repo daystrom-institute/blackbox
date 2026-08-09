@@ -548,6 +548,17 @@ fn read_child_directories(path: &Path, allowed_files: &[&str]) -> Result<Vec<Pat
     Ok(directories)
 }
 
+fn read_child_directories_if_present(path: &Path, allowed_files: &[&str]) -> Result<Vec<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            read_child_directories(path, allowed_files)
+        }
+        Ok(_) => bail!(StoreRequestError::InvalidState),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
 fn read_regular_json_files(path: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
@@ -1040,6 +1051,18 @@ pub struct ReadyProvisionalWorkspace {
     pub baseline_gaps: Vec<ReadyPublicationFile>,
     pub working_knowledge: Vec<ReadyPublicationFile>,
     pub working_gaps: Vec<ReadyPublicationFile>,
+}
+
+/// Lock-consistent source state used by the offline strict-cutover preflight.
+///
+/// The store reports source facts only. Overlay computation and authority
+/// decisions remain with the indexing/runtime layer.
+#[derive(Debug, Clone)]
+pub struct KnowledgeSourceProjectCutoverReadiness {
+    pub prepared_upload_count: u64,
+    pub unfinished_finalize_journal_count: u64,
+    pub expired_workspace_ids: Vec<WorkspaceId>,
+    pub selected_workspaces: Vec<ReadyProvisionalWorkspace>,
 }
 
 #[derive(Debug)]
@@ -1827,6 +1850,14 @@ impl KnowledgeSourceStore {
     ) -> Result<Option<ReadyProvisionalWorkspace>> {
         validate_provisional_authority(authority)?;
         let _guard = self.lock_mutation()?;
+        self.materialize_selected_provisional_locked(authority, now)
+    }
+
+    fn materialize_selected_provisional_locked(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+        now: u64,
+    ) -> Result<Option<ReadyProvisionalWorkspace>> {
         let Some(pointer) = self.load_provisional_pointer(authority)? else {
             return Ok(None);
         };
@@ -1872,6 +1903,170 @@ impl KnowledgeSourceStore {
             working_knowledge: self.materialize_ready_publication_files(&manifests[2])?,
             working_gaps: self.materialize_ready_publication_files(&manifests[3])?,
         }))
+    }
+
+    /// Capture the source-store facts that must be quiet and replayable before
+    /// one Published project can cross the strict knowledge-transport boundary.
+    /// The mutation lock makes uploads, journals, pointers, and materialized
+    /// generations one coherent observation.
+    pub fn project_cutover_readiness(
+        &self,
+        project_id: &str,
+        now: u64,
+    ) -> Result<KnowledgeSourceProjectCutoverReadiness> {
+        validate_project_id(project_id)?;
+        let _guard = self.lock_mutation()?;
+
+        let mut prepared_upload_count = 0_u64;
+        for producer in read_child_directories(&self.root.join("publications/uploads"), &[])? {
+            validate_producer_id(&file_name(&producer)?)?;
+            for upload_path in read_child_directories(&producer, &[])? {
+                let upload = read_json::<PublicationUploadV1>(
+                    &upload_path,
+                    "upload.json",
+                    MAX_UPLOAD_RECORD_BYTES,
+                    "publication upload",
+                )?
+                .ok_or(StoreRequestError::InvalidState)?;
+                validate_publication_upload(&upload)?;
+                if upload.project_id == project_id && is_open(upload.state) {
+                    prepared_upload_count = prepared_upload_count.saturating_add(1);
+                }
+            }
+        }
+        for workspace in read_child_directories(&self.root.join("provisional/uploads"), &[])? {
+            WorkspaceId::parse(file_name(&workspace)?)?;
+            for upload_path in read_child_directories(&workspace, &[])? {
+                let upload = read_json::<ProvisionalUploadV1>(
+                    &upload_path,
+                    "upload.json",
+                    MAX_UPLOAD_RECORD_BYTES,
+                    "provisional upload",
+                )?
+                .ok_or(StoreRequestError::InvalidState)?;
+                validate_provisional_upload(&upload)?;
+                if upload.project_id == project_id && is_open(upload.state) {
+                    prepared_upload_count = prepared_upload_count.saturating_add(1);
+                }
+            }
+        }
+
+        let mut unfinished_finalize_journal_count = 0_u64;
+        for path in read_regular_json_files(&self.root.join("journals"))? {
+            let journal = read_json::<FinalizeJournalV1>(
+                &self.root.join("journals"),
+                &file_name(&path)?,
+                MAX_JOURNAL_BYTES,
+                "knowledge-source finalize journal",
+            )?
+            .ok_or(StoreRequestError::InvalidState)?;
+            journal.validate()?;
+            if journal.project_id == project_id && journal.stage != FinalizeStageV1::Committed {
+                unfinished_finalize_journal_count =
+                    unfinished_finalize_journal_count.saturating_add(1);
+            }
+        }
+
+        let (expired_workspace_ids, selected_workspaces) =
+            self.materialize_selected_provisionals_for_project_locked(project_id, now)?;
+
+        Ok(KnowledgeSourceProjectCutoverReadiness {
+            prepared_upload_count,
+            unfinished_finalize_journal_count,
+            expired_workspace_ids,
+            selected_workspaces,
+        })
+    }
+
+    /// Materialize every live atomic workspace pointer for one project. This
+    /// is the restart-safe `all` source: visibility comes from the durable
+    /// generation lease, not an in-memory session-token cache.
+    pub fn materialize_selected_provisionals_for_project(
+        &self,
+        project_id: &str,
+        now: u64,
+    ) -> Result<Vec<ReadyProvisionalWorkspace>> {
+        validate_project_id(project_id)?;
+        let _guard = self.lock_mutation()?;
+        self.materialize_selected_provisionals_for_project_locked(project_id, now)
+            .map(|(_, selected)| selected)
+    }
+
+    /// Enumerate durable workspace pointer owners without materializing any
+    /// peer. Callers then materialize each id independently so one corrupt or
+    /// expired peer degrades only that peer in an `all` view.
+    pub fn selected_provisional_workspace_ids_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<WorkspaceId>> {
+        validate_project_id(project_id)?;
+        let _guard = self.lock_mutation()?;
+        let project_root = self.root.join("provisional/generations").join(project_id);
+        let mut workspace_ids = Vec::new();
+        for workspace_root in read_child_directories_if_present(&project_root, &["current.json"])? {
+            let workspace_id = WorkspaceId::parse(file_name(&workspace_root)?)?;
+            let directory = existing_directory(&workspace_root)?;
+            if directory
+                .read_regular(
+                    "current.json",
+                    MAX_GENERATION_RECORD_BYTES,
+                    "provisional pointer",
+                )?
+                .is_some()
+            {
+                workspace_ids.push(workspace_id);
+            }
+        }
+        Ok(workspace_ids)
+    }
+
+    fn materialize_selected_provisionals_for_project_locked(
+        &self,
+        project_id: &str,
+        now: u64,
+    ) -> Result<(Vec<WorkspaceId>, Vec<ReadyProvisionalWorkspace>)> {
+        let mut expired_workspace_ids = Vec::new();
+        let mut selected_workspaces = Vec::new();
+        let project_root = self.root.join("provisional/generations").join(project_id);
+        for workspace_root in read_child_directories_if_present(&project_root, &["current.json"])? {
+            let workspace_id = WorkspaceId::parse(file_name(&workspace_root)?)?;
+            let Some(pointer) = read_json::<ProvisionalPointerV1>(
+                &workspace_root,
+                "current.json",
+                MAX_GENERATION_RECORD_BYTES,
+                "provisional pointer",
+            )?
+            else {
+                continue;
+            };
+            if pointer.version != STORE_VERSION
+                || pointer.project_id != project_id
+                || pointer.workspace_id != workspace_id
+                || pointer.sequence == 0
+            {
+                bail!(StoreRequestError::InvalidState);
+            }
+            validate_provisional_generation_id(&pointer.source_generation_id)?;
+            if pointer.lease_expires_unix_secs <= now {
+                expired_workspace_ids.push(workspace_id);
+                continue;
+            }
+            let source = self.load_provisional_generation(
+                project_id,
+                &workspace_id,
+                &pointer.source_generation_id,
+            )?;
+            let authority = ProvisionalAuthorityV1 {
+                project_id: project_id.to_string(),
+                scope: source.descriptor.scope.clone(),
+                workspace_id,
+            };
+            let selected = self
+                .materialize_selected_provisional_locked(&authority, now)?
+                .ok_or(StoreRequestError::InvalidState)?;
+            selected_workspaces.push(selected);
+        }
+        Ok((expired_workspace_ids, selected_workspaces))
     }
 
     pub fn probe_provisional(
@@ -3994,6 +4189,125 @@ mod tests {
                 .selected_provisional(&authority, now_unix_secs())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn cutover_readiness_is_lock_consistent_and_refuses_unquiet_source_state() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, nodes, knowledge, gaps) = provisional_fixture(7);
+        let upload = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+
+        let prepared = store
+            .project_cutover_readiness(&authority.project_id, now_unix_secs())
+            .unwrap();
+        assert_eq!(prepared.prepared_upload_count, 1);
+        assert_eq!(prepared.unfinished_finalize_journal_count, 0);
+        assert!(prepared.selected_workspaces.is_empty());
+
+        put_provisional_pages(
+            &store,
+            &authority,
+            &upload.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        install_fixture_blobs_provisional(&store, &authority, &upload.upload_id);
+        let generation = store
+            .finalize_provisional_upload(&authority, &upload.upload_id, 60)
+            .unwrap()
+            .source_generation_id;
+
+        let ready = store
+            .project_cutover_readiness(&authority.project_id, now_unix_secs())
+            .unwrap();
+        assert_eq!(ready.prepared_upload_count, 0);
+        assert_eq!(ready.unfinished_finalize_journal_count, 0);
+        assert!(ready.expired_workspace_ids.is_empty());
+        assert_eq!(ready.selected_workspaces.len(), 1);
+        assert_eq!(
+            ready.selected_workspaces[0].source_generation_id,
+            generation
+        );
+        assert_eq!(
+            store
+                .selected_provisional_workspace_ids_for_project(&authority.project_id)
+                .unwrap(),
+            vec![authority.workspace_id.clone()]
+        );
+        assert_eq!(
+            ready.selected_workspaces[0].working_knowledge[0].source_bytes,
+            KNOWLEDGE_BYTES
+        );
+        assert_eq!(
+            ready.selected_workspaces[0].working_gaps[0].source_bytes,
+            GAP_BYTES
+        );
+
+        store
+            .write_finalize_journal(
+                FinalizeJournalV1 {
+                    version: STORE_VERSION,
+                    kind: FinalizeKindV1::Provisional,
+                    stage: FinalizeStageV1::Prepared,
+                    upload_id: "f".repeat(32),
+                    source_generation_id: format!("kws_{}", "e".repeat(64)),
+                    authority_key: authority.workspace_id.as_str().to_string(),
+                    project_id: authority.project_id.clone(),
+                    created_unix_secs: 1,
+                    created_unix_nanos: 1,
+                    lease_expires_unix_secs: Some(2),
+                    prior_generation_id: None,
+                    provisional_sequence: Some(8),
+                    checksum_sha256: String::new(),
+                }
+                .seal()
+                .unwrap(),
+            )
+            .unwrap();
+        let unquiet = store
+            .project_cutover_readiness(&authority.project_id, u64::MAX)
+            .unwrap();
+        assert_eq!(unquiet.unfinished_finalize_journal_count, 1);
+        assert_eq!(unquiet.expired_workspace_ids, vec![authority.workspace_id]);
+        assert!(unquiet.selected_workspaces.is_empty());
+    }
+
+    #[test]
+    fn cutover_readiness_fails_closed_on_selected_remote_blob_corruption() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, nodes, knowledge, gaps) = provisional_fixture(7);
+        let upload = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &authority,
+            &upload.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        install_fixture_blobs_provisional(&store, &authority, &upload.upload_id);
+        store
+            .finalize_provisional_upload(&authority, &upload.upload_id, 60)
+            .unwrap();
+
+        let hash = source_file_blob_sha256(KNOWLEDGE_BYTES);
+        std::fs::write(
+            root.join("blobs/sha256").join(&hash[..2]).join(&hash[2..]),
+            b"corrupt",
+        )
+        .unwrap();
+
+        assert_store_error(
+            store.project_cutover_readiness(&authority.project_id, now_unix_secs()),
+            StoreRequestError::InvalidState,
         );
     }
 

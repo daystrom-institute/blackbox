@@ -798,17 +798,28 @@ fn acquire_leases_for_record(
     purpose: ProjectLeasePurpose,
     git_history_transport_governed: bool,
 ) -> Result<LeasedProjectAccess> {
-    let publisher_config = broker.acquire(access_request(
-        &project.project_id,
-        None,
-        CheckoutAccessKind::PublisherConfigTreeRead,
-    ));
-    let expected_scope = publisher_config
-        .as_ref()
-        .ok()
-        .and_then(|lease| lease.published_scope().cloned());
-    let publisher_config_denial = publisher_config.as_ref().err().map(ToString::to_string);
-    let publisher_config = publisher_config.ok();
+    let (publisher_config, expected_scope, publisher_config_denial) = match broker
+        .recorded_project_scope(&project.project_id)
+    {
+        Ok(crate::checkout_access::CheckoutRecordedProjectScope::Published(scope)) => {
+            (None, Some(scope), None)
+        }
+        Ok(crate::checkout_access::CheckoutRecordedProjectScope::LegacyLocal) => (None, None, None),
+        Ok(crate::checkout_access::CheckoutRecordedProjectScope::Unavailable) => {
+            let publisher_config = broker.acquire(access_request(
+                &project.project_id,
+                None,
+                CheckoutAccessKind::PublisherConfigTreeRead,
+            ));
+            let expected_scope = publisher_config
+                .as_ref()
+                .ok()
+                .and_then(|lease| lease.published_scope().cloned());
+            let denial = publisher_config.as_ref().err().map(ToString::to_string);
+            (publisher_config.ok(), expected_scope, denial)
+        }
+        Err(error) => (None, None, Some(error.to_string())),
+    };
     // A collected project needs no local walk lease for its own indexing,
     // but a full reindex pass still uses the local root for the tool-edge,
     // project-record, and knowledge lanes, so the acquisition set stays

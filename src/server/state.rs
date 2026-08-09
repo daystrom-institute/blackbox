@@ -132,6 +132,11 @@ pub(crate) struct SharedState {
     /// Single daemon-owned checkout authority. Every checkout consumer reuses
     /// this broker so counters and authority state cannot diverge per call.
     pub(crate) checkout_access: Arc<bbox_indexing::checkout_access::CheckoutAccessBroker>,
+    /// Durable operation and shadow-parity evidence for knowledge transport.
+    /// Checkout observations prove the absence of local leases; this store
+    /// proves the remote result matched its overlap reference.
+    pub(crate) knowledge_transport_observations:
+        bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1,
     /// Host-local symbolic branch pins defining published truth per scope.
     pub(crate) publisher_refs: RwLock<bbox_indexing::publisher::PublisherRefStore>,
     /// Session-authorized provisional snapshots keyed by scope and checkout.
@@ -206,6 +211,10 @@ pub(crate) struct SharedState {
     /// Bridge mode and pre-cutover catalog mode carry an empty runtime.
     pub(crate) git_transport_cutover:
         Arc<bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1>,
+    /// Strict per-project knowledge transport authority. Any present row is a
+    /// monotonic no-fallback boundary even while it is pending re-cutover.
+    pub(crate) knowledge_transport_cutover:
+        Arc<bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1>,
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
@@ -555,6 +564,48 @@ impl SharedState {
             .is_some_and(|coverage| coverage.transport_governed()))
     }
 
+    /// Classify one catalog Published project against its strict knowledge
+    /// transport row. Any non-`Uncovered` state remains a no-fallback
+    /// boundary; `Current` alone may serve newly selected remote state.
+    pub(crate) fn knowledge_transport_coverage_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<
+        Option<bbox_indexing::knowledge_transport_cutover::KnowledgeTransportRuntimeCoverageV1>,
+    > {
+        let Some(store) = self.project_authority.catalog_store() else {
+            return Ok(None);
+        };
+        let project_id =
+            bbox_corpus_core::project_catalog::ProjectId::parse(project_id.to_string())?;
+        let snapshot = store.snapshot()?;
+        let Some(project) = snapshot.catalog().projects.get(&project_id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            project.scope,
+            bbox_corpus_core::project_catalog::ProjectScope::Published(_)
+        ) {
+            return Ok(None);
+        }
+        let assignments = self
+            .code_sources
+            .producer_auth()
+            .assignments()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let accepted = self
+            .accepted_publications
+            .as_ref()
+            .and_then(|runtime| runtime.load_verified(&project_id).ok());
+        Ok(Some(self.knowledge_transport_cutover.classify_project(
+            snapshot.catalog(),
+            &assignments,
+            &project_id,
+            accepted.as_ref(),
+        )))
+    }
+
     /// Attach the daemon read-view publisher to the index writer's commit
     /// boundary. The actor invokes the hook once immediately, then after each
     /// successful commit, so no startup or small-op batch can leave the pinned
@@ -882,6 +933,8 @@ impl SharedState {
                 store_dir.join("resolver-compat-observations.json"),
             ),
             checkout_access,
+            knowledge_transport_observations:
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationsV1::in_memory(),
             publisher_refs: RwLock::new(
                 bbox_indexing::publisher::PublisherRefStore::open(
                     store_dir.join("publisher-refs.json"),
@@ -919,6 +972,9 @@ impl SharedState {
             )),
             git_transport_cutover: Arc::new(
                 bbox_indexing::git_transport_cutover::GitTransportCutoverRuntimeV1::default(),
+            ),
+            knowledge_transport_cutover: Arc::new(
+                bbox_indexing::knowledge_transport_cutover::KnowledgeTransportCutoverRuntimeV1::default(),
             ),
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),

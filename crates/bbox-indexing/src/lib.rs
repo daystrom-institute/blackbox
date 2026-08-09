@@ -16,6 +16,8 @@ pub mod checkout_access_v2;
 pub mod checkout_registry;
 pub mod git_transport_cutover;
 pub mod index;
+pub mod knowledge_transport_cutover;
+pub mod knowledge_transport_observations;
 pub mod project_catalog_admin;
 pub mod project_catalog_backfill;
 pub mod project_catalog_inventory;

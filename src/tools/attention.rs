@@ -108,11 +108,21 @@ impl BlackboxServer {
                         &server.state,
                     )?;
                 let projects = inputs.records.clone();
+                let local_projects = projects
+                    .iter()
+                    .filter(|project| {
+                        !server
+                            .state
+                            .knowledge_transport_cutover
+                            .covers_project_str(&project.project_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let repo_write = crate::server::repo_io::RepoIoAuthority::new(
                     server.state.checkout_access.clone(),
                 );
                 let mut carriers = crate::server::repo_io::RepoIoAuthority::gap_base_carriers(
-                    &projects,
+                    &local_projects,
                     inputs.targets.as_ref(),
                 )?
                 .into_iter()
@@ -142,6 +152,13 @@ impl BlackboxServer {
                             }
                         }
                     };
+                    if server
+                        .state
+                        .knowledge_transport_cutover
+                        .covers_project_str(&project_id)
+                    {
+                        continue;
+                    }
                     let project = projects
                         .iter()
                         .find(|project| project.project_id == project_id)

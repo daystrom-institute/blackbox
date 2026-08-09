@@ -259,6 +259,27 @@ impl BlackboxServer {
         };
         let resolution = self.resolve_project_write(&raw)?;
         let durable_scope = resolution.durable_scope;
+        if let Some(project_id) = resolution.project_id.as_deref().filter(|project_id| {
+            self.state
+                .knowledge_transport_cutover
+                .covers_project_str(project_id)
+        }) {
+            self.observe_knowledge_transport_operation(
+                project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
+            );
+            anyhow::bail!(
+                "error.knowledge_transport_authoritative: covered project knowledge must be mutated by the checkout-owner harness"
+            );
+        }
+        if let Some(project_id) = resolution.project_id.as_deref() {
+            self.observe_knowledge_transport_operation(
+                project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Local,
+            );
+        }
         // Dual-read stamping (phase-2 §8.1): new rows carry the resolved
         // stable id beside the path key; the unregistered lane stays None.
         *project_id = resolution.project_id;

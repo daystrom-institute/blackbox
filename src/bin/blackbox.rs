@@ -14,6 +14,11 @@ use bbox_indexing::git_transport_cutover::{
     GitTransportCutoverPreflightRequestV1, GitTransportCutoverVerifyRequestV1,
     ProjectCatalogGitTransportCutoverFacadeV1,
 };
+use bbox_indexing::knowledge_transport_cutover::{
+    KnowledgeTransportCutoverApplyRequestV1, KnowledgeTransportCutoverError,
+    KnowledgeTransportCutoverPreflightRequestV1, KnowledgeTransportCutoverVerifyRequestV1,
+    ProjectCatalogKnowledgeTransportCutoverFacadeV1,
+};
 use bbox_indexing::project_catalog_admin;
 use bbox_indexing::project_catalog_backfill::{
     DurableBackfillApplyRequestV1, DurableBackfillPreflightRequestV1,
@@ -73,6 +78,8 @@ enum ProjectCatalogCommand {
     PathFreeRebuild(PathFreeRebuildArgs),
     /// Inventory and prove Git history/provenance transport overlap parity.
     GitTransportCutover(GitTransportCutoverArgs),
+    /// Prove knowledge parity and install strict remote-only authority.
+    KnowledgeTransportCutover(KnowledgeTransportCutoverArgs),
     /// Create a catalog project by authoritative scope or as legacy-local.
     Add(AddArgs),
     /// List every catalog project, including remote-only projects.
@@ -291,6 +298,36 @@ struct GitTransportCutoverArgs {
     #[arg(long)]
     verify: bool,
     /// Reviewable coverage and parity report output.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+    /// Canonical empty-or-explicit resolution artifact.
+    #[arg(long, value_name = "PATH")]
+    resolution: Option<PathBuf>,
+    /// Select the configured catalog for offline apply or verify.
+    #[arg(long)]
+    configured: bool,
+    #[command(flatten)]
+    config: ConfigArgs,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("mode")
+        .required(true)
+        .multiple(false)
+        .args(["preflight", "apply", "verify"])
+))]
+struct KnowledgeTransportCutoverArgs {
+    /// Capture configured state and emit reviewed cutover artifacts.
+    #[arg(long)]
+    preflight: bool,
+    /// Atomically install the exact reviewed cutover marker while offline.
+    #[arg(long)]
+    apply: bool,
+    /// Verify and receipt the selected current marker while offline.
+    #[arg(long)]
+    verify: bool,
+    /// Reviewable coverage, parity, and local-observation report output.
     #[arg(long, value_name = "PATH")]
     report: Option<PathBuf>,
     /// Canonical empty-or-explicit resolution artifact.
@@ -542,6 +579,12 @@ impl From<GitTransportCutoverError> for CommandFailure {
     }
 }
 
+impl From<KnowledgeTransportCutoverError> for CommandFailure {
+    fn from(error: KnowledgeTransportCutoverError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
 #[derive(Serialize)]
 struct SuccessEnvelope<T> {
     version: u32,
@@ -643,6 +686,15 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::GitTransportCutover(_),
         }) => "project_catalog_git_transport_cutover_verify",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::KnowledgeTransportCutover(args),
+        }) if args.preflight => "project_catalog_knowledge_transport_cutover_preflight",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::KnowledgeTransportCutover(args),
+        }) if args.apply => "project_catalog_knowledge_transport_cutover_apply",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::KnowledgeTransportCutover(_),
+        }) => "project_catalog_knowledge_transport_cutover_verify",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(_),
         }) => "project_catalog_add",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
@@ -695,6 +747,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::GitTransportCutover(args),
         }) => execute_git_transport_cutover(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::KnowledgeTransportCutover(args),
+        }) => execute_knowledge_transport_cutover(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(args),
         }) => execute_add(args),
@@ -1153,6 +1208,101 @@ fn execute_git_transport_cutover(
     }
 }
 
+fn execute_knowledge_transport_cutover(
+    args: KnowledgeTransportCutoverArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let mode = match (args.preflight, args.apply, args.verify) {
+        (true, false, false) => NewVerbModeV1::Preflight,
+        (false, true, false) => NewVerbModeV1::Apply,
+        (false, false, true) => NewVerbModeV1::Verify,
+        _ => {
+            return Err(cli_arguments(
+                "knowledge-transport-cutover requires exactly one mode: --preflight, --apply, or --verify",
+            ));
+        }
+    };
+    let artifacts = match mode {
+        NewVerbModeV1::Preflight | NewVerbModeV1::Apply => {
+            let (Some(report), Some(resolution)) = (args.report, args.resolution) else {
+                return Err(cli_arguments(
+                    "knowledge-transport-cutover --preflight and --apply require both --report and --resolution",
+                ));
+            };
+            Some((report, resolution))
+        }
+        NewVerbModeV1::Verify => {
+            if args.report.is_some() || args.resolution.is_some() {
+                return Err(cli_arguments(
+                    "knowledge-transport-cutover --verify takes no report or resolution artifacts",
+                ));
+            }
+            None
+        }
+    };
+    match mode {
+        NewVerbModeV1::Preflight if args.configured => {
+            return Err(cli_arguments(
+                "knowledge-transport-cutover --preflight captures configured state and does not accept --configured",
+            ));
+        }
+        NewVerbModeV1::Apply | NewVerbModeV1::Verify if !args.configured => {
+            return Err(cli_arguments(
+                "knowledge-transport-cutover --apply and --verify require --configured",
+            ));
+        }
+        _ => {}
+    }
+    let config = load_config(args.config.config)?;
+    let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: args.config.projects_path,
+            state_dir: args.config.state_dir,
+        },
+    )?;
+    match mode {
+        NewVerbModeV1::Preflight => {
+            let (report_path, resolution_path) =
+                artifacts.expect("preflight artifacts resolved above");
+            let receipt = ProjectCatalogKnowledgeTransportCutoverFacadeV1::preflight(
+                KnowledgeTransportCutoverPreflightRequestV1 {
+                    layout,
+                    config,
+                    report_path,
+                    resolution_path,
+                    generated_at: offline_timestamp(),
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Apply => {
+            let (report_path, resolution_path) = artifacts.expect("apply artifacts resolved above");
+            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
+            let receipt = ProjectCatalogKnowledgeTransportCutoverFacadeV1::apply(
+                KnowledgeTransportCutoverApplyRequestV1 {
+                    layout,
+                    config,
+                    report_path,
+                    resolution_path,
+                    applied_at: offline_timestamp(),
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Verify => {
+            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
+            let receipt = ProjectCatalogKnowledgeTransportCutoverFacadeV1::verify(
+                KnowledgeTransportCutoverVerifyRequestV1 {
+                    layout,
+                    config,
+                    verified_at: offline_timestamp(),
+                },
+            )?;
+            serialize_result(&receipt)
+        }
+    }
+}
+
 fn execute_path_free_rebuild(
     args: PathFreeRebuildArgs,
 ) -> Result<serde_json::Value, CommandFailure> {
@@ -1452,6 +1602,22 @@ mod tests {
         assert_eq!(
             command_name(&git_transport_cutover),
             "project_catalog_git_transport_cutover_preflight"
+        );
+
+        let knowledge_transport_cutover = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "knowledge-transport-cutover",
+            "--preflight",
+            "--report",
+            "/tmp/knowledge-transport-report.json",
+            "--resolution",
+            "/tmp/knowledge-transport-resolution.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_name(&knowledge_transport_cutover),
+            "project_catalog_knowledge_transport_cutover_preflight"
         );
 
         let preflight = Cli::try_parse_from([

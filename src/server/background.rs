@@ -437,6 +437,12 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
                         }
                     }
                 };
+                if shared
+                    .knowledge_transport_cutover
+                    .covers_project_str(&project_id)
+                {
+                    continue;
+                }
                 let carrier = match watcher::ArtifactWatchCarrier::checkout(
                     project_id,
                     row.checkout_id.clone(),

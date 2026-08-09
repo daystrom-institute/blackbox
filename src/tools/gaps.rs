@@ -59,6 +59,27 @@ impl BlackboxServer {
         let resolution = self.resolve_project_write(raw)?;
         let durable_scope = resolution.durable_scope;
         let resolved_project_id = resolution.project_id;
+        if let Some(project_id) = resolved_project_id.as_deref().filter(|project_id| {
+            self.state
+                .knowledge_transport_cutover
+                .covers_project_str(project_id)
+        }) {
+            self.observe_knowledge_transport_operation(
+                project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
+            );
+            anyhow::bail!(
+                "error.knowledge_transport_authoritative: covered project gaps must be mutated by the checkout-owner harness"
+            );
+        }
+        if let Some(project_id) = resolved_project_id.as_deref() {
+            self.observe_knowledge_transport_operation(
+                project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Local,
+            );
+        }
         let checkout = resolution.checkout_scope;
         let write_dir = checkout
             .as_ref()

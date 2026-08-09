@@ -119,6 +119,13 @@ pub(crate) struct DoctorReport {
     /// exposes every closed operation kind and bounded counter dimension.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) checkout_access: Option<bbox_indexing::checkout_access::CheckoutAccessHealth>,
+    /// Complete path-free knowledge transport overlap evidence. The section
+    /// below classifies the operator-relevant failures; JSON retains the
+    /// bounded per-project counters and latest shadow comparisons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) knowledge_transport: Option<
+        bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationSnapshotV1,
+    >,
 }
 
 impl DoctorReport {
@@ -132,6 +139,7 @@ impl DoctorReport {
             status,
             sections,
             checkout_access: None,
+            knowledge_transport: None,
         }
     }
 
@@ -140,6 +148,14 @@ impl DoctorReport {
         health: bbox_indexing::checkout_access::CheckoutAccessHealth,
     ) -> Self {
         self.checkout_access = Some(health);
+        self
+    }
+
+    fn with_knowledge_transport(
+        mut self,
+        observations: bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationSnapshotV1,
+    ) -> Self {
+        self.knowledge_transport = Some(observations);
         self
     }
 
@@ -200,6 +216,12 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
     ];
     let checkout_access = state.checkout_access_observations.health();
     sections.push(checkout_access_section(&checkout_access));
+    let knowledge_transport = state.knowledge_transport_observations.snapshot();
+    sections.push(knowledge_transport_section(
+        state,
+        &checkout_access,
+        &knowledge_transport,
+    ));
     sections.push(resolver_compat_section(state));
     // Catalog-only project health (plan section 8, P5-G). Each section is
     // observational: it reports what the catalog, the accepted pointer, and
@@ -220,7 +242,9 @@ pub(crate) fn run(server: &crate::server::BlackboxServer) -> anyhow::Result<Doct
         knowledge_section(state),
         attention_section(state),
     ]);
-    Ok(DoctorReport::from_sections(sections).with_checkout_access(checkout_access))
+    Ok(DoctorReport::from_sections(sections)
+        .with_checkout_access(checkout_access)
+        .with_knowledge_transport(knowledge_transport))
 }
 
 /// How many per-project findings one catalog section emits before it
@@ -624,6 +648,190 @@ fn checkout_access_section(
     }
 }
 
+/// Strict knowledge transport authority and overlap evidence. Marker rows
+/// are monotonic: every non-current classification is a remote degradation,
+/// never permission to reopen the local adapter.
+fn knowledge_transport_section(
+    state: &crate::server::state::SharedState,
+    checkout_health: &bbox_indexing::checkout_access::CheckoutAccessHealth,
+    observations: &bbox_indexing::knowledge_transport_observations::KnowledgeTransportObservationSnapshotV1,
+) -> SectionReport {
+    use bbox_indexing::checkout_access::CheckoutAccessOutcome;
+    use bbox_indexing::knowledge_transport_cutover::KnowledgeTransportRuntimeCoverageV1;
+    use bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1;
+
+    let mut findings = Vec::new();
+    let Some(marker) = state.knowledge_transport_cutover.marker() else {
+        findings.push(if observations.sequence == 0 {
+            Finding::info("knowledge transport has no observations or strict cutover rows yet")
+        } else {
+            Finding::info(format!(
+                "knowledge transport has {} overlap observation(s) and no strict cutover rows",
+                observations.sequence
+            ))
+        });
+        return SectionReport {
+            section: "knowledge_transport",
+            findings,
+        };
+    };
+
+    let catalog = state
+        .project_authority
+        .catalog_store()
+        .ok_or_else(|| "catalog store unavailable".to_string())
+        .and_then(|store| store.snapshot().map_err(|error| format!("{error:#}")));
+    let assignments = state
+        .code_sources
+        .producer_auth()
+        .assignments()
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let covered_ids = marker
+        .rows
+        .iter()
+        .map(|row| row.project_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let parity_workspaces = marker
+        .rows
+        .iter()
+        .flat_map(|row| {
+            row.parity_workspace_ids
+                .iter()
+                .map(move |workspace_id| (row.project_id.as_str(), workspace_id.as_str()))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut current = 0usize;
+    let mut considered = 0usize;
+
+    match catalog {
+        Err(error) => findings.push(Finding::blocked(format!(
+            "knowledge transport has {} strict row(s), but live catalog classification failed: {error}",
+            marker.rows.len()
+        ))),
+        Ok(catalog) => {
+            for row in &marker.rows {
+                let accepted = state
+                    .accepted_publications
+                    .as_ref()
+                    .and_then(|runtime| runtime.load_verified(&row.project_id).ok());
+                let coverage = state.knowledge_transport_cutover.classify_project(
+                    catalog.catalog(),
+                    &assignments,
+                    &row.project_id,
+                    accepted.as_ref(),
+                );
+                if coverage == KnowledgeTransportRuntimeCoverageV1::Current {
+                    current += 1;
+                } else {
+                    considered += 1;
+                    if considered <= MAX_PROJECT_FINDINGS {
+                        findings.push(Finding::action(
+                            format!(
+                                "project {} remains transport-governed but is {}; local fallback stays closed",
+                                row.project_id,
+                                serde_json::to_value(coverage)
+                                    .ok()
+                                    .and_then(|value| value.as_str().map(str::to_owned))
+                                    .unwrap_or_else(|| "pending_recutover".into())
+                            ),
+                            "blackbox project-catalog knowledge-transport-cutover --preflight",
+                        ));
+                    }
+                }
+
+                for baseline in &row.capability_baselines {
+                    let count = |outcome| {
+                        checkout_health
+                            .target_counters
+                            .iter()
+                            .filter(|counter| {
+                                counter.project_id == row.project_id.as_str()
+                                    && counter.kind == baseline.capability
+                                    && counter.outcome == outcome
+                            })
+                            .map(|counter| counter.count)
+                            .sum::<u64>()
+                    };
+                    let granted = count(CheckoutAccessOutcome::Granted);
+                    let denied = count(CheckoutAccessOutcome::Denied);
+                    if granted != baseline.granted || denied != baseline.denied {
+                        findings.push(Finding::blocked(format!(
+                            "project {} recorded a post-cutover {} checkout observation (baseline {}/{}, current {}/{})",
+                            row.project_id,
+                            baseline.capability.as_str(),
+                            baseline.granted,
+                            baseline.denied,
+                            granted,
+                            denied
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let mismatch_count = observations
+        .comparisons
+        .iter()
+        .filter(|comparison| {
+            comparison
+                .workspace_id
+                .as_deref()
+                .is_some_and(|workspace_id| {
+                    parity_workspaces.contains(&(comparison.project_id.as_str(), workspace_id))
+                })
+        })
+        .filter(|comparison| !comparison.equal)
+        .count();
+    if mismatch_count > 0 {
+        findings.push(Finding::action(
+            format!(
+                "{mismatch_count} latest covered-project knowledge transport shadow comparison(s) mismatch"
+            ),
+            "blackbox project-catalog knowledge-transport-cutover --preflight",
+        ));
+    }
+    let remote_count = observations
+        .counters
+        .iter()
+        .filter(|counter| {
+            covered_ids.contains(counter.project_id.as_str())
+                && counter.outcome == KnowledgeTransportOutcomeV1::Remote
+        })
+        .map(|counter| counter.count)
+        .sum::<u64>();
+    let degraded_count = observations
+        .counters
+        .iter()
+        .filter(|counter| {
+            covered_ids.contains(counter.project_id.as_str())
+                && counter.outcome == KnowledgeTransportOutcomeV1::Degraded
+        })
+        .map(|counter| counter.count)
+        .sum::<u64>();
+    if degraded_count > 0 {
+        findings.push(Finding::warn(format!(
+            "covered knowledge transport recorded {degraded_count} degraded operation(s); local fallback remained closed"
+        )));
+    }
+    bound_findings(&mut findings, considered, "knowledge-transport");
+    if current > 0 {
+        findings.push(Finding::ok(format!(
+            "{current} strict knowledge transport row(s) are current; {remote_count} remote operation(s) observed"
+        )));
+    }
+    if findings.is_empty() {
+        findings.push(Finding::ok(
+            "strict knowledge transport marker contains no rows",
+        ));
+    }
+    SectionReport {
+        section: "knowledge_transport",
+        findings,
+    }
+}
+
 /// Resolver compatibility-lane counters (phase-2 §9.2): the per-surface
 /// observations the Phase 6 compatibility cut consumes. Also surfaces the
 /// records-provider's most recent degradation (stale projection serving,
@@ -836,14 +1044,55 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                         intent: CheckoutAccessIntent::Read,
                         source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
                     };
-                    let scope = state
-                        .checkout_access
-                        .acquire(request(CheckoutAccessKind::PublisherConfigTreeRead, None));
-                    let git = scope.and_then(|scope| {
-                        state.checkout_access.acquire(request(
-                            CheckoutAccessKind::GitHistory,
-                            scope.published_scope().cloned(),
-                        ))
+                    let expected_scope = if let Some(catalog_store) =
+                        state.project_authority.catalog_store()
+                    {
+                        let project_id =
+                            bbox_corpus_core::project_catalog::ProjectId::parse(
+                                project.project_id.clone(),
+                            )
+                            .map_err(|_| {
+                                bbox_indexing::checkout_access::CheckoutAccessError::new(
+                                    bbox_indexing::checkout_access::CheckoutAccessErrorCode::ScopeMismatch,
+                                    "catalog project id is invalid",
+                                )
+                            });
+                        project_id.and_then(|project_id| {
+                            let snapshot = catalog_store.snapshot().map_err(|error| {
+                                bbox_indexing::checkout_access::CheckoutAccessError::new(
+                                    bbox_indexing::checkout_access::CheckoutAccessErrorCode::ScopeMismatch,
+                                    format!("catalog scope is unavailable: {error}"),
+                                )
+                            })?;
+                            snapshot
+                                .catalog()
+                                .projects
+                                .get(&project_id)
+                                .map(|project| match &project.scope {
+                                    bbox_corpus_core::project_catalog::ProjectScope::Published(
+                                        scope,
+                                    ) => Some(scope.clone()),
+                                    bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => {
+                                        None
+                                    }
+                                })
+                                .ok_or_else(|| {
+                                    bbox_indexing::checkout_access::CheckoutAccessError::new(
+                                        bbox_indexing::checkout_access::CheckoutAccessErrorCode::ScopeMismatch,
+                                        "catalog project disappeared",
+                                    )
+                                })
+                        })
+                    } else {
+                        state
+                            .checkout_access
+                            .acquire(request(CheckoutAccessKind::PublisherConfigTreeRead, None))
+                            .map(|scope| scope.published_scope().cloned())
+                    };
+                    let git = expected_scope.and_then(|expected_scope| {
+                        state
+                            .checkout_access
+                            .acquire(request(CheckoutAccessKind::GitHistory, expected_scope))
                     });
                     let git = match git {
                         Ok(git) => git,
@@ -1620,6 +1869,7 @@ mod tests {
                 "graph",
                 "projects",
                 "checkout_access",
+                "knowledge_transport",
                 "resolver_compat",
                 "memories",
                 "knowledge",
@@ -1740,6 +1990,7 @@ mod tests {
             serde_json::to_value(&report).unwrap()["checkout_access"],
             projection
         );
+        assert!(serde_json::to_value(&report).unwrap()["knowledge_transport"].is_object());
 
         let checkout_section = report
             .sections

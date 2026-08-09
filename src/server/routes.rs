@@ -2635,8 +2635,17 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
     };
     let projects = inputs.records;
     let catalog_targets = inputs.targets;
+    let local_projects = projects
+        .iter()
+        .filter(|project| {
+            !state
+                .knowledge_transport_cutover
+                .covers_project_str(&project.project_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     match super::repo_io::RepoIoAuthority::knowledge_base_carriers(
-        &projects,
+        &local_projects,
         catalog_targets.as_ref(),
     ) {
         Ok(knowledge_carriers) => {
@@ -2652,7 +2661,10 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
             tracing::warn!("knowledge repository-carrier sync failed: {error:#}");
         }
     }
-    match super::repo_io::RepoIoAuthority::gap_base_carriers(&projects, catalog_targets.as_ref()) {
+    match super::repo_io::RepoIoAuthority::gap_base_carriers(
+        &local_projects,
+        catalog_targets.as_ref(),
+    ) {
         Ok(gap_carriers) => {
             if let Err(error) =
                 state
@@ -2682,6 +2694,14 @@ pub(crate) fn published_knowledge_for_embedding(
     Ok(view.knowledge.all_entries().to_vec())
 }
 
+fn knowledge_entry_belongs_to_project(
+    entry: &crate::knowledge::KnowledgeEntry,
+    project_dir: &str,
+    project_id: &str,
+) -> bool {
+    entry.project.as_deref() == Some(project_dir) || entry.project_id.as_deref() == Some(project_id)
+}
+
 /// Enqueue embeddings for a project's committed knowledge entries. The BM25
 /// reindex picks up committed `.bbox/knowledge/` automatically, but vector
 /// coverage is driven by enqueue, so a project registered from a clone would
@@ -2705,48 +2725,54 @@ pub(crate) fn enqueue_project_knowledge_embeds(
         );
         return 0;
     };
-    let publication_lease = match super::checkout_access::published_scope_for_project(
-        &state.checkout_access,
-        &project.project_id,
-    ) {
-        Ok(Some(scope)) => match server
-            .authorize_publisher(&projects, &scope)
-            .and_then(|publisher| server.acquire_authorized_publisher_lease(&publisher))
-        {
-            Ok(lease) => lease,
-            Err(error) => {
-                tracing::warn!(
-                    project = project_dir,
-                    error = %error,
-                    "project knowledge embed publisher authority unavailable"
-                );
-                return 0;
-            }
-        },
-        Ok(None) => match super::checkout_access::acquire_selected_project_access(
-            &state.checkout_access,
-            &project.project_id,
-            bbox_indexing::checkout_access::CheckoutAccessKind::PublisherConfigTreeRead,
-            bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                tracing::warn!(
-                    project = project_dir,
-                    error = %error,
-                    "legacy project knowledge embed authority unavailable"
-                );
-                return 0;
-            }
-        },
-        Err(error) => {
-            tracing::warn!(
-                project = project_dir,
-                error = %error,
-                "project knowledge embed scope authority unavailable"
-            );
-            return 0;
-        }
+    let publication_lease = if state.project_authority.is_bridge() {
+        Some(
+            match super::checkout_access::published_scope_for_project(
+                &state.checkout_access,
+                &project.project_id,
+            ) {
+                Ok(Some(scope)) => match server
+                    .authorize_publisher(&projects, &scope)
+                    .and_then(|publisher| server.acquire_authorized_publisher_lease(&publisher))
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        tracing::warn!(
+                            project = project_dir,
+                            error = %error,
+                            "project knowledge embed publisher authority unavailable"
+                        );
+                        return 0;
+                    }
+                },
+                Ok(None) => match super::checkout_access::acquire_selected_project_access(
+                    &state.checkout_access,
+                    &project.project_id,
+                    bbox_indexing::checkout_access::CheckoutAccessKind::PublisherConfigTreeRead,
+                    bbox_indexing::checkout_access::CheckoutAccessIntent::Read,
+                ) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        tracing::warn!(
+                            project = project_dir,
+                            error = %error,
+                            "legacy project knowledge embed authority unavailable"
+                        );
+                        return 0;
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        project = project_dir,
+                        error = %error,
+                        "project knowledge embed scope authority unavailable"
+                    );
+                    return 0;
+                }
+            },
+        )
+    } else {
+        None
     };
     let entries = match published_knowledge_for_embedding(state, Some(project_dir)) {
         Ok(entries) => entries,
@@ -2759,20 +2785,25 @@ pub(crate) fn enqueue_project_knowledge_embeds(
             return 0;
         }
     };
-    let publication = match state.checkout_access.publication_guard(&publication_lease) {
-        Ok(publication) => publication,
-        Err(error) => {
-            tracing::warn!(
-                project = project_dir,
-                error = %error,
-                "project knowledge embed publication authority changed"
-            );
-            return 0;
+    let publication = match publication_lease.as_ref() {
+        Some(publication_lease) => {
+            match state.checkout_access.publication_guard(publication_lease) {
+                Ok(publication) => Some(publication),
+                Err(error) => {
+                    tracing::warn!(
+                        project = project_dir,
+                        error = %error,
+                        "project knowledge embed publication authority changed"
+                    );
+                    return 0;
+                }
+            }
         }
+        None => None,
     };
     let mut enqueued = 0usize;
     for entry in entries.iter().filter(|e| {
-        e.project.as_deref() == Some(project_dir)
+        knowledge_entry_belongs_to_project(e, project_dir, &project.project_id)
             && matches!(
                 e.status,
                 crate::knowledge::Status::Active | crate::knowledge::Status::Superseded
@@ -3688,6 +3719,23 @@ mod tests {
             "embedding publication must stop when its checkout fence is unavailable"
         );
         drop(lifecycle);
+    }
+
+    #[test]
+    fn catalog_embedding_rows_match_stable_project_identity_without_a_path() {
+        let mut entry = embedding_test_entry("published bytes");
+        entry.project_id = Some("p_catalog".into());
+
+        assert!(knowledge_entry_belongs_to_project(
+            &entry,
+            "/checkout/path",
+            "p_catalog"
+        ));
+        assert!(!knowledge_entry_belongs_to_project(
+            &entry,
+            "/checkout/path",
+            "p_other"
+        ));
     }
 
     #[test]

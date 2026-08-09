@@ -456,6 +456,11 @@ pub(crate) fn catalog_watch_carriers(state: &SharedState) -> CatalogWatchCarrier
             .values()
             .filter(|attachment| attachment.status == AttachmentStatus::Attached)
             .filter(|attachment| attachment.capabilities.artifact_watching)
+            .filter(|attachment| {
+                !state
+                    .knowledge_transport_cutover
+                    .covers_project(&attachment.project_id)
+            })
             .filter_map(|attachment| {
                 ArtifactWatchCarrier::for_attachment(
                     attachment.project_id.as_str(),
@@ -659,12 +664,19 @@ impl ArtifactWatchRead for LeaseArtifactWatchRead<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use bbox_corpus_core::project_catalog::{
         AttachmentCapabilities, AttachmentId, CheckoutAttachment,
     };
+    use bbox_indexing::knowledge_transport_cutover::{
+        KnowledgeTransportCapabilityBaselineV1, KnowledgeTransportCutoverMarkerV1,
+        KnowledgeTransportCutoverRuntimeV1, PredictedKnowledgeTransportCutoverRowV1,
+    };
+    use bbox_indexing::project_catalog_inventory::Sha256ValueV1;
 
     use super::*;
-    use crate::server::state::catalog_fixture::CatalogFixture;
+    use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
 
     const PROJECT: &str = "proj_watch";
     const CAPABLE: &str = "att_00000000000000000000000000000c01";
@@ -741,6 +753,58 @@ mod tests {
         }
     }
 
+    fn cover_project(server: &mut BlackboxServer) {
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let scope = CatalogFixture::scope(".");
+        let capabilities = [
+            CheckoutAccessKind::PublisherConfigTreeRead,
+            CheckoutAccessKind::KnowledgeGapOverlayRead,
+            CheckoutAccessKind::ArtifactWatchDiscovery,
+            CheckoutAccessKind::RepositoryMutation,
+        ];
+        let marker = KnowledgeTransportCutoverMarkerV1 {
+            version: 1,
+            applied_at: "unix:1".into(),
+            report_artifact_hash: Sha256ValueV1::digest(b"report"),
+            resolution_artifact_hash: Sha256ValueV1::digest(b"resolution"),
+            predecessor_marker_checksum: None,
+            predecessor_catalog_epoch: 1,
+            inventory_hash: Sha256ValueV1::digest(b"inventory"),
+            observation_snapshot_hash: Sha256ValueV1::digest(b"observations"),
+            rows: vec![PredictedKnowledgeTransportCutoverRowV1 {
+                project_id,
+                scope,
+                producer_id: "producer".into(),
+                grant_commitment: Sha256ValueV1::digest(b"grant"),
+                accepted_generation_id: "a".repeat(64),
+                accepted_generation_sha256: "b".repeat(64),
+                accepted_pointer_sha256: "c".repeat(64),
+                source_generation_id: format!("kpub_{}", "d".repeat(64)),
+                source_generation_sha256: "e".repeat(64),
+                publication_parity_commitment: Sha256ValueV1::digest(b"publication"),
+                parity_workspace_ids: Vec::new(),
+                workspace_parity_commitment: Sha256ValueV1::digest(b"workspace"),
+                shadow_observation_commitment: Sha256ValueV1::digest(b"shadow"),
+                capability_baselines: capabilities
+                    .into_iter()
+                    .map(|capability| KnowledgeTransportCapabilityBaselineV1 {
+                        capability,
+                        granted: 0,
+                        denied: 0,
+                    })
+                    .collect(),
+                observation_window_start_sequence: 0,
+                observation_window_end_sequence: 0,
+            }],
+            checksum_sha256: Sha256ValueV1::digest(b"test fixture bypasses marker decoding"),
+        };
+        Arc::get_mut(&mut server.state)
+            .expect("test server has one state owner")
+            .knowledge_transport_cutover = Arc::new(
+            KnowledgeTransportCutoverRuntimeV1::from_marker(Some(marker)),
+        );
+    }
+
     /// Only an active attachment recording `artifact_watching` becomes a
     /// carrier, and the carrier names the attachment id, not a checkout id
     /// or the Selected ladder.
@@ -784,6 +848,73 @@ mod tests {
             &ArtifactWatchAttachment::AttachmentId(CAPABLE.to_string())
         );
         assert!(carriers[0].is_attachment());
+    }
+
+    #[test]
+    fn strict_knowledge_transport_projects_no_watcher_carrier() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let mut server = fixture.server();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        attach(
+            &server,
+            CAPABLE,
+            CHECKOUT_ONE,
+            &root.join("capable"),
+            watching(),
+            AttachmentStatus::Attached,
+        );
+        assert_eq!(available(&server.state).len(), 1, "positive control");
+
+        cover_project(&mut server);
+
+        assert!(available(&server.state).is_empty());
+    }
+
+    #[test]
+    fn covered_producer_loss_refuses_own_without_local_fallback() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "accepted")],
+            &[],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let checkout = root.join("capable");
+        let mut server = fixture.server_with_checkout_authority();
+        attach(
+            &server,
+            CAPABLE,
+            CHECKOUT_ONE,
+            &checkout,
+            AttachmentCapabilities {
+                repo_knowledge: true,
+                ..Default::default()
+            },
+            AttachmentStatus::Attached,
+        );
+        cover_project(&mut server);
+        server.set_session_checkout_for_test(PROJECT.into(), scope, CHECKOUT_ONE.into(), checkout);
+        let before = server.state.checkout_access.health().sequence;
+
+        let error = server
+            .session_knowledge_view(None, Some("own"))
+            .err()
+            .expect("producer loss keeps the strict row closed");
+
+        assert!(format!("{error:#}").contains("pending knowledge transport re-cutover"));
+        let gap_error = server
+            .session_gap_view(None, Some("own"))
+            .err()
+            .expect("gap views share the same no-fallback boundary");
+        assert!(format!("{gap_error:#}").contains("pending knowledge transport re-cutover"));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 
     /// Detach removes the carrier. The store additionally refuses to hold a
