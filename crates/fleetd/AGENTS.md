@@ -34,9 +34,11 @@ into a binary that changes a few times a year is the fix.
   protocol.
 - **Auth is a gate, not a suggestion.** The first post-handshake envelope must
   be `Authenticate` with a valid bearer token. A well-formed `Spawn` sent
-  first is refused, not executed. `verify_peer_uid` runs on accept as a second
-  independent check: it proves the peer runs as our uid, never which service
-  it is. Use both, as `bro-rpc`'s AGENTS.md says.
+  first is refused, not executed. Unix accepts also run `verify_peer_uid` as a
+  second independent check: it proves the peer runs as our uid, never which
+  service it is. TCP has no Unix uid claim, is disabled by default, refuses a
+  non-loopback bind without a second explicit grant, and is valid only behind
+  an encrypted, ACL-restricted network identity boundary such as a tailnet.
 - **Disconnect is not session death.** Losing the owner connection keeps
   children running, keeps the registry, and pauses relaying. Emitted messages
   with no owner attached are DROPPED on purpose: the durable event log is the
@@ -97,6 +99,8 @@ Deliberate deltas, all documented at their call sites:
   persistence beyond the children and their event logs.
 - Terminal-session GC is ack-driven only: a session is forgotten when it has
   exited AND the daemon has acknowledged through its last seq.
+- One daemon selects one fleetd endpoint. Routing among multiple fleetd
+  instances remains outside this v1 supervisor contract.
 
 ## Split, not hand-rolled
 
@@ -110,20 +114,21 @@ local version.
 
 ## Wire note
 
-The design doc's slice 5 contract paragraph says "newline-delimited JSON".
-The transport that actually landed is `bro-rpc`'s length-prefixed bounded
-framing, which bans newline framing outright (see `crates/bro-rpc/AGENTS.md`).
-The framing is an implementation detail beneath the message contract; the
-contract's substance (versioned handshake, file-sourced bearer token, message
-types in `bro-protocol`, socket path derived from the state dir) is unchanged.
+The transport is `bro-rpc`'s length-prefixed bounded framing, which bans
+newline framing outright (see `crates/bro-rpc/AGENTS.md`). The same framed
+protocol runs over the state-local Unix socket and the explicitly configured
+TCP endpoint. The Unix path derives its token and socket from the state dir;
+the remote client requires a pre-existing explicit token file and never
+creates or auto-starts anything.
 
 ## The daemon side of this contract
 
 `src/orchestration/fleetd_client.rs` is the client. Three things there are
 paired with invariants above and must not drift:
 
-- **One connection, sessions multiplexed over it.** Because fleetd serves a
-  single owner connection, the daemon must not open a second: a second dial
+- **One endpoint and one connection, sessions multiplexed over it.** Because
+  fleetd serves a single owner connection, the daemon must not open a second:
+  a second dial
   fences the first out and silently strands whatever the first was relaying.
   A connection actor owns the socket and fans messages to per-session handles.
 - **The daemon advances its cursor AFTER ingest, not on receipt.** That is what
@@ -135,7 +140,8 @@ paired with invariants above and must not drift:
   would otherwise collide on this registry, on the daemon's slot map, and on
   the event-log filename.
 
-Deliberate delta from the "accepted v1 limits" above: the daemon starts fleetd
-itself, detached, when the socket is absent at first need. That is a daemon-side
-convenience and changes nothing about fleetd; it still never adopts processes
-and still kills its children on its own restart.
+Deliberate delta from the "accepted v1 limits" above: for the state-local Unix
+endpoint only, the daemon starts fleetd itself, detached, when the socket is
+absent at first need. A remote endpoint never autostarts and never falls back
+to local execution. fleetd still never adopts processes and still kills its
+children on its own restart.

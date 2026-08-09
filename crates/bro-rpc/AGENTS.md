@@ -1,7 +1,8 @@
-# bro-rpc - transport substrate for same-host RPC channels
+# bro-rpc - transport substrate for bounded authenticated RPC channels
 
 Built for design/daemon-runtime/locality-first-decomposition.md slice 5: the
-daemon<->fleetd Unix domain socket channel. Mined from
+daemon<->fleetd channel, state-local over Unix and explicitly remote over TCP.
+Mined from
 `salvage/satellite-arc-20260718`'s `crates/bro-rpc`, which built the same
 mechanics for a worker<->fleet capability-RPC system; this crate keeps the
 framing/auth/handshake substrate and drops everything that was specific to

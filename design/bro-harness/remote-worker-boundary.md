@@ -221,11 +221,14 @@ is operational work, not architecture work.
 
 ## 8. Open questions
 
-- **Control-plane transport off-host.** `bro-protocol` over what, when the
-  worker is on another machine? The schema is settled (serde types, seq-ordered
-  commands); the byte transport was deliberately left thin
-  ([`harness-daemon-boundary.md`](./harness-daemon-boundary.md) §12). Remote
-  workers force the pick.
+Control-plane transport is no longer open for the first remote deployment.
+The full daemon selects one fleetd endpoint. Same-host operation uses the Unix
+socket plus peer-uid and bearer checks; off-host operation uses the identical
+bounded `bro-rpc` protocol over an explicitly enabled TCP endpoint, a
+pre-existing bearer-token file, and an external encrypted ACL boundary. The
+remote path never creates a token, starts fleetd, or downgrades to a local
+executor. Routing among multiple fleetd instances remains deferred.
+
 - **Artifact return shape.** Branch push vs EditSet envelope vs both — what is
   the canonical unit the integration boundary accepts? Interacts with
   [`refactor-tools-v2.md`](./refactor-tools-v2.md) §3's EditSet artifact.

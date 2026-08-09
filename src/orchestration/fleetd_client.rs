@@ -58,7 +58,8 @@ use bro_protocol::{
     SessionSummary, WorkerSpawnSpec,
 };
 use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceToken};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UnixStream};
 
 use super::executor::{HarnessExecutor, WorkerHandle, WorkerKill, WorkerOutcome};
 
@@ -79,11 +80,33 @@ const AUTOSTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// host can take a noticeable fraction of a second.
 const SPAWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Where fleetd's socket and token live, plus how to start it if it is not
-/// running.
+/// The one fleetd this daemon owns. Multi-fleet routing is deliberately not
+/// hidden in this type: v1 has one endpoint and therefore one owner/fencing
+/// domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetdEndpoint {
+    Unix(PathBuf),
+    Tcp(String),
+}
+
+impl FleetdEndpoint {
+    fn label(&self) -> String {
+        match self {
+            Self::Unix(path) => format!("unix://{}", path.display()),
+            Self::Tcp(address) => format!("tcp://{address}"),
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
+}
+
+/// Where fleetd and its token live, plus how to start the local Unix form if
+/// it is not running.
 #[derive(Debug, Clone)]
 pub struct FleetdConfig {
-    pub socket: PathBuf,
+    pub endpoint: FleetdEndpoint,
     pub token: PathBuf,
     /// State dir handed to a fleetd we start ourselves, so it derives the same
     /// socket/token paths we are dialing.
@@ -96,7 +119,7 @@ impl FleetdConfig {
     pub fn in_state_dir(state_dir: impl AsRef<Path>) -> Self {
         let state_dir = state_dir.as_ref().to_path_buf();
         Self {
-            socket: state_dir.join(SOCKET_FILE),
+            endpoint: FleetdEndpoint::Unix(state_dir.join(SOCKET_FILE)),
             token: state_dir.join(TOKEN_FILE),
             state_dir,
             binary: std::env::var("BLACKBOX_FLEETD_BIN")
@@ -105,6 +128,69 @@ impl FleetdConfig {
                 .map(PathBuf::from),
         }
     }
+
+    /// Resolve the daemon's explicit fleetd settings. An absent endpoint is
+    /// the same-host Unix default. Remote TCP is fail-closed: it requires an
+    /// explicit token file and never inherits the daemon's state-local token.
+    pub fn resolve(
+        state_dir: impl AsRef<Path>,
+        endpoint: Option<&str>,
+        token_file: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let state_dir = state_dir.as_ref().to_path_buf();
+        let Some(endpoint) = endpoint.map(str::trim).filter(|value| !value.is_empty()) else {
+            if token_file.is_some() {
+                anyhow::bail!(
+                    "daemon.fleetd_token_file requires daemon.fleetd_endpoint; refusing an ambiguous token override"
+                );
+            }
+            return Ok(Self::in_state_dir(state_dir));
+        };
+        let Some(address) = endpoint.strip_prefix("tcp://") else {
+            anyhow::bail!(
+                "unsupported fleetd endpoint `{endpoint}`; expected tcp://host:port or omit it for the state-local Unix socket"
+            );
+        };
+        validate_tcp_address(endpoint, address)?;
+        let token = token_file.ok_or_else(|| {
+            anyhow::anyhow!(
+                "remote fleetd endpoint `{endpoint}` requires daemon.fleetd_token_file or BLACKBOX_FLEETD_TOKEN_FILE"
+            )
+        })?;
+        Ok(Self {
+            endpoint: FleetdEndpoint::Tcp(address.to_string()),
+            token: token.to_path_buf(),
+            state_dir,
+            binary: None,
+        })
+    }
+}
+
+fn validate_tcp_address(endpoint: &str, address: &str) -> anyhow::Result<()> {
+    if address.starts_with('[') {
+        let parsed = address.parse::<std::net::SocketAddr>().map_err(|error| {
+            anyhow::anyhow!("invalid fleetd TCP endpoint `{endpoint}`: {error}")
+        })?;
+        if parsed.port() == 0 {
+            anyhow::bail!("fleetd TCP endpoint `{endpoint}` cannot use port zero");
+        }
+        return Ok(());
+    }
+    let Some((host, port)) = address.rsplit_once(':') else {
+        anyhow::bail!("fleetd TCP endpoint `{endpoint}` must include host and port");
+    };
+    if host.trim().is_empty() || host.contains(':') {
+        anyhow::bail!(
+            "fleetd TCP endpoint `{endpoint}` has an invalid host; bracket IPv6 addresses"
+        );
+    }
+    let port = port.parse::<u16>().map_err(|error| {
+        anyhow::anyhow!("fleetd TCP endpoint `{endpoint}` has an invalid port: {error}")
+    })?;
+    if port == 0 {
+        anyhow::bail!("fleetd TCP endpoint `{endpoint}` cannot use port zero");
+    }
+    Ok(())
 }
 
 /// Build identity this daemon advertises to fleetd. `build_id` is the root
@@ -249,23 +335,50 @@ impl FleetdExecutor {
 
     /// Connect, authenticate, and start the connection actor.
     async fn dial(&self) -> anyhow::Result<Connection> {
-        let socket = self.shared.config.socket.clone();
-        if UnixStream::connect(&socket).await.is_err() {
-            start_fleetd(&self.shared.config).await?;
+        match &self.shared.config.endpoint {
+            FleetdEndpoint::Unix(socket) => {
+                if UnixStream::connect(socket).await.is_err() {
+                    start_fleetd(&self.shared.config).await?;
+                }
+                let stream = UnixStream::connect(socket).await.map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot reach fleetd at {}: {error}. Start it (launchd label \
+                         com.daystrom.fleetd, or `fleetd --state-dir {}`), or set \
+                         BLACKBOX_EXECUTOR=local to run workers as daemon children.",
+                        socket.display(),
+                        self.shared.config.state_dir.display()
+                    )
+                })?;
+                self.finish_dial(stream).await
+            }
+            FleetdEndpoint::Tcp(address) => {
+                let stream = TcpStream::connect(address).await.map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot reach remote fleetd at tcp://{address}: {error}. Remote fleetd is never auto-started and there is no local-executor fallback."
+                    )
+                })?;
+                stream.set_nodelay(true).map_err(|error| {
+                    anyhow::anyhow!("cannot configure remote fleetd socket: {error}")
+                })?;
+                self.finish_dial(stream).await
+            }
         }
-        let stream = UnixStream::connect(&socket).await.map_err(|error| {
-            anyhow::anyhow!(
-                "cannot reach fleetd at {}: {error}. Start it (launchd label \
-                 com.daystrom.fleetd, or `fleetd --state-dir {}`), or set \
-                 BLACKBOX_EXECUTOR=local to run workers as daemon children.",
-                socket.display(),
-                self.shared.config.state_dir.display()
-            )
-        })?;
+    }
 
-        // The token file is created by whichever of daemon and fleetd starts
-        // first; `load_or_create` keeps a daemon-first boot working.
-        let token = ServiceToken::load_or_create(&self.shared.config.token).map_err(|error| {
+    async fn finish_dial<S>(&self, stream: S) -> anyhow::Result<Connection>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let endpoint = self.shared.config.endpoint.label();
+        // Same-host startup is symmetric: whichever process starts first may
+        // create the token. A remote daemon is only a consumer and must never
+        // create a replacement secret if its mount/config is wrong.
+        let token = if self.shared.config.endpoint.is_remote() {
+            ServiceToken::load(&self.shared.config.token)
+        } else {
+            ServiceToken::load_or_create(&self.shared.config.token)
+        }
+        .map_err(|error| {
             anyhow::anyhow!(
                 "cannot load the fleetd token at {}: {error}",
                 self.shared.config.token.display()
@@ -324,7 +437,7 @@ impl FleetdExecutor {
         spawn_reader(self.shared.clone(), reader);
 
         tracing::info!(
-            socket = %socket.display(),
+            %endpoint,
             generation,
             fleetd_version = %welcome.build.version,
             fleetd_build = %welcome.build.build_id,
@@ -436,12 +549,14 @@ fn control_lane(
 /// wire. Exits when the queue closes or the socket errors, which drops the
 /// command sender and makes `Connection::is_alive` false so the next dispatch
 /// redials.
-fn spawn_writer(
+fn spawn_writer<W>(
     shared: Arc<Shared>,
-    mut writer: NegotiatedIo<tokio::io::WriteHalf<UnixStream>>,
+    mut writer: NegotiatedIo<W>,
     mut commands: mpsc::UnboundedReceiver<DaemonToFleetd>,
     generation: u64,
-) {
+) where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         while let Some(body) = commands.recv().await {
             let envelope = Envelope {
@@ -460,7 +575,10 @@ fn spawn_writer(
 }
 
 /// Reader task: fan every `FleetdToDaemon` out to the session it names.
-fn spawn_reader(shared: Arc<Shared>, mut reader: NegotiatedIo<tokio::io::ReadHalf<UnixStream>>) {
+fn spawn_reader<R>(shared: Arc<Shared>, mut reader: NegotiatedIo<R>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         loop {
             let envelope = match reader.read_envelope::<FleetdToDaemon>().await {
@@ -714,6 +832,9 @@ fn readopt_one(
 /// not in the daemon's process group, so it survives the `launchctl kickstart`
 /// that replaces `blackboxd`. That survival IS the point of the slice.
 async fn start_fleetd(config: &FleetdConfig) -> anyhow::Result<()> {
+    let FleetdEndpoint::Unix(socket) = &config.endpoint else {
+        anyhow::bail!("remote fleetd is never auto-started")
+    };
     let binary = resolve_fleetd_binary(config)?;
     tokio::fs::create_dir_all(&config.state_dir).await.ok();
 
@@ -747,7 +868,7 @@ async fn start_fleetd(config: &FleetdConfig) -> anyhow::Result<()> {
 
     let deadline = tokio::time::Instant::now() + AUTOSTART_SOCKET_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
-        if UnixStream::connect(&config.socket).await.is_ok() {
+        if UnixStream::connect(socket).await.is_ok() {
             tracing::info!(?pid, "fleetd is listening");
             return Ok(());
         }
@@ -756,7 +877,7 @@ async fn start_fleetd(config: &FleetdConfig) -> anyhow::Result<()> {
     anyhow::bail!(
         "started fleetd ({}) but its socket {} did not come up within {}s",
         binary.display(),
-        config.socket.display(),
+        socket.display(),
         AUTOSTART_SOCKET_TIMEOUT.as_secs()
     )
 }
@@ -786,7 +907,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let config = FleetdConfig::in_state_dir(&root);
-        assert_eq!(config.socket, root.join("fleetd.sock"));
+        assert_eq!(
+            config.endpoint,
+            FleetdEndpoint::Unix(root.join("fleetd.sock"))
+        );
         assert_eq!(config.token, root.join("fleetd.token"));
         assert_eq!(config.state_dir, root);
     }
@@ -797,8 +921,75 @@ mod tests {
     fn distinct_state_dirs_yield_distinct_sockets() {
         let prod = FleetdConfig::in_state_dir("/state/prod");
         let dev = FleetdConfig::in_state_dir("/state/dev");
-        assert_ne!(prod.socket, dev.socket);
+        assert_ne!(prod.endpoint, dev.endpoint);
         assert_ne!(prod.token, dev.token);
+    }
+
+    #[test]
+    fn remote_endpoint_requires_an_explicit_token_file() {
+        let error = FleetdConfig::resolve("/state/cage", Some("tcp://fleet.tailnet:7265"), None)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires daemon.fleetd_token_file")
+        );
+
+        let config = FleetdConfig::resolve(
+            "/state/cage",
+            Some("tcp://fleet.tailnet:7265"),
+            Some(Path::new("/run/secrets/fleetd-token")),
+        )
+        .unwrap();
+        assert_eq!(
+            config.endpoint,
+            FleetdEndpoint::Tcp("fleet.tailnet:7265".to_string())
+        );
+        assert_eq!(config.token, PathBuf::from("/run/secrets/fleetd-token"));
+        assert!(config.binary.is_none());
+    }
+
+    #[test]
+    fn explicit_token_without_endpoint_is_rejected() {
+        let error = FleetdConfig::resolve(
+            "/state/local",
+            None,
+            Some(Path::new("/run/secrets/ambiguous")),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires daemon.fleetd_endpoint")
+        );
+    }
+
+    #[test]
+    fn malformed_remote_endpoints_fail_during_startup_resolution() {
+        for endpoint in [
+            "tcp://host",
+            "tcp://host:",
+            "tcp://host:0",
+            "tcp://host:not-a-port",
+            "tcp://2001:db8::1:7265",
+            "tcp://[2001:db8::1]",
+        ] {
+            assert!(
+                FleetdConfig::resolve(
+                    "/state/cage",
+                    Some(endpoint),
+                    Some(Path::new("/run/secrets/fleetd-token")),
+                )
+                .is_err(),
+                "{endpoint} must fail before daemon startup completes"
+            );
+        }
+        FleetdConfig::resolve(
+            "/state/cage",
+            Some("tcp://[2001:db8::1]:7265"),
+            Some(Path::new("/run/secrets/fleetd-token")),
+        )
+        .expect("bracketed IPv6 with a nonzero port is valid");
     }
 
     /// The daemon's advertised identity has to satisfy `bro_rpc`'s own

@@ -78,16 +78,18 @@ pub async fn run() -> anyhow::Result<()> {
     // (or `daemon.executor = "local"`) is the explicit escape back to
     // daemon-child workers. Installing here also arms fleetd re-adoption: the
     // first connection re-attaches whatever survived our restart.
-    crate::orchestration::install_harness_executor(
+    crate::orchestration::install_configured_harness_executor(
         cfg.daemon.executor,
         store_dir.clone(),
+        cfg.daemon.fleetd_endpoint.as_deref(),
+        cfg.daemon.fleetd_token_file.as_deref(),
         shared.task_store.clone(),
         shared.tail_tx.clone(),
         Some(shared.system_events.clone()),
         Some(std::sync::Arc::new(
             crate::server::knowledge_source::DaemonWorkspaceBindingAuthority::new(shared.clone()),
         )),
-    );
+    )?;
 
     // Bind before starting any background work that probes registered project
     // paths. A stalled mount must not prevent the daemon from claiming its

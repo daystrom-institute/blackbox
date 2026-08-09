@@ -293,6 +293,16 @@ struct RawDaemonConfig {
     pub checkout_lifecycle_writer_wait_ms: u64,
     #[serde(default = "default_daemon_executor")]
     pub executor: ExecutorKind,
+    /// Optional explicit fleetd endpoint. When absent, the daemon uses the
+    /// Unix socket under its state directory. Remote fleetd currently accepts
+    /// only the `tcp://host:port` form.
+    #[serde(default)]
+    pub fleetd_endpoint: Option<String>,
+    /// Token file used with an explicit fleetd endpoint. A remote endpoint
+    /// requires this to be set; unlike the same-host path, the daemon never
+    /// creates a remote transport token.
+    #[serde(default)]
+    pub fleetd_token_file: Option<PathBuf>,
 }
 
 /// Which executor turns a resolved spawn spec into a supervised worker.
@@ -562,6 +572,8 @@ pub struct DaemonConfig {
     pub poller_min_interval_secs: u64,
     pub checkout_lifecycle_writer_wait_ms: u64,
     pub executor: ExecutorKind,
+    pub fleetd_endpoint: Option<String>,
+    pub fleetd_token_file: Option<PathBuf>,
 }
 
 /// Index configuration
@@ -670,6 +682,8 @@ impl Config {
                 poller_min_interval_secs: default_daemon_poller_min_interval_secs(),
                 checkout_lifecycle_writer_wait_ms: default_checkout_lifecycle_writer_wait_ms(),
                 executor: default_daemon_executor(),
+                fleetd_endpoint: None,
+                fleetd_token_file: None,
             },
             index: RawIndexConfig {
                 reindex_interval_secs: default_index_reindex_interval_secs(),
@@ -776,6 +790,17 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && let Some(kind) = ExecutorKind::parse(&executor)
     {
         raw.daemon.executor = kind;
+    }
+
+    if let Ok(endpoint) = std::env::var("BLACKBOX_FLEETD_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        raw.daemon.fleetd_endpoint = Some(endpoint);
+    }
+    if let Ok(path) = std::env::var("BLACKBOX_FLEETD_TOKEN_FILE")
+        && !path.trim().is_empty()
+    {
+        raw.daemon.fleetd_token_file = Some(PathBuf::from(path));
     }
 
     // poller_min_interval_secs
@@ -969,6 +994,13 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
     )?;
     validate_checkout_lifecycle_writer_wait_ms(raw.daemon.checkout_lifecycle_writer_wait_ms)?;
 
+    let fleetd_token_file = raw
+        .daemon
+        .fleetd_token_file
+        .as_ref()
+        .map(|path| expand_tilde(&path.to_string_lossy(), &home))
+        .transpose()?;
+
     // Build final config
     Ok(Config {
         daemon: DaemonConfig {
@@ -981,6 +1013,8 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             poller_min_interval_secs: raw.daemon.poller_min_interval_secs,
             checkout_lifecycle_writer_wait_ms: raw.daemon.checkout_lifecycle_writer_wait_ms,
             executor: raw.daemon.executor,
+            fleetd_endpoint: raw.daemon.fleetd_endpoint,
+            fleetd_token_file,
         },
         index: IndexConfig {
             reindex_interval_secs: raw.index.reindex_interval_secs,
@@ -1727,6 +1761,12 @@ mod tests {
         unsafe {
             env::remove_var("BBOX_BIND");
         }
+        unsafe {
+            env::remove_var("BLACKBOX_FLEETD_ENDPOINT");
+        }
+        unsafe {
+            env::remove_var("BLACKBOX_FLEETD_TOKEN_FILE");
+        }
 
         let config = load().unwrap();
 
@@ -1737,6 +1777,8 @@ mod tests {
         assert_eq!(config.daemon.mcp_session_keepalive_secs, 21600);
         assert_eq!(config.daemon.poller_min_interval_secs, 5);
         assert_eq!(config.daemon.checkout_lifecycle_writer_wait_ms, 500);
+        assert_eq!(config.daemon.fleetd_endpoint, None);
+        assert_eq!(config.daemon.fleetd_token_file, None);
 
         assert_eq!(config.index.reindex_interval_secs, 120);
         assert!(!config.index.edge_index_boot_rebuild);
@@ -1828,6 +1870,58 @@ bind = "0.0.0.0"
         } else {
             unsafe { env::remove_var("BLACKBOX_CONFIG") };
         }
+    }
+
+    #[test]
+    fn remote_fleetd_config_resolves_file_and_environment_forms() {
+        let _guard = bbox_util::util::test_env_lock();
+        let dir = tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+            env::remove_var("BLACKBOX_CONFIG");
+            env::remove_var("BLACKBOX_FLEETD_ENDPOINT");
+            env::remove_var("BLACKBOX_FLEETD_TOKEN_FILE");
+        }
+        let config_path = home.join("remote.toml");
+        std::fs::write(
+            &config_path,
+            "[daemon]\nfleetd_endpoint = \"tcp://agent.tailnet:7265\"\nfleetd_token_file = \"~/secrets/fleetd.token\"\n",
+        )
+        .unwrap();
+
+        let config = load_with(LoadOptions {
+            config_path: Some(config_path.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            config.daemon.fleetd_endpoint.as_deref(),
+            Some("tcp://agent.tailnet:7265")
+        );
+        assert_eq!(
+            config.daemon.fleetd_token_file,
+            Some(home.join("secrets/fleetd.token"))
+        );
+
+        let env_token = home.join("mounted/remote.token");
+        unsafe {
+            env::set_var("BLACKBOX_FLEETD_ENDPOINT", "tcp://override.tailnet:8265");
+            env::set_var("BLACKBOX_FLEETD_TOKEN_FILE", &env_token);
+        }
+        let overridden = load_with(LoadOptions {
+            config_path: Some(config_path),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            overridden.daemon.fleetd_endpoint.as_deref(),
+            Some("tcp://override.tailnet:8265")
+        );
+        assert_eq!(overridden.daemon.fleetd_token_file, Some(env_token));
     }
 
     #[test]

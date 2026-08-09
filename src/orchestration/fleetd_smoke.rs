@@ -63,6 +63,7 @@ mod smoke {
     struct FleetdProcess {
         child: std::process::Child,
         state_dir: PathBuf,
+        tcp_address: Option<std::net::SocketAddr>,
     }
 
     impl FleetdProcess {
@@ -84,11 +85,43 @@ mod smoke {
                     return Self {
                         child,
                         state_dir: state_dir.to_path_buf(),
+                        tcp_address: None,
                     };
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             panic!("fleetd did not bind {} within the deadline", socket.display());
+        }
+
+        async fn start_tcp(state_dir: &Path) -> Self {
+            std::fs::create_dir_all(state_dir).expect("state dir");
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("reserve loopback port");
+            let tcp_address = reservation.local_addr().expect("reserved address");
+            drop(reservation);
+            let child = std::process::Command::new(fleetd_binary())
+                .arg("--state-dir")
+                .arg(state_dir)
+                .arg("--listen-tcp")
+                .arg(tcp_address.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start TCP fleetd");
+
+            let deadline = tokio::time::Instant::now() + DEADLINE;
+            while tokio::time::Instant::now() < deadline {
+                if tokio::net::TcpStream::connect(tcp_address).await.is_ok() {
+                    return Self {
+                        child,
+                        state_dir: state_dir.to_path_buf(),
+                        tcp_address: Some(tcp_address),
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("fleetd did not bind tcp://{tcp_address} within the deadline");
         }
 
         fn config(&self) -> FleetdConfig {
@@ -98,6 +131,16 @@ mod smoke {
             // auto-start a second one: this test owns the fleetd it talks to.
             config.binary = Some(fleetd_binary());
             config
+        }
+
+        fn remote_config(&self) -> FleetdConfig {
+            let address = self.tcp_address.expect("TCP fleetd process");
+            FleetdConfig::resolve(
+                &self.state_dir,
+                Some(&format!("tcp://{address}")),
+                Some(&self.state_dir.join("fleetd.token")),
+            )
+            .expect("valid remote config")
         }
     }
 
@@ -289,6 +332,70 @@ mod smoke {
         drop(second);
         // Dropping the fleetd process signals its children on the way out.
         drop(fleetd);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_fleetd_executor_authenticates_and_drives_a_real_dispatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let fleetd = FleetdProcess::start_tcp(&root.join("state")).await;
+        let log = root.join("remote.events.jsonl");
+        let stub = write_stub(
+            &root,
+            "remote.sh",
+            &[r#"{"type":"assistant","seq":1}"#],
+            &log,
+            "exit 0\n",
+        );
+
+        let executor = FleetdExecutor::new(fleetd.remote_config());
+        let mut handle = executor
+            .spawn(spec_for(
+                &stub,
+                "remote-session",
+                "remote-task",
+                &log,
+                &root,
+            ))
+            .await
+            .expect("remote fleetd accepted the spawn");
+        assert!(recv_line(&mut handle.events).await.contains(r#""seq":1"#));
+        let outcome = tokio::time::timeout(DEADLINE, handle.outcome)
+            .await
+            .expect("remote outcome within deadline")
+            .expect("remote outcome published");
+        assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn unreachable_remote_fleetd_is_never_autostarted_and_creates_no_token() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve unreachable port");
+        let address = reservation.local_addr().expect("reserved address");
+        drop(reservation);
+        let token = root.join("missing-fleetd.token");
+        let config = FleetdConfig::resolve(
+            &root,
+            Some(&format!("tcp://{address}")),
+            Some(&token),
+        )
+        .expect("valid remote config");
+        let executor = FleetdExecutor::new(config);
+        let error = executor
+            .spawn(spec_for(
+                "/bin/true",
+                "unreachable-remote",
+                "unreachable-task",
+                &root.join("unreachable.events.jsonl"),
+                &root,
+            ))
+            .await
+            .err()
+            .expect("unreachable remote fleetd must fail");
+        assert!(error.to_string().contains("Remote fleetd is never auto-started"));
+        assert!(!token.exists(), "remote token must never be synthesized");
     }
 
     /// `kill(pid, 0)`: the signal-free liveness probe. Exact, unlike a

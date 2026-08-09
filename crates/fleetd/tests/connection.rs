@@ -22,8 +22,9 @@ use bro_protocol::{
     WorkerSpawnSpec,
 };
 use bro_rpc::{BuildIdentity, Envelope, HandshakeOptions, NegotiatedIo, ServiceToken};
-use fleetd::server::{Fleetd, bind_listener, build_identity, serve};
-use tokio::net::UnixStream;
+use fleetd::server::{Fleetd, bind_listener, bind_tcp_listener, build_identity, serve, serve_tcp};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UnixStream};
 
 const TEST_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 /// Every wait in this file is bounded, so a broken assumption fails as a test
@@ -33,12 +34,12 @@ const DEADLINE: Duration = Duration::from_secs(20);
 // ---------------------------------------------------------------- fake daemon
 
 /// The dialing side: what the daemon's future `FleetdExecutor` client will do.
-struct FakeDaemon {
-    io: NegotiatedIo<UnixStream>,
+struct FakeDaemon<S> {
+    io: NegotiatedIo<S>,
     next_id: u64,
 }
 
-impl FakeDaemon {
+impl FakeDaemon<UnixStream> {
     async fn connect(socket: &Path) -> Result<Self, bro_rpc::RpcError> {
         Self::connect_with_build(socket, build_identity()).await
     }
@@ -57,7 +58,26 @@ impl FakeDaemon {
         .await?;
         Ok(Self { io, next_id: 0 })
     }
+}
 
+impl FakeDaemon<TcpStream> {
+    async fn connect_tcp(address: std::net::SocketAddr) -> Result<Self, bro_rpc::RpcError> {
+        let stream = TcpStream::connect(address).await.expect("dial fleetd TCP");
+        let (io, _welcome) = bro_rpc::connect(
+            stream,
+            build_identity(),
+            vec![FLEETD_PROTOCOL_VERSION],
+            HandshakeOptions::default(),
+        )
+        .await?;
+        Ok(Self { io, next_id: 0 })
+    }
+}
+
+impl<S> FakeDaemon<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     async fn send(&mut self, body: DaemonToFleetd) {
         self.next_id += 1;
         let binding = self.io.binding();
@@ -117,6 +137,13 @@ struct Harness {
     state: Arc<Fleetd>,
 }
 
+struct TcpHarness {
+    _directory: tempfile::TempDir,
+    root: PathBuf,
+    address: std::net::SocketAddr,
+    state: Arc<Fleetd>,
+}
+
 async fn start_fleetd() -> Harness {
     let directory = tempfile::tempdir().expect("tempdir");
     // Canonicalize: on macOS the tempdir is /var/... but resolves to
@@ -134,6 +161,26 @@ async fn start_fleetd() -> Harness {
         _directory: directory,
         root,
         socket,
+        state,
+    }
+}
+
+async fn start_fleetd_tcp() -> TcpHarness {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().canonicalize().expect("canonicalize");
+    let listener = bind_tcp_listener("127.0.0.1:0".parse().unwrap(), false)
+        .await
+        .expect("bind TCP");
+    let address = listener.local_addr().expect("TCP address");
+    let state = Fleetd::new(
+        ServiceToken::parse(TEST_TOKEN).expect("token"),
+        build_identity(),
+    );
+    tokio::spawn(serve_tcp(state.clone(), listener));
+    TcpHarness {
+        _directory: directory,
+        root,
+        address,
         state,
     }
 }
@@ -189,6 +236,62 @@ async fn authenticated_connection_becomes_the_owner() {
     let generation = daemon.authenticate().await;
     assert_eq!(generation, 1, "first connection gets generation 1");
     assert!(harness.state.has_owner());
+}
+
+#[tokio::test]
+async fn authenticated_tcp_connection_uses_the_same_owner_and_spawn_contract() {
+    let harness = start_fleetd_tcp().await;
+    let mut daemon = FakeDaemon::connect_tcp(harness.address)
+        .await
+        .expect("connect TCP");
+    let generation = daemon.authenticate().await;
+    assert_eq!(generation, 1);
+    assert!(harness.state.has_owner());
+
+    let stub = write_stub(
+        &harness.root,
+        "remote-child.sh",
+        "printf '{\"type\":\"assistant\",\"seq\":1}\\n'\nexit 0\n",
+    );
+    let log = harness.root.join("remote.events.jsonl");
+    daemon
+        .send(DaemonToFleetd::Spawn {
+            spec: Box::new(spec_for(&stub, "tcp-session", log)),
+        })
+        .await;
+    let started = daemon
+        .recv_until(|message| {
+            matches!(message, FleetdToDaemon::SessionStarted { session_id, .. } if session_id == "tcp-session")
+        })
+        .await;
+    assert!(matches!(
+        started,
+        FleetdToDaemon::SessionStarted { pid: Some(_), .. }
+    ));
+    let event = daemon
+        .recv_until(|message| {
+            matches!(message, FleetdToDaemon::Event { session_id, .. } if session_id == "tcp-session")
+        })
+        .await;
+    assert!(matches!(event, FleetdToDaemon::Event { seq: Some(1), .. }));
+}
+
+#[tokio::test]
+async fn tcp_connection_with_a_wrong_token_never_becomes_owner() {
+    let harness = start_fleetd_tcp().await;
+    let mut daemon = FakeDaemon::connect_tcp(harness.address)
+        .await
+        .expect("connect TCP");
+    daemon
+        .send(DaemonToFleetd::Authenticate {
+            token: BearerToken::new("f".repeat(64)),
+        })
+        .await;
+    match daemon.expect().await {
+        FleetdToDaemon::Error { code, .. } => assert_eq!(code, "auth.invalid"),
+        other => panic!("expected auth.invalid, got {other:?}"),
+    }
+    assert!(!harness.state.has_owner());
 }
 
 /// The token gate is independent of the handshake: a peer that negotiates

@@ -34,6 +34,7 @@
 //! so generation fencing applies to every frame on both halves exactly as it
 //! did before the split.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,7 +47,8 @@ use bro_rpc::{
     BuildIdentity, ConnectionBinding, Envelope, HandshakeOptions, NegotiatedIo, RpcError,
     ServiceToken, verify_peer_uid,
 };
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc};
 
 use crate::registry::{Registry, SessionEntry};
@@ -193,6 +195,26 @@ pub async fn bind_listener(socket_path: &Path) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Bind the optional TCP control listener. Loopback is safe for a local
+/// tunnel. A concrete tailnet/LAN address requires an explicit second opt-in,
+/// while wildcard and multicast binds are always refused.
+pub async fn bind_tcp_listener(
+    address: SocketAddr,
+    allow_nonloopback: bool,
+) -> anyhow::Result<TcpListener> {
+    if address.ip().is_unspecified() || address.ip().is_multicast() {
+        anyhow::bail!(
+            "refusing fleetd TCP listener {address}; bind one concrete loopback or encrypted-interface address, never wildcard or multicast"
+        );
+    }
+    if !address.ip().is_loopback() && !allow_nonloopback {
+        anyhow::bail!(
+            "refusing non-loopback fleetd TCP listener {address}; pass --allow-nonloopback-tcp only for an encrypted, ACL-restricted transport such as a tailnet"
+        );
+    }
+    Ok(TcpListener::bind(address).await?)
+}
+
 /// Accept connections forever, serving each on its own task.
 pub async fn serve(state: Arc<Fleetd>, listener: UnixListener) {
     loop {
@@ -212,12 +234,52 @@ pub async fn serve(state: Arc<Fleetd>, listener: UnixListener) {
     }
 }
 
+/// Accept explicitly-enabled TCP owner connections. The bearer gate and
+/// generation fence are identical to Unix. TCP cannot supply a Unix peer uid,
+/// so callers must provide the network identity boundary outside fleetd.
+pub async fn serve_tcp(state: Arc<Fleetd>, listener: TcpListener) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(%error, "TCP accept failed");
+                continue;
+            }
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_tcp_connection(state, stream).await {
+                tracing::warn!(%peer, %error, "TCP daemon connection ended with an error");
+            }
+        });
+    }
+}
+
 /// Handshake, authenticate, then run one owner connection to completion.
 pub async fn serve_connection(state: Arc<Fleetd>, stream: UnixStream) -> anyhow::Result<()> {
     // Peer-uid verification is independent of the token, not a substitute for
     // it: it proves the peer runs as our uid, never which service it is.
     verify_peer_uid(&stream)?;
 
+    serve_authenticated_connection(state, stream, "unix").await
+}
+
+/// TCP counterpart to [`serve_connection`]. There is deliberately no peer-uid
+/// claim here. Enabling a non-loopback listener is a separate explicit CLI
+/// grant, and the first protocol envelope still has to pass bearer auth.
+pub async fn serve_tcp_connection(state: Arc<Fleetd>, stream: TcpStream) -> anyhow::Result<()> {
+    stream.set_nodelay(true)?;
+    serve_authenticated_connection(state, stream, "tcp").await
+}
+
+async fn serve_authenticated_connection<S>(
+    state: Arc<Fleetd>,
+    stream: S,
+    transport: &'static str,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let generation = state.next_generation();
     let (negotiated, _hello, _welcome) = bro_rpc::accept(
         stream,
@@ -272,7 +334,11 @@ pub async fn serve_connection(state: Arc<Fleetd>, stream: UnixStream) -> anyhow:
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<FleetdToDaemon>();
     let fence = Arc::new(Notify::new());
     state.install_owner(generation, outbound_tx, fence.clone());
-    tracing::info!(generation, "daemon connection authenticated and installed");
+    tracing::info!(
+        generation,
+        transport,
+        "daemon connection authenticated and installed"
+    );
 
     let writer_counter = counter.clone();
     let writer_task = tokio::spawn(async move {
@@ -694,5 +760,24 @@ mod tests {
         let _relisten = bind_listener(&socket)
             .await
             .expect("stale socket is cleared");
+    }
+
+    #[tokio::test]
+    async fn tcp_bind_requires_a_second_grant_off_loopback() {
+        let wildcard: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let error = bind_tcp_listener(wildcard, true).await.unwrap_err();
+        assert!(error.to_string().contains("never wildcard"));
+
+        let concrete_nonloopback: SocketAddr = "192.0.2.1:7265".parse().unwrap();
+        let error = bind_tcp_listener(concrete_nonloopback, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("--allow-nonloopback-tcp"));
+
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener = bind_tcp_listener(loopback, false)
+            .await
+            .expect("loopback is safe for a local tunnel");
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 }

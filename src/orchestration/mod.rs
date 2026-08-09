@@ -74,8 +74,63 @@ fn harness_executor() -> &'static Arc<dyn executor::HarnessExecutor> {
 /// Returns whether the selection took effect: a second call is a no-op, since
 /// swapping executors under live sessions would orphan whatever the first one
 /// is supervising.
+#[cfg(test)]
 pub fn install_harness_executor(
     kind: bbox_config::config::ExecutorKind,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+    workspace_binding_authority: Option<Arc<dyn WorkspaceBindingAuthority>>,
+) -> bool {
+    let fleetd_config = fleetd_client::FleetdConfig::in_state_dir(&store_dir);
+    install_harness_executor_with_config(
+        kind,
+        fleetd_config,
+        store_dir,
+        task_store,
+        tail_tx,
+        system_events,
+        workspace_binding_authority,
+    )
+}
+
+/// Daemon-startup variant that resolves the explicit remote fleetd surface
+/// before installing the process-wide executor. Invalid or partial remote
+/// configuration fails startup instead of producing a daemon that looks
+/// healthy until its first dispatch.
+pub fn install_configured_harness_executor(
+    kind: bbox_config::config::ExecutorKind,
+    store_dir: std::path::PathBuf,
+    fleetd_endpoint: Option<&str>,
+    fleetd_token_file: Option<&std::path::Path>,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+    workspace_binding_authority: Option<Arc<dyn WorkspaceBindingAuthority>>,
+) -> anyhow::Result<bool> {
+    let fleetd_config = match kind {
+        bbox_config::config::ExecutorKind::Local => {
+            fleetd_client::FleetdConfig::in_state_dir(&store_dir)
+        }
+        bbox_config::config::ExecutorKind::Fleetd => {
+            fleetd_client::FleetdConfig::resolve(&store_dir, fleetd_endpoint, fleetd_token_file)?
+        }
+    };
+    Ok(install_harness_executor_with_config(
+        kind,
+        fleetd_config,
+        store_dir,
+        task_store,
+        tail_tx,
+        system_events,
+        workspace_binding_authority,
+    ))
+}
+
+fn install_harness_executor_with_config(
+    kind: bbox_config::config::ExecutorKind,
+    fleetd_config: fleetd_client::FleetdConfig,
     store_dir: std::path::PathBuf,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
@@ -98,12 +153,11 @@ pub fn install_harness_executor(
             Arc::new(executor::LocalExecutor)
         }
         bbox_config::config::ExecutorKind::Fleetd => {
-            let config = fleetd_client::FleetdConfig::in_state_dir(&store_dir);
             tracing::info!(
-                socket = %config.socket.display(),
+                endpoint = ?fleetd_config.endpoint,
                 "harness executor: fleetd (workers survive a daemon restart)"
             );
-            Arc::new(fleetd_client::FleetdExecutor::new(config))
+            Arc::new(fleetd_client::FleetdExecutor::new(fleetd_config))
         }
     };
     let installed = harness_executor_storage().set(executor).is_ok();

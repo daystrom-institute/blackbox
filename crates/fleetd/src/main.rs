@@ -5,28 +5,50 @@
 //! way out (fleetd's own restart killing its children is an accepted v1
 //! limitation, so the least we can do is make it orderly).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use fleetd::paths::{FleetdPaths, default_state_dir};
-use fleetd::server::{Fleetd, bind_listener, build_identity, serve};
+use fleetd::server::{Fleetd, bind_listener, bind_tcp_listener, build_identity, serve, serve_tcp};
 
 const USAGE: &str = "\
 fleetd - the per-machine blackbox fleet supervisor
 
 USAGE:
-    fleetd [--state-dir <path>]
+    fleetd [--state-dir <path>] [--listen-tcp <ip:port> [--allow-nonloopback-tcp]]
 
 OPTIONS:
     --state-dir <path>  Directory holding fleetd.sock and fleetd.token.
                         Defaults to $BLACKBOX_STATE_DIR, else
                         $XDG_STATE_HOME/blackbox, else ~/.local/state/blackbox.
+    --listen-tcp <addr> Optional TCP owner listener. Loopback is allowed for
+                        local tunnels. A non-loopback address also requires
+                        --allow-nonloopback-tcp and MUST be protected by an
+                        encrypted, ACL-restricted transport such as a tailnet.
+    --allow-nonloopback-tcp
+                        Explicitly allow --listen-tcp on a non-loopback IP.
     -h, --help          Print this help.
     -V, --version       Print version and build id.
 ";
 
-fn parse_state_dir() -> anyhow::Result<Option<PathBuf>> {
+struct Options {
+    state_dir: Option<PathBuf>,
+    listen_tcp: Option<SocketAddr>,
+    allow_nonloopback_tcp: bool,
+}
+
+fn parse_options() -> anyhow::Result<Options> {
     let mut args = std::env::args().skip(1);
     let mut state_dir = None;
+    let mut listen_tcp = std::env::var("BLACKBOX_FLEETD_LISTEN_TCP")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.parse::<SocketAddr>())
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid BLACKBOX_FLEETD_LISTEN_TCP: {error}"))?;
+    let mut allow_nonloopback_tcp = std::env::var("BLACKBOX_FLEETD_ALLOW_NONLOOPBACK_TCP")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--state-dir" => {
@@ -35,6 +57,15 @@ fn parse_state_dir() -> anyhow::Result<Option<PathBuf>> {
                     .ok_or_else(|| anyhow::anyhow!("--state-dir requires a path"))?;
                 state_dir = Some(PathBuf::from(value));
             }
+            "--listen-tcp" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--listen-tcp requires an ip:port"))?;
+                listen_tcp = Some(value.parse().map_err(|error| {
+                    anyhow::anyhow!("invalid --listen-tcp address `{value}`: {error}")
+                })?);
+            }
+            "--allow-nonloopback-tcp" => allow_nonloopback_tcp = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -47,7 +78,14 @@ fn parse_state_dir() -> anyhow::Result<Option<PathBuf>> {
             other => anyhow::bail!("unrecognized argument `{other}`\n\n{USAGE}"),
         }
     }
-    Ok(state_dir)
+    if allow_nonloopback_tcp && listen_tcp.is_none() {
+        anyhow::bail!("--allow-nonloopback-tcp requires --listen-tcp");
+    }
+    Ok(Options {
+        state_dir,
+        listen_tcp,
+        allow_nonloopback_tcp,
+    })
 }
 
 #[tokio::main]
@@ -59,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let state_dir = match parse_state_dir()? {
+    let options = parse_options()?;
+    let state_dir = match options.state_dir {
         Some(dir) => dir,
         None => default_state_dir()?,
     };
@@ -71,6 +110,10 @@ async fn main() -> anyhow::Result<()> {
     // owner-only) is enforced inside ServiceToken.
     let token = bro_rpc::ServiceToken::load_or_create(&paths.token)?;
     let listener = bind_listener(&paths.socket).await?;
+    let tcp_listener = match options.listen_tcp {
+        Some(address) => Some(bind_tcp_listener(address, options.allow_nonloopback_tcp).await?),
+        None => None,
+    };
     let state = Fleetd::new(token, build_identity());
 
     let build = build_identity();
@@ -80,8 +123,12 @@ async fn main() -> anyhow::Result<()> {
         build_id = %build.build_id,
         "fleetd listening"
     );
+    if let Some(listener) = tcp_listener.as_ref() {
+        tracing::info!(address = %listener.local_addr()?, "fleetd TCP listener enabled");
+    }
 
     let serving = tokio::spawn(serve(state.clone(), listener));
+    let serving_tcp = tcp_listener.map(|listener| tokio::spawn(serve_tcp(state.clone(), listener)));
     wait_for_shutdown().await;
 
     tracing::info!(
@@ -89,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
         "shutting down; signalling supervised children"
     );
     serving.abort();
+    if let Some(serving_tcp) = serving_tcp {
+        serving_tcp.abort();
+    }
     state.registry().kill_all();
     let _ = tokio::fs::remove_file(&paths.socket).await;
     Ok(())

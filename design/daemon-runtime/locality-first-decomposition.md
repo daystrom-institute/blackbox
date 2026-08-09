@@ -497,7 +497,7 @@ The executable dependency map from this rebaseline is:
    the daemon composes everything it already materializes at spawn today
    (brofile resolution, provider credentials, MCP injection env, the
    `shell_env` lane, surface-filter argv, dispatch context) and hands it
-   over a narrow typed local RPC; fleetd executes and supervises the
+   over a narrow typed RPC; fleetd executes and supervises the
    child, relays the stdio event/control channels, and holds leases plus
    a bounded replay window so live sessions survive daemon restarts.
    fleetd never re-derives policy and never reads brofiles or credential
@@ -515,7 +515,8 @@ The executable dependency map from this rebaseline is:
    dual-path role mask (post-mortem item 2).
 
    **Contract (decided 2026-07-19):**
-   - *Wire:* Unix domain socket + bounded length-prefixed JSON frames
+   - *Wire:* a state-local Unix domain socket, or one explicitly configured
+     remote TCP endpoint, plus bounded length-prefixed JSON frames
      (`bro-rpc`: big-endian u32 length + UTF-8 JSON, mid-serialize abort
      at the frame cap; never newline framing, since model events and tool
      results carry arbitrary newlines and an oversize line cannot be
@@ -526,9 +527,14 @@ The executable dependency map from this rebaseline is:
      before fleetd was built, and the built system follows `bro-rpc`.)
      The harness needs zero changes: it stays a plain stdio child of
      fleetd speaking NDJSON on stdin/stdout as today, and never dials
-     anyone. The socket path derives from the daemon's state dir, so the
+     anyone. The local socket path derives from the daemon's state dir, so the
      prod and dev daemons on one machine each get their OWN fleetd; a
      shared supervisor would let one daemon adopt the other's sessions.
+     The remote form requires a pre-existing explicit token file and an
+     encrypted ACL boundary. It never creates the token, auto-starts fleetd,
+     or falls back to the local executor. Unix retains its independent
+     peer-uid check. Non-loopback TCP bind is disabled without a second
+     explicit server grant.
    - *Replay:* no in-memory replay buffer. The session's existing
      event-log JSONL in the task store is the replay source; the daemon
      is the authority on its own cursor (last-ingested seq per session)
@@ -551,7 +557,7 @@ The executable dependency map from this rebaseline is:
    built, so the Contract paragraph above reads as record rather than
    pending work:
    - The `crates/fleetd` binary exists and owns worker spawn/supervision over
-     the `bro-rpc` Unix-domain-socket wire described above.
+     the `bro-rpc` Unix or explicitly remote TCP wire described above.
    - Every harness dispatch composes a `WorkerSpawnSpec` and runs it through
      `HarnessExecutor`; `LocalExecutor` and `FleetdExecutor` (over
      `crates/fleetd`) are the two live implementations, selected once at
@@ -580,10 +586,10 @@ The executable dependency map from this rebaseline is:
    daemon surface passes the residency test wholesale. Deployment rides
    `bbox-cage`; state-root resolution derives from one `BLACKBOX_STATE_DIR`
    and fails loud (post-mortem item 6); transcript + code collectors ship
-   from satellites; dispatch/fleet stays on agent machines. The
-   multi-machine routing question (which machine runs a dispatch) remains
-   deferred exactly as the satellite arc left it, but it no longer blocks
-   the corpus move because dispatch never leaves the agent machines.
+   from satellites; fleetd stays on the agent machine while the full daemon
+   reaches one selected fleetd through the authenticated remote control seam.
+   Multi-machine routing remains deferred, but does not block the first corpus
+   move because that deployment has exactly one fleet endpoint.
 
 ## 7. What this deletes or avoids
 
@@ -603,8 +609,9 @@ The executable dependency map from this rebaseline is:
 ## 8. Open questions
 
 - **Multi-machine dispatch routing.** Which machine runs a dispatch when
-  there is more than one fleetd. Still deferred; nothing in this design
-  needs it, and the corpus move (slice 6) does not touch it.
+  there is more than one fleetd. Still deferred. The first off-host corpus
+  deployment selects exactly one authenticated fleetd endpoint, so this is no
+  longer confused with the already-settled off-host control transport.
 - **Further residual splits.** Whether the machine-side daemon ever
   splits again (operational singleton vs fleet, the satellite arc's
   blackopsd). Deliberately NOT reopened here: the post-mortem's stranded

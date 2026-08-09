@@ -157,7 +157,7 @@ supervisor outlives the daemon that started it. It resolves the binary from
 `BLACKBOX_FLEETD_BIN`, else a `fleetd` sitting next to the daemon binary, else
 `PATH`.
 
-**Socket and token.** Both derive from the daemon's state dir:
+**Local socket and token.** Both derive from the daemon's state dir:
 
 | Path | Contents |
 |---|---|
@@ -207,6 +207,42 @@ There is **no automatic fallback**. If `fleetd` is selected and unreachable,
 the dispatch fails loudly rather than quietly spawning a daemon child, because
 a silent downgrade would reintroduce the restart-drops-sessions problem
 invisibly.
+
+**One remote fleet.** A full daemon running off-host can select one fleetd over
+the same bounded, generation-fenced protocol:
+
+```toml
+[daemon]
+executor = "fleetd"
+fleetd_endpoint = "tcp://agent-host.tailnet:7265"
+fleetd_token_file = "/run/secrets/fleetd-token"
+```
+
+The equivalent environment variables are `BLACKBOX_FLEETD_ENDPOINT` and
+`BLACKBOX_FLEETD_TOKEN_FILE`. The token file must already exist, be owned by
+the daemon uid, and have no group or other permission bits. A remote client
+never creates that file, starts fleetd, or falls back to a local worker.
+
+TCP listening is disabled by default. A loopback listener is suitable for a
+local encrypted tunnel:
+
+```bash
+fleetd --state-dir "$BLACKBOX_STATE_DIR" --listen-tcp 127.0.0.1:7265
+```
+
+A direct tailnet bind also requires the second explicit grant:
+
+```bash
+fleetd --state-dir "$BLACKBOX_STATE_DIR" \
+  --listen-tcp 100.64.0.10:7265 \
+  --allow-nonloopback-tcp
+```
+
+The TCP bearer protocol does not add TLS. Non-loopback use is valid only on an
+encrypted, ACL-restricted transport such as Tailscale, with the listener bound
+to that interface address. Do not expose it on a LAN wildcard or public
+interface. Unix operation retains the independent peer-uid check. The v1
+remote surface selects exactly one fleetd; multi-fleet routing is separate.
 
 **Restart semantics.** Restarting `fleetd` kills its children; that is an
 accepted v1 limit, not a bug (process-adoption tricks are not worth it for a

@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.7
+#
+# Runtime-only assembly for the full locality-first daemon. The cage build
+# compiles the pinned ref in a warm native lane and constructs this context:
+#
+#   out/blackboxd
+#   out/blackbox
+#   system-defaults/memories/
+#
+# There is one runtime target. The retired corpus/operations role split is not
+# represented here.
+
+FROM debian:trixie-slim AS blackboxd
+
+# git remains a runtime dependency for provenance and administrative surfaces.
+# ca-certificates serves Voyage and other HTTPS clients. openssh-client keeps
+# explicit SSH Git operations available without adding a checkout connector.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        git \
+        openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 blackbox \
+    && useradd --uid 10001 --gid 10001 --home-dir /home/blackbox --create-home blackbox
+
+COPY out/blackboxd /usr/local/bin/blackboxd
+COPY out/blackbox /usr/local/bin/blackbox
+COPY system-defaults/memories /usr/local/share/blackbox/memories
+
+# Every mutable root is explicit and expected to live below the one PVC mount.
+# Keeping these defaults in the image also makes an incorrectly rendered pod
+# fail against one coherent estate instead of silently scattering state across
+# the container overlay.
+ENV HOME=/home/blackbox \
+    BLACKBOX_STATE_DIR=/var/lib/blackbox/state \
+    TRANSCRIPT_SEARCH_INDEX_PATH=/var/lib/blackbox/index \
+    BLACKBOX_VECTORS_PATH=/var/lib/blackbox/vectors \
+    XDG_STATE_HOME=/var/lib/blackbox/xdg-state \
+    XDG_DATA_HOME=/var/lib/blackbox/xdg-data \
+    BLACKBOX_DEFAULTS_DIR=/usr/local/share/blackbox \
+    BBOX_PORT=7264
+
+USER blackbox
+WORKDIR /var/lib/blackbox
+VOLUME ["/var/lib/blackbox"]
+EXPOSE 7264
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/7264 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && grep -q "200 OK" <&3' || exit 1
+
+ENTRYPOINT ["/usr/local/bin/blackboxd"]
