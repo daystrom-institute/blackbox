@@ -3177,6 +3177,21 @@ mod tests {
         }
     }
 
+    struct GovernedFixedRecordsProvider(Vec<ProjectRecord>);
+
+    impl ProjectRecordsProvider for GovernedFixedRecordsProvider {
+        fn records_snapshot(&self) -> bbox_corpus_core::project_record::ProjectRecordsSnapshot {
+            bbox_corpus_core::project_record::ProjectRecordsSnapshot::from_bridge_records(
+                self.0.clone(),
+                1,
+            )
+        }
+
+        fn code_source_locality_governed(&self, _project_id: &str) -> bool {
+            true
+        }
+    }
+
     fn deny_all_actor(
         index: &TranscriptIndex,
         records: Vec<ProjectRecord>,
@@ -3205,6 +3220,51 @@ mod tests {
             languages: Default::default(),
             aliases: Default::default(),
         }
+    }
+
+    #[test]
+    fn governed_collected_reindex_does_not_request_local_project_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = test_index(&root);
+        let fixture = collected_fixture(&root);
+        let project_id = "collected-project";
+        install_outgoing_collected_state(
+            &root,
+            &fixture.store,
+            project_id,
+            &fixture.generation_id,
+            &fixture.descriptor,
+        );
+        let broker = Arc::new(CheckoutAccessBroker::new(
+            Arc::new(crate::checkout_access::DenyCheckoutAccess),
+            crate::checkout_access::CheckoutAccessObservations::in_memory(),
+        ));
+        let records_provider: Arc<dyn ProjectRecordsProvider> = Arc::new(
+            GovernedFixedRecordsProvider(vec![attached_record(project_id, Some("repo-family"))]),
+        );
+        let plans = plan_project_sources(
+            &index.reindex_config(),
+            &records_provider,
+            &broker,
+            None,
+            ProjectLeasePurpose::Reindex,
+            &HashMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plans[0].effective,
+            EffectiveSource::Collected { .. }
+        ));
+        let local = broker
+            .health()
+            .operations
+            .into_iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
+            .unwrap();
+        assert_eq!(local.granted, 0);
+        assert_eq!(local.denied, 0);
     }
 
     /// Phase 3 plan section 6 item 2 (governing section 11, closing F5): the

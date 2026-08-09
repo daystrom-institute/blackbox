@@ -6663,6 +6663,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn governed_code_source_refuses_local_walk_before_observation() {
+        let project_id = "p_00000000000000000000000000000001";
+        let observations = CheckoutAccessObservations::in_memory();
+        let broker = CheckoutAccessBroker::new(
+            Arc::new(bbox_indexing::checkout_access::DenyCheckoutAccess),
+            observations,
+        );
+        broker
+            .install_policy(Arc::new(CodeSourceLocalityCheckoutPolicy::new(Arc::new(
+                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::governed_for_test(
+                    project_id,
+                ),
+            ))))
+            .unwrap();
+        let error = broker
+            .acquire(CheckoutAccessRequest {
+                project_id: project_id.into(),
+                attachment: CheckoutAttachmentSelector::Selected,
+                expected_scope: None,
+                kind: CheckoutAccessKind::LocalProjectWalk,
+                intent: CheckoutAccessIntent::Read,
+                source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            CheckoutAccessErrorCode::CodeSourceTransportAuthoritative
+        );
+        let local = broker
+            .health()
+            .operations
+            .into_iter()
+            .find(|operation| operation.kind == CheckoutAccessKind::LocalProjectWalk)
+            .unwrap();
+        assert_eq!(local.granted, 0);
+        assert_eq!(local.denied, 0);
+    }
+
     fn empty_generation_descriptor(scope: PublishedScope, head: &str) -> GenerationDescriptor {
         GenerationDescriptor {
             schema_version: SCHEMA_VERSION,

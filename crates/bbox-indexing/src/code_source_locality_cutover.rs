@@ -700,3 +700,86 @@ fn now_unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROJECT: &str = "p_00000000000000000000000000000001";
+
+    fn row() -> CodeSourceLocalityCutoverRowV1 {
+        let project_id = ProjectId::parse(PROJECT).unwrap();
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+        let observation = |kind, sequence| CodeSourceLocalityObservationV1 {
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            producer_id: "producer".into(),
+            generation_id: "a".repeat(64),
+            selector: "collected:fixture".into(),
+            snapshot_id: "collected-fixture".into(),
+            document_count: 3,
+            entity_inventory_sha256: "b".repeat(64),
+            evidence_kind: kind,
+            sequence,
+            observed_at_unix_secs: sequence,
+        };
+        let startup = observation(CodeSourceLocalityEvidenceKindV1::StartupRecovery, 1);
+        CodeSourceLocalityCutoverRowV1 {
+            project_id,
+            scope,
+            producer_id: "producer".into(),
+            generation: generation_from_observation(&startup),
+            startup_recovery: startup,
+            full_rebuild: observation(CodeSourceLocalityEvidenceKindV1::FullRebuild, 2),
+            checkout_baselines: Vec::new(),
+        }
+    }
+
+    fn marker() -> CodeSourceLocalityCutoverMarkerV1 {
+        let mut marker = CodeSourceLocalityCutoverMarkerV1 {
+            version: MARKER_VERSION,
+            applied_at: "2026-08-09T00:00:00Z".into(),
+            report_sha256: "c".repeat(64),
+            catalog_epoch: 1,
+            catalog_sha256: "d".repeat(64),
+            rows: vec![row()],
+            checksum_sha256: String::new(),
+        };
+        marker.checksum_sha256 = marker_checksum(&marker).unwrap();
+        marker
+    }
+
+    #[test]
+    fn runtime_marker_closes_assignment_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        write_json(
+            &dir.path().join(CODE_SOURCE_LOCALITY_CUTOVER_MARKER_FILE),
+            &marker(),
+        )
+        .unwrap();
+        let runtime = CodeSourceLocalityCutoverRuntimeV1::open(dir.path()).unwrap();
+        assert!(runtime.transport_governed(PROJECT));
+        let row = row();
+        let assignments = BTreeMap::from([(
+            row.scope.clone(),
+            (PROJECT.to_string(), "producer".to_string()),
+        )]);
+        runtime.verify_assignments(&assignments).unwrap();
+        let error = runtime.verify_assignments(&BTreeMap::new()).unwrap_err();
+        assert!(format!("{error:#}").contains("must retain producer"));
+    }
+
+    #[test]
+    fn corrupt_marker_checksum_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut marker = marker();
+        marker.checksum_sha256 = "e".repeat(64);
+        write_json(
+            &dir.path().join(CODE_SOURCE_LOCALITY_CUTOVER_MARKER_FILE),
+            &marker,
+        )
+        .unwrap();
+        let error = CodeSourceLocalityCutoverRuntimeV1::open(dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("checksum mismatch"));
+    }
+}
