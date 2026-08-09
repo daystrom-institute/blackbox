@@ -616,10 +616,6 @@ impl EmbedQueueHandle {
         Self::start_default_with_optional_store(Some(vector_store))
     }
 
-    pub fn start_default_without_store() -> Self {
-        Self::start_default_with_optional_store(None)
-    }
-
     /// Build an isolated single-route queue for cross-crate tests.
     ///
     /// The production process always uses the configured router constructors

@@ -940,9 +940,10 @@ pub(crate) fn queue_drain_wake(_route: &str) {
 }
 
 const DEFAULT_EMBED_SWEEP_INTERVAL_SECS: u64 = 300;
-/// Short boot delay so the first sweep runs after the vector store warms
-/// (coverage reads it) but well before the slow interval, catching residue
-/// left by a prior capped wave without waiting a full cycle.
+/// Short boot delay before the first coverage probe. If vector warmup is still
+/// active, the probe waits for the global store; the provider-capable queue is
+/// installed before that store is published, so the pass can never enqueue
+/// work into a non-persistent startup queue.
 const EMBED_SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(15);
 
 /// `BLACKBOX_EMBED_SWEEP_INTERVAL_SECS` overrides the sweep timer (default

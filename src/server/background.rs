@@ -24,7 +24,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     configure_dispatch_path_env();
     restore_badgey_registry_from_notes(&shared);
     recover_badgey_non_terminal_state(&shared);
-    configure_embed_queue(&shared);
+    configure_embed_runtime(&shared);
     spawn_vector_warmup_thread(shared.clone())?;
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
     spawn_storage_gc(shared.clone());
@@ -184,10 +184,9 @@ fn install_badgey_adapter(shared: &Arc<SharedState>) {
         }));
 }
 
-fn configure_embed_queue(shared: &Arc<SharedState>) {
+fn configure_embed_runtime(shared: &Arc<SharedState>) {
     crate::embed_runtime::install_contradiction_threshold(tier0_cosine_threshold_from_env());
     crate::embed_runtime::install_contradiction_state(shared.clone());
-    embed_queue::install(embed::queue::EmbedQueueHandle::start_default_without_store());
 }
 
 fn spawn_vector_warmup_thread(shared: Arc<SharedState>) -> anyhow::Result<()> {
@@ -199,6 +198,11 @@ fn spawn_vector_warmup_thread(shared: Arc<SharedState>) -> anyhow::Result<()> {
             embed_queue::install(embed::queue::EmbedQueueHandle::start_default_with_store(
                 store.clone(),
             ));
+            // No provider-capable queue exists before durable vectors are
+            // available. Wake convergence after activation so mutations that
+            // landed during warmup are recovered without waiting for the
+            // periodic sweep interval.
+            crate::embed_runtime::queue_drain_wake("vector-store-warmed");
             tracing::info!(
                 partitions = store.partition_count(),
                 elapsed_ms = started.elapsed().as_millis(),
