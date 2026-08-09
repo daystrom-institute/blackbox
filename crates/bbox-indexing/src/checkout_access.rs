@@ -1541,8 +1541,8 @@ pub struct CheckoutAccessCounter {
     pub last_unix_secs: u64,
 }
 
-/// Path-free, project-attributed counters for capabilities governed by Git or
-/// knowledge transport cutover. Aggregate counters remain the stable
+/// Path-free, project-attributed counters for capabilities governed by Git,
+/// knowledge, or blame transport cutover. Aggregate counters remain the stable
 /// low-cardinality health surface; these bounded rows exist so a mixed catalog
 /// can prove that a covered subject stayed at zero while an uncovered subject
 /// legitimately used its adapter.
@@ -2615,6 +2615,7 @@ mod tests {
     fn every_transport_cutover_capability_has_project_attributed_counters() {
         let observations = CheckoutAccessObservations::in_memory();
         let target_kinds = [
+            CheckoutAccessKind::Blame,
             CheckoutAccessKind::GitHistory,
             CheckoutAccessKind::ProvenanceNoteIo,
             CheckoutAccessKind::PublisherConfigTreeRead,
@@ -2874,8 +2875,21 @@ mod tests {
             health.counters.len()
                 <= CheckoutAccessKind::ALL.len() * CheckoutAccessSourceLane::ALL.len() * 2
         );
-        assert_eq!(health.target_counters.len(), 1);
-        assert_eq!(health.target_counters[0].project_id, "project-1");
+        assert_eq!(health.target_counters.len(), 3);
+        assert!(
+            health
+                .target_counters
+                .iter()
+                .all(|counter| counter.project_id == "project-1")
+        );
+        assert_eq!(
+            health
+                .target_counters
+                .iter()
+                .filter(|counter| counter.kind == CheckoutAccessKind::Blame)
+                .count(),
+            2
+        );
 
         let persisted = std::fs::read_to_string(path).unwrap();
         assert!(!persisted.contains(root.to_string_lossy().as_ref()));
@@ -2911,7 +2925,7 @@ mod tests {
         let merged = CheckoutAccessObservations::open(&path).unwrap().health();
         assert_eq!(merged.sequence, 2);
         assert_eq!(merged.counters.len(), 2);
-        assert_eq!(merged.target_counters.len(), 1);
+        assert_eq!(merged.target_counters.len(), 2);
         assert!(
             merged
                 .counters
