@@ -4827,7 +4827,8 @@ fn classify_checkout_error(error: &CheckoutAccessError) -> CutbackAttemptOutcome
     let outcome = match error.code {
         Code::AttachmentNotFound
         | Code::ObservationUnavailable
-        | Code::KnowledgeTransportAuthoritative => {
+        | Code::KnowledgeTransportAuthoritative
+        | Code::CodeSourceTransportAuthoritative => {
             CutbackAttemptOutcome::Structural(CutbackReason::NoLocalAttachment)
         }
         Code::ScopeMismatch => CutbackAttemptOutcome::Structural(CutbackReason::ScopeMismatch),
