@@ -1,10 +1,10 @@
 //! Durable authenticated provenance-import publication.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use bbox_git_source::ProvenanceImportStateV1;
+use bbox_git_source::{MAX_PROVENANCE_DOCUMENT_BYTES, ProvenanceImportStateV1};
 use bbox_git_source_store::{
     ProvenanceImportJournalV1, ProvenanceImportStageV1, VerifiedProvenanceImportV1,
 };
@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use super::SharedState;
 
 const MAX_PREPARED_PROVENANCE_IMPORT_EDGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROVENANCE_OBSERVED_SCAN_BYTES: u64 = 512 * 1024 * 1024;
 
 pub(crate) fn spawn_worker(state: &Arc<SharedState>) -> Result<()> {
     let Some(receiver) = state.git_sources.take_provenance_import_receiver() else {
@@ -302,9 +303,9 @@ fn prepare_documents(
     journal: &ProvenanceImportJournalV1,
 ) -> Result<bbox_mcp_tools::mcp_tools::provenance::PreparedProvenanceImport> {
     let searcher = state.code_read_view.read().searcher.clone();
-    let relation_index = state.code_read_view.read().edge_index.clone();
     let exact_selectors =
         BTreeMap::from([(source.project_id.clone(), journal.code_selector.clone())]);
+    let observed_targets = collect_observed_provenance_targets(state, source, journal)?;
     let membership_cache = parking_lot::Mutex::new(BTreeMap::<String, bool>::new());
     let mut prepared_import =
         bbox_mcp_tools::mcp_tools::provenance::PreparedProvenanceImport::default();
@@ -337,17 +338,11 @@ fn prepare_documents(
                 );
                 // Observed provenance is immutable historical evidence. Its
                 // project-file identity can legitimately predate the active
-                // collected snapshot or the ProjectFileV2 schema. Admit that
-                // exact target only when the pinned edge view still contains
-                // a matching observed file edge for this project. Imported
-                // provenance edges have no project_id field, so they cannot
-                // recursively authorize arbitrary targets.
-                let observed = !active
-                    && observed_provenance_target_is_member(
-                        &relation_index,
-                        &source.project_id,
-                        target,
-                    );
+                // collected snapshot or the ProjectFileV2 schema. The boot
+                // read view may deliberately defer its multi-GB EdgeIndex
+                // rebuild, so historical authority comes from the bounded,
+                // per-project observed lane scanned once before this pass.
+                let observed = !active && observed_targets.contains(&key);
                 let member = active || observed;
                 membership_cache.lock().insert(key, member);
                 Ok(member)
@@ -376,27 +371,93 @@ fn prepare_documents(
     Ok(prepared_import)
 }
 
-fn observed_provenance_target_is_member(
-    edge_index: &bbox_edge_index::edge_index::EdgeIndex,
+fn collect_observed_provenance_targets(
+    state: &Arc<SharedState>,
+    source: &VerifiedProvenanceImportV1,
+    journal: &ProvenanceImportJournalV1,
+) -> Result<HashSet<String>> {
+    let searcher = state.code_read_view.read().searcher.clone();
+    let candidates = parking_lot::Mutex::new(HashSet::<String>::new());
+    state
+        .git_sources
+        .store()
+        .visit_verified_provenance_documents(source, |document| {
+            let resolve_legacy = |relative_path: &str, byte_range| {
+                state
+                    .idx
+                    .read()
+                    .resolve_project_chunk_for_selector_with_searcher(
+                        &source.project_id,
+                        &journal.code_selector,
+                        relative_path,
+                        byte_range,
+                        &searcher,
+                    )
+            };
+            let collect_target = |target: &bbox_corpus_core::entity_ref::EntityRef| {
+                candidates.lock().insert(target.to_string());
+                Ok(true)
+            };
+            bbox_mcp_tools::mcp_tools::provenance::prepare_authenticated_provenance_import(
+                &source.project_id,
+                &source.import_generation_id,
+                &[(
+                    document.note_commit,
+                    document.document_sha256,
+                    document.document,
+                )],
+                &resolve_legacy,
+                &collect_target,
+            )?;
+            Ok(())
+        })?;
+    let candidates = candidates.into_inner();
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut observed = HashSet::new();
+    let edges_dir = super::edge_sidecar_dir(state);
+    bbox_edge_sidecar::edge_sidecar::visit_observed_edge_lane(
+        &edges_dir,
+        &source.project_id,
+        MAX_PROVENANCE_OBSERVED_SCAN_BYTES,
+        MAX_PROVENANCE_DOCUMENT_BYTES as usize,
+        |edge| {
+            let key = edge.target.to_string();
+            if candidates.contains(&key)
+                && observed_provenance_edge_authorizes_target(
+                    &edge,
+                    &source.project_id,
+                    &edge.target,
+                )
+            {
+                observed.insert(key);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(observed)
+}
+
+fn observed_provenance_edge_authorizes_target(
+    edge: &bbox_edge_index::edge_index::Edge,
     project_id: &str,
     target: &bbox_corpus_core::entity_ref::EntityRef,
 ) -> bool {
-    edge_index.any_reverse_edge(target, |edge| {
-        matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE")
-            && edge.metadata.get("anchor.project_id").map(String::as_str) == Some(project_id)
-            // Observed rows written before the catalog-owner backfill have
-            // no typed project_id. Their per-project lane and anchor remain
-            // valid historical authority. Authenticated import rows also
-            // omit project_id, so exclude their durable generation marker to
-            // prevent one import from recursively authorizing another.
-            && edge
-                .project_id
-                .as_deref()
-                .is_none_or(|owner| owner == project_id)
-            && !edge
-                .metadata
-                .contains_key("provenance.import_generation_id")
-    })
+    &edge.target == target
+        && matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE")
+        && edge.metadata.get("anchor.project_id").map(String::as_str) == Some(project_id)
+        // Observed rows written before the catalog-owner backfill have no
+        // typed project_id. Their per-project lane and anchor remain valid
+        // historical authority.
+        && edge
+            .project_id
+            .as_deref()
+            .is_none_or(|owner| owner == project_id)
+        && !edge
+            .metadata
+            .contains_key("provenance.import_generation_id")
 }
 
 fn is_invalid_import(error: &anyhow::Error) -> bool {
@@ -451,7 +512,7 @@ mod tests {
         RecordedRepoAuthority, RepoHistoryAuthority, RepoHistoryId, RepoHistoryMaterialization,
         RepoHistoryRecord,
     };
-    use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+    use bbox_edge_index::edge_index::Edge;
     use bbox_git_source::{
         ProvenanceImportDescriptorV1, ProvenanceImportManifestEntryV1,
         ProvenanceImportManifestPageV1, SCHEMA_VERSION, provenance_manifest_sha256,
@@ -487,24 +548,19 @@ mod tests {
             metadata: metadata.clone(),
             project_id: Some(project_id.into()),
         };
-        let observed_index = EdgeIndex::from_edges_for_tests(vec![observed.clone()]);
-
-        assert!(observed_provenance_target_is_member(
-            &observed_index,
-            project_id,
-            &target,
+        assert!(observed_provenance_edge_authorizes_target(
+            &observed, project_id, &target,
         ));
-        assert!(!observed_provenance_target_is_member(
-            &observed_index,
+        assert!(!observed_provenance_edge_authorizes_target(
+            &observed,
             "another-project",
             &target,
         ));
 
         let mut legacy_unstamped = observed;
         legacy_unstamped.project_id = None;
-        let legacy_index = EdgeIndex::from_edges_for_tests(vec![legacy_unstamped.clone()]);
-        assert!(observed_provenance_target_is_member(
-            &legacy_index,
+        assert!(observed_provenance_edge_authorizes_target(
+            &legacy_unstamped,
             project_id,
             &target,
         ));
@@ -514,11 +570,8 @@ mod tests {
             "provenance.import_generation_id".into(),
             "pis_fixture".into(),
         );
-        let imported_index = EdgeIndex::from_edges_for_tests(vec![imported]);
-        assert!(!observed_provenance_target_is_member(
-            &imported_index,
-            project_id,
-            &target,
+        assert!(!observed_provenance_edge_authorizes_target(
+            &imported, project_id, &target,
         ));
     }
 
@@ -924,16 +977,18 @@ mod tests {
             provenance: EdgeProvenance::Explicit,
             confidence: EdgeConfidence::Exact,
             metadata,
-            project_id: Some(project_id.clone()),
+            project_id: None,
         };
-        let prior = state.code_read_view.read().clone();
-        *state.code_read_view.write() = Arc::new(CodeReadView {
-            active_selectors: prior.active_selectors.clone(),
-            searcher: prior.searcher.clone(),
-            edge_index: Arc::new(EdgeIndex::from_edges_for_tests(vec![observed])),
-            catalog_epoch: prior.catalog_epoch,
-            git_overlays: prior.git_overlays.clone(),
-        });
+        let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(
+            &state.idx.read().reindex_config().projects_path,
+        );
+        bbox_edge_sidecar::edge_sidecar::append_observed_edges(
+            &edges_dir,
+            &project_id,
+            &[observed],
+        )
+        .unwrap();
+        assert_eq!(state.code_read_view.read().edge_index.edge_count(), 0);
 
         let retried = store
             .finalize_provenance_import(&producer_id, &upload_id)
