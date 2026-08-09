@@ -56,6 +56,12 @@ pub(crate) struct WorkspaceBindingGrant {
     pub(crate) expires_unix_secs: u64,
 }
 
+impl WorkspaceBindingGrant {
+    pub(crate) fn is_live_now(&self) -> bool {
+        self.expires_unix_secs > now_unix_secs()
+    }
+}
+
 struct WorkspaceBindingEntry {
     token: ServiceToken,
     grant: WorkspaceBindingGrant,

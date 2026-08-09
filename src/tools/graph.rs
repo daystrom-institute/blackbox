@@ -654,6 +654,9 @@ fn workspace_blame_plan(
     let grant = server.authoritative_session_workspace_binding().context(
         "error.blame_locality_binding: blame locality requires a live workspace binding",
     )?;
+    if !grant.is_live_now() {
+        bail!("error.blame_locality_binding: workspace binding has expired");
+    }
     let target = match target {
         mcp_tools::blame::BlameTargetIdentity::ProjectFile {
             project_id,
@@ -1562,6 +1565,39 @@ mod tests {
         assert_eq!(fallback.is_error, Some(true));
         assert!(extract_text(&fallback).contains("error.blame_locality_required"));
         assert_eq!(server.state.checkout_access.health().sequence, before);
+
+        let expired_tmp = tempfile::tempdir().unwrap();
+        let expired_server = test_server(&expired_tmp);
+        assert!(
+            expired_server
+                .session_workspace_binding
+                .set(Some(Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "expired-task".into(),
+                        session_id: "expired-session".into(),
+                        project_id: "project-bound".into(),
+                        scope: PublishedScope::try_new("repo-bound", ".").unwrap(),
+                        workspace_id: bro_core::WorkspaceId::parse("a".repeat(32)).unwrap(),
+                        expires_unix_secs: 0,
+                    },
+                )))
+                .is_ok()
+        );
+        let expired_before = expired_server.state.checkout_access.health().sequence;
+        let expired = expired_server
+            .bbox_blame(Parameters(BlameParams {
+                file: Some("src/lib.rs".into()),
+                line: Some(7),
+                entity_ref: None,
+                locality: Some(mcp_tools::blame::BlameLocalityRequestV1::Plan),
+            }))
+            .await;
+        assert_eq!(expired.is_error, Some(true));
+        assert!(extract_text(&expired).contains("workspace binding has expired"));
+        assert_eq!(
+            expired_server.state.checkout_access.health().sequence,
+            expired_before
+        );
     }
 
     #[derive(Clone)]

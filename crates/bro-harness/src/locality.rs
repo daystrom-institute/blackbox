@@ -1229,6 +1229,12 @@ mod tests {
         assert!(calls[1]["_blame_locality"]["plan"].is_object());
         assert!(calls[1]["_blame_locality"]["fact"].is_object());
         assert_ne!(calls[1]["_blame_locality"]["plan"], "caller-forged");
+        assert!(
+            !serde_json::to_string(&*calls)
+                .unwrap()
+                .contains(root.to_str().unwrap()),
+            "locality transport must not expose the absolute checkout root"
+        );
     }
 
     #[tokio::test]
