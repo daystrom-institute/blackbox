@@ -264,30 +264,38 @@ mod tests {
         ) -> Response {
             let id = request["id"].clone();
             if request["method"] == "initialize" {
-                assert_eq!(
-                    headers
-                        .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok()),
-                    Some(format!("Bearer {}", state.token).as_str())
-                );
-                assert_eq!(
-                    headers
-                        .get(OPERATOR_BLAME_REPO_ID_HEADER)
-                        .and_then(|value| value.to_str().ok()),
-                    Some("repo")
-                );
-                assert_eq!(
-                    headers
-                        .get(OPERATOR_BLAME_ROOT_RELPATH_HEADER)
-                        .and_then(|value| value.to_str().ok()),
-                    Some(".")
-                );
-                assert_eq!(
-                    headers
-                        .get(OPERATOR_BLAME_WORKSPACE_ID_HEADER)
-                        .and_then(|value| value.to_str().ok()),
-                    Some(state.plan.workspace_id.as_str())
-                );
+                let operator = headers.contains_key(axum::http::header::AUTHORIZATION);
+                if operator {
+                    let expected_authorization = format!("Bearer {}", state.token);
+                    assert_eq!(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(expected_authorization.as_str())
+                    );
+                    assert_eq!(
+                        headers
+                            .get(OPERATOR_BLAME_REPO_ID_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("repo")
+                    );
+                    assert_eq!(
+                        headers
+                            .get(OPERATOR_BLAME_ROOT_RELPATH_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(".")
+                    );
+                    assert_eq!(
+                        headers
+                            .get(OPERATOR_BLAME_WORKSPACE_ID_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(state.plan.workspace_id.as_str())
+                    );
+                } else {
+                    assert!(!headers.contains_key(OPERATOR_BLAME_REPO_ID_HEADER));
+                    assert!(!headers.contains_key(OPERATOR_BLAME_ROOT_RELPATH_HEADER));
+                    assert!(!headers.contains_key(OPERATOR_BLAME_WORKSPACE_ID_HEADER));
+                }
                 assert!(!request.to_string().contains(&state.checkout_root));
                 let mut response = Json(json!({
                     "jsonrpc": "2.0",
@@ -299,15 +307,25 @@ mod tests {
                     }
                 }))
                 .into_response();
-                response
-                    .headers_mut()
-                    .insert("mcp-session-id", HeaderValue::from_static("operator-test"));
+                response.headers_mut().insert(
+                    "mcp-session-id",
+                    if operator {
+                        HeaderValue::from_static("operator-test")
+                    } else {
+                        HeaderValue::from_static("legacy-test")
+                    },
+                );
                 return response;
             }
 
             let arguments = request["params"]["arguments"].clone();
             state.calls.lock().unwrap().push(arguments.clone());
             let phase = arguments["_blame_locality"]["phase"].as_str();
+            let final_result = json!({
+                "status": "ok",
+                "file": "src/lib.rs",
+                "line": 1,
+            });
             let text = match phase {
                 Some("plan") => serde_json::to_string(&json!({
                     "status": "blame_locality_plan",
@@ -320,12 +338,19 @@ mod tests {
                         state.commit
                     );
                     assert!(!arguments.to_string().contains(&state.checkout_root));
-                    serde_json::to_string(&json!({
-                        "status": "ok",
-                        "file": "src/lib.rs",
-                        "line": 1,
-                    }))
-                    .unwrap()
+                    serde_json::to_string(&final_result).unwrap()
+                }
+                Some("compare") => {
+                    assert_eq!(
+                        arguments["_blame_locality"]["legacy_response_sha256"],
+                        response_sha256(&final_result).unwrap()
+                    );
+                    assert!(!arguments.to_string().contains(&state.checkout_root));
+                    serde_json::to_string(&final_result).unwrap()
+                }
+                None => {
+                    assert!(arguments["file"].as_str().unwrap().starts_with('/'));
+                    serde_json::to_string(&final_result).unwrap()
                 }
                 other => panic!("unexpected locality phase {other:?}"),
             };
@@ -421,15 +446,17 @@ mod tests {
             file: Some(PathBuf::from("src/lib.rs")),
             entity_ref: None,
             line: Some(1),
-            verify_overlap: false,
+            verify_overlap: true,
         })
         .await
         .unwrap();
         server.abort();
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0]["_blame_locality"]["phase"], "plan");
         assert_eq!(calls[1]["_blame_locality"]["phase"], "resolve");
+        assert!(calls[2].get("_blame_locality").is_none());
+        assert_eq!(calls[3]["_blame_locality"]["phase"], "compare");
     }
 }
