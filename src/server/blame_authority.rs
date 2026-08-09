@@ -17,7 +17,7 @@ use bro_core::WorkspaceId;
 
 use super::{BlackboxServer, SharedState};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct OperatorBlameGrant {
     pub(crate) project_id: String,
     pub(crate) scope: PublishedScope,
