@@ -1,0 +1,12 @@
+{
+  "id": "thread-7fb8aecd",
+  "topic": "Locality program GH-F: authenticated Git history and provenance overlap inventory, parity proof, preflight report and resolution artifacts; authority remains unchanged until GH-G",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Opened after GH-A through GH-E landed and exact-SHA cluster verification passed at 19eae82822adf1222192e64110442f825b475eb5. This arc owns GH-F only: membership-generation projection, offline preflight, complete coverage/parity evidence, FreshV2 rehearsal, reviewed artifacts, and full verification. It must not perform GH-G authority cutover.",
+    "GH-F/G locality Git transport program complete at 9cb34e9cb47effb44c0e6ec7b80fe76ab9cd5cda and pushed to beta/blackbox-v2. Strict preflight/apply/verify marker and receipt, per-repo current/stale/blocked/producer-removed classification, zero-fallback history and provenance guards, immediate reload revocation, row-preserving re-cutover, observation baselines, health taxonomy, and attached-overlap live rehearsal are implemented. Local gates: 6,243 standard workspace nextest and 6,247 full-profile nextest passed; pinned format/check and script syntax passed. Cluster workflow bbox-verify-z7j5p resolved beta/blackbox-v2 to 9cb34e9cb47e and passed nextest, clippy, and concurrency. Production daemon remained off; ports 7264 and 7398 were closed outside the isolated thread-update window. BLACKBOX.md remained byte-identical at sha256 266ab0bda78d72838ac7abae9bb1b121b8c65119537bb08bb9ef253914402320, inode 156298704, size 30650."
+  ],
+  "created_at": "2026-08-08T22:52:53Z",
+  "resolved_at": "2026-08-09T02:25:11Z"
+}
