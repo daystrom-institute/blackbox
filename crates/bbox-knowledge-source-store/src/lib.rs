@@ -4216,6 +4216,9 @@ mod tests {
             &knowledge,
             &gaps,
         );
+        store
+            .missing_provisional_blobs(&authority, &upload.upload_id, None)
+            .unwrap();
         install_fixture_blobs_provisional(&store, &authority, &upload.upload_id);
         let generation = store
             .finalize_provisional_upload(&authority, &upload.upload_id, 60)
@@ -4293,6 +4296,9 @@ mod tests {
             &knowledge,
             &gaps,
         );
+        store
+            .missing_provisional_blobs(&authority, &upload.upload_id, None)
+            .unwrap();
         install_fixture_blobs_provisional(&store, &authority, &upload.upload_id);
         store
             .finalize_provisional_upload(&authority, &upload.upload_id, 60)

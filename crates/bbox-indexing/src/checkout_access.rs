@@ -845,12 +845,17 @@ impl CheckoutAccessBroker {
     ) -> std::result::Result<ValidatedCheckoutLease, CheckoutAccessError> {
         match result {
             Ok(candidate) => {
+                // Legacy path selectors do not carry a request project id.
+                // Once authority has resolved the candidate, observations
+                // must use that durable identity rather than minting an
+                // invalid empty target-counter key.
+                let observed_project_id = candidate.project_id.clone();
                 let checkout_root_handle = match open_directory_nofollow(&candidate.checkout_root) {
                     Ok(handle) => handle,
                     Err(_) => {
                         self.observations
                             .record(
-                                &request.project_id,
+                                &observed_project_id,
                                 request.kind,
                                 request.source_lane,
                                 CheckoutAccessOutcome::Denied,
@@ -867,7 +872,7 @@ impl CheckoutAccessBroker {
                     Err(_) => {
                         self.observations
                             .record(
-                                &request.project_id,
+                                &observed_project_id,
                                 request.kind,
                                 request.source_lane,
                                 CheckoutAccessOutcome::Denied,
@@ -882,7 +887,7 @@ impl CheckoutAccessBroker {
                 let sequence = self
                     .observations
                     .record(
-                        &request.project_id,
+                        &observed_project_id,
                         request.kind,
                         request.source_lane,
                         CheckoutAccessOutcome::Granted,
@@ -1719,7 +1724,11 @@ fn record_observation(
             outcome: counter.outcome,
         });
     }
-    if is_cutover_target_kind(kind) {
+    // A denied legacy-path lookup can fail before authority resolves a
+    // durable project id. Keep the aggregate observation, but do not invent
+    // an unattributed target row. Successful legacy-path operations use the
+    // resolved candidate identity in `finish_acquire` above.
+    if is_cutover_target_kind(kind) && !project_id.is_empty() {
         if let Some(counter) = next.target_counters.iter_mut().find(|counter| {
             counter.project_id == project_id
                 && counter.kind == kind

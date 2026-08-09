@@ -2749,6 +2749,25 @@ mod tests {
         let scope = CatalogFixture::scope(".");
         fixture.add_published_project("p_candidate_tool", &scope);
         let server = fixture.server();
+        let catalog = fixture.store().snapshot().unwrap().catalog().clone();
+        server
+            .state
+            .code_sources
+            .install_auth_for_test(std::sync::Arc::new(
+                crate::server::producer_auth::ProducerAuthRuntime::for_test_catalog(
+                    vec![(
+                        bro_rpc::ServiceToken::parse("1".repeat(64)).unwrap(),
+                        crate::server::producer_auth::ProducerGrant {
+                            producer_id: "producer-a".into(),
+                            projects: std::collections::BTreeMap::from([(
+                                scope.clone(),
+                                "p_candidate_tool".into(),
+                            )]),
+                        },
+                    )],
+                    catalog.as_ref(),
+                ),
+            ));
         let store = server.state.knowledge_sources.store();
         let source_bytes =
             serde_json::to_vec(&knowledge_entry("knowledge-a", "remote candidate content"))

@@ -2182,7 +2182,7 @@ mod tests {
             accepted_generation_id: "a".repeat(64),
             accepted_generation_sha256: "b".repeat(64),
             accepted_pointer_sha256: "c".repeat(64),
-            source_generation_id: format!("kpub_{}", "d".repeat(64)),
+            source_generation_id: format!("kps_{}", "d".repeat(64)),
             source_generation_sha256: "e".repeat(64),
             publication_parity_commitment: Sha256ValueV1::digest(b"parity"),
             parity_workspace_ids: Vec::new(),
