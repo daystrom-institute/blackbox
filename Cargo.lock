@@ -290,6 +290,7 @@ name = "bbox-artifacts"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "axum",
  "bbox-corpus-core",
  "bbox-util",
  "hex",

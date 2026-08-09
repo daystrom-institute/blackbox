@@ -195,4 +195,204 @@ mod tests {
                 .contains("exactly one")
         );
     }
+
+    #[tokio::test]
+    async fn operator_cli_executes_real_git_and_transports_only_the_fact() {
+        use axum::Json;
+        use axum::extract::State;
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::post;
+        use bbox_corpus_core::blame_transport::{
+            BLAME_TRANSPORT_VERSION, BlameExecutionPlanV1, BlamePlanTargetV1,
+            OPERATOR_BLAME_REPO_ID_HEADER, OPERATOR_BLAME_ROOT_RELPATH_HEADER,
+            OPERATOR_BLAME_WORKSPACE_ID_HEADER,
+        };
+        use bbox_corpus_core::identity::PublishedScope;
+        use std::process::Command;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct FakeMcp {
+            plan: BlameExecutionPlanV1,
+            token: String,
+            checkout_root: String,
+            commit: String,
+            calls: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn fake_mcp(
+            State(state): State<FakeMcp>,
+            headers: HeaderMap,
+            Json(request): Json<Value>,
+        ) -> Response {
+            let id = request["id"].clone();
+            if request["method"] == "initialize" {
+                assert_eq!(
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(format!("Bearer {}", state.token).as_str())
+                );
+                assert_eq!(
+                    headers
+                        .get(OPERATOR_BLAME_REPO_ID_HEADER)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("repo")
+                );
+                assert_eq!(
+                    headers
+                        .get(OPERATOR_BLAME_ROOT_RELPATH_HEADER)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(".")
+                );
+                assert_eq!(
+                    headers
+                        .get(OPERATOR_BLAME_WORKSPACE_ID_HEADER)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(state.plan.workspace_id.as_str())
+                );
+                assert!(!request.to_string().contains(&state.checkout_root));
+                let mut response = Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "fake", "version": "test"}
+                    }
+                }))
+                .into_response();
+                response
+                    .headers_mut()
+                    .insert("mcp-session-id", HeaderValue::from_static("operator-test"));
+                return response;
+            }
+
+            let arguments = request["params"]["arguments"].clone();
+            state.calls.lock().unwrap().push(arguments.clone());
+            let phase = arguments["_blame_locality"]["phase"].as_str();
+            let text = match phase {
+                Some("plan") => serde_json::to_string(&json!({
+                    "status": "blame_locality_plan",
+                    "plan": state.plan,
+                }))
+                .unwrap(),
+                Some("resolve") => {
+                    assert_eq!(
+                        arguments["_blame_locality"]["fact"]["attribution"]["commit_sha"],
+                        state.commit
+                    );
+                    assert!(!arguments.to_string().contains(&state.checkout_root));
+                    serde_json::to_string(&json!({
+                        "status": "ok",
+                        "file": "src/lib.rs",
+                        "line": 1,
+                    }))
+                    .unwrap()
+                }
+                other => panic!("unexpected locality phase {other:?}"),
+            };
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false
+                }
+            }))
+            .into_response()
+        }
+
+        fn git(root: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .current_dir(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Blackbox Test")
+                .env("GIT_AUTHOR_EMAIL", "blackbox@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Blackbox Test")
+                .env("GIT_COMMITTER_EMAIL", "blackbox@example.invalid")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join(".bbox")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"repo\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        git(&root, &["add", ".bbox/config.toml", "src/lib.rs"]);
+        git(&root, &["commit", "-qm", "base"]);
+        let commit = git(&root, &["rev-parse", "HEAD"]);
+        let workspace_id = bbox_corpus_core::identity::ensure_checkout_id(&root).unwrap();
+        let token = "c".repeat(64);
+        let token_file = root.join("operator.token");
+        std::fs::write(&token_file, format!("{token}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let state = FakeMcp {
+            plan: BlameExecutionPlanV1 {
+                version: BLAME_TRANSPORT_VERSION,
+                project_id: "project".into(),
+                scope: PublishedScope::try_new("repo", ".").unwrap(),
+                workspace_id,
+                target: BlamePlanTargetV1::WorkspacePath {
+                    input_path: "src/lib.rs".into(),
+                    line: 1,
+                },
+            },
+            token,
+            checkout_root: root.to_string_lossy().into_owned(),
+            commit,
+            calls: calls.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/mcp", post(fake_mcp))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+
+        run(BlameArgs {
+            project_root: Some(root),
+            token_file,
+            daemon_url: Some(format!("http://{address}")),
+            file: Some(PathBuf::from("src/lib.rs")),
+            entity_ref: None,
+            line: Some(1),
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["_blame_locality"]["phase"], "plan");
+        assert_eq!(calls[1]["_blame_locality"]["phase"], "resolve");
+    }
 }

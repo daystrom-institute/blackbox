@@ -53,6 +53,7 @@ fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+axum = "0.8"
 # Render snapshot harness (Phase 0 safety net for the fleet_tui split).
 # insta captures rendered output as reviewable golden snapshots. We render
 # headlessly into a cell grid (codex's VT100Backend technique) using ratatui's
