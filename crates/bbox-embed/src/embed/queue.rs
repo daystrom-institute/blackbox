@@ -1153,7 +1153,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
         // Drain up to WORKER_CONCURRENCY batches and dispatch them in
         // parallel. The retry path keeps single-batch semantics so we
         // don't fan out a known-failing batch.
-        let batches = if !retry_batch.is_empty() {
+        let mut batches = if !retry_batch.is_empty() {
             vec![retry_batch.clone()]
         } else {
             let mut acc = Vec::with_capacity(WORKER_CONCURRENCY);
@@ -1177,24 +1177,21 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
             acc
         };
         if let Some(limiter) = &mut rate_limiter {
-            for batch in batches {
-                limiter.acquire(1).await;
-                let result = embed_batch_requests(spec.provider.as_ref(), &batch).await;
-                process_batch_outcome(
-                    &spec,
-                    &mut retry_batch,
-                    &mut retry_attempts,
-                    &mut backoff,
-                    batch,
-                    result,
-                )
-                .await;
+            let permitted = limiter.acquire_wave(batches.len()).await;
+            let deferred = batches.split_off(permitted);
+            for batch in deferred.into_iter().rev() {
+                for request in batch.into_iter().rev() {
+                    pending.push_front(request);
+                }
             }
-            continue;
         }
-        // Dispatch all unthrottled batches concurrently. The rate-limited
-        // path sends each batch as soon as its permit is available; otherwise
-        // a worker can look stuck while it waits for permits for later batches.
+        // The limiter admits one due batch plus any burst permits already
+        // available, then puts the rest back at the queue head. It therefore
+        // keeps low configured rates steady without serializing an already
+        // permitted Voyage burst. Voyage providers always carry a limiter, so
+        // a sequential rate-limited arm would make WORKER_CONCURRENCY dead code
+        // in production and turn a full-corpus rebuild into hours of avoidable
+        // wall time.
         let provider = &spec.provider;
         let mut results: Vec<(Vec<EmbedRequest>, anyhow::Result<Vec<Vec<f32>>>)> = {
             let futures = batches
@@ -1592,6 +1589,17 @@ impl TokenBucket {
         }
     }
 
+    async fn acquire_wave(&mut self, max_count: usize) -> usize {
+        if max_count == 0 {
+            return 0;
+        }
+        self.acquire(1).await;
+        self.refill();
+        let extra = (self.tokens.floor() as usize).min(max_count - 1);
+        self.tokens -= extra as f64;
+        1 + extra
+    }
+
     fn refill(&mut self) {
         let elapsed = self.last_refill.elapsed().as_secs_f64();
         if elapsed <= 0.0 {
@@ -1846,6 +1854,45 @@ mod tests {
         fail: bool,
     }
 
+    struct ConcurrentProbeProvider {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for ConcurrentProbeProvider {
+        async fn embed_batch(
+            &self,
+            inputs: &[EmbedInput],
+            _input_type: EmbedInputType,
+        ) -> Result<Vec<EmbedOutput>> {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(inputs
+                .iter()
+                .map(|_| EmbedOutput::single(vec![0.0_f32; 4]))
+                .collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        fn document_model(&self) -> &str {
+            "concurrency-probe"
+        }
+
+        fn endpoint_kind(&self) -> EmbedEndpointKind {
+            EmbedEndpointKind::Text
+        }
+
+        fn id(&self) -> &str {
+            "concurrency-probe"
+        }
+    }
+
     impl MockProvider {
         fn ok() -> Self {
             Self {
@@ -1971,6 +2018,54 @@ mod tests {
         assert_eq!(status.queue_depth, 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         queue.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rate_limited_worker_keeps_batch_dispatch_concurrent() {
+        let provider = Arc::new(ConcurrentProbeProvider {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
+        let queue = EmbedQueueHandle::from_providers(
+            vec![("code".into(), provider.clone(), Some(2_000), "code".into())],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            None,
+            None,
+        );
+        let oversized = "x".repeat(MAX_BATCH_BYTES + 1);
+        for index in 0..WORKER_CONCURRENCY {
+            assert!(queue.enqueue(request_with_text(
+                Bucket::Code,
+                &format!("entity-{index}"),
+                "hash",
+                &oversized,
+            )));
+        }
+        for _ in 0..50 {
+            if queue.status().routes["code"].queue_depth == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(queue.status().routes["code"].queue_depth, 0);
+        assert_eq!(
+            provider.max_in_flight.load(Ordering::SeqCst),
+            WORKER_CONCURRENCY,
+            "rate accounting must not serialize already-permitted batches"
+        );
+        queue.shutdown();
+    }
+
+    #[tokio::test]
+    async fn rate_limited_wave_never_exceeds_the_available_burst() {
+        let mut limiter = TokenBucket::new(2).unwrap();
+        assert_eq!(limiter.acquire_wave(WORKER_CONCURRENCY).await, 2);
+        assert!(
+            limiter.tokens < 1.0,
+            "the admitted burst must consume both available permits"
+        );
     }
 
     /// The queue-full path must reject cleanly and COUNT the rejection
