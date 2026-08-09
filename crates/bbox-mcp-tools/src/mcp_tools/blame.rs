@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn locality_transport_is_absent_from_the_public_blame_schema() {
-        let schema = serde_json::to_string(&schemars::schema_for!(BlameParams)).unwrap();
+        let schema = serde_json::to_string(&::schemars::schema_for!(BlameParams)).unwrap();
         assert!(!schema.contains("_blame_locality"), "{schema}");
     }
 
