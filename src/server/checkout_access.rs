@@ -854,7 +854,7 @@ mod tests {
     fn strict_knowledge_transport_projects_no_watcher_carrier() {
         let fixture = CatalogFixture::new();
         fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
-        let mut server = fixture.server();
+        let mut server = fixture.server_with_checkout_authority();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         attach(
@@ -865,11 +865,37 @@ mod tests {
             watching(),
             AttachmentStatus::Attached,
         );
-        assert_eq!(available(&server.state).len(), 1, "positive control");
+
+        // Positive control: the surviving local adapter is real for an
+        // uncovered row. Drive one discovery lease all the way through the
+        // broker before installing the strict cutover marker.
+        let carrier = available(&server.state)
+            .into_iter()
+            .next()
+            .expect("uncovered capable attachment projects a carrier");
+        let access = DaemonArtifactWatchAccess::new(
+            server.state.checkout_access.clone(),
+            server.state.project_authority.catalog_store(),
+        );
+        let before_local = server.state.checkout_access.health().sequence;
+        access
+            .with_discovery(&carrier, &mut |_| Ok(()), &mut |_| Ok(()))
+            .expect("uncovered watcher discovery uses the local adapter");
+        let after_local = server.state.checkout_access.health().sequence;
+        assert!(
+            after_local > before_local,
+            "positive control must reach the checkout broker"
+        );
+        drop(access);
 
         cover_project(&mut server);
 
         assert!(available(&server.state).is_empty());
+        assert_eq!(
+            server.state.checkout_access.health().sequence,
+            after_local,
+            "covered watcher projection must not attempt another checkout lease"
+        );
     }
 
     #[test]

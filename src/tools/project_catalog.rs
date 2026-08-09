@@ -2175,6 +2175,66 @@ mod tests {
             .join("\n")
     }
 
+    fn cover_knowledge_transport_project(
+        server: &mut BlackboxServer,
+        project_id: &str,
+        scope: PublishedScope,
+    ) {
+        use bbox_indexing::knowledge_transport_cutover::{
+            KnowledgeTransportCapabilityBaselineV1, KnowledgeTransportCutoverMarkerV1,
+            KnowledgeTransportCutoverRuntimeV1, PredictedKnowledgeTransportCutoverRowV1,
+        };
+        use bbox_indexing::project_catalog_inventory::Sha256ValueV1;
+
+        let capabilities = [
+            CheckoutAccessKind::PublisherConfigTreeRead,
+            CheckoutAccessKind::KnowledgeGapOverlayRead,
+            CheckoutAccessKind::ArtifactWatchDiscovery,
+            CheckoutAccessKind::RepositoryMutation,
+        ];
+        let marker = KnowledgeTransportCutoverMarkerV1 {
+            version: 1,
+            applied_at: "unix:1".into(),
+            report_artifact_hash: Sha256ValueV1::digest(b"report"),
+            resolution_artifact_hash: Sha256ValueV1::digest(b"resolution"),
+            predecessor_marker_checksum: None,
+            predecessor_catalog_epoch: 1,
+            inventory_hash: Sha256ValueV1::digest(b"inventory"),
+            observation_snapshot_hash: Sha256ValueV1::digest(b"observations"),
+            rows: vec![PredictedKnowledgeTransportCutoverRowV1 {
+                project_id: ProjectId::parse(project_id).unwrap(),
+                scope,
+                producer_id: "producer".into(),
+                grant_commitment: Sha256ValueV1::digest(b"grant"),
+                accepted_generation_id: "a".repeat(64),
+                accepted_generation_sha256: "b".repeat(64),
+                accepted_pointer_sha256: "c".repeat(64),
+                source_generation_id: format!("kps_{}", "d".repeat(64)),
+                source_generation_sha256: "e".repeat(64),
+                publication_parity_commitment: Sha256ValueV1::digest(b"publication"),
+                parity_workspace_ids: Vec::new(),
+                workspace_parity_commitment: Sha256ValueV1::digest(b"workspace"),
+                shadow_observation_commitment: Sha256ValueV1::digest(b"shadow"),
+                capability_baselines: capabilities
+                    .into_iter()
+                    .map(|capability| KnowledgeTransportCapabilityBaselineV1 {
+                        capability,
+                        granted: 0,
+                        denied: 0,
+                    })
+                    .collect(),
+                observation_window_start_sequence: 0,
+                observation_window_end_sequence: 0,
+            }],
+            checksum_sha256: Sha256ValueV1::digest(b"test fixture bypasses marker decoding"),
+        };
+        Arc::get_mut(&mut server.state)
+            .expect("test server has one state owner")
+            .knowledge_transport_cutover = Arc::new(
+            KnowledgeTransportCutoverRuntimeV1::from_marker(Some(marker)),
+        );
+    }
+
     #[test]
     fn publish_mode_parsing_refuses_half_specified_requests() {
         fn params(
@@ -2644,6 +2704,88 @@ mod tests {
             "a dry run must not converge the index to newer accepted content"
         );
     }
+
+    /// KT-F closeout: the attachment-backed publisher remains a live local
+    /// adapter for uncovered projects, while a covered row refuses before
+    /// the checkout broker can acquire or deny a lease. The positive control
+    /// prevents this from passing merely because the fixture never had a
+    /// usable checkout.
+    #[tokio::test]
+    async fn strict_knowledge_transport_closes_only_the_covered_publisher_adapter() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
+        const PROJECT_ID: &str = "p_covered_publisher";
+        const ATTACHMENT_ID: &str = "att_00000000000000000000000000000e02";
+        const CHECKOUT_ID: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeee02";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().canonicalize().unwrap().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        publishing_checkout(&checkout);
+        let scope = PublishedScope::try_new("repo_probe", ".").unwrap();
+
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT_ID, &scope);
+        fixture.attach_overlay_checkout(
+            PROJECT_ID,
+            &scope,
+            &checkout,
+            ATTACHMENT_ID,
+            CHECKOUT_ID,
+            true,
+        );
+        let mut server = fixture.server_with_checkout_authority();
+
+        let before_local = server.state.checkout_access.health().sequence;
+        let local = server
+            .bbox_project_publisher_advance(Parameters(ProjectPublisherAdvanceParams {
+                project_id: PROJECT_ID.into(),
+                attachment_id: Some(ATTACHMENT_ID.into()),
+                source_generation_id: None,
+                mode: "establish".into(),
+                full_ref: Some("refs/heads/main".into()),
+                expected_generation_id: None,
+                expected_pointer_sha256: None,
+                dry_run: true,
+                expected_catalog_epoch: fixture.epoch(),
+                audit_reason: "uncovered positive control".into(),
+            }))
+            .await;
+        assert!(!local.is_error.unwrap_or(false), "{}", error_text(&local));
+        let after_local = server.state.checkout_access.health().sequence;
+        assert!(
+            after_local > before_local,
+            "positive control must reach the checkout broker"
+        );
+
+        cover_knowledge_transport_project(&mut server, PROJECT_ID, scope);
+        let covered = server
+            .bbox_project_publisher_advance(Parameters(ProjectPublisherAdvanceParams {
+                project_id: PROJECT_ID.into(),
+                attachment_id: Some(ATTACHMENT_ID.into()),
+                source_generation_id: None,
+                mode: "establish".into(),
+                full_ref: Some("refs/heads/main".into()),
+                expected_generation_id: None,
+                expected_pointer_sha256: None,
+                dry_run: true,
+                expected_catalog_epoch: fixture.epoch(),
+                audit_reason: "covered refusal".into(),
+            }))
+            .await;
+        let text = error_text(&covered);
+        assert!(covered.is_error.unwrap_or(false), "{text}");
+        assert!(
+            text.contains("error.knowledge_transport_authoritative"),
+            "{text}"
+        );
+        assert_eq!(
+            server.state.checkout_access.health().sequence,
+            after_local,
+            "covered publisher request must refuse before checkout acquisition"
+        );
+    }
+
     /// Denied publish requests must not touch a repository.
     ///
     /// The fixture has no checkout anywhere: the catalog holds one
