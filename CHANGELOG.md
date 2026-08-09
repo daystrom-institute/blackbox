@@ -77,6 +77,11 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Global guidance renders now fail closed when an incomplete source view would
+  replace a substantial managed region with less than half its content. The
+  guard catches nonempty bootstrap stubs as well as empty renders before any
+  backup or atomic replacement can touch `~/.blackbox/BLACKBOX.md` or a
+  provider memory file (gap-a44c80b2).
 - `blackboxd --help` / `--version` are side-effect-free: they print and
   exit before any store open, background worker, port bind, or tokio
   runtime; unknown flags exit 2 instead of silently starting a daemon

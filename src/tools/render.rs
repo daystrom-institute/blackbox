@@ -683,6 +683,65 @@ mod catalog_render_tests {
         assert_eq!(attempted, 0, "global render acquired checkout authority");
     }
 
+    /// Reproduce the operator-facing failure where a restarted daemon exposed
+    /// only the built-in bootstrap rule and an ordinary global render replaced
+    /// roughly 30 KiB of standing guidance with that nonempty stub.
+    #[tokio::test]
+    async fn global_render_refuses_nonempty_stub_over_full_guidance() {
+        let fixture = CatalogFixture::new();
+        let render_root = fixture.root().join("global-render-shrink");
+        std::fs::create_dir_all(&render_root).expect("create render fixture");
+        let common_path = render_root.join("BLACKBOX.md");
+        let existing_body = "standing operator guidance\n".repeat(1_300);
+        let original = format!(
+            "{}\n{}{}\n",
+            bbox_knowledge::render::MANAGED_START,
+            existing_body,
+            bbox_knowledge::render::MANAGED_END,
+        );
+        std::fs::write(&common_path, &original).expect("seed full global guidance");
+
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_GLOBAL_COMMON_MD", &common_path);
+        env.set("BLACKBOX_GLOBAL_CLAUDE_MD", render_root.join("CLAUDE.md"));
+        env.set("BLACKBOX_GLOBAL_CODEX_MD", render_root.join("AGENTS.md"));
+        env.set("BLACKBOX_GLOBAL_GEMINI_MD", render_root.join("GEMINI.md"));
+        env.set("BLACKBOX_BACKUP_DIR", render_root.join("backups"));
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                scope: Some("global".into()),
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(is_error(&result), "{result:?}");
+        assert!(
+            format!("{result:?}").contains("error.render_destructive_shrink"),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&common_path).unwrap(),
+            original,
+            "a refused render must preserve the full managed region byte for byte"
+        );
+        assert!(
+            !render_root.join("backups").exists(),
+            "a refused render must not claim that it committed a backup"
+        );
+        let attempted: u64 = server
+            .state
+            .checkout_access
+            .health()
+            .operations
+            .into_iter()
+            .map(|operation| operation.granted + operation.denied)
+            .sum();
+        assert_eq!(attempted, 0, "global render acquired checkout authority");
+    }
+
     /// A project render against a catalog project with no attachment reports
     /// the attachment requirement rather than reaching a checkout. The
     /// refusal is the resolver's, so no record path lookup stands between the

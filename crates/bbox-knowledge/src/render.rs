@@ -13,6 +13,13 @@ use anyhow::{Context, Result};
 pub const MANAGED_START: &str = "<!-- bb:managed-start -->";
 pub const MANAGED_END: &str = "<!-- bb:managed-end -->";
 
+/// A managed region this large is durable operator guidance, not a tiny
+/// bootstrap pointer. Refuse to discard more than half of it in one ordinary
+/// render. This catches incomplete source views while still allowing routine
+/// edits and small generated regions to evolve normally.
+const MIN_SHRINK_PROTECTED_BYTES: usize = 512;
+const MAX_UNACKNOWLEDGED_SHRINK_DIVISOR: usize = 2;
+
 /// Test binaries must never inspect or rewrite the operator's real global
 /// guidance files. Unit tests compile this crate with `cfg(test)`; nextest
 /// also marks integration-test processes through its runtime environment.
@@ -247,10 +254,14 @@ pub fn plan_managed_patch(file_path: &Path, managed_body: &str) -> Result<PatchP
 /// and we're actually changing it) to the backup directory before writing.
 /// Returns the backup path, if a snapshot was taken.
 ///
-/// By default (`allow_empty=false`), refuses to replace a non-empty
-/// managed region with an empty one (a typical symptom of path-vs-repo_id
-/// scoping mismatches). Pass `allow_empty=true` to override.
-pub fn apply_managed_patch(plan: &PatchPlan, allow_empty: bool) -> Result<Option<PathBuf>> {
+/// By default (`allow_destructive_shrink=false`), refuses to replace a
+/// substantial managed region with a candidate less than half its size. An
+/// empty candidate is the degenerate case. Large unexpected shrinkage is a
+/// strong signal that the render source view is incomplete.
+pub fn apply_managed_patch(
+    plan: &PatchPlan,
+    allow_destructive_shrink: bool,
+) -> Result<Option<PathBuf>> {
     let path = match plan {
         PatchPlan::Create { path, .. }
         | PatchPlan::Append { path, .. }
@@ -295,17 +306,18 @@ pub fn apply_managed_patch(plan: &PatchPlan, allow_empty: bool) -> Result<Option
             existing_block,
             managed_block,
         } => {
-            if !allow_empty {
+            if !allow_destructive_shrink {
                 let new_body = managed_body_trimmed(managed_block);
                 let existing_body = managed_body_trimmed(existing_block);
-                if new_body.is_empty() && !existing_body.is_empty() {
+                if destructive_managed_shrink(existing_body.len(), new_body.len()) {
                     anyhow::bail!(
-                        "Refusing to clobber non-empty managed region in {} with an \
-                         empty render. This typically happens when the render path \
-                         does not match the path knowledge entries were stored under \
-                         (path vs repo_id scoping mismatch). \
-                         Pass allow_empty=true to override.",
-                        path.display()
+                        "error.render_destructive_shrink: refusing to replace the managed region \
+                         in {}: the candidate is {} bytes but the existing region is {} bytes. \
+                         The rendered source view may be incomplete; inspect a dry run and \
+                         restore source authority before retrying",
+                        path.display(),
+                        new_body.len(),
+                        existing_body.len(),
                     );
                 }
             }
@@ -326,6 +338,12 @@ pub fn apply_managed_patch(plan: &PatchPlan, allow_empty: bool) -> Result<Option
             Ok(backup)
         }
     }
+}
+
+fn destructive_managed_shrink(existing_bytes: usize, candidate_bytes: usize) -> bool {
+    (existing_bytes > 0 && candidate_bytes == 0)
+        || (existing_bytes >= MIN_SHRINK_PROTECTED_BYTES
+            && candidate_bytes.saturating_mul(MAX_UNACKNOWLEDGED_SHRINK_DIVISOR) < existing_bytes)
 }
 
 fn create_parent_dir(path: &Path) {
@@ -581,11 +599,11 @@ mod tests {
             "should be a Replace, not {plan:?}"
         );
 
-        // default (allow_empty=false) → refused
+        // Default safety policy refuses the destructive shrink.
         let err = apply_managed_patch(&plan, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Refusing to clobber"),
+            msg.contains("error.render_destructive_shrink"),
             "error should mention clobber refusal: {msg}"
         );
         assert!(
@@ -604,7 +622,44 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_empty_overrides_clobber_guard() {
+    fn test_nonempty_stub_cannot_replace_full_global_guidance() {
+        let _env = bbox_util::util::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let backup_dir = root.join("backups");
+        unsafe {
+            std::env::set_var("BLACKBOX_BACKUP_DIR", &backup_dir);
+        }
+
+        let p = root.join("BLACKBOX.md");
+        let existing_body = "x".repeat(30_430);
+        let incomplete_candidate = "y".repeat(998);
+        let original = format!("{MANAGED_START}\n{existing_body}\n{MANAGED_END}\n");
+        std::fs::write(&p, &original).unwrap();
+
+        let plan = plan_managed_patch(&p, &incomplete_candidate).unwrap();
+        let error = apply_managed_patch(&plan, false)
+            .expect_err("a nonempty bootstrap stub must not replace full guidance");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("error.render_destructive_shrink"),
+            "{message}"
+        );
+        assert!(message.contains("998 bytes"), "{message}");
+        assert!(message.contains("30430 bytes"), "{message}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+        assert!(
+            !backup_dir.exists(),
+            "a refused render must not create a misleading backup"
+        );
+
+        unsafe {
+            std::env::remove_var("BLACKBOX_BACKUP_DIR");
+        }
+    }
+
+    #[test]
+    fn test_allow_destructive_shrink_overrides_clobber_guard() {
         let _env = bbox_util::util::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -617,7 +672,7 @@ mod tests {
         std::fs::write(&p, format!("{MANAGED_START}\nold body\n{MANAGED_END}\n")).unwrap();
 
         let plan = plan_managed_patch(&p, "").unwrap();
-        // allow_empty=true bypasses the guard
+        // Explicit internal authority bypasses the guard.
         let backup = apply_managed_patch(&plan, true).unwrap();
         assert!(backup.is_some());
 
