@@ -233,6 +233,10 @@ pub(crate) struct SharedState {
     /// checkout after the measured cut.
     pub(crate) render_locality_cutover:
         Arc<bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1>,
+    /// Strict per-project collected-source authority. A checksummed marker
+    /// closes LocalProjectWalk and removes local cutback as a valid fallback.
+    pub(crate) code_source_locality_cutover:
+        Arc<bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1>,
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
@@ -1003,6 +1007,9 @@ impl SharedState {
             ),
             render_locality_cutover: Arc::new(
                 bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default(),
+            ),
+            code_source_locality_cutover: Arc::new(
+                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
             ),
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),

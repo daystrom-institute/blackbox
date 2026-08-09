@@ -491,6 +491,41 @@ pub(crate) struct CodeSourceRuntime {
     /// and this generation form the cutback authority fence.
     assignment_revision: std::sync::atomic::AtomicU64,
     retirement_coordinator: Arc<RetirementCoordinator>,
+    code_source_locality_cutover:
+        Arc<bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1>,
+}
+
+pub(crate) struct CodeSourceLocalityCheckoutPolicy {
+    cutover: Arc<bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1>,
+}
+
+impl CodeSourceLocalityCheckoutPolicy {
+    pub(crate) fn new(
+        cutover: Arc<
+            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1,
+        >,
+    ) -> Self {
+        Self { cutover }
+    }
+}
+
+impl bbox_indexing::checkout_access::CheckoutAccessPolicy for CodeSourceLocalityCheckoutPolicy {
+    fn authorize(
+        &self,
+        request: &bbox_indexing::checkout_access::CheckoutAccessRequest,
+    ) -> std::result::Result<(), bbox_indexing::checkout_access::CheckoutAccessError> {
+        use bbox_indexing::checkout_access::{CheckoutAccessError, CheckoutAccessErrorCode};
+
+        if request.kind == CheckoutAccessKind::LocalProjectWalk
+            && self.cutover.transport_governed(&request.project_id)
+        {
+            return Err(CheckoutAccessError::new(
+                CheckoutAccessErrorCode::CodeSourceTransportAuthoritative,
+                "error.code_source_transport_authoritative: LocalProjectWalk is closed by the code-source locality cutover",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -505,6 +540,9 @@ impl CodeSourceRuntime {
         projects: &[ProjectRecord],
         catalog_store: Option<Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
         checkout_access: Arc<CheckoutAccessBroker>,
+        code_source_locality_cutover: Arc<
+            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1,
+        >,
     ) -> Result<Self> {
         let transition_guards = Arc::new(TransitionGuardMap::new(BTreeMap::new()));
         let reconciler = if catalog_store.is_some() {
@@ -512,14 +550,16 @@ impl CodeSourceRuntime {
         } else {
             None
         };
+        let snapshot = Arc::new(build_snapshot(
+            config,
+            projects,
+            catalog_store.as_ref(),
+            None,
+            &checkout_access,
+        )?);
+        code_source_locality_cutover.verify_assignments(&assignment_map(&snapshot))?;
         Ok(Self {
-            snapshot: parking_lot::RwLock::new(Arc::new(build_snapshot(
-                config,
-                projects,
-                catalog_store.as_ref(),
-                None,
-                &checkout_access,
-            )?)),
+            snapshot: parking_lot::RwLock::new(snapshot),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
             checkout_access,
             catalog_store,
@@ -527,6 +567,7 @@ impl CodeSourceRuntime {
             reconciler,
             assignment_revision: std::sync::atomic::AtomicU64::new(1),
             retirement_coordinator: Arc::new(RetirementCoordinator::new()),
+            code_source_locality_cutover,
         })
     }
 
@@ -543,6 +584,8 @@ impl CodeSourceRuntime {
             Some(previous.store.clone()),
             &self.checkout_access,
         )?);
+        self.code_source_locality_cutover
+            .verify_assignments(&assignment_map(&replacement))?;
         replacement.store.update_limits(store_limits(config))?;
         let old_assignments = assignment_map(&previous);
         let new_assignments = assignment_map(&replacement);
@@ -585,6 +628,9 @@ impl CodeSourceRuntime {
             reconciler: None,
             assignment_revision: std::sync::atomic::AtomicU64::new(1),
             retirement_coordinator: Arc::new(RetirementCoordinator::new()),
+            code_source_locality_cutover: Arc::new(
+                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
+            ),
         }
     }
 
@@ -623,6 +669,9 @@ impl CodeSourceRuntime {
             reconciler,
             assignment_revision: std::sync::atomic::AtomicU64::new(1),
             retirement_coordinator: Arc::new(RetirementCoordinator::new()),
+            code_source_locality_cutover: Arc::new(
+                bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
+            ),
         }
     }
 
@@ -1160,6 +1209,12 @@ fn enqueue_current_transition(
 }
 
 fn schedule_cutback_if_owner_changed(state: Arc<SharedState>, project_id: String) {
+    if state
+        .code_source_locality_cutover
+        .transport_governed(&project_id)
+    {
+        return;
+    }
     let store = state.code_sources.store();
     let Some(activation) = store.load_activation_mixed(&project_id).ok().flatten() else {
         return;
@@ -1668,7 +1723,14 @@ pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, runtime_handle: tokio::
                     let persisted = activation
                         .as_ref()
                         .and_then(|record| record.cutback().cloned());
-                    let ladder = probe_ladder(&state_for_task, &project_id);
+                    let ladder = if state_for_task
+                        .code_source_locality_cutover
+                        .transport_governed(&project_id)
+                    {
+                        LadderResult::None
+                    } else {
+                        probe_ladder(&state_for_task, &project_id)
+                    };
 
                     // Evaluate open-bridge predicate (section 9.3).
                     let effective_gen = activation
@@ -3864,6 +3926,17 @@ pub(crate) fn pre_bind_catalog_recovery(
         &pending_first_republish,
     )
     .context("pre-bind: validating active workspace materializations")?;
+    let locality_observations =
+        bbox_indexing::code_source_locality_observations::CodeSourceLocalityObservationsV1::open(
+            bbox_indexing::code_source_locality_observations::observation_path_from_code_source_root(
+                store.root(),
+            )?,
+        )?;
+    locality_observations.record_verified_activations(
+        store,
+        projects_path,
+        bbox_indexing::code_source_locality_observations::CodeSourceLocalityEvidenceKindV1::StartupRecovery,
+    )?;
 
     // Step 7: detect incomplete retirement journals.
     detect_incomplete_retirement_journal(bro_home)
@@ -4363,6 +4436,12 @@ fn probe_ladder(state: &Arc<SharedState>, project_id: &str) -> LadderResult {
 
 /// Determine the desired assignment for a project from auth-table state.
 fn determine_desired_assignment(state: &Arc<SharedState>, project_id: &str) -> DesiredAssignment {
+    if state
+        .code_source_locality_cutover
+        .transport_governed(project_id)
+    {
+        return DesiredAssignment::Collected;
+    }
     let assigned = state
         .code_sources
         .assignments()

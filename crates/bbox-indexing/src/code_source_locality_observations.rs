@@ -106,10 +106,7 @@ impl CodeSourceLocalityObservationsV1 {
                 continue;
             };
             if activation.cutback.is_some() || activation.cutback_pending {
-                bail!(
-                    "cannot record code-source locality evidence while cutback is pending for {}",
-                    activation.project_id
-                );
+                continue;
             }
             let generation = store.find_generation_mixed(&activation.generation_id)?;
             let MixedStoredGeneration::CurrentV2(generation) = generation else {
@@ -117,7 +114,7 @@ impl CodeSourceLocalityObservationsV1 {
             };
             activation.validate_against_generation(&generation)?;
             if generation.state != GenerationState::Active {
-                bail!("code-source locality evidence requires an active generation");
+                continue;
             }
             let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
                 activation.project_id.as_str(),

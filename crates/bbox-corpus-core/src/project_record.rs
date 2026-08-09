@@ -389,6 +389,13 @@ pub trait ProjectRecordsProvider: Send + Sync {
         false
     }
 
+    /// Whether a measured collected-source cutover closes the daemon-side
+    /// LocalProjectWalk adapter for this project. Bridge and offline providers
+    /// retain the default compatibility behavior.
+    fn code_source_locality_governed(&self, _project_id: &str) -> bool {
+        false
+    }
+
     /// Per-project code identity for the COMPLETE corpus id set (Phase 3
     /// plan section 7 item 1). Source planning needs an identity for every
     /// catalog project, including one with zero attachments, so it cannot

@@ -319,6 +319,9 @@ mod tests {
                 &[],
                 Some(authority_store.clone()),
                 state.checkout_access.clone(),
+                Arc::new(
+                    bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
+                ),
             )
             .unwrap(),
         );

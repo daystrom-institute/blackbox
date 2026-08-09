@@ -370,6 +370,22 @@ pub(super) fn open_shared_state(
             bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default()
         },
     );
+    let code_source_locality_cutover = Arc::new(
+        if matches!(
+            store_probe,
+            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
+        ) {
+            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::open(
+                &cfg.paths.state_dir,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("code-source locality cutover startup gate: {error}")
+            })?
+        } else {
+            bbox_indexing::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(
+            )
+        },
+    );
     let (access_authority, records_provider): (
         Arc<dyn bbox_indexing::checkout_access::CheckoutAccessAuthority>,
         Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
@@ -411,9 +427,10 @@ pub(super) fn open_shared_state(
                     ),
                 ),
                 Arc::new(
-                    bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new_with_git_transport_cutover(
+                    bbox_indexing::catalog_records::CatalogProjectRecordsProvider::new_with_transport_cutovers(
                         store,
                         git_transport_cutover.clone(),
+                        code_source_locality_cutover.clone(),
                     ),
                 ),
             )
@@ -430,6 +447,13 @@ pub(super) fn open_shared_state(
         .install_policy(Arc::new(
             super::knowledge_source::KnowledgeTransportCheckoutPolicy::new(
                 knowledge_transport_cutover.clone(),
+            ),
+        ))
+        .map_err(anyhow::Error::new)?;
+    checkout_access
+        .install_policy(Arc::new(
+            super::code_source::CodeSourceLocalityCheckoutPolicy::new(
+                code_source_locality_cutover.clone(),
             ),
         ))
         .map_err(anyhow::Error::new)?;
@@ -705,7 +729,16 @@ pub(super) fn open_shared_state(
         &records_provider.records_snapshot().records,
         catalog_store.clone(),
         checkout_access.clone(),
+        code_source_locality_cutover.clone(),
     )?);
+    if let Some(catalog_store) = catalog_store.as_ref() {
+        code_source_locality_cutover.verify_live(
+            catalog_store,
+            &cfg,
+            code_sources.store().as_ref(),
+            &projects_path,
+        )?;
+    }
     let git_sources = Arc::new(super::git_source::GitSourceRuntime::open(&cfg)?);
     let knowledge_sources = Arc::new(super::knowledge_source::KnowledgeSourceRuntime::open(&cfg)?);
 
@@ -933,6 +966,7 @@ pub(super) fn open_shared_state(
         knowledge_transport_cutover,
         blame_locality_cutover,
         render_locality_cutover,
+        code_source_locality_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

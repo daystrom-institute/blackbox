@@ -620,6 +620,7 @@ pub(super) fn plan_project_sources(
                 &collected,
                 purpose,
                 records_provider.git_history_transport_governed(project_id),
+                records_provider.code_source_locality_governed(project_id),
             )?),
             None => None,
         };
@@ -797,6 +798,7 @@ fn acquire_leases_for_record(
     collected: &std::collections::BTreeMap<String, super::project_files::ActiveCollectedSource>,
     purpose: ProjectLeasePurpose,
     git_history_transport_governed: bool,
+    code_source_locality_governed: bool,
 ) -> Result<LeasedProjectAccess> {
     let (publisher_config, expected_scope, publisher_config_denial) = match broker
         .recorded_project_scope(&project.project_id)
@@ -825,8 +827,9 @@ fn acquire_leases_for_record(
     // project-record, and knowledge lanes, so the acquisition set stays
     // exactly today's (bridge parity; leases are a property of attachment,
     // not of effective source).
-    let needs_local =
-        !collected.contains_key(&project.project_id) || purpose == ProjectLeasePurpose::Reindex;
+    let needs_local = !code_source_locality_governed
+        && (!collected.contains_key(&project.project_id)
+            || purpose == ProjectLeasePurpose::Reindex);
     let (local, local_denial) = if !needs_local {
         (None, None)
     } else {

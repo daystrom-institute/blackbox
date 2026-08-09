@@ -346,6 +346,7 @@ pub enum CheckoutAccessErrorCode {
     WriteIntentRequired,
     LifecycleBusy,
     KnowledgeTransportAuthoritative,
+    CodeSourceTransportAuthoritative,
     DeniedByTestProbe,
     ObservationUnavailable,
 }
@@ -368,6 +369,7 @@ impl CheckoutAccessErrorCode {
             Self::WriteIntentRequired => "write_intent_required",
             Self::LifecycleBusy => "lifecycle_busy",
             Self::KnowledgeTransportAuthoritative => "knowledge_transport_authoritative",
+            Self::CodeSourceTransportAuthoritative => "code_source_transport_authoritative",
             Self::DeniedByTestProbe => "denied_by_test_probe",
             Self::ObservationUnavailable => "observation_unavailable",
         }

@@ -34,6 +34,8 @@ use crate::project_catalog_store::ProjectCatalogStore;
 pub struct CatalogProjectRecordsProvider {
     store: Arc<ProjectCatalogStore>,
     git_transport_cutover: Arc<crate::git_transport_cutover::GitTransportCutoverRuntimeV1>,
+    code_source_locality_cutover:
+        Arc<crate::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1>,
     cache: parking_lot::Mutex<Option<ProjectRecordsSnapshot>>,
     /// Most recent degradation (stale-cache serving, cross-validation
     /// failure, omitted rows), surfaced through doctor/health.
@@ -42,9 +44,12 @@ pub struct CatalogProjectRecordsProvider {
 
 impl CatalogProjectRecordsProvider {
     pub fn new(store: Arc<ProjectCatalogStore>) -> Self {
-        Self::new_with_git_transport_cutover(
+        Self::new_with_transport_cutovers(
             store,
             Arc::new(crate::git_transport_cutover::GitTransportCutoverRuntimeV1::default()),
+            Arc::new(
+                crate::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
+            ),
         )
     }
 
@@ -52,9 +57,26 @@ impl CatalogProjectRecordsProvider {
         store: Arc<ProjectCatalogStore>,
         git_transport_cutover: Arc<crate::git_transport_cutover::GitTransportCutoverRuntimeV1>,
     ) -> Self {
+        Self::new_with_transport_cutovers(
+            store,
+            git_transport_cutover,
+            Arc::new(
+                crate::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1::default(),
+            ),
+        )
+    }
+
+    pub fn new_with_transport_cutovers(
+        store: Arc<ProjectCatalogStore>,
+        git_transport_cutover: Arc<crate::git_transport_cutover::GitTransportCutoverRuntimeV1>,
+        code_source_locality_cutover: Arc<
+            crate::code_source_locality_cutover::CodeSourceLocalityCutoverRuntimeV1,
+        >,
+    ) -> Self {
         Self {
             store,
             git_transport_cutover,
+            code_source_locality_cutover,
             cache: parking_lot::Mutex::new(None),
             degradation: parking_lot::Mutex::new(None),
         }
@@ -180,6 +202,11 @@ impl ProjectRecordsProvider for CatalogProjectRecordsProvider {
             .repo_history
             .as_ref()
             .is_some_and(|repo_history_id| self.git_transport_cutover.covers_repo(repo_history_id))
+    }
+
+    fn code_source_locality_governed(&self, project_id: &str) -> bool {
+        self.code_source_locality_cutover
+            .transport_governed(project_id)
     }
 
     /// Catalog derivation of the planning identity map (Phase 3 plan

@@ -848,6 +848,23 @@ pub(super) fn execute_reindex_pass(
             );
         }
     }
+    if full {
+        let store = bbox_code_source_store::CodeSourceStore::open(
+            &config.code_source_store_path,
+            bbox_code_source_store::StoreLimits::default(),
+        )?;
+        let observations =
+            crate::code_source_locality_observations::CodeSourceLocalityObservationsV1::open(
+                crate::code_source_locality_observations::observation_path_from_code_source_root(
+                    store.root(),
+                )?,
+            )?;
+        observations.record_verified_activations(
+            &store,
+            &config.projects_path,
+            crate::code_source_locality_observations::CodeSourceLocalityEvidenceKindV1::FullRebuild,
+        )?;
+    }
     tracing::info!(
         full,
         elapsed_ms = commit_phase.elapsed().as_millis(),
