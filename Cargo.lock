@@ -1214,8 +1214,10 @@ name = "bro-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bbox-corpus-core",
  "bbox-provenance",
  "bro-fleet-client",
+ "bro-rpc",
  "clap",
  "crossterm",
  "dirs",
