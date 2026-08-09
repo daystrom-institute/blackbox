@@ -14,11 +14,12 @@ brief: "Move repo-owned knowledge and gap acquisition to checkout owners without
 
 # Remote knowledge source transport
 
-> **Status: proposed; implementation through KT-D verified 2026-08-09.** KT-E
-> measured overlap and strict cutover is the next locality-program slice. This
-> consumes the shipped accepted-publication store, project-scoped producer
-> grants, typed Git transport, checkout identity, provisional overlay model,
-> and knowledge/gap merge gate. It does not reopen those semantics.
+> **Status: proposed; implementation through KT-E verified 2026-08-09.** The
+> measured overlap and strict cutover runtime is complete for operator-cutover
+> covered Published rows; KT-F adapter retirement and parent-plan closeout is
+> next. This consumes the shipped accepted-publication store, project-scoped
+> producer grants, typed Git transport, checkout identity, provisional overlay
+> model, and knowledge/gap merge gate. It does not reopen those semantics.
 
 ## 0. Outcome
 
@@ -615,6 +616,23 @@ teardown, and no token logging.
 
 ### KT-E: Measured overlap and strict cutover
 
+Status: complete.
+
+Evidence: code commit `d51ca9595210` passed exact-ref cluster workflow
+`bbox-verify-mnnk2`, including the full 6,331-test workspace nextest profile,
+workspace clippy, and the concurrency gate. The implementation persists
+bounded per-operation and per-target checkout observations, requires exact
+readiness, parity, capability-baseline, and blocked-project acknowledgements
+through an offline marker/receipt ceremony, and restores remote `own` and
+`all` selection durably after restart. Once the marker covers a Published
+project, watcher refresh, local read/write/schema-marker acquisition, and
+fallback after drift or producer loss remain closed. Bridge, uncovered, and
+`LegacyLocal` lanes remain intentionally outside that cutover.
+
+No production marker was applied and no deployed-instance cutover is claimed.
+The production daemon remained off; deployment and marker application require
+separate operator authorization.
+
 1. Add per-operation observation counters and shadow comparison reports.
 2. Implement offline preflight/apply/verify marker ceremony.
 3. Close watcher plus read and mutation checkout-lease acquisition for covered
@@ -689,4 +707,5 @@ remote knowledge source named by
 consumes the semantics of
 [`checkout-identity-and-provisional-knowledge.md`](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md)
 without superseding that design. GH-G and KT-A are complete and are no longer
-the next locality arc. KT-A through KT-D are complete; KT-E is next.
+the next locality arc. KT-A through KT-E are complete; KT-F adapter retirement
+and parent-plan closeout is next.
