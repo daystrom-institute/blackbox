@@ -1492,11 +1492,15 @@ async fn collect_quiescent_batch(
     debounce: Duration,
     mode: PackMode,
 ) -> Option<Vec<EmbedRequest>> {
+    let already_backlogged = !pending.is_empty();
     while pending.is_empty() {
         match rx.recv().await? {
             WorkerCommand::Enqueue(request) => pending.push_back(request),
             WorkerCommand::Shutdown => return None,
         }
+    }
+    if already_backlogged {
+        return Some(pack_batch(pending, mode));
     }
     loop {
         match tokio::time::timeout(debounce, rx.recv()).await {
@@ -2066,6 +2070,25 @@ mod tests {
             limiter.tokens < 1.0,
             "the admitted burst must consume both available permits"
         );
+    }
+
+    #[tokio::test]
+    async fn an_existing_backlog_does_not_pay_the_ingress_debounce_again() {
+        let (_sender, mut receiver) = mpsc::unbounded_channel();
+        let mut pending = VecDeque::from([request(Bucket::Code, "entity", "hash")]);
+        let batch = tokio::time::timeout(
+            Duration::from_millis(50),
+            collect_quiescent_batch(
+                &mut receiver,
+                &mut pending,
+                Duration::from_secs(5),
+                PackMode::Flat,
+            ),
+        )
+        .await
+        .expect("an existing backlog must be packed immediately")
+        .expect("the queue remains open");
+        assert_eq!(batch.len(), 1);
     }
 
     /// The queue-full path must reject cleanly and COUNT the rejection
