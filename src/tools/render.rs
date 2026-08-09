@@ -647,6 +647,78 @@ mod tests {
         assert_eq!(p.scope_project, None);
     }
 
+    #[tokio::test]
+    async fn render_locality_plan_preserves_published_own_and_all_views() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = visibility_fixture(&temp);
+        let workspace_id = bro_core::WorkspaceId::parse("b".repeat(32)).unwrap();
+        assert!(
+            fixture
+                .server
+                .session_workspace_binding
+                .set(Some(Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "render-view-task".into(),
+                        session_id: "render-view-session".into(),
+                        project_id: fixture.own_checkout.project_id.clone(),
+                        scope: fixture.scope.clone(),
+                        workspace_id,
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
+
+        for (view, expected, absent) in [
+            (
+                "published",
+                vec!["PUBLISHED_REVIEW"],
+                vec!["OWN_REVIEW", "PEER_REVIEW"],
+            ),
+            (
+                "own",
+                vec!["OWN_REVIEW"],
+                vec!["PUBLISHED_REVIEW", "PEER_REVIEW"],
+            ),
+            (
+                "all",
+                vec!["PUBLISHED_REVIEW", "OWN_REVIEW", "PEER_REVIEW"],
+                vec![],
+            ),
+        ] {
+            let result = fixture
+                .server
+                .bbox_render(Parameters(RenderParams {
+                    provider: Some("claude".into()),
+                    project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                    scope: Some("project".into()),
+                    dry_run: Some(true),
+                    provisional: Some(view.into()),
+                    scope_project: None,
+                    locality: Some(ProjectRenderLocalityRequestV1::Plan),
+                }))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let wire = serde_json::to_value(result).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
+            let plan: ProjectRenderPlanV1 = serde_json::from_value(value["plan"].clone()).unwrap();
+            assert_eq!(plan.view.as_str(), view);
+            let content = plan
+                .entries
+                .iter()
+                .map(|entry| entry.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for marker in expected {
+                assert!(content.contains(marker), "view={view}: {content}");
+            }
+            for marker in absent {
+                assert!(!content.contains(marker), "view={view}: {content}");
+            }
+        }
+    }
+
     #[test]
     fn read_only_knowledge_consumers_share_session_visibility() {
         let temp = tempfile::tempdir().unwrap();

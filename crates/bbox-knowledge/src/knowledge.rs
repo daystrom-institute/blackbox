@@ -5169,6 +5169,23 @@ mod tests {
     }
 
     #[test]
+    fn project_render_transport_matches_candidate_tree_check() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        fs::write(root.join(PROJECT_DOC_FILE), "candidate context\n").unwrap();
+        let plan = project_render_plan(None, false);
+        execute_project_render_plan(&plan, &root, &plan.scope, plan.workspace_id.as_str()).unwrap();
+
+        let mut candidate_entries = plan.entries.clone();
+        for entry in &mut candidate_entries {
+            entry.project = Some(root.to_string_lossy().into_owned());
+        }
+        let candidate = Knowledge::detached_view(candidate_entries, BTreeMap::new());
+        let check = candidate.check_project_render(&root).unwrap();
+        assert!(check.mismatches.is_empty(), "{:?}", check.mismatches);
+    }
+
+    #[test]
     fn render_locality_transport_is_absent_from_public_schema() {
         let schema = serde_json::to_string(&rmcp::schemars::schema_for!(RenderParams)).unwrap();
         assert!(!schema.contains("_render_locality"), "{schema}");
