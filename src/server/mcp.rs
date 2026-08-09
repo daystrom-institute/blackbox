@@ -341,7 +341,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap();
+            panic!(
+                "operator blame MCP initialize failed with {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
         let session_id = response
             .headers()
             .get("mcp-session-id")
