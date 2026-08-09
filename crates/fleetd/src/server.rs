@@ -39,7 +39,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bro_protocol::{
-    DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState, WorkerSpawnSpec,
+    DaemonToFleetd, FLEETD_PROTOCOL_VERSION, FleetdToDaemon, SessionState, WORKSPACE_BINDING_ENV,
+    WorkerSpawnSpec, WorkspaceBindingToken,
 };
 use bro_rpc::{
     BuildIdentity, ConnectionBinding, Envelope, HandshakeOptions, NegotiatedIo, RpcError,
@@ -382,6 +383,28 @@ async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
     let session_id = spec.session_id.clone();
     let task_id = spec.task_id.clone();
     let workspace_id = spec.workspace_id.clone();
+    let workspace_binding_token = match spec.env.as_map().get(WORKSPACE_BINDING_ENV) {
+        Some(token) => match WorkspaceBindingToken::parse(token.clone()) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                state.emit(FleetdToDaemon::Error {
+                    session_id: Some(session_id),
+                    code: "workspace_binding.invalid".to_string(),
+                    message: error.to_string(),
+                });
+                return;
+            }
+        },
+        None => None,
+    };
+    if workspace_binding_token.is_some() && workspace_id.is_none() {
+        state.emit(FleetdToDaemon::Error {
+            session_id: Some(session_id),
+            code: "workspace_binding.unbound".to_string(),
+            message: "workspace binding token requires a workspace id".to_string(),
+        });
+        return;
+    }
     let event_log_path = spec.event_log_path.clone();
 
     if state.registry().contains(&session_id) {
@@ -417,6 +440,7 @@ async fn handle_spawn(state: Arc<Fleetd>, spec: WorkerSpawnSpec) {
         session_id: session_id.clone(),
         task_id: task_id.clone(),
         workspace_id: workspace_id.clone(),
+        workspace_binding_token,
         pid,
         state: SessionState::Running,
         last_seq: None,

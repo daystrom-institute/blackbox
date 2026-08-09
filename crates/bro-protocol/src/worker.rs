@@ -26,6 +26,96 @@ use bro_core::{Provider, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Harness environment key carrying the opaque managed-workspace capability.
+///
+/// The value rides [`SecretEnv`], never argv. The harness may resolve it into
+/// the daemon self-MCP header, and shell grandchildren must scrub it with the
+/// rest of the session credentials.
+pub const WORKSPACE_BINDING_ENV: &str = "BRO_WORKSPACE_BINDING_TOKEN";
+
+/// Harness environment key carrying the daemon endpoint that owns provisional
+/// source intake for the bound workspace. This is trusted spawn configuration,
+/// not model input, and shell grandchildren scrub it with the session env.
+pub const KNOWLEDGE_SOURCE_URL_ENV: &str = "BRO_KNOWLEDGE_SOURCE_URL";
+
+/// Harness environment key carrying the serialized path-free published scope
+/// authorized by the daemon when it minted [`WORKSPACE_BINDING_ENV`].
+pub const WORKSPACE_SCOPE_ENV: &str = "BRO_WORKSPACE_PUBLISHED_SCOPE";
+
+/// Private daemon self-MCP header carrying [`WORKSPACE_BINDING_ENV`].
+///
+/// Harness configuration stores only an environment reference for this
+/// header. The secret itself is resolved inside the harness process.
+pub const WORKSPACE_BINDING_HEADER: &str = "x-blackbox-workspace-binding";
+
+/// Opaque capability binding one supervised session to one managed workspace.
+///
+/// The wire form is a 64-character lowercase hexadecimal secret. Debug and
+/// Display are always redacted because fleetd retains this value for daemon
+/// re-adoption after a daemon restart.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct WorkspaceBindingToken(String);
+
+impl WorkspaceBindingToken {
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidWorkspaceBindingToken> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(InvalidWorkspaceBindingToken);
+        }
+        Ok(Self(value))
+    }
+
+    /// Expose the credential only at the authentication/injection boundary.
+    /// Never log or format the returned value.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for WorkspaceBindingToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("WorkspaceBindingToken")
+            .field(&REDACTED)
+            .finish()
+    }
+}
+
+impl fmt::Display for WorkspaceBindingToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(REDACTED)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceBindingToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidWorkspaceBindingToken;
+
+impl fmt::Display for InvalidWorkspaceBindingToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "workspace binding token must be exactly 64 lowercase hexadecimal characters",
+        )
+    }
+}
+
+impl std::error::Error for InvalidWorkspaceBindingToken {}
+
 /// An environment map whose `Debug`/`Display` redact every value, but whose
 /// serde representation is the plain map (it must cross a wire and reach the
 /// executor intact). Provider credentials ride here, so it must never print
@@ -54,6 +144,12 @@ impl SecretEnv {
     /// Iterate the key/value pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.0.iter()
+    }
+
+    /// Insert one daemon-resolved secret before the spec crosses to its
+    /// executor. The map remains uniformly redacted under Debug/Display.
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.0.insert(key.into(), value.into());
     }
 
     /// Number of variables.
@@ -230,6 +326,28 @@ mod tests {
             !debug.contains("sk-super-secret"),
             "secret value must never appear in Debug: {debug}"
         );
+    }
+
+    #[test]
+    fn workspace_binding_token_round_trips_and_redacts() {
+        let token = WorkspaceBindingToken::parse("b".repeat(64)).unwrap();
+        let encoded = serde_json::to_string(&token).unwrap();
+        assert_eq!(encoded, format!("\"{}\"", "b".repeat(64)));
+        assert_eq!(
+            serde_json::from_str::<WorkspaceBindingToken>(&encoded).unwrap(),
+            token
+        );
+        let debug = format!("{token:?}");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains(&"b".repeat(64)));
+    }
+
+    #[test]
+    fn workspace_binding_token_decode_rejects_noncanonical_secrets() {
+        for value in ["b".repeat(63), "B".repeat(64), "g".repeat(64)] {
+            assert!(WorkspaceBindingToken::parse(value.clone()).is_err());
+            assert!(serde_json::from_value::<WorkspaceBindingToken>(Value::String(value)).is_err());
+        }
     }
 
     #[test]

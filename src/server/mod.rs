@@ -93,6 +93,7 @@ impl BlackboxServer {
             surface: std::sync::OnceLock::new(),
             surface_project: std::sync::OnceLock::new(),
             session_checkout: std::sync::OnceLock::new(),
+            session_workspace_binding: std::sync::OnceLock::new(),
         }
     }
 

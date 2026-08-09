@@ -383,6 +383,7 @@ mod smoke {
             store.clone(),
             tail_tx.clone(),
             None,
+            None,
         );
 
         // ---- the first daemon: spawn, wire ingest, get the cursor to 3 ----

@@ -903,6 +903,12 @@ impl Session {
                 (tools, placement)
             }
         };
+        let mcp_tools = crate::locality::install_project_mutation_routes(
+            mcp_tools,
+            &cx,
+            cli.capability_mcp_server.as_deref(),
+        )
+        .await?;
         let (mcp_in_box, mcp_out_box) =
             mcp::split_mcp_tools_by_placement(&mcp_tools, &tool_placement);
         // Code-mode projects the full tool surface (builtins + all MCP) into the

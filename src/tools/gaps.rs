@@ -10,6 +10,39 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 }
 
 impl BlackboxServer {
+    fn guard_workspace_bound_project_gap(&self, scope: Option<&str>) -> anyhow::Result<()> {
+        if self.authoritative_session_workspace_binding().is_some() && scope != Some("global") {
+            anyhow::bail!(
+                "error.knowledge_transport_authoritative: a bound workspace must write project gaps through its checkout-owner transport"
+            );
+        }
+        Ok(())
+    }
+
+    fn guard_workspace_bound_gap_id(&self, raw_id: &str) -> anyhow::Result<()> {
+        if self.authoritative_session_workspace_binding().is_none() {
+            return Ok(());
+        }
+        let canonical = if raw_id.starts_with("gap-") {
+            raw_id.to_string()
+        } else {
+            format!("gap-{raw_id}")
+        };
+        if self
+            .state
+            .gaps
+            .read()
+            .all()
+            .iter()
+            .any(|gap| gap.id == canonical && gap.project.is_none())
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "error.knowledge_transport_authoritative: a bound workspace may mutate only global gaps through the daemon"
+        )
+    }
+
     /// Resolve a raw project path/id to its durable gap scope and optional
     /// committed-file write target — for filing and for the resolve/update
     /// rewrites alike. Delegates to the store-shared resolution in
@@ -81,6 +114,9 @@ impl BlackboxServer {
         &self,
         Parameters(mut p): Parameters<GapFileParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.guard_workspace_bound_project_gap(p.scope.as_deref()) {
+            return Self::err_text(&format!("Error: {error:#}"));
+        }
         // Gap mutations are disk-authoritative: reload + full-store rewrite
         // under a flock. Run on the blocking pool, not a tokio worker.
         let server = self.clone();
@@ -207,6 +243,9 @@ impl BlackboxServer {
         &self,
         Parameters(mut p): Parameters<GapResolveParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.guard_workspace_bound_gap_id(&p.id) {
+            return Self::err_text(&format!("Error: {error:#}"));
+        }
         let server = self.clone();
         Self::run_blocking("bbox_gap_resolve", move || {
             // `project` is write-targeting only: resolve it through the same
@@ -248,6 +287,9 @@ impl BlackboxServer {
         &self,
         Parameters(mut p): Parameters<GapUpdateParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.guard_workspace_bound_gap_id(&p.id) {
+            return Self::err_text(&format!("Error: {error:#}"));
+        }
         let server = self.clone();
         Self::run_blocking("bbox_gap_update", move || {
             // Same write-targeting resolution as bbox_gap_resolve.
@@ -286,6 +328,58 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
+
+    fn bind_remote_workspace(server: &BlackboxServer) {
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "task-bound".into(),
+                        session_id: "session-bound".into(),
+                        project_id: "p_bound".into(),
+                        scope: bbox_corpus_core::identity::PublishedScope::try_new(
+                            "bound-test",
+                            "."
+                        )
+                        .unwrap(),
+                        workspace_id: bro_core::WorkspaceId::parse(
+                            "0123456789abcdef0123456789abcdef"
+                        )
+                        .unwrap(),
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bound_workspace_daemon_lane_accepts_only_global_gap_mutations() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(directory.path())));
+        bind_remote_workspace(&server);
+
+        assert!(
+            server
+                .guard_workspace_bound_project_gap(Some("global"))
+                .is_ok()
+        );
+        assert!(
+            server
+                .guard_workspace_bound_project_gap(Some("project"))
+                .unwrap_err()
+                .to_string()
+                .contains("knowledge_transport_authoritative")
+        );
+        assert!(
+            server
+                .guard_workspace_bound_gap_id("gap-1234abcd")
+                .unwrap_err()
+                .to_string()
+                .contains("only global gaps")
+        );
+    }
 
     fn run_git(cwd: &Path, args: &[&str]) {
         let out = Command::new("git")

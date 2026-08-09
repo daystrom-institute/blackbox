@@ -213,7 +213,11 @@ impl BlackboxServer {
         provisional: Option<&str>,
     ) -> Result<SessionGapView> {
         let session_checkout = self.authoritative_session_checkout();
-        let mode = ProvisionalMode::parse(provisional, session_checkout.is_some())?;
+        let session_workspace = self.authoritative_session_workspace_binding();
+        let mode = ProvisionalMode::parse(
+            provisional,
+            session_checkout.is_some() || session_workspace.is_some(),
+        )?;
         let projects = self.state.records_provider.records_snapshot().records;
         // Filter-class engine resolution (phase-2 §9.2): a miss keeps the
         // lenient unmanaged-scope view semantics; a hit joins the records
@@ -262,6 +266,7 @@ impl BlackboxServer {
                 requested_project_id.as_deref(),
                 mode,
                 session_checkout.as_deref(),
+                session_workspace.as_deref(),
                 &mut gaps,
                 &mut metadata,
                 &mut built_from,
@@ -499,6 +504,7 @@ impl BlackboxServer {
         requested_project_id: Option<&str>,
         mode: ProvisionalMode,
         session_checkout: Option<&ResolvedCheckoutScope>,
+        session_workspace: Option<&super::knowledge_source::WorkspaceBindingGrant>,
         gaps: &mut Vec<bbox_gaps::gaps::GapNote>,
         metadata: &mut BTreeMap<String, GapViewMetadata>,
         built_from: &mut BuiltFromTable,
@@ -573,6 +579,7 @@ impl BlackboxServer {
                     &target.project_id,
                     &verified,
                     session_checkout,
+                    session_workspace,
                     &mut project_gaps,
                     metadata,
                     built_from,
@@ -604,11 +611,54 @@ impl BlackboxServer {
         project_id: &ProjectId,
         verified: &VerifiedAcceptedPublication,
         session_checkout: Option<&ResolvedCheckoutScope>,
+        session_workspace: Option<&super::knowledge_source::WorkspaceBindingGrant>,
         project_gaps: &mut BTreeMap<String, GapNote>,
         metadata: &mut BTreeMap<String, GapViewMetadata>,
         built_from: &mut BuiltFromTable,
         diagnostics: &mut Vec<String>,
     ) -> Result<()> {
+        if let Some(workspace) =
+            session_workspace.filter(|workspace| workspace.project_id == project_id.as_str())
+        {
+            let pair = self
+                .remote_provisional_overlays(workspace, verified)
+                .map_err(|error| {
+                    anyhow::anyhow!("{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: {error:#}")
+                })?;
+            let pair = pair.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: no live provisional generation is selected for the bound workspace"
+                )
+            })?;
+            if pair.gaps.status != GapOverlayStatus::Valid {
+                anyhow::bail!(
+                    "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} workspace {}: {}",
+                    workspace.workspace_id,
+                    pair.gaps.diagnostics.join("; ")
+                );
+            }
+            diagnostics.extend(pair.gaps.diagnostics.iter().map(|diagnostic| {
+                format!(
+                    "project {project_id} gap workspace {}: {diagnostic}",
+                    workspace.workspace_id
+                )
+            }));
+            let overlay_ref = intern_gap_overlay_stamp(built_from, &pair.gaps, diagnostics);
+            for (id, value) in pair.gaps.values {
+                match value {
+                    GapOverlayValue::Upsert { mut gap, .. } => {
+                        stamp_catalog_gap(&mut gap, project_id, workspace.workspace_id.as_str());
+                        metadata.insert(id.clone(), overlay_gap_metadata(overlay_ref.as_deref()));
+                        project_gaps.insert(id, *gap);
+                    }
+                    GapOverlayValue::Tombstone => {
+                        project_gaps.remove(&id);
+                        metadata.remove(&id);
+                    }
+                }
+            }
+            return Ok(());
+        }
         let Some(own) = session_checkout.filter(|own| own.project_id == project_id.as_str()) else {
             return Ok(());
         };
@@ -672,7 +722,12 @@ impl BlackboxServer {
         diagnostics: &mut Vec<String>,
         degraded_overlays: &mut Vec<OverlayDegradation>,
     ) -> Result<()> {
-        for attachment in self.catalog_active_overlay_attachments(project_id)? {
+        let attachments = self.catalog_active_overlay_attachments(project_id)?;
+        let mut seen_checkouts = attachments
+            .iter()
+            .map(|attachment| attachment.checkout_id.clone())
+            .collect::<BTreeSet<_>>();
+        for attachment in attachments {
             let degraded = match self.refresh_catalog_gap_overlay(verified, &attachment) {
                 Ok(snapshot) if snapshot.status == GapOverlayStatus::Valid => {
                     add_catalog_gap_overlay_rows(
@@ -698,6 +753,54 @@ impl BlackboxServer {
             // The peer is omitted, never faked. The typed row is the
             // report; the diagnostic line renders the same facts for the
             // text surface.
+            diagnostics.push(degraded.diagnostic_line());
+            degraded_overlays.push(degraded);
+        }
+        for workspace in self
+            .state
+            .knowledge_sources
+            .active_workspace_bindings_now()
+            .into_iter()
+            .filter(|workspace| workspace.project_id == project_id.as_str())
+            .filter(|workspace| seen_checkouts.insert(workspace.workspace_id.as_str().to_string()))
+        {
+            let degraded = match self.remote_provisional_overlays(&workspace, verified) {
+                Ok(Some(pair)) if pair.gaps.status == GapOverlayStatus::Valid => {
+                    add_catalog_gap_overlay_rows(
+                        project_id,
+                        &pair.gaps,
+                        gaps,
+                        metadata,
+                        built_from,
+                        diagnostics,
+                    );
+                    continue;
+                }
+                Ok(Some(pair)) => OverlayDegradation {
+                    project_id: project_id.as_str().to_string(),
+                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    attachment_id: None,
+                    code: ERROR_OVERLAY_SNAPSHOT_STALE,
+                    detail: pair.gaps.diagnostics.join("; "),
+                    transient: false,
+                },
+                Ok(None) => OverlayDegradation {
+                    project_id: project_id.as_str().to_string(),
+                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    attachment_id: None,
+                    code: ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE,
+                    detail: "no live provisional generation is selected".into(),
+                    transient: false,
+                },
+                Err(error) => OverlayDegradation {
+                    project_id: project_id.as_str().to_string(),
+                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    attachment_id: None,
+                    code: ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE,
+                    detail: format!("{error:#}"),
+                    transient: false,
+                },
+            };
             diagnostics.push(degraded.diagnostic_line());
             degraded_overlays.push(degraded);
         }
@@ -1134,7 +1237,9 @@ fn gap_recompute_degradation(
 /// Project the accepted gap manifest into the identity the diff asks for.
 /// Manifest keys are repository-relative; the diff compares basenames
 /// inside one published scope's gap directory.
-fn accepted_gap_digests(verified: &VerifiedAcceptedPublication) -> AcceptedPublishedGapDigests {
+pub(crate) fn accepted_gap_digests(
+    verified: &VerifiedAcceptedPublication,
+) -> AcceptedPublishedGapDigests {
     AcceptedPublishedGapDigests(
         verified
             .gap_manifest()

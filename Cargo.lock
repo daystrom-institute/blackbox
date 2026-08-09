@@ -685,6 +685,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-knowledge-source-client"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bbox-corpus-core",
+ "bbox-knowledge-source",
+ "bro-core",
+ "bro-protocol",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bbox-knowledge-source-store"
 version = "0.0.1"
 dependencies = [
@@ -1271,7 +1288,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "bbox-corpus-core",
+ "bbox-gaps",
+ "bbox-knowledge",
+ "bbox-knowledge-source-client",
  "bbox-refactor",
+ "bbox-util",
  "bro-apply-patch",
  "bro-capabilities",
  "bro-code-mode",

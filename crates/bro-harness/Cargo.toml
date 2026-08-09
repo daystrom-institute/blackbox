@@ -32,6 +32,11 @@ bro-lsp = { path = "../bro-lsp" }
 # fact bindings projected into code-mode cells (decision af3c4783 — refactor
 # tooling is harness-native; the forbidden edge is only bro-harness -> blackbox).
 bbox-refactor = { path = "../bbox-refactor" }
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-knowledge = { path = "../bbox-knowledge" }
+bbox-gaps = { path = "../bbox-gaps" }
+bbox-knowledge-source-client = { path = "../bbox-knowledge-source-client" }
+bbox-util = { path = "../bbox-util" }
 lsp-types = "0.94.1"
 
 serde = { version = "1", features = ["derive"] }

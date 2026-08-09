@@ -362,6 +362,34 @@ pub struct ProvisionalProbeResponseV1 {
     pub current: Option<ProvisionalWorkspaceStatusV1>,
 }
 
+/// Daemon-authenticated inputs a workspace owner must pin before capturing a
+/// provisional generation. The project id is deliberately absent: the
+/// workspace binding already selects it, while the source descriptor carries
+/// only the portable published scope and accepted content identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionalCaptureContextV1 {
+    pub scope: PublishedScope,
+    pub accepted_generation: String,
+    pub accepted_commit: String,
+    pub lease_ttl_secs: u64,
+}
+
+impl ProvisionalCaptureContextV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_scope(&self.scope)?;
+        validate_sha256(&self.accepted_generation)?;
+        if self.lease_ttl_secs == 0 {
+            return Err(ContractError::InvalidLimit);
+        }
+        match self.accepted_commit.len() {
+            40 => validate_object_id(&self.accepted_commit, GitObjectFormatV1::Sha1),
+            64 => validate_object_id(&self.accepted_commit, GitObjectFormatV1::Sha256),
+            _ => Err(ContractError::InvalidObjectId),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BeginProvisionalUploadRequestV1 {
@@ -726,6 +754,14 @@ pub fn validate_ancestry(
         return Err(ContractError::AncestryUnreachable);
     }
     validate_acyclic(nodes, &by_oid)?;
+    let common = from_head
+        .intersection(&from_accepted)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let best = best_common_ancestors(&by_oid, &common);
+    if best.len() != 1 || !best.contains(merge_base) {
+        return Err(ContractError::InvalidMergeBase);
+    }
     if ancestry_sha256(object_format, nodes) != descriptor.ancestry_sha256 {
         return Err(ContractError::AncestryCommitmentMismatch);
     }
@@ -1011,6 +1047,52 @@ fn reachable_ancestors<'a>(
         pending.extend(by_oid[oid].parent_oids.iter().map(String::as_str));
     }
     reachable
+}
+
+/// Return the common ancestors with no strictly newer common descendant.
+/// The graph is already closure-checked and acyclic. Processing children
+/// before parents marks every older common ancestor in one linear pass.
+fn best_common_ancestors<'a>(
+    by_oid: &BTreeMap<&'a str, &'a AncestryCommitV1>,
+    common: &BTreeSet<&'a str>,
+) -> BTreeSet<&'a str> {
+    let mut remaining_children = by_oid
+        .keys()
+        .map(|oid| (*oid, 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    for node in by_oid.values() {
+        for parent in &node.parent_oids {
+            *remaining_children
+                .get_mut(parent.as_str())
+                .expect("ancestry closure checked before merge-base computation") += 1;
+        }
+    }
+    let mut ready = remaining_children
+        .iter()
+        .filter_map(|(oid, children)| (*children == 0).then_some(*oid))
+        .collect::<Vec<_>>();
+    let mut has_common_descendant = BTreeSet::new();
+    while let Some(oid) = ready.pop() {
+        let carries_common = common.contains(oid) || has_common_descendant.contains(oid);
+        for parent in &by_oid[oid].parent_oids {
+            let parent = parent.as_str();
+            if carries_common {
+                has_common_descendant.insert(parent);
+            }
+            let children = remaining_children
+                .get_mut(parent)
+                .expect("ancestry closure checked before merge-base computation");
+            *children -= 1;
+            if *children == 0 {
+                ready.push(parent);
+            }
+        }
+    }
+    common
+        .iter()
+        .filter(|oid| !has_common_descendant.contains(**oid))
+        .copied()
+        .collect()
 }
 
 fn validate_acyclic<'a>(
@@ -1429,6 +1511,52 @@ mod tests {
     }
 
     #[test]
+    fn ancestry_rejects_multiple_best_merge_bases() {
+        let format = GitObjectFormatV1::Sha1;
+        let oid = |value: &str| value.repeat(40);
+        let nodes = vec![
+            AncestryCommitV1 {
+                commit_oid: oid("1"),
+                parent_oids: vec![],
+            },
+            AncestryCommitV1 {
+                commit_oid: oid("2"),
+                parent_oids: vec![oid("1")],
+            },
+            AncestryCommitV1 {
+                commit_oid: oid("3"),
+                parent_oids: vec![oid("1")],
+            },
+            AncestryCommitV1 {
+                commit_oid: oid("4"),
+                parent_oids: vec![oid("2"), oid("3")],
+            },
+            AncestryCommitV1 {
+                commit_oid: oid("5"),
+                parent_oids: vec![oid("2"), oid("3")],
+            },
+        ];
+        let descriptor = AncestryDescriptorV1 {
+            ancestry_sha256: ancestry_sha256(format, &nodes),
+            node_count: nodes.len() as u64,
+            edge_count: 6,
+            page_count: 1,
+        };
+        assert_eq!(
+            validate_ancestry(
+                &descriptor,
+                &nodes,
+                format,
+                &oid("4"),
+                &oid("5"),
+                &oid("2"),
+                KnowledgeSourceLimits::default(),
+            ),
+            Err(ContractError::InvalidMergeBase)
+        );
+    }
+
+    #[test]
     fn ancestry_refuses_cycles_duplicate_parents_and_bad_object_ids() {
         let format = GitObjectFormatV1::Sha1;
         let one = "1".repeat(40);
@@ -1564,6 +1692,26 @@ mod tests {
             moved.validate_header(KnowledgeSourceLimits::default()),
             Err(ContractError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn provisional_capture_context_validates_accepted_identity_and_lease() {
+        let mut context = ProvisionalCaptureContextV1 {
+            scope: scope(),
+            accepted_generation: "a".repeat(64),
+            accepted_commit: "1".repeat(40),
+            lease_ttl_secs: 60,
+        };
+        context.validate().unwrap();
+
+        context.lease_ttl_secs = 0;
+        assert_eq!(context.validate(), Err(ContractError::InvalidLimit));
+        context.lease_ttl_secs = 60;
+        context.accepted_commit = "1".repeat(41);
+        assert_eq!(context.validate(), Err(ContractError::InvalidObjectId));
+        context.accepted_commit = "1".repeat(40);
+        context.accepted_generation = "z".repeat(64);
+        assert_eq!(context.validate(), Err(ContractError::InvalidDigest));
     }
 
     #[test]

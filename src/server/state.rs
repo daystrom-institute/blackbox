@@ -2591,6 +2591,10 @@ pub(crate) struct BlackboxServer {
     /// transport context at initialization. Tool arguments never replace it.
     pub(crate) session_checkout:
         OnceLock<Option<Arc<bbox_corpus_core::project_record::ResolvedCheckoutScope>>>,
+    /// Path-free managed workspace authority authenticated from the private
+    /// self-MCP header. A raw query parameter can never populate this slot.
+    pub(crate) session_workspace_binding:
+        OnceLock<Option<Arc<super::knowledge_source::WorkspaceBindingGrant>>>,
 }
 
 /// Catalog-mode view fixtures shared by the published knowledge and gap

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bro_core::WorkspaceId;
-use bro_protocol::{SessionState, SessionSummary};
+use bro_protocol::{SessionState, SessionSummary, WorkspaceBindingToken};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -27,6 +27,7 @@ pub struct SessionEntry {
     pub session_id: String,
     pub task_id: String,
     pub workspace_id: Option<WorkspaceId>,
+    pub workspace_binding_token: Option<WorkspaceBindingToken>,
     pub pid: Option<u32>,
     pub state: SessionState,
     /// Highest event seq observed on this session's stdout, relayed or not.
@@ -45,6 +46,7 @@ impl SessionEntry {
             session_id: self.session_id.clone(),
             task_id: self.task_id.clone(),
             workspace_id: self.workspace_id.clone(),
+            workspace_binding_token: self.workspace_binding_token.clone(),
             pid: self.pid,
             state: self.state,
             last_seq: self.last_seq,
@@ -186,6 +188,7 @@ mod tests {
             session_id: session_id.to_string(),
             task_id: format!("task-{session_id}"),
             workspace_id: None,
+            workspace_binding_token: None,
             pid: Some(4242),
             state: SessionState::Running,
             last_seq: None,

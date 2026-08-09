@@ -1,0 +1,27 @@
+[package]
+name = "bbox-knowledge-source-client"
+version = "0.0.1"
+edition = "2024"
+
+# Checkout-owner capture and upload client. This crate may open one bound
+# workspace and speak the typed knowledge-source transport, but never links a
+# daemon store, index, corpus runtime, or server implementation.
+
+[dependencies]
+anyhow = "1"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-knowledge-source = { path = "../bbox-knowledge-source" }
+bro-core = { path = "../bro-core" }
+bro-protocol = { path = "../bro-protocol" }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+
+[lints.clippy]
+disallowed_methods = "deny"

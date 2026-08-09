@@ -84,6 +84,9 @@ pub async fn run() -> anyhow::Result<()> {
         shared.task_store.clone(),
         shared.tail_tx.clone(),
         Some(shared.system_events.clone()),
+        Some(std::sync::Arc::new(
+            crate::server::knowledge_source::DaemonWorkspaceBindingAuthority::new(shared.clone()),
+        )),
     );
 
     // Bind before starting any background work that probes registered project

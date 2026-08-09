@@ -1026,6 +1026,22 @@ pub struct ReadyPublicationCandidate {
     pub gaps: Vec<ReadyPublicationFile>,
 }
 
+/// Fully detached bytes for the exact live provisional pointer selected under
+/// the store mutation lock. Once returned, retirement or maintenance cannot
+/// change the caller's point-in-time view.
+#[derive(Debug, Clone)]
+pub struct ReadyProvisionalWorkspace {
+    pub source_generation_id: String,
+    pub project_id: String,
+    pub descriptor: ProvisionalWorkspaceDescriptorV1,
+    pub lease_expires_unix_secs: u64,
+    pub ancestry: Vec<AncestryCommitV1>,
+    pub baseline_knowledge: Vec<ReadyPublicationFile>,
+    pub baseline_gaps: Vec<ReadyPublicationFile>,
+    pub working_knowledge: Vec<ReadyPublicationFile>,
+    pub working_gaps: Vec<ReadyPublicationFile>,
+}
+
 #[derive(Debug)]
 pub struct PinnedReadyPublicationCandidate {
     candidate: ReadyPublicationCandidate,
@@ -1581,6 +1597,22 @@ impl KnowledgeSourceStore {
         write_json(&existing_directory(&path)?, "upload.json", &record)
     }
 
+    /// Return the immutable descriptor pinned when an authenticated workspace
+    /// began an upload. The server uses this immediately before finalize to
+    /// reject a capture whose accepted publication advanced during transfer.
+    pub fn provisional_upload_descriptor(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+        upload_id: &str,
+    ) -> Result<ProvisionalWorkspaceDescriptorV1> {
+        validate_provisional_authority(authority)?;
+        let _guard = self.lock_mutation()?;
+        let path = self.provisional_upload_path(&authority.workspace_id, upload_id)?;
+        Ok(self
+            .load_provisional_upload(&path, authority, upload_id)?
+            .descriptor)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn put_provisional_manifest_page(
         &self,
@@ -1728,6 +1760,39 @@ impl KnowledgeSourceStore {
         provisional_status(&source)
     }
 
+    /// Return the immutable descriptor of one authenticated provisional
+    /// generation. Renewal callers use this to prove the generation still
+    /// targets the daemon's current accepted publication before extending it.
+    pub fn provisional_generation_descriptor(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+        generation_id: &str,
+    ) -> Result<ProvisionalWorkspaceDescriptorV1> {
+        validate_provisional_authority(authority)?;
+        validate_provisional_generation_id(generation_id)?;
+        let index = read_json::<ProvisionalGenerationIndexV1>(
+            &self.root.join("provisional/generation-index"),
+            &format!("{generation_id}.json"),
+            MAX_GENERATION_RECORD_BYTES,
+            "provisional generation index",
+        )?
+        .ok_or(StoreRequestError::NotFound)?;
+        if index.version != STORE_VERSION
+            || index.source_generation_id != generation_id
+            || index.project_id != authority.project_id
+            || index.workspace_id != authority.workspace_id
+        {
+            bail!(StoreRequestError::NotFound);
+        }
+        Ok(self
+            .load_provisional_generation(
+                &authority.project_id,
+                &authority.workspace_id,
+                generation_id,
+            )?
+            .descriptor)
+    }
+
     pub fn selected_provisional(
         &self,
         authority: &ProvisionalAuthorityV1,
@@ -1750,6 +1815,63 @@ impl KnowledgeSourceStore {
         }
         source.lease_expires_unix_secs = pointer.lease_expires_unix_secs;
         Ok(Some(source))
+    }
+
+    /// Select and materialize one workspace's current live generation as one
+    /// atomic, hash-verified snapshot. No descriptor-only selection escapes
+    /// this boundary.
+    pub fn materialize_selected_provisional(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+        now: u64,
+    ) -> Result<Option<ReadyProvisionalWorkspace>> {
+        validate_provisional_authority(authority)?;
+        let _guard = self.lock_mutation()?;
+        let Some(pointer) = self.load_provisional_pointer(authority)? else {
+            return Ok(None);
+        };
+        if pointer.lease_expires_unix_secs <= now {
+            return Ok(None);
+        }
+        let source = self.load_provisional_generation(
+            &authority.project_id,
+            &authority.workspace_id,
+            &pointer.source_generation_id,
+        )?;
+        if source.state != SourceGenerationStateV1::Ready
+            || source.source_generation_id != pointer.source_generation_id
+            || source.project_id != pointer.project_id
+            || source.descriptor.workspace_id != pointer.workspace_id
+            || source.descriptor.sequence != pointer.sequence
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let generation_path = self.provisional_generation_path(
+            &authority.project_id,
+            &authority.workspace_id,
+            &source.source_generation_id,
+        )?;
+        let (ancestry, manifests) = load_provisional_manifests(&generation_path)?;
+        validate_provisional_workspace(
+            &source.descriptor,
+            &ancestry,
+            &manifests[0],
+            &manifests[1],
+            &manifests[2],
+            &manifests[3],
+            self.current_limits()?.contract,
+        )?;
+        Ok(Some(ReadyProvisionalWorkspace {
+            source_generation_id: source.source_generation_id,
+            project_id: source.project_id,
+            descriptor: source.descriptor,
+            lease_expires_unix_secs: pointer.lease_expires_unix_secs,
+            ancestry,
+            baseline_knowledge: self.materialize_ready_publication_files(&manifests[0])?,
+            baseline_gaps: self.materialize_ready_publication_files(&manifests[1])?,
+            working_knowledge: self.materialize_ready_publication_files(&manifests[2])?,
+            working_gaps: self.materialize_ready_publication_files(&manifests[3])?,
+        }))
     }
 
     pub fn probe_provisional(
@@ -1804,6 +1926,62 @@ impl KnowledgeSourceStore {
             lease_expires_unix_secs: expires,
             ..source
         })
+    }
+
+    /// Renew the exact live pointer at the configured maximum lease without a
+    /// descriptor/select race. Expired pointers are never resurrected.
+    pub fn renew_selected_provisional(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+    ) -> Result<Option<ProvisionalWorkspaceStatusV1>> {
+        validate_provisional_authority(authority)?;
+        let limits = self.current_limits()?;
+        let now = now_unix_secs();
+        let expires = now
+            .checked_add(limits.max_provisional_lease_secs)
+            .ok_or(StoreRequestError::LimitExceeded)?;
+        let _guard = self.lock_mutation()?;
+        let Some(pointer) = self.load_provisional_pointer(authority)? else {
+            return Ok(None);
+        };
+        if pointer.lease_expires_unix_secs <= now {
+            return Ok(None);
+        }
+        let source = self.load_provisional_generation(
+            &authority.project_id,
+            &authority.workspace_id,
+            &pointer.source_generation_id,
+        )?;
+        if source.state != SourceGenerationStateV1::Ready {
+            bail!(StoreRequestError::InvalidState);
+        }
+        self.write_provisional_pointer(
+            authority,
+            ProvisionalPointerV1 {
+                lease_expires_unix_secs: expires,
+                ..pointer
+            },
+        )?;
+        provisional_status(&StoredProvisionalWorkspaceV1 {
+            lease_expires_unix_secs: expires,
+            ..source
+        })
+        .map(Some)
+    }
+
+    pub fn provisional_renew_interval_secs(&self) -> Result<u64> {
+        Ok(self
+            .current_limits()?
+            .max_provisional_lease_secs
+            .saturating_div(2)
+            .max(1))
+    }
+
+    /// Maximum lease the current server configuration will accept. Checkout
+    /// owners use this daemon-authored value instead of guessing a TTL that a
+    /// stricter deployment might reject.
+    pub fn max_provisional_lease_secs(&self) -> Result<u64> {
+        Ok(self.current_limits()?.max_provisional_lease_secs)
     }
 
     pub fn retire_provisional(
@@ -3668,6 +3846,20 @@ mod tests {
         let first = store
             .begin_provisional_upload(&authority, descriptor.clone())
             .unwrap();
+        assert_eq!(
+            store
+                .provisional_upload_descriptor(&authority, &first.upload_id)
+                .unwrap(),
+            descriptor
+        );
+        let mut other_authority = authority.clone();
+        other_authority.workspace_id =
+            WorkspaceId::parse("fedcba9876543210fedcba9876543210").unwrap();
+        assert!(
+            store
+                .provisional_upload_descriptor(&other_authority, &first.upload_id)
+                .is_err()
+        );
         put_provisional_pages(
             &store,
             &authority,
@@ -3691,11 +3883,47 @@ mod tests {
             .source_generation_id;
         assert_eq!(
             store
+                .provisional_generation_descriptor(&authority, &first_generation)
+                .unwrap(),
+            descriptor
+        );
+        assert!(
+            store
+                .provisional_generation_descriptor(&other_authority, &first_generation)
+                .is_err()
+        );
+        assert_eq!(
+            store
                 .selected_provisional(&authority, now_unix_secs())
                 .unwrap()
                 .unwrap()
                 .source_generation_id,
             first_generation
+        );
+        let materialized = store
+            .materialize_selected_provisional(&authority, now_unix_secs())
+            .unwrap()
+            .unwrap();
+        assert_eq!(materialized.source_generation_id, first_generation);
+        assert_eq!(materialized.project_id, authority.project_id);
+        assert_eq!(materialized.ancestry, nodes);
+        assert_eq!(
+            materialized.baseline_knowledge[0].source_bytes,
+            KNOWLEDGE_BYTES
+        );
+        assert_eq!(
+            materialized.working_knowledge[0].source_bytes,
+            KNOWLEDGE_BYTES
+        );
+        assert_eq!(materialized.baseline_gaps[0].source_bytes, GAP_BYTES);
+        assert_eq!(materialized.working_gaps[0].source_bytes, GAP_BYTES);
+        let selected_renewal = store
+            .renew_selected_provisional(&authority)
+            .unwrap()
+            .unwrap();
+        assert!(
+            selected_renewal.lease_expires_unix_secs.unwrap()
+                >= materialized.lease_expires_unix_secs
         );
         let renewed = store
             .renew_provisional(&authority, &first_generation, 120)

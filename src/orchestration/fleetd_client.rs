@@ -654,6 +654,8 @@ fn readopt_one(
     let Some(cursor) = super::readopt_harness_session(super::ReadoptedSession {
         session_id: summary.session_id.clone(),
         task_id: summary.task_id.clone(),
+        workspace_id: summary.workspace_id.clone(),
+        workspace_binding_token: summary.workspace_binding_token.clone(),
         pid: summary.pid,
         state: summary.state,
         control,

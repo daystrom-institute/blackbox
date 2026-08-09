@@ -552,10 +552,23 @@ fn http_transport_config(
     let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
     let mut custom_headers = HashMap::new();
     for (name, value) in headers {
+        let resolved = match value.strip_prefix("$env:") {
+            Some(variable) if !variable.is_empty() => std::env::var(variable).map_err(|_| {
+                anyhow::anyhow!(
+                    "MCP header {name:?} requires missing environment variable {variable:?}"
+                )
+            })?,
+            Some(_) => {
+                return Err(anyhow::anyhow!(
+                    "MCP header {name:?} has an empty environment reference"
+                ));
+            }
+            None => value.clone(),
+        };
         custom_headers.insert(
             HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| anyhow::anyhow!("invalid MCP header name {name:?}: {e}"))?,
-            HeaderValue::from_str(value)
+            HeaderValue::from_str(&resolved)
                 .map_err(|e| anyhow::anyhow!("invalid MCP header value for {name:?}: {e}"))?,
         );
     }
@@ -782,6 +795,41 @@ mod tests {
                 .custom_headers
                 .get(&HeaderName::from_static("x-auth")),
             Some(&HeaderValue::from_static("token123"))
+        );
+    }
+
+    #[test]
+    fn http_transport_resolves_header_environment_reference() {
+        let expected = std::env::var("PATH").expect("test process PATH");
+        let config = http_transport_config(
+            "http://127.0.0.1:7264/mcp",
+            &BTreeMap::from([("X-Auth".to_string(), "$env:PATH".to_string())]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .custom_headers
+                .get(&HeaderName::from_static("x-auth")),
+            Some(&HeaderValue::from_str(&expected).unwrap())
+        );
+    }
+
+    #[test]
+    fn http_transport_refuses_missing_header_environment_reference() {
+        let error = http_transport_config(
+            "http://127.0.0.1:7264/mcp",
+            &BTreeMap::from([(
+                "X-Auth".to_string(),
+                "$env:BRO_TEST_DEFINITELY_MISSING_HEADER".to_string(),
+            )]),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires missing environment variable")
         );
     }
 

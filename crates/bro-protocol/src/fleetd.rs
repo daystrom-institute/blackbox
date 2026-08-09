@@ -34,7 +34,7 @@ use serde_json::Value;
 
 use bro_core::WorkspaceId;
 
-use crate::worker::{REDACTED, WorkerSpawnSpec};
+use crate::worker::{REDACTED, WorkerSpawnSpec, WorkspaceBindingToken};
 
 /// The shared-secret bearer token, as it crosses the wire.
 ///
@@ -213,6 +213,11 @@ pub struct SessionSummary {
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<WorkspaceId>,
+    /// Opaque session/workspace capability retained by fleetd solely so a
+    /// restarted daemon can restore the exact binding the live harness still
+    /// presents. Debug is redacted by the token newtype.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_binding_token: Option<WorkspaceBindingToken>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub state: SessionState,
@@ -254,6 +259,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn legacy_session_summary_without_workspace_binding_decodes_unbound() {
+        let decoded: FleetdToDaemon = serde_json::from_value(json!({
+            "type": "sessions",
+            "sessions": [{
+                "session_id": "sess-1",
+                "task_id": "task-1",
+                "workspace_id": "0123456789abcdef0123456789abcdef",
+                "state": "running",
+                "event_log_path": "/state/bro/sess-1.events.jsonl"
+            }]
+        }))
+        .unwrap();
+        let FleetdToDaemon::Sessions { sessions } = decoded else {
+            panic!("expected sessions message");
+        };
+        assert_eq!(sessions[0].workspace_binding_token, None);
     }
 
     fn round_trip_fleetd(message: &FleetdToDaemon) {
@@ -342,6 +366,9 @@ mod tests {
                     task_id: "task-1".to_string(),
                     workspace_id: Some(
                         WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+                    ),
+                    workspace_binding_token: Some(
+                        WorkspaceBindingToken::parse("b".repeat(64)).unwrap(),
                     ),
                     pid: Some(4242),
                     state: SessionState::Running,

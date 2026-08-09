@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod emit;
 pub mod event_log;
 pub mod hooks;
+pub mod locality;
 pub mod lsp_baselines;
 pub mod mcp;
 pub mod project_doc;

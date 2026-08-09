@@ -4,9 +4,10 @@
 //! Provisional snapshots use an exact, expiring workspace binding. Both
 //! middleware boundaries run before Axum parses a request body.
 
+use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use axum::body::Body;
@@ -22,28 +23,33 @@ use bbox_knowledge_source::{
     BeginSourceUploadResponseV1, ContractError, FinalizeProvisionalUploadRequestV1,
     FinalizeSourceUploadResponseV1, KnowledgeSourceLimits, MAX_ANCESTRY_PAGE_BYTES,
     MAX_MANIFEST_PAGE_BYTES, MAX_SOURCE_FILE_BYTES, MissingSourceBlobsPageV1,
-    ProvisionalProbeRequestV1, ProvisionalProbeResponseV1, ProvisionalWorkspaceStatusV1,
-    PublicationCandidateStatusV1, PublicationProbeRequestV1, PublicationProbeResponseV1,
-    RenewProvisionalGenerationRequestV1, SnapshotClassV1, SourceLaneV1, SourceManifestPageV1,
+    ProvisionalCaptureContextV1, ProvisionalProbeRequestV1, ProvisionalProbeResponseV1,
+    ProvisionalWorkspaceStatusV1, PublicationCandidateStatusV1, PublicationProbeRequestV1,
+    PublicationProbeResponseV1, RenewProvisionalGenerationRequestV1, SnapshotClassV1, SourceLaneV1,
+    SourceManifestPageV1,
 };
 use bbox_knowledge_source_store::{
-    KnowledgeSourceStore, ProvisionalAuthorityV1, PublicationAuthorityV1, StoreLimits,
-    StoreRequestError,
+    KnowledgeSourceStore, ProvisionalAuthorityV1, PublicationAuthorityV1, ReadyPublicationFile,
+    StoreLimits, StoreRequestError,
 };
 use bro_core::WorkspaceId;
 use bro_rpc::ServiceToken;
 use futures::StreamExt;
 use serde::Deserialize;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use super::SharedState;
 use super::producer_auth::{ProducerGrant, RepoTransportGrantError};
 
 const UPLOAD_BODY_TEMP_PREFIX: &str = ".knowledge-source-upload-body-";
 const UPLOAD_BODY_TEMP_SUFFIX: &str = ".tmp";
+const WORKSPACE_BINDING_TTL_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceBindingGrant {
+    pub(crate) task_id: String,
+    pub(crate) session_id: String,
     pub(crate) project_id: String,
     pub(crate) scope: bbox_corpus_core::identity::PublishedScope,
     pub(crate) workspace_id: WorkspaceId,
@@ -96,7 +102,7 @@ impl KnowledgeSourceRuntime {
         self.store.update_limits(checked_store_limits(config)?)
     }
 
-    fn authenticate_workspace_binding(
+    pub(crate) fn authenticate_workspace_binding(
         &self,
         candidate: &str,
         now: u64,
@@ -110,16 +116,362 @@ impl KnowledgeSourceRuntime {
         matched
     }
 
+    pub(crate) fn authenticate_workspace_binding_now(
+        &self,
+        candidate: &str,
+    ) -> Option<WorkspaceBindingGrant> {
+        self.authenticate_workspace_binding(candidate, now_unix_secs())
+    }
+
+    fn install_workspace_binding(
+        &self,
+        token: ServiceToken,
+        grant: WorkspaceBindingGrant,
+        now: u64,
+    ) {
+        let candidate = token.expose_secret();
+        let mut bindings = self.workspace_bindings.write();
+        bindings.retain(|entry| {
+            entry.grant.expires_unix_secs > now
+                && entry.grant.task_id != grant.task_id
+                && entry.grant.session_id != grant.session_id
+                && !entry.token.verify(candidate)
+        });
+        bindings.push(WorkspaceBindingEntry { token, grant });
+    }
+
+    pub(crate) fn active_workspace_bindings(&self, now: u64) -> Vec<WorkspaceBindingGrant> {
+        let mut bindings = self.workspace_bindings.write();
+        bindings.retain(|entry| entry.grant.expires_unix_secs > now);
+        bindings.iter().map(|entry| entry.grant.clone()).collect()
+    }
+
+    pub(crate) fn active_workspace_bindings_now(&self) -> Vec<WorkspaceBindingGrant> {
+        self.active_workspace_bindings(now_unix_secs())
+    }
+
+    fn extend_workspace_binding(&self, task_id: &str, session_id: &str, now: u64) {
+        for entry in self.workspace_bindings.write().iter_mut() {
+            if entry.grant.task_id == task_id && entry.grant.session_id == session_id {
+                entry.grant.expires_unix_secs = now.saturating_add(WORKSPACE_BINDING_TTL_SECS);
+            }
+        }
+    }
+
+    fn revoke_workspace_bindings(&self, task_id: &str) -> Vec<WorkspaceBindingGrant> {
+        let mut revoked = Vec::new();
+        self.workspace_bindings.write().retain(|entry| {
+            if entry.grant.task_id == task_id {
+                revoked.push(entry.grant.clone());
+                false
+            } else {
+                true
+            }
+        });
+        revoked
+    }
+
     #[cfg(test)]
     pub(crate) fn install_workspace_binding_for_test(
         &self,
         token: ServiceToken,
         grant: WorkspaceBindingGrant,
     ) {
-        self.workspace_bindings
-            .write()
-            .push(WorkspaceBindingEntry { token, grant });
+        self.install_workspace_binding(token, grant, 0);
     }
+}
+
+/// Production adapter joining managed-checkout authority to the path-free
+/// session capability retained by fleetd. It never persists or logs a token.
+pub(crate) struct DaemonWorkspaceBindingAuthority {
+    state: Arc<SharedState>,
+    renewals: parking_lot::Mutex<BTreeMap<String, CancellationToken>>,
+}
+
+impl DaemonWorkspaceBindingAuthority {
+    pub(crate) fn new(state: Arc<SharedState>) -> Self {
+        Self {
+            state,
+            renewals: parking_lot::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn grant(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        cwd: &str,
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceBindingGrant> {
+        let server = super::BlackboxServer::new(self.state.clone());
+        let resolution = server.resolve_project_write(cwd)?;
+        let checkout = resolution.checkout_scope.ok_or_else(|| {
+            anyhow::anyhow!("managed workspace did not resolve to checkout authority")
+        })?;
+        if checkout.checkout_id != workspace_id.as_str() {
+            bail!("managed workspace identity does not match resolved checkout authority");
+        }
+        if checkout.project_id.is_empty() {
+            bail!("managed workspace resolved without project identity");
+        }
+        Ok(WorkspaceBindingGrant {
+            task_id: task_id.to_string(),
+            session_id: session_id.to_string(),
+            project_id: checkout.project_id,
+            scope: checkout.published_scope,
+            workspace_id: workspace_id.clone(),
+            expires_unix_secs: now_unix_secs().saturating_add(WORKSPACE_BINDING_TTL_SECS),
+        })
+    }
+
+    fn install(
+        &self,
+        grant: WorkspaceBindingGrant,
+        token: &bro_protocol::WorkspaceBindingToken,
+    ) -> Result<()> {
+        let interval_secs = self
+            .state
+            .knowledge_sources
+            .store()
+            .provisional_renew_interval_secs()?;
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("workspace binding requires an async runtime"))?;
+        let token = ServiceToken::parse(token.expose_secret().to_string())?;
+        self.state.knowledge_sources.install_workspace_binding(
+            token,
+            grant.clone(),
+            now_unix_secs(),
+        );
+        let cancellation = CancellationToken::new();
+        if let Some(prior) = self
+            .renewals
+            .lock()
+            .insert(grant.task_id.clone(), cancellation.clone())
+        {
+            prior.cancel();
+        }
+        let state = self.state.clone();
+        runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {
+                        state.knowledge_sources.extend_workspace_binding(
+                            &grant.task_id,
+                            &grant.session_id,
+                            now_unix_secs(),
+                        );
+                        let renewal_state = state.clone();
+                        let renewal_grant = grant.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            renew_selected_provisional_if_current(
+                                &renewal_state,
+                                &renewal_grant,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(ProvisionalRenewal::RetiredStale)) => tracing::info!(
+                                task_id = %grant.task_id,
+                                workspace_id = %grant.workspace_id,
+                                "retired provisional workspace after accepted publication advanced"
+                            ),
+                            Ok(Ok(ProvisionalRenewal::Absent | ProvisionalRenewal::Renewed)) => {}
+                            Ok(Err(error)) => tracing::warn!(
+                                task_id = %grant.task_id,
+                                workspace_id = %grant.workspace_id,
+                                error = %error,
+                                "failed to reconcile live provisional workspace renewal"
+                            ),
+                            Err(error) => tracing::warn!(
+                                task_id = %grant.task_id,
+                                workspace_id = %grant.workspace_id,
+                                error = %error,
+                                "provisional workspace renewal task failed"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingAuthority {
+    fn mint(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        cwd: &str,
+        workspace_id: &WorkspaceId,
+    ) -> Result<crate::orchestration::MintedWorkspaceBinding> {
+        let grant = self.grant(task_id, session_id, cwd, workspace_id)?;
+        let secret = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let token = bro_protocol::WorkspaceBindingToken::parse(secret)?;
+        let scope = grant.scope.clone();
+        self.install(grant, &token)?;
+        Ok(crate::orchestration::MintedWorkspaceBinding { token, scope })
+    }
+
+    fn restore(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        cwd: &str,
+        workspace_id: &WorkspaceId,
+        token: &bro_protocol::WorkspaceBindingToken,
+    ) -> Result<()> {
+        let grant = self.grant(task_id, session_id, cwd, workspace_id)?;
+        self.install(grant, token)
+    }
+
+    fn revoke_task(&self, task_id: &str) {
+        if let Some(cancellation) = self.renewals.lock().remove(task_id) {
+            cancellation.cancel();
+        }
+        for grant in self
+            .state
+            .knowledge_sources
+            .revoke_workspace_bindings(task_id)
+        {
+            let authority = provisional_authority(&grant);
+            let store = self.state.knowledge_sources.store();
+            match store.selected_provisional(&authority, now_unix_secs()) {
+                Ok(Some(source)) => {
+                    if let Err(error) =
+                        store.retire_provisional(&authority, &source.source_generation_id)
+                    {
+                        tracing::warn!(
+                            task_id,
+                            workspace_id = %grant.workspace_id,
+                            error = %error,
+                            "failed to retire terminal provisional workspace"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    task_id,
+                    workspace_id = %grant.workspace_id,
+                    error = %error,
+                    "failed to inspect terminal provisional workspace"
+                ),
+            }
+        }
+    }
+}
+
+pub(crate) struct RemoteProvisionalOverlayPair {
+    pub(crate) knowledge: bbox_knowledge::overlay::OverlaySnapshot,
+    pub(crate) gaps: bbox_gaps::overlay::GapOverlaySnapshot,
+}
+
+impl super::BlackboxServer {
+    /// Materialize the exact selected remote generation and converge both
+    /// knowledge and gap lanes through the same source-neutral overlay cores
+    /// used by local checkouts. The accepted generation must still be the one
+    /// the workspace captured against.
+    pub(crate) fn remote_provisional_overlays(
+        &self,
+        grant: &WorkspaceBindingGrant,
+        verified: &bbox_indexing::accepted_publication_runtime::VerifiedAcceptedPublication,
+    ) -> Result<Option<RemoteProvisionalOverlayPair>> {
+        if verified.content_stamp().project_id().as_str() != grant.project_id
+            || verified.content_stamp().accepted_scope() != &grant.scope
+        {
+            bail!("workspace binding does not match accepted project content");
+        }
+        let authority = provisional_authority(grant);
+        let Some(source) = self
+            .state
+            .knowledge_sources
+            .store()
+            .materialize_selected_provisional(&authority, now_unix_secs())?
+        else {
+            return Ok(None);
+        };
+        let accepted = verified.content_stamp();
+        if source.project_id != grant.project_id
+            || source.descriptor.scope != grant.scope
+            || source.descriptor.workspace_id != grant.workspace_id
+            || source.descriptor.accepted_generation != accepted.generation_id()
+            || source.descriptor.accepted_commit != accepted.accepted_commit()
+        {
+            bail!(
+                "error.provisional_snapshot_stale: selected workspace generation does not match accepted content"
+            );
+        }
+
+        let baseline_knowledge = bbox_knowledge::overlay::BaselineKnowledgeSnapshot::new(
+            provisional_file_map(&source.baseline_knowledge, "knowledge")?,
+        )?;
+        let working_knowledge = bbox_knowledge::overlay::WorkingKnowledgeSnapshot::new(
+            provisional_file_map(&source.working_knowledge, "knowledge")?,
+        )?;
+        let knowledge_digests = super::knowledge_view::accepted_knowledge_digests(verified);
+        let knowledge = bbox_knowledge::overlay::recompute_catalog_overlay_from_sources(
+            bbox_knowledge::overlay::CatalogOverlayPublished {
+                published_scope: &grant.scope,
+                checkout_id: grant.workspace_id.as_str(),
+                full_ref: accepted.full_ref(),
+                accepted_commit: accepted.accepted_commit(),
+                accepted_generation: accepted.generation_id(),
+                published: &knowledge_digests,
+            },
+            &source.descriptor.checkout_head,
+            &source.descriptor.merge_base,
+            &baseline_knowledge,
+            &working_knowledge,
+        )
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+
+        let baseline_gaps = bbox_gaps::overlay::BaselineGapSnapshot::new(provisional_file_map(
+            &source.baseline_gaps,
+            "gap",
+        )?)?;
+        let working_gaps = bbox_gaps::overlay::WorkingGapSnapshot::new(provisional_file_map(
+            &source.working_gaps,
+            "gap",
+        )?)?;
+        let gap_digests = super::gap_view::accepted_gap_digests(verified);
+        let gaps = bbox_gaps::overlay::recompute_catalog_overlay_from_sources(
+            bbox_gaps::overlay::CatalogGapOverlayPublished {
+                published_scope: &grant.scope,
+                checkout_id: grant.workspace_id.as_str(),
+                full_ref: accepted.full_ref(),
+                accepted_commit: accepted.accepted_commit(),
+                accepted_generation: accepted.generation_id(),
+                published: &gap_digests,
+            },
+            &source.descriptor.checkout_head,
+            &source.descriptor.merge_base,
+            &baseline_gaps,
+            &working_gaps,
+        )
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+
+        Ok(Some(RemoteProvisionalOverlayPair { knowledge, gaps }))
+    }
+}
+
+fn provisional_file_map(
+    files: &[ReadyPublicationFile],
+    lane: &str,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut mapped = BTreeMap::new();
+    for file in files {
+        let filename = super::knowledge_view::basename(&file.manifest.repository_relative_filename)
+            .ok_or_else(|| anyhow::anyhow!("provisional {lane} filename has no basename"))?;
+        if mapped.insert(filename, file.source_bytes.clone()).is_some() {
+            bail!("provisional {lane} snapshot contains duplicate basenames");
+        }
+    }
+    Ok(mapped)
 }
 
 fn store_limits(config: &crate::config::Config) -> StoreLimits {
@@ -192,6 +544,10 @@ fn publication_router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
 fn provisional_router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
     Router::new()
         .route(
+            "/internal/knowledge-source/v1/provisional/context",
+            get(provisional_capture_context),
+        )
+        .route(
             "/internal/knowledge-source/v1/provisional/probe",
             post(probe_provisional).layer(DefaultBodyLimit::max(64 * 1024)),
         )
@@ -238,6 +594,116 @@ fn provisional_router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
             state,
             authenticate_workspace_source_request,
         ))
+}
+
+async fn provisional_capture_context(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<WorkspaceBindingGrant>,
+) -> Result<Json<ProvisionalCaptureContextV1>, HttpError> {
+    Ok(Json(current_provisional_capture_context(&state, &grant)?))
+}
+
+fn current_provisional_capture_context(
+    state: &SharedState,
+    grant: &WorkspaceBindingGrant,
+) -> Result<ProvisionalCaptureContextV1, HttpError> {
+    let runtime = state.accepted_publications.as_ref().ok_or_else(|| {
+        HttpError::new(
+            StatusCode::CONFLICT,
+            "knowledge_source_accepted_generation_stale",
+            "accepted publication is unavailable",
+        )
+    })?;
+    let project_id = bbox_corpus_core::project_catalog::ProjectId::parse(grant.project_id.clone())
+        .map_err(|_| {
+            HttpError::new(
+                StatusCode::CONFLICT,
+                "knowledge_source_scope_forbidden",
+                "workspace project authority is unavailable",
+            )
+        })?;
+    let verified = runtime.load_verified(&project_id).map_err(|_| {
+        HttpError::new(
+            StatusCode::CONFLICT,
+            "knowledge_source_accepted_generation_stale",
+            "accepted publication is unavailable",
+        )
+    })?;
+    let stamp = verified.content_stamp();
+    if stamp.accepted_scope() != &grant.scope {
+        return Err(HttpError::new(
+            StatusCode::CONFLICT,
+            "knowledge_source_accepted_generation_stale",
+            "workspace scope no longer matches accepted publication",
+        ));
+    }
+    let context = ProvisionalCaptureContextV1 {
+        scope: grant.scope.clone(),
+        accepted_generation: stamp.generation_id().to_string(),
+        accepted_commit: stamp.accepted_commit().to_string(),
+        lease_ttl_secs: state
+            .knowledge_sources
+            .store()
+            .max_provisional_lease_secs()
+            .map_err(HttpError::from_store)?,
+    };
+    context
+        .validate()
+        .map_err(|error| HttpError::from_contract(&error))?;
+    Ok(context)
+}
+
+fn require_current_provisional_descriptor(
+    state: &SharedState,
+    grant: &WorkspaceBindingGrant,
+    descriptor: &bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1,
+) -> Result<(), HttpError> {
+    let current = current_provisional_capture_context(state, grant)?;
+    if !provisional_descriptor_matches_current(descriptor, grant, &current) {
+        return Err(HttpError::new(
+            StatusCode::CONFLICT,
+            "knowledge_source_accepted_generation_stale",
+            "provisional capture does not match the current accepted publication",
+        ));
+    }
+    Ok(())
+}
+
+fn provisional_descriptor_matches_current(
+    descriptor: &bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1,
+    grant: &WorkspaceBindingGrant,
+    current: &ProvisionalCaptureContextV1,
+) -> bool {
+    descriptor.scope == current.scope
+        && descriptor.workspace_id == grant.workspace_id
+        && descriptor.accepted_generation == current.accepted_generation
+        && descriptor.accepted_commit == current.accepted_commit
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisionalRenewal {
+    Absent,
+    Renewed,
+    RetiredStale,
+}
+
+fn renew_selected_provisional_if_current(
+    state: &SharedState,
+    grant: &WorkspaceBindingGrant,
+) -> Result<ProvisionalRenewal> {
+    let current = current_provisional_capture_context(state, grant)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.body.code, error.body.message))?;
+    let authority = provisional_authority(grant);
+    let store = state.knowledge_sources.store();
+    let Some(selected) = store.selected_provisional(&authority, now_unix_secs())? else {
+        return Ok(ProvisionalRenewal::Absent);
+    };
+    if !provisional_descriptor_matches_current(&selected.descriptor, grant, &current) {
+        store.retire_provisional(&authority, &selected.source_generation_id)?;
+        return Ok(ProvisionalRenewal::RetiredStale);
+    }
+    store.renew_selected_provisional(&authority)?;
+    Ok(ProvisionalRenewal::Renewed)
 }
 
 async fn probe_publication(
@@ -384,6 +850,7 @@ async fn begin_provisional_upload(
     Extension(grant): Extension<WorkspaceBindingGrant>,
     Json(request): Json<BeginProvisionalUploadRequestV1>,
 ) -> Result<(StatusCode, Json<BeginSourceUploadResponseV1>), HttpError> {
+    require_current_provisional_descriptor(&state, &grant, &request.descriptor)?;
     let authority = provisional_authority(&grant);
     let store = state.knowledge_sources.store();
     let response =
@@ -470,6 +937,13 @@ async fn finalize_provisional_upload(
 ) -> Result<(StatusCode, Json<FinalizeSourceUploadResponseV1>), HttpError> {
     let authority = provisional_authority(&grant);
     let store = state.knowledge_sources.store();
+    let descriptor = {
+        let store = store.clone();
+        let authority = authority.clone();
+        let upload_id = upload_id.clone();
+        blocking(move || store.provisional_upload_descriptor(&authority, &upload_id)).await?
+    };
+    require_current_provisional_descriptor(&state, &grant, &descriptor)?;
     let response = blocking(move || {
         store.finalize_provisional_upload(&authority, &upload_id, request.lease_ttl_secs)
     })
@@ -485,6 +959,19 @@ async fn renew_provisional_generation(
 ) -> Result<Json<ProvisionalWorkspaceStatusV1>, HttpError> {
     let authority = provisional_authority(&grant);
     let store = state.knowledge_sources.store();
+    let descriptor = {
+        let store = store.clone();
+        let authority = authority.clone();
+        let generation = generation.clone();
+        blocking(move || store.provisional_generation_descriptor(&authority, &generation)).await?
+    };
+    if let Err(error) = require_current_provisional_descriptor(&state, &grant, &descriptor) {
+        let store = store.clone();
+        let authority = authority.clone();
+        let stale_generation = generation.clone();
+        let _ = blocking(move || store.retire_provisional(&authority, &stale_generation)).await;
+        return Err(error);
+    }
     Ok(Json(
         blocking(move || store.renew_provisional(&authority, &generation, request.lease_ttl_secs))
             .await?,
@@ -901,6 +1388,7 @@ impl IntoResponse for HttpError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Cursor;
 
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -912,25 +1400,33 @@ mod tests {
     };
     use bbox_knowledge_source::{
         AncestryCommitV1, AncestryDescriptorV1, GitObjectFormatV1, SCHEMA_VERSION,
-        SourceFileManifestEntryV1, SourceManifestDescriptorV1, StableCaptureV1, ancestry_sha256,
-        source_file_blob_sha256, source_manifest_sha256, working_pair_sha256,
+        SourceFileManifestEntryV1, SourceGenerationStateV1, SourceManifestDescriptorV1,
+        StableCaptureV1, ancestry_sha256, source_file_blob_sha256, source_manifest_sha256,
+        working_pair_sha256,
     };
     use tower::ServiceExt;
 
     use super::*;
     use crate::server::producer_auth::ProducerAuthRuntime;
+    use crate::server::state::catalog_fixture::{
+        COMMIT_ONE, COMMIT_TWO, CatalogFixture, gap_note, knowledge_entry,
+    };
 
     const KNOWLEDGE_BYTES: &[u8] = br#"{"id":"knowledge-1"}"#;
 
     struct TestAuthority {
+        catalog_fixture: crate::server::state::catalog_fixture::CatalogFixture,
         state: Arc<SharedState>,
         producer_token: String,
         other_producer_token: String,
         workspace_token: String,
         other_workspace_token: String,
         expired_workspace_token: String,
+        project_id: ProjectId,
         scope: PublishedScope,
         workspace_id: WorkspaceId,
+        accepted_generation: String,
+        accepted_commit: String,
     }
 
     fn project(
@@ -968,8 +1464,7 @@ mod tests {
         )
     }
 
-    fn enabled_state(root: &std::path::Path) -> TestAuthority {
-        let state = Arc::new(SharedState::for_test(root));
+    fn enabled_state(_root: &std::path::Path) -> TestAuthority {
         let scope = PublishedScope::try_new("knowledge-http-repo", ".").unwrap();
         let other_scope = PublishedScope::try_new("other-knowledge-http-repo", ".").unwrap();
         let (history_id, history) =
@@ -980,6 +1475,17 @@ mod tests {
         );
         let project_id = ProjectId::parse("p_00000000000000000000000000000001").unwrap();
         let other_project_id = ProjectId::parse("p_00000000000000000000000000000002").unwrap();
+        let catalog_fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
+        catalog_fixture.add_published_project(project_id.as_str(), &scope);
+        catalog_fixture.add_published_project(other_project_id.as_str(), &other_scope);
+        let accepted = catalog_fixture.install_publication(
+            project_id.as_str(),
+            &scope,
+            crate::server::state::catalog_fixture::COMMIT_TWO,
+            &[],
+            &[],
+        );
+        let state = catalog_fixture.server().state.clone();
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
         catalog.repo_histories.insert(history_id.clone(), history);
         catalog
@@ -1034,7 +1540,7 @@ mod tests {
         let workspace_token = "3".repeat(64);
         let other_workspace_token = "4".repeat(64);
         let expired_workspace_token = "5".repeat(64);
-        for (token, bound_workspace, expires) in [
+        for (index, (token, bound_workspace, expires)) in [
             (
                 workspace_token.clone(),
                 workspace_id.clone(),
@@ -1046,10 +1552,15 @@ mod tests {
                 now_unix_secs() + 600,
             ),
             (expired_workspace_token.clone(), workspace_id.clone(), 1),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             state.knowledge_sources.install_workspace_binding_for_test(
                 ServiceToken::parse(token).unwrap(),
                 WorkspaceBindingGrant {
+                    task_id: format!("task-test-{index}"),
+                    session_id: format!("session-test-{index}"),
                     project_id: project_id.as_str().to_string(),
                     scope: scope.clone(),
                     workspace_id: bound_workspace,
@@ -1058,15 +1569,333 @@ mod tests {
             );
         }
         TestAuthority {
+            catalog_fixture,
             state,
             producer_token,
             other_producer_token,
             workspace_token,
             other_workspace_token,
             expired_workspace_token,
+            project_id,
             scope,
             workspace_id,
+            accepted_generation: accepted.generation_id,
+            accepted_commit: crate::server::state::catalog_fixture::COMMIT_TWO.to_string(),
         }
+    }
+
+    #[test]
+    fn workspace_binding_replacement_is_exact_and_expiry_is_enforced() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = KnowledgeSourceRuntime::for_test(directory.path());
+        let workspace_id = WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let grant = |session_id: &str, expires_unix_secs| WorkspaceBindingGrant {
+            task_id: "task-one".to_string(),
+            session_id: session_id.to_string(),
+            project_id: "p_00000000000000000000000000000001".to_string(),
+            scope: PublishedScope::try_new("repo-one", ".").unwrap(),
+            workspace_id: workspace_id.clone(),
+            expires_unix_secs,
+        };
+        let first = "6".repeat(64);
+        runtime.install_workspace_binding(
+            ServiceToken::parse(first.clone()).unwrap(),
+            grant("session-one", 200),
+            100,
+        );
+        assert!(
+            runtime
+                .authenticate_workspace_binding(&first, 100)
+                .is_some()
+        );
+
+        let replacement = "7".repeat(64);
+        runtime.install_workspace_binding(
+            ServiceToken::parse(replacement.clone()).unwrap(),
+            grant("session-two", 200),
+            100,
+        );
+        assert!(
+            runtime
+                .authenticate_workspace_binding(&first, 100)
+                .is_none()
+        );
+        let restored = runtime
+            .authenticate_workspace_binding(&replacement, 100)
+            .unwrap();
+        assert_eq!(restored.task_id, "task-one");
+        assert_eq!(restored.session_id, "session-two");
+        assert_eq!(runtime.active_workspace_bindings(100).len(), 1);
+        assert_eq!(runtime.revoke_workspace_bindings("task-one").len(), 1);
+        assert!(
+            runtime
+                .authenticate_workspace_binding(&replacement, 100)
+                .is_none()
+        );
+        runtime.install_workspace_binding(
+            ServiceToken::parse(replacement.clone()).unwrap(),
+            grant("session-two", 200),
+            100,
+        );
+        assert!(
+            runtime
+                .authenticate_workspace_binding(&replacement, 200)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bound_remote_own_materializes_both_lanes_and_rejects_accepted_advance() {
+        const PROJECT: &str = "p_remoteown";
+        const WORKSPACE: &str = "0123456789abcdef0123456789abcdef";
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let accepted_knowledge = knowledge_entry("remote-knowledge", "accepted");
+        let accepted_gap = gap_note("gap-1234abcd", "accepted");
+        let installed = fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_ONE,
+            std::slice::from_ref(&accepted_knowledge),
+            std::slice::from_ref(&accepted_gap),
+        );
+        let server = fixture.server();
+        let workspace_id = WorkspaceId::parse(WORKSPACE).unwrap();
+        let authority = ProvisionalAuthorityV1 {
+            project_id: PROJECT.to_string(),
+            scope: scope.clone(),
+            workspace_id: workspace_id.clone(),
+        };
+        let working_knowledge = knowledge_entry("remote-knowledge", "changed remotely");
+        let working_gap = gap_note("gap-1234abcd", "changed remotely");
+        let baseline_knowledge_bytes =
+            bbox_knowledge::knowledge::committed_knowledge_entry_bytes(&accepted_knowledge)
+                .unwrap();
+        let working_knowledge_bytes =
+            bbox_knowledge::knowledge::committed_knowledge_entry_bytes(&working_knowledge).unwrap();
+        let baseline_gap_bytes = bbox_gaps::gaps::committed_gap_note_bytes(&accepted_gap).unwrap();
+        let working_gap_bytes = bbox_gaps::gaps::committed_gap_note_bytes(&working_gap).unwrap();
+        let source_entry = |path: &str, bytes: &[u8]| SourceFileManifestEntryV1 {
+            repository_relative_filename: path.to_string(),
+            encoded_bytes: bytes.len() as u64,
+            content_sha256: source_file_blob_sha256(bytes),
+        };
+        let baseline_knowledge_manifest = vec![source_entry(
+            ".bbox/knowledge/remote-knowledge.json",
+            &baseline_knowledge_bytes,
+        )];
+        let working_knowledge_manifest = vec![source_entry(
+            ".bbox/knowledge/remote-knowledge.json",
+            &working_knowledge_bytes,
+        )];
+        let baseline_gap_manifest = vec![source_entry(
+            ".bbox/gaps/gap-1234abcd.json",
+            &baseline_gap_bytes,
+        )];
+        let working_gap_manifest = vec![source_entry(
+            ".bbox/gaps/gap-1234abcd.json",
+            &working_gap_bytes,
+        )];
+        let merge_base = "0".repeat(40);
+        let checkout_head = "3".repeat(40);
+        let ancestry = vec![
+            AncestryCommitV1 {
+                commit_oid: merge_base.clone(),
+                parent_oids: Vec::new(),
+            },
+            AncestryCommitV1 {
+                commit_oid: COMMIT_ONE.to_string(),
+                parent_oids: vec![merge_base.clone()],
+            },
+            AncestryCommitV1 {
+                commit_oid: checkout_head.clone(),
+                parent_oids: vec![merge_base.clone()],
+            },
+        ];
+        let baseline_knowledge_descriptor =
+            manifest(SourceLaneV1::Knowledge, &baseline_knowledge_manifest);
+        let baseline_gap_descriptor = manifest(SourceLaneV1::Gaps, &baseline_gap_manifest);
+        let working_knowledge_descriptor =
+            manifest(SourceLaneV1::Knowledge, &working_knowledge_manifest);
+        let working_gap_descriptor = manifest(SourceLaneV1::Gaps, &working_gap_manifest);
+        let working_pair =
+            working_pair_sha256(&working_knowledge_descriptor, &working_gap_descriptor);
+        let descriptor = bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            scope: scope.clone(),
+            workspace_id: workspace_id.clone(),
+            sequence: 1,
+            accepted_generation: installed.generation_id,
+            accepted_commit: COMMIT_ONE.to_string(),
+            checkout_head,
+            merge_base,
+            object_format: GitObjectFormatV1::Sha1,
+            ancestry: AncestryDescriptorV1 {
+                ancestry_sha256: ancestry_sha256(GitObjectFormatV1::Sha1, &ancestry),
+                node_count: ancestry.len() as u64,
+                edge_count: 2,
+                page_count: 1,
+            },
+            capture: StableCaptureV1 {
+                transaction_pending_before: false,
+                transaction_pending_after: false,
+                first_working_pair_sha256: working_pair.clone(),
+                second_working_pair_sha256: working_pair,
+            },
+            baseline_knowledge: baseline_knowledge_descriptor,
+            baseline_gaps: baseline_gap_descriptor,
+            working_knowledge: working_knowledge_descriptor,
+            working_gaps: working_gap_descriptor,
+        };
+        let store = server.state.knowledge_sources.store();
+        let upload = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+        store
+            .put_provisional_ancestry_page(
+                &authority,
+                &upload.upload_id,
+                0,
+                &bbox_knowledge_source::AncestryPageV1 {
+                    page_index: 0,
+                    nodes: ancestry,
+                },
+            )
+            .unwrap();
+        for (class, lane, entries) in [
+            (
+                SnapshotClassV1::Baseline,
+                SourceLaneV1::Knowledge,
+                baseline_knowledge_manifest,
+            ),
+            (
+                SnapshotClassV1::Baseline,
+                SourceLaneV1::Gaps,
+                baseline_gap_manifest,
+            ),
+            (
+                SnapshotClassV1::Working,
+                SourceLaneV1::Knowledge,
+                working_knowledge_manifest,
+            ),
+            (
+                SnapshotClassV1::Working,
+                SourceLaneV1::Gaps,
+                working_gap_manifest,
+            ),
+        ] {
+            store
+                .put_provisional_manifest_page(
+                    &authority,
+                    &upload.upload_id,
+                    class,
+                    lane,
+                    0,
+                    &SourceManifestPageV1 {
+                        page_index: 0,
+                        entries,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .missing_provisional_blobs(&authority, &upload.upload_id, None)
+                .unwrap()
+                .hashes
+                .len(),
+            4
+        );
+        let mut blobs = BTreeMap::new();
+        for bytes in [
+            baseline_knowledge_bytes,
+            working_knowledge_bytes,
+            baseline_gap_bytes,
+            working_gap_bytes,
+        ] {
+            blobs.insert(source_file_blob_sha256(&bytes), bytes);
+        }
+        for (hash, bytes) in blobs {
+            store
+                .install_provisional_blob(
+                    &authority,
+                    &upload.upload_id,
+                    &hash,
+                    bytes.len() as u64,
+                    Cursor::new(bytes),
+                )
+                .unwrap();
+        }
+        store
+            .finalize_provisional_upload(&authority, &upload.upload_id, 60)
+            .unwrap();
+        let grant = WorkspaceBindingGrant {
+            task_id: "task-remote".to_string(),
+            session_id: "session-remote".to_string(),
+            project_id: PROJECT.to_string(),
+            scope: scope.clone(),
+            workspace_id,
+            expires_unix_secs: now_unix_secs() + 60,
+        };
+        server
+            .state
+            .knowledge_sources
+            .install_workspace_binding_for_test(
+                ServiceToken::parse("8".repeat(64)).unwrap(),
+                grant.clone(),
+            );
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(Arc::new(grant)))
+                .is_ok()
+        );
+
+        let knowledge = server.session_knowledge_view(None, Some("own")).unwrap();
+        let knowledge_row = knowledge
+            .items
+            .iter()
+            .find(|item| item.entry.id == "remote-knowledge")
+            .unwrap();
+        assert_eq!(knowledge_row.entry.content, "changed remotely");
+        assert_eq!(knowledge_row.entry.project_id.as_deref(), Some(PROJECT));
+        assert_eq!(knowledge_row.entry.project, None);
+        let gaps = server.session_gap_view(None, Some("own")).unwrap();
+        let gap = gaps
+            .gaps
+            .all()
+            .iter()
+            .find(|gap| gap.id == "gap-1234abcd")
+            .unwrap();
+        assert_eq!(gap.title, "changed remotely");
+        assert_eq!(gap.project_id.as_deref(), Some(PROJECT));
+        let all_knowledge = server.session_knowledge_view(None, Some("all")).unwrap();
+        assert!(all_knowledge.items.iter().any(|item| {
+            item.entry.id == "remote-knowledge" && item.entry.content == "changed remotely"
+        }));
+        let all_gaps = server.session_gap_view(None, Some("all")).unwrap();
+        assert!(
+            all_gaps
+                .gaps
+                .all()
+                .iter()
+                .any(|gap| { gap.id.contains("gap-1234abcd") && gap.title == "changed remotely" })
+        );
+
+        fixture.install_publication(
+            PROJECT,
+            &scope,
+            COMMIT_TWO,
+            &[knowledge_entry("remote-knowledge", "advanced")],
+            &[gap_note("gap-1234abcd", "advanced")],
+        );
+        server.invalidate_catalog_published_content(&ProjectId::parse(PROJECT).unwrap());
+        let error = server
+            .session_knowledge_view(None, Some("own"))
+            .err()
+            .expect("accepted advance must stale the captured workspace");
+        assert!(format!("{error:#}").contains("error.provisional_snapshot_stale"));
     }
 
     fn request(method: &str, uri: &str, token: Option<&str>, body: Body) -> Request<Body> {
@@ -1118,6 +1947,8 @@ mod tests {
     fn provisional_descriptor(
         scope: PublishedScope,
         workspace_id: WorkspaceId,
+        accepted_generation: String,
+        accepted_commit: String,
     ) -> (
         bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1,
         Vec<AncestryCommitV1>,
@@ -1147,8 +1978,8 @@ mod tests {
                 scope,
                 workspace_id,
                 sequence: 1,
-                accepted_generation: "a".repeat(64),
-                accepted_commit: "2".repeat(40),
+                accepted_generation,
+                accepted_commit,
                 checkout_head: "3".repeat(40),
                 merge_base: "1".repeat(40),
                 object_format: GitObjectFormatV1::Sha1,
@@ -1178,7 +2009,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
         let fixture = enabled_state(&root);
-        let app = router(fixture.state.clone()).with_state(fixture.state);
+        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
 
         for token in [None, Some(fixture.other_producer_token.as_str())] {
             let response = app
@@ -1326,7 +2157,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
         let fixture = enabled_state(&root);
-        let app = router(fixture.state.clone()).with_state(fixture.state);
+        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
         for token in [None, Some(fixture.expired_workspace_token.as_str())] {
             let denied = app
                 .clone()
@@ -1341,8 +2172,48 @@ mod tests {
             assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
         }
 
-        let (descriptor, nodes) =
-            provisional_descriptor(fixture.scope.clone(), fixture.workspace_id.clone());
+        let context = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/internal/knowledge-source/v1/provisional/context",
+                Some(&fixture.workspace_token),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(context.status(), StatusCode::OK);
+        let context: ProvisionalCaptureContextV1 =
+            serde_json::from_slice(&to_bytes(context.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(context.scope, fixture.scope);
+        assert_eq!(context.accepted_generation, fixture.accepted_generation);
+        assert_eq!(context.accepted_commit, fixture.accepted_commit);
+
+        let (descriptor, nodes) = provisional_descriptor(
+            fixture.scope.clone(),
+            fixture.workspace_id.clone(),
+            fixture.accepted_generation.clone(),
+            fixture.accepted_commit.clone(),
+        );
+        let mut stale_descriptor = descriptor.clone();
+        stale_descriptor.accepted_generation = "a".repeat(64);
+        let stale = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/knowledge-source/v1/provisional/uploads",
+                Some(&fixture.workspace_token),
+                Body::from(
+                    serde_json::to_vec(&BeginProvisionalUploadRequestV1 {
+                        descriptor: stale_descriptor,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
         let begun = app
             .clone()
             .oneshot(request(
@@ -1466,5 +2337,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(finalized.status(), StatusCode::ACCEPTED);
+        let finalized: FinalizeSourceUploadResponseV1 =
+            serde_json::from_slice(&to_bytes(finalized.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+
+        let (mut second_descriptor, _) = provisional_descriptor(
+            fixture.scope.clone(),
+            fixture.workspace_id.clone(),
+            fixture.accepted_generation.clone(),
+            fixture.accepted_commit.clone(),
+        );
+        second_descriptor.sequence = 2;
+        let second = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/knowledge-source/v1/provisional/uploads",
+                Some(&fixture.workspace_token),
+                Body::from(
+                    serde_json::to_vec(&BeginProvisionalUploadRequestV1 {
+                        descriptor: second_descriptor,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second: BeginSourceUploadResponseV1 =
+            serde_json::from_slice(&to_bytes(second.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        fixture.catalog_fixture.install_publication(
+            "p_00000000000000000000000000000001",
+            &fixture.scope,
+            crate::server::state::catalog_fixture::COMMIT_ONE,
+            &[],
+            &[],
+        );
+        fixture
+            .state
+            .accepted_publications
+            .as_ref()
+            .unwrap()
+            .invalidate_content(&fixture.project_id);
+        let stale_renew = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/knowledge-source/v1/provisional/generations/{}/renew",
+                    finalized.source_generation_id
+                ),
+                Some(&fixture.workspace_token),
+                Body::from(
+                    serde_json::to_vec(&RenewProvisionalGenerationRequestV1 { lease_ttl_secs: 60 })
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_renew.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            fixture
+                .state
+                .knowledge_sources
+                .store()
+                .provisional_status(
+                    &ProvisionalAuthorityV1 {
+                        project_id: fixture.project_id.as_str().to_string(),
+                        scope: fixture.scope.clone(),
+                        workspace_id: fixture.workspace_id.clone(),
+                    },
+                    &finalized.source_generation_id,
+                )
+                .unwrap()
+                .state,
+            SourceGenerationStateV1::Retired
+        );
+        let stale_finalize = app
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/knowledge-source/v1/provisional/uploads/{}/finalize",
+                    second.upload_id
+                ),
+                Some(&fixture.workspace_token),
+                Body::from(
+                    serde_json::to_vec(&FinalizeProvisionalUploadRequestV1 { lease_ttl_secs: 60 })
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_finalize.status(), StatusCode::CONFLICT);
     }
 }

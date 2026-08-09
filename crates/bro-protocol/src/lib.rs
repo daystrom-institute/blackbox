@@ -25,7 +25,11 @@ pub use fleetd::{
     SessionSummary,
 };
 pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
-pub use worker::{REDACTED, SecretEnv, WorkerSpawnSpec};
+pub use worker::{
+    InvalidWorkspaceBindingToken, KNOWLEDGE_SOURCE_URL_ENV, REDACTED, SecretEnv,
+    WORKSPACE_BINDING_ENV, WORKSPACE_BINDING_HEADER, WORKSPACE_SCOPE_ENV, WorkerSpawnSpec,
+    WorkspaceBindingToken,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]

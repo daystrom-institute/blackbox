@@ -276,6 +276,12 @@ impl BlackboxServer {
         self.session_checkout.get().and_then(Clone::clone)
     }
 
+    pub(crate) fn authoritative_session_workspace_binding(
+        &self,
+    ) -> Option<Arc<super::knowledge_source::WorkspaceBindingGrant>> {
+        self.session_workspace_binding.get().and_then(Clone::clone)
+    }
+
     /// Drop committed-tree snapshots after a caller has already resolved and
     /// validated the current publisher authority.
     pub(crate) fn invalidate_published_snapshot_caches(&self, scope: &PublishedScope) {
@@ -328,7 +334,11 @@ impl BlackboxServer {
         provisional: Option<&str>,
     ) -> Result<SessionKnowledgeView> {
         let session_checkout = self.authoritative_session_checkout();
-        let mode = ProvisionalMode::parse(provisional, session_checkout.is_some())?;
+        let session_workspace = self.authoritative_session_workspace_binding();
+        let mode = ProvisionalMode::parse(
+            provisional,
+            session_checkout.is_some() || session_workspace.is_some(),
+        )?;
         let projects = self.state.records_provider.records_snapshot().records;
         // Filter-class engine resolution (phase-2 §9.2): a miss keeps the
         // lenient unmanaged-scope view semantics; a hit joins the records
@@ -387,6 +397,7 @@ impl BlackboxServer {
                 requested_project_id.as_deref(),
                 mode,
                 session_checkout.as_deref(),
+                session_workspace.as_deref(),
                 &mut items,
                 &mut built_from,
                 &mut diagnostics,
@@ -628,6 +639,7 @@ impl BlackboxServer {
         requested_project_id: Option<&str>,
         mode: ProvisionalMode,
         session_checkout: Option<&ResolvedCheckoutScope>,
+        session_workspace: Option<&super::knowledge_source::WorkspaceBindingGrant>,
         items: &mut BTreeMap<String, KnowledgeViewItem>,
         built_from: &mut BuiltFromTable,
         diagnostics: &mut Vec<String>,
@@ -697,6 +709,7 @@ impl BlackboxServer {
                     &target.project_id,
                     &verified,
                     session_checkout,
+                    session_workspace,
                     items,
                     built_from,
                     diagnostics,
@@ -726,10 +739,46 @@ impl BlackboxServer {
         project_id: &ProjectId,
         verified: &VerifiedAcceptedPublication,
         session_checkout: Option<&ResolvedCheckoutScope>,
+        session_workspace: Option<&super::knowledge_source::WorkspaceBindingGrant>,
         items: &mut BTreeMap<String, KnowledgeViewItem>,
         built_from: &mut BuiltFromTable,
         diagnostics: &mut Vec<String>,
     ) -> Result<()> {
+        if let Some(workspace) =
+            session_workspace.filter(|workspace| workspace.project_id == project_id.as_str())
+        {
+            let pair = self
+                .remote_provisional_overlays(workspace, verified)
+                .map_err(|error| {
+                    anyhow::anyhow!("{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: {error:#}")
+                })?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: no live provisional generation is selected for the bound workspace"
+                    )
+                })?;
+            if pair.knowledge.status != OverlayStatus::Valid {
+                anyhow::bail!(
+                    "{ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE}: project {project_id} workspace {}: {}",
+                    workspace.workspace_id,
+                    pair.knowledge.diagnostics.join("; ")
+                );
+            }
+            diagnostics.extend(pair.knowledge.diagnostics.iter().map(|diagnostic| {
+                format!(
+                    "project {project_id} workspace {}: {diagnostic}",
+                    workspace.workspace_id
+                )
+            }));
+            let overlay_ref = intern_overlay_stamp(built_from, &pair.knowledge, diagnostics);
+            apply_own_overlay(
+                items,
+                &pair.knowledge,
+                OverlayRowProject::Catalog(project_id.as_str()),
+                overlay_ref.as_deref(),
+            );
+            return Ok(());
+        }
         // A session checkout belongs to one project. Every other selected
         // project serves published rows only, exactly as the bridge does.
         let Some(own) = session_checkout.filter(|own| own.project_id == project_id.as_str()) else {
@@ -780,7 +829,12 @@ impl BlackboxServer {
         diagnostics: &mut Vec<String>,
         degraded_overlays: &mut Vec<OverlayDegradation>,
     ) -> Result<()> {
-        for attachment in self.catalog_active_overlay_attachments(project_id)? {
+        let attachments = self.catalog_active_overlay_attachments(project_id)?;
+        let mut seen_checkouts = attachments
+            .iter()
+            .map(|attachment| attachment.checkout_id.clone())
+            .collect::<BTreeSet<_>>();
+        for attachment in attachments {
             let degraded = match self.refresh_catalog_knowledge_overlay(verified, &attachment) {
                 Ok(snapshot) if snapshot.status == OverlayStatus::Valid => {
                     add_catalog_overlay_rows(project_id, &snapshot, items, built_from, diagnostics);
@@ -793,6 +847,53 @@ impl BlackboxServer {
             };
             // The peer is omitted, never faked: its reason rides both the
             // structured report and the human diagnostics.
+            diagnostics.push(degraded.diagnostic_line());
+            degraded_overlays.push(degraded);
+        }
+        for workspace in self
+            .state
+            .knowledge_sources
+            .active_workspace_bindings_now()
+            .into_iter()
+            .filter(|workspace| workspace.project_id == project_id.as_str())
+            .filter(|workspace| seen_checkouts.insert(workspace.workspace_id.as_str().to_string()))
+        {
+            let degraded = match self.remote_provisional_overlays(&workspace, verified) {
+                Ok(Some(pair)) if pair.knowledge.status == OverlayStatus::Valid => {
+                    add_catalog_overlay_rows(
+                        project_id,
+                        &pair.knowledge,
+                        items,
+                        built_from,
+                        diagnostics,
+                    );
+                    continue;
+                }
+                Ok(Some(pair)) => OverlayDegradation {
+                    project_id: project_id.as_str().to_string(),
+                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    attachment_id: None,
+                    code: ERROR_OVERLAY_SNAPSHOT_STALE,
+                    detail: pair.knowledge.diagnostics.join("; "),
+                    transient: false,
+                },
+                Ok(None) => OverlayDegradation {
+                    project_id: project_id.as_str().to_string(),
+                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    attachment_id: None,
+                    code: ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE,
+                    detail: "no live provisional generation is selected".into(),
+                    transient: false,
+                },
+                Err(error) => OverlayDegradation {
+                    project_id: project_id.as_str().to_string(),
+                    checkout_id: workspace.workspace_id.as_str().to_string(),
+                    attachment_id: None,
+                    code: ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE,
+                    detail: format!("{error:#}"),
+                    transient: false,
+                },
+            };
             diagnostics.push(degraded.diagnostic_line());
             degraded_overlays.push(degraded);
         }
@@ -1508,7 +1609,9 @@ fn same_knowledge_snapshot(left: &OverlaySnapshot, right: &OverlaySnapshot) -> b
 /// inside one published scope's knowledge directory. Basenames are unique
 /// there by construction, because every manifest entry names a file in that
 /// one directory.
-fn accepted_knowledge_digests(verified: &VerifiedAcceptedPublication) -> AcceptedPublishedDigests {
+pub(crate) fn accepted_knowledge_digests(
+    verified: &VerifiedAcceptedPublication,
+) -> AcceptedPublishedDigests {
     AcceptedPublishedDigests(
         verified
             .knowledge_manifest()

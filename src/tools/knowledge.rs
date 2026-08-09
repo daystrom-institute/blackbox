@@ -229,6 +229,15 @@ fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut Knowle
 }
 
 impl BlackboxServer {
+    fn guard_workspace_bound_project_knowledge(&self, scope: Option<&str>) -> anyhow::Result<()> {
+        if self.authoritative_session_workspace_binding().is_some() && scope == Some("project") {
+            anyhow::bail!(
+                "error.knowledge_transport_authoritative: a bound workspace must write project knowledge through its checkout-owner transport"
+            );
+        }
+        Ok(())
+    }
+
     /// Rescope a knowledge WRITE's `project` param through worktree→base
     /// resolution: the entry's durable scope becomes the registered base
     /// (so render/list/inject filters keyed by the base path match it), and
@@ -605,6 +614,9 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<LearnParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.guard_workspace_bound_project_knowledge(p.scope.as_deref()) {
+            return Self::err_text(&format!("Error: {error:#}"));
+        }
         let format = match ResponseFormat::parse_optional(p.format.as_deref()) {
             Ok(format) => format,
             Err(e) => return Self::err_text(&format!("Error: {e:#}")),
@@ -727,6 +739,9 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<RememberParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.guard_workspace_bound_project_knowledge(p.scope.as_deref()) {
+            return Self::err_text(&format!("Error: {error:#}"));
+        }
         let start = std::time::Instant::now();
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
@@ -786,6 +801,9 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<DecideParams>,
     ) -> CallToolResult {
+        if let Err(error) = self.guard_workspace_bound_project_knowledge(p.scope.as_deref()) {
+            return Self::err_text(&format!("Error: {error:#}"));
+        }
         let start = std::time::Instant::now();
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
@@ -1124,6 +1142,54 @@ impl BlackboxServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bind_remote_workspace(server: &BlackboxServer) {
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(std::sync::Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "task-bound".into(),
+                        session_id: "session-bound".into(),
+                        project_id: "p_bound".into(),
+                        scope: bbox_corpus_core::identity::PublishedScope::try_new(
+                            "bound-test",
+                            "."
+                        )
+                        .unwrap(),
+                        workspace_id: bro_core::WorkspaceId::parse(
+                            "0123456789abcdef0123456789abcdef"
+                        )
+                        .unwrap(),
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bound_workspace_daemon_lane_accepts_global_and_refuses_project_knowledge() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(
+            crate::server::state::SharedState::for_test(directory.path()),
+        ));
+        bind_remote_workspace(&server);
+
+        assert!(
+            server
+                .guard_workspace_bound_project_knowledge(Some("global"))
+                .is_ok()
+        );
+        let error = server
+            .guard_workspace_bound_project_knowledge(Some("project"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("knowledge_transport_authoritative")
+        );
+    }
 
     fn init_system_memory() {
         crate::init_system_memory_for_tests();

@@ -99,7 +99,7 @@ impl ServerHandler for BlackboxServer {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        let (surface_str, project_raw) =
+        let (surface_str, project_raw, workspace_binding) =
             if let Some(parts) = context.extensions.get::<http::request::Parts>() {
                 let project =
                     server::surface::extract_decoded_query_param(parts.uri.query(), "project")
@@ -109,12 +109,38 @@ impl ServerHandler for BlackboxServer {
                                 None,
                             )
                         })?;
+                let workspace_binding =
+                    match parts.headers.get(bro_protocol::WORKSPACE_BINDING_HEADER) {
+                        Some(candidate) => {
+                            let candidate = candidate.to_str().map_err(|_| {
+                                ErrorData::new(
+                                    ErrorCode::INVALID_REQUEST,
+                                    "invalid workspace binding",
+                                    None,
+                                )
+                            })?;
+                            Some(
+                                self.state
+                                    .knowledge_sources
+                                    .authenticate_workspace_binding_now(candidate)
+                                    .ok_or_else(|| {
+                                        ErrorData::new(
+                                            ErrorCode::INVALID_REQUEST,
+                                            "invalid workspace binding",
+                                            None,
+                                        )
+                                    })?,
+                            )
+                        }
+                        None => None,
+                    };
                 (
                     server::surface::extract_surface_from_uri(parts.uri.query()),
                     project,
+                    workspace_binding,
                 )
             } else {
-                ("default", None)
+                ("default", None, None)
             };
         // Resolve the project selector (alias / id / path) through the
         // shared engine (phase-2 §9.2, Filter class) to the base canonical
@@ -122,10 +148,12 @@ impl ServerHandler for BlackboxServer {
         // parity with bbox_mcp_surface. A catalog-mode identity with no
         // attachment pins the stable project id: identity without a host
         // path. Blocking fs (canonicalize / git probes) → blocking pool.
-        let project = match project_raw.clone() {
-            Some(raw) => {
-                let server = self.clone();
-                let resolved = tokio::task::spawn_blocking(move || {
+        let project = match workspace_binding.as_ref() {
+            Some(grant) => Some(grant.project_id.clone()),
+            None => match project_raw.clone() {
+                Some(raw) => {
+                    let server = self.clone();
+                    let resolved = tokio::task::spawn_blocking(move || {
                     match server.resolve_project_filter(&raw) {
                         Some(resolution) => match resolution
                             .store_key()
@@ -154,9 +182,10 @@ impl ServerHandler for BlackboxServer {
                 .map_err(|e| {
                     ErrorData::internal_error(format!("project resolution failed: {e}"), None)
                 })?;
-                Some(resolved)
-            }
-            None => None,
+                    Some(resolved)
+                }
+                None => None,
+            },
         };
         let entry = self.surface_entry(surface_str, project.as_deref()).await;
         if let server::surface::ToolSurfaceVerdict::Deny { reason } = &entry.decision.verdict {
@@ -166,41 +195,15 @@ impl ServerHandler for BlackboxServer {
                 None,
             ));
         }
-        // Checkout authority is derived only after the surface decision and
-        // only through the conservative write resolver. The raw transport
-        // project is trusted session context; later tool arguments are not.
-        let session_checkout = match project_raw {
-            Some(raw) => {
-                let server = self.clone();
-                tokio::task::spawn_blocking(move || {
-                    let resolved = server.resolve_project_write(&raw)?;
-                    let Some(checkout) = resolved.checkout_scope else {
-                        return Ok::<_, anyhow::Error>(None);
-                    };
-                    server.register_dark_knowledge_checkout(&checkout)?;
-                    server.refresh_dark_knowledge_overlay(&checkout);
-                    server.refresh_dark_gap_overlay(&checkout);
-                    Ok(Some(Arc::new(checkout)))
-                })
-                .await
-                .map_err(|e| {
-                    ErrorData::internal_error(
-                        format!("checkout authority resolution failed: {e}"),
-                        None,
-                    )
-                })?
-                .map_err(|e| {
-                    ErrorData::internal_error(
-                        format!("checkout authority initialization failed: {e:#}"),
-                        None,
-                    )
-                })?
-            }
-            None => None,
-        };
+        // A raw `?project` remains a surface/filter selector only. Managed
+        // workspace authority comes exclusively from the private capability
+        // header minted for this supervised harness session.
         let _ = self.surface.set(Arc::from(surface_str));
         let _ = self.surface_project.set(project.map(Arc::from));
-        let _ = self.session_checkout.set(session_checkout);
+        let _ = self.session_checkout.set(None);
+        let _ = self
+            .session_workspace_binding
+            .set(workspace_binding.map(Arc::new));
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }

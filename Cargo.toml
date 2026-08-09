@@ -35,6 +35,7 @@ members = [
     "crates/bbox-git-source",
     "crates/bbox-git-source-store",
     "crates/bbox-knowledge-source",
+    "crates/bbox-knowledge-source-client",
     "crates/bbox-knowledge-source-store",
     "crates/bbox-provenance",
     "crates/bbox-corpus-index",

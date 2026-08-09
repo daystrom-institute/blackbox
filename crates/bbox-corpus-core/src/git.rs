@@ -152,6 +152,118 @@ impl StableGitRepository {
         read_stable_repository_object_format(&self.authority)
     }
 
+    /// Compute one exact merge base through this already-held repository
+    /// authority. The result is a full object id or `None` when the histories
+    /// are unrelated.
+    pub fn merge_base_oid(&self, left: &str, right: &str) -> Result<Option<String>> {
+        validate_full_object_id(left)?;
+        validate_full_object_id(right)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (left, right);
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            let bytes = run_stable_repository_stdout_bounded_with_timeout(
+                &self.authority,
+                &["merge-base", "--all", left, right],
+                "computing exact stable merge base",
+                256,
+                GIT_OUTPUT_TIMEOUT,
+            )?;
+            let text =
+                std::str::from_utf8(&bytes).context("stable Git merge-base output is not UTF-8")?;
+            let mut bases = text.lines().map(str::trim).filter(|oid| !oid.is_empty());
+            let Some(oid) = bases.next() else {
+                return Ok(None);
+            };
+            if bases.next().is_some() {
+                anyhow::bail!("stable Git histories have multiple best merge bases");
+            }
+            validate_full_object_id(oid)?;
+            Ok(Some(oid.to_string()))
+        }
+    }
+
+    /// Capture the complete parent graph reachable from the supplied exact
+    /// commits. Records are returned sorted by object id so callers can feed
+    /// canonical ancestry contracts without trusting Git's traversal order.
+    pub fn ancestry_bounded(
+        &self,
+        tips: &[&str],
+        max_commits: usize,
+        max_edges: usize,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        if tips.is_empty() || max_commits == 0 || max_edges == 0 {
+            anyhow::bail!("stable Git ancestry limits and tips must be nonempty");
+        }
+        for tip in tips {
+            validate_full_object_id(tip)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (tips, max_commits, max_edges);
+            anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+        }
+        #[cfg(unix)]
+        {
+            let oid_len = self.object_id_hex_len()?;
+            let output_limit = max_commits
+                .saturating_mul(oid_len.saturating_add(2))
+                .saturating_add(max_edges.saturating_mul(oid_len.saturating_add(1)))
+                .min(128 * 1024 * 1024);
+            let mut args = vec!["rev-list", "--parents"];
+            args.extend_from_slice(tips);
+            let bytes = run_stable_repository_stdout_bounded_with_timeout(
+                &self.authority,
+                &args,
+                "capturing exact stable ancestry",
+                output_limit,
+                GIT_HISTORY_OUTPUT_TIMEOUT,
+            )?;
+            let text =
+                std::str::from_utf8(&bytes).context("stable Git ancestry output is not UTF-8")?;
+            let mut nodes = std::collections::BTreeMap::<String, Vec<String>>::new();
+            let mut edges = 0_usize;
+            for line in text.lines() {
+                let mut fields = line.split_whitespace();
+                let oid = fields
+                    .next()
+                    .context("stable Git ancestry contains an empty record")?;
+                validate_full_object_id(oid)?;
+                if oid.len() != oid_len {
+                    anyhow::bail!("stable Git ancestry mixes object formats");
+                }
+                let parents = fields
+                    .map(|parent| {
+                        validate_full_object_id(parent)?;
+                        if parent.len() != oid_len {
+                            anyhow::bail!("stable Git ancestry mixes object formats");
+                        }
+                        Ok(parent.to_string())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                edges = edges
+                    .checked_add(parents.len())
+                    .context("stable Git ancestry edge count overflow")?;
+                if edges > max_edges {
+                    anyhow::bail!("stable Git ancestry exceeds its edge limit");
+                }
+                if nodes.insert(oid.to_string(), parents).is_some() {
+                    anyhow::bail!("stable Git ancestry contains a duplicate commit");
+                }
+                if nodes.len() > max_commits {
+                    anyhow::bail!("stable Git ancestry exceeds its commit limit");
+                }
+            }
+            if nodes.is_empty() || tips.iter().any(|tip| !nodes.contains_key(*tip)) {
+                anyhow::bail!("stable Git ancestry is incomplete for its tips");
+            }
+            Ok(nodes.into_iter().collect())
+        }
+    }
+
     pub fn is_shallow(&self) -> Result<bool> {
         #[cfg(not(unix))]
         {
@@ -1126,6 +1238,26 @@ pub fn open_stable_git_repository(
         Ok(authority.map(|authority| StableGitRepository {
             authority: Arc::new(authority),
         }))
+    }
+}
+
+/// Open an exact worktree root, including a linked worktree whose `.git` is a
+/// file, and retain the resolved Git/common/object directories by descriptor.
+/// Unlike repository discovery helpers, this refuses nested paths.
+pub fn open_exact_worktree_git_repository(root: &Path) -> Result<StableGitRepository> {
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        anyhow::bail!("stable Git repositories require Unix directory-handle confinement");
+    }
+    #[cfg(unix)]
+    {
+        Ok(StableGitRepository {
+            authority: Arc::new(resolve_and_open_stable_repository(
+                root,
+                "exact worktree repository",
+            )?),
+        })
     }
 }
 
@@ -4827,6 +4959,52 @@ mod tests {
         fs::write(root.join(".git"), "gitdir: /outside/repository\n").unwrap();
         let authority = NofollowDirectory::open_existing(&root).unwrap().unwrap();
         assert!(open_stable_git_repository(&authority).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_worktree_repository_captures_linked_worktree_ancestry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let base = root.join("base");
+        let linked = root.join("linked");
+        fs::create_dir_all(&base).unwrap();
+        init_repo(&base);
+        write(&base, "tracked.txt", "base\n");
+        run_git(&base, &["add", "tracked.txt"]);
+        run_git(&base, &["commit", "-q", "-m", "base"]);
+        let base_head = current_head(&base).unwrap();
+        run_git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-test",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        write(&linked, "tracked.txt", "linked\n");
+        run_git(&linked, &["add", "tracked.txt"]);
+        run_git(&linked, &["commit", "-q", "-m", "linked"]);
+        let linked_head = current_head(&linked).unwrap();
+
+        let repository = open_exact_worktree_git_repository(&linked).unwrap();
+        assert_eq!(repository.repository_root(), linked.canonicalize().unwrap());
+        assert_eq!(
+            repository
+                .merge_base_oid(&base_head, &linked_head)
+                .unwrap()
+                .as_deref(),
+            Some(base_head.as_str())
+        );
+        let ancestry = repository
+            .ancestry_bounded(&[&base_head, &linked_head], 16, 32)
+            .unwrap();
+        assert!(ancestry.iter().any(|(oid, _)| oid == &base_head));
+        assert!(ancestry.iter().any(|(oid, _)| oid == &linked_head));
     }
 
     #[cfg(unix)]
