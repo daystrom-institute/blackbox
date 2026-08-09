@@ -950,7 +950,7 @@ pub(super) fn execute_reindex_pass(
             );
         }
     }
-    if full {
+    if full && cause == FullRebuildCause::Ordinary {
         let mode = if records_provider.catalog_authority() {
             bbox_code_source_store::RuntimeRecordMode::CatalogV2
         } else {
