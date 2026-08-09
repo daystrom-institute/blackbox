@@ -1430,9 +1430,27 @@ fn apply_stall_health(response: &mut EmbedStatusResponse) {
     }
 }
 
-/// Structured variant shared by `bbox_embed_status` and `bbox_doctor`, so
-/// both surfaces classify the exact same rows.
-pub(crate) fn status_response_for_state(state: &SharedState) -> Result<EmbedStatusResponse> {
+/// Structured status for `bbox_embed_status`. Exact coverage is an explicit
+/// source-corpus scan; the default health path never performs that walk.
+pub(crate) fn status_response_for_state(
+    state: &SharedState,
+    include_coverage: bool,
+) -> Result<EmbedStatusResponse> {
+    if !include_coverage {
+        let mut response = status_response();
+        let router = EmbeddingRouter::load_default().unwrap_or_default();
+        backfill_visual_route_metadata(&router, &mut response);
+        queue::normalize_route_statuses(&mut response);
+        for status in response.routes.values_mut() {
+            if status.coverage_ratio.is_none() {
+                status.coverage_state = Some(
+                    "guarded: exact coverage not requested; call bbox_embed_status(include_coverage=true) for a full source-corpus scan"
+                        .into(),
+                );
+            }
+        }
+        return Ok(response);
+    }
     const STATUS_COVERAGE_BUCKETS: &[Bucket] = &[
         Bucket::Knowledge,
         Bucket::Code,
@@ -1464,8 +1482,7 @@ pub(crate) fn status_response_for_state(state: &SharedState) -> Result<EmbedStat
 /// every embedding-source document. On a production corpus that took 142
 /// seconds and made a nominal health read indistinguishable from a daemon
 /// outage. Doctor reports live queue/provider state and marks coverage as
-/// guarded; callers that explicitly request embed status still get the exact
-/// corpus scan.
+/// guarded; bbox_embed_status gets the exact scan only when its caller opts in.
 pub(crate) fn status_response_for_doctor() -> EmbedStatusResponse {
     let mut response = status_response();
     let router = EmbeddingRouter::load_default().unwrap_or_default();
@@ -1482,8 +1499,8 @@ pub(crate) fn status_response_for_doctor() -> EmbedStatusResponse {
     response
 }
 
-pub(crate) fn status_json_for_state(state: &SharedState) -> Result<String> {
-    let response = status_response_for_state(state)?;
+pub(crate) fn status_json_for_state(state: &SharedState, include_coverage: bool) -> Result<String> {
+    let response = status_response_for_state(state, include_coverage)?;
     Ok(serde_json::to_string_pretty(&response)?)
 }
 

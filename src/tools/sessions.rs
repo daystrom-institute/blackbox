@@ -16,6 +16,11 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct EmbedStatusParams {
+    /// Compute exact embedding coverage by walking every source document.
+    /// Disabled by default because a production corpus scan can take minutes;
+    /// queue/provider health remains available on the cheap path.
+    #[serde(default)]
+    pub include_coverage: Option<bool>,
     /// Include explicit HNSW graph diagnostics. Cheap status leaves graph
     /// fields absent; this opt-in walk can be expensive on large partitions.
     #[serde(default)]
@@ -138,7 +143,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_embed_status",
-        description = "Return cheap route embedding health and health_reason. include_diagnostics explicitly requests deadline-bounded HNSW graph diagnostics; recall_probe_route runs a sampled self-recall probe (both can be expensive)."
+        description = "Return cheap route embedding health and health_reason. include_coverage explicitly requests a full source-corpus coverage scan; include_diagnostics requests deadline-bounded HNSW graph diagnostics; recall_probe_route runs a sampled self-recall probe (all opt-ins can be expensive)."
     )]
     pub(crate) async fn bbox_embed_status(
         &self,
@@ -146,7 +151,10 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_embed_status", move || {
-            let status = crate::embed_runtime::status_json_for_state(&server.state)?;
+            let status = crate::embed_runtime::status_json_for_state(
+                &server.state,
+                p.include_coverage.unwrap_or(false),
+            )?;
             let diagnostics_requested =
                 p.include_diagnostics.unwrap_or(false) || p.diagnostic_routes.is_some();
             if !diagnostics_requested && p.recall_probe_route.is_none() {
@@ -234,5 +242,20 @@ impl BlackboxServer {
     pub(crate) async fn bbox_stats(&self) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_stats", move || server.state.idx.read().stats()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbedStatusParams;
+
+    #[test]
+    fn embed_status_coverage_scan_is_opt_in() {
+        let default: EmbedStatusParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.include_coverage, None);
+
+        let requested: EmbedStatusParams =
+            serde_json::from_value(serde_json::json!({"include_coverage": true})).unwrap();
+        assert_eq!(requested.include_coverage, Some(true));
     }
 }
