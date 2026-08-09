@@ -13,6 +13,56 @@ use anyhow::{Context, Result};
 pub const MANAGED_START: &str = "<!-- bb:managed-start -->";
 pub const MANAGED_END: &str = "<!-- bb:managed-end -->";
 
+/// Test binaries must never inspect or rewrite the operator's real global
+/// guidance files. Unit tests compile this crate with `cfg(test)`; nextest
+/// also marks integration-test processes through its runtime environment.
+fn running_under_test_harness() -> bool {
+    cfg!(test)
+        || ["NEXTEST", "NEXTEST_RUN_ID", "NEXTEST_EXECUTION_MODE"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+}
+
+fn host_global_target_env_key(path: &Path, home: &Path) -> Option<&'static str> {
+    [
+        (
+            home.join(".blackbox").join("BLACKBOX.md"),
+            "BLACKBOX_GLOBAL_COMMON_MD",
+        ),
+        (
+            home.join(".claude").join("CLAUDE.md"),
+            "BLACKBOX_GLOBAL_CLAUDE_MD",
+        ),
+        (
+            home.join(".codex").join("AGENTS.md"),
+            "BLACKBOX_GLOBAL_CODEX_MD",
+        ),
+        (
+            home.join(".gemini").join("GEMINI.md"),
+            "BLACKBOX_GLOBAL_GEMINI_MD",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(default, env_key)| (path == default).then_some(env_key))
+}
+
+fn refuse_test_host_global_target(path: &Path) -> Result<()> {
+    if !running_under_test_harness() {
+        return Ok(());
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    let Some(env_key) = host_global_target_env_key(path, &home) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "refusing test-process access to host global guidance file {}; route {} to a test fixture",
+        path.display(),
+        env_key
+    )
+}
+
 /// Resolve global-memory destinations per provider. Returns `None` for
 /// providers without a defined global memory file (copilot reads project
 /// files only; vibe is intentionally unsupported per design).
@@ -150,6 +200,7 @@ impl PatchPlan {
 /// Compute what a managed-region patch would do without writing anything.
 /// `managed_body` is the bbox-rendered content (without markers).
 pub fn plan_managed_patch(file_path: &Path, managed_body: &str) -> Result<PatchPlan> {
+    refuse_test_host_global_target(file_path)?;
     let managed_block = format!(
         "{MANAGED_START}\n{}\n{MANAGED_END}",
         managed_body.trim_end()
@@ -200,6 +251,14 @@ pub fn plan_managed_patch(file_path: &Path, managed_body: &str) -> Result<PatchP
 /// managed region with an empty one (a typical symptom of path-vs-repo_id
 /// scoping mismatches). Pass `allow_empty=true` to override.
 pub fn apply_managed_patch(plan: &PatchPlan, allow_empty: bool) -> Result<Option<PathBuf>> {
+    let path = match plan {
+        PatchPlan::Create { path, .. }
+        | PatchPlan::Append { path, .. }
+        | PatchPlan::Replace { path, .. }
+        | PatchPlan::Unchanged { path } => path,
+    };
+    refuse_test_host_global_target(path)?;
+
     match plan {
         // Nothing to do — and no empty backup dir, either.
         PatchPlan::Unchanged { .. } => Ok(None),
@@ -342,6 +401,47 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifies_every_host_global_guidance_target() {
+        let home = Path::new("/operator-home");
+        for (path, env_key) in [
+            (
+                home.join(".blackbox").join("BLACKBOX.md"),
+                "BLACKBOX_GLOBAL_COMMON_MD",
+            ),
+            (
+                home.join(".claude").join("CLAUDE.md"),
+                "BLACKBOX_GLOBAL_CLAUDE_MD",
+            ),
+            (
+                home.join(".codex").join("AGENTS.md"),
+                "BLACKBOX_GLOBAL_CODEX_MD",
+            ),
+            (
+                home.join(".gemini").join("GEMINI.md"),
+                "BLACKBOX_GLOBAL_GEMINI_MD",
+            ),
+        ] {
+            assert_eq!(host_global_target_env_key(&path, home), Some(env_key));
+        }
+        assert_eq!(
+            host_global_target_env_key(Path::new("/fixture/BLACKBOX.md"), home),
+            None
+        );
+    }
+
+    #[test]
+    fn test_harness_refuses_real_host_global_guidance_before_reading_it() {
+        let home = dirs::home_dir().expect("test host has a home directory");
+        let path = home.join(".blackbox").join("BLACKBOX.md");
+        let error = plan_managed_patch(&path, "fixture body")
+            .expect_err("a test must not inspect the operator's global guidance");
+        assert!(
+            error.to_string().contains("refusing test-process access"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn test_patch_plan_creates_when_missing() {
