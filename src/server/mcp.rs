@@ -280,4 +280,116 @@ mod tests {
         assert!(text.contains("event: removed"), "chunk: {text}");
         assert!(text.contains("task-sse-mounted"), "chunk: {text}");
     }
+
+    #[tokio::test]
+    async fn operator_blame_headers_bind_only_the_mcp_blame_locality_session() {
+        use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
+        use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+        use bbox_corpus_core::blame_transport::{
+            OPERATOR_BLAME_REPO_ID_HEADER, OPERATOR_BLAME_ROOT_RELPATH_HEADER,
+            OPERATOR_BLAME_WORKSPACE_ID_HEADER,
+        };
+        use bbox_corpus_core::identity::PublishedScope;
+        use bro_rpc::ServiceToken;
+        use std::collections::BTreeMap;
+
+        let (app, state) = test_app_with_state();
+        let token = "b".repeat(64);
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![(
+                    ServiceToken::parse(token.clone()).unwrap(),
+                    ProducerGrant {
+                        producer_id: "operator".into(),
+                        projects: BTreeMap::from([(scope, "project-bound".into())]),
+                    },
+                )],
+            )));
+        let before = state.checkout_access.health().sequence;
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "bro-cli", "version": "test"}
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(ACCEPT, "application/json, text/event-stream")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Mcp-Protocol-Version", "2025-03-26")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(OPERATOR_BLAME_REPO_ID_HEADER, "repo")
+                    .header(OPERATOR_BLAME_ROOT_RELPATH_HEADER, ".")
+                    .header(
+                        OPERATOR_BLAME_WORKSPACE_ID_HEADER,
+                        "0123456789abcdef0123456789abcdef",
+                    )
+                    .body(Body::from(initialize.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "bbox_blame",
+                "arguments": {
+                    "file": "src/lib.rs",
+                    "line": 7,
+                    "_blame_locality": {"phase": "plan"}
+                }
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(ACCEPT, "application/json, text/event-stream")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Mcp-Protocol-Version", "2025-03-26")
+                    .header("Mcp-Session-Id", session_id)
+                    .body(Body::from(call.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let plan: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(plan["status"], "blame_locality_plan");
+        assert_eq!(plan["plan"]["project_id"], "project-bound");
+        assert_eq!(
+            plan["plan"]["workspace_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(state.checkout_access.health().sequence, before);
+    }
 }

@@ -911,4 +911,19 @@ mod tests {
         ]);
         assert!(matches!(cli.command, BroCommand::Provenance(_)));
     }
+
+    #[test]
+    fn clap_routes_checkout_local_blame() {
+        let cli = BroCli::parse_from([
+            "bro",
+            "blame",
+            "--token-file",
+            "/tmp/token",
+            "--file",
+            "src/lib.rs",
+            "--line",
+            "7",
+        ]);
+        assert!(matches!(cli.command, BroCommand::Blame(_)));
+    }
 }

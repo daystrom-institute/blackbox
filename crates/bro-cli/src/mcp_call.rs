@@ -450,6 +450,14 @@ mod tests {
     }
 
     #[test]
+    fn credentialed_mcp_requires_https_or_loopback() {
+        assert!(validate_credentialed_base_url("https://corpus.example").is_ok());
+        assert!(validate_credentialed_base_url("http://127.0.0.1:7264").is_ok());
+        assert!(validate_credentialed_base_url("http://localhost:7264").is_ok());
+        assert!(validate_credentialed_base_url("http://192.0.2.10:7264").is_err());
+    }
+
+    #[test]
     fn extracts_json_tool_payload() {
         let response = json!({
             "jsonrpc": "2.0",
