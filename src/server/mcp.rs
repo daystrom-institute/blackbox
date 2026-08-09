@@ -8,6 +8,10 @@ use rmcp::transport::streamable_http_server::{
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+async fn health_probe() -> axum::http::StatusCode {
+    axum::http::StatusCode::OK
+}
+
 pub(super) fn build_http_app(
     shared: Arc<SharedState>,
     cfg: &config::Config,
@@ -30,6 +34,10 @@ pub(super) fn build_http_app(
         );
 
     axum::Router::new()
+        // The HTTP router is constructed only after durable state has opened,
+        // so a reachable route proves startup completed as well as liveness.
+        .route("/healthz", axum::routing::get(health_probe))
+        .route("/readyz", axum::routing::get(health_probe))
         .route("/tail", axum::routing::get(tail_handler))
         .route("/roster", axum::routing::get(roster_handler))
         .route("/orchestrate", axum::routing::post(orchestrate_handler))
@@ -177,6 +185,17 @@ mod tests {
 
     fn test_app() -> axum::Router {
         test_app_with_state().0
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_health_and_readiness_routes_are_live() {
+        for path in ["/healthz", "/readyz"] {
+            let response = test_app()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
 
     /// The generic control plane is reachable at the neutral `/control/*`
