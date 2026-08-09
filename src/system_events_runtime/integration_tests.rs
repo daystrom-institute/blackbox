@@ -170,6 +170,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         blame_locality_cutover: Arc::new(
             bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default(),
         ),
+        render_locality_cutover: Arc::new(
+            bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default(),
+        ),
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

@@ -44,6 +44,11 @@ use bbox_indexing::project_catalog_rebuild::{
 };
 use bbox_indexing::project_catalog_rebuild_planning::PathFreeRebuildPreflightRequestV1;
 use bbox_indexing::project_catalog_store::{ProjectCatalogStore, ProjectCatalogStoreError};
+use bbox_indexing::render_locality_cutover::{
+    MIN_RENDER_LOCALITY_QUIET_SECS, ProjectCatalogRenderLocalityCutoverFacadeV1,
+    RenderLocalityCutoverApplyRequestV1, RenderLocalityCutoverPreflightRequestV1,
+    RenderLocalityCutoverVerifyRequestV1,
+};
 use bbox_vectors::migration_inventory as vector_inventory;
 use blackbox::project_catalog_rebuild_admin::PathFreeRebuildApplyRequestV1;
 use clap::{ArgGroup, Args, Parser, Subcommand};
@@ -87,6 +92,8 @@ enum ProjectCatalogCommand {
     KnowledgeTransportCutover(KnowledgeTransportCutoverArgs),
     /// Prove checkout-local blame parity and retire daemon-side checkout access.
     BlameLocalityCutover(BlameLocalityCutoverArgs),
+    /// Prove checkout-owned render parity and retire daemon-side project writes.
+    RenderLocalityCutover(RenderLocalityCutoverArgs),
     /// Create a catalog project by authoritative scope or as legacy-local.
     Add(AddArgs),
     /// List every catalog project, including remote-only projects.
@@ -372,6 +379,39 @@ struct BlameLocalityCutoverArgs {
     project_ids: Vec<String>,
     /// Mandatory no-legacy-access observation window.
     #[arg(long, default_value_t = MIN_BLAME_LOCALITY_QUIET_SECS)]
+    min_quiet_secs: u64,
+    /// Select the configured catalog. Required in every mode.
+    #[arg(long)]
+    configured: bool,
+    #[command(flatten)]
+    config: ConfigArgs,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("mode")
+        .required(true)
+        .multiple(false)
+        .args(["preflight", "apply", "verify"])
+))]
+struct RenderLocalityCutoverArgs {
+    /// Capture published/own/all completions and checkout-access baselines.
+    #[arg(long)]
+    preflight: bool,
+    /// Install the reviewed marker after the mandatory quiet window.
+    #[arg(long)]
+    apply: bool,
+    /// Verify the installed marker and runtime projection while offline.
+    #[arg(long)]
+    verify: bool,
+    /// Reviewable preflight report, required by preflight and apply.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+    /// Exact catalog project id to cut over. Repeatable; preflight only.
+    #[arg(long = "project-id", value_name = "PROJECT_ID")]
+    project_ids: Vec<String>,
+    /// Mandatory no-daemon-render-access observation window.
+    #[arg(long, default_value_t = MIN_RENDER_LOCALITY_QUIET_SECS)]
     min_quiet_secs: u64,
     /// Select the configured catalog. Required in every mode.
     #[arg(long)]
@@ -744,6 +784,15 @@ fn command_name(cli: &Cli) -> &'static str {
             command: ProjectCatalogCommand::BlameLocalityCutover(_),
         }) => "project_catalog_blame_locality_cutover_verify",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::RenderLocalityCutover(args),
+        }) if args.preflight => "project_catalog_render_locality_cutover_preflight",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::RenderLocalityCutover(args),
+        }) if args.apply => "project_catalog_render_locality_cutover_apply",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::RenderLocalityCutover(_),
+        }) => "project_catalog_render_locality_cutover_verify",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(_),
         }) => "project_catalog_add",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
@@ -802,6 +851,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::BlameLocalityCutover(args),
         }) => execute_blame_locality_cutover(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::RenderLocalityCutover(args),
+        }) => execute_render_locality_cutover(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Add(args),
         }) => execute_add(args),
@@ -1468,6 +1520,119 @@ fn execute_blame_locality_cutover(
     }
 }
 
+fn execute_render_locality_cutover(
+    args: RenderLocalityCutoverArgs,
+) -> Result<serde_json::Value, CommandFailure> {
+    let mode = match (args.preflight, args.apply, args.verify) {
+        (true, false, false) => NewVerbModeV1::Preflight,
+        (false, true, false) => NewVerbModeV1::Apply,
+        (false, false, true) => NewVerbModeV1::Verify,
+        _ => {
+            return Err(cli_arguments(
+                "render-locality-cutover requires exactly one mode: --preflight, --apply, or --verify",
+            ));
+        }
+    };
+    if !args.configured {
+        return Err(cli_arguments(
+            "render-locality-cutover requires --configured in every mode",
+        ));
+    }
+    let (report_path, project_ids) = match mode {
+        NewVerbModeV1::Preflight => {
+            let Some(report_path) = args.report else {
+                return Err(cli_arguments(
+                    "render-locality-cutover --preflight requires --report",
+                ));
+            };
+            if args.project_ids.is_empty() {
+                return Err(cli_arguments(
+                    "render-locality-cutover --preflight requires at least one --project-id",
+                ));
+            }
+            let project_ids = args
+                .project_ids
+                .into_iter()
+                .map(|project_id| {
+                    ProjectId::parse(project_id).map_err(|error| {
+                        cli_arguments(format!("invalid render cutover project id: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (Some(report_path), project_ids)
+        }
+        NewVerbModeV1::Apply => {
+            let Some(report_path) = args.report else {
+                return Err(cli_arguments(
+                    "render-locality-cutover --apply requires --report",
+                ));
+            };
+            if !args.project_ids.is_empty() {
+                return Err(cli_arguments(
+                    "render-locality-cutover --apply takes its exact project set from --report",
+                ));
+            }
+            (Some(report_path), Vec::new())
+        }
+        NewVerbModeV1::Verify => {
+            if args.report.is_some() || !args.project_ids.is_empty() {
+                return Err(cli_arguments(
+                    "render-locality-cutover --verify takes no report or project ids",
+                ));
+            }
+            (None, Vec::new())
+        }
+    };
+    let config = load_config(args.config.config)?;
+    let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: args.config.projects_path,
+            state_dir: args.config.state_dir,
+        },
+    )?;
+    let cutover_error = |error: anyhow::Error| {
+        CommandFailure::new("error.render_locality_cutover", format!("{error:#}"))
+    };
+    match mode {
+        NewVerbModeV1::Preflight => {
+            let receipt = ProjectCatalogRenderLocalityCutoverFacadeV1::preflight(
+                RenderLocalityCutoverPreflightRequestV1 {
+                    layout,
+                    config,
+                    report_path: report_path.expect("preflight report resolved above"),
+                    project_ids,
+                    min_quiet_secs: args.min_quiet_secs,
+                    generated_at: offline_timestamp(),
+                },
+            )
+            .map_err(cutover_error)?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Apply => {
+            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
+            let receipt = ProjectCatalogRenderLocalityCutoverFacadeV1::apply(
+                RenderLocalityCutoverApplyRequestV1 {
+                    layout,
+                    config,
+                    report_path: report_path.expect("apply report resolved above"),
+                    applied_at: offline_timestamp(),
+                },
+            )
+            .map_err(cutover_error)?;
+            serialize_result(&receipt)
+        }
+        NewVerbModeV1::Verify => {
+            let _claim = acquire_admin_lifetime_claim(layout.projects_path())?;
+            let receipt = ProjectCatalogRenderLocalityCutoverFacadeV1::verify(
+                RenderLocalityCutoverVerifyRequestV1 { layout },
+            )
+            .map_err(cutover_error)?;
+            serialize_result(&receipt)
+        }
+    }
+}
+
 fn execute_path_free_rebuild(
     args: PathFreeRebuildArgs,
 ) -> Result<serde_json::Value, CommandFailure> {
@@ -1800,6 +1965,23 @@ mod tests {
         assert_eq!(
             command_name(&blame_locality_cutover),
             "project_catalog_blame_locality_cutover_preflight"
+        );
+
+        let render_locality_cutover = Cli::try_parse_from([
+            "blackbox",
+            "project-catalog",
+            "render-locality-cutover",
+            "--preflight",
+            "--configured",
+            "--report",
+            "/tmp/render-locality-report.json",
+            "--project-id",
+            "p_00000000000000000000000000000001",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_name(&render_locality_cutover),
+            "project_catalog_render_locality_cutover_preflight"
         );
 
         let preflight = Cli::try_parse_from([

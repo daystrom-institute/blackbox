@@ -232,6 +232,15 @@ impl BlackboxServer {
                     // `render_output` gate, so render resolves identity and
                     // acquires its one capability directly.
                     let project_id = server.validate_project_selection(&raw)?;
+                    if server
+                        .state
+                        .render_locality_cutover
+                        .transport_governed(&project_id)
+                    {
+                        anyhow::bail!(
+                            "error.render_locality_required: this project's render authority is checkout-local"
+                        );
+                    }
                     let view = server
                         .session_knowledge_view(Some(&project_id), p.provisional.as_deref())?;
                     p.scope_project = Some(project_id.clone());
@@ -1007,6 +1016,27 @@ mod catalog_render_tests {
             .map(|operation| operation.granted)
             .sum();
         assert_eq!(granted, 0, "a refused render must open no checkout");
+    }
+
+    #[tokio::test]
+    async fn covered_project_render_refuses_before_daemon_checkout_access() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server_with_render_locality_cutover(PROJECT);
+        let before = server.state.checkout_access.health().sequence;
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                project: Some(PROJECT.into()),
+                scope: Some("project".into()),
+                provisional: Some("published".into()),
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(is_error(&result), "{}", text(&result));
+        assert!(text(&result).contains("error.render_locality_required"));
+        assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 
     #[tokio::test]

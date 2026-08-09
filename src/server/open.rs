@@ -357,6 +357,19 @@ pub(super) fn open_shared_state(
             bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default()
         },
     );
+    let render_locality_cutover = Arc::new(
+        if matches!(
+            store_probe,
+            bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
+        ) {
+            bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::open(
+                &cfg.paths.state_dir,
+            )
+            .map_err(|error| anyhow::anyhow!("render locality cutover startup gate: {error}"))?
+        } else {
+            bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default()
+        },
+    );
     let (access_authority, records_provider): (
         Arc<dyn bbox_indexing::checkout_access::CheckoutAccessAuthority>,
         Arc<dyn bbox_corpus_core::project_record::ProjectRecordsProvider>,
@@ -919,6 +932,7 @@ pub(super) fn open_shared_state(
         git_transport_cutover,
         knowledge_transport_cutover,
         blame_locality_cutover,
+        render_locality_cutover,
         reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )),

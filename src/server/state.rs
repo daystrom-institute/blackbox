@@ -228,6 +228,11 @@ pub(crate) struct SharedState {
     /// acquire a daemon-side checkout lease.
     pub(crate) blame_locality_cutover:
         Arc<bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1>,
+    /// Strict per-project render locality authority. A checksummed marker row
+    /// prevents any unbound daemon project-render adapter from reacquiring a
+    /// checkout after the measured cut.
+    pub(crate) render_locality_cutover:
+        Arc<bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1>,
     /// Shutdown flag for the cutback reconciler background task (P4-D).
     /// `None` in bridge mode (no reconciler spawned).
     pub(crate) reconciler_shutdown: parking_lot::RwLock<Arc<std::sync::atomic::AtomicBool>>,
@@ -995,6 +1000,9 @@ impl SharedState {
             ),
             blame_locality_cutover: Arc::new(
                 bbox_indexing::blame_locality_cutover::BlameLocalityCutoverRuntimeV1::default(),
+            ),
+            render_locality_cutover: Arc::new(
+                bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::default(),
             ),
             reconciler_shutdown: parking_lot::RwLock::new(Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -3066,6 +3074,19 @@ pub(crate) mod catalog_fixture {
                 &self.root,
                 &self.catalog_projects_path,
             )))
+        }
+
+        pub(crate) fn server_with_render_locality_cutover(
+            &self,
+            project_id: &str,
+        ) -> BlackboxServer {
+            let mut state = SharedState::for_test_catalog(&self.root, &self.catalog_projects_path);
+            state.render_locality_cutover = Arc::new(
+                bbox_indexing::render_locality_cutover::RenderLocalityCutoverRuntimeV1::governed_for_test(
+                    project_id,
+                ),
+            );
+            BlackboxServer::new(Arc::new(state))
         }
 
         /// A server whose records provider is wrapped, over the same
