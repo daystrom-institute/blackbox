@@ -835,6 +835,11 @@ fn enqueue_reembed_routes(
     if !doc_types.is_empty() {
         let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
         let mut index_enqueued = 0usize;
+        let mut index_docs_seen = 0usize;
+        let mut visual_docs_seen = 0usize;
+        let mut visual_docs_reconstructed = 0usize;
+        let mut visual_payloads_decoded = 0usize;
+        let mut visual_docs_enqueued = 0usize;
         state
             .idx
             .read()
@@ -842,11 +847,36 @@ fn enqueue_reembed_routes(
                 if limit_reached(remaining, index_enqueued) {
                     return Ok(());
                 }
-                if enqueue_reembed_index_doc(buckets, &doc) {
+                index_docs_seen += 1;
+                let visual = doc.doc_type == "project_file"
+                    && crate::embed_queue::is_visual_chunk_kind(&doc.chunk_kind);
+                if visual {
+                    visual_docs_seen += 1;
+                    if let Some(chunk) = chunk_from_embedding_doc(&doc) {
+                        visual_docs_reconstructed += 1;
+                        if chunk.visual_payload.is_some() {
+                            visual_payloads_decoded += 1;
+                        }
+                    }
+                }
+                let accepted = enqueue_reembed_index_doc(buckets, &doc);
+                if accepted {
                     index_enqueued += 1;
+                    if visual {
+                        visual_docs_enqueued += 1;
+                    }
                 }
                 Ok(())
             })?;
+        tracing::info!(
+            index_docs_seen,
+            index_enqueued,
+            visual_docs_seen,
+            visual_docs_reconstructed,
+            visual_payloads_decoded,
+            visual_docs_enqueued,
+            "embedding rebuild index-source refill classified"
+        );
         enqueued += index_enqueued;
     }
     Ok(enqueued)
@@ -2322,6 +2352,26 @@ pdf_figure = "voyage_visual"
         assert_eq!(payload.content_hash, "deadbeef");
         assert_eq!(payload.media_type, "image/png");
         assert_eq!(payload.byte_len, 4096);
+    }
+
+    #[test]
+    fn chunk_from_embedding_doc_decodes_visual_payload_from_collected_v2_entity() {
+        let mut doc = image_embedding_source_doc();
+        doc.entity_id = Some(format!(
+            "project_file_v2:proj1234:collected-{}:abcd1234:{}:0",
+            "a".repeat(32),
+            "f".repeat(64)
+        ));
+
+        let chunk = chunk_from_embedding_doc(&doc).expect("collected V2 visual source doc");
+        assert_eq!(chunk.project_id, "proj1234");
+        assert_eq!(
+            chunk
+                .visual_payload
+                .expect("visual payload decoded from stored symbol")
+                .content_hash,
+            "deadbeef"
+        );
     }
 
     /// A non-visual chunk kind's `symbol` never decodes as a visual ref
