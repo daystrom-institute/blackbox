@@ -41,8 +41,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::accepted_publication_store::{
     AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
-    AcceptedPublicationLimits, FullPublisherRef, GitObjectId, PreparedAcceptedPublicationV1,
-    prepare_accepted_publication_v1,
+    AcceptedPublicationBuildSourceV1, AcceptedPublicationLimits, FullPublisherRef, GitObjectId,
+    PreparedAcceptedPublicationV1, prepare_accepted_publication_v1,
 };
 use crate::project_catalog_inventory::{
     AttachmentMigrationReportRowV1, AttachmentPostImageInputV1, CheckoutIdentityActionV1,
@@ -3372,7 +3372,7 @@ fn prepare_publisher_generation(
     prepare_accepted_publication_v1(
         AcceptedPublicationBuildInputV1 {
             project_id: project_id.clone(),
-            attachment_id: attachment_id.clone(),
+            source_binding: AcceptedPublicationBuildSourceV1::Attachment(attachment_id.clone()),
             scope: scope.clone(),
             full_ref,
             accepted_commit,

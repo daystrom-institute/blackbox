@@ -1214,9 +1214,10 @@ mod harness {
             .bbox_project_publisher_advance(Parameters(
                 crate::tools::project_catalog::ProjectPublisherAdvanceParams {
                     project_id: "p_00000000000000000000000000000000".into(),
-                    attachment_id: "att_00000000000000000000000000000000".into(),
+                    attachment_id: Some("att_00000000000000000000000000000000".into()),
+                    source_generation_id: None,
                     mode: "establish".into(),
-                    full_ref: "refs/heads/main".into(),
+                    full_ref: Some("refs/heads/main".into()),
                     expected_generation_id: None,
                     expected_pointer_sha256: None,
                     dry_run: false,

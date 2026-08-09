@@ -2325,11 +2325,24 @@ pub(crate) fn spawn_store_maintenance(state: &Arc<SharedState>) -> Result<()> {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "Git-source maintenance failed"),
                 }
-                match state
-                    .knowledge_sources
-                    .store()
-                    .maintain(&std::collections::BTreeSet::new())
-                {
+                let knowledge_maintenance = (|| -> anyhow::Result<_> {
+                    let mut protected = std::collections::BTreeSet::new();
+                    if let (Some(runtime), Some(catalog_store)) = (
+                        state.accepted_publications.as_ref(),
+                        state.project_authority.catalog_store(),
+                    ) {
+                        let snapshot = catalog_store
+                            .snapshot()
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        protected = runtime
+                            .protected_source_generation_roots(
+                                snapshot.catalog().projects.keys().cloned(),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    }
+                    state.knowledge_sources.store().maintain(&protected)
+                })();
+                match knowledge_maintenance {
                     Ok(report)
                         if report != bbox_knowledge_source_store::MaintenanceReport::default() =>
                     {

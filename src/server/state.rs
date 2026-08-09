@@ -2141,10 +2141,18 @@ pub(crate) struct AcceptedRuntimeView {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct BindingRuntimeView {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attachment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) producer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_generation_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pointer_sha256: Option<String>,
-    /// `attached`, `detached`, `unknown_attachment`, or `unbound`.
+    /// `attached`, `detached`, `unknown_attachment`, `producer`, or `unbound`.
     ///
     /// `detached` is the D-033 item 1 residual made observable: catalog
     /// detach does not take the publication lock, so a pointer can name a
@@ -2248,11 +2256,39 @@ impl SharedState {
                 // The pointer's own bytes are readable; whether the
                 // attachment it names is still attached is a CATALOG
                 // question, and the catalog is what could not be read.
-                status: "unknown_attachment",
+                status: match accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .map(|stamp| stamp.source().kind())
+                {
+                    Some("producer") => "producer",
+                    Some("attachment") => "unknown_attachment",
+                    _ => "unbound",
+                },
+                source_kind: accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .map(|stamp| stamp.source().kind()),
                 attachment_id: accepted_status
                     .as_ref()
                     .and_then(|status| status.binding_stamp())
-                    .map(|stamp| stamp.attachment_id().as_str().to_string()),
+                    .and_then(|stamp| stamp.attachment_id())
+                    .map(|id| id.as_str().to_string()),
+                producer_id: accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .and_then(|stamp| stamp.source().producer_id())
+                    .map(str::to_string),
+                source_generation_id: accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .and_then(|stamp| stamp.source().source_generation_id())
+                    .map(str::to_string),
+                source_generation_sha256: accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .and_then(|stamp| stamp.source().source_generation_sha256())
+                    .map(str::to_string),
                 pointer_sha256: accepted_status
                     .as_ref()
                     .and_then(|status| status.binding_stamp())
@@ -2308,11 +2344,20 @@ impl SharedState {
         let bound_attachment = accepted_status
             .as_ref()
             .and_then(|status| status.binding_stamp())
-            .map(|stamp| stamp.attachment_id().as_str().to_string());
+            .and_then(|stamp| stamp.attachment_id())
+            .map(|id| id.as_str().to_string());
         let binding = BindingRuntimeView {
-            status: match bound_attachment.as_deref() {
-                None => "unbound",
-                Some(attachment_id) => match rows
+            status: match (
+                accepted_status
+                    .as_ref()
+                    .and_then(|status| status.binding_stamp())
+                    .map(|stamp| stamp.source().kind()),
+                bound_attachment.as_deref(),
+            ) {
+                (Some("producer"), _) => "producer",
+                (None, _) => "unbound",
+                (_, None) => "unbound",
+                (_, Some(attachment_id)) => match rows
                     .iter()
                     .find(|row| row.attachment_id.as_str() == attachment_id)
                 {
@@ -2325,7 +2370,26 @@ impl SharedState {
                 .as_ref()
                 .and_then(|status| status.binding_stamp())
                 .map(|stamp| stamp.pointer_sha256().to_string()),
+            source_kind: accepted_status
+                .as_ref()
+                .and_then(|status| status.binding_stamp())
+                .map(|stamp| stamp.source().kind()),
             attachment_id: bound_attachment,
+            producer_id: accepted_status
+                .as_ref()
+                .and_then(|status| status.binding_stamp())
+                .and_then(|stamp| stamp.source().producer_id())
+                .map(str::to_string),
+            source_generation_id: accepted_status
+                .as_ref()
+                .and_then(|status| status.binding_stamp())
+                .and_then(|stamp| stamp.source().source_generation_id())
+                .map(str::to_string),
+            source_generation_sha256: accepted_status
+                .as_ref()
+                .and_then(|status| status.binding_stamp())
+                .and_then(|stamp| stamp.source().source_generation_sha256())
+                .map(str::to_string),
         };
 
         let attachments = rows
@@ -3552,9 +3616,10 @@ mod clause_three_exit_proof {
             .bbox_project_publisher_advance(Parameters(
                 crate::tools::project_catalog::ProjectPublisherAdvanceParams {
                     project_id: PROJECT.into(),
-                    attachment_id: CatalogFixture::attachment().as_str().to_string(),
+                    attachment_id: Some(CatalogFixture::attachment().as_str().to_string()),
+                    source_generation_id: None,
                     mode: "advance".into(),
-                    full_ref: "refs/heads/main".into(),
+                    full_ref: Some("refs/heads/main".into()),
                     expected_generation_id: status.accepted.generation_id.clone(),
                     expected_pointer_sha256: status.binding.pointer_sha256.clone(),
                     dry_run: false,

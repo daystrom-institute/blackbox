@@ -56,7 +56,8 @@ use bbox_corpus_index::index::TranscriptIndex;
 use bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause;
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::accepted_publication_runtime::{
-    AcceptedPublicationRuntime, PublishRequest, PublishSources, PublisherPublishMode,
+    AcceptedPublicationRuntime, AcceptedPublicationSourceBinding, PublishRequest, PublishSources,
+    PublisherPublishMode,
 };
 use bbox_indexing::index::schema_rebuild::SchemaRebuildResume;
 use bbox_indexing::project_catalog_backfill::{
@@ -2304,7 +2305,8 @@ fn a_legitimate_advance_after_apply_keeps_backfill_verify_valid() {
         .binding_stamp()
         .expect("migration installed a verified seeded binding")
         .attachment_id()
-        .clone();
+        .cloned()
+        .expect("migration seeded an attachment binding");
     let (expected_generation_id, expected_pointer_sha256) = runtime
         .advance_tokens(&project_id)
         .unwrap()
@@ -2317,7 +2319,7 @@ fn a_legitimate_advance_after_apply_keeps_backfill_verify_valid() {
                     expected_pointer_sha256,
                 },
                 project_id,
-                attachment_id,
+                source: AcceptedPublicationSourceBinding::Attachment { attachment_id },
                 scope: scope.clone(),
                 full_ref: "refs/heads/main".to_string(),
                 accepted_commit: "b".repeat(40),

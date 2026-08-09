@@ -23,11 +23,13 @@ use bbox_gaps::gaps::{BlockingLevel, GapImpact, GapKind, GapNote, GapResolution}
 use bbox_knowledge::knowledge::{
     Approval, Category, KnowledgeEdgeKind, KnowledgeEntry, Priority, Scope, Status,
 };
+use bbox_knowledge_source::validate_publication_generation_id;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 const ACCEPTED_PUBLICATION_VERSION: u32 = 1;
+const ACCEPTED_PUBLICATION_POINTER_V2: u32 = 2;
 const MAX_PROJECTS_BASENAME_BYTES: usize = 255;
 const MAX_FULL_REF_BYTES: usize = 1024;
 const MAX_RECORD_ID_BYTES: usize = 256;
@@ -506,9 +508,25 @@ pub(crate) struct AcceptedPublicationGenerationV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum AcceptedPublicationSourceBindingV2 {
+    Attachment {
+        attachment_id: AttachmentId,
+    },
+    Producer {
+        producer_id: String,
+        source_generation_id: String,
+        source_generation_sha256: PublicationSha256,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcceptedPublicationPriorPointerV1 {
-    pub(crate) attachment_id: AttachmentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attachment_id: Option<AttachmentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_binding: Option<AcceptedPublicationSourceBindingV2>,
     pub(crate) full_ref: FullPublisherRef,
     pub(crate) accepted_commit: GitObjectId,
     pub(crate) accepted_scope: PublishedScope,
@@ -521,7 +539,10 @@ pub(crate) struct AcceptedPublicationPriorPointerV1 {
 pub(crate) struct AcceptedPublicationPointerV1 {
     pub(crate) version: u32,
     pub(crate) project_id: ProjectId,
-    pub(crate) attachment_id: AttachmentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attachment_id: Option<AttachmentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_binding: Option<AcceptedPublicationSourceBindingV2>,
     pub(crate) full_ref: FullPublisherRef,
     pub(crate) accepted_commit: GitObjectId,
     pub(crate) accepted_scope: PublishedScope,
@@ -545,13 +566,100 @@ pub(crate) struct AcceptedGapSourceV1 {
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptedPublicationBuildInputV1 {
     pub(crate) project_id: ProjectId,
-    pub(crate) attachment_id: AttachmentId,
+    pub(crate) source_binding: AcceptedPublicationBuildSourceV1,
     pub(crate) scope: PublishedScope,
     pub(crate) full_ref: FullPublisherRef,
     pub(crate) accepted_commit: GitObjectId,
     pub(crate) knowledge: Vec<AcceptedKnowledgeSourceV1>,
     pub(crate) gaps: Vec<AcceptedGapSourceV1>,
     pub(crate) prior_pointer: Option<AcceptedPublicationPriorPointerV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AcceptedPublicationBuildSourceV1 {
+    Attachment(AttachmentId),
+    Producer {
+        producer_id: String,
+        source_generation_id: String,
+        source_generation_sha256: PublicationSha256,
+    },
+}
+
+fn validate_source_producer_id(value: &str) -> AcceptedPublicationStoreResult<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_pointer(
+            "accepted publication producer id is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_binding_v2(
+    binding: &AcceptedPublicationSourceBindingV2,
+) -> AcceptedPublicationStoreResult<()> {
+    match binding {
+        AcceptedPublicationSourceBindingV2::Attachment { .. } => Ok(()),
+        AcceptedPublicationSourceBindingV2::Producer {
+            producer_id,
+            source_generation_id,
+            ..
+        } => {
+            validate_source_producer_id(producer_id)?;
+            validate_publication_generation_id(source_generation_id)
+                .map_err(|error| invalid_pointer(error.to_string()))
+        }
+    }
+}
+
+fn prior_source_binding(
+    pointer: &AcceptedPublicationPriorPointerV1,
+) -> AcceptedPublicationStoreResult<AcceptedPublicationSourceBindingV2> {
+    match (&pointer.attachment_id, &pointer.source_binding) {
+        (Some(attachment_id), None) => Ok(AcceptedPublicationSourceBindingV2::Attachment {
+            attachment_id: attachment_id.clone(),
+        }),
+        (None, Some(binding)) => {
+            validate_source_binding_v2(binding)?;
+            Ok(binding.clone())
+        }
+        _ => Err(invalid_pointer(
+            "accepted publication prior arm must carry exactly one source binding",
+        )),
+    }
+}
+
+pub(crate) fn pointer_source_binding(
+    pointer: &AcceptedPublicationPointerV1,
+) -> AcceptedPublicationStoreResult<AcceptedPublicationSourceBindingV2> {
+    match pointer.version {
+        ACCEPTED_PUBLICATION_VERSION => match (&pointer.attachment_id, &pointer.source_binding) {
+            (Some(attachment_id), None) => Ok(AcceptedPublicationSourceBindingV2::Attachment {
+                attachment_id: attachment_id.clone(),
+            }),
+            _ => Err(invalid_pointer(
+                "version-1 accepted publication pointer must carry one attachment binding",
+            )),
+        },
+        ACCEPTED_PUBLICATION_POINTER_V2 => {
+            match (&pointer.attachment_id, &pointer.source_binding) {
+                (None, Some(binding)) => {
+                    validate_source_binding_v2(binding)?;
+                    Ok(binding.clone())
+                }
+                _ => Err(invalid_pointer(
+                    "version-2 accepted publication pointer must carry one typed source binding",
+                )),
+            }
+        }
+        _ => Err(invalid_pointer(
+            "accepted publication pointer has an unsupported version",
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1223,10 +1331,43 @@ pub(crate) fn prepare_accepted_publication_v1(
     if let Some(prior) = &input.prior_pointer {
         validate_prior_pointer_v1(prior)?;
     }
+    let write_v2 = matches!(
+        &input.source_binding,
+        AcceptedPublicationBuildSourceV1::Producer { .. }
+    ) || input
+        .prior_pointer
+        .as_ref()
+        .is_some_and(|prior| prior.source_binding.is_some());
+    let (attachment_id, source_binding) = match input.source_binding {
+        AcceptedPublicationBuildSourceV1::Attachment(attachment_id) if !write_v2 => {
+            (Some(attachment_id), None)
+        }
+        AcceptedPublicationBuildSourceV1::Attachment(attachment_id) => (
+            None,
+            Some(AcceptedPublicationSourceBindingV2::Attachment { attachment_id }),
+        ),
+        AcceptedPublicationBuildSourceV1::Producer {
+            producer_id,
+            source_generation_id,
+            source_generation_sha256,
+        } => (
+            None,
+            Some(AcceptedPublicationSourceBindingV2::Producer {
+                producer_id,
+                source_generation_id,
+                source_generation_sha256,
+            }),
+        ),
+    };
     let pointer = AcceptedPublicationPointerV1 {
-        version: ACCEPTED_PUBLICATION_VERSION,
+        version: if write_v2 {
+            ACCEPTED_PUBLICATION_POINTER_V2
+        } else {
+            ACCEPTED_PUBLICATION_VERSION
+        },
         project_id: input.project_id,
-        attachment_id: input.attachment_id,
+        attachment_id,
+        source_binding,
         full_ref: input.full_ref,
         accepted_commit: input.accepted_commit,
         accepted_scope: input.scope,
@@ -1503,6 +1644,7 @@ fn validate_normalized_gap_v1(gap: &AcceptedGapEntryV1) -> AcceptedPublicationSt
 fn validate_prior_pointer_v1(
     pointer: &AcceptedPublicationPriorPointerV1,
 ) -> AcceptedPublicationStoreResult<()> {
+    prior_source_binding(pointer)?;
     pointer
         .accepted_scope
         .validate()
@@ -1512,11 +1654,7 @@ fn validate_prior_pointer_v1(
 fn validate_pointer_v1(
     pointer: &AcceptedPublicationPointerV1,
 ) -> AcceptedPublicationStoreResult<()> {
-    if pointer.version != ACCEPTED_PUBLICATION_VERSION {
-        return Err(invalid_pointer(
-            "accepted publication pointer has an unsupported version",
-        ));
-    }
+    pointer_source_binding(pointer)?;
     pointer
         .accepted_scope
         .validate()
@@ -1609,6 +1747,20 @@ fn verify_generation_binding(
 pub(crate) enum VerifiedAcceptedPublicationSelectionV1 {
     Current,
     Prior,
+}
+
+pub(crate) fn selected_pointer_source_binding(
+    pointer: &AcceptedPublicationPointerV1,
+    selection: VerifiedAcceptedPublicationSelectionV1,
+) -> AcceptedPublicationStoreResult<AcceptedPublicationSourceBindingV2> {
+    match selection {
+        VerifiedAcceptedPublicationSelectionV1::Current => pointer_source_binding(pointer),
+        VerifiedAcceptedPublicationSelectionV1::Prior => pointer
+            .prior_pointer
+            .as_ref()
+            .ok_or_else(|| invalid_pointer("a prior selection requires a prior pointer"))
+            .and_then(prior_source_binding),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1763,6 +1915,39 @@ pub(crate) fn pointer_generation_roots_locked(
     let mut roots = vec![pointer.accepted_generation];
     if let Some(prior) = pointer.prior_pointer {
         roots.push(prior.accepted_generation);
+    }
+    Ok(Some(roots))
+}
+
+pub(crate) fn pointer_source_generation_roots_locked(
+    paths: &AcceptedPublicationStorePaths,
+    guard: &AcceptedPublicationLockGuard,
+    project_id: &ProjectId,
+    limits: &AcceptedPublicationLimits,
+) -> AcceptedPublicationStoreResult<Option<Vec<String>>> {
+    ensure_matching_guard(paths, guard)?;
+    limits.validate()?;
+    let Some(pointer_bytes) =
+        read_pointer_optional_locked(paths, project_id, limits.max_pointer_bytes)?
+    else {
+        return Ok(None);
+    };
+    let pointer = decode_pointer_v1(&pointer_bytes, limits)?;
+    let mut roots = Vec::new();
+    if let AcceptedPublicationSourceBindingV2::Producer {
+        source_generation_id,
+        ..
+    } = pointer_source_binding(&pointer)?
+    {
+        roots.push(source_generation_id);
+    }
+    if let Some(prior) = &pointer.prior_pointer
+        && let AcceptedPublicationSourceBindingV2::Producer {
+            source_generation_id,
+            ..
+        } = prior_source_binding(prior)?
+    {
+        roots.push(source_generation_id);
     }
     Ok(Some(roots))
 }
@@ -2007,6 +2192,7 @@ pub(crate) fn commit_pointer_locked(
                 || prepared_prior.accepted_scope != current.accepted_scope
                 || prepared_prior.full_ref != current.full_ref
                 || prepared_prior.attachment_id != current.attachment_id
+                || prepared_prior.source_binding != current.source_binding
             {
                 return Err(pointer_conflict(
                     "the prepared prior pointer does not match the installed pointer",
@@ -2110,7 +2296,15 @@ pub(crate) fn rebind_pointer_attachment_locked(
             "the expected scope disagrees with the pointer's accepted scope",
         ));
     }
-    pointer.attachment_id = new_attachment.clone();
+    if pointer.version == ACCEPTED_PUBLICATION_VERSION {
+        pointer.attachment_id = Some(new_attachment.clone());
+        pointer.source_binding = None;
+    } else {
+        pointer.attachment_id = None;
+        pointer.source_binding = Some(AcceptedPublicationSourceBindingV2::Attachment {
+            attachment_id: new_attachment.clone(),
+        });
+    }
     let encoded = encode_pointer_v1(&pointer, limits)?;
     let directory = NofollowDirectory::open_existing(paths.pointers())
         .map_err(accepted_io_error)?
@@ -2298,7 +2492,7 @@ pub(crate) mod fixtures {
         };
         let input = AcceptedPublicationBuildInputV1 {
             project_id: project_id.clone(),
-            attachment_id: attachment_id.clone(),
+            source_binding: AcceptedPublicationBuildSourceV1::Attachment(attachment_id.clone()),
             scope: scope.clone(),
             full_ref: FullPublisherRef::parse("refs/heads/main").unwrap(),
             accepted_commit: GitObjectId::parse(accepted_commit).unwrap(),
@@ -2320,6 +2514,7 @@ pub(crate) mod fixtures {
     ) -> AcceptedPublicationPriorPointerV1 {
         AcceptedPublicationPriorPointerV1 {
             attachment_id: prepared.pointer.attachment_id.clone(),
+            source_binding: prepared.pointer.source_binding.clone(),
             full_ref: prepared.pointer.full_ref.clone(),
             accepted_commit: prepared.pointer.accepted_commit.clone(),
             accepted_scope: prepared.pointer.accepted_scope.clone(),
@@ -2469,7 +2664,7 @@ mod tests {
     fn build_input() -> AcceptedPublicationBuildInputV1 {
         AcceptedPublicationBuildInputV1 {
             project_id: project_id(),
-            attachment_id: attachment_id(),
+            source_binding: AcceptedPublicationBuildSourceV1::Attachment(attachment_id()),
             scope: scope("."),
             full_ref: FullPublisherRef::parse("refs/heads/main").unwrap(),
             accepted_commit: GitObjectId::parse("a".repeat(40)).unwrap(),
@@ -2647,6 +2842,106 @@ mod tests {
                 .unwrap();
         assert_eq!(first.generation_bytes, second.generation_bytes);
         assert_eq!(first.generation_id, second.generation_id);
+    }
+
+    #[test]
+    fn version_one_pointer_round_trips_without_v2_fields() {
+        let prepared = prepared();
+        let value = serde_json::to_value(&prepared.pointer).unwrap();
+        assert_eq!(value["version"], 1);
+        assert!(value.get("attachment_id").is_some());
+        assert!(value.get("source_binding").is_none());
+        assert_eq!(
+            encode_pointer_v1(
+                &decode_pointer_v1(
+                    &prepared.pointer_bytes,
+                    &AcceptedPublicationLimits::default(),
+                )
+                .unwrap(),
+                &AcceptedPublicationLimits::default(),
+            )
+            .unwrap(),
+            prepared.pointer_bytes
+        );
+    }
+
+    #[test]
+    fn producer_pointer_v2_preserves_v1_prior_and_attachment_advance_stays_v2() {
+        let first = prepared();
+        let mut producer_input = build_input();
+        producer_input.accepted_commit = GitObjectId::parse("b".repeat(40)).unwrap();
+        producer_input.prior_pointer = Some(fixtures::prior_of(&first));
+        producer_input.source_binding = AcceptedPublicationBuildSourceV1::Producer {
+            producer_id: "producer-a".to_string(),
+            source_generation_id: format!("kps_{}", "1".repeat(64)),
+            source_generation_sha256: PublicationSha256::parse("2".repeat(64)).unwrap(),
+        };
+        let producer =
+            prepare_accepted_publication_v1(producer_input, &AcceptedPublicationLimits::default())
+                .unwrap();
+        assert_eq!(producer.pointer.version, ACCEPTED_PUBLICATION_POINTER_V2);
+        assert!(producer.pointer.attachment_id.is_none());
+        assert!(matches!(
+            pointer_source_binding(&producer.pointer).unwrap(),
+            AcceptedPublicationSourceBindingV2::Producer {
+                ref producer_id,
+                ref source_generation_id,
+                ..
+            } if producer_id == "producer-a" && source_generation_id.starts_with("kps_")
+        ));
+        let prior = producer.pointer.prior_pointer.as_ref().unwrap();
+        assert_eq!(prior.attachment_id, first.pointer.attachment_id);
+        assert!(prior.source_binding.is_none());
+        assert_eq!(
+            decode_pointer_v1(
+                &producer.pointer_bytes,
+                &AcceptedPublicationLimits::default(),
+            )
+            .unwrap(),
+            producer.pointer
+        );
+
+        let mut attachment_input = build_input();
+        attachment_input.accepted_commit = GitObjectId::parse("c".repeat(40)).unwrap();
+        attachment_input.prior_pointer = Some(fixtures::prior_of(&producer));
+        let attachment = prepare_accepted_publication_v1(
+            attachment_input,
+            &AcceptedPublicationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(attachment.pointer.version, ACCEPTED_PUBLICATION_POINTER_V2);
+        assert!(attachment.pointer.attachment_id.is_none());
+        assert!(matches!(
+            pointer_source_binding(&attachment.pointer).unwrap(),
+            AcceptedPublicationSourceBindingV2::Attachment { .. }
+        ));
+        assert!(matches!(
+            attachment
+                .pointer
+                .prior_pointer
+                .as_ref()
+                .and_then(|prior| prior.source_binding.as_ref()),
+            Some(AcceptedPublicationSourceBindingV2::Producer { .. })
+        ));
+    }
+
+    #[test]
+    fn pointer_versions_refuse_missing_ambiguous_and_invalid_source_bindings() {
+        let limits = AcceptedPublicationLimits::default();
+        let mut pointer = prepared().pointer;
+        pointer.version = ACCEPTED_PUBLICATION_POINTER_V2;
+        assert!(encode_pointer_v1(&pointer, &limits).is_err());
+
+        pointer.attachment_id = None;
+        pointer.source_binding = Some(AcceptedPublicationSourceBindingV2::Producer {
+            producer_id: "bad producer".to_string(),
+            source_generation_id: format!("kps_{}", "1".repeat(64)),
+            source_generation_sha256: PublicationSha256::parse("2".repeat(64)).unwrap(),
+        });
+        assert!(encode_pointer_v1(&pointer, &limits).is_err());
+
+        pointer.attachment_id = Some(attachment_id());
+        assert!(encode_pointer_v1(&pointer, &limits).is_err());
     }
 
     #[test]
@@ -2891,7 +3186,7 @@ mod tests {
 
         let before = verify_selected_locked(&paths, &guard, &project_id(), &limits).unwrap();
         let new_attachment = AttachmentId::parse("att_0000000000000000000000000000f001").unwrap();
-        assert_ne!(prepared.pointer.attachment_id, new_attachment);
+        assert_ne!(prepared.pointer.attachment_id, Some(new_attachment.clone()));
 
         let rebound = rebind_pointer_attachment_locked(
             &paths,
@@ -2913,7 +3208,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), "error.accepted_publication_invalid_pointer");
-        assert_eq!(rebound.attachment_id, new_attachment);
+        assert_eq!(rebound.attachment_id, Some(new_attachment));
         assert_eq!(rebound.full_ref, prepared.pointer.full_ref);
         assert_eq!(rebound.accepted_commit, prepared.pointer.accepted_commit);
         assert_eq!(
@@ -2939,6 +3234,7 @@ mod tests {
         let first = prepared();
         let prior = AcceptedPublicationPriorPointerV1 {
             attachment_id: first.pointer.attachment_id.clone(),
+            source_binding: first.pointer.source_binding.clone(),
             full_ref: first.pointer.full_ref.clone(),
             accepted_commit: first.pointer.accepted_commit.clone(),
             accepted_scope: first.pointer.accepted_scope.clone(),

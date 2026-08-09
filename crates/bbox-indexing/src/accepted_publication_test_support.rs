@@ -20,10 +20,10 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 
 use crate::accepted_publication_store::{
     AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
-    AcceptedPublicationGenerationId, AcceptedPublicationLimits, AcceptedPublicationPriorPointerV1,
-    AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId,
-    acquire_accepted_publication_lock, decode_pointer_v1, prepare_accepted_publication_v1,
-    rebind_pointer_attachment_locked,
+    AcceptedPublicationBuildSourceV1, AcceptedPublicationGenerationId, AcceptedPublicationLimits,
+    AcceptedPublicationPriorPointerV1, AcceptedPublicationStorePaths, FullPublisherRef,
+    GitObjectId, acquire_accepted_publication_lock, decode_pointer_v1,
+    prepare_accepted_publication_v1, rebind_pointer_attachment_locked,
 };
 
 /// One committed source file, byte-exact, as the publisher would have read
@@ -68,6 +68,7 @@ pub fn install_accepted_publication_for_test(
             let pointer = decode_pointer_v1(&bytes, &limits)?;
             Some(AcceptedPublicationPriorPointerV1 {
                 attachment_id: pointer.attachment_id,
+                source_binding: pointer.source_binding,
                 full_ref: pointer.full_ref,
                 accepted_commit: pointer.accepted_commit,
                 accepted_scope: pointer.accepted_scope,
@@ -81,7 +82,7 @@ pub fn install_accepted_publication_for_test(
     let prepared = prepare_accepted_publication_v1(
         AcceptedPublicationBuildInputV1 {
             project_id: project_id.clone(),
-            attachment_id: attachment_id.clone(),
+            source_binding: AcceptedPublicationBuildSourceV1::Attachment(attachment_id.clone()),
             scope: scope.clone(),
             full_ref: FullPublisherRef::parse(full_ref)?,
             accepted_commit: GitObjectId::parse(accepted_commit)?,

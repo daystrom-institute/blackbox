@@ -621,6 +621,7 @@ dependencies = [
  "bbox-git-source-store",
  "bbox-indexing",
  "bbox-knowledge",
+ "bbox-knowledge-source",
  "bbox-packets",
  "bbox-provenance",
  "bbox-slack",

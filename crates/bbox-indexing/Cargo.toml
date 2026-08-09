@@ -60,6 +60,7 @@ bbox-stores = { path = "../bbox-stores" }
 bbox-chunker = { path = "../bbox-chunker" }
 bbox-gaps = { path = "../bbox-gaps" }
 bbox-knowledge = { path = "../bbox-knowledge" }
+bbox-knowledge-source = { path = "../bbox-knowledge-source" }
 bbox-config = { path = "../bbox-config" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-edge-index = { path = "../bbox-edge-index" }

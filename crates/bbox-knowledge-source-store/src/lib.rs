@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -744,6 +744,17 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn publication_source_generation_sha256(
+    source: &StoredPublicationCandidateV1,
+    knowledge: &[SourceFileManifestEntryV1],
+    gaps: &[SourceFileManifestEntryV1],
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bbox-knowledge-publication-source-evidence-v1\0");
+    hasher.update(serde_json::to_vec(&(source, knowledge, gaps))?);
+    Ok(hex::encode(hasher.finalize()))
+}
+
 fn is_lower_hex(value: &str) -> bool {
     value
         .bytes()
@@ -994,6 +1005,58 @@ pub struct KnowledgeSourceStore {
     root: PathBuf,
     limits: RwLock<StoreLimits>,
     mutation: Mutex<()>,
+    publication_pins: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadyPublicationFile {
+    pub manifest: SourceFileManifestEntryV1,
+    pub source_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadyPublicationCandidate {
+    pub source_generation_id: String,
+    pub source_generation_sha256: String,
+    pub producer_id: String,
+    pub project_id: String,
+    pub descriptor: PublicationCandidateDescriptorV1,
+    pub observed_at_unix_secs: u64,
+    pub knowledge: Vec<ReadyPublicationFile>,
+    pub gaps: Vec<ReadyPublicationFile>,
+}
+
+#[derive(Debug)]
+pub struct PinnedReadyPublicationCandidate {
+    candidate: ReadyPublicationCandidate,
+    _pin: PublicationPinGuard,
+}
+
+impl PinnedReadyPublicationCandidate {
+    pub fn candidate(&self) -> &ReadyPublicationCandidate {
+        &self.candidate
+    }
+}
+
+#[derive(Debug)]
+struct PublicationPinGuard {
+    generation_id: String,
+    pins: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+impl Drop for PublicationPinGuard {
+    fn drop(&mut self) {
+        let Ok(mut pins) = self.pins.lock() else {
+            return;
+        };
+        let Some(count) = pins.get_mut(&self.generation_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            pins.remove(&self.generation_id);
+        }
+    }
 }
 
 impl KnowledgeSourceStore {
@@ -1007,6 +1070,7 @@ impl KnowledgeSourceStore {
             root,
             limits: RwLock::new(limits),
             mutation: Mutex::new(()),
+            publication_pins: Arc::new(Mutex::new(BTreeMap::new())),
         };
         store.recover()?;
         Ok(store)
@@ -1023,6 +1087,7 @@ impl KnowledgeSourceStore {
             root,
             limits: RwLock::new(limits),
             mutation: Mutex::new(()),
+            publication_pins: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -1287,6 +1352,66 @@ impl KnowledgeSourceStore {
             producer_id: producer_id.to_string(),
             project_id: index.project_id,
             scope: source.descriptor.scope,
+        })
+    }
+
+    pub fn pin_ready_publication_candidate(
+        &self,
+        generation_id: &str,
+    ) -> Result<PinnedReadyPublicationCandidate> {
+        validate_publication_generation_id(generation_id)?;
+        let _guard = self.lock_mutation()?;
+        let index = read_json::<PublicationGenerationIndexV1>(
+            &self.root.join("publications/generation-index"),
+            &format!("{generation_id}.json"),
+            MAX_GENERATION_RECORD_BYTES,
+            "publication generation index",
+        )?
+        .ok_or(StoreRequestError::NotFound)?;
+        if index.version != STORE_VERSION || index.source_generation_id != generation_id {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let source = self.load_publication_generation(&index.project_id, generation_id)?;
+        if source.state != SourceGenerationStateV1::Ready
+            || source.source_generation_id != generation_id
+            || source.producer_id != index.producer_id
+            || source.project_id != index.project_id
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let generation_path = self.publication_generation_path(&index.project_id, generation_id)?;
+        let (knowledge_manifest, gap_manifest) = load_publication_manifests(&generation_path)?;
+        validate_publication_candidate(
+            &source.descriptor,
+            &knowledge_manifest,
+            &gap_manifest,
+            self.current_limits()?.contract,
+        )?;
+        let knowledge = self.materialize_ready_publication_files(&knowledge_manifest)?;
+        let gaps = self.materialize_ready_publication_files(&gap_manifest)?;
+        let source_generation_sha256 =
+            publication_source_generation_sha256(&source, &knowledge_manifest, &gap_manifest)?;
+        let mut pins = self
+            .publication_pins
+            .lock()
+            .map_err(|_| anyhow!(StoreRequestError::InvalidState))?;
+        *pins.entry(generation_id.to_string()).or_insert(0) += 1;
+        drop(pins);
+        Ok(PinnedReadyPublicationCandidate {
+            candidate: ReadyPublicationCandidate {
+                source_generation_id: generation_id.to_string(),
+                source_generation_sha256,
+                producer_id: source.producer_id,
+                project_id: source.project_id,
+                descriptor: source.descriptor,
+                observed_at_unix_secs: source.created_unix_secs,
+                knowledge,
+                gaps,
+            },
+            _pin: PublicationPinGuard {
+                generation_id: generation_id.to_string(),
+                pins: Arc::clone(&self.publication_pins),
+            },
         })
     }
 
@@ -2373,6 +2498,29 @@ impl KnowledgeSourceStore {
         directory.atomic_replace(name, bytes)
     }
 
+    fn materialize_ready_publication_files(
+        &self,
+        manifest: &[SourceFileManifestEntryV1],
+    ) -> Result<Vec<ReadyPublicationFile>> {
+        manifest
+            .iter()
+            .map(|entry| {
+                let maximum = usize::try_from(entry.encoded_bytes)
+                    .map_err(|_| anyhow!(StoreRequestError::LimitExceeded))?;
+                let source_bytes = self
+                    .read_blob(&entry.content_sha256, maximum)?
+                    .ok_or(StoreRequestError::InvalidState)?;
+                if source_bytes.len() != maximum {
+                    bail!(StoreRequestError::InvalidState);
+                }
+                Ok(ReadyPublicationFile {
+                    manifest: entry.clone(),
+                    source_bytes,
+                })
+            })
+            .collect()
+    }
+
     fn read_blob(&self, hash: &str, maximum: usize) -> Result<Option<Vec<u8>>> {
         validate_blob_hash(hash)?;
         let Some(directory) =
@@ -2693,7 +2841,15 @@ impl KnowledgeSourceStore {
         protected_publication_generations: &BTreeSet<String>,
         now: u64,
     ) -> Result<MaintenanceReport> {
-        for generation in protected_publication_generations {
+        let mut protected_publication_generations = protected_publication_generations.clone();
+        protected_publication_generations.extend(
+            self.publication_pins
+                .lock()
+                .map_err(|_| anyhow!(StoreRequestError::InvalidState))?
+                .keys()
+                .cloned(),
+        );
+        for generation in &protected_publication_generations {
             validate_publication_generation_id(generation)?;
         }
         let (resumed_publication_retirements, resumed_provisional_retirements) =
@@ -2701,7 +2857,7 @@ impl KnowledgeSourceStore {
         let expired_uploads = self.expire_uploads(now)?;
         let expired_provisional_leases = self.expire_provisional_leases(now)?;
         let (new_publication_retirements, new_provisional_retirements) =
-            self.retire_old_generations(protected_publication_generations)?;
+            self.retire_old_generations(&protected_publication_generations)?;
         let retired_publication_generations =
             resumed_publication_retirements.saturating_add(new_publication_retirements);
         let retired_provisional_generations =
@@ -3948,6 +4104,69 @@ mod tests {
         assert!(!root.join("journals").join(journal_name).exists());
         assert_store_error(
             store.publication_status(&authority.producer_id, &generation),
+            StoreRequestError::NotFound,
+        );
+    }
+
+    #[test]
+    fn pinned_ready_candidate_materializes_exact_bytes_and_blocks_retention() {
+        let limits = StoreLimits {
+            retained_publication_generations: 1,
+            ..StoreLimits::default()
+        };
+        let (_temporary, _root, store) = test_store(limits);
+        let authority = publication_authority();
+        let (descriptor, knowledge, gaps) = publication_fixture();
+        let first = store
+            .begin_publication_upload(&authority, descriptor)
+            .unwrap();
+        put_publication_pages(&store, &authority, &first.upload_id, &knowledge, &gaps);
+        store
+            .missing_publication_blobs(&authority, &first.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_publication(&store, &authority, &first.upload_id);
+        let first_generation = store
+            .finalize_publication_upload(&authority, &first.upload_id)
+            .unwrap()
+            .source_generation_id;
+        let pinned = store
+            .pin_ready_publication_candidate(&first_generation)
+            .unwrap();
+        assert_eq!(pinned.candidate().knowledge.len(), 1);
+        assert_eq!(pinned.candidate().gaps.len(), 1);
+        assert_eq!(
+            pinned.candidate().knowledge[0].source_bytes,
+            KNOWLEDGE_BYTES
+        );
+        assert_eq!(pinned.candidate().gaps[0].source_bytes, GAP_BYTES);
+        assert_eq!(pinned.candidate().source_generation_sha256.len(), 64);
+
+        let mut second_descriptor = publication_fixture().0;
+        second_descriptor.publisher_commit = "2".repeat(40);
+        second_descriptor.knowledge = manifest(SourceLaneV1::Knowledge, &[]);
+        second_descriptor.gaps = manifest(SourceLaneV1::Gaps, &[]);
+        let second = store
+            .begin_publication_upload(&authority, second_descriptor)
+            .unwrap();
+        store
+            .missing_publication_blobs(&authority, &second.upload_id, None)
+            .unwrap();
+        store
+            .finalize_publication_upload(&authority, &second.upload_id)
+            .unwrap();
+
+        let protected = store.maintain_at(&BTreeSet::new(), u64::MAX).unwrap();
+        assert_eq!(protected.retired_publication_generations, 0);
+        assert!(
+            store
+                .publication_status(&authority.producer_id, &first_generation)
+                .is_ok()
+        );
+        drop(pinned);
+        let reclaimed = store.maintain_at(&BTreeSet::new(), u64::MAX).unwrap();
+        assert_eq!(reclaimed.retired_publication_generations, 1);
+        assert_store_error(
+            store.publication_status(&authority.producer_id, &first_generation),
             StoreRequestError::NotFound,
         );
     }

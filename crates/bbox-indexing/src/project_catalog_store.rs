@@ -3836,7 +3836,8 @@ fn validate_new_side_cross_roles(
         verify_pointer_generation_v1(&pointer, generation_bytes, &limits)
             .map_err(|error| fail(&error.to_string()))?;
         if &pointer.project_id != project_id
-            || &pointer.attachment_id != attachment_id
+            || pointer.attachment_id.as_ref() != Some(attachment_id)
+            || pointer.source_binding.is_some()
             || &pointer.full_ref != full_ref
             || &pointer.accepted_commit != accepted_commit
             || &pointer.accepted_scope != expected_scope
@@ -5471,10 +5472,16 @@ impl ProjectCatalogTransactionOwner {
                     "current accepted publication rewrites pinned publisher authority",
                 ));
             }
+            let pointer_attachment = pointer.attachment_id.as_ref().ok_or_else(|| {
+                ProjectCatalogStoreError::new(
+                    "error.project_catalog_migration_incomplete",
+                    "current accepted publication is not attachment-bound",
+                )
+            })?;
             let attachment = state
                 .attachments
                 .attachments
-                .get(&pointer.attachment_id)
+                .get(pointer_attachment)
                 .ok_or_else(|| {
                     ProjectCatalogStoreError::new(
                         "error.project_catalog_migration_incomplete",
@@ -10974,7 +10981,8 @@ mod tests {
         ImmutableAssetRoleV1,
     ) {
         use crate::accepted_publication_store::{
-            AcceptedPublicationBuildInputV1, prepare_accepted_publication_v1,
+            AcceptedPublicationBuildInputV1, AcceptedPublicationBuildSourceV1,
+            prepare_accepted_publication_v1,
         };
 
         let (mut registry, mut draft, _) = basic_migration_draft(path, legacy_bytes);
@@ -11036,7 +11044,7 @@ mod tests {
         let prepared = prepare_accepted_publication_v1(
             AcceptedPublicationBuildInputV1 {
                 project_id: project_id.clone(),
-                attachment_id: attachment_id.clone(),
+                source_binding: AcceptedPublicationBuildSourceV1::Attachment(attachment_id.clone()),
                 scope: scope.clone(),
                 full_ref: full_ref.clone(),
                 accepted_commit: accepted_commit.clone(),

@@ -21,9 +21,9 @@ use bbox_corpus_core::project_catalog::{
 };
 
 use crate::accepted_publication_runtime::{
-    AcceptedPublicationRuntime, ERROR_ACCEPTED_PUBLICATION_REF_MOVED,
-    ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED, PublishError, PublishReceipt,
-    PublishRequest, PublishSources, PublisherPublishMode,
+    AcceptedPublicationRuntime, AcceptedPublicationSourceBinding,
+    ERROR_ACCEPTED_PUBLICATION_REF_MOVED, ERROR_ACCEPTED_PUBLICATION_SCOPE_ADVANCE_REQUIRED,
+    PublishError, PublishReceipt, PublishRequest, PublishSources, PublisherPublishMode,
 };
 use crate::project_catalog_store::{
     ProjectCatalogCommit, ProjectCatalogStore, ProjectCatalogStoreError,
@@ -849,6 +849,54 @@ pub struct PublisherPublishRequest {
     pub dry_run: bool,
 }
 
+pub struct PublisherCandidatePublishProbe {
+    pub producer_id: String,
+    pub source_generation_id: String,
+    pub source_generation_sha256: String,
+    pub scope: PublishedScope,
+    pub full_ref: String,
+    pub accepted_commit: String,
+    pub sources: PublishSources,
+    pub revalidate_source: Box<dyn Fn() -> Result<(), PublishError> + Send + Sync>,
+}
+
+pub struct PublisherCandidatePublishRequest {
+    pub mode: PublisherPublishMode,
+    pub project_id: ProjectId,
+    pub source_generation_id: String,
+    pub expected_epoch: u64,
+    pub dry_run: bool,
+}
+
+pub fn preflight_candidate_publish_authority(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    project_id: &ProjectId,
+) -> std::result::Result<PublishedScope, PublishError> {
+    let state = store
+        .snapshot()
+        .map_err(|error| PublishError::refusal(error.code(), error.to_string()))?;
+    if state.epoch() != expected_epoch {
+        return Err(PublishError::refusal(
+            "error.project_catalog_stale_epoch",
+            "expected epoch does not match the current catalog epoch",
+        ));
+    }
+    let Some(project) = state.catalog().projects.get(project_id) else {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_unknown_project",
+            "the requested project is not in the catalog",
+        ));
+    };
+    let ProjectScope::Published(scope) = &project.scope else {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_scope_required",
+            "a legacy-local project has no published scope to publish at",
+        ));
+    };
+    Ok(scope.clone())
+}
+
 /// Read-only authority preflight for a publish (plan §7.2 steps 1 to 3).
 ///
 /// Catalog authority is decided BEFORE the caller opens a checkout. A
@@ -930,7 +978,9 @@ pub fn publish_accepted_publication(
         PublishRequest {
             mode: request.mode.clone(),
             project_id: request.project_id.clone(),
-            attachment_id: request.attachment_id.clone(),
+            source: AcceptedPublicationSourceBinding::Attachment {
+                attachment_id: request.attachment_id.clone(),
+            },
             scope: catalog_scope.clone(),
             full_ref: request.full_ref.clone(),
             accepted_commit: probe.resolved_commit.clone(),
@@ -972,6 +1022,74 @@ pub fn publish_accepted_publication(
                 "the full ref moved between preparation and the pointer swap",
             )),
         }
+    })
+}
+
+pub fn publish_accepted_publication_candidate(
+    store: &ProjectCatalogStore,
+    runtime: &AcceptedPublicationRuntime,
+    request: &PublisherCandidatePublishRequest,
+    probe: PublisherCandidatePublishProbe,
+) -> std::result::Result<PublishReceipt, PublishError> {
+    if request.source_generation_id != probe.source_generation_id {
+        return Err(PublishError::refusal(
+            "error.accepted_publication_candidate_stale",
+            "the selected source generation changed before preparation",
+        ));
+    }
+    let catalog_scope =
+        preflight_candidate_publish_authority(store, request.expected_epoch, &request.project_id)?;
+    if probe.scope != catalog_scope {
+        return Err(PublishError::refusal(
+            "error.project_catalog_admin_scope_mismatch",
+            "the publication candidate declares a different scope than the catalog",
+        ));
+    }
+    let prepared = runtime.prepare_publish(
+        PublishRequest {
+            mode: request.mode.clone(),
+            project_id: request.project_id.clone(),
+            source: AcceptedPublicationSourceBinding::Producer {
+                producer_id: probe.producer_id,
+                source_generation_id: probe.source_generation_id,
+                source_generation_sha256: probe.source_generation_sha256,
+            },
+            scope: catalog_scope.clone(),
+            full_ref: probe.full_ref,
+            accepted_commit: probe.accepted_commit,
+            dry_run: request.dry_run,
+        },
+        probe.sources,
+    )?;
+    if request.dry_run {
+        return Ok(PublishReceipt::dry_run(&prepared));
+    }
+    let expected_epoch = request.expected_epoch;
+    let project_id = request.project_id.clone();
+    let revalidate_source = probe.revalidate_source;
+    runtime.commit_publish(prepared, &mut || {
+        let fresh = store
+            .snapshot()
+            .map_err(|error| PublishError::refusal(error.code(), error.to_string()))?;
+        if fresh.epoch() != expected_epoch {
+            return Err(PublishError::refusal(
+                "error.project_catalog_stale_epoch",
+                "the catalog changed while the candidate publish was being committed",
+            ));
+        }
+        let Some(project) = fresh.catalog().projects.get(&project_id) else {
+            return Err(PublishError::refusal(
+                "error.project_catalog_admin_unknown_project",
+                "the project disappeared while the candidate publish was being committed",
+            ));
+        };
+        if project.scope != ProjectScope::Published(catalog_scope.clone()) {
+            return Err(PublishError::refusal(
+                "error.project_catalog_admin_scope_mismatch",
+                "the project scope changed while the candidate publish was being committed",
+            ));
+        }
+        revalidate_source()
     })
 }
 
@@ -1162,8 +1280,9 @@ pub fn bind_publisher_attachment(
         &limits,
     )
     .map_err(|error| admin_error(error.code(), error.to_string()))?;
+    let _ = rebound;
     Ok(PublisherBindReceipt {
-        attachment_id: rebound.attachment_id,
+        attachment_id: new_attachment.clone(),
         catalog_epoch: state.epoch(),
     })
 }
@@ -7075,7 +7194,8 @@ mod tests {
 mod publisher_publish_tests {
     use super::*;
     use crate::accepted_publication_runtime::{
-        AcceptedPublicationRuntime, PublishSourceFile, PublisherPublishMode,
+        AcceptedPublicationRuntime, AcceptedPublicationSourceBinding, PublishSourceFile,
+        PublisherPublishMode,
     };
     use crate::accepted_publication_store::fixtures;
     use bbox_corpus_core::project_catalog::CorpusProject;
@@ -7085,6 +7205,8 @@ mod publisher_publish_tests {
     const OTHER_ATTACHMENT: &str = "att_00000000000000000000000000000c02";
     const COMMIT_ONE: &str = "1111111111111111111111111111111111111111";
     const COMMIT_TWO: &str = "2222222222222222222222222222222222222222";
+    const SOURCE_GENERATION: &str =
+        "kps_1111111111111111111111111111111111111111111111111111111111111111";
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -7292,6 +7414,48 @@ mod publisher_publish_tests {
             }
         }
 
+        fn candidate_request(
+            &self,
+            mode: PublisherPublishMode,
+            dry_run: bool,
+        ) -> PublisherCandidatePublishRequest {
+            PublisherCandidatePublishRequest {
+                mode,
+                project_id: project_id(),
+                source_generation_id: SOURCE_GENERATION.into(),
+                expected_epoch: self.epoch(),
+                dry_run,
+            }
+        }
+
+        fn candidate_probe(
+            &self,
+            committed_scope: &PublishedScope,
+            commit: &str,
+            source_is_fresh: bool,
+        ) -> PublisherCandidatePublishProbe {
+            let attachment_probe = self.probe(committed_scope, commit);
+            PublisherCandidatePublishProbe {
+                producer_id: "producer-a".into(),
+                source_generation_id: SOURCE_GENERATION.into(),
+                source_generation_sha256: "2".repeat(64),
+                scope: committed_scope.clone(),
+                full_ref: "refs/heads/main".into(),
+                accepted_commit: commit.into(),
+                sources: attachment_probe.sources,
+                revalidate_source: Box::new(move || {
+                    if source_is_fresh {
+                        Ok(())
+                    } else {
+                        Err(PublishError::refusal(
+                            "error.accepted_publication_candidate_stale",
+                            "injected stale source candidate",
+                        ))
+                    }
+                }),
+            }
+        }
+
         fn establish(&self, commit: &str) -> Result<PublishReceipt, PublishError> {
             publish_accepted_publication(
                 &self.store,
@@ -7339,6 +7503,75 @@ mod publisher_publish_tests {
                 .accepted_commit(),
             COMMIT_TWO
         );
+    }
+
+    #[test]
+    fn candidate_establish_and_advance_use_producer_evidence_and_preserve_prior() {
+        let fixture = fixture();
+        let dry_run = publish_accepted_publication_candidate(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.candidate_request(PublisherPublishMode::Establish, true),
+            fixture.candidate_probe(&scope("."), COMMIT_ONE, true),
+        )
+        .unwrap();
+        assert!(dry_run.is_dry_run());
+        assert!(fixture.runtime.load_verified(&project_id()).is_err());
+
+        let established = fixture.establish(COMMIT_ONE).unwrap();
+        let tokens = fixture
+            .runtime
+            .advance_tokens(&project_id())
+            .unwrap()
+            .unwrap();
+        let advanced = publish_accepted_publication_candidate(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.candidate_request(
+                PublisherPublishMode::Advance {
+                    expected_generation_id: tokens.0,
+                    expected_pointer_sha256: tokens.1,
+                },
+                false,
+            ),
+            fixture.candidate_probe(&scope("."), COMMIT_TWO, true),
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.previous_pointer_sha256(),
+            Some(established.pointer_sha256())
+        );
+        let verified = fixture.runtime.load_verified(&project_id()).unwrap();
+        assert_eq!(verified.content_stamp().accepted_commit(), COMMIT_TWO);
+        assert!(matches!(
+            verified.binding_stamp().source(),
+            AcceptedPublicationSourceBinding::Producer {
+                producer_id,
+                source_generation_id,
+                ..
+            } if producer_id == "producer-a" && source_generation_id == SOURCE_GENERATION
+        ));
+        assert_eq!(
+            fixture
+                .runtime
+                .protected_source_generation_roots([project_id()])
+                .unwrap(),
+            std::collections::BTreeSet::from([SOURCE_GENERATION.to_string()])
+        );
+    }
+
+    #[test]
+    fn candidate_publish_rechecks_source_freshness_before_the_swap() {
+        let fixture = fixture();
+        let error = publish_accepted_publication_candidate(
+            &fixture.store,
+            &fixture.runtime,
+            &fixture.candidate_request(PublisherPublishMode::Establish, false),
+            fixture.candidate_probe(&scope("."), COMMIT_ONE, false),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "error.accepted_publication_candidate_stale");
+        assert!(fixture.runtime.load_verified(&project_id()).is_err());
     }
 
     #[test]
@@ -7622,7 +7855,7 @@ mod publisher_publish_tests {
 
         // The pointer names an attachment the catalog now reports detached.
         // That is the residual: a binding an operator repairs with bind.
-        let bound = verified.binding_stamp().attachment_id().clone();
+        let bound = verified.binding_stamp().attachment_id().cloned().unwrap();
         let state = fixture.store.snapshot().unwrap();
         assert_eq!(
             state.attachments().attachments.get(&bound).unwrap().status,

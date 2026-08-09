@@ -24,14 +24,16 @@ use parking_lot::RwLock;
 
 use crate::accepted_publication_store::{
     AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
-    AcceptedPublicationFaultInjector, AcceptedPublicationGenerationId,
-    AcceptedPublicationGenerationV1, AcceptedPublicationLimits, AcceptedPublicationLockGuard,
-    AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1, AcceptedPublicationStoreError,
+    AcceptedPublicationBuildSourceV1, AcceptedPublicationFaultInjector,
+    AcceptedPublicationGenerationId, AcceptedPublicationGenerationV1, AcceptedPublicationLimits,
+    AcceptedPublicationLockGuard, AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
+    AcceptedPublicationSourceBindingV2, AcceptedPublicationStoreError,
     AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId, PointerExpectationV1,
     PreparedAcceptedPublicationV1, VerifiedAcceptedPublicationSelectionV1,
     acquire_accepted_publication_lock, commit_pointer_locked, install_generation_off_lock,
     installed_pointer_tokens_locked, pointer_generation_roots_locked,
-    prepare_accepted_publication_v1, probe_global_store_locked,
+    pointer_source_generation_roots_locked, prepare_accepted_publication_v1,
+    probe_global_store_locked, selected_pointer_source_binding,
     verify_selected_with_binding_locked,
 };
 
@@ -245,9 +247,64 @@ impl AcceptedPublicationContentStamp {
 /// `pointer_sha256` digests the exact installed pointer bytes that were
 /// verified, so it is the token an advance compares against.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AcceptedPublicationSourceBinding {
+    Attachment {
+        attachment_id: AttachmentId,
+    },
+    Producer {
+        producer_id: String,
+        source_generation_id: String,
+        source_generation_sha256: String,
+    },
+}
+
+impl AcceptedPublicationSourceBinding {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Attachment { .. } => "attachment",
+            Self::Producer { .. } => "producer",
+        }
+    }
+
+    pub fn attachment_id(&self) -> Option<&AttachmentId> {
+        match self {
+            Self::Attachment { attachment_id } => Some(attachment_id),
+            Self::Producer { .. } => None,
+        }
+    }
+
+    pub fn producer_id(&self) -> Option<&str> {
+        match self {
+            Self::Attachment { .. } => None,
+            Self::Producer { producer_id, .. } => Some(producer_id),
+        }
+    }
+
+    pub fn source_generation_id(&self) -> Option<&str> {
+        match self {
+            Self::Attachment { .. } => None,
+            Self::Producer {
+                source_generation_id,
+                ..
+            } => Some(source_generation_id),
+        }
+    }
+
+    pub fn source_generation_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Attachment { .. } => None,
+            Self::Producer {
+                source_generation_sha256,
+                ..
+            } => Some(source_generation_sha256),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AcceptedPublicationBindingStamp {
     project_id: ProjectId,
-    attachment_id: AttachmentId,
+    source: AcceptedPublicationSourceBinding,
     pointer_sha256: String,
     selection: AcceptedPublicationSelection,
     accepted_scope: PublishedScope,
@@ -258,8 +315,12 @@ impl AcceptedPublicationBindingStamp {
         &self.project_id
     }
 
-    pub fn attachment_id(&self) -> &AttachmentId {
-        &self.attachment_id
+    pub fn source(&self) -> &AcceptedPublicationSourceBinding {
+        &self.source
+    }
+
+    pub fn attachment_id(&self) -> Option<&AttachmentId> {
+        self.source.attachment_id()
     }
 
     pub fn pointer_sha256(&self) -> &str {
@@ -571,7 +632,7 @@ pub struct PublishSources {
 pub struct PublishRequest {
     pub mode: PublisherPublishMode,
     pub project_id: ProjectId,
-    pub attachment_id: AttachmentId,
+    pub source: AcceptedPublicationSourceBinding,
     /// The catalog's current published scope. Advance always publishes at
     /// this scope, which is what clears a scope-migration bridge.
     pub scope: PublishedScope,
@@ -1013,6 +1074,30 @@ impl AcceptedPublicationRuntime {
         Ok(protected)
     }
 
+    pub fn protected_source_generation_roots<I>(
+        &self,
+        projects: I,
+    ) -> Result<BTreeSet<String>, AcceptedPublicationRuntimeError>
+    where
+        I: IntoIterator<Item = ProjectId>,
+    {
+        let guard = self.lock()?;
+        let mut roots = BTreeSet::new();
+        for project_id in projects {
+            if let Some(project_roots) = pointer_source_generation_roots_locked(
+                &self.paths,
+                &guard,
+                &project_id,
+                &self.limits,
+            )
+            .map_err(|error| AcceptedPublicationRuntimeError::from_store(&error))?
+            {
+                roots.extend(project_roots);
+            }
+        }
+        Ok(roots)
+    }
+
     /// Off-lock preparation (plan §7.2 and §4.6).
     ///
     /// Everything expensive happens here: normalization, dual-lane
@@ -1075,7 +1160,22 @@ impl AcceptedPublicationRuntime {
         let prepared = prepare_accepted_publication_v1(
             AcceptedPublicationBuildInputV1 {
                 project_id: request.project_id.clone(),
-                attachment_id: request.attachment_id,
+                source_binding: match request.source {
+                    AcceptedPublicationSourceBinding::Attachment { attachment_id } => {
+                        AcceptedPublicationBuildSourceV1::Attachment(attachment_id)
+                    }
+                    AcceptedPublicationSourceBinding::Producer {
+                        producer_id,
+                        source_generation_id,
+                        source_generation_sha256,
+                    } => AcceptedPublicationBuildSourceV1::Producer {
+                        producer_id,
+                        source_generation_id,
+                        source_generation_sha256: PublicationSha256::parse(
+                            source_generation_sha256,
+                        )?,
+                    },
+                },
                 scope: request.scope,
                 full_ref,
                 accepted_commit,
@@ -1291,9 +1391,17 @@ impl AcceptedPublicationRuntime {
                     generation_id: read.verified.generation_id.as_str().to_string(),
                     generation_hash: generation_hash.to_string(),
                 };
+                let source = match selected_pointer_source_binding(&read.pointer, selection) {
+                    Ok(source) => runtime_source_binding(source),
+                    Err(error) => {
+                        return ProjectReadOutcome::Corrupt(
+                            AcceptedPublicationRuntimeError::from_store(&error),
+                        );
+                    }
+                };
                 let binding_stamp = AcceptedPublicationBindingStamp {
                     project_id: read.pointer.project_id.clone(),
-                    attachment_id: read.pointer.attachment_id.clone(),
+                    source,
                     pointer_sha256: read.pointer_sha256.as_str().to_string(),
                     selection: AcceptedPublicationSelection::from_store(selection),
                     accepted_scope: generation.scope.clone(),
@@ -1384,10 +1492,30 @@ impl AcceptedPublicationRuntime {
     }
 }
 
+fn runtime_source_binding(
+    binding: AcceptedPublicationSourceBindingV2,
+) -> AcceptedPublicationSourceBinding {
+    match binding {
+        AcceptedPublicationSourceBindingV2::Attachment { attachment_id } => {
+            AcceptedPublicationSourceBinding::Attachment { attachment_id }
+        }
+        AcceptedPublicationSourceBindingV2::Producer {
+            producer_id,
+            source_generation_id,
+            source_generation_sha256,
+        } => AcceptedPublicationSourceBinding::Producer {
+            producer_id,
+            source_generation_id,
+            source_generation_sha256: source_generation_sha256.as_str().to_string(),
+        },
+    }
+}
+
 /// The prior arm an advance carries: the exact pointer it replaces.
 fn prior_pointer_from(pointer: &AcceptedPublicationPointerV1) -> AcceptedPublicationPriorPointerV1 {
     AcceptedPublicationPriorPointerV1 {
         attachment_id: pointer.attachment_id.clone(),
+        source_binding: pointer.source_binding.clone(),
         full_ref: pointer.full_ref.clone(),
         accepted_commit: pointer.accepted_commit.clone(),
         accepted_scope: pointer.accepted_scope.clone(),
@@ -1553,7 +1681,7 @@ mod tests {
 
         let binding = verified.binding_stamp();
         assert_eq!(binding.project_id(), &project_id);
-        assert_eq!(binding.attachment_id(), &attachment("a1"));
+        assert_eq!(binding.attachment_id(), Some(&attachment("a1")));
         assert_eq!(binding.pointer_sha256(), prepared.pointer_hash.as_str());
         assert_eq!(binding.selection(), AcceptedPublicationSelection::Current);
         assert_eq!(
@@ -1955,7 +2083,10 @@ mod tests {
         let rebound = runtime.load_verified(&project_id).unwrap();
         assert!(before.shares_content_with(&rebound));
         assert_eq!(before.content_stamp(), rebound.content_stamp());
-        assert_eq!(rebound.binding_stamp().attachment_id(), &rebound_attachment);
+        assert_eq!(
+            rebound.binding_stamp().attachment_id(),
+            Some(&rebound_attachment)
+        );
         assert_ne!(
             before.binding_stamp().pointer_sha256(),
             rebound.binding_stamp().pointer_sha256()
@@ -2106,7 +2237,9 @@ mod tests {
         PublishRequest {
             mode: PublisherPublishMode::Establish,
             project_id: project_id.clone(),
-            attachment_id: attachment("a1"),
+            source: AcceptedPublicationSourceBinding::Attachment {
+                attachment_id: attachment("a1"),
+            },
             scope: scope(),
             full_ref: "refs/heads/main".into(),
             accepted_commit: commit.into(),
@@ -2125,7 +2258,25 @@ mod tests {
                 expected_pointer_sha256: tokens.1,
             },
             project_id: project_id.clone(),
-            attachment_id: attachment("a1"),
+            source: AcceptedPublicationSourceBinding::Attachment {
+                attachment_id: attachment("a1"),
+            },
+            scope: scope(),
+            full_ref: "refs/heads/main".into(),
+            accepted_commit: commit.into(),
+            dry_run: false,
+        }
+    }
+
+    fn producer_request(project_id: &ProjectId, commit: &str) -> PublishRequest {
+        PublishRequest {
+            mode: PublisherPublishMode::Establish,
+            project_id: project_id.clone(),
+            source: AcceptedPublicationSourceBinding::Producer {
+                producer_id: "producer-a".into(),
+                source_generation_id: format!("kps_{}", "1".repeat(64)),
+                source_generation_sha256: "2".repeat(64),
+            },
             scope: scope(),
             full_ref: "refs/heads/main".into(),
             accepted_commit: commit.into(),
@@ -2197,6 +2348,79 @@ mod tests {
             .unwrap();
         assert!(roots.protects(&project_id, established.generation_id()));
         assert!(roots.protects(&project_id, advanced.generation_id()));
+    }
+
+    #[test]
+    fn producer_binding_survives_attachment_advance_prior_fallback_and_roots() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_producer_binding");
+        let source_generation_id = format!("kps_{}", "1".repeat(64));
+
+        let producer = run_publish(
+            &runtime,
+            producer_request(&project_id, COMMIT_ONE),
+            "producer",
+        )
+        .unwrap();
+        let verified = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(verified.binding_stamp().attachment_id(), None);
+        assert_eq!(verified.binding_stamp().source().kind(), "producer");
+        assert_eq!(
+            verified.binding_stamp().source().producer_id(),
+            Some("producer-a")
+        );
+        assert_eq!(
+            verified.binding_stamp().source().source_generation_id(),
+            Some(source_generation_id.as_str())
+        );
+        assert_eq!(
+            runtime
+                .protected_source_generation_roots([project_id.clone()])
+                .unwrap(),
+            BTreeSet::from([source_generation_id.clone()])
+        );
+
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let attachment_receipt = run_publish(
+            &runtime,
+            advance_request(&project_id, COMMIT_TWO, tokens),
+            "attachment",
+        )
+        .unwrap();
+        let current = runtime.load_verified(&project_id).unwrap();
+        assert_eq!(current.binding_stamp().source().kind(), "attachment");
+        assert_eq!(
+            current.binding_stamp().attachment_id(),
+            Some(&attachment("a1"))
+        );
+        assert_eq!(
+            runtime
+                .protected_source_generation_roots([project_id.clone()])
+                .unwrap(),
+            BTreeSet::from([source_generation_id.clone()])
+        );
+
+        fixtures::corrupt_generation(
+            &fixture.paths,
+            &project_id,
+            &AcceptedPublicationGenerationId::parse(attachment_receipt.generation_id().to_string())
+                .unwrap(),
+        );
+        let fallback = fixture.runtime().load_verified(&project_id).unwrap();
+        assert_eq!(
+            fallback.binding_stamp().selection(),
+            AcceptedPublicationSelection::Prior
+        );
+        assert_eq!(
+            fallback.content_stamp().generation_id(),
+            producer.generation_id()
+        );
+        assert_eq!(fallback.binding_stamp().source().kind(), "producer");
+        assert_eq!(
+            fallback.binding_stamp().source().source_generation_id(),
+            Some(source_generation_id.as_str())
+        );
     }
 
     #[test]
