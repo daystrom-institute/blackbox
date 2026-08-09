@@ -14,8 +14,8 @@ brief: "Move repo-owned knowledge and gap acquisition to checkout owners without
 
 # Remote knowledge source transport
 
-> **Status: proposed; current-HEAD inventory verified 2026-08-08 after GH-G
-> strict Git transport cutover.** This is the next locality-program arc. It
+> **Status: proposed; implementation through KT-D verified 2026-08-09.** KT-E
+> measured overlap and strict cutover is the next locality-program slice. This
 > consumes the shipped accepted-publication store, project-scoped producer
 > grants, typed Git transport, checkout identity, provisional overlay model,
 > and knowledge/gap merge gate. It does not reopen those semantics.
@@ -588,6 +588,17 @@ not a KT-C gate failure.
 
 ### KT-D: Remote provisional views, local mutations, and session binding
 
+Status: complete.
+
+Evidence: code commit `fe5d2f0d948c` passed exact-ref cluster workflow
+`bbox-verify-5jhp6`, including the full workspace nextest profile, clippy, and
+the concurrency gate. The implementation carries redacted workspace bindings
+through spawn and fleetd re-adoption, performs initial and post-write stable
+capture from the checkout owner, serves remote `own`/`all` overlays, confines
+project mutations to the harness, forwards global mutations, rejects ambiguous
+merge bases, retires stale generations after accepted-publication advance, and
+retires the selected generation on task teardown.
+
 1. Carry `WorkspaceId` through worktree lifecycle, spawn, session registry,
    replay/re-adoption, and redacted MCP binding.
 2. Select live remote generations into knowledge and gap overlay stores.
@@ -678,4 +689,4 @@ remote knowledge source named by
 consumes the semantics of
 [`checkout-identity-and-provisional-knowledge.md`](../corpus/knowledge/checkout-identity-and-provisional-knowledge.md)
 without superseding that design. GH-G and KT-A are complete and are no longer
-the next locality arc; KT-B is.
+the next locality arc. KT-A through KT-D are complete; KT-E is next.
