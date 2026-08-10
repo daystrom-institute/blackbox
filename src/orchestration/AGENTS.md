@@ -36,3 +36,13 @@ Domain home for the dispatch plane. Boundary contract:
   lacks `bro-harness` locally must still admit otherwise-eligible fleetd
   lanes. The pseudo-provider `workflow` remains non-dispatchable in either
   mode.
+
+## Cockpit dispatches use the interactive MCP surface
+
+- `Origin::Cockpit` workers use `surface=interactive`, which retains the
+  model-facing `bbox_render` capability required by the managed-workspace
+  locality wrapper. The external-client `default` surface deliberately hides
+  lifecycle tools including `bbox_render`, so routing a cockpit worker there
+  makes checkout-local render impossible even when workspace authority is
+  valid. Workflow workers remain on `agent-internal`; recursive agent and atom
+  dispatches remain on `default`.
