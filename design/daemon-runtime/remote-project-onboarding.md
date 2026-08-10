@@ -103,6 +103,31 @@ explicit project sets). It renders through the named compatibility lanes
 until an operator runs the relevant cutover ceremony for it. Knowledge
 transport coverage classifies it uncovered; nothing fails open.
 
+## 5a. Startup ordering decisions (from the 2026-08-10 live fire)
+
+Two fail-closed startup gates had to learn about onboarding before this flow
+could run, both proven against the live estate:
+
+1. **Producer grant admission.** The producer-auth constructor resolved every
+   configured scope against the catalog at startup and refused to boot on an
+   unregistered scope, which made "add the scope to the daemon config first"
+   impossible. A configured catalog-mode scope with no project is now admitted
+   as pending-onboarding: it is excluded from every publication lane and only
+   the onboard endpoint may accept it. Bridge-mode resolution still fails
+   closed. Proven: the 2026-08-10 deploy with a pre-registered scope refused
+   boot with `code-collection scope is not registered`.
+2. **Marker verify vs. crash-wedged staging.** The code-source locality
+   startup verify required every covered project's active generation to be in
+   state `Active`, but a crash between the activation journal write and the
+   final state flip leaves a completed staging wedged at `StagingIndex`, and
+   the reconciler that would repair it runs after the gate. The gate now
+   checks the workspace manifest and activation journal first and accepts
+   `StagingIndex` when both agree (staging completed; only the flip was lost);
+   any other non-Active state still refuses. Proven live: the 2026-08-10 OOM
+   during post-reindex activation wedged one project exactly this way and
+   bricked startup until the state was repaired by hand; the regression test
+   wedges a fixture the same way.
+
 ## 6. Non-goals
 
 - No agent self-service registration.

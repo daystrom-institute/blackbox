@@ -1096,7 +1096,17 @@ async fn catalog_onboard(
     request
         .validate()
         .map_err(|error| HttpError::unprocessable("invalid_onboard_request", error.to_string()))?;
-    require_scope(&grant, &request.scope)?;
+    if let Err(forbidden) = require_scope(&grant, &request.scope) {
+        // A configured-but-unregistered scope is usable ONLY here: it is the
+        // onboarding case. Publication lanes keep their plain grant check.
+        if !state
+            .code_sources
+            .producer_auth()
+            .is_pending_onboard_scope(&request.scope)
+        {
+            return Err(forbidden);
+        }
+    }
     let store = state
         .project_authority
         .catalog_store()
@@ -7593,6 +7603,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_onboard_route_admits_a_pending_onboarding_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            &catalog_projects_path,
+        )
+        .unwrap();
+        let state = Arc::new(SharedState::for_test_catalog(&root, &catalog_projects_path));
+        let token_secret = "9".repeat(64);
+        let token = bro_rpc::ServiceToken::parse(token_secret.clone()).unwrap();
+        // The pending scope is operator-configured but not in any grant's
+        // registered project set, mirroring a scope awaiting onboarding.
+        let pending = PublishedScope::try_new("repo_pending", ".").unwrap();
+        state.code_sources.install_auth_for_test(Arc::new(
+            ProducerAuthRuntime::for_test_with_pending(
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "onboard-producer".into(),
+                        projects: BTreeMap::new(),
+                    },
+                )],
+                BTreeSet::from([pending.clone()]),
+            ),
+        ));
+        let app = router(state.clone()).with_state(state);
+
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &token_secret,
+                Body::from(serde_json::to_vec(&onboard_request(&pending)).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let receipt: CatalogOnboardResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert!(receipt.created_project);
+    }
+
+    #[tokio::test]
     async fn code_source_http_routes_preserve_auth_not_found_and_store_limit_semantics() {
         let directory = tempfile::tempdir().unwrap();
         let scope = PublishedScope::try_new("http-limits", ".").unwrap();
@@ -8309,16 +8364,21 @@ mod tests {
                 ProjectScope::Published(other_scope),
             )],
         );
-        let error = build_snapshot(
+        // Remote onboarding (remote-project-onboarding.md §5a): startup
+        // admits a configured-but-unregistered catalog scope as
+        // pending-onboarding instead of refusing to boot. The scope stays out
+        // of the producer grant, so publication lanes keep refusing it.
+        let snapshot = build_snapshot(
             &catalog_grant_config(&base, &token_file, &scope),
             &[],
             Some(&unknown),
             None,
             &broker,
         )
-        .map(|_| ())
-        .expect_err("an unregistered scope must fail closed");
-        assert_eq!(error.to_string(), "code-collection scope is not registered");
+        .expect("an unregistered catalog scope is admitted as pending onboarding");
+        assert!(snapshot.auth.is_pending_onboard_scope(&scope));
+        let grant = snapshot.auth.authenticate(&"b".repeat(64)).unwrap();
+        assert!(!grant.projects.contains_key(&scope));
     }
 
     /// The collision arm is defense in depth: `validate_catalog` already
@@ -8467,7 +8527,7 @@ mod tests {
     /// the daemon ever binds its HTTP listener. The typed AuthTable is not
     /// constructed on failure.
     #[test]
-    fn catalog_mode_cold_open_refuses_an_unresolved_scope_before_bind() {
+    fn catalog_mode_cold_open_admits_an_unresolved_scope_as_pending_onboarding() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let state_dir = root.join("state");
@@ -8493,18 +8553,19 @@ mod tests {
         );
 
         // Cold open: no existing store, fresh state dir. The configured
-        // scope is not in the catalog, so resolution must fail closed.
-        let error = build_snapshot(
+        // scope is not in the catalog, so it is admitted as pending
+        // onboarding (usable only by the onboard endpoint) rather than
+        // refusing startup.
+        let snapshot = build_snapshot(
             &catalog_grant_config(&base, &token_file, &configured_scope),
             &[],
             Some(&catalog),
             None,
             &broker,
         )
-        .map(|_| ())
-        .expect_err("catalog-mode cold-open must refuse an unresolved scope");
-        assert_eq!(error.to_string(), "code-collection scope is not registered");
-        // No leases were acquired during the failed cold-open.
+        .expect("cold open admits an unresolved catalog scope as pending onboarding");
+        assert!(snapshot.auth.is_pending_onboard_scope(&configured_scope));
+        // No leases were acquired during the cold-open.
         let attempted: u64 = broker
             .health()
             .operations
@@ -8513,7 +8574,7 @@ mod tests {
             .sum();
         assert_eq!(
             attempted, 0,
-            "the failed cold-open must not have acquired any lease"
+            "the cold-open must not have acquired any lease"
         );
     }
 

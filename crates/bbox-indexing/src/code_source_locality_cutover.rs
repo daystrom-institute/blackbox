@@ -454,9 +454,6 @@ fn current_generation_evidence(
         bail!("code-source locality cutover requires a current generation");
     };
     activation.validate_against_generation(&generation)?;
-    if generation.state != GenerationState::Active {
-        bail!("code-source locality cutover requires an active generation");
-    }
     let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
     let entry = manifest
@@ -472,6 +469,16 @@ fn current_generation_evidence(
         || entry.active_snapshot.as_deref() != Some(expected_snapshot.as_str())
     {
         bail!("active collected generation disagrees with the workspace manifest");
+    }
+    // A staging-index state with the workspace manifest and the activation
+    // journal in full agreement is a completed activation whose final state
+    // flip was lost to a crash; the reconciler flips it to Active right
+    // after startup. The agreement checks above are what distinguish that
+    // from a genuinely incomplete staging, which still fails closed.
+    if generation.state != GenerationState::Active
+        && generation.state != GenerationState::StagingIndex
+    {
+        bail!("code-source locality cutover requires an active generation");
     }
     Ok(CodeSourceLocalityGenerationEvidenceV1 {
         project_id: activation.project_id,
@@ -1145,5 +1152,65 @@ mod tests {
             format!("{error:#}").contains("changed after cutover"),
             "unexpected verification error: {error:#}"
         );
+    }
+
+    #[test]
+    fn verify_tolerates_a_crash_wedged_completed_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, scope) = current_v2_fixture(&root);
+        let report_path = root.join("code-source-locality-report.json");
+
+        let preflight = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::preflight(
+            CodeSourceLocalityCutoverPreflightRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path: report_path.clone(),
+                project_ids: vec![project_id.clone()],
+                min_quiet_secs: MIN_CODE_SOURCE_LOCALITY_QUIET_SECS,
+                generated_at: "2026-08-09T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(preflight.status, "preflight_clean");
+        let mut report: CodeSourceLocalityCutoverReportV1 =
+            read_json_required(&report_path).unwrap();
+        report.generated_at_unix_secs =
+            now_unix_secs().saturating_sub(MIN_CODE_SOURCE_LOCALITY_QUIET_SECS);
+        write_json(&report_path, &report).unwrap();
+        let generation_id = report.rows[0].generation.generation_id.clone();
+        ProjectCatalogCodeSourceLocalityCutoverFacadeV1::apply(
+            CodeSourceLocalityCutoverApplyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path,
+                applied_at: "2026-08-09T00:05:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        // Wedge: staging completed (manifest, journal, and index all agree,
+        // which the preflight established) but the final state flip was lost,
+        // as when a crash lands between journal write and state flip.
+        let store = CodeSourceStore::open_with_mode(
+            config.paths.state_dir.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        store
+            .mark_generation_state_mixed(
+                &scope,
+                &generation_id,
+                GenerationState::StagingIndex,
+                None,
+            )
+            .unwrap();
+
+        let verified = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 { layout, config },
+        )
+        .unwrap();
+        assert_eq!(verified.status, "verified");
     }
 }

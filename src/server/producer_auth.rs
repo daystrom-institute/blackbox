@@ -62,6 +62,20 @@ impl RepoTransportGrantError {
     }
 }
 
+/// A configured producer scope with no catalog project yet. Only the catalog
+/// onboarding endpoint may use it; every publication lane keeps refusing it
+/// until onboarding attaches the project.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnregisteredCatalogScope;
+
+impl std::fmt::Display for UnregisteredCatalogScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("code-collection scope is pending onboarding")
+    }
+}
+
+impl std::error::Error for UnregisteredCatalogScope {}
+
 /// Immutable replacement snapshot. `CodeSourceRuntime` swaps this only after
 /// every token, scope, and whole-repo relationship validates.
 pub(crate) struct ProducerAuthRuntime {
@@ -70,6 +84,9 @@ pub(crate) struct ProducerAuthRuntime {
     knowledge_transport_enabled: bool,
     entries: Vec<AuthEntry>,
     scope_to_project: BTreeMap<PublishedScope, ProjectId>,
+    /// Configured grant scopes with no catalog project yet. Startup admits
+    /// them so onboarding can run; only the onboard endpoint may accept them.
+    pending_onboard_scopes: BTreeSet<PublishedScope>,
     #[cfg(test)]
     producer_to_scopes: BTreeMap<String, BTreeSet<PublishedScope>>,
     project_to_repo_history: BTreeMap<ProjectId, RepoHistoryId>,
@@ -160,6 +177,7 @@ impl ProducerAuthRuntime {
 
         let mut entries = Vec::new();
         let mut scope_to_project = BTreeMap::new();
+        let mut pending_onboard_scopes = BTreeSet::new();
         #[cfg(test)]
         let mut producer_to_scopes = BTreeMap::new();
         let mut producer_ids = BTreeSet::new();
@@ -188,12 +206,32 @@ impl ProducerAuthRuntime {
                 if !assigned_scopes.insert(scope.clone()) {
                     bail!("code-collection scope is assigned more than once");
                 }
-                let project_id = resolve_grant_scope(&resolution, scope)?;
-                if let GrantScopeResolution::Catalog { catalog } = &resolution {
-                    scope_to_project
-                        .insert(scope.clone(), resolve_catalog_project(catalog, scope)?);
+                match resolve_grant_scope(&resolution, scope) {
+                    Ok(project_id) => {
+                        if let GrantScopeResolution::Catalog { catalog } = &resolution {
+                            scope_to_project
+                                .insert(scope.clone(), resolve_catalog_project(catalog, scope)?);
+                        }
+                        resolved.insert(scope.clone(), project_id);
+                    }
+                    Err(error) => {
+                        // A catalog-mode scope with no project yet is pending
+                        // onboarding: admit it at startup so the onboard
+                        // endpoint can attach it, and keep it out of every
+                        // publication lane until then.
+                        let pending = matches!(resolution, GrantScopeResolution::Catalog { .. })
+                            && error.downcast_ref::<UnregisteredCatalogScope>().is_some();
+                        if pending {
+                            pending_onboard_scopes.insert(scope.clone());
+                            tracing::info!(
+                                scope = %format_args!("{}/{}", scope.repo_id(), scope.bbox_root_relpath()),
+                                "code-collection scope is pending onboarding"
+                            );
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
-                resolved.insert(scope.clone(), project_id);
             }
             #[cfg(test)]
             producer_to_scopes.insert(
@@ -224,6 +262,7 @@ impl ProducerAuthRuntime {
             knowledge_transport_enabled: config.code_collection.knowledge_transport_enabled,
             entries,
             scope_to_project,
+            pending_onboard_scopes,
             #[cfg(test)]
             producer_to_scopes,
             project_to_repo_history,
@@ -240,6 +279,7 @@ impl ProducerAuthRuntime {
             knowledge_transport_enabled: false,
             entries: Vec::new(),
             scope_to_project: BTreeMap::new(),
+            pending_onboard_scopes: BTreeSet::new(),
             #[cfg(test)]
             producer_to_scopes: BTreeMap::new(),
             project_to_repo_history: BTreeMap::new(),
@@ -264,6 +304,7 @@ impl ProducerAuthRuntime {
                 .map(|(token, grant)| AuthEntry { token, grant })
                 .collect(),
             scope_to_project: BTreeMap::new(),
+            pending_onboard_scopes: BTreeSet::new(),
             producer_to_scopes: BTreeMap::new(),
             project_to_repo_history: BTreeMap::new(),
             repo_grants: BTreeMap::new(),
@@ -306,11 +347,28 @@ impl ProducerAuthRuntime {
             knowledge_transport_enabled: true,
             entries,
             scope_to_project,
+            pending_onboard_scopes: BTreeSet::new(),
             producer_to_scopes,
             project_to_repo_history: projection.project_to_repo_history,
             repo_grants: projection.grants,
             catalog_mode: true,
         }
+    }
+
+    /// True when the scope is operator-configured but has no catalog project
+    /// yet. Only the catalog onboarding endpoint may admit such a scope.
+    pub(crate) fn is_pending_onboard_scope(&self, scope: &PublishedScope) -> bool {
+        self.pending_onboard_scopes.contains(scope)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_pending(
+        entries: Vec<(ServiceToken, ProducerGrant)>,
+        pending: BTreeSet<PublishedScope>,
+    ) -> Self {
+        let mut runtime = Self::for_test(true, false, entries);
+        runtime.pending_onboard_scopes = pending;
+        runtime
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -509,7 +567,7 @@ pub(crate) fn resolve_catalog_project(
         .collect();
     let [project_id] = matching.as_slice() else {
         if matching.is_empty() {
-            bail!("code-collection scope is not registered");
+            return Err(anyhow::Error::new(UnregisteredCatalogScope));
         }
         bail!("code-collection scope resolves to multiple registered projects");
     };
