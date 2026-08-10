@@ -15,6 +15,7 @@ Updated: 2026-08-10
 - Authenticated checkout-local `bro provenance export` completed 210 pages for generation `28e9b7a85b7eb2b57084f2bc4b047c9a60e54940051b1efe3e52c844f171c4b1`: 671 existing note documents were unchanged, 0 were rejected, and no stale-generation restart occurred. The export caused a real sidecar rebuild while the daemon continued serving; that rebuild converged in 10.3 seconds and the graph remained intact.
 - The current catalog has 19 projects and all 19 are Published. The blame locality marker is applied and offline-verified for the full set at catalog epoch 49. Marker checksum: `f3ed9e9e95e3448cccda2b7d90ab4599d319ad70b07ac683410a31a83ecaf422`.
 - After the marked daemon restart, corpus-entity `bbox_blame` refuses with `error.blame_locality_required` before any checkout acquisition. Authenticated checkout-local `bro blame` succeeds against a real file and line. The checkout observation sequence remains exactly 327234; only the expected operator completion advanced the blame observation sequence from 169 to 170. The pod remains ready with zero restarts.
+- Managed project render is now live-accepted for one disposable Published checkout. The `published`, `all`, and `own` views each produced an all-provider, non-dry-run receipt with three writes and zero refusals. The three provider projections were written by the checkout-owner harness, while the complete daemon checkout-observation file remained byte-for-byte unchanged at sequence 327234 with no `render_file_provider` counter. The pod remained ready with zero restarts.
 
 ## Landed implementation
 
@@ -25,8 +26,10 @@ Updated: 2026-08-10
 - `035f42e49b0f`: moved fleetd provider-binary eligibility to the executor host instead of testing the containerized daemon host.
 - `e450bdd5c477`: preserved the interactive MCP surface for direct cockpit dispatches while keeping workflow and recursive automation on their restricted surfaces.
 - `78b994d923dc`: added typed MCP host-authority configuration, the `BBOX_MCP_ALLOWED_HOSTS` override, strict validation, and rmcp server wiring.
+- `cbcdd2748070`: repaired standalone harness locality configuration lookup across task-local and process environment forms.
+- `391eb8c6d419`: admitted the daemon-authored source endpoint only through the managed harness's explicit encrypted-network policy and made fatal harness startup errors independent of inherited log filters.
 - Every deployed implementation commit passed its full cluster verification gate. Image build `build-bbox-image-lmkmn` produced the current immutable cage digest.
-- The live Pulumi deployment is pinned to the current exact image digest. The matching cage source changes remain uncommitted until managed-render acceptance succeeds.
+- The live Pulumi deployment is pinned to the current exact image digest. Cage commit `f44dca1a1803617a376cbae43a22d134a4d78169` records and publishes the matching worker routing and image pin.
 
 ## Verified repair
 
@@ -52,18 +55,18 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 ## Next operations
 
 1. Migrate the hand-authored provider guidance into provider-neutral project documentation and reviewed knowledge without losing content.
-2. Generate successful all-provider `published`, `all`, and `own` render completions without daemon checkout access.
+2. Generate the same successful all-provider `published`, `all`, and `own` render completions for the remaining 18 Published projects without daemon checkout access.
 3. Run the render locality preflight, quiet window, offline marker apply, restart, and strict refusal/successor probes.
 4. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
 
 ## Next-lane inventory
 
-- Production has no `render-locality-observations.json`, no render locality marker, and no `RenderFileProvider` target counters. The render cutover is therefore not preflight-ready: each selected project first needs successful managed all-provider writes for the `published`, `all`, and `own` views.
+- Production now has three accepted render-locality observations for one Published project and still has no render locality marker or `RenderFileProvider` target counters. The render cutover is not yet preflight-ready: the remaining 18 selected projects need successful managed all-provider writes for the `published`, `all`, and `own` views.
 - The 19 bound checkout roots are mapped and none of their four instruction targets is currently dirty. Seven already have all three blackbox-managed provider files; one has all three provider files absent. The other eleven contain hand-authored provider guidance that render must preserve rather than overwrite: eleven `CLAUDE.md` files and nine `AGENTS.md` files. `GEMINI.md` is managed in seven checkouts and absent in twelve. Only six checkouts currently have a nonempty `PROJECT.md`.
-- Eight checkouts can accept provider writes immediately. The other eleven need deliberate bootstrap/decomposition first, and every checkout still needs a managed plan proving that each view produces three written projections rather than skipped output.
+- One of the eight immediately writable checkouts has completed the full three-view managed proof. Seven more can accept provider writes immediately. The other eleven need deliberate bootstrap/decomposition first, and every remaining checkout needs a managed plan proving that each view produces three written projections rather than skipped output.
 - Historical checkout counters show the already-governed Git history, collected source, publisher, knowledge, artifact-watch, and blame paths refusing their daemon checkout lanes. The remaining explicit work is project render evidence plus the separately scoped bridge/raw compatibility categories; global render remains host-local by design.
 
-## In-flight managed-render acceptance
+## Managed-render acceptance
 
 - The first managed render dispatch exposed a separate executor-boundary regression: the allocator rejected every fleetd lane as `provider_binary_missing` because it resolved `bro-harness` on the containerized daemon host, even though fleetd owns the worker process and its login-shell `PATH`.
 - Commit `035f42e49b0f` makes provider-binary eligibility executor-local. Local execution retains the daemon-host binary gate, fleetd execution defers final resolution to the worker host, and the non-dispatchable workflow pseudo-provider still fails closed. Full local and cluster verification passed, image build `build-bbox-image-cb45d` succeeded, and digest `sha256:025872bdd9db0b877a0744620d411b499600db8a63ebc094fdcb5495bba08fdd` is deployed with zero restarts. Live allocator preview reports `executor_host` and admits a pinned remote lane without a daemon-host harness binary.
@@ -74,11 +77,16 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 - Cage now derives a worker-only MCP URL from the stable daemon ClusterIP and routes it over the accepted encrypted cage subnet. The direct path returns health 200, but exact MCP initialize exposed one more daemon defect: `BBOX_MCP_ALLOWED_HOSTS` was present in the deployment yet ignored by blackboxd, so rmcp returned `403 Forbidden: Host header is not allowed` and the harness again loaded zero tools.
 - Commit `78b994d923dc` repaired the host-authority defect, passed full cluster verification, and is live by immutable digest. Direct MCP initialize with the exact daemon ClusterIP authority now returns HTTP 200 and a valid interactive session without a workspace token.
 - The first managed render dispatch after that repair received a valid workspace binding, loaded `mcp__blackbox__bbox_render`, and reached the daemon. Its first `published` call failed closed with `error.render_locality_required`; `all` and `own` were deliberately not attempted after the first failure. No provider file was changed.
-- The current defect is in standalone harness locality installation. The daemon injects the binding, source URL, and published scope into the child process environment, but `install_project_mutation_routes` reads only `ToolCx.session_env`, whose standalone task-local snapshot is empty by design. The raw MCP tool therefore bypasses `LocalRenderTool` even though daemon authentication succeeds.
-- The in-flight repair resolves those three daemon-authored values through the established task-local-then-process environment seam and adds a regression proving tool-context precedence plus standalone fallback. Acceptance remains incomplete until the exact repair passes verification, is deployed, and all three views produce local writes and durable path-free receipts with unchanged daemon checkout counters.
+- The next dispatch exposed a standalone harness locality-installation defect. The daemon injected the binding, source URL, and published scope into the child process environment, but `install_project_mutation_routes` read only `ToolCx.session_env`, whose standalone task-local snapshot is empty by design. The raw MCP tool therefore bypassed `LocalRenderTool` even though daemon authentication succeeded.
+- The resulting repair resolves those three daemon-authored values through the established task-local-then-process environment seam and adds a regression proving tool-context precedence plus standalone fallback.
 - Commit `cbcdd2748070` contains that standalone environment repair, passed the full cluster gate, and was installed as the stablesigned arm64 host harness with its prior binary preserved. The matching linux image build also succeeded but was not deployed because this change belongs to the worker harness, not the cage daemon.
 - The first repaired startup then exposed a transport-policy mismatch before any model event: the generic knowledge-source client rejected the daemon-authored ClusterIP HTTP endpoint even though the remote fleet contract requires that route to sit behind an encrypted ACL boundary and the same routed endpoint already carries MCP successfully. The three injected locality values were present with valid shapes; no credential value was logged.
-- The current repair keeps the generic client strict, adds an explicit trusted-daemon endpoint constructor for the managed harness only, keeps redirects disabled and the origin pinned, and makes fatal harness startup errors visible even when fleetd's inherited `RUST_LOG` filter excludes the harness target.
+- The transport repair keeps the generic client strict, adds an explicit trusted-daemon endpoint constructor for the managed harness only, keeps redirects disabled and the origin pinned, and makes fatal harness startup errors visible even when fleetd's inherited `RUST_LOG` filter excludes the harness target.
+- Commit `391eb8c6d419` passed all 6,433 full-profile tests plus clippy and concurrency, then was installed as the stablesigned arm64 worker harness. The cage daemon was not restarted because the repaired code belongs to the standalone worker process.
+- Live task `27780b75-e9ca-467c-bf90-6e9df7aa2f59` completed normally. Its three render calls wrote all three fixed provider files for `published`, `all`, and `own`; durable observation sequence 3 contains one all-provider, non-dry-run, 3-written, 0-refused completion per view.
+- The rendered provider files share SHA-256 `28147e04c5e8bf22182e6f7e4aa590b7b8e93a4f5780d736bfb2531429ab7e94`. The before and after checkout-observation snapshots are byte-identical at SHA-256 `74a57f37e3d5ccbb2bf11614912e7de78c4fc1e8bb91a55492c2746620ee8c8c`; sequence stayed 327234 and no render checkout counter appeared.
+- All three views surfaced the same bounded diagnostic that legacy compatibility rows lack a provable `built_from` stamp. This did not create a refusal, widen checkout authority, or prevent exact receipt validation. The next program step is the remaining-project rollout, including deliberate migration of the eleven hand-authored provider-doc sets before any strict marker ceremony.
+- Gap `gap-194793e9` is addressed after the live successor proof; its resolution records the successful three-view checkout-owner render and unchanged daemon checkout observations.
 
 ## Preserved operator state
 
