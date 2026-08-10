@@ -497,6 +497,10 @@ impl FleetdExecutor {
 
 #[async_trait]
 impl HarnessExecutor for FleetdExecutor {
+    fn provider_binary_location(&self) -> super::executor::ProviderBinaryLocation {
+        super::executor::ProviderBinaryLocation::ExecutorHost
+    }
+
     fn worker_locality(&self) -> Option<&WorkerLocality> {
         self.shared.config.worker_locality.as_ref()
     }
@@ -1032,6 +1036,20 @@ mod tests {
         let dev = FleetdConfig::in_state_dir("/state/dev");
         assert_ne!(prod.endpoint, dev.endpoint);
         assert_ne!(prod.token, dev.token);
+    }
+
+    #[test]
+    fn fleetd_owns_provider_binary_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(directory.path()));
+        assert_eq!(
+            executor.provider_binary_location(),
+            super::super::executor::ProviderBinaryLocation::ExecutorHost
+        );
+        assert_eq!(
+            super::super::executor::LocalExecutor.provider_binary_location(),
+            super::super::executor::ProviderBinaryLocation::DaemonHost
+        );
     }
 
     #[test]

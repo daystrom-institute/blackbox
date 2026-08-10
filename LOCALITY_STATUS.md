@@ -47,7 +47,7 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 
 ## Next operations
 
-1. Map the 19 bound checkout owners and provider-file dispositions needed for managed project render.
+1. Migrate the hand-authored provider guidance into provider-neutral project documentation and reviewed knowledge without losing content.
 2. Generate successful all-provider `published`, `all`, and `own` render completions without daemon checkout access.
 3. Run the render locality preflight, quiet window, offline marker apply, restart, and strict refusal/successor probes.
 4. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
@@ -55,7 +55,15 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 ## Next-lane inventory
 
 - Production has no `render-locality-observations.json`, no render locality marker, and no `RenderFileProvider` target counters. The render cutover is therefore not preflight-ready: each selected project first needs successful managed all-provider writes for the `published`, `all`, and `own` views.
+- The 19 bound checkout roots are mapped and none of their four instruction targets is currently dirty. Seven already have all three blackbox-managed provider files; one has all three provider files absent. The other eleven contain hand-authored provider guidance that render must preserve rather than overwrite: eleven `CLAUDE.md` files and nine `AGENTS.md` files. `GEMINI.md` is managed in seven checkouts and absent in twelve. Only six checkouts currently have a nonempty `PROJECT.md`.
+- Eight checkouts can accept provider writes immediately. The other eleven need deliberate bootstrap/decomposition first, and every checkout still needs a managed plan proving that each view produces three written projections rather than skipped output.
 - Historical checkout counters show the already-governed Git history, collected source, publisher, knowledge, artifact-watch, and blame paths refusing their daemon checkout lanes. The remaining explicit work is project render evidence plus the separately scoped bridge/raw compatibility categories; global render remains host-local by design.
+
+## In-flight allocator repair
+
+- The first managed render dispatch exposed a separate executor-boundary regression: the allocator rejected every fleetd lane as `provider_binary_missing` because it resolved `bro-harness` on the containerized daemon host, even though fleetd owns the worker process and its login-shell `PATH`.
+- The current checkout makes provider-binary eligibility executor-local. Local execution retains the daemon-host binary gate, fleetd execution defers final resolution to the worker host, and the non-dispatchable workflow pseudo-provider still fails closed.
+- Three focused regression tests, `cargo check --workspace`, pinned formatting, concurrency lint, and the fleetd dependency acceptance check pass. The full default workspace nextest gate passed all 6,421 tests with zero failures. This repair is not considered live until the exact commit passes cluster verification, is built and deployed by immutable digest, and a bounded managed dispatch succeeds while the daemon stays up.
 
 ## Preserved operator state
 

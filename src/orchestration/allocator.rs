@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use super::TaskStore;
 use super::brofile::BroConfig;
+use super::executor::ProviderBinaryLocation;
 use super::providers::dispatch_prelude::*;
 use super::providers::{self, Capability, ExecOpts, Provider};
 
@@ -302,6 +303,7 @@ struct LaneId {
 pub struct AllocationContext {
     pub in_flight: BTreeMap<String, usize>,
     pub probes: BTreeMap<String, ProbeRecord>,
+    pub provider_binary_location: ProviderBinaryLocation,
 }
 
 static LEASE_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -653,6 +655,7 @@ pub fn allocation_context_with_probes(
     AllocationContext {
         in_flight,
         probes: probes.records,
+        provider_binary_location: super::harness_provider_binary_location(),
     }
 }
 
@@ -814,7 +817,13 @@ fn score_candidate(
         score: 0.0,
     };
 
-    if provider_binary_missing(lane.provider) {
+    if matches!(lane.provider, Provider::Workflow) {
+        candidate.exclusion_reason = Some("provider_not_dispatchable".into());
+        return candidate;
+    }
+    if ctx.provider_binary_location == ProviderBinaryLocation::DaemonHost
+        && provider_binary_missing(lane.provider)
+    {
         candidate.exclusion_reason = Some("provider_binary_missing".into());
         return candidate;
     }
@@ -1095,9 +1104,6 @@ fn tie_break_score(tie_break: &[String], provider: &str) -> f64 {
 }
 
 fn provider_binary_missing(provider: Provider) -> bool {
-    if matches!(provider, Provider::Workflow) {
-        return true;
-    }
     providers::resolve_bin(&provider.bin()).is_none()
 }
 
@@ -1726,6 +1732,61 @@ mod tests {
     }
 
     #[test]
+    fn executor_host_binary_resolution_does_not_require_daemon_binary() {
+        let _guard = crate::util::test_env_lock();
+        let _restore = EnvRestore::capture(&["BRO_HARNESS_BIN"]);
+        unsafe {
+            std::env::set_var(
+                "BRO_HARNESS_BIN",
+                "definitely_missing_bro_harness_binary_for_allocator_test",
+            );
+        }
+        let request = RuntimeRequest {
+            pin: Some(RuntimePin {
+                provider: Some(Provider::Brodex),
+                ..Default::default()
+            }),
+            durable: true,
+            ..Default::default()
+        };
+        let local = allocate(
+            request.clone(),
+            &built_in_config(),
+            &BroConfig::default(),
+            &AllocationContext::default(),
+        );
+        assert_eq!(
+            local.trace.candidates[0].exclusion_reason.as_deref(),
+            Some("provider_binary_missing")
+        );
+
+        let remote = allocate(
+            request,
+            &built_in_config(),
+            &BroConfig::default(),
+            &AllocationContext {
+                provider_binary_location: ProviderBinaryLocation::ExecutorHost,
+                ..Default::default()
+            },
+        );
+        assert!(remote.trace.error.is_none(), "{:?}", remote.trace.error);
+        assert_eq!(remote.lane.provider, Provider::Brodex);
+        assert_eq!(remote.trace.candidates[0].exclusion_reason, None);
+    }
+
+    #[test]
+    fn workflow_is_excluded_before_executor_binary_policy() {
+        let request = RuntimeRequest {
+            pin: Some(RuntimePin {
+                provider: Some(Provider::Workflow),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(provider_candidates_for_request(&request, &built_in_config()).is_empty());
+    }
+
+    #[test]
     fn allocation_intersects_named_pool_and_provider_filter() {
         with_provider_bins(|| {
             let cfg = built_in_config();
@@ -2175,6 +2236,7 @@ mod tests {
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
                     probes,
+                    ..Default::default()
                 },
             );
             assert!(

@@ -26,3 +26,13 @@ Domain home for the dispatch plane. Boundary contract:
 - bro-fleet-client does not yet forward per-dispatch defaults
   (`dispatch_body`); fleet-side grants need the brofile lane. Deferred
   while fleetd extraction is in flight.
+
+## Allocator binary eligibility follows the executor boundary
+
+- Harness provider binaries are resolved on the host that actually spawns the
+  worker. `LocalExecutor` may use daemon-host PATH availability as allocator
+  eligibility; `FleetdExecutor` must not. Fleetd performs final login-shell
+  resolution against its own worker-host PATH, so a containerized daemon that
+  lacks `bro-harness` locally must still admit otherwise-eligible fleetd
+  lanes. The pseudo-provider `workflow` remains non-dispatchable in either
+  mode.

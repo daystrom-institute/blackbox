@@ -191,6 +191,10 @@ fn harness_worker_locality() -> Option<executor::WorkerLocality> {
     harness_executor().worker_locality().cloned()
 }
 
+fn harness_provider_binary_location() -> executor::ProviderBinaryLocation {
+    harness_executor().provider_binary_location()
+}
+
 /// Daemon-side state a re-adopted session needs to be reattached to its task.
 struct ReadoptionEnv {
     store_dir: std::path::PathBuf,

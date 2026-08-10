@@ -56,6 +56,19 @@ pub struct WorkerLocality {
     pub bro_home: PathBuf,
 }
 
+/// Host whose PATH is authoritative for the standalone harness binary.
+///
+/// Local execution can reject an allocator lane when the daemon cannot resolve
+/// `bro-harness`. Fleetd execution must defer that check because fleetd owns
+/// the worker host's login-shell PATH and performs final binary resolution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderBinaryLocation {
+    #[default]
+    DaemonHost,
+    ExecutorHost,
+}
+
 /// Where a [`WorkerKill`] sends its one signal. The two executors reach the
 /// child by different routes, but the daemon-side registry stores one type and
 /// calls one method, so `cancel_task` never has to know which executor ran the
@@ -165,6 +178,11 @@ pub struct WorkerHandle {
 /// can hold an executor behind `dyn`.
 #[async_trait]
 pub trait HarnessExecutor: Send + Sync {
+    /// Host whose PATH decides whether the harness binary exists.
+    fn provider_binary_location(&self) -> ProviderBinaryLocation {
+        ProviderBinaryLocation::DaemonHost
+    }
+
     /// Worker filesystem roots when they differ from the daemon's roots.
     fn worker_locality(&self) -> Option<&WorkerLocality> {
         None

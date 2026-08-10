@@ -898,6 +898,7 @@ impl BlackboxServer {
             })
         });
         Self::ok_json(&json!({
+            "provider_binary_location": ctx.provider_binary_location,
             "tiers": cfg.tiers,
             "tier_ladders": cfg.tier_ladders,
             "pools": cfg.pools,
