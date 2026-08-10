@@ -68,18 +68,9 @@ pub async fn install_project_mutation_routes(
     cx: &ToolCx,
     capability_server: Option<&str>,
 ) -> Result<Vec<Arc<dyn Tool>>> {
-    let token = cx
-        .session_env
-        .get(bro_protocol::WORKSPACE_BINDING_ENV)
-        .cloned();
-    let source_url = cx
-        .session_env
-        .get(bro_protocol::KNOWLEDGE_SOURCE_URL_ENV)
-        .cloned();
-    let scope = cx
-        .session_env
-        .get(bro_protocol::WORKSPACE_SCOPE_ENV)
-        .cloned();
+    let token = locality_session_var(cx, bro_protocol::WORKSPACE_BINDING_ENV);
+    let source_url = locality_session_var(cx, bro_protocol::KNOWLEDGE_SOURCE_URL_ENV);
+    let scope = locality_session_var(cx, bro_protocol::WORKSPACE_SCOPE_ENV);
     if token.is_none() && source_url.is_none() && scope.is_none() {
         return Ok(tools);
     }
@@ -130,6 +121,16 @@ pub async fn install_project_mutation_routes(
             upstream
         })
         .collect())
+}
+
+/// Resolve daemon-authored session configuration across both harness forms.
+/// Library embedders bind a task-local map, while the standalone harness child
+/// receives the same values in its scrubbed process environment.
+fn locality_session_var(cx: &ToolCx, key: &str) -> Option<String> {
+    cx.session_env
+        .get(key)
+        .cloned()
+        .or_else(|| crate::transport::session_var(key))
 }
 
 struct ProjectMutationTool {
@@ -1054,6 +1055,33 @@ mod tests {
             shell_env: Arc::new(Default::default()),
             tool_arg_defaults: Arc::new(bro_tools::ToolArgDefaults::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn locality_session_config_uses_tool_context_then_transport_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let key = "BRO_TEST_LOCALITY_SESSION_FALLBACK_K1";
+        let mut cx = tool_cx(&root);
+        cx.session_env = Arc::new(std::collections::BTreeMap::from([(
+            key.to_string(),
+            "tool-context".to_string(),
+        )]));
+        let transport_env =
+            std::collections::BTreeMap::from([(key.to_string(), "standalone-env".to_string())]);
+
+        crate::transport::with_session_env(transport_env, async {
+            assert_eq!(
+                locality_session_var(&cx, key).as_deref(),
+                Some("tool-context")
+            );
+            let empty = tool_cx(&root);
+            assert_eq!(
+                locality_session_var(&empty, key).as_deref(),
+                Some("standalone-env")
+            );
+        })
+        .await;
     }
 
     fn git(root: &Path, args: &[&str]) {
