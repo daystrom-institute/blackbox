@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -210,7 +211,10 @@ pub struct RenderParams {
 pub const PROJECT_RENDER_TRANSPORT_VERSION: u32 = 1;
 pub const PROJECT_RENDER_TRANSPORT_SCOPE: &str = "project-render-transport-v1";
 const MAX_PROJECT_RENDER_ENTRIES: usize = 4_096;
-const MAX_PROJECT_RENDER_PLAN_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PROJECT_RENDER_PLAN_BYTES: usize = 8 * 1024 * 1024;
+pub const PROJECT_RENDER_PLAN_CHUNK_BYTES: usize = 32 * 1024;
+const MAX_PROJECT_RENDER_CHUNK_WIRE_BYTES: usize = 64 * 1024;
+const MAX_PROJECT_RENDER_GLOBAL_RESULT_BYTES: usize = 16 * 1024;
 const MAX_PROJECT_RENDER_DIAGNOSTICS_BYTES: usize = 64 * 1024;
 
 /// Exact authorized knowledge snapshot sent to the checkout owner for a
@@ -264,11 +268,48 @@ impl ProjectRenderViewV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum ProjectRenderLocalityRequestV1 {
-    Plan,
+    Plan {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        plan_sha256: Option<String>,
+    },
     Complete {
-        plan: ProjectRenderPlanV1,
+        plan_sha256: String,
         receipt: ProjectRenderReceiptV1,
     },
+}
+
+/// One bounded page of the compact serialized project-render plan. The plan
+/// itself remains path-free; base64 lets pages split at arbitrary byte offsets
+/// without requiring knowledge-entry boundaries to fit the MCP response cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRenderPlanChunkV1 {
+    pub version: u32,
+    pub plan_sha256: String,
+    pub plan_bytes: usize,
+    pub offset: usize,
+    pub chunk_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_result: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssembledProjectRenderPlanV1 {
+    pub plan: ProjectRenderPlanV1,
+    pub plan_sha256: String,
+    pub global_result: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ProjectRenderPlanAssemblerV1 {
+    plan_sha256: Option<String>,
+    plan_bytes: Option<usize>,
+    bytes: Vec<u8>,
+    global_result: Option<String>,
+    complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +447,159 @@ impl ProjectRenderPlanV1 {
                 })
             })
             .collect()
+    }
+
+    pub fn transport_bytes_and_sha256(&self) -> Result<(Vec<u8>, String)> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        Ok((bytes, sha256))
+    }
+
+    pub fn transport_sha256(&self) -> Result<String> {
+        self.transport_bytes_and_sha256().map(|(_, sha256)| sha256)
+    }
+
+    pub fn transport_chunk(
+        &self,
+        offset: usize,
+        expected_plan_sha256: Option<&str>,
+        global_result: Option<String>,
+    ) -> Result<ProjectRenderPlanChunkV1> {
+        let (bytes, plan_sha256) = self.transport_bytes_and_sha256()?;
+        if let Some(expected) = expected_plan_sha256
+            && expected != plan_sha256
+        {
+            anyhow::bail!(
+                "error.render_plan_stale: project render authority changed while its plan was being paged"
+            );
+        }
+        if offset >= bytes.len() {
+            anyhow::bail!(
+                "invalid project render plan offset {offset}; plan has {} bytes",
+                bytes.len()
+            );
+        }
+        if offset != 0 && global_result.is_some() {
+            anyhow::bail!("project render global result is only valid on the first plan chunk");
+        }
+        if global_result
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_PROJECT_RENDER_GLOBAL_RESULT_BYTES)
+        {
+            anyhow::bail!("project render global result exceeds the transport bound");
+        }
+
+        let end = offset
+            .saturating_add(PROJECT_RENDER_PLAN_CHUNK_BYTES)
+            .min(bytes.len());
+        let chunk = ProjectRenderPlanChunkV1 {
+            version: PROJECT_RENDER_TRANSPORT_VERSION,
+            plan_sha256,
+            plan_bytes: bytes.len(),
+            offset,
+            chunk_base64: BASE64_STANDARD.encode(&bytes[offset..end]),
+            next_offset: (end < bytes.len()).then_some(end),
+            global_result,
+        };
+        if serde_json::to_vec(&chunk)?.len() > MAX_PROJECT_RENDER_CHUNK_WIRE_BYTES {
+            anyhow::bail!("project render plan chunk exceeds the wire bound");
+        }
+        Ok(chunk)
+    }
+}
+
+impl ProjectRenderPlanAssemblerV1 {
+    pub fn push(
+        &mut self,
+        chunk: ProjectRenderPlanChunkV1,
+    ) -> Result<Option<AssembledProjectRenderPlanV1>> {
+        if self.complete {
+            anyhow::bail!("project render plan assembler is already complete");
+        }
+        if chunk.version != PROJECT_RENDER_TRANSPORT_VERSION {
+            anyhow::bail!("unsupported project render chunk version {}", chunk.version);
+        }
+        if chunk.plan_sha256.len() != 64
+            || !chunk
+                .plan_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            anyhow::bail!("project render plan chunk has an invalid SHA-256");
+        }
+        if chunk.plan_bytes == 0 || chunk.plan_bytes > MAX_PROJECT_RENDER_PLAN_BYTES {
+            anyhow::bail!("project render plan chunk declares an invalid byte length");
+        }
+        if chunk.offset != self.bytes.len() {
+            anyhow::bail!(
+                "project render plan chunk offset {} does not continue at {}",
+                chunk.offset,
+                self.bytes.len()
+            );
+        }
+
+        match (&self.plan_sha256, self.plan_bytes) {
+            (None, None) => {
+                if chunk.offset != 0 {
+                    anyhow::bail!("project render plan must begin at offset zero");
+                }
+                self.plan_sha256 = Some(chunk.plan_sha256.clone());
+                self.plan_bytes = Some(chunk.plan_bytes);
+                self.bytes.reserve(chunk.plan_bytes);
+                self.global_result = chunk.global_result.clone();
+            }
+            (Some(plan_sha256), Some(plan_bytes)) => {
+                if plan_sha256 != &chunk.plan_sha256 || plan_bytes != chunk.plan_bytes {
+                    anyhow::bail!("project render plan authority changed between chunks");
+                }
+                if chunk.global_result.is_some() {
+                    anyhow::bail!("project render global result repeated after the first chunk");
+                }
+            }
+            _ => anyhow::bail!("project render plan assembler state is inconsistent"),
+        }
+
+        let decoded = BASE64_STANDARD
+            .decode(&chunk.chunk_base64)
+            .context("decoding project render plan chunk")?;
+        if decoded.is_empty() || decoded.len() > PROJECT_RENDER_PLAN_CHUNK_BYTES {
+            anyhow::bail!("project render plan chunk has an invalid decoded length");
+        }
+        let end = chunk
+            .offset
+            .checked_add(decoded.len())
+            .context("project render plan chunk offset overflow")?;
+        if end > chunk.plan_bytes {
+            anyhow::bail!("project render plan chunk exceeds its declared byte length");
+        }
+        match chunk.next_offset {
+            Some(next) if next == end && end < chunk.plan_bytes => {}
+            None if end == chunk.plan_bytes => {}
+            _ => anyhow::bail!("project render plan chunk has an invalid continuation"),
+        }
+        self.bytes.extend_from_slice(&decoded);
+        if chunk.next_offset.is_some() {
+            return Ok(None);
+        }
+
+        let plan_sha256 = self
+            .plan_sha256
+            .clone()
+            .context("completed project render plan has no SHA-256")?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(&self.bytes));
+        if actual_sha256 != plan_sha256 {
+            anyhow::bail!("project render plan payload does not match its SHA-256");
+        }
+        let plan: ProjectRenderPlanV1 = serde_json::from_slice(&self.bytes)
+            .context("decoding assembled project render plan")?;
+        plan.validate()?;
+        self.complete = true;
+        Ok(Some(AssembledProjectRenderPlanV1 {
+            plan,
+            plan_sha256,
+            global_result: self.global_result.take(),
+        }))
     }
 }
 
@@ -5154,6 +5348,51 @@ mod tests {
         assert!(rendered.contains("PROJECT_RENDER_LOCALITY_MARKER"));
         assert!(rendered.contains("@PROJECT.md"));
         assert!(execution.output.contains(root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn project_render_plan_chunks_reassemble_an_over_cap_payload() {
+        let mut plan = project_render_plan(Some("claude"), true);
+        plan.entries[0].content = "PROJECT_RENDER_PAGED_PAYLOAD".repeat(5_000);
+        let expected_plan = plan.clone();
+        let expected_sha256 = plan.transport_sha256().unwrap();
+        let mut assembler = ProjectRenderPlanAssemblerV1::default();
+        let mut offset = 0;
+        let mut pages = 0;
+
+        loop {
+            let chunk = plan
+                .transport_chunk(
+                    offset,
+                    (offset != 0).then_some(expected_sha256.as_str()),
+                    (offset == 0).then(|| "global render complete".to_string()),
+                )
+                .unwrap();
+            assert!(serde_json::to_vec(&chunk).unwrap().len() < 64 * 1024);
+            let next_offset = chunk.next_offset;
+            pages += 1;
+            if let Some(assembled) = assembler.push(chunk).unwrap() {
+                assert_eq!(assembled.plan, expected_plan);
+                assert_eq!(assembled.plan_sha256, expected_sha256);
+                assert_eq!(
+                    assembled.global_result.as_deref(),
+                    Some("global render complete")
+                );
+                break;
+            }
+            offset = next_offset.unwrap();
+        }
+
+        assert!(pages > 1);
+    }
+
+    #[test]
+    fn project_render_plan_chunk_refuses_a_stale_continuation() {
+        let plan = project_render_plan(Some("claude"), true);
+        let error = plan
+            .transport_chunk(0, Some(&"0".repeat(64)), None)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("error.render_plan_stale"));
     }
 
     #[test]

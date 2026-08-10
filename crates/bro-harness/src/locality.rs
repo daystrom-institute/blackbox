@@ -16,8 +16,8 @@ use bbox_gaps::gaps::{GapFileParams, GapResolveParams, GapStore, GapUpdateParams
 use bbox_gaps::repo_io::{GapRepoCarrier, GapRepoRead, GapRepoWrite};
 use bbox_knowledge::knowledge::{
     DecideParams, ForgetParams, Knowledge, KnowledgeLinkParams, LearnParams,
-    ProjectRenderExecutionV1, ProjectRenderPlanV1, RememberParams, ResponseFormat, ReviewParams,
-    execute_project_render_plan,
+    ProjectRenderExecutionV1, ProjectRenderPlanAssemblerV1, ProjectRenderPlanChunkV1,
+    ProjectRenderPlanV1, RememberParams, ResponseFormat, ReviewParams, execute_project_render_plan,
 };
 use bbox_knowledge::repo_io::{KnowledgeRepoCarrier, KnowledgeRepoRead, KnowledgeRepoWrite};
 use bbox_knowledge_source_client::{CaptureOutcome, WorkspaceCaptureClient};
@@ -207,13 +207,47 @@ impl Tool for LocalRenderTool {
         };
         public.insert("project".into(), Value::String(selector));
 
-        let mut plan_input = public.clone();
-        plan_input.insert("_render_locality".into(), json!({ "phase": "plan" }));
-        let (plan, global_result) =
-            match parse_render_plan(self.upstream.call(Value::Object(plan_input), cx).await) {
-                Ok(plan) => plan,
+        let mut assembler = ProjectRenderPlanAssemblerV1::default();
+        let mut offset = 0;
+        let mut plan_sha256 = None::<String>;
+        let assembled = loop {
+            let mut plan_input = public.clone();
+            plan_input.insert(
+                "_render_locality".into(),
+                json!({
+                    "phase": "plan",
+                    "offset": offset,
+                    "plan_sha256": plan_sha256.as_deref(),
+                }),
+            );
+            let chunk = match parse_render_plan_chunk(
+                self.upstream.call(Value::Object(plan_input), cx).await,
+            ) {
+                Ok(chunk) => chunk,
                 Err(result) => return result,
             };
+            let next_offset = chunk.next_offset;
+            plan_sha256 = Some(chunk.plan_sha256.clone());
+            match assembler.push(chunk) {
+                Ok(Some(assembled)) => break assembled,
+                Ok(None) => {
+                    let Some(next_offset) = next_offset else {
+                        return ToolResult::Error(
+                            "daemon project render plan ended before assembly completed".into(),
+                        );
+                    };
+                    offset = next_offset;
+                }
+                Err(error) => {
+                    return ToolResult::Error(format!(
+                        "daemon returned an invalid render plan: {error:#}"
+                    ));
+                }
+            }
+        };
+        let plan = assembled.plan;
+        let plan_sha256 = assembled.plan_sha256;
+        let global_result = assembled.global_result;
         let runtime = self.runtime.clone();
         let execution_plan = plan.clone();
         let execution =
@@ -234,7 +268,7 @@ impl Tool for LocalRenderTool {
             "_render_locality".into(),
             json!({
                 "phase": "complete",
-                "plan": plan,
+                "plan_sha256": plan_sha256,
                 "receipt": execution.receipt,
             }),
         );
@@ -256,35 +290,28 @@ impl Tool for LocalRenderTool {
     }
 }
 
-fn parse_render_plan(
+fn parse_render_plan_chunk(
     result: ToolResult,
-) -> std::result::Result<(ProjectRenderPlanV1, Option<String>), ToolResult> {
+) -> std::result::Result<ProjectRenderPlanChunkV1, ToolResult> {
     let value = parse_json_tool_result(result, "project render plan")?;
-    if value.get("status").and_then(Value::as_str) != Some("render_locality_plan") {
+    if value.get("status").and_then(Value::as_str) != Some("render_locality_plan_chunk") {
+        if value.get("error").and_then(Value::as_str) == Some("response_too_large") {
+            return Err(ToolResult::Error(
+                "daemon project render plan chunk exceeded the MCP response cap".into(),
+            ));
+        }
         return Err(ToolResult::Error(
             "daemon returned an unexpected project render plan status".into(),
         ));
     }
-    let plan: ProjectRenderPlanV1 =
-        serde_json::from_value(value.get("plan").cloned().ok_or_else(|| {
-            ToolResult::Error("daemon project render response omitted plan".into())
-        })?)
-        .map_err(|error| {
-            ToolResult::Error(format!("daemon returned an invalid render plan: {error}"))
-        })?;
-    plan.validate().map_err(|error| {
-        ToolResult::Error(format!("daemon returned an invalid render plan: {error:#}"))
-    })?;
-    let global_result = value
-        .get("global_result")
-        .filter(|value| !value.is_null())
-        .map(|value| {
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                ToolResult::Error("daemon returned an invalid global render result".into())
-            })
-        })
-        .transpose()?;
-    Ok((plan, global_result))
+    serde_json::from_value(value.get("chunk").cloned().ok_or_else(|| {
+        ToolResult::Error("daemon project render response omitted its chunk".into())
+    })?)
+    .map_err(|error| {
+        ToolResult::Error(format!(
+            "daemon returned an invalid render plan chunk: {error}"
+        ))
+    })
 }
 
 fn parse_render_completion(result: ToolResult) -> std::result::Result<Option<String>, ToolResult> {
@@ -1406,11 +1433,15 @@ mod tests {
             async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
                 self.calls.lock().unwrap().push(input.clone());
                 match input["_render_locality"]["phase"].as_str() {
-                    Some("plan") => ToolResult::Json(json!({
-                        "status": "render_locality_plan",
-                        "plan": self.plan,
-                        "global_result": null,
-                    })),
+                    Some("plan") => {
+                        let offset = input["_render_locality"]["offset"].as_u64().unwrap() as usize;
+                        let expected = input["_render_locality"]["plan_sha256"].as_str();
+                        let chunk = self.plan.transport_chunk(offset, expected, None).unwrap();
+                        ToolResult::Json(json!({
+                            "status": "render_locality_plan_chunk",
+                            "chunk": chunk,
+                        }))
+                    }
                     Some("complete") => ToolResult::Json(json!({
                         "status": "render_locality_complete",
                         "diagnostics": null,
@@ -1439,6 +1470,9 @@ mod tests {
         };
         entry.project = Some(bbox_knowledge::knowledge::PROJECT_RENDER_TRANSPORT_SCOPE.into());
         entry.project_id = Some("project-render-locality".into());
+        entry
+            .content
+            .push_str(&" PROJECT_RENDER_HARNESS_PAGE".repeat(2_000));
         let plan = ProjectRenderPlanV1 {
             version: bbox_knowledge::knowledge::PROJECT_RENDER_TRANSPORT_VERSION,
             project_id: "project-render-locality".into(),
@@ -1478,11 +1512,18 @@ mod tests {
         );
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0]["_render_locality"]["phase"], "plan");
-        assert_eq!(calls[1]["_render_locality"]["phase"], "complete");
-        assert_eq!(calls[0]["project"], BOUND_WORKSPACE_RENDER_SELECTOR);
-        assert!(calls[1]["_render_locality"]["receipt"].is_object());
+        assert!(
+            calls.len() > 2,
+            "the large plan must require multiple pages"
+        );
+        for call in &calls[..calls.len() - 1] {
+            assert_eq!(call["_render_locality"]["phase"], "plan");
+            assert_eq!(call["project"], BOUND_WORKSPACE_RENDER_SELECTOR);
+        }
+        let completion = calls.last().unwrap();
+        assert_eq!(completion["_render_locality"]["phase"], "complete");
+        assert!(completion["_render_locality"]["receipt"].is_object());
+        assert!(completion["_render_locality"]["plan_sha256"].is_string());
         assert!(
             !serde_json::to_string(&*calls)
                 .unwrap()

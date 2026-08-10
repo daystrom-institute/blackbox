@@ -340,7 +340,9 @@ Each call must complete the harness-local write of all three generated
 provider files without a hand-authored-file refusal. The daemon persists the
 exact path-free receipt after independently recomputing every projection hash.
 The absolute checkout path remains inside the harness. Global render is not
-part of this ceremony.
+part of this ceremony. Large knowledge snapshots are transported as
+SHA-256-pinned bounded pages; a generic MCP `response_too_large` envelope is a
+render-transport defect, not an acceptable positive control.
 
 Preflight may run while the daemon is live. It requires explicit catalog
 project IDs, successful all-provider non-dry-run completions for

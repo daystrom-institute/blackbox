@@ -653,6 +653,7 @@ name = "bbox-knowledge"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bbox-chunker",
  "bbox-corpus-core",
  "bbox-stores",
@@ -1085,6 +1086,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bbox-artifacts",
  "bbox-chunker",
  "bbox-code-source",

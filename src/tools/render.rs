@@ -5,6 +5,9 @@ use crate::knowledge::{
 };
 use crate::server::BlackboxServer;
 
+#[cfg(test)]
+use crate::knowledge::{ProjectRenderPlanAssemblerV1, ProjectRenderPlanChunkV1};
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -173,18 +176,28 @@ impl BlackboxServer {
             let project_render = p.project.is_some()
                 && matches!(p.scope.as_deref().unwrap_or("both"), "project" | "both");
             match p.locality.clone() {
-                Some(ProjectRenderLocalityRequestV1::Plan) => {
+                Some(ProjectRenderLocalityRequestV1::Plan {
+                    offset,
+                    plan_sha256,
+                }) => {
                     let (plan, global_result) =
-                        workspace_project_render_plan(&server, &p, true)?;
-                    return Ok(serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "render_locality_plan",
-                        "plan": plan,
-                        "global_result": global_result,
+                        workspace_project_render_plan(&server, &p, offset == 0)?;
+                    let chunk = plan.transport_chunk(
+                        offset,
+                        plan_sha256.as_deref(),
+                        global_result,
+                    )?;
+                    return Ok(serde_json::to_string(&serde_json::json!({
+                        "status": "render_locality_plan_chunk",
+                        "chunk": chunk,
                     }))?);
                 }
-                Some(ProjectRenderLocalityRequestV1::Complete { plan, receipt }) => {
+                Some(ProjectRenderLocalityRequestV1::Complete {
+                    plan_sha256,
+                    receipt,
+                }) => {
                     let (current, _) = workspace_project_render_plan(&server, &p, false)?;
-                    if plan != current {
+                    if current.transport_sha256()? != plan_sha256 {
                         anyhow::bail!(
                             "error.render_plan_stale: project render authority changed after the checkout plan was issued"
                         );
@@ -371,6 +384,54 @@ impl BlackboxServer {
             server.bootstrap_session_knowledge(&p)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+struct FetchedRenderPlanForTest {
+    plan: ProjectRenderPlanV1,
+    plan_sha256: String,
+    page_count: usize,
+    max_response_bytes: usize,
+}
+
+#[cfg(test)]
+async fn fetch_render_plan_for_test(
+    server: &BlackboxServer,
+    params: RenderParams,
+) -> FetchedRenderPlanForTest {
+    let mut assembler = ProjectRenderPlanAssemblerV1::default();
+    let mut offset = 0;
+    let mut plan_sha256 = None::<String>;
+    let mut page_count = 0;
+    let mut max_response_bytes = 0;
+    loop {
+        let mut request = params.clone();
+        request.locality = Some(ProjectRenderLocalityRequestV1::Plan {
+            offset,
+            plan_sha256: plan_sha256.clone(),
+        });
+        let result = server.bbox_render(Parameters(request)).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let wire = serde_json::to_value(result).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        page_count += 1;
+        max_response_bytes = max_response_bytes.max(text.len());
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["status"], "render_locality_plan_chunk");
+        let chunk: ProjectRenderPlanChunkV1 =
+            serde_json::from_value(value["chunk"].clone()).unwrap();
+        let next_offset = chunk.next_offset;
+        plan_sha256 = Some(chunk.plan_sha256.clone());
+        if let Some(assembled) = assembler.push(chunk).unwrap() {
+            return FetchedRenderPlanForTest {
+                plan: assembled.plan,
+                plan_sha256: assembled.plan_sha256,
+                page_count,
+                max_response_bytes,
+            };
+        }
+        offset = next_offset.expect("an incomplete render plan must continue");
     }
 }
 
@@ -675,23 +736,20 @@ mod tests {
                 vec![],
             ),
         ] {
-            let result = fixture
-                .server
-                .bbox_render(Parameters(RenderParams {
+            let fetched = fetch_render_plan_for_test(
+                &fixture.server,
+                RenderParams {
                     provider: Some("claude".into()),
                     project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
                     scope: Some("project".into()),
                     dry_run: Some(true),
                     provisional: Some(view.into()),
                     scope_project: None,
-                    locality: Some(ProjectRenderLocalityRequestV1::Plan),
-                }))
-                .await;
-            assert_ne!(result.is_error, Some(true), "{result:?}");
-            let wire = serde_json::to_value(result).unwrap();
-            let value: serde_json::Value =
-                serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
-            let plan: ProjectRenderPlanV1 = serde_json::from_value(value["plan"].clone()).unwrap();
+                    locality: None,
+                },
+            )
+            .await;
+            let plan = fetched.plan;
             assert_eq!(plan.view.as_str(), view);
             let content = plan
                 .entries
@@ -1136,20 +1194,21 @@ mod catalog_render_tests {
         assert!(text(&legacy).contains("error.render_locality_required"));
         assert_eq!(server.state.checkout_access.health().sequence, before);
 
-        let planned = server
-            .bbox_render(Parameters(RenderParams {
+        let fetched = fetch_render_plan_for_test(
+            &server,
+            RenderParams {
                 provider: Some("claude".into()),
                 project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
                 scope: Some("project".into()),
                 dry_run: Some(false),
                 provisional: Some("published".into()),
                 scope_project: None,
-                locality: Some(ProjectRenderLocalityRequestV1::Plan),
-            }))
-            .await;
-        assert!(!is_error(&planned), "{}", text(&planned));
-        let value: serde_json::Value = serde_json::from_str(&text(&planned)).unwrap();
-        let plan: ProjectRenderPlanV1 = serde_json::from_value(value["plan"].clone()).unwrap();
+                locality: None,
+            },
+        )
+        .await;
+        let plan = fetched.plan;
+        let plan_sha256 = fetched.plan_sha256;
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.view, ProjectRenderViewV1::Published);
         assert_eq!(
@@ -1181,7 +1240,7 @@ mod catalog_render_tests {
                 provisional: Some("published".into()),
                 scope_project: None,
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {
-                    plan,
+                    plan_sha256,
                     receipt: execution.receipt,
                 }),
             }))
@@ -1195,6 +1254,60 @@ mod catalog_render_tests {
             observations.completions[0].view,
             ProjectRenderViewV1::Published
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_bound_project_render_plan_is_paged_below_the_mcp_cap() {
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(PROJECT, &scope);
+        let mut entry = render_entry();
+        entry.content = "PAGED_RENDER_PLAN_MARKER".repeat(5_000);
+        fixture.install_publication(PROJECT, &scope, COMMIT_ONE, &[entry], &[]);
+        let server = fixture.server();
+        let workspace_id = bro_core::WorkspaceId::parse("c".repeat(32)).unwrap();
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(std::sync::Arc::new(
+                    crate::server::knowledge_source::WorkspaceBindingGrant {
+                        task_id: "render-paging-task".into(),
+                        session_id: "render-paging-session".into(),
+                        project_id: PROJECT.into(),
+                        scope,
+                        workspace_id,
+                        expires_unix_secs: u64::MAX,
+                    },
+                )))
+                .is_ok()
+        );
+        let before = server.state.checkout_access.health().sequence;
+
+        let fetched = fetch_render_plan_for_test(
+            &server,
+            RenderParams {
+                provider: Some("claude".into()),
+                project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
+                scope: Some("project".into()),
+                dry_run: Some(true),
+                provisional: Some("published".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(fetched.page_count > 1, "large plan must be paged");
+        assert!(
+            fetched.max_response_bytes < BlackboxServer::MCP_RESPONSE_CAP_BYTES,
+            "largest page was {} bytes",
+            fetched.max_response_bytes
+        );
+        assert!(
+            fetched.plan.entries[0]
+                .content
+                .contains("PAGED_RENDER_PLAN_MARKER")
+        );
+        assert_eq!(server.state.checkout_access.health().sequence, before);
     }
 
     #[tokio::test]
