@@ -118,6 +118,30 @@ pub(crate) fn activate_import(state: &Arc<SharedState>, import_generation_id: &s
             // the current read view; background redrive alone cannot do this.
             prepare_journal(state, &source)?
         }
+        Some(journal)
+            if journal.import_generation_id == import_generation_id
+                && journal.stage == ProvenanceImportStageV1::Committed =>
+        {
+            match active_code_selector(state, &source.project_id) {
+                Some(active_code_selector) if journal.code_selector != active_code_selector => {
+                    // The immutable note inventory can stay byte-identical
+                    // while a later code publication advances the project's
+                    // selector. An authenticated re-finalize must revalidate
+                    // that same source against the new corpus view instead of
+                    // leaving it permanently bound to the superseded code
+                    // generation.
+                    tracing::info!(
+                        import_generation = import_generation_id,
+                        project_id = source.project_id,
+                        prior_code_selector = journal.code_selector,
+                        current_code_selector = active_code_selector,
+                        "revalidating authenticated provenance against the current code generation"
+                    );
+                    prepare_journal(state, &source)?
+                }
+                _ => journal,
+            }
+        }
         Some(journal) if journal.import_generation_id == import_generation_id => journal,
         Some(journal) if !journal.stage.terminal() => {
             bail!("an earlier provenance import is still publishing for this project")
@@ -295,6 +319,15 @@ fn prepare_journal(
         .store()
         .save_provenance_import_journal(journal)?;
     Ok(journal)
+}
+
+fn active_code_selector(state: &SharedState, project_id: &str) -> Option<String> {
+    state
+        .code_read_view
+        .read()
+        .active_selectors
+        .get(project_id)
+        .cloned()
 }
 
 fn prepare_documents(
@@ -866,6 +899,88 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(journal.stage, ProvenanceImportStageV1::Committed);
+    }
+
+    #[test]
+    fn explicit_refinalize_rebinds_committed_import_to_current_code_selector() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (state, scope, producer_id, project_id) = state_with_active_project(&root);
+        let commit = "7".repeat(40);
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "commit": commit,
+            "produced_by": {},
+            "tool_calls": [{
+                "tool": "Read",
+                "source_ref": "transcript:test:session:1:0",
+                "file": "src/lib.rs",
+                "byte_range": [4, 8]
+            }],
+            "knowledge_writes": []
+        })
+        .to_string();
+        let (source, upload_id) =
+            install_import(&state, scope, &producer_id, &project_id, &commit, &document);
+        activate_import(&state, &source.import_generation_id).unwrap();
+        let store = state.git_sources.store();
+        let first = store
+            .read_provenance_import_journal(&project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.stage, ProvenanceImportStageV1::Committed);
+        assert_eq!(
+            first.code_selector,
+            "collected:provenance-project:generation-one"
+        );
+
+        let next_selector = "collected:provenance-project:generation-two".to_string();
+        let fields = state.idx.read().field_handles();
+        let mut indexed = TantivyDocument::default();
+        indexed.add_text(fields.code_source_selector, &next_selector);
+        indexed.add_text(fields.relative_path, "src/lib.rs");
+        indexed.add_u64(fields.byte_offset, 0);
+        indexed.add_u64(fields.byte_end, 20);
+        indexed.add_text(
+            fields.entity_id,
+            format!(
+                "project_file_v2:{project_id}:snapshot:path:{}:0",
+                "a".repeat(64)
+            ),
+        );
+        let mut writer = state.idx.read().index_handle().writer(50_000_000).unwrap();
+        writer.add_document(indexed).unwrap();
+        writer.commit().unwrap();
+        state.idx.read().reader_reload_for_test();
+        let prior = state.code_read_view.read().clone();
+        *state.code_read_view.write() = Arc::new(CodeReadView {
+            active_selectors: BTreeMap::from([(project_id.clone(), next_selector.clone())]),
+            searcher: state.idx.read().searcher(),
+            edge_index: prior.edge_index.clone(),
+            catalog_epoch: prior.catalog_epoch + 1,
+            git_overlays: prior.git_overlays.clone(),
+        });
+
+        let retried = store
+            .finalize_provenance_import(&producer_id, &upload_id)
+            .unwrap();
+        assert_eq!(retried.import_generation_id, source.import_generation_id);
+        activate_import(&state, &source.import_generation_id).unwrap();
+        activate_import(&state, &source.import_generation_id).unwrap();
+
+        let rebound = store
+            .read_provenance_import_journal(&project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.stage, ProvenanceImportStageV1::Committed);
+        assert_eq!(rebound.code_selector, next_selector);
+        assert_eq!(
+            store
+                .provenance_import_status(&producer_id, &source.import_generation_id)
+                .unwrap()
+                .state,
+            ProvenanceImportStateV1::Active
+        );
     }
 
     #[test]

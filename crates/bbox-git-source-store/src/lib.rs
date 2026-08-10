@@ -1368,6 +1368,9 @@ impl GitSourceStore {
                 ProvenanceImportStateV1::Quarantined
             ) | (
                 ProvenanceImportStateV1::Active,
+                ProvenanceImportStateV1::Importing
+            ) | (
+                ProvenanceImportStateV1::Active,
                 ProvenanceImportStateV1::Superseded
             ) | (
                 ProvenanceImportStateV1::Active,
