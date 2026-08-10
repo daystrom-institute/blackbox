@@ -185,10 +185,10 @@ impl WorkspaceCaptureClient {
                 }),
             )
             .await?;
-        let sequence = probe
-            .current
-            .as_ref()
-            .map_or(1, |current| current.sequence.saturating_add(1));
+        probe
+            .validate()
+            .map_err(|error| anyhow!("daemon returned an invalid provisional probe: {error}"))?;
+        let sequence = probe.next_sequence;
         let root = self.workspace_root.clone();
         let project = self.project_root.clone();
         let workspace = self.workspace_id.clone();
@@ -1103,6 +1103,7 @@ mod tests {
         expected_blobs: BTreeSet<String>,
         installed_blobs: BTreeSet<String>,
         current: Option<ProvisionalWorkspaceStatusV1>,
+        next_sequence: u64,
         begin_calls: usize,
         renew_calls: usize,
     }
@@ -1135,6 +1136,7 @@ mod tests {
         assert_mock_auth(&headers, &state);
         Json(ProvisionalProbeResponseV1 {
             current: state.current.clone(),
+            next_sequence: state.next_sequence,
         })
     }
 
@@ -1236,6 +1238,7 @@ mod tests {
         assert_eq!(state.installed_blobs, state.expected_blobs);
         let descriptor = state.descriptor.clone().unwrap();
         let generation = "c".repeat(64);
+        state.next_sequence = descriptor.sequence.checked_add(1).unwrap();
         state.current = Some(ProvisionalWorkspaceStatusV1 {
             source_generation_id: generation.clone(),
             state: SourceGenerationStateV1::Ready,
@@ -1305,6 +1308,7 @@ mod tests {
             expected_blobs: BTreeSet::new(),
             installed_blobs: BTreeSet::new(),
             current: None,
+            next_sequence: 9,
             begin_calls: 0,
             renew_calls: 0,
         }));
@@ -1366,6 +1370,7 @@ mod tests {
         let first = client.sync_once().await.unwrap();
         assert!(!first.reused);
         assert_eq!(first.source_generation_id, "c".repeat(64));
+        assert_eq!(first.sequence, 9);
         let second = client.sync_once().await.unwrap();
         assert!(second.reused);
         assert_eq!(second.source_generation_id, first.source_generation_id);

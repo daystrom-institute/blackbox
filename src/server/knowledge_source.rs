@@ -1021,8 +1021,11 @@ async fn probe_provisional(
         return Err(HttpError::forbidden_scope());
     }
     let store = state.knowledge_sources.store();
-    let current = blocking(move || store.probe_provisional(&authority, now_unix_secs())).await?;
-    Ok(Json(ProvisionalProbeResponseV1 { current }))
+    let probe = blocking(move || store.probe_provisional(&authority, now_unix_secs())).await?;
+    Ok(Json(ProvisionalProbeResponseV1 {
+        current: probe.current,
+        next_sequence: probe.next_sequence,
+    }))
 }
 
 async fn begin_provisional_upload(

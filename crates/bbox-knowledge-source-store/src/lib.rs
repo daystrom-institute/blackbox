@@ -941,6 +941,17 @@ enum FinalizeStageV1 {
     Retiring,
 }
 
+impl FinalizeStageV1 {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Prepared => 0,
+            Self::GenerationInstalled => 1,
+            Self::Committed => 2,
+            Self::Retiring => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct FinalizeJournalV1 {
@@ -1005,6 +1016,20 @@ impl FinalizeJournalV1 {
         }
         Ok(())
     }
+
+    fn has_same_identity(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.kind == other.kind
+            && self.upload_id == other.upload_id
+            && self.source_generation_id == other.source_generation_id
+            && self.authority_key == other.authority_key
+            && self.project_id == other.project_id
+            && self.created_unix_secs == other.created_unix_secs
+            && self.created_unix_nanos == other.created_unix_nanos
+            && self.lease_expires_unix_secs == other.lease_expires_unix_secs
+            && self.prior_generation_id == other.prior_generation_id
+            && self.provisional_sequence == other.provisional_sequence
+    }
 }
 
 struct MutationGuard<'a> {
@@ -1051,6 +1076,12 @@ pub struct ReadyProvisionalWorkspace {
     pub baseline_gaps: Vec<ReadyPublicationFile>,
     pub working_knowledge: Vec<ReadyPublicationFile>,
     pub working_gaps: Vec<ReadyPublicationFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvisionalProbe {
+    pub current: Option<ProvisionalWorkspaceStatusV1>,
+    pub next_sequence: u64,
 }
 
 /// Lock-consistent source state used by the offline strict-cutover preflight.
@@ -1533,6 +1564,24 @@ impl KnowledgeSourceStore {
             if is_open(record.state) {
                 open += 1;
             }
+        }
+        if self
+            .load_provisional_sequence(authority, descriptor.sequence)?
+            .is_some()
+            || self
+                .load_provisional_pointer(authority)?
+                .is_some_and(|pointer| {
+                    pointer.sequence == descriptor.sequence
+                        && pointer.source_generation_id == generation_id
+                })
+            || NofollowDirectory::open_existing(&self.provisional_generation_path(
+                &authority.project_id,
+                &authority.workspace_id,
+                &generation_id,
+            )?)?
+            .is_some()
+        {
+            bail!(StoreRequestError::InvalidState);
         }
         if open >= limits.max_open_uploads_per_authority {
             bail!(StoreRequestError::TooManyOpenUploads);
@@ -2073,11 +2122,19 @@ impl KnowledgeSourceStore {
         &self,
         authority: &ProvisionalAuthorityV1,
         now: u64,
-    ) -> Result<Option<ProvisionalWorkspaceStatusV1>> {
-        self.selected_provisional(authority, now)?
+    ) -> Result<ProvisionalProbe> {
+        validate_provisional_authority(authority)?;
+        let _guard = self.lock_mutation()?;
+        let current = self
+            .selected_provisional(authority, now)?
             .as_ref()
             .map(provisional_status)
-            .transpose()
+            .transpose()?;
+        let next_sequence = self.next_provisional_sequence_locked(authority)?;
+        Ok(ProvisionalProbe {
+            current,
+            next_sequence,
+        })
     }
 
     pub fn renew_provisional(
@@ -2278,6 +2335,11 @@ impl KnowledgeSourceStore {
                         || journal.provisional_sequence != Some(upload.descriptor.sequence)
                     {
                         bail!(StoreRequestError::InvalidState);
+                    }
+                    if self.repair_duplicate_provisional_finalize_journal(
+                        &authority, &journal, &upload,
+                    )? {
+                        continue;
                     }
                     if journal.stage == FinalizeStageV1::Committed {
                         if upload.state != SourceGenerationStateV1::Ready {
@@ -2738,15 +2800,8 @@ impl KnowledgeSourceStore {
                 bail!(StoreRequestError::Conflict);
             }
         }
-        let sequence_path = self
-            .provisional_workspace_root(&authority.project_id, &authority.workspace_id)?
-            .join("sequences");
-        if let Some(sequence) = read_json::<ProvisionalPointerV1>(
-            &sequence_path,
-            &format!("{:020}.json", descriptor.sequence),
-            MAX_GENERATION_RECORD_BYTES,
-            "provisional sequence",
-        )? && sequence.source_generation_id != generation_id
+        if let Some(sequence) = self.load_provisional_sequence(authority, descriptor.sequence)?
+            && sequence.source_generation_id != generation_id
         {
             bail!(StoreRequestError::Conflict);
         }
@@ -2853,6 +2908,105 @@ impl KnowledgeSourceStore {
         self.verify_all_upload_blobs(&generation_path)
     }
 
+    /// Repair the exact legacy failure where a second upload reused an
+    /// already-finalized sequence and replaced its committed journal with a
+    /// fresh Prepared journal. The immutable generation, sequence assignment,
+    /// generation index, and original Ready upload must all agree before the
+    /// committed journal is reconstructed.
+    fn repair_duplicate_provisional_finalize_journal(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+        journal: &FinalizeJournalV1,
+        duplicate: &ProvisionalUploadV1,
+    ) -> Result<bool> {
+        if journal.stage != FinalizeStageV1::Prepared
+            || duplicate.state != SourceGenerationStateV1::MissingBlobs
+        {
+            return Ok(false);
+        }
+        let generation_path = self.provisional_generation_path(
+            &authority.project_id,
+            &authority.workspace_id,
+            &journal.source_generation_id,
+        )?;
+        if NofollowDirectory::open_existing(&generation_path)?.is_none() {
+            return Ok(false);
+        }
+        let source = self.load_provisional_generation(
+            &authority.project_id,
+            &authority.workspace_id,
+            &journal.source_generation_id,
+        )?;
+        if source.descriptor != duplicate.descriptor
+            || matches!(
+                source.state,
+                SourceGenerationStateV1::ReceivingManifest
+                    | SourceGenerationStateV1::MissingBlobs
+                    | SourceGenerationStateV1::Failed
+            )
+        {
+            return Ok(false);
+        }
+        let sequence = self
+            .load_provisional_sequence(authority, duplicate.descriptor.sequence)?
+            .ok_or(StoreRequestError::InvalidState)?;
+        if sequence.source_generation_id != journal.source_generation_id {
+            bail!(StoreRequestError::InvalidState);
+        }
+
+        let mut originals = Vec::new();
+        for path in read_child_directories(
+            &self.provisional_upload_authority_root(&authority.workspace_id)?,
+            &[],
+        )? {
+            let upload_id = file_name(&path)?;
+            let candidate = self.load_provisional_upload(&path, authority, &upload_id)?;
+            if candidate.upload_id != duplicate.upload_id
+                && candidate.state == SourceGenerationStateV1::Ready
+                && candidate.source_generation_id == journal.source_generation_id
+                && candidate.descriptor == source.descriptor
+            {
+                originals.push(candidate);
+            }
+        }
+        if originals.len() != 1 {
+            bail!(StoreRequestError::InvalidState);
+        }
+        let original = originals.pop().expect("length checked");
+        self.verify_finalized_provisional(authority, &original)?;
+
+        let restored = FinalizeJournalV1 {
+            version: STORE_VERSION,
+            kind: FinalizeKindV1::Provisional,
+            stage: FinalizeStageV1::Committed,
+            upload_id: original.upload_id,
+            source_generation_id: source.source_generation_id,
+            authority_key: authority.workspace_id.to_string(),
+            project_id: authority.project_id.clone(),
+            created_unix_secs: source.created_unix_secs,
+            created_unix_nanos: source.created_unix_nanos,
+            lease_expires_unix_secs: Some(source.lease_expires_unix_secs),
+            prior_generation_id: None,
+            provisional_sequence: Some(source.descriptor.sequence),
+            checksum_sha256: String::new(),
+        }
+        .seal()?;
+        restored.validate()?;
+
+        // This is the sole identity-changing journal write: it repairs an
+        // on-disk journal produced before identity monotonicity was enforced.
+        write_json(
+            &existing_directory(&self.root.join("journals"))?,
+            &journal_filename(restored.kind, &restored.source_generation_id),
+            &restored,
+        )?;
+        remove_upload_directory(
+            &self.provisional_upload_path(&authority.workspace_id, &duplicate.upload_id)?,
+            true,
+        )?;
+        Ok(true)
+    }
+
     fn install_blob_bytes(&self, hash: &str, bytes: &[u8]) -> Result<()> {
         validate_blob_hash(hash)?;
         let directory =
@@ -2914,11 +3068,27 @@ impl KnowledgeSourceStore {
     fn write_finalize_journal(&self, journal: FinalizeJournalV1) -> Result<FinalizeJournalV1> {
         let journal = journal.seal()?;
         journal.validate()?;
-        write_json(
-            &existing_directory(&self.root.join("journals"))?,
-            &journal_filename(journal.kind, &journal.source_generation_id),
-            &journal,
-        )?;
+        let root = self.root.join("journals");
+        let name = journal_filename(journal.kind, &journal.source_generation_id);
+        if let Some(existing) = read_json::<FinalizeJournalV1>(
+            &root,
+            &name,
+            MAX_JOURNAL_BYTES,
+            "knowledge-source finalize journal",
+        )? {
+            existing.validate()?;
+            if !journal.has_same_identity(&existing) || journal.stage.rank() < existing.stage.rank()
+            {
+                bail!(StoreRequestError::Conflict);
+            }
+            if journal.stage == existing.stage {
+                if journal != existing {
+                    bail!(StoreRequestError::Conflict);
+                }
+                return Ok(existing);
+            }
+        }
+        write_json(&existing_directory(&root)?, &name, &journal)?;
         Ok(journal)
     }
 
@@ -3052,6 +3222,71 @@ impl KnowledgeSourceStore {
             bail!(StoreRequestError::InvalidState);
         }
         Ok(Some(pointer))
+    }
+
+    fn load_provisional_sequence(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+        sequence: u64,
+    ) -> Result<Option<ProvisionalPointerV1>> {
+        if sequence == 0 {
+            bail!(StoreRequestError::InvalidInput);
+        }
+        let root = self
+            .provisional_workspace_root(&authority.project_id, &authority.workspace_id)?
+            .join("sequences");
+        let Some(pointer) = read_json::<ProvisionalPointerV1>(
+            &root,
+            &format!("{sequence:020}.json"),
+            MAX_GENERATION_RECORD_BYTES,
+            "provisional sequence",
+        )?
+        else {
+            return Ok(None);
+        };
+        if pointer.version != STORE_VERSION
+            || pointer.project_id != authority.project_id
+            || pointer.workspace_id != authority.workspace_id
+            || pointer.sequence != sequence
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        validate_provisional_generation_id(&pointer.source_generation_id)?;
+        Ok(Some(pointer))
+    }
+
+    fn next_provisional_sequence_locked(&self, authority: &ProvisionalAuthorityV1) -> Result<u64> {
+        let mut highest = self
+            .load_provisional_pointer(authority)?
+            .map_or(0, |pointer| pointer.sequence);
+        let sequences = self
+            .provisional_workspace_root(&authority.project_id, &authority.workspace_id)?
+            .join("sequences");
+        match fs::symlink_metadata(&sequences) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                for path in read_regular_json_files(&sequences)? {
+                    let name = file_name(&path)?;
+                    let encoded = name
+                        .strip_suffix(".json")
+                        .ok_or(StoreRequestError::InvalidState)?;
+                    if encoded.len() != 20 || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
+                        bail!(StoreRequestError::InvalidState);
+                    }
+                    let sequence = encoded
+                        .parse::<u64>()
+                        .map_err(|_| anyhow!(StoreRequestError::InvalidState))?;
+                    self.load_provisional_sequence(authority, sequence)?
+                        .ok_or(StoreRequestError::InvalidState)?;
+                    highest = highest.max(sequence);
+                }
+            }
+            Ok(_) => bail!(StoreRequestError::InvalidState),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        highest
+            .checked_add(1)
+            .ok_or_else(|| anyhow!(StoreRequestError::LimitExceeded))
     }
 
     fn write_provisional_pointer(
@@ -4095,6 +4330,14 @@ mod tests {
                 .source_generation_id,
             first_generation
         );
+        let first_probe = store
+            .probe_provisional(&authority, now_unix_secs())
+            .unwrap();
+        assert_eq!(
+            first_probe.current.unwrap().source_generation_id,
+            first_generation
+        );
+        assert_eq!(first_probe.next_sequence, 8);
         let materialized = store
             .materialize_selected_provisional(&authority, now_unix_secs())
             .unwrap()
@@ -4189,6 +4432,159 @@ mod tests {
                 .selected_provisional(&authority, now_unix_secs())
                 .unwrap()
                 .is_none()
+        );
+        let retired_probe = store
+            .probe_provisional(&authority, now_unix_secs())
+            .unwrap();
+        assert!(retired_probe.current.is_none());
+        assert_eq!(retired_probe.next_sequence, 9);
+        assert_store_error(
+            store.begin_provisional_upload(&authority, provisional_fixture(8).0),
+            StoreRequestError::InvalidState,
+        );
+    }
+
+    #[test]
+    fn finalize_journals_refuse_identity_changes_and_stage_regressions() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, nodes, knowledge, gaps) = provisional_fixture(7);
+        let upload = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &authority,
+            &upload.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        store
+            .missing_provisional_blobs(&authority, &upload.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_provisional(&store, &authority, &upload.upload_id);
+        let generation = store
+            .finalize_provisional_upload(&authority, &upload.upload_id, 60)
+            .unwrap()
+            .source_generation_id;
+        let journal = read_json::<FinalizeJournalV1>(
+            &root.join("journals"),
+            &journal_filename(FinalizeKindV1::Provisional, &generation),
+            MAX_JOURNAL_BYTES,
+            "test journal",
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut regressed = journal.clone();
+        regressed.stage = FinalizeStageV1::Prepared;
+        assert_store_error(
+            store.write_finalize_journal(regressed),
+            StoreRequestError::Conflict,
+        );
+        let mut changed_identity = journal;
+        changed_identity.stage = FinalizeStageV1::Retiring;
+        changed_identity.upload_id = "f".repeat(32);
+        assert_store_error(
+            store.write_finalize_journal(changed_identity),
+            StoreRequestError::Conflict,
+        );
+    }
+
+    #[test]
+    fn recovery_repairs_legacy_duplicate_provisional_finalize_journal() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, nodes, knowledge, gaps) = provisional_fixture(7);
+        let original = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &authority,
+            &original.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        store
+            .missing_provisional_blobs(&authority, &original.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_provisional(&store, &authority, &original.upload_id);
+        let generation = store
+            .finalize_provisional_upload(&authority, &original.upload_id, 60)
+            .unwrap()
+            .source_generation_id;
+        store.retire_provisional(&authority, &generation).unwrap();
+
+        let original_path = store
+            .provisional_upload_path(&authority.workspace_id, &original.upload_id)
+            .unwrap();
+        let mut duplicate = store
+            .load_provisional_upload(&original_path, &authority, &original.upload_id)
+            .unwrap();
+        duplicate.upload_id = "f".repeat(32);
+        duplicate.state = SourceGenerationStateV1::MissingBlobs;
+        duplicate.updated_unix_secs = now_unix_secs();
+        let duplicate_path = store
+            .provisional_upload_path(&authority.workspace_id, &duplicate.upload_id)
+            .unwrap();
+        write_json(
+            &NofollowDirectory::open_or_create(&duplicate_path).unwrap(),
+            "upload.json",
+            &duplicate,
+        )
+        .unwrap();
+
+        let legacy = FinalizeJournalV1 {
+            version: STORE_VERSION,
+            kind: FinalizeKindV1::Provisional,
+            stage: FinalizeStageV1::Prepared,
+            upload_id: duplicate.upload_id.clone(),
+            source_generation_id: generation.clone(),
+            authority_key: authority.workspace_id.to_string(),
+            project_id: authority.project_id.clone(),
+            created_unix_secs: now_unix_secs(),
+            created_unix_nanos: now_unix_nanos(),
+            lease_expires_unix_secs: Some(now_unix_secs() + 60),
+            prior_generation_id: None,
+            provisional_sequence: Some(7),
+            checksum_sha256: String::new(),
+        }
+        .seal()
+        .unwrap();
+        write_json(
+            &existing_directory(&root.join("journals")).unwrap(),
+            &journal_filename(FinalizeKindV1::Provisional, &generation),
+            &legacy,
+        )
+        .unwrap();
+        drop(store);
+
+        let recovered = KnowledgeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        assert!(!duplicate_path.exists());
+        let restored = read_json::<FinalizeJournalV1>(
+            &root.join("journals"),
+            &journal_filename(FinalizeKindV1::Provisional, &generation),
+            MAX_JOURNAL_BYTES,
+            "test journal",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.stage, FinalizeStageV1::Committed);
+        assert_eq!(restored.upload_id, original.upload_id);
+        let probe = recovered
+            .probe_provisional(&authority, now_unix_secs())
+            .unwrap();
+        assert!(probe.current.is_none());
+        assert_eq!(probe.next_sequence, 8);
+        assert_eq!(
+            recovered
+                .project_cutover_readiness(&authority.project_id, now_unix_secs())
+                .unwrap()
+                .unfinished_finalize_journal_count,
+            0
         );
     }
 

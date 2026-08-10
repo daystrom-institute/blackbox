@@ -5,7 +5,7 @@ Updated: 2026-08-10
 ## Current production state
 
 - The macOS production daemon remains disabled.
-- The cage daemon is running the verified `78b994d923dc` image at immutable digest `sha256:8f21ce69ddb8ff67458ba7764c83fc6cf4ec1938acecccb2c3c607e8f0270f7a` with zero restarts. Pod: `blackboxd-848ccdc78f-llccb`.
+- The cage daemon is running the verified `f06c114cd749` image at immutable digest `sha256:74087b6fd6eec72b1b56fe7d5d68dfd3b06370f75ea5100b84172e07f85e9d2d` with zero restarts. Pod: `blackboxd-dd45fddd5-rx927`.
 - No maintenance pod currently has the production PVC mounted.
 - The final collector refresh completed successfully for all 19 published projects. Code, Git history, provenance, and published knowledge all reached durable terminal states.
 - The two stale provenance journals were explicitly revalidated against their current code selectors and converged to `Committed` with their exact prior edge counts.
@@ -15,7 +15,7 @@ Updated: 2026-08-10
 - Authenticated checkout-local `bro provenance export` completed 210 pages for generation `28e9b7a85b7eb2b57084f2bc4b047c9a60e54940051b1efe3e52c844f171c4b1`: 671 existing note documents were unchanged, 0 were rejected, and no stale-generation restart occurred. The export caused a real sidecar rebuild while the daemon continued serving; that rebuild converged in 10.3 seconds and the graph remained intact.
 - The current catalog has 19 projects and all 19 are Published. The blame locality marker is applied and offline-verified for the full set at catalog epoch 49. Marker checksum: `f3ed9e9e95e3448cccda2b7d90ab4599d319ad70b07ac683410a31a83ecaf422`.
 - After the marked daemon restart, corpus-entity `bbox_blame` refuses with `error.blame_locality_required` before any checkout acquisition. Authenticated checkout-local `bro blame` succeeds against a real file and line. The checkout observation sequence remains exactly 327234; only the expected operator completion advanced the blame observation sequence from 169 to 170. The pod remains ready with zero restarts.
-- Managed project render is now live-accepted for one disposable Published checkout. The `published`, `all`, and `own` views each produced an all-provider, non-dry-run receipt with three writes and zero refusals. The three provider projections were written by the checkout-owner harness, while the complete daemon checkout-observation file remained byte-for-byte unchanged at sequence 327234 with no `render_file_provider` counter. The pod remained ready with zero restarts.
+- Managed project render is fully live-accepted for five disposable Published checkouts. Each has successful all-provider, non-dry-run `published`, `all`, and `own` receipts with three writes and zero refusals. Two additional projects have successful zero-write completions because they contain no project guidance. A large managed checkout has successful three-write `published` and `all` receipts; its `own` view exposed an expired-provisional sequence defect described below. Durable render observation sequence is 23. The complete daemon checkout-observation file remains byte-for-byte unchanged at sequence 327234 with no `render_file_provider` counter, and the pod remains ready with zero restarts.
 
 ## Landed implementation
 
@@ -28,8 +28,9 @@ Updated: 2026-08-10
 - `78b994d923dc`: added typed MCP host-authority configuration, the `BBOX_MCP_ALLOWED_HOSTS` override, strict validation, and rmcp server wiring.
 - `cbcdd2748070`: repaired standalone harness locality configuration lookup across task-local and process environment forms.
 - `391eb8c6d419`: admitted the daemon-authored source endpoint only through the managed harness's explicit encrypted-network policy and made fatal harness startup errors independent of inherited log filters.
-- Every deployed implementation commit passed its full cluster verification gate. Image build `build-bbox-image-lmkmn` produced the current immutable cage digest.
-- The live Pulumi deployment is pinned to the current exact image digest. Cage commit `f44dca1a1803617a376cbae43a22d134a4d78169` records and publishes the matching worker routing and image pin.
+- `f06c114cd749`: paged managed render plans below the MCP response cap, pinned the compact canonical plan by SHA-256, and made the checkout-owner harness validate every page before completing the plan.
+- Every deployed implementation commit passed its full cluster verification gate. Exact rerun `bbox-verify-crlcw` passed all 6,436 tests plus clippy and concurrency for `f06c114cd749`; image build `build-bbox-image-x8mzx` produced the current immutable cage digest.
+- The live Pulumi deployment is pinned to the current exact image digest. Cage commit `34eee75` records and publishes the matching worker routing and image pin.
 
 ## Verified repair
 
@@ -54,19 +55,24 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 
 ## Next operations
 
-1. Migrate the hand-authored provider guidance into provider-neutral project documentation and reviewed knowledge without losing content.
-2. Generate the same successful all-provider `published`, `all`, and `own` render completions for the remaining 18 Published projects without daemon checkout access.
-3. Run the render locality preflight, quiet window, offline marker apply, restart, and strict refusal/successor probes.
-4. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
+1. Repair provisional probing so an expired or retired current pointer still returns the next durable workspace sequence, and prevent finalize journals from regressing or changing identity.
+2. Redeploy the exact repaired daemon and checkout-owner harness, then rerun all three views for the large managed checkout and prove the checkout-observation file is unchanged.
+3. Migrate the eleven hand-authored provider-guidance sets and give the two zero-content projects a provider-neutral source document, then complete three-view coverage for all 19 projects.
+4. Run the render locality preflight, quiet window, offline marker apply, restart, and strict refusal/successor probes.
+5. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
 
 ## Next-lane inventory
 
-- Production now has three accepted render-locality observations for one Published project and still has no render locality marker or `RenderFileProvider` target counters. The render cutover is not yet preflight-ready: the remaining 18 selected projects need successful managed all-provider writes for the `published`, `all`, and `own` views.
+- Production now has complete three-view render-locality acceptance for five Published projects and still has no render locality marker or `RenderFileProvider` target counters. Two no-content projects have valid zero-write completions. One large project has two of three successful views. The other eleven projects still need provider-guidance migration and complete three-view evidence.
 - The 19 bound checkout roots are mapped and none of their four instruction targets is currently dirty. Seven already have all three blackbox-managed provider files; one has all three provider files absent. The other eleven contain hand-authored provider guidance that render must preserve rather than overwrite: eleven `CLAUDE.md` files and nine `AGENTS.md` files. `GEMINI.md` is managed in seven checkouts and absent in twelve. Only six checkouts currently have a nonempty `PROJECT.md`.
-- One of the eight immediately writable checkouts has completed the full three-view managed proof. Seven more can accept provider writes immediately. The other eleven need deliberate bootstrap/decomposition first, and every remaining checkout needs a managed plan proving that each view produces three written projections rather than skipped output.
+- Five of the eight initially writable checkouts have completed the full three-view managed proof. Two lack any source guidance and need a provider-neutral source document before a three-write proof is possible. The large checkout is blocked only on the sequence defect below. The other eleven need deliberate bootstrap/decomposition first, and every remaining checkout needs a managed plan proving that each view produces three written projections rather than skipped output.
 - Historical checkout counters show the already-governed Git history, collected source, publisher, knowledge, artifact-watch, and blame paths refusing their daemon checkout lanes. The remaining explicit work is project render evidence plus the separately scoped bridge/raw compatibility categories; global render remains host-local by design.
 
 ## Managed-render acceptance
+
+- The large managed checkout proved that `f06c114cd749` fixes render plans above the generic MCP response cap: its `published` and `all` calls each assembled the paged plan and wrote all three provider projections.
+- Its `own` call then failed because the prior provisional lease had expired. The client inferred sequence one from an absent live pointer even though immutable sequence one history remained. A second exact upload reached `Prepared`, collided with the retired immutable generation, and replaced the prior committed journal. This is the active implementation and live-state repair; it is not an accepted render result.
+- The repair makes the probe return the next durable sequence under the store mutation lock, forbids new uploads from reusing finalized sequences, enforces monotonic journal stage and identity, and reconstructs the committed journal on startup only when all immutable evidence and the original Ready upload agree. After verification and deployment, the large checkout must rerun all three views and advance durable render observations by exactly three while checkout observations remain unchanged.
 
 - The first managed render dispatch exposed a separate executor-boundary regression: the allocator rejected every fleetd lane as `provider_binary_missing` because it resolved `bro-harness` on the containerized daemon host, even though fleetd owns the worker process and its login-shell `PATH`.
 - Commit `035f42e49b0f` makes provider-binary eligibility executor-local. Local execution retains the daemon-host binary gate, fleetd execution defers final resolution to the worker host, and the non-dispatchable workflow pseudo-provider still fails closed. Full local and cluster verification passed, image build `build-bbox-image-cb45d` succeeded, and digest `sha256:025872bdd9db0b877a0744620d411b499600db8a63ebc094fdcb5495bba08fdd` is deployed with zero restarts. Live allocator preview reports `executor_host` and admits a pinned remote lane without a daemon-host harness binary.

@@ -266,6 +266,14 @@ monotonic producer/workspace sequence. The default lease is short and bounded
 by server config; renewal names the exact generation. A newer generation
 atomically supersedes the prior pair.
 
+The provisional probe returns both the optional live generation and the next
+durable sequence. The store derives that sequence under its mutation lock from
+the immutable per-workspace sequence assignments, not from the live pointer,
+so lease expiry or explicit retirement cannot reset the producer to sequence
+one. A finalized sequence is single-use: an exact open upload remains
+resumable, but a new upload cannot reuse an already-assigned sequence or an
+installed generation identity.
+
 The store may persist ready payloads under the corpus state root so daemon
 restart does not create a false empty interval, but it is a transport cache,
 not canonical knowledge. Startup drops expired, corrupt, grant-revoked,
@@ -393,6 +401,11 @@ GET  provisional/generations/{id}/status
 `class` is `baseline` or `working`; `lane` is `knowledge` or `gaps`.
 Manifest and ancestry-page order is canonical and pages are contiguous.
 Missing-blob responses make retries resumable. Finalize is idempotent for
+the exact upload and generation. Finalize journals advance monotonically and
+cannot change upload identity. Startup recovery may reconstruct a committed
+provisional journal only for the legacy duplicate-finalize failure shape where
+the immutable generation, sequence assignment, generation index, and exactly
+one original Ready upload all agree.
 byte-identical evidence and conflicts on the same logical sequence with
 different bytes.
 

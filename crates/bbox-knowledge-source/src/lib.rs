@@ -360,6 +360,9 @@ pub struct ProvisionalProbeRequestV1 {
 pub struct ProvisionalProbeResponseV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<ProvisionalWorkspaceStatusV1>,
+    /// The next durable sequence for this workspace. This remains monotonic
+    /// after the current lease expires or its pointer is explicitly retired.
+    pub next_sequence: u64,
 }
 
 /// Daemon-authenticated inputs a workspace owner must pin before capturing a
@@ -420,6 +423,20 @@ impl ProvisionalProbeRequestV1 {
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_scope(&self.scope)?;
         WorkspaceId::parse(self.workspace_id.as_str()).map_err(|_| ContractError::InvalidInput)?;
+        Ok(())
+    }
+}
+
+impl ProvisionalProbeResponseV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.next_sequence == 0
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|current| current.sequence >= self.next_sequence)
+        {
+            return Err(ContractError::InvalidInput);
+        }
         Ok(())
     }
 }
