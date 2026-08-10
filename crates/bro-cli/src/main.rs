@@ -908,6 +908,8 @@ mod tests {
             "export",
             "--project-root",
             "/tmp/project",
+            "--token-file",
+            "/tmp/token",
         ]);
         assert!(matches!(cli.command, BroCommand::Provenance(_)));
     }

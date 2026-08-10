@@ -79,3 +79,14 @@
   relies on the per-store locks instead.
 - `run_blocking`'s per-call log line (`tool`, `elapsed_ms`, `bytes`) is the
   only built-in tool telemetry; keep it intact when wrapping handlers.
+- Deferred EdgeIndex startup is a fail-closed warmup, never an empty graph.
+  The watcher immediately publishes the first complete sidecar view and graph
+  consumers return `error.edge_index_warming` until that publication lands.
+  Selector-changing publications lower the readiness fence before publishing
+  their intentionally empty placeholder, then nudge the same watcher; a graph
+  reader may retain a complete old immutable view or wait for the complete new
+  one, but may never observe the placeholder as a valid graph.
+- Raw `?project=` remains a surface/filter selector only. Attended blame and
+  provenance export use separate producer-token grants bound to a committed
+  published scope; neither grant implies managed-workspace knowledge or
+  mutation authority, and the three authority lanes are mutually exclusive.

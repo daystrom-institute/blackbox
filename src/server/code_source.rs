@@ -2546,6 +2546,9 @@ pub(super) fn republish_code_read_view(state: &Arc<SharedState>) -> Result<()> {
     );
     let index = state.idx.write();
     let selectors = index.active_code_selectors();
+    state
+        .edge_index_ready
+        .store(false, std::sync::atomic::Ordering::Release);
     *state.code_read_view.write() = Arc::new(super::CodeReadView {
         active_selectors: selectors,
         searcher: index.searcher(),
@@ -5039,6 +5042,9 @@ fn cutback_to_local_single_attempt(
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), staged.selector.clone());
             index.replace_active_code_selectors(selectors.clone());
+            state
+                .edge_index_ready
+                .store(false, std::sync::atomic::Ordering::Release);
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
                 searcher: index.searcher(),
@@ -5387,6 +5393,9 @@ fn cutback_to_local(
             let mut selectors = index.active_code_selectors();
             selectors.insert(project_id.to_string(), staged.selector.clone());
             index.replace_active_code_selectors(selectors.clone());
+            state
+                .edge_index_ready
+                .store(false, std::sync::atomic::Ordering::Release);
             *state.code_read_view.write() = Arc::new(super::CodeReadView {
                 active_selectors: selectors,
                 searcher: index.searcher(),
@@ -5800,6 +5809,9 @@ fn activate_desired_loop(
                 let mut selectors = index.active_code_selectors();
                 selectors.insert(project_id.to_string(), staged.selector.clone());
                 index.replace_active_code_selectors(selectors.clone());
+                state
+                    .edge_index_ready
+                    .store(false, std::sync::atomic::Ordering::Release);
                 *state.code_read_view.write() = Arc::new(super::CodeReadView {
                     active_selectors: selectors,
                     searcher: index.searcher(),

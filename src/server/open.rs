@@ -954,6 +954,7 @@ pub(super) fn open_shared_state(
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
         code_read_view: RwLock::new(Arc::new(code_read_view)),
+        edge_index_ready: std::sync::atomic::AtomicBool::new(cfg.index.edge_index_boot_rebuild),
         code_sources,
         git_sources,
         knowledge_sources,

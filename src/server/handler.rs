@@ -99,63 +99,84 @@ impl ServerHandler for BlackboxServer {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        let (surface_str, project_raw, workspace_binding, operator_blame_binding) =
-            if let Some(parts) = context.extensions.get::<http::request::Parts>() {
-                let project =
-                    server::surface::extract_decoded_query_param(parts.uri.query(), "project")
-                        .map_err(|error| {
-                            ErrorData::internal_error(
-                                format!("invalid project query parameter: {error}"),
-                                None,
-                            )
-                        })?;
-                let workspace_binding =
-                    match parts.headers.get(bro_protocol::WORKSPACE_BINDING_HEADER) {
-                        Some(candidate) => {
-                            let candidate = candidate.to_str().map_err(|_| {
+        let (
+            surface_str,
+            project_raw,
+            workspace_binding,
+            operator_blame_binding,
+            operator_provenance_binding,
+        ) = if let Some(parts) = context.extensions.get::<http::request::Parts>() {
+            let project =
+                server::surface::extract_decoded_query_param(parts.uri.query(), "project")
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("invalid project query parameter: {error}"),
+                            None,
+                        )
+                    })?;
+            let workspace_binding = match parts.headers.get(bro_protocol::WORKSPACE_BINDING_HEADER)
+            {
+                Some(candidate) => {
+                    let candidate = candidate.to_str().map_err(|_| {
+                        ErrorData::new(
+                            ErrorCode::INVALID_REQUEST,
+                            "invalid workspace binding",
+                            None,
+                        )
+                    })?;
+                    Some(
+                        self.state
+                            .knowledge_sources
+                            .authenticate_workspace_binding_now(candidate)
+                            .ok_or_else(|| {
                                 ErrorData::new(
                                     ErrorCode::INVALID_REQUEST,
                                     "invalid workspace binding",
                                     None,
                                 )
-                            })?;
-                            Some(
-                                self.state
-                                    .knowledge_sources
-                                    .authenticate_workspace_binding_now(candidate)
-                                    .ok_or_else(|| {
-                                        ErrorData::new(
-                                            ErrorCode::INVALID_REQUEST,
-                                            "invalid workspace binding",
-                                            None,
-                                        )
-                                    })?,
-                            )
-                        }
-                        None => None,
-                    };
-                let operator_blame_binding =
-                    server::blame_authority::authenticate_operator_blame_binding(
-                        self.state.as_ref(),
-                        &parts.headers,
+                            })?,
                     )
-                    .map_err(|message| ErrorData::new(ErrorCode::INVALID_REQUEST, message, None))?;
-                if workspace_binding.is_some() && operator_blame_binding.is_some() {
-                    return Err(ErrorData::new(
-                        ErrorCode::INVALID_REQUEST,
-                        "managed workspace and operator blame authorities are mutually exclusive",
-                        None,
-                    ));
                 }
-                (
-                    server::surface::extract_surface_from_uri(parts.uri.query()),
-                    project,
-                    workspace_binding,
-                    operator_blame_binding,
-                )
-            } else {
-                ("default", None, None, None)
+                None => None,
             };
+            let operator_blame_binding =
+                server::blame_authority::authenticate_operator_blame_binding(
+                    self.state.as_ref(),
+                    &parts.headers,
+                )
+                .map_err(|message| ErrorData::new(ErrorCode::INVALID_REQUEST, message, None))?;
+            let operator_provenance_binding =
+                server::provenance_authority::authenticate_operator_provenance_binding(
+                    self.state.as_ref(),
+                    &parts.headers,
+                )
+                .map_err(|message| ErrorData::new(ErrorCode::INVALID_REQUEST, message, None))?;
+            if [
+                workspace_binding.is_some(),
+                operator_blame_binding.is_some(),
+                operator_provenance_binding.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count()
+                > 1
+            {
+                return Err(ErrorData::new(
+                    ErrorCode::INVALID_REQUEST,
+                    "managed workspace and operator checkout authorities are mutually exclusive",
+                    None,
+                ));
+            }
+            (
+                server::surface::extract_surface_from_uri(parts.uri.query()),
+                project,
+                workspace_binding,
+                operator_blame_binding,
+                operator_provenance_binding,
+            )
+        } else {
+            ("default", None, None, None, None)
+        };
         // Resolve the project selector (alias / id / path) through the
         // shared engine (phase-2 §9.2, Filter class) to the base canonical
         // path packets are scoped by, keeping the literal on a miss for
@@ -167,6 +188,11 @@ impl ServerHandler for BlackboxServer {
             .map(|grant| grant.project_id.clone())
             .or_else(|| {
                 operator_blame_binding
+                    .as_ref()
+                    .map(|grant| grant.project_id.clone())
+            })
+            .or_else(|| {
+                operator_provenance_binding
                     .as_ref()
                     .map(|grant| grant.project_id.clone())
             });
@@ -229,6 +255,9 @@ impl ServerHandler for BlackboxServer {
         let _ = self
             .session_operator_blame_binding
             .set(operator_blame_binding.map(Arc::new));
+        let _ = self
+            .session_operator_provenance_binding
+            .set(operator_provenance_binding.map(Arc::new));
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }

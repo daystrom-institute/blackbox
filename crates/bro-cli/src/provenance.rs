@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use bbox_provenance::{ApplyExportPageResult, ProvenanceExportPage, apply_export_page};
+use bro_rpc::ServiceToken;
 use clap::{Args, Subcommand};
 use serde_json::{Map, Value, json};
 
@@ -30,6 +31,10 @@ struct ProvenanceExportArgs {
     /// Checkout project root. Defaults to the current directory.
     #[arg(long, value_name = "DIR")]
     project_root: Option<PathBuf>,
+    /// Scope-bound producer bearer file. The token is sent only during MCP
+    /// initialization and is never put in the URL or output.
+    #[arg(long, value_name = "FILE")]
+    token_file: PathBuf,
     /// Daemon base URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
     #[arg(long, value_name = "URL")]
     daemon_url: Option<String>,
@@ -146,7 +151,12 @@ async fn export(args: ProvenanceExportArgs) -> anyhow::Result<()> {
     }
 
     let base_url = args.daemon_url.unwrap_or_else(default_base_url);
-    let mut client = McpClient::connect(&base_url, Some(&project_root)).await?;
+    let scope = bbox_provenance::resolve_committed_scope(&project_root)
+        .context("resolving committed provenance project scope")?;
+    let token = ServiceToken::load(&args.token_file)
+        .with_context(|| format!("loading {}", args.token_file.display()))?;
+    let mut client = McpClient::connect_with_operator_provenance(&base_url, &token, &scope).await?;
+    drop(token);
     let mut progress = ExportProgress::default();
 
     loop {

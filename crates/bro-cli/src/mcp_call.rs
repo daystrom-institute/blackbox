@@ -4,6 +4,9 @@ use bbox_corpus_core::blame_transport::{
     OPERATOR_BLAME_WORKSPACE_ID_HEADER,
 };
 use bbox_corpus_core::identity::PublishedScope;
+use bbox_provenance::{
+    OPERATOR_PROVENANCE_REPO_ID_HEADER, OPERATOR_PROVENANCE_ROOT_RELPATH_HEADER,
+};
 use bro_rpc::ServiceToken;
 use clap::{Args, Subcommand};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap};
@@ -136,6 +139,36 @@ impl McpClient {
             workspace_id
                 .parse()
                 .context("encoding operator blame workspace id")?,
+        );
+        Self::connect_with_initialization_headers(base_url, None, headers).await
+    }
+
+    pub(crate) async fn connect_with_operator_provenance(
+        base_url: &str,
+        token: &ServiceToken,
+        scope: &PublishedScope,
+    ) -> anyhow::Result<Self> {
+        validate_credentialed_base_url(base_url)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", token.expose_secret())
+                .parse()
+                .context("encoding operator provenance authorization")?,
+        );
+        headers.insert(
+            OPERATOR_PROVENANCE_REPO_ID_HEADER,
+            scope
+                .repo_id()
+                .parse()
+                .context("encoding operator provenance repo id")?,
+        );
+        headers.insert(
+            OPERATOR_PROVENANCE_ROOT_RELPATH_HEADER,
+            scope
+                .bbox_root_relpath()
+                .parse()
+                .context("encoding operator provenance root relative path")?,
         );
         Self::connect_with_initialization_headers(base_url, None, headers).await
     }

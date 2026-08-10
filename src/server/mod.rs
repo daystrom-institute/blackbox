@@ -22,6 +22,7 @@ mod mcp;
 mod open;
 pub(crate) mod producer_auth;
 pub mod progress;
+pub(crate) mod provenance_authority;
 pub(crate) mod provenance_import;
 pub(crate) mod repo_io;
 pub(crate) mod resolver_compat;
@@ -96,6 +97,7 @@ impl BlackboxServer {
             session_checkout: std::sync::OnceLock::new(),
             session_workspace_binding: std::sync::OnceLock::new(),
             session_operator_blame_binding: std::sync::OnceLock::new(),
+            session_operator_provenance_binding: std::sync::OnceLock::new(),
         }
     }
 

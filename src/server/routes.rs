@@ -2019,6 +2019,9 @@ pub(crate) fn rebuild_edge_index_from_shared_at(
                 &state.code_sources,
             ),
         });
+        state
+            .edge_index_ready
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }) {
         let _ = state.code_sources.store().record_health_failure(
@@ -2331,8 +2334,15 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             // Nudge channel: async tool handlers whose store mutations change
             // projected edges wake this thread instead of rebuilding inline.
             let nudge_rx = state.edge_rebuild_nudge_rx.lock().unwrap().take();
-            // Initial settle so the boot-time rebuild already ran.
-            std::thread::sleep(std::time::Duration::from_secs(20));
+            // Eager startup already published a graph. Deferred startup did
+            // not: rebuild immediately in the background, and keep graph
+            // consumers fail-closed until this publication succeeds.
+            let mut pending_nudge = !state
+                .edge_index_ready
+                .load(std::sync::atomic::Ordering::Acquire);
+            if !pending_nudge {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            }
             let mut last_seen: u64 = state.idx.read().num_docs();
             let edges_dir = edge_sidecar_dir(&state);
             let mut last_signature = capture_edge_rebuild_authority(
@@ -2341,9 +2351,9 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
             )
             .ok()
             .map(|authority| authority.signature);
-            let mut pending_nudge = false;
             loop {
-                pending_nudge |= match &nudge_rx {
+                if !pending_nudge {
+                    pending_nudge = match &nudge_rx {
                     Some(rx) => match rx.recv_timeout(interval) {
                         Ok(()) => true,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
@@ -2354,14 +2364,16 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                         std::thread::sleep(interval);
                         false
                     }
-                };
-                let Some(_publication_guard) =
+                    };
+                }
+                let Some(publication_guard) =
                     state.index_writer.try_begin_edge_index_rebuild()
                 else {
                     tracing::debug!(
                         pending_nudge,
                         "edge-index watcher deferred while a reindex publication is active"
                     );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                     continue;
                 };
                 let nudged = std::mem::take(&mut pending_nudge);
@@ -2378,6 +2390,14 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                             nudged,
                             "edge-index watcher authority capture failed; keeping the last published graph"
                         );
+                        if !state
+                            .edge_index_ready
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            pending_nudge = true;
+                            drop(publication_guard);
+                            std::thread::sleep(interval);
+                        }
                         last_seen = current;
                         continue;
                     }
@@ -2434,6 +2454,14 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
                                 elapsed_ms = started.elapsed().as_millis(),
                                 "edge-index watcher rebuild failed; retaining prior signature for retry"
                             );
+                            if !state
+                                .edge_index_ready
+                                .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                pending_nudge = true;
+                                drop(publication_guard);
+                                std::thread::sleep(interval);
+                            }
                         }
                     }
                 } else if nudged {

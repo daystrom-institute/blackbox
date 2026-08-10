@@ -331,6 +331,9 @@ async fn provenance_export_page(
     Extension(grant): Extension<ProducerGrant>,
     Json(request): Json<ProvenanceExportPullRequestV1>,
 ) -> Result<Json<ProvenanceExportPageResponseV1>, HttpError> {
+    let read_view = state
+        .complete_code_read_view()
+        .map_err(|_| HttpError::edge_index_warming())?;
     request
         .scope
         .validate()
@@ -346,7 +349,7 @@ async fn provenance_export_page(
     let current =
         bbox_edge_sidecar::edge_sidecar::observed_edge_lane_version(&edges_dir, &project_id)
             .map_err(HttpError::storage)?;
-    let relation_index = state.code_read_view.read().edge_index.clone();
+    let relation_index = read_view.edge_index.clone();
     let notes_ref = bbox_corpus_core::git::notes_ref("provenance").map_err(HttpError::storage)?;
     let limits = state
         .git_sources
@@ -1148,6 +1151,14 @@ impl HttpError {
 
     fn too_large(code: &str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, code, message)
+    }
+
+    fn edge_index_warming() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "edge_index_warming",
+            "the complete graph view is still rebuilding",
+        )
     }
 
     fn from_grant(error: RepoTransportGrantError) -> Self {

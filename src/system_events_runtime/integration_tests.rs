@@ -152,6 +152,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             catalog_epoch: 0,
             git_overlays: std::collections::BTreeMap::new(),
         })),
+        edge_index_ready: std::sync::atomic::AtomicBool::new(true),
         code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(
             tmp.path(),
         )),

@@ -954,7 +954,7 @@ impl BlackboxServer {
                 }
             };
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
-            let read_view = server.state.code_read_view.read().clone();
+            let read_view = server.state.complete_code_read_view()?;
             let edge_index = read_view.edge_index.as_ref();
             if matches!(
                 &entity_ref,
@@ -997,12 +997,13 @@ impl BlackboxServer {
         Parameters(p): Parameters<DescribeSchemaParams>,
     ) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
+            let read_view = self.state.complete_code_read_view()?;
             let include_agents = p.include_agents_resolved();
             let agents = include_agents
                 .then(|| self.build_agent_schema_entries())
                 .unwrap_or_default();
             mcp_tools::describe_schema::describe_schema_with_options(
-                &self.describe_schema_counts(),
+                &self.describe_schema_counts_from_view(&read_view),
                 &agents,
                 DescribeSchemaOptions { include_agents },
             )
@@ -1019,7 +1020,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_find_paths", move || {
-            let read_view = server.state.code_read_view.read().clone();
+            let read_view = server.state.complete_code_read_view()?;
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx = server
                 .provider_context()
@@ -1045,8 +1046,8 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking_with_structured("bbox_bundle_evidence", move || {
+            let read_view = server.state.complete_code_read_view()?;
             let knowledge_view = server.session_knowledge_view(None, p.provisional.as_deref())?;
-            let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx = server
                 .provider_context()
@@ -1074,6 +1075,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_ref_size", move || {
+            let read_view = server.state.complete_code_read_view()?;
             let projects = server.state.records_provider.records_snapshot().records;
             let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
             let session_checkout = server.authoritative_session_checkout();
@@ -1126,7 +1128,6 @@ impl BlackboxServer {
                     }
                 }
             }
-            let read_view = server.state.code_read_view.read().clone();
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx = server
                 .provider_context()
@@ -1196,7 +1197,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_blame", move || {
-            let read_view = server.state.code_read_view.read().clone();
+            let read_view = server.state.complete_code_read_view()?;
             let edge_index = read_view.edge_index.as_ref();
             let provider_ctx = server
                 .provider_context()
@@ -1377,6 +1378,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_export", move || {
+            let read_view = server.state.complete_code_read_view()?;
             if let Some(project_id) = p.project_id.as_deref() {
                 validate_explicit_project_selection(&server, project_id)?;
             }
@@ -1389,7 +1391,6 @@ impl BlackboxServer {
                 &projects,
                 CheckoutAccessIntent::Write,
             )?;
-            let read_view = server.state.code_read_view.read().clone();
             let output = if leases.is_empty() {
                 mcp_tools::provenance::export_provenance(read_view.edge_index.as_ref(), &inputs)?
             } else {
@@ -1418,18 +1419,21 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_provenance_export_plan", move || {
-            let checkout = server.authoritative_session_checkout().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "error.no_authoritative_checkout: initialize MCP with an admitted project context"
-                )
-            })?;
-            if checkout.project_id.trim().is_empty()
-                || checkout.published_scope.repo_id().trim().is_empty()
-                || checkout
-                    .published_scope
-                    .bbox_root_relpath()
-                    .trim()
-                    .is_empty()
+            let read_view = server.state.complete_code_read_view()?;
+            let (project_id, published_scope) = if let Some(checkout) =
+                server.authoritative_session_checkout()
+            {
+                (checkout.project_id.clone(), checkout.published_scope.clone())
+            } else if let Some(grant) = server.authoritative_operator_provenance_binding() {
+                (grant.project_id.clone(), grant.scope.clone())
+            } else {
+                anyhow::bail!(
+                    "error.no_authoritative_checkout: initialize MCP with authenticated provenance checkout authority"
+                );
+            };
+            if project_id.trim().is_empty()
+                || published_scope.repo_id().trim().is_empty()
+                || published_scope.bbox_root_relpath().trim().is_empty()
             {
                 anyhow::bail!(
                     "error.invalid_checkout_scope: authoritative checkout has no durable project scope"
@@ -1445,27 +1449,22 @@ impl BlackboxServer {
                 let projects = server.state.records_provider.records_snapshot().records;
                 if !projects
                     .iter()
-                    .any(|project| project.project_id == checkout.project_id)
+                    .any(|project| project.project_id == project_id)
                 {
                     anyhow::bail!(
                         "error.project_not_registered: authoritative checkout project is absent from the registry"
                     );
                 }
             } else {
-                server.validate_project_selection(&checkout.project_id)?;
+                server.validate_project_selection(&project_id)?;
             }
             let notes_ref = git::notes_ref("provenance")?;
             let page = mcp_tools::provenance_plan::export_plan_page(
                 &p,
-                checkout.published_scope.clone(),
-                &checkout.project_id,
+                published_scope,
+                &project_id,
                 &notes_ref,
-                server
-                    .state
-                    .code_read_view
-                    .read()
-                    .edge_index
-                    .as_ref(),
+                read_view.edge_index.as_ref(),
             )?;
             Ok(serde_json::to_string(&page)?)
         })
@@ -2478,6 +2477,80 @@ mod tests {
             .await;
         assert_eq!(result.is_error, Some(true));
         assert!(extract_text(&result).contains("error.no_authoritative_checkout"));
+    }
+
+    #[tokio::test]
+    async fn deferred_edge_index_refuses_graph_reads_until_complete_view_is_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server
+            .state
+            .edge_index_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let result = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: "thread:thread-00000000".into(),
+                provisional: None,
+                edge_types: None,
+                direction: None,
+                per_type_limit: Some(5),
+                property_mode: Some("summary".into()),
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(extract_text(&result).contains("error.edge_index_warming"));
+
+        let schema = server.bbox_describe_schema(Parameters(DescribeSchemaParams::default()));
+        assert_eq!(schema.is_error, Some(true));
+        assert!(extract_text(&schema).contains("error.edge_index_warming"));
+
+        let ref_size = server
+            .bbox_ref_size(Parameters(RefSizeParams {
+                refs: Vec::new(),
+                project_dir: None,
+            }))
+            .await;
+        assert_eq!(ref_size.is_error, Some(true));
+        assert!(extract_text(&ref_size).contains("error.edge_index_warming"));
+    }
+
+    #[tokio::test]
+    async fn provenance_export_plan_accepts_scope_bound_operator_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&root)
+            .unwrap();
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+        server
+            .session_operator_provenance_binding
+            .set(Some(std::sync::Arc::new(
+                crate::server::provenance_authority::OperatorProvenanceGrant {
+                    project_id: project.project_id.clone(),
+                    scope: scope.clone(),
+                },
+            )))
+            .unwrap();
+
+        let result = server
+            .bbox_provenance_export_plan(Parameters(ProvenanceExportPlanParams::default()))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
+        let page: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(page["project_id"], project.project_id);
+        assert_eq!(page["scope"]["repo_id"], scope.repo_id());
+        assert_eq!(
+            page["scope"]["bbox_root_relpath"],
+            scope.bbox_root_relpath()
+        );
     }
 
     #[tokio::test]

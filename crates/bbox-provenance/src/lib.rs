@@ -21,6 +21,8 @@ pub const SCHEMA_VERSION_V2: u32 = 2;
 pub const MAX_NOTE_DOCUMENT_BYTES: usize = 24 * 1024;
 pub const MAX_PAGE_DOCUMENTS: usize = 64;
 pub const MAX_PAGE_DOCUMENT_BYTES: usize = 64 * 1024;
+pub const OPERATOR_PROVENANCE_REPO_ID_HEADER: &str = "x-blackbox-provenance-repo-id";
+pub const OPERATOR_PROVENANCE_ROOT_RELPATH_HEADER: &str = "x-blackbox-provenance-root-relpath";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitProvenanceNote {

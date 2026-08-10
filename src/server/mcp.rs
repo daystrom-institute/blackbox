@@ -433,4 +433,127 @@ mod tests {
         );
         assert_eq!(state.checkout_access.health().sequence, before);
     }
+
+    #[tokio::test]
+    async fn operator_provenance_headers_bind_only_the_mcp_export_planning_session() {
+        use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
+        use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+        use bbox_corpus_core::identity::PublishedScope;
+        use bbox_provenance::{
+            OPERATOR_PROVENANCE_REPO_ID_HEADER, OPERATOR_PROVENANCE_ROOT_RELPATH_HEADER,
+        };
+        use bro_rpc::ServiceToken;
+        use std::collections::BTreeMap;
+
+        let (app, state) = test_app_with_state();
+        let project_root = tempfile::tempdir().unwrap();
+        let project = state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(project_root.path())
+            .unwrap();
+        let token = "c".repeat(64);
+        let scope = PublishedScope::try_new("repo", ".").unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![(
+                    ServiceToken::parse(token.clone()).unwrap(),
+                    ProducerGrant {
+                        producer_id: "operator".into(),
+                        projects: BTreeMap::from([(scope.clone(), project.project_id.clone())]),
+                    },
+                )],
+            )));
+        let before = state.checkout_access.health().sequence;
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "bro-cli", "version": "test"}
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(ACCEPT, "application/json, text/event-stream")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Host", "127.0.0.1:7264")
+                    .header("Mcp-Protocol-Version", "2025-03-26")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(OPERATOR_PROVENANCE_REPO_ID_HEADER, scope.repo_id())
+                    .header(
+                        OPERATOR_PROVENANCE_ROOT_RELPATH_HEADER,
+                        scope.bbox_root_relpath(),
+                    )
+                    .body(Body::from(initialize.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "bbox_provenance_export_plan",
+                "arguments": {}
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(ACCEPT, "application/json, text/event-stream")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Host", "127.0.0.1:7264")
+                    .header("Mcp-Protocol-Version", "2025-03-26")
+                    .header("Mcp-Session-Id", session_id)
+                    .body(Body::from(call.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| {
+            let data = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str(&data).unwrap_or_else(|error| {
+                panic!("invalid MCP response {error}: {body}");
+            })
+        });
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let page: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(page["project_id"], project.project_id);
+        assert_eq!(page["scope"]["repo_id"], scope.repo_id());
+        assert_eq!(state.checkout_access.health().sequence, before);
+    }
 }

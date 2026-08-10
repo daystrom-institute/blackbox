@@ -178,6 +178,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking_with_structured("bbox_discover_seed_entities", move || {
+            let read_view = server.state.complete_code_read_view()?;
             let mut p = p;
             p.resolved_project_id = server
                 .resolve_hybrid_project_filter("bbox_discover_seed_entities", p.project.as_deref());
@@ -190,7 +191,6 @@ impl BlackboxServer {
             }
             let knowledge_view =
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
-            let read_view = server.state.code_read_view.read().clone();
             let provider_ctx = server
                 .provider_context()
                 .with_knowledge_view(&knowledge_view.knowledge)

@@ -5,7 +5,7 @@ use crate::{artifacts, mcp_tools, orchestration};
 
 impl BlackboxServer {
     pub(crate) fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
-        let mut counts = match self.state.code_read_view.try_read() {
+        let counts = match self.state.code_read_view.try_read() {
             Some(view) => view.edge_index.entity_type_counts_active(),
             None => {
                 tracing::warn!(
@@ -16,6 +16,20 @@ impl BlackboxServer {
                 BTreeMap::new()
             }
         };
+        self.complete_schema_counts(counts)
+    }
+
+    pub(crate) fn describe_schema_counts_from_view(
+        &self,
+        view: &super::CodeReadView,
+    ) -> BTreeMap<String, usize> {
+        self.complete_schema_counts(view.edge_index.entity_type_counts_active())
+    }
+
+    fn complete_schema_counts(
+        &self,
+        mut counts: BTreeMap<String, usize>,
+    ) -> BTreeMap<String, usize> {
         // transcript entities are deliberately excluded from
         // entity_type_counts_active (they're an observed history lane, not
         // part of the active knowledge graph), so seed the count from a

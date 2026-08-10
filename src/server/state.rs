@@ -211,6 +211,10 @@ pub(crate) struct SharedState {
     /// Shared with the reindex thread (same `Arc`).
     pub(crate) reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) code_read_view: RwLock<Arc<CodeReadView>>,
+    /// True only after the process has published one complete EdgeIndex view.
+    /// Deferred startup must never make an empty placeholder look like a
+    /// valid graph to callers.
+    pub(crate) edge_index_ready: AtomicBool,
     pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
     pub(crate) git_sources: Arc<super::git_source::GitSourceRuntime>,
     pub(crate) knowledge_sources: Arc<super::knowledge_source::KnowledgeSourceRuntime>,
@@ -710,6 +714,23 @@ impl SharedState {
         let _ = self.edge_rebuild_nudge_tx.try_send(());
     }
 
+    /// Clone one internally coherent code read view and reject the deferred
+    /// placeholder. Selector-changing publishers lower the readiness fence
+    /// before swapping the view, so checking after the clone can return only
+    /// a complete old view or a complete new view, never the placeholder.
+    pub(crate) fn complete_code_read_view(&self) -> anyhow::Result<Arc<CodeReadView>> {
+        let view = self.code_read_view.read().clone();
+        if !self
+            .edge_index_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            anyhow::bail!(
+                "error.edge_index_warming: the complete graph view is still rebuilding; retry this request"
+            );
+        }
+        Ok(view)
+    }
+
     pub(crate) fn roster_events(&self) -> orchestration::RosterEventSink {
         // Wire the view into the sink so every emit_* call also
         // updates the daemon-side cache. Sinks created before the
@@ -986,6 +1007,7 @@ impl SharedState {
                 catalog_epoch: 0,
                 git_overlays: BTreeMap::new(),
             })),
+            edge_index_ready: AtomicBool::new(true),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             git_sources: Arc::new(super::git_source::GitSourceRuntime::for_test(store_dir)),
             knowledge_sources: Arc::new(super::knowledge_source::KnowledgeSourceRuntime::for_test(
@@ -1776,6 +1798,21 @@ mod committed_bytes_parity_tests {
 #[cfg(test)]
 mod code_read_view_tests {
     use super::*;
+
+    #[test]
+    fn selector_republish_lowers_edge_readiness_before_placeholder_is_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let state = Arc::new(SharedState::for_test(&root));
+        assert!(state.complete_code_read_view().is_ok());
+
+        super::super::code_source::republish_code_read_view(&state).unwrap();
+
+        let Err(error) = state.complete_code_read_view() else {
+            panic!("selector republish exposed its placeholder as complete");
+        };
+        assert!(error.to_string().contains("error.edge_index_warming"));
+    }
 
     #[test]
     fn covered_noncurrent_repo_suppresses_only_the_producer_overlay() {
@@ -2686,6 +2723,11 @@ pub(crate) struct BlackboxServer {
     /// not consult this slot.
     pub(crate) session_operator_blame_binding:
         OnceLock<Option<Arc<super::blame_authority::OperatorBlameGrant>>>,
+    /// Scope-bound attended provenance-export authority authenticated from a
+    /// producer bearer plus path-free published-scope headers. This grant is
+    /// read-only corpus planning authority and cannot mutate project state.
+    pub(crate) session_operator_provenance_binding:
+        OnceLock<Option<Arc<super::provenance_authority::OperatorProvenanceGrant>>>,
 }
 
 /// Catalog-mode view fixtures shared by the published knowledge and gap
