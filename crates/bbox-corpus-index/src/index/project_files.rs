@@ -1520,6 +1520,25 @@ fn index_active_collected_project(
             stats,
         )?;
     }
+    // A full rebuild also re-stages a generation that is already on the
+    // current materialization. `stage_collected_project_generation` holds an
+    // on-disk staging guard until activation, so this path must perform the
+    // same manifest activation as the outgoing-materialization arm above.
+    // Otherwise the live snapshot retains an unlocked legacy `.staging`
+    // marker after the pass and pre-bind recovery correctly refuses the next
+    // daemon start.
+    if let (CollectedMaterializationState::Current, Some(staged)) = (materialization, &staged) {
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot_with(
+            edges_dir,
+            project_id,
+            stored.descriptor().scope.repo_id(),
+            &staged.head_commit,
+            &active.generation_id,
+            &staged.selector,
+            &staged.snapshot_id,
+            || Ok(()),
+        )?;
+    }
     let current_chunk_targets = staged
         .as_ref()
         .map(|result| result.current_chunk_targets.clone())
@@ -4715,6 +4734,33 @@ mod purge_exemption_tests {
             BTreeSet::from([project_id.to_string()])
         );
         assert_eq!(preserved.documents.len(), 1);
+
+        drop(writer);
+        let mut rebuild_writer: IndexWriter = index.writer(50_000_000).unwrap();
+        let mut rebuild_meta = HashMap::new();
+        let mut rebuild_stats = ProjectIndexStats::default();
+        index_active_collected_project(
+            &identity,
+            None,
+            None,
+            &active,
+            &store,
+            fields,
+            &mut rebuild_writer,
+            &mut rebuild_meta,
+            &edges_dir,
+            &root.join("git-meta"),
+            true,
+            false,
+            &mut rebuild_stats,
+        )
+        .unwrap();
+        assert!(
+            !snapshot_dir.join(".staging").exists(),
+            "a full rebuild of a current collected generation must reactivate its snapshot"
+        );
+        bbox_edge_sidecar::snapshot::recover_pending_transactions_prebind(&edges_dir, None)
+            .unwrap();
     }
 
     #[test]
