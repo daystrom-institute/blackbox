@@ -29,6 +29,7 @@ Updated: 2026-08-10
 - `cbcdd2748070`: repaired standalone harness locality configuration lookup across task-local and process environment forms.
 - `391eb8c6d419`: admitted the daemon-authored source endpoint only through the managed harness's explicit encrypted-network policy and made fatal harness startup errors independent of inherited log filters.
 - `f06c114cd749`: paged managed render plans below the MCP response cap, pinned the compact canonical plan by SHA-256, and made the checkout-owner harness validate every page before completing the plan.
+- `916029e6ec86`: repaired the provisional probe so it returns the next durable workspace sequence under the store mutation lock, forbade new uploads from reusing finalized sequences or installed generation identities, made finalize journals monotonic in stage and fixed in identity, and added startup recovery for the legacy duplicate-finalize journal shape. Focused gates passed locally (30/30 knowledge-source crate tests, 7/7 daemon handler tests, clippy, pinned fmt). Full cluster verification `bbox-verify-md8vt` is running; image build and deployment have not yet occurred.
 - Every deployed implementation commit passed its full cluster verification gate. Exact rerun `bbox-verify-crlcw` passed all 6,436 tests plus clippy and concurrency for `f06c114cd749`; image build `build-bbox-image-x8mzx` produced the current immutable cage digest.
 - The live Pulumi deployment is pinned to the current exact image digest. Cage commit `34eee75` records and publishes the matching worker routing and image pin.
 
@@ -55,11 +56,10 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 
 ## Next operations
 
-1. Repair provisional probing so an expired or retired current pointer still returns the next durable workspace sequence, and prevent finalize journals from regressing or changing identity.
-2. Redeploy the exact repaired daemon and checkout-owner harness, then rerun all three views for the large managed checkout and prove the checkout-observation file is unchanged.
-3. Migrate the eleven hand-authored provider-guidance sets and give the two zero-content projects a provider-neutral source document, then complete three-view coverage for all 19 projects.
-4. Run the render locality preflight, quiet window, offline marker apply, restart, and strict refusal/successor probes.
-5. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
+1. Cluster-verify `916029e6ec86` (`bbox-verify-md8vt` running), build the image, redeploy the exact repaired daemon and checkout-owner harness, then rerun all three views for the large managed checkout and prove the checkout-observation file is unchanged. Startup recovery must also reconstruct the committed journal clobbered by the duplicate upload.
+2. Migrate the eleven hand-authored provider-guidance sets and give the two zero-content projects a provider-neutral source document, then complete three-view coverage for all 19 projects. The operator approved absorbing the hand-authored guidance into provider-neutral source documentation on 2026-08-10.
+3. Run the render locality preflight, quiet window, offline marker apply, restart, and strict refusal/successor probes.
+4. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
 
 ## Next-lane inventory
 
@@ -71,8 +71,8 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 ## Managed-render acceptance
 
 - The large managed checkout proved that `f06c114cd749` fixes render plans above the generic MCP response cap: its `published` and `all` calls each assembled the paged plan and wrote all three provider projections.
-- Its `own` call then failed because the prior provisional lease had expired. The client inferred sequence one from an absent live pointer even though immutable sequence one history remained. A second exact upload reached `Prepared`, collided with the retired immutable generation, and replaced the prior committed journal. This is the active implementation and live-state repair; it is not an accepted render result.
-- The repair makes the probe return the next durable sequence under the store mutation lock, forbids new uploads from reusing finalized sequences, enforces monotonic journal stage and identity, and reconstructs the committed journal on startup only when all immutable evidence and the original Ready upload agree. After verification and deployment, the large checkout must rerun all three views and advance durable render observations by exactly three while checkout observations remain unchanged.
+- Its `own` call then failed because the prior provisional lease had expired. The client inferred sequence one from an absent live pointer even though immutable sequence one history remained. A second exact upload reached `Prepared`, collided with the retired immutable generation, and replaced the prior committed journal.
+- The repair landed as `916029e6ec86`: the probe returns the next durable sequence under the store mutation lock, new uploads cannot reuse finalized sequences, journals enforce monotonic stage and fixed identity, and startup recovery reconstructs the committed journal only when all immutable evidence and the original Ready upload agree. After verification and deployment, the large checkout must rerun all three views and advance durable render observations by exactly three while checkout observations remain unchanged.
 
 - The first managed render dispatch exposed a separate executor-boundary regression: the allocator rejected every fleetd lane as `provider_binary_missing` because it resolved `bro-harness` on the containerized daemon host, even though fleetd owns the worker process and its login-shell `PATH`.
 - Commit `035f42e49b0f` makes provider-binary eligibility executor-local. Local execution retains the daemon-host binary gate, fleetd execution defers final resolution to the worker host, and the non-dispatchable workflow pseudo-provider still fails closed. Full local and cluster verification passed, image build `build-bbox-image-cb45d` succeeded, and digest `sha256:025872bdd9db0b877a0744620d411b499600db8a63ebc094fdcb5495bba08fdd` is deployed with zero restarts. Live allocator preview reports `executor_host` and admits a pinned remote lane without a daemon-host harness binary.
