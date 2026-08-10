@@ -29,7 +29,7 @@ Updated: 2026-08-10
 - `cbcdd2748070`: repaired standalone harness locality configuration lookup across task-local and process environment forms.
 - `391eb8c6d419`: admitted the daemon-authored source endpoint only through the managed harness's explicit encrypted-network policy and made fatal harness startup errors independent of inherited log filters.
 - `f06c114cd749`: paged managed render plans below the MCP response cap, pinned the compact canonical plan by SHA-256, and made the checkout-owner harness validate every page before completing the plan.
-- `916029e6ec86`: repaired the provisional probe so it returns the next durable workspace sequence under the store mutation lock, forbade new uploads from reusing finalized sequences or installed generation identities, made finalize journals monotonic in stage and fixed in identity, and added startup recovery for the legacy duplicate-finalize journal shape. Focused gates passed locally (30/30 knowledge-source crate tests, 7/7 daemon handler tests, clippy, pinned fmt). Full cluster verification `bbox-verify-md8vt` is running; image build and deployment have not yet occurred.
+- `916029e6ec86`: repaired the provisional probe so it returns the next durable workspace sequence under the store mutation lock, forbade new uploads from reusing finalized sequences or installed generation identities, made finalize journals monotonic in stage and fixed in identity, and added startup recovery for the legacy duplicate-finalize journal shape. Focused gates passed locally (30/30 knowledge-source crate tests, 7/7 daemon handler tests, clippy, pinned fmt). Full cluster verification `bbox-verify-md8vt` passed nextest, clippy, and concurrency; image build and deployment have not yet occurred.
 - Every deployed implementation commit passed its full cluster verification gate. Exact rerun `bbox-verify-crlcw` passed all 6,436 tests plus clippy and concurrency for `f06c114cd749`; image build `build-bbox-image-x8mzx` produced the current immutable cage digest.
 - The live Pulumi deployment is pinned to the current exact image digest. Cage commit `34eee75` records and publishes the matching worker routing and image pin.
 
@@ -56,7 +56,7 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 
 ## Next operations
 
-1. Cluster-verify `916029e6ec86` (`bbox-verify-md8vt` running), build the image, redeploy the exact repaired daemon and checkout-owner harness, then rerun all three views for the large managed checkout and prove the checkout-observation file is unchanged. Startup recovery must also reconstruct the committed journal clobbered by the duplicate upload.
+1. Build the image for the verified repair `916029e6ec86`, redeploy the exact repaired daemon and checkout-owner harness, then rerun all three views for the large managed checkout and prove the checkout-observation file is unchanged. Startup recovery must also reconstruct the committed journal clobbered by the duplicate upload.
 2. Migrate the eleven hand-authored provider-guidance sets and give the two zero-content projects a provider-neutral source document, then complete three-view coverage for all 19 projects. The operator approved absorbing the hand-authored guidance into provider-neutral source documentation on 2026-08-10.
 3. Run the render locality preflight, quiet window, offline marker apply, restart, and strict refusal/successor probes.
 4. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
