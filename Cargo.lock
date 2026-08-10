@@ -349,6 +349,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bbox-code-source",
+ "bbox-config",
  "bbox-corpus-core",
  "bbox-git-source",
  "bbox-knowledge-source",
