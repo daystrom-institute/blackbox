@@ -29,7 +29,8 @@ For an explicitly selected Published project:
 2. one current v2 collected generation is active in both the code-source store
    and workspace manifest;
 3. successful daemon startup recovery and a successful full rebuild record
-   exact evidence for that same generation;
+   exact evidence for that same generation before the authority boundary is
+   installed;
 4. offline preflight captures those controls and the project's
    `LocalProjectWalk` counters, then apply requires at least 300 seconds with no
    counter, catalog, assignment, generation, or recovery-evidence drift;
@@ -101,9 +102,14 @@ verification failure even if another bug bypasses the runtime policy.
 ### CS-D3: governed means collected or fail closed
 
 The runtime marker is loaded before the listener binds. It requires the exact
-scope-to-project-to-producer assignment and exact active generation. Dynamic
-reload performs the assignment check before replacing the live snapshot or
-advancing its revision.
+scope-to-project-to-producer assignment and a healthy current v2 activation
+from that same producer and scope. The generation recorded in the marker is
+the evidence baseline that justified the authority boundary, not a permanent
+content pin: later authenticated collector generations may advance normally
+when their active record, immutable generation, and workspace manifest agree.
+Producer or scope drift, legacy records, inactive generations, cutback state,
+and manifest disagreement still fail closed. Dynamic reload performs the
+assignment check before replacing the live snapshot or advancing its revision.
 
 The broker policy refuses a governed `LocalProjectWalk` before authority
 selection, path discovery, or observation. Source planning separately refuses

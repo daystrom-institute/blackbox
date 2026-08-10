@@ -192,9 +192,12 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
                 bail!("governed code-source producer assignment changed");
             }
             let current = current_generation_evidence(store, projects_path, &row.project_id)?;
-            if current != row.generation {
+            if current.project_id != row.project_id
+                || current.scope != row.scope
+                || current.producer_id != row.producer_id
+            {
                 bail!(
-                    "error.code_source_locality_generation: governed project {} no longer has its cutover generation",
+                    "error.code_source_locality_generation: governed project {} no longer has a current generation from its cutover authority",
                     row.project_id
                 );
             }
@@ -914,6 +917,89 @@ mod tests {
         }
     }
 
+    fn activate_successor_generation(
+        config: &Config,
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+    ) -> String {
+        let store = CodeSourceStore::open_with_mode(
+            config.paths.state_dir.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let head_commit = "c".repeat(40);
+        let entries = Vec::new();
+        let descriptor = bbox_code_source::GenerationDescriptor {
+            schema_version: bbox_code_source::SCHEMA_VERSION,
+            walker_policy_version: bbox_code_source::WALKER_POLICY_VERSION.into(),
+            scope: scope.clone(),
+            head_commit: head_commit.clone(),
+            dirty_fingerprint: bbox_code_source::dirty_fingerprint(&head_commit, &entries),
+            manifest_sha256: bbox_code_source::manifest_sha256(&entries),
+            file_count: 0,
+            logical_bytes: 0,
+        };
+        let upload = store.begin_upload("producer", descriptor).unwrap();
+        store
+            .complete_manifest("producer", &upload.upload_id)
+            .unwrap();
+        let generation = store
+            .finalize_upload_mixed("producer", &upload.upload_id)
+            .unwrap();
+        let generation_id = generation.generation_id().to_string();
+        let inventory = "d".repeat(64);
+        store
+            .record_materialization_mixed(scope, &generation_id, 0, inventory.clone())
+            .unwrap();
+        store
+            .mark_generation_state_mixed(scope, &generation_id, GenerationState::Active, None)
+            .unwrap();
+        let selector = crate::index::project_files::collected_materialization_selector(
+            project_id.as_str(),
+            &generation_id,
+        );
+        let snapshot_id =
+            bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id.as_str(), &generation_id);
+        store
+            .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
+                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                project_id: project_id.clone(),
+                published_scope: scope.clone(),
+                generation_id: generation_id.clone(),
+                selector: selector.clone(),
+                snapshot_id: snapshot_id.clone(),
+                document_count: 0,
+                entity_inventory_sha256: inventory,
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: 2,
+                cutback_pending: false,
+                cutback: None,
+                diagnostic: None,
+            })
+            .unwrap();
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(layout.projects_path());
+        std::fs::create_dir_all(bbox_edge_sidecar::snapshot::snapshot_dir(
+            &edges_dir,
+            project_id.as_str(),
+            &snapshot_id,
+        ))
+        .unwrap();
+        bbox_edge_sidecar::snapshot::activate_collected_snapshot(
+            &edges_dir,
+            project_id.as_str(),
+            scope.repo_id(),
+            &head_commit,
+            &generation_id,
+            &selector,
+            &snapshot_id,
+        )
+        .unwrap();
+        generation_id
+    }
+
     fn marker() -> CodeSourceLocalityCutoverMarkerV1 {
         let mut marker = CodeSourceLocalityCutoverMarkerV1 {
             version: MARKER_VERSION,
@@ -966,7 +1052,7 @@ mod tests {
     fn current_v2_preflight_apply_verify_closes_post_cutover_local_walk() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let (config, layout, project_id, _scope) = current_v2_fixture(&root);
+        let (config, layout, project_id, scope) = current_v2_fixture(&root);
         let report_path = root.join("code-source-locality-report.json");
 
         let preflight = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::preflight(
@@ -1010,6 +1096,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verified.status, "verified");
+
+        let successor = activate_successor_generation(&config, &layout, &project_id, &scope);
+        assert_ne!(successor, report.rows[0].generation.generation_id);
+        let verified_after_successor = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(verified_after_successor.status, "verified");
 
         let observation_path = layout.bro_home.join("checkout-access-observations.json");
         std::fs::create_dir_all(observation_path.parent().unwrap()).unwrap();
