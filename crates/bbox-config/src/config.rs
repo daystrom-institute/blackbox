@@ -55,6 +55,7 @@ pub struct DaemonOverrides {
     pub port: Option<u16>,
     pub bind: Option<String>,
     pub mcp_name: Option<String>,
+    pub mcp_allowed_hosts: Option<Vec<String>>,
     pub shutdown_grace_secs: Option<u64>,
     pub task_ttl_ms: Option<u64>,
     pub mcp_session_keepalive_secs: Option<u64>,
@@ -273,6 +274,25 @@ fn validate_checkout_lifecycle_writer_wait_ms(wait_ms: u64) -> Result<()> {
     Ok(())
 }
 
+fn validate_mcp_allowed_hosts(hosts: &[String]) -> Result<()> {
+    if hosts.is_empty() {
+        anyhow::bail!("daemon.mcp_allowed_hosts must contain at least one host");
+    }
+    for host in hosts {
+        if host.is_empty()
+            || host.trim() != host
+            || host.contains("://")
+            || host.contains('/')
+            || host.contains(',')
+        {
+            anyhow::bail!(
+                "daemon.mcp_allowed_hosts entry must be a bare host or host:port authority: {host:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawDaemonConfig {
     #[serde(default = "default_daemon_port")]
@@ -281,6 +301,8 @@ struct RawDaemonConfig {
     pub bind: String,
     #[serde(default = "default_daemon_mcp_name")]
     pub mcp_name: String,
+    #[serde(default = "default_daemon_mcp_allowed_hosts")]
+    pub mcp_allowed_hosts: Vec<String>,
     #[serde(default = "default_daemon_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
     #[serde(default = "default_daemon_task_ttl_ms")]
@@ -355,6 +377,14 @@ fn default_daemon_bind() -> String {
 }
 fn default_daemon_mcp_name() -> String {
     "blackbox".to_string()
+}
+
+fn default_daemon_mcp_allowed_hosts() -> Vec<String> {
+    vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ]
 }
 fn default_daemon_shutdown_grace_secs() -> u64 {
     15
@@ -576,6 +606,7 @@ pub struct DaemonConfig {
     pub port: u16,
     pub bind: String,
     pub mcp_name: String,
+    pub mcp_allowed_hosts: Vec<String>,
     pub shutdown_grace_secs: u64,
     pub task_ttl_ms: u64,
     pub mcp_session_keepalive_secs: u64,
@@ -688,6 +719,7 @@ impl Config {
                 port: default_daemon_port(),
                 bind: default_daemon_bind(),
                 mcp_name: default_daemon_mcp_name(),
+                mcp_allowed_hosts: default_daemon_mcp_allowed_hosts(),
                 shutdown_grace_secs: default_daemon_shutdown_grace_secs(),
                 task_ttl_ms: default_daemon_task_ttl_ms(),
                 mcp_session_keepalive_secs: default_daemon_mcp_session_keepalive_secs(),
@@ -771,6 +803,17 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && !mcp_name.trim().is_empty()
     {
         raw.daemon.mcp_name = mcp_name;
+    }
+
+    if let Ok(hosts) = std::env::var("BBOX_MCP_ALLOWED_HOSTS")
+        && !hosts.trim().is_empty()
+    {
+        raw.daemon.mcp_allowed_hosts = hosts
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+            .collect();
     }
 
     if let Ok(keepalive) = std::env::var("BBOX_MCP_SESSION_KEEPALIVE_SECS")
@@ -1017,6 +1060,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         raw.code_collection.cutback_max_attempts,
     )?;
     validate_checkout_lifecycle_writer_wait_ms(raw.daemon.checkout_lifecycle_writer_wait_ms)?;
+    validate_mcp_allowed_hosts(&raw.daemon.mcp_allowed_hosts)?;
 
     let fleetd_token_file = raw
         .daemon
@@ -1035,6 +1079,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             port: raw.daemon.port,
             bind: raw.daemon.bind,
             mcp_name: raw.daemon.mcp_name,
+            mcp_allowed_hosts: raw.daemon.mcp_allowed_hosts,
             shutdown_grace_secs: raw.daemon.shutdown_grace_secs,
             task_ttl_ms: raw.daemon.task_ttl_ms,
             mcp_session_keepalive_secs: raw.daemon.mcp_session_keepalive_secs,
@@ -1383,6 +1428,9 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(mcp_name) = overrides.daemon.mcp_name {
         raw.daemon.mcp_name = mcp_name;
+    }
+    if let Some(mcp_allowed_hosts) = overrides.daemon.mcp_allowed_hosts {
+        raw.daemon.mcp_allowed_hosts = mcp_allowed_hosts;
     }
     if let Some(shutdown_grace_secs) = overrides.daemon.shutdown_grace_secs {
         raw.daemon.shutdown_grace_secs = shutdown_grace_secs;
@@ -1792,6 +1840,9 @@ mod tests {
             env::remove_var("BBOX_BIND");
         }
         unsafe {
+            env::remove_var("BBOX_MCP_ALLOWED_HOSTS");
+        }
+        unsafe {
             env::remove_var("BLACKBOX_FLEETD_ENDPOINT");
         }
         unsafe {
@@ -1807,6 +1858,10 @@ mod tests {
         assert_eq!(config.daemon.port, 7264);
         assert_eq!(config.daemon.bind, "127.0.0.1");
         assert_eq!(config.daemon.mcp_name, "blackbox");
+        assert_eq!(
+            config.daemon.mcp_allowed_hosts,
+            ["localhost", "127.0.0.1", "::1"]
+        );
         assert_eq!(config.daemon.shutdown_grace_secs, 15);
         assert_eq!(config.daemon.mcp_session_keepalive_secs, 21600);
         assert_eq!(config.daemon.poller_min_interval_secs, 5);
@@ -1830,6 +1885,17 @@ mod tests {
         assert!(validate_checkout_lifecycle_writer_wait_ms(5_000).is_ok());
         assert!(validate_checkout_lifecycle_writer_wait_ms(0).is_err());
         assert!(validate_checkout_lifecycle_writer_wait_ms(5_001).is_err());
+    }
+
+    #[test]
+    fn mcp_allowed_hosts_require_bare_nonempty_authorities() {
+        assert!(validate_mcp_allowed_hosts(&[]).is_err());
+        assert!(validate_mcp_allowed_hosts(&[" https://example.test".into()]).is_err());
+        assert!(validate_mcp_allowed_hosts(&["example.test/path".into()]).is_err());
+        assert!(
+            validate_mcp_allowed_hosts(&["example.test:7264".into(), "10.43.0.10:7264".into(),])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2278,6 +2344,34 @@ port = 8000
 
         let config = load().unwrap();
         assert_eq!(config.daemon.mcp_session_keepalive_secs, 21600);
+    }
+
+    #[test]
+    fn mcp_allowed_hosts_env_is_csv_and_trimmed() {
+        let _guard = bbox_util::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe {
+            env::set_var("HOME", home);
+            env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+            env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+            env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+            env::remove_var("BLACKBOX_CONFIG");
+            env::set_var(
+                "BBOX_MCP_ALLOWED_HOSTS",
+                "corpus.internal:7264, 10.43.214.253:7264",
+            );
+        }
+
+        let config = load().unwrap();
+        assert_eq!(
+            config.daemon.mcp_allowed_hosts,
+            ["corpus.internal:7264", "10.43.214.253:7264"]
+        );
+        unsafe {
+            env::remove_var("BBOX_MCP_ALLOWED_HOSTS");
+        }
     }
 
     #[test]

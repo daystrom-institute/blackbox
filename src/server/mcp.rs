@@ -18,6 +18,7 @@ pub(super) fn build_http_app(
     ct: &CancellationToken,
 ) -> axum::Router {
     let server_config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(cfg.daemon.mcp_allowed_hosts.clone())
         .with_cancellation_token(ct.child_token())
         .with_stateful_mode(true);
 
@@ -196,6 +197,41 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn configured_external_mcp_host_is_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedState::for_test(dir.path()));
+        let mut cfg = shared.config.read().clone();
+        cfg.daemon.mcp_allowed_hosts = vec!["corpus.internal:7264".to_string()];
+        let app = build_http_app(shared, &cfg, &CancellationToken::new());
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "external-host-test", "version": "1"}
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp?surface=interactive")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "application/json")
+                    .header("host", "corpus.internal:7264")
+                    .body(Body::from(initialize.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// The generic control plane is reachable at the neutral `/control/*`
