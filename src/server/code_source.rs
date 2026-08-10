@@ -1116,14 +1116,14 @@ async fn catalog_onboard(
             other => bail!("unvalidated checkout kind {other}"),
         };
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let display_name = std::path::Path::new(&request.checkout_project_dir)
+        let display_name = std::path::Path::new(&request.producer_project_dir)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| request.checkout_project_dir.clone());
+            .unwrap_or_else(|| request.producer_project_dir.clone());
         let probe = bbox_indexing::project_catalog_admin::AttachProbe {
             checkout_id: request.checkout_id.clone(),
-            checkout_dir: request.canonical_checkout_dir.clone(),
-            checkout_project_dir: request.checkout_project_dir.clone(),
+            checkout_dir: request.producer_checkout_dir.clone(),
+            checkout_project_dir: request.producer_project_dir.clone(),
             project_root_relpath: request.project_root_relpath.clone(),
             kind,
             validated_scope: Some(request.scope.clone()),
@@ -7426,8 +7426,8 @@ mod tests {
         CatalogOnboardRequestV1 {
             schema_version: bbox_code_source::CATALOG_ONBOARD_SCHEMA_VERSION,
             scope: scope.clone(),
-            canonical_checkout_dir: "/checkout-owner/repos/example".into(),
-            checkout_project_dir: "/checkout-owner/repos/example".into(),
+            producer_checkout_dir: "/checkout-owner/repos/example".into(),
+            producer_project_dir: "/checkout-owner/repos/example".into(),
             project_root_relpath: ".".into(),
             checkout_kind: "base".into(),
             checkout_id: "a".repeat(32),

@@ -419,8 +419,8 @@ fn probe_onboard_request(
     let request = bbox_code_source::CatalogOnboardRequestV1 {
         schema_version: bbox_code_source::CATALOG_ONBOARD_SCHEMA_VERSION,
         scope: project.scope.clone(),
-        canonical_checkout_dir: checkout_dir.to_string_lossy().into_owned(),
-        checkout_project_dir: project_dir.to_string_lossy().into_owned(),
+        producer_checkout_dir: checkout_dir.to_string_lossy().into_owned(),
+        producer_project_dir: project_dir.to_string_lossy().into_owned(),
         project_root_relpath,
         checkout_kind: checkout_kind.to_string(),
         checkout_id,
@@ -2539,7 +2539,7 @@ mod tests {
             published_knowledge: None,
         };
         let request = probe_onboard_request(&project).unwrap();
-        assert_eq!(request.canonical_checkout_dir, root.to_string_lossy());
+        assert_eq!(request.producer_checkout_dir, root.to_string_lossy());
         assert_eq!(request.checkout_kind, "base");
         assert_eq!(request.project_root_relpath, ".");
         assert_eq!(

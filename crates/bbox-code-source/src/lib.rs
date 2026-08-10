@@ -244,9 +244,11 @@ pub struct CatalogOnboardRequestV1 {
     /// The published scope the producer grant must already cover.
     pub scope: PublishedScope,
     /// Producer-canonical checkout top (absolute on the producer host).
-    pub canonical_checkout_dir: String,
-    /// Producer-canonical project dir inside the checkout.
-    pub checkout_project_dir: String,
+    /// Carried as producer-side data; the daemon never opens it.
+    pub producer_checkout_dir: String,
+    /// Producer-canonical project dir inside the checkout. Carried as
+    /// producer-side data; the daemon never opens it.
+    pub producer_project_dir: String,
     /// Monorepo discriminator relative to the checkout top (`.` at root).
     pub project_root_relpath: String,
     /// Checkout shape: `base`, `worktree`, or `managed_clone`.
@@ -269,7 +271,7 @@ impl CatalogOnboardRequestV1 {
             return Err(ContractError::UnsupportedSchema(self.schema_version));
         }
         validate_scope(&self.scope)?;
-        for path in [&self.canonical_checkout_dir, &self.checkout_project_dir] {
+        for path in [&self.producer_checkout_dir, &self.producer_project_dir] {
             if path.is_empty()
                 || path.len() > MAX_ONBOARD_PATH_BYTES
                 || !path.starts_with('/')
@@ -811,8 +813,8 @@ mod tests {
         CatalogOnboardRequestV1 {
             schema_version: CATALOG_ONBOARD_SCHEMA_VERSION,
             scope: scope(),
-            canonical_checkout_dir: "/home/operator/repos/example".into(),
-            checkout_project_dir: "/home/operator/repos/example".into(),
+            producer_checkout_dir: "/home/operator/repos/example".into(),
+            producer_project_dir: "/home/operator/repos/example".into(),
             project_root_relpath: ".".into(),
             checkout_kind: "base".into(),
             checkout_id: "a".repeat(32),
@@ -847,7 +849,7 @@ mod tests {
         ));
 
         let mut relative = valid_onboard_request();
-        relative.canonical_checkout_dir = "repos/example".into();
+        relative.producer_checkout_dir = "repos/example".into();
         assert!(relative.validate().is_err());
 
         let mut relpath_mismatch = valid_onboard_request();
