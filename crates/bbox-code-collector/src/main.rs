@@ -64,6 +64,12 @@ enum Command {
 struct CollectorConfig {
     server_url: String,
     token_file: PathBuf,
+    /// Explicit operator opt-in for a plaintext daemon endpoint that sits
+    /// behind an encrypted, ACL-bound network boundary (the same contract the
+    /// managed harness honors via `new_for_trusted_daemon_endpoint`). When
+    /// false, non-loopback server URLs must use https.
+    #[serde(default)]
+    trusted_encrypted_network: bool,
     #[serde(default = "default_interval_secs")]
     interval_secs: u64,
     #[serde(default = "default_status_timeout_secs")]
@@ -171,7 +177,7 @@ async fn main() -> Result<()> {
 impl Runtime {
     fn new(config: &CollectorConfig) -> Result<Self> {
         let mut base_url = Url::parse(&config.server_url).context("parsing server_url")?;
-        validate_server_url(&base_url)?;
+        validate_server_url(&base_url, config.trusted_encrypted_network)?;
         if !base_url.path().ends_with('/') {
             let path = format!("{}/", base_url.path());
             base_url.set_path(&path);
@@ -2070,11 +2076,14 @@ fn pack_history_manifest_pages(
     Ok(pages)
 }
 
-fn validate_server_url(url: &Url) -> Result<()> {
+fn validate_server_url(url: &Url, trusted_encrypted_network: bool) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
         "http" if is_loopback_host(url.host_str().unwrap_or_default()) => Ok(()),
-        "http" => bail!("non-loopback code-source server URLs must use https"),
+        "http" if trusted_encrypted_network => Ok(()),
+        "http" => bail!(
+            "non-loopback code-source server URLs must use https unless trusted_encrypted_network is set"
+        ),
         scheme => bail!("unsupported server URL scheme {scheme}"),
     }
 }
@@ -2204,9 +2213,19 @@ mod tests {
 
     #[test]
     fn remote_plaintext_is_rejected() {
-        assert!(validate_server_url(&Url::parse("http://example.test/").unwrap()).is_err());
-        assert!(validate_server_url(&Url::parse("http://127.0.0.1:7264/").unwrap()).is_ok());
-        assert!(validate_server_url(&Url::parse("https://example.test/").unwrap()).is_ok());
+        assert!(validate_server_url(&Url::parse("http://example.test/").unwrap(), false).is_err());
+        assert!(validate_server_url(&Url::parse("http://127.0.0.1:7264/").unwrap(), false).is_ok());
+        assert!(validate_server_url(&Url::parse("https://example.test/").unwrap(), false).is_ok());
+    }
+
+    #[test]
+    fn trusted_encrypted_network_admits_configured_plaintext_endpoint() {
+        assert!(
+            validate_server_url(&Url::parse("http://10.43.214.253:7264/").unwrap(), true).is_ok()
+        );
+        assert!(
+            validate_server_url(&Url::parse("http://10.43.214.253:7264/").unwrap(), false).is_err()
+        );
     }
 
     #[test]

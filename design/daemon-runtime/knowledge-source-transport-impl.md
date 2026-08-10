@@ -414,7 +414,11 @@ may additionally accept its daemon-authored endpoint over HTTP only through an
 explicit trusted-daemon constructor: the remote fleet contract already
 requires that endpoint to live behind an encrypted ACL boundary. Redirects
 remain disabled and requests stay pinned to the configured origin. Arbitrary
-callers do not inherit this exception.
+callers do not inherit this exception. The checkout-owner code collector has
+the same shape as an explicit config opt-in: `trusted_encrypted_network = true`
+admits one configured plaintext daemon endpoint that the operator has placed
+behind the same encrypted ACL-bound network (the accepted cage subnet route);
+absent the flag, non-loopback URLs must use HTTPS.
 
 ### 3.3 Durable layout
 
