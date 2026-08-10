@@ -29,6 +29,12 @@ use serde::de::DeserializeOwned;
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerUrlPolicy {
+    TlsOrLoopback,
+    TrustedEncryptedNetwork,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureOutcome {
     pub source_generation_id: String,
@@ -70,6 +76,49 @@ impl WorkspaceCaptureClient {
         workspace_id: WorkspaceId,
         scope: PublishedScope,
     ) -> Result<Self> {
+        Self::new_with_url_policy(
+            server_url,
+            token,
+            workspace_root,
+            project_root,
+            workspace_id,
+            scope,
+            ServerUrlPolicy::TlsOrLoopback,
+        )
+    }
+
+    /// Connect to the daemon endpoint selected by the remote-worker control
+    /// plane. The caller must already place that endpoint behind the encrypted
+    /// and ACL-bound network required by the fleet contract. Redirects remain
+    /// disabled and every request stays pinned to this exact origin.
+    pub fn new_for_trusted_daemon_endpoint(
+        server_url: &str,
+        token: WorkspaceBindingToken,
+        workspace_root: PathBuf,
+        project_root: PathBuf,
+        workspace_id: WorkspaceId,
+        scope: PublishedScope,
+    ) -> Result<Self> {
+        Self::new_with_url_policy(
+            server_url,
+            token,
+            workspace_root,
+            project_root,
+            workspace_id,
+            scope,
+            ServerUrlPolicy::TrustedEncryptedNetwork,
+        )
+    }
+
+    fn new_with_url_policy(
+        server_url: &str,
+        token: WorkspaceBindingToken,
+        workspace_root: PathBuf,
+        project_root: PathBuf,
+        workspace_id: WorkspaceId,
+        scope: PublishedScope,
+        url_policy: ServerUrlPolicy,
+    ) -> Result<Self> {
         let workspace_root = workspace_root
             .canonicalize()
             .context("canonicalizing bound workspace root")?;
@@ -95,7 +144,7 @@ impl WorkspaceCaptureClient {
         }
 
         let mut base_url = Url::parse(server_url).context("parsing knowledge-source server URL")?;
-        validate_server_url(&base_url)?;
+        validate_server_url(&base_url, url_policy)?;
         base_url.set_path("/");
         base_url.set_query(None);
         base_url.set_fragment(None);
@@ -878,13 +927,14 @@ fn class_name(class: SnapshotClassV1) -> &'static str {
     }
 }
 
-fn validate_server_url(url: &Url) -> Result<()> {
+fn validate_server_url(url: &Url, policy: ServerUrlPolicy) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
         "http"
-            if url
-                .host_str()
-                .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost")) =>
+            if url.host_str().is_some_and(|host| {
+                policy == ServerUrlPolicy::TrustedEncryptedNetwork
+                    || matches!(host, "127.0.0.1" | "::1" | "localhost")
+            }) =>
         {
             Ok(())
         }
@@ -1032,9 +1082,18 @@ mod tests {
 
     #[test]
     fn transport_url_policy_rejects_cleartext_non_loopback() {
-        assert!(validate_server_url(&Url::parse("https://example.invalid").unwrap()).is_ok());
-        assert!(validate_server_url(&Url::parse("http://127.0.0.1:7264").unwrap()).is_ok());
-        assert!(validate_server_url(&Url::parse("http://example.invalid").unwrap()).is_err());
+        let https = Url::parse("https://example.invalid").unwrap();
+        let loopback = Url::parse("http://127.0.0.1:7264").unwrap();
+        let external = Url::parse("http://example.invalid").unwrap();
+        let unsupported = Url::parse("ftp://example.invalid").unwrap();
+
+        assert!(validate_server_url(&https, ServerUrlPolicy::TlsOrLoopback).is_ok());
+        assert!(validate_server_url(&loopback, ServerUrlPolicy::TlsOrLoopback).is_ok());
+        assert!(validate_server_url(&external, ServerUrlPolicy::TlsOrLoopback).is_err());
+        assert!(validate_server_url(&external, ServerUrlPolicy::TrustedEncryptedNetwork).is_ok());
+        assert!(
+            validate_server_url(&unsupported, ServerUrlPolicy::TrustedEncryptedNetwork).is_err()
+        );
     }
 
     struct MockSourceState {

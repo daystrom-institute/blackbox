@@ -48,8 +48,10 @@ async fn main() {
         }
         Err(e) => {
             // Surface the failure on stderr; the daemon captures it as the
-            // task's stderr and marks the task failed on non-zero exit.
-            tracing::error!("harness error: {e:#}");
+            // task's stderr and marks the task failed on non-zero exit. Use a
+            // direct write because fleetd's inherited RUST_LOG may contain a
+            // target-only filter that excludes bro-harness diagnostics.
+            eprintln!("harness error: {e:#}");
             std::process::exit(1);
         }
     }

@@ -514,7 +514,7 @@ impl LocalProjectRuntime {
             GapStore::open(&workspace_root.join(".bbox/local/harness-gaps-central.json"))?;
         gaps.configure_repo_io(io.clone(), io, vec![gap_carrier.clone()])?;
         gaps.set_path_fallback_cut(true);
-        let capture = WorkspaceCaptureClient::new(
+        let capture = WorkspaceCaptureClient::new_for_trusted_daemon_endpoint(
             source_url,
             token,
             workspace_root.clone(),

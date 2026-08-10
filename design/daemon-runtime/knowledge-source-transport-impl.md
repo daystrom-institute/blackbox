@@ -396,6 +396,13 @@ Missing-blob responses make retries resumable. Finalize is idempotent for
 byte-identical evidence and conflicts on the same logical sequence with
 different bytes.
 
+The generic source client accepts HTTPS or loopback HTTP. A managed harness
+may additionally accept its daemon-authored endpoint over HTTP only through an
+explicit trusted-daemon constructor: the remote fleet contract already
+requires that endpoint to live behind an encrypted ACL boundary. Redirects
+remain disabled and requests stay pinned to the configured origin. Arbitrary
+callers do not inherit this exception.
+
 ### 3.3 Durable layout
 
 `bbox-knowledge-source-store` owns nofollow persistence under the configured
