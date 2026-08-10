@@ -51,7 +51,8 @@ use crate::project_catalog_inventory::{
 };
 use crate::project_catalog_migration::{
     ProjectCatalogMigrationResolvedLayoutV1, read_artifact_optional, read_artifact_required,
-    validate_artifact_set, write_artifact_if_absent, write_artifact_replacing,
+    validate_artifact_set, validate_artifact_target, write_artifact_if_absent,
+    write_artifact_replacing,
 };
 use crate::project_catalog_store::ProjectCatalogStore;
 
@@ -59,10 +60,14 @@ const REPORT_VERSION: u32 = 1;
 const RESOLUTION_VERSION: u32 = 1;
 const MARKER_VERSION: u32 = 1;
 const RECEIPT_VERSION: u32 = 1;
+const CHECKOUT_PARITY_PROOF_VERSION: u32 = 1;
 const MAX_EXPLICIT_EDGE_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_SIDECAR_INPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const MAX_GIT_TRANSPORT_CHECKOUT_PARITY_PROOF_BYTES: usize = 1024 * 1024;
 pub const MAX_GIT_TRANSPORT_CUTOVER_MARKER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_GIT_TRANSPORT_CUTOVER_RECEIPT_BYTES: usize = 1024 * 1024;
+pub const GIT_TRANSPORT_CHECKOUT_PARITY_PROOF_FILE: &str =
+    "git-transport-checkout-parity-proof.json";
 pub const GIT_TRANSPORT_CUTOVER_MARKER_FILE: &str = "git-transport-cutover-marker.json";
 pub const GIT_TRANSPORT_CUTOVER_RECEIPT_FILE: &str = "git-transport-cutover-receipt.json";
 
@@ -90,6 +95,7 @@ pub enum GitTransportCutoverCoverageStatusV1 {
 pub enum GitTransportParityStatusV1 {
     Equal,
     VacuousFreshV2,
+    ExternalCheckoutProof,
     Missing,
     Mismatch,
 }
@@ -164,8 +170,99 @@ pub struct GitTransportCapabilityBaselineV1 {
 
 impl GitTransportParityStatusV1 {
     fn accepted(&self) -> bool {
-        matches!(self, Self::Equal | Self::VacuousFreshV2)
+        matches!(
+            self,
+            Self::Equal | Self::VacuousFreshV2 | Self::ExternalCheckoutProof
+        )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitTransportCheckoutParityProofRowV1 {
+    pub repo_history_id: RepoHistoryId,
+    pub source_generation_id: String,
+    pub source_head: String,
+    pub checkout_p3_generation_id: String,
+    pub commit_document_count: u64,
+    pub commit_document_commitment_sha256: String,
+    pub vector_input_count: u64,
+    pub vector_input_commitment_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitTransportCheckoutParityProofV1 {
+    pub version: u32,
+    pub generated_at: String,
+    pub rows: Vec<GitTransportCheckoutParityProofRowV1>,
+    pub checksum_sha256: Sha256ValueV1,
+}
+
+impl GitTransportCheckoutParityProofV1 {
+    pub fn new(
+        generated_at: String,
+        mut rows: Vec<GitTransportCheckoutParityProofRowV1>,
+    ) -> CutoverResult<Self> {
+        rows.sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+        let checksum_sha256 =
+            checkout_parity_proof_checksum(CHECKOUT_PARITY_PROOF_VERSION, &generated_at, &rows)?;
+        let proof = Self {
+            version: CHECKOUT_PARITY_PROOF_VERSION,
+            generated_at,
+            rows,
+            checksum_sha256,
+        };
+        proof.validate()?;
+        Ok(proof)
+    }
+
+    pub fn validate(&self) -> CutoverResult<()> {
+        if self.version != CHECKOUT_PARITY_PROOF_VERSION
+            || self.generated_at.trim().is_empty()
+            || self.generated_at.len() > 128
+            || self.rows.is_empty()
+            || self
+                .rows
+                .windows(2)
+                .any(|pair| pair[0].repo_history_id >= pair[1].repo_history_id)
+            || checkout_parity_proof_checksum(self.version, &self.generated_at, &self.rows)?
+                != self.checksum_sha256
+        {
+            return Err(cutover_error(
+                "error.git_transport_checkout_parity_proof",
+                "checkout parity proof identity is invalid",
+            ));
+        }
+        for row in &self.rows {
+            if row.source_generation_id.trim().is_empty()
+                || row.source_generation_id.len() > 128
+                || row.source_head.trim().is_empty()
+                || row.source_head.len() > 128
+                || bbox_corpus_index::index::history_generations::HistoryGenerationIdV1::parse(
+                    &row.checkout_p3_generation_id,
+                )
+                .is_err()
+                || Sha256ValueV1::parse(row.commit_document_commitment_sha256.clone()).is_err()
+                || Sha256ValueV1::parse(row.vector_input_commitment_sha256.clone()).is_err()
+            {
+                return Err(cutover_error(
+                    "error.git_transport_checkout_parity_proof",
+                    "checkout parity proof row is invalid",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitTransportCheckoutParityAcceptanceReceiptV1 {
+    pub version: u32,
+    pub accepted_at: String,
+    pub proof_checksum_sha256: Sha256ValueV1,
+    pub accepted_repo_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +276,8 @@ pub struct GitTransportHistoryEvidenceV1 {
     pub vector_input_count: u64,
     pub vector_input_commitment_sha256: String,
     pub parity: GitTransportParityStatusV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_parity_proof_checksum: Option<Sha256ValueV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +460,13 @@ pub struct GitTransportCutoverVerifyRequestV1 {
     pub verified_at: String,
 }
 
+pub struct GitTransportCheckoutParityAcceptanceRequestV1 {
+    pub layout: ProjectCatalogMigrationResolvedLayoutV1,
+    pub config: Config,
+    pub proof_path: PathBuf,
+    pub accepted_at: String,
+}
+
 /// Atomically selected current cutover artifact.
 ///
 /// The checksum covers every preceding field through a separate canonical
@@ -453,6 +559,47 @@ fn cutover_error(code: &'static str, error: impl std::fmt::Display) -> GitTransp
         code,
         message: error.to_string(),
     }
+}
+
+fn checkout_parity_proof_checksum(
+    version: u32,
+    generated_at: &str,
+    rows: &[GitTransportCheckoutParityProofRowV1],
+) -> CutoverResult<Sha256ValueV1> {
+    serde_json::to_vec(&(version, generated_at, rows))
+        .map(|bytes| Sha256ValueV1::digest(&bytes))
+        .map_err(|error| cutover_error("error.git_transport_checkout_parity_proof", error))
+}
+
+pub fn decode_git_transport_checkout_parity_proof_v1(
+    bytes: &[u8],
+) -> CutoverResult<GitTransportCheckoutParityProofV1> {
+    if bytes.is_empty() || bytes.len() > MAX_GIT_TRANSPORT_CHECKOUT_PARITY_PROOF_BYTES {
+        return Err(cutover_error(
+            "error.git_transport_checkout_parity_proof",
+            "checkout parity proof is empty or oversized",
+        ));
+    }
+    let proof: GitTransportCheckoutParityProofV1 = serde_json::from_slice(bytes)
+        .map_err(|error| cutover_error("error.git_transport_checkout_parity_proof", error))?;
+    proof.validate()?;
+    Ok(proof)
+}
+
+pub fn git_transport_checkout_parity_proof_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(GIT_TRANSPORT_CHECKOUT_PARITY_PROOF_FILE)
+}
+
+fn load_checkout_parity_proof_optional(
+    state_dir: &Path,
+) -> CutoverResult<Option<GitTransportCheckoutParityProofV1>> {
+    read_cutover_state_file(
+        &git_transport_checkout_parity_proof_path(state_dir),
+        MAX_GIT_TRANSPORT_CHECKOUT_PARITY_PROOF_BYTES,
+        "Git transport checkout parity proof",
+    )?
+    .map(|bytes| decode_git_transport_checkout_parity_proof_v1(&bytes))
+    .transpose()
 }
 
 fn derived_report_status(
@@ -1019,6 +1166,145 @@ fn carried_forward_marker_rows(
 pub struct ProjectCatalogGitTransportCutoverFacadeV1;
 
 impl ProjectCatalogGitTransportCutoverFacadeV1 {
+    pub fn accept_checkout_parity(
+        request: GitTransportCheckoutParityAcceptanceRequestV1,
+    ) -> CutoverResult<GitTransportCheckoutParityAcceptanceReceiptV1> {
+        if !request.config.code_collection.enabled
+            || !request.config.code_collection.git_transport_enabled
+        {
+            return Err(cutover_error(
+                "error.git_transport_cutover_disabled",
+                "code collection and Git transport must both be enabled",
+            ));
+        }
+        if request.accepted_at.trim().is_empty() || request.accepted_at.len() > 128 {
+            return Err(cutover_error(
+                "error.git_transport_checkout_parity_acceptance",
+                "checkout parity acceptance timestamp is invalid",
+            ));
+        }
+        validate_artifact_target(&request.layout, &request.proof_path)
+            .map_err(|error| cutover_error("error.git_transport_cutover_unsafe_layout", error))?;
+        let proof_bytes = read_artifact_required(
+            &request.proof_path,
+            MAX_GIT_TRANSPORT_CHECKOUT_PARITY_PROOF_BYTES,
+            "Git transport checkout parity proof",
+        )
+        .map_err(|error| cutover_error("error.git_transport_checkout_parity_proof", error))?;
+        let proof = decode_git_transport_checkout_parity_proof_v1(&proof_bytes)?;
+        if serde_json::to_vec(&proof)
+            .map_err(|error| cutover_error("error.git_transport_checkout_parity_proof", error))?
+            != proof_bytes
+        {
+            return Err(cutover_error(
+                "error.git_transport_checkout_parity_proof",
+                "checkout parity proof is not in canonical encoding",
+            ));
+        }
+
+        let assignments = configured_assignments(&request.config)?;
+        let store = ProjectCatalogStore::open_existing(request.layout.projects_path())
+            .map_err(|error| cutover_error("error.git_transport_cutover_catalog", error))?;
+        let state = store
+            .snapshot()
+            .map_err(|error| cutover_error("error.git_transport_cutover_catalog", error))?;
+        validate_assignments_resolve(state.catalog(), &assignments)?;
+        let projection = derive_repo_transport_grants(state.catalog(), &assignments);
+        let git_store =
+            open_git_store_if_present(&request.layout, &request.config)?.ok_or_else(|| {
+                cutover_error(
+                    "error.git_transport_checkout_parity_acceptance",
+                    "Git source store is missing",
+                )
+            })?;
+        let history_store = open_history_store_if_present(&request.layout)?.ok_or_else(|| {
+            cutover_error(
+                "error.git_transport_checkout_parity_acceptance",
+                "P3 history store is missing",
+            )
+        })?;
+        let journals = git_store
+            .list_activation_journals()
+            .map_err(|error| cutover_error("error.git_transport_cutover_history", error))?;
+        if journals.iter().any(|journal| !journal.stage.terminal()) {
+            return Err(cutover_error(
+                "error.git_transport_cutover_prepared_journal",
+                "a prepared history journal exists while accepting checkout parity",
+            ));
+        }
+
+        let mut expected_rows = Vec::new();
+        for (repo_history_id, grant_state) in &projection.grants {
+            let RepoTransportGrantState::Granted { grant } = grant_state else {
+                continue;
+            };
+            let history_record = state
+                .catalog()
+                .repo_histories
+                .get(repo_history_id)
+                .ok_or_else(|| {
+                    cutover_error(
+                        "error.git_transport_cutover_catalog",
+                        "granted repo history disappeared",
+                    )
+                })?;
+            let history = capture_history(
+                &state.catalog().origin,
+                history_record,
+                grant,
+                Some(&git_store),
+                Some(&history_store),
+                None,
+                &journals,
+            )?
+            .ok_or_else(|| {
+                cutover_error(
+                    "error.git_transport_checkout_parity_acceptance",
+                    "current typed history evidence is incomplete",
+                )
+            })?;
+            if history.parity.accepted() {
+                continue;
+            }
+            expected_rows.push(GitTransportCheckoutParityProofRowV1 {
+                repo_history_id: repo_history_id.clone(),
+                source_generation_id: history.source_generation_id,
+                source_head: history.source_head,
+                checkout_p3_generation_id: history.p3_generation_id,
+                commit_document_count: history.commit_document_count,
+                commit_document_commitment_sha256: history.commit_document_commitment_sha256,
+                vector_input_count: history.vector_input_count,
+                vector_input_commitment_sha256: history.vector_input_commitment_sha256,
+            });
+        }
+        expected_rows.sort_by(|left, right| left.repo_history_id.cmp(&right.repo_history_id));
+        if expected_rows.is_empty() || proof.rows != expected_rows {
+            return Err(cutover_error(
+                "error.git_transport_checkout_parity_acceptance",
+                "proof rows do not exactly match every current non-equal typed history row",
+            ));
+        }
+
+        atomic_write_bytes_locked(
+            &git_transport_checkout_parity_proof_path(&request.layout.state_dir),
+            &proof_bytes,
+        )
+        .map_err(|error| cutover_error("error.git_transport_checkout_parity_proof_write", error))?;
+        if load_checkout_parity_proof_optional(&request.layout.state_dir)?.as_ref() != Some(&proof)
+        {
+            return Err(cutover_error(
+                "error.git_transport_checkout_parity_proof_write",
+                "installed checkout parity proof did not round-trip",
+            ));
+        }
+        Ok(GitTransportCheckoutParityAcceptanceReceiptV1 {
+            version: CHECKOUT_PARITY_PROOF_VERSION,
+            accepted_at: request.accepted_at,
+            proof_checksum_sha256: proof.checksum_sha256,
+            accepted_repo_count: proof.rows.len() as u64,
+        })
+    }
+
     pub fn preflight(
         request: GitTransportCutoverPreflightRequestV1,
     ) -> CutoverResult<GitTransportCutoverPreflightReceiptV1> {
@@ -1051,6 +1337,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             GitTransportCutoverRuntimeV1::from_marker(predecessor_marker.clone());
         let git_store = open_git_store_if_present(&request.layout, &request.config)?;
         let history_store = open_history_store_if_present(&request.layout)?;
+        let checkout_parity_proof = load_checkout_parity_proof_optional(&request.layout.state_dir)?;
         let manifest = ManifestIndex::load_or_new(&request.layout.edge_root)
             .map_err(|error| cutover_error("error.git_transport_cutover_overlay", error))?;
         let observation_baseline = capture_observation_baseline(&request.layout)?;
@@ -1112,6 +1399,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
                             grant,
                             git_store.as_ref(),
                             history_store.as_ref(),
+                            checkout_parity_proof.as_ref(),
                             &manifest,
                             &history_journals,
                             &provenance_journals,
@@ -1137,6 +1425,7 @@ impl ProjectCatalogGitTransportCutoverFacadeV1 {
             &projection,
             git_store.as_ref(),
             history_store.as_ref(),
+            checkout_parity_proof.as_ref(),
             &manifest,
             &history_journals,
             &provenance_journals,
@@ -1539,6 +1828,7 @@ fn recheck_report_for_apply(
     validate_report_projection(report, state.catalog(), &projection)?;
     let git_store = open_git_store_if_present(layout, config)?;
     let history_store = open_history_store_if_present(layout)?;
+    let checkout_parity_proof = load_checkout_parity_proof_optional(&layout.state_dir)?;
     let manifest = ManifestIndex::load_or_new(&layout.edge_root)
         .map_err(|error| cutover_error("error.git_transport_cutover_overlay", error))?;
     let history_journals = git_store
@@ -1577,6 +1867,7 @@ fn recheck_report_for_apply(
         &projection,
         git_store.as_ref(),
         history_store.as_ref(),
+        checkout_parity_proof.as_ref(),
         &manifest,
         &history_journals,
         &provenance_journals,
@@ -1919,6 +2210,7 @@ fn capture_granted_repo(
     grant: &RepoTransportGrant,
     git_store: Option<&GitSourceStore>,
     history_store: Option<&HistoryGenerationStore>,
+    checkout_parity_proof: Option<&GitTransportCheckoutParityProofV1>,
     manifest: &ManifestIndex,
     history_journals: &[HistoryActivationJournalV1],
     provenance_journals: &[ProvenanceImportJournalV1],
@@ -1931,6 +2223,7 @@ fn capture_granted_repo(
         grant,
         git_store,
         history_store,
+        checkout_parity_proof,
         history_journals,
     )?;
     if history.is_none() {
@@ -2056,6 +2349,7 @@ fn recheck_capture(
     projection: &RepoTransportGrantProjection,
     git_store: Option<&GitSourceStore>,
     history_store: Option<&HistoryGenerationStore>,
+    checkout_parity_proof: Option<&GitTransportCheckoutParityProofV1>,
     manifest: &ManifestIndex,
     history_journals: &[HistoryActivationJournalV1],
     provenance_journals: &[ProvenanceImportJournalV1],
@@ -2117,6 +2411,30 @@ fn recheck_capture(
     for repo in repos {
         if !capture_evidence_requires_recheck(&repo.coverage_status) {
             continue;
+        }
+        if let Some(history) = &repo.history {
+            let history_record = catalog
+                .repo_histories
+                .get(&repo.repo_history_id)
+                .ok_or_else(|| changed("repo history disappeared"))?;
+            let grant = repo
+                .grant
+                .as_ref()
+                .ok_or_else(|| changed("history grant disappeared"))?;
+            if capture_history(
+                &catalog.origin,
+                history_record,
+                grant,
+                git_store,
+                history_store,
+                checkout_parity_proof,
+                history_journals,
+            )?
+            .as_ref()
+                != Some(history)
+            {
+                return Err(changed("history parity evidence"));
+            }
         }
         if let (Some(git_store), Some(history)) = (git_store, &repo.history)
             && git_store
@@ -2402,6 +2720,7 @@ fn capture_history(
     grant: &RepoTransportGrant,
     git_store: Option<&GitSourceStore>,
     history_store: Option<&HistoryGenerationStore>,
+    checkout_parity_proof: Option<&GitTransportCheckoutParityProofV1>,
     journals: &[HistoryActivationJournalV1],
 ) -> CutoverResult<Option<GitTransportHistoryEvidenceV1>> {
     let (Some(git_store), Some(history_store)) = (git_store, history_store) else {
@@ -2450,11 +2769,29 @@ fn capture_history(
     if !history_generation_matches_journal(&generation, journal) {
         return Ok(None);
     }
-    let parity = history_parity_status(
+    let raw_parity = history_parity_status(
         origin,
         journal.prior_p3_generation_id.as_deref(),
         &journal.planned_p3_generation_id,
     );
+    let matching_external_proof = if raw_parity.accepted() {
+        None
+    } else {
+        checkout_parity_proof.and_then(|proof| {
+            proof
+                .rows
+                .iter()
+                .find(|row| checkout_parity_row_matches(row, journal, &source))
+                .map(|_| proof.checksum_sha256.clone())
+        })
+    };
+    let parity = if raw_parity.accepted() {
+        raw_parity
+    } else if matching_external_proof.is_some() {
+        GitTransportParityStatusV1::ExternalCheckoutProof
+    } else {
+        raw_parity
+    };
     Ok(Some(GitTransportHistoryEvidenceV1 {
         source_generation_id: source.source_generation_id,
         source_head: source.repo_head,
@@ -2467,7 +2804,23 @@ fn capture_history(
         vector_input_count: generation.manifest.body.vector_input_count,
         vector_input_commitment_sha256: generation.manifest.body.vector_input_commitment_sha256,
         parity,
+        checkout_parity_proof_checksum: matching_external_proof,
     }))
+}
+
+fn checkout_parity_row_matches(
+    row: &GitTransportCheckoutParityProofRowV1,
+    journal: &HistoryActivationJournalV1,
+    source: &bbox_git_source_store::VerifiedGitHistorySourceV1,
+) -> bool {
+    row.repo_history_id == journal.repo_history_id
+        && row.source_generation_id == journal.source_generation_id
+        && row.source_head == source.repo_head
+        && row.checkout_p3_generation_id == journal.planned_p3_generation_id
+        && row.commit_document_count == journal.commit_document_count
+        && row.commit_document_commitment_sha256 == journal.commit_document_commitment_sha256
+        && row.vector_input_count == journal.vector_input_count
+        && row.vector_input_commitment_sha256 == journal.vector_input_commitment_sha256
 }
 
 fn history_parity_status(
@@ -3169,6 +3522,67 @@ mod tests {
             history_parity_status(&migrated, Some("stale"), "planned"),
             GitTransportParityStatusV1::Mismatch
         );
+        assert!(GitTransportParityStatusV1::ExternalCheckoutProof.accepted());
+    }
+
+    fn checkout_parity_proof_row(suffix: &str) -> GitTransportCheckoutParityProofRowV1 {
+        GitTransportCheckoutParityProofRowV1 {
+            repo_history_id: RepoHistoryId::parse(format!(
+                "rh_0000000000000000000000000000000{suffix}"
+            ))
+            .unwrap(),
+            source_generation_id: format!("source-{suffix}"),
+            source_head: suffix.repeat(40),
+            checkout_p3_generation_id: format!("rhg_{}", suffix.repeat(64)),
+            commit_document_count: 11,
+            commit_document_commitment_sha256: suffix.repeat(64),
+            vector_input_count: 7,
+            vector_input_commitment_sha256: suffix.repeat(64),
+        }
+    }
+
+    #[test]
+    fn checkout_parity_proof_is_canonical_sorted_and_round_trips() {
+        let first = checkout_parity_proof_row("1");
+        let second = checkout_parity_proof_row("2");
+        let proof = GitTransportCheckoutParityProofV1::new(
+            "2026-08-10T00:00:00Z".to_string(),
+            vec![second.clone(), first.clone()],
+        )
+        .unwrap();
+        assert_eq!(proof.rows, vec![first, second]);
+
+        let bytes = serde_json::to_vec(&proof).unwrap();
+        assert_eq!(
+            decode_git_transport_checkout_parity_proof_v1(&bytes).unwrap(),
+            proof
+        );
+    }
+
+    #[test]
+    fn checkout_parity_proof_refuses_duplicates_reordering_and_tampering() {
+        let first = checkout_parity_proof_row("1");
+        let second = checkout_parity_proof_row("2");
+        assert!(
+            GitTransportCheckoutParityProofV1::new(
+                "2026-08-10T00:00:00Z".to_string(),
+                vec![first.clone(), first],
+            )
+            .is_err()
+        );
+
+        let proof = GitTransportCheckoutParityProofV1::new(
+            "2026-08-10T00:00:00Z".to_string(),
+            vec![checkout_parity_proof_row("1"), second],
+        )
+        .unwrap();
+        let mut reordered = proof.clone();
+        reordered.rows.reverse();
+        assert!(reordered.validate().is_err());
+
+        let mut tampered = proof;
+        tampered.rows[0].commit_document_count += 1;
+        assert!(tampered.validate().is_err());
     }
 
     #[test]
@@ -3549,6 +3963,7 @@ mod tests {
             vector_input_count: 1,
             vector_input_commitment_sha256: "d".repeat(64),
             parity: GitTransportParityStatusV1::Equal,
+            checkout_parity_proof_checksum: None,
         });
         let carried = minimal_repo_evidence(
             second_repo.clone(),

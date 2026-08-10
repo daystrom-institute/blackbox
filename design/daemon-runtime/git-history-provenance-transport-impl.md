@@ -284,6 +284,23 @@ blackbox project-catalog git-transport-cutover --preflight --report <path> --res
 blackbox project-catalog git-transport-cutover --apply --report <path> --resolution <path> --configured
 blackbox project-catalog git-transport-cutover --verify --configured
 ```
+If a migrated repository's first transport activation committed before the
+operator completed checkout parity, the committed activation journal remains
+immutable. The operator may instead reproduce that repository's canonical
+history generation through the certified checkout row builder and install the
+result as a separate offline review artifact:
+```text
+blackbox project-catalog git-transport-checkout-parity --proof <path> --configured
+```
+The canonical, checksummed proof must enumerate exactly every current
+non-equal typed-history row and bind the repo-history id, current source
+generation and HEAD, P3 generation, commit-document count and commitment, and
+vector-input count and commitment. Acceptance refuses prepared journals,
+extra or missing rows, stale source state, noncanonical encoding, and proof
+paths inside managed state roots. Preflight and apply recheck the installed
+proof against live state. A later source or P3 change therefore invalidates
+the row. This proof closes parity evidence only; it neither rewrites an
+activation journal nor changes transport authority.
 All forms accept D-021 `ConfigArgs` with unchanged precedence: `--config`, then explicit `--state-dir` and `--projects-path` overrides. Preflight is read-only, resolves configured state through that precedence, and emits the GH-F coverage report, a canonical empty-or-explicit resolution artifact, plus predicted `GitTransportCutoverMarkerV1`. The verb returns the D-020 versioned result envelope with snake_case `command` values `project_catalog_git_transport_cutover_preflight`, `project_catalog_git_transport_cutover_apply`, and `project_catalog_git_transport_cutover_verify`.
 Apply reuses `open_admin_store`, requires the configured-state opt-in, rechecks catalog epoch, grant commitments, generations, receipts, journals, parity commitments, and report/resolution hashes, then atomically writes a checksummed auxiliary marker beside the catalog store. The marker is not a `CatalogSnapshotV2` field and does not advance catalog epoch. Verify proves marker and live state agree before daemon restart.
 `FreshV2` catalog stores with configured producers perform the same preflight, apply, verify, and restart ceremony. Their legacy-history and V1-provenance parity sets are vacuous, not exempt; uniform authority activation prevents a second startup mode.
@@ -648,6 +665,9 @@ Mechanics:
 3. Inventory heads, commit/vector commitments, overlays, notes tips, V1/V2 counts, legacy/typed edge keys, grants, counters, membership generations, and the per-repo, per-capability `overlap_window` baseline.
 4. For each V1 repo proposed for marker coverage, run operator-controlled legacy import, producer export, producer import, and parity compare.
 5. Require typed history parity with checkout generation at same HEAD.
+   A committed activation that predates checkout proof may satisfy this only
+   through the separately installed GH-FD-15 external proof, whose exact
+   source and P3 commitments are rechecked during preflight and apply.
 6. Require typed provenance keys cover legacy keys.
 7. Require an export receipt for every member of each repo proposed for coverage; blocked-Published repos are excluded from coverage and named in the report.
 8. Require no prepared journal.
