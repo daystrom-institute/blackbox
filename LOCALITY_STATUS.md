@@ -73,17 +73,26 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 - The managed provider projections were committed back into the thirteen live checkouts (hand-authored files replaced by exact render output; symlinks replaced by regular files) and pushed, except rtk (still push-blocked; commits `cf9d557` absorption and `7d5d9e5` projections are local). Proof clones were disposed.
 - Operational notes: the rtk output-compaction hook mangles `head`/`grep` pipelines in foreground commands (use absolute binary paths in checks), and literal `git` inside command substitution in loops gets rewritten into a broken form (use an indirect variable). git-lfs must be on PATH for pushes in LFS-configured repos.
 
+## Raw blame and bridge compatibility inventory (2026-08-10)
+
+With render coverage strict, the remaining named compatibility lanes and their observed production traffic:
+
+- **Raw unscoped blame paths and bridge blame calls** remain named compatibility lanes by design (blame-locality non-goals: no retirement of bridge or unbound operator behavior). Production evidence: zero granted `blame` checkout operations in the entire observation history; exactly one denied covered refusal at sequence 327234 (the blame ceremony's strict probe). The operator checkout-local `bro blame` CLI is the sanctioned operator lane and stays.
+- **Bridge, uncovered, and `LegacyLocal` render adapters** remain available (render-locality design section 3): catalog compatibility render gated directly on `render_output`, and bridge render with its worktree/base-path behavior. The current catalog has zero rows in those classes (all 19 projects are Published and covered), so no live traffic can select them without a catalog change.
+- **Checkout capability counters** confirm the cutovers hold: every governed lane (`local_project_walk`, `git_history`, `publisher_config_tree_read`, `knowledge_gap_overlay_read`, `artifact_watch_discovery`) shows granted traffic frozen before its marker and only denials after; `repository_mutation` grants predate the cutover (last at sequence 265181 on 2026-08-09); no `render_file_provider` counter has ever existed.
+- Retirement of any of these lanes is a separate operator decision, explicitly outside every installed marker.
+
 ## Next operations
 
-1. Inventory the separately scoped raw blame and bridge compatibility categories now that render coverage is strict.
-2. Operator-side residual: fix rtk push rights (https 403, ssh read-only) and decide the rebase of local develop onto remote; three commits wait on it.
+1. Operator-side residual: fix rtk push rights (https 403, ssh read-only) and decide the rebase of local develop onto remote; three commits wait on it.
+2. Optional hardening, operator decision only: retirement of the named bridge/raw compatibility lanes inventoried above.
+3. The locality program's planned cutovers are otherwise complete: code source, Git transport, provenance, blame, knowledge transport, and project render are all marker-governed for all 19 Published projects with zero daemon checkout authority.
 
 ## Next-lane inventory
 
-- Production now has complete three-view render-locality acceptance for eight Published projects and still has no render locality marker or `RenderFileProvider` target counters. Five have three-write proofs, two have valid zero-write completions, and the large project completed all three views on 2026-08-10. The other eleven projects still need provider-guidance migration and complete three-view evidence.
-- The 19 bound checkout roots are mapped and none of their four instruction targets is currently dirty. Seven already have all three blackbox-managed provider files; one has all three provider files absent. The other eleven contain hand-authored provider guidance that render must preserve rather than overwrite: eleven `CLAUDE.md` files and nine `AGENTS.md` files. `GEMINI.md` is managed in seven checkouts and absent in twelve. Only six checkouts currently have a nonempty `PROJECT.md`.
-- All eight initially writable checkouts now have three-view evidence: five full three-write proofs, two zero-write completions that need a provider-neutral source document before a three-write proof is possible, and the large checkout completed after the sequence repair. The other eleven need deliberate bootstrap/decomposition first, and every remaining checkout needs a managed plan proving that each view produces three written projections rather than skipped output.
-- Historical checkout counters show the already-governed Git history, collected source, publisher, knowledge, artifact-watch, and blame paths refusing their daemon checkout lanes. The remaining explicit work is project render evidence plus the separately scoped bridge/raw compatibility categories; global render remains host-local by design.
+- All 19 Published projects carry complete three-view render-locality acceptance (all-provider, non-dry-run, three-written, zero-refusal receipts for `published`, `all`, and `own`), the render locality marker is applied and verified (checksum `2b4aa201d4079ff3c17ee929e3194c1149c884721f8d84dc3a8579a9e7f1275a`), and no `RenderFileProvider` target counter exists.
+- All 19 bound checkout roots now carry blackbox-managed provider files and provider-neutral source documents: the eleven hand-authored sets were absorbed into PROJECT.md plus committed knowledge entries on 2026-08-10, the two zero-content projects gained source documents, and every checkout has a nonempty PROJECT.md. Every absorbed checkout's provider files are committed managed render output; rtk's two commits are local-only pending the push-rights fix.
+- Historical checkout counters show the governed Git history, collected source, publisher, knowledge, artifact-watch, and blame paths refusing their daemon checkout lanes; render never acquired a daemon checkout lane at all. Global render remains host-local by design.
 
 ## Managed-render acceptance
 
