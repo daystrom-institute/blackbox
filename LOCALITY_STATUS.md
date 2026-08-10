@@ -14,6 +14,7 @@ Updated: 2026-08-10
 - Worker dispatch now reaches the daemon ClusterIP through the checkout host's accepted cage subnet route. The HA tailnet Service VIP currently resolves but has no approved backend and times out; it remains unavailable for operator and collector HTTPS until its service advertisements are approved by tailnet policy.
 - Authenticated checkout-local `bro provenance export` completed 210 pages for generation `28e9b7a85b7eb2b57084f2bc4b047c9a60e54940051b1efe3e52c844f171c4b1`: 671 existing note documents were unchanged, 0 were rejected, and no stale-generation restart occurred. The export caused a real sidecar rebuild while the daemon continued serving; that rebuild converged in 10.3 seconds and the graph remained intact.
 - The current catalog has 19 projects and all 19 are Published. The blame locality marker is applied and offline-verified for the full set at catalog epoch 49. Marker checksum: `f3ed9e9e95e3448cccda2b7d90ab4599d319ad70b07ac683410a31a83ecaf422`.
+- The render locality marker is applied and offline-verified for all 19 Published projects as of 2026-08-10. Marker checksum: `2b4aa201d4079ff3c17ee929e3194c1149c884721f8d84dc3a8579a9e7f1275a`. The ceremony: live preflight clean over all 19 (checkout observation sequence 327234, render observation sequence 68), a 330-second quiet window, offline apply and verify from the admin pod with the daemon scaled to zero, then daemon restore. Post-marker probes: unbound renders for covered projects refuse with `error.render_locality_required` before any checkout acquisition (probed on two projects), and a managed bound successor render completed all three views with three writes and zero refusals, advancing render observations to 71 while the checkout-observation file stayed byte-identical.
 - After the marked daemon restart, corpus-entity `bbox_blame` refuses with `error.blame_locality_required` before any checkout acquisition. Authenticated checkout-local `bro blame` succeeds against a real file and line. The checkout observation sequence remains exactly 327234; only the expected operator completion advanced the blame observation sequence from 169 to 170. The pod remains ready with zero restarts.
 - Managed project render is fully live-accepted for eight Published checkouts: five disposable three-write proofs, two zero-write completions for projects with no project guidance, and the large managed checkout, whose `own` view completed on 2026-08-10 after the provisional sequence repair. Every view receipt is all-provider, non-dry-run, three writes (or zero writes for the no-content pair), zero refusals. Durable render observation sequence is 26. The complete daemon checkout-observation file remains byte-for-byte unchanged at sequence 327234 with no `render_file_provider` counter, and the pod remains ready with zero restarts.
 
@@ -74,9 +75,8 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 
 ## Next operations
 
-1. Run the render locality preflight over all 19 Published projects, quiet window, offline marker apply, restart, and strict refusal/successor probes.
-2. Inventory the separately scoped raw blame and bridge compatibility categories after render coverage is strict.
-3. Operator-side residual: fix rtk push rights (https 403, ssh read-only) and decide the rebase of local develop onto remote; three commits wait on it.
+1. Inventory the separately scoped raw blame and bridge compatibility categories now that render coverage is strict.
+2. Operator-side residual: fix rtk push rights (https 403, ssh read-only) and decide the rebase of local develop onto remote; three commits wait on it.
 
 ## Next-lane inventory
 
