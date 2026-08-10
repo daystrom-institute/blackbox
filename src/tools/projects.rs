@@ -309,6 +309,17 @@ impl BlackboxServer {
         Parameters(p): Parameters<ProjectRegisterParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
+        if !Path::new(&p.path).exists() {
+            return Self::err_text(&format!(
+                "Error: error.project_onboarding_remote: {} is not visible to this daemon. \
+                 Onboard it through the checkout owner instead: add the project to the \
+                 checkout-host collector config, run `bbox-code-collector --config <cfg> \
+                 init {}` on that host for scaffolding, and the collector onboards it \
+                 through the producer channel on its next cycle. See \
+                 design/daemon-runtime/remote-project-onboarding.md",
+                p.path, p.path
+            ));
+        }
         // Catalog arm (plan §9.1): the compatibility composite. Probing,
         // find-or-create, attach, and nomination ingestion run on the
         // blocking pool; the enrichment pipeline is shared with the bridge
@@ -665,7 +676,16 @@ impl BlackboxServer {
                 anyhow::bail!("project path must be absolute: {}", p.path);
             }
             if !path.exists() {
-                anyhow::bail!("project path does not exist: {}", p.path);
+                anyhow::bail!(
+                    "error.project_onboarding_remote: {} is not visible to this daemon. \
+                     Onboard it through the checkout owner instead: add the project to the \
+                     checkout-host collector config, run `bbox-code-collector --config <cfg> \
+                     init {}` on that host for scaffolding, and the collector onboards it \
+                     through the producer channel on its next cycle. See \
+                     design/daemon-runtime/remote-project-onboarding.md",
+                    p.path,
+                    p.path
+                );
             }
             // Bootstrap exception, plan section 4.19: an UNREGISTERED absolute
             // path is initialized with no lease, because attach needs the

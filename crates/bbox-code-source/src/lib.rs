@@ -36,6 +36,8 @@ pub enum ContractError {
     },
     #[error("invalid published scope: {0}")]
     InvalidScope(String),
+    #[error("invalid catalog onboard request field: {0}")]
+    InvalidOnboardField(&'static str),
     #[error("invalid producer id")]
     InvalidProducerId,
     #[error("invalid relative path: {0}")]
@@ -219,6 +221,118 @@ pub struct GenerationStatus {
 pub struct ErrorResponse {
     pub code: String,
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Catalog onboarding (remote project registration via the producer channel)
+// ---------------------------------------------------------------------------
+
+pub const CATALOG_ONBOARD_SCHEMA_VERSION: u32 = 1;
+pub const MAX_ONBOARD_ALIASES: usize = 64;
+pub const MAX_ONBOARD_PATH_BYTES: usize = 4096;
+
+/// Checkout facts probed by the checkout-owner collector and presented over
+/// the authenticated producer channel. The daemon revalidates every field it
+/// can check independently (scope membership in the producer grant, repo_id
+/// equality, relpath shape and agreement, catalog uniqueness); the residual
+/// trust in the canonical path strings is exactly the trust the publication
+/// lanes already place in the producer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogOnboardRequestV1 {
+    pub schema_version: u32,
+    /// The published scope the producer grant must already cover.
+    pub scope: PublishedScope,
+    /// Producer-canonical checkout top (absolute on the producer host).
+    pub canonical_checkout_dir: String,
+    /// Producer-canonical project dir inside the checkout.
+    pub checkout_project_dir: String,
+    /// Monorepo discriminator relative to the checkout top (`.` at root).
+    pub project_root_relpath: String,
+    /// Checkout shape: `base`, `worktree`, or `managed_clone`.
+    pub checkout_kind: String,
+    /// Durable checkout identity from `.bbox/local/checkout-id`.
+    pub checkout_id: String,
+    pub branch_ref: Option<String>,
+    /// repo_id recorded by the committed config at HEAD, when present.
+    pub committed_repo_id: Option<String>,
+    #[serde(default)]
+    pub declared_aliases: Vec<String>,
+    /// Capabilities observed at onboard time; lease-time acquisition still
+    /// revalidates each capability.
+    pub capabilities: bbox_corpus_core::project_catalog::AttachmentCapabilities,
+}
+
+impl CatalogOnboardRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != CATALOG_ONBOARD_SCHEMA_VERSION {
+            return Err(ContractError::UnsupportedSchema(self.schema_version));
+        }
+        validate_scope(&self.scope)?;
+        for path in [&self.canonical_checkout_dir, &self.checkout_project_dir] {
+            if path.is_empty()
+                || path.len() > MAX_ONBOARD_PATH_BYTES
+                || !path.starts_with('/')
+                || path
+                    .bytes()
+                    .any(|byte| byte == 0 || byte.is_ascii_control())
+            {
+                return Err(ContractError::InvalidOnboardField("checkout path"));
+            }
+        }
+        if self.project_root_relpath != self.scope.bbox_root_relpath() {
+            return Err(ContractError::InvalidOnboardField(
+                "project_root_relpath disagrees with scope",
+            ));
+        }
+        if self.project_root_relpath != "."
+            && validate_relative_path(&self.project_root_relpath).is_err()
+        {
+            return Err(ContractError::InvalidOnboardField("project_root_relpath"));
+        }
+        if !matches!(
+            self.checkout_kind.as_str(),
+            "base" | "worktree" | "managed_clone"
+        ) {
+            return Err(ContractError::InvalidOnboardField("checkout_kind"));
+        }
+        if self.checkout_id.len() != 32
+            || !self
+                .checkout_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ContractError::InvalidOnboardField("checkout_id"));
+        }
+        if let Some(repo_id) = &self.committed_repo_id {
+            if repo_id != self.scope.repo_id() {
+                return Err(ContractError::InvalidOnboardField(
+                    "committed_repo_id disagrees with scope",
+                ));
+            }
+        }
+        if self.declared_aliases.len() > MAX_ONBOARD_ALIASES
+            || self
+                .declared_aliases
+                .iter()
+                .any(|alias| alias.is_empty() || alias.len() > 256)
+        {
+            return Err(ContractError::InvalidOnboardField("declared_aliases"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogOnboardResponseV1 {
+    pub project_id: String,
+    pub attachment_id: String,
+    pub created_project: bool,
+    pub already_attached: bool,
+    pub epoch: u64,
+    #[serde(default)]
+    pub nominated_aliases: Vec<String>,
 }
 
 pub fn validate_scope(scope: &PublishedScope) -> Result<(), ContractError> {
@@ -691,6 +805,72 @@ mod tests {
 
     fn scope() -> PublishedScope {
         PublishedScope::try_new("repo-family", ".").unwrap()
+    }
+
+    fn valid_onboard_request() -> CatalogOnboardRequestV1 {
+        CatalogOnboardRequestV1 {
+            schema_version: CATALOG_ONBOARD_SCHEMA_VERSION,
+            scope: scope(),
+            canonical_checkout_dir: "/home/operator/repos/example".into(),
+            checkout_project_dir: "/home/operator/repos/example".into(),
+            project_root_relpath: ".".into(),
+            checkout_kind: "base".into(),
+            checkout_id: "a".repeat(32),
+            branch_ref: Some("refs/heads/main".into()),
+            committed_repo_id: Some("repo-family".into()),
+            declared_aliases: vec!["example".into()],
+            capabilities: bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                local_code_source: true,
+                git_history: true,
+                blame: true,
+                repo_knowledge: true,
+                repo_mutation: true,
+                render_output: true,
+                provenance_note_io: true,
+                artifact_watching: true,
+            },
+        }
+    }
+
+    #[test]
+    fn catalog_onboard_request_accepts_a_valid_probe() {
+        valid_onboard_request().validate().unwrap();
+    }
+
+    #[test]
+    fn catalog_onboard_request_rejects_field_violations() {
+        let mut bad_schema = valid_onboard_request();
+        bad_schema.schema_version += 1;
+        assert!(matches!(
+            bad_schema.validate(),
+            Err(ContractError::UnsupportedSchema(_))
+        ));
+
+        let mut relative = valid_onboard_request();
+        relative.canonical_checkout_dir = "repos/example".into();
+        assert!(relative.validate().is_err());
+
+        let mut relpath_mismatch = valid_onboard_request();
+        relpath_mismatch.project_root_relpath = "nested".into();
+        assert!(relpath_mismatch.validate().is_err());
+
+        let mut bad_kind = valid_onboard_request();
+        bad_kind.checkout_kind = "symlink-farm".into();
+        assert!(bad_kind.validate().is_err());
+
+        let mut bad_checkout_id = valid_onboard_request();
+        bad_checkout_id.checkout_id = "not-hex".into();
+        assert!(bad_checkout_id.validate().is_err());
+
+        let mut identity_mismatch = valid_onboard_request();
+        identity_mismatch.committed_repo_id = Some("another-repo".into());
+        assert!(identity_mismatch.validate().is_err());
+
+        let mut alias_overflow = valid_onboard_request();
+        alias_overflow.declared_aliases = (0..=MAX_ONBOARD_ALIASES)
+            .map(|index| format!("alias-{index}"))
+            .collect();
+        assert!(alias_overflow.validate().is_err());
     }
 
     #[test]

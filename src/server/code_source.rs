@@ -11,9 +11,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::{
-    BeginUploadRequest, ContractError, CutbackErrorClass, CutbackReason, CutbackStateV2,
-    ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus, ManifestPage,
-    MissingBlobsPage,
+    BeginUploadRequest, CatalogOnboardRequestV1, CatalogOnboardResponseV1, ContractError,
+    CutbackErrorClass, CutbackReason, CutbackStateV2, ErrorResponse, FinalizeResponse,
+    GenerationState, GenerationStatus, ManifestPage, MissingBlobsPage,
 };
 use bbox_code_source_store::{
     ActivationFence, ActivationFenceConflict, ActivationRecord, ActivationRecordV2,
@@ -859,6 +859,10 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
             "/internal/code-source/v1/generations/{generation}/status",
             get(generation_status),
         )
+        .route(
+            "/internal/code-source/v1/catalog/onboard",
+            post(catalog_onboard).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             super::producer_auth::authenticate_code_source_request,
@@ -1077,6 +1081,95 @@ async fn generation_status(
         "generation_not_found",
         "generation not found",
     ))
+}
+
+/// Remote project onboarding (design/daemon-runtime/remote-project-onboarding.md):
+/// the checkout-owner collector presents probed checkout facts over the
+/// authenticated producer channel; the daemon validates what it can, then runs
+/// the same register/attach composite the local arm uses. No daemon checkout
+/// access is acquired at any point.
+async fn catalog_onboard(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<CatalogOnboardRequestV1>,
+) -> Result<impl IntoResponse, HttpError> {
+    request
+        .validate()
+        .map_err(|error| HttpError::unprocessable("invalid_onboard_request", error.to_string()))?;
+    require_scope(&grant, &request.scope)?;
+    let store = state
+        .project_authority
+        .catalog_store()
+        .cloned()
+        .ok_or_else(|| {
+            HttpError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "catalog_unavailable",
+                "the project catalog is unavailable",
+            )
+        })?;
+    let receipt = blocking(move || -> Result<CatalogOnboardResponseV1> {
+        let kind = match request.checkout_kind.as_str() {
+            "base" => bbox_corpus_core::project_catalog::AttachmentKind::Base,
+            "worktree" => bbox_corpus_core::project_catalog::AttachmentKind::Worktree,
+            "managed_clone" => bbox_corpus_core::project_catalog::AttachmentKind::ManagedClone,
+            other => bail!("unvalidated checkout kind {other}"),
+        };
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let display_name = std::path::Path::new(&request.checkout_project_dir)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| request.checkout_project_dir.clone());
+        let probe = bbox_indexing::project_catalog_admin::AttachProbe {
+            checkout_id: request.checkout_id.clone(),
+            checkout_dir: request.canonical_checkout_dir.clone(),
+            checkout_project_dir: request.checkout_project_dir.clone(),
+            project_root_relpath: request.project_root_relpath.clone(),
+            kind,
+            validated_scope: Some(request.scope.clone()),
+            computed_repo_hint: None,
+            branch_ref: request.branch_ref.clone(),
+            capabilities: request.capabilities,
+            attached_at: now.clone(),
+        };
+        let epoch = store
+            .snapshot()
+            .map_err(|error| anyhow!("{error}"))?
+            .epoch();
+        let receipt = bbox_indexing::project_catalog_admin::register_composite(
+            &store,
+            epoch,
+            &probe,
+            &display_name,
+            &now,
+        )
+        .map_err(|error| anyhow!("{error}"))?;
+        let nomination_epoch = receipt
+            .commit
+            .as_ref()
+            .map(|commit| commit.epoch)
+            .unwrap_or(epoch);
+        let nominated = crate::tools::project_catalog::ingest_alias_nominations(
+            &store,
+            nomination_epoch,
+            &receipt.project_id,
+            &request.declared_aliases,
+        );
+        Ok(CatalogOnboardResponseV1 {
+            project_id: receipt.project_id.as_str().to_string(),
+            attachment_id: receipt.attachment_id.as_str().to_string(),
+            created_project: receipt.created_project,
+            already_attached: receipt.already_attached,
+            epoch: nominated
+                .epoch
+                .or(receipt.commit.as_ref().map(|c| c.epoch))
+                .unwrap_or(epoch),
+            nominated_aliases: nominated.recorded,
+        })
+    })
+    .await?;
+    state.nudge_edge_index_rebuild();
+    Ok((StatusCode::CREATED, Json(receipt)))
 }
 
 fn schedule_activation(
@@ -7327,6 +7420,176 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, "unsupported_contract");
+    }
+
+    fn onboard_request(scope: &PublishedScope) -> CatalogOnboardRequestV1 {
+        CatalogOnboardRequestV1 {
+            schema_version: bbox_code_source::CATALOG_ONBOARD_SCHEMA_VERSION,
+            scope: scope.clone(),
+            canonical_checkout_dir: "/checkout-owner/repos/example".into(),
+            checkout_project_dir: "/checkout-owner/repos/example".into(),
+            project_root_relpath: ".".into(),
+            checkout_kind: "base".into(),
+            checkout_id: "a".repeat(32),
+            branch_ref: Some("refs/heads/main".into()),
+            committed_repo_id: Some(scope.repo_id().to_string()),
+            declared_aliases: vec!["example-alias".into()],
+            capabilities: bbox_corpus_core::project_catalog::AttachmentCapabilities {
+                local_code_source: true,
+                git_history: true,
+                blame: true,
+                repo_knowledge: true,
+                repo_mutation: true,
+                render_output: true,
+                provenance_note_io: true,
+                artifact_watching: true,
+            },
+        }
+    }
+
+    fn enabled_catalog_onboard_state(
+        root: &Path,
+        catalog_projects_path: &Path,
+        scope: &PublishedScope,
+    ) -> (Arc<SharedState>, String) {
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            catalog_projects_path,
+        )
+        .unwrap();
+        let state = Arc::new(SharedState::for_test_catalog(root, catalog_projects_path));
+        let token_secret = "f".repeat(64);
+        let token = bro_rpc::ServiceToken::parse(token_secret.clone()).unwrap();
+        // The plain runtime, not for_test_catalog: onboarding registers a
+        // scope that by definition has no catalog project yet, and the
+        // catalog fixture refuses unregistered scopes at construction.
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "onboard-producer".into(),
+                        projects: BTreeMap::from([(scope.clone(), "onboard-project".into())]),
+                    },
+                )],
+            )));
+        (state, token_secret)
+    }
+
+    #[tokio::test]
+    async fn catalog_onboard_route_attaches_and_stays_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let (state, token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        let app = router(state.clone()).with_state(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&onboard_request(&scope)).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let receipt: CatalogOnboardResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert!(receipt.created_project);
+        assert!(!receipt.already_attached);
+        assert_eq!(receipt.nominated_aliases, vec!["example-alias".to_string()]);
+
+        let store = state.project_authority.catalog_store().unwrap().clone();
+        let snapshot = store.snapshot().unwrap();
+        let project_id = ProjectId::parse(receipt.project_id.clone()).unwrap();
+        let project = snapshot.catalog().projects.get(&project_id).unwrap();
+        assert_eq!(project.scope, ProjectScope::Published(scope.clone()));
+        let attachments = snapshot.attachments();
+        assert!(
+            attachments
+                .attachments
+                .values()
+                .any(|attachment| { attachment.checkout_id.as_str() == "a".repeat(32).as_str() })
+        );
+
+        let replay = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&onboard_request(&scope)).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        let body = to_bytes(replay.into_body(), 64 * 1024).await.unwrap();
+        let replayed: CatalogOnboardResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert!(replayed.already_attached);
+        assert!(!replayed.created_project);
+        assert_eq!(replayed.project_id, receipt.project_id);
+    }
+
+    #[tokio::test]
+    async fn catalog_onboard_route_enforces_grant_scope_and_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let (state, token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        let app = router(state.clone()).with_state(state);
+
+        // A scope outside the producer grant is forbidden before any mutation.
+        let foreign = PublishedScope::try_new("repo_foreign", ".").unwrap();
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&onboard_request(&foreign)).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Contract violations are unprocessable and carry a typed code.
+        let mut invalid = onboard_request(&scope);
+        invalid.checkout_kind = "bogus".into();
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&invalid).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let error: ErrorResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, "invalid_onboard_request");
+
+        // A committed identity disagreeing with the grant scope is refused.
+        let mut mismatched = onboard_request(&scope);
+        mismatched.committed_repo_id = Some("someone_elses_repo".into());
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&mismatched).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

@@ -1445,9 +1445,9 @@ impl BlackboxServer {
     }
 }
 
-struct NominationOutcome {
-    recorded: Vec<String>,
-    epoch: Option<u64>,
+pub(crate) struct NominationOutcome {
+    pub(crate) recorded: Vec<String>,
+    pub(crate) epoch: Option<u64>,
 }
 
 /// The exact epoch-checked offline command that accepts one pending
@@ -1488,7 +1488,7 @@ fn well_formed_alias(alias: &str) -> bool {
 /// nominations (plan §7.6). Acceptance stays an offline operator action, so
 /// nothing here grants selector authority. Collisions and malformed entries
 /// are skipped with a warning rather than failing the committed attachment.
-fn ingest_alias_nominations(
+pub(crate) fn ingest_alias_nominations(
     store: &ProjectCatalogStore,
     expected_epoch: u64,
     project_id: &ProjectId,

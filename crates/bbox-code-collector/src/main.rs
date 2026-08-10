@@ -57,6 +57,14 @@ struct Cli {
 enum Command {
     Once,
     Run,
+    /// Write `.bbox` scaffolding into a checkout on this host. This replaces
+    /// daemon-side `bbox_project_init` for checkouts the daemon cannot reach:
+    /// the checkout owner initializes its own workspace and the next
+    /// collection cycle onboards the project through the producer channel.
+    Init {
+        /// Absolute path of the project root to initialize.
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,11 +175,66 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
+    if let Command::Init { path } = &cli.command {
+        return init_project_scaffolding(path);
+    }
     let runtime = Runtime::new(&config)?;
     match cli.command {
         Command::Once => publish_all(&runtime, &config).await,
         Command::Run => run_loop(&runtime, &config).await,
+        Command::Init { .. } => unreachable!("init returns above"),
     }
+}
+
+/// Checkout-local `.bbox` scaffolding (the checkout-owner answer to
+/// `bbox_project_init` for a daemon with no checkout access). Idempotent;
+/// the identity-bearing config is only created when absent and the durable
+/// repo_id is recorded through the shared helper.
+fn init_project_scaffolding(path: &Path) -> Result<()> {
+    let project_dir = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    if !project_dir.is_dir() {
+        bail!(
+            "project path must be an existing directory: {}",
+            project_dir.display()
+        );
+    }
+    let bbox_dir = project_dir.join(".bbox");
+    for dir in [
+        "brofiles",
+        "workflows",
+        "packets",
+        "teams",
+        "agents",
+        "local",
+        "knowledge",
+        "gaps",
+    ] {
+        fs::create_dir_all(bbox_dir.join(dir))?;
+    }
+    let config_path = bbox_dir.join("config.toml");
+    if !config_path.exists() {
+        fs::write(
+            &config_path,
+            "# Project-local blackbox configuration.\n[roadmap]\n[mcp]\n[artifacts]\n",
+        )?;
+    }
+    let mcp_path = bbox_dir.join("mcp.json");
+    if !mcp_path.exists() {
+        fs::write(&mcp_path, "{\"version\":1,\"servers\":{},\"filters\":{}}\n")?;
+    }
+    let local_gitignore = bbox_dir.join("local").join(".gitignore");
+    if !local_gitignore.exists() {
+        fs::write(&local_gitignore, "*\n!.gitignore\n")?;
+    }
+    if bbox_corpus_core::git::git_root_for_path(&project_dir).is_some() {
+        let recorded = bbox_config::config::ensure_recorded_repo_id(&project_dir)
+            .context("recording durable repo identity")?;
+        tracing::info!(repo_id = %recorded.repo_id, "recorded durable repo identity");
+    }
+    println!("initialized {}", project_dir.display());
+    Ok(())
 }
 
 impl Runtime {
@@ -209,12 +272,178 @@ impl Runtime {
 
 async fn run_loop(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
     tokio::select! {
+        _ = run_onboard_lane(runtime, config) => unreachable!("onboard lane is an endless loop"),
         _ = run_code_lane(runtime, config) => unreachable!("code lane is an endless loop"),
         _ = run_history_lane(runtime, config) => unreachable!("history lane is an endless loop"),
         _ = run_provenance_lane(runtime, config) => unreachable!("provenance lane is an endless loop"),
         _ = run_published_knowledge_lane(runtime, config) => unreachable!("published knowledge lane is an endless loop"),
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
+}
+
+/// Catalog onboarding lane (design/daemon-runtime/remote-project-onboarding.md):
+/// probe every configured project locally and present the facts over the
+/// authenticated producer channel. The composite is find-or-create, so the
+/// pass is idempotent and runs on the normal cadence.
+async fn run_onboard_lane(runtime: &Runtime, config: &CollectorConfig) {
+    let interval = Duration::from_secs(config.interval_secs.max(1));
+    let mut backoff = interval;
+    loop {
+        match onboard_projects(runtime, config).await {
+            Ok(()) => backoff = interval,
+            Err(error) => {
+                tracing::error!(error = %error, "catalog onboarding failed");
+                backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
+            }
+        }
+        tokio::time::sleep(jittered(backoff)).await;
+    }
+}
+
+async fn onboard_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    let mut failures = Vec::new();
+    for project in &config.projects {
+        match onboard_project(runtime, project).await {
+            Ok(receipt) => {
+                if receipt.created_project {
+                    tracing::info!(
+                        project_id = %receipt.project_id,
+                        attachment_id = %receipt.attachment_id,
+                        "catalog onboarding attached a new project"
+                    );
+                } else {
+                    tracing::debug!(
+                        project_id = %receipt.project_id,
+                        already_attached = receipt.already_attached,
+                        "catalog onboarding is current"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    root = %project.root.display(),
+                    error = %error,
+                    "catalog onboarding failed for project"
+                );
+                failures.push(format!("{}: {error:#}", project.root.display()));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(failures.join("; "))
+    }
+}
+
+async fn onboard_project(
+    runtime: &Runtime,
+    project: &ProjectConfig,
+) -> Result<bbox_code_source::CatalogOnboardResponseV1> {
+    let request = probe_onboard_request(project)?;
+    let url = runtime.endpoint("internal/code-source/v1/catalog/onboard")?;
+    let response = runtime
+        .request(reqwest::Method::POST, url)
+        .json(&request)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(response_error_value(response).await);
+    }
+    response.json().await.map_err(Into::into)
+}
+
+/// Probe one configured project into an onboarding request. All facts are
+/// read locally on this host; the daemon revalidates scope membership,
+/// repo_id agreement, and catalog uniqueness before attaching.
+fn probe_onboard_request(
+    project: &ProjectConfig,
+) -> Result<bbox_code_source::CatalogOnboardRequestV1> {
+    let project_dir = project
+        .root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", project.root.display()))?;
+    if !project_dir.is_dir() {
+        bail!(
+            "project path must be an existing directory: {}",
+            project_dir.display()
+        );
+    }
+    let git_root = bbox_corpus_core::git::git_root_for_path(&project_dir)
+        .and_then(|root| root.canonicalize().ok());
+    let (checkout_dir, checkout_kind) = match &git_root {
+        Some(root) => {
+            let kind = if bbox_corpus_core::git::managed_checkout_root(root).is_some() {
+                "managed_clone"
+            } else if bbox_corpus_core::git::linked_worktree_base(root).is_some() {
+                "worktree"
+            } else {
+                "base"
+            };
+            (root.clone(), kind)
+        }
+        None => (project_dir.clone(), "base"),
+    };
+    let project_root_relpath = bbox_root_relpath(&checkout_dir, &project_dir)
+        .ok_or_else(|| anyhow!("project root is outside its checkout top"))?;
+    if project_root_relpath != project.scope.bbox_root_relpath() {
+        bail!(
+            "configured relpath {} disagrees with probed {}",
+            project.scope.bbox_root_relpath(),
+            project_root_relpath
+        );
+    }
+    let committed = git_root
+        .as_ref()
+        .and_then(|_| bbox_config::config::load_project_at_ref(&project_dir, "HEAD").ok());
+    let committed_repo_id = committed
+        .as_ref()
+        .and_then(|cfg| cfg.project.repo_id.clone());
+    let declared_aliases = committed
+        .as_ref()
+        .map(|cfg| cfg.project.aliases.clone())
+        .unwrap_or_default();
+    if let Some(repo_id) = &committed_repo_id {
+        if repo_id != project.scope.repo_id() {
+            bail!(
+                "committed repo_id {} disagrees with configured scope repo_id {}",
+                repo_id,
+                project.scope.repo_id()
+            );
+        }
+    }
+    let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&checkout_dir)
+        .context("ensuring durable checkout identity")?;
+    let is_git = git_root.is_some();
+    let has_bbox_dir = project_dir.join(".bbox").is_dir();
+    let request = bbox_code_source::CatalogOnboardRequestV1 {
+        schema_version: bbox_code_source::CATALOG_ONBOARD_SCHEMA_VERSION,
+        scope: project.scope.clone(),
+        canonical_checkout_dir: checkout_dir.to_string_lossy().into_owned(),
+        checkout_project_dir: project_dir.to_string_lossy().into_owned(),
+        project_root_relpath,
+        checkout_kind: checkout_kind.to_string(),
+        checkout_id,
+        branch_ref: git_root
+            .as_ref()
+            .and_then(|_| bbox_corpus_core::git::current_branch(&checkout_dir)),
+        committed_repo_id,
+        declared_aliases,
+        capabilities: bbox_corpus_core::project_catalog::AttachmentCapabilities {
+            local_code_source: true,
+            git_history: is_git,
+            blame: is_git,
+            repo_knowledge: has_bbox_dir,
+            repo_mutation: has_bbox_dir,
+            render_output: true,
+            provenance_note_io: is_git,
+            artifact_watching: has_bbox_dir,
+        },
+    };
+    request
+        .validate()
+        .context("probed onboard request is invalid")?;
+    Ok(request)
 }
 
 async fn run_published_knowledge_lane(runtime: &Runtime, config: &CollectorConfig) {
@@ -288,6 +517,7 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     let history = publish_history_repositories(runtime, config).await;
     let provenance = publish_provenance_projects(runtime, config).await;
     let published_knowledge = publish_knowledge_projects(runtime, config).await;
+    let onboard = onboard_projects(runtime, config).await;
     let mut failures = Vec::new();
     if let Err(error) = code {
         failures.push(format!("code-source lane failed: {error:#}"));
@@ -300,6 +530,9 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     }
     if let Err(error) = published_knowledge {
         failures.push(format!("published knowledge lane failed: {error:#}"));
+    }
+    if let Err(error) = onboard {
+        failures.push(format!("catalog onboarding lane failed: {error:#}"));
     }
     if failures.is_empty() {
         Ok(())
@@ -2226,6 +2459,106 @@ mod tests {
         assert!(
             validate_server_url(&Url::parse("http://10.43.214.253:7264/").unwrap(), false).is_err()
         );
+    }
+
+    fn init_fixture_repo(root: &Path) {
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "user.name", "Onboard Fixture"]);
+        git(&root, &["config", "user.email", "onboard@example.invalid"]);
+        fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    #[test]
+    fn init_scaffolding_creates_workspace_and_records_repo_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        init_fixture_repo(&root);
+
+        init_project_scaffolding(&root).unwrap();
+
+        assert!(root.join(".bbox/config.toml").is_file());
+        assert!(root.join(".bbox/mcp.json").is_file());
+        assert!(root.join(".bbox/local/.gitignore").is_file());
+        for dir in [
+            "brofiles",
+            "workflows",
+            "packets",
+            "teams",
+            "agents",
+            "local",
+            "knowledge",
+            "gaps",
+        ] {
+            assert!(root.join(".bbox").join(dir).is_dir(), "missing {dir}");
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+            .unwrap();
+        let first_commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let config = fs::read_to_string(root.join(".bbox/config.toml")).unwrap();
+        assert!(
+            config.contains(&format!("repo_id = \"{first_commit}\"")),
+            "config records first-commit identity: {config}"
+        );
+        init_project_scaffolding(&root).unwrap();
+        let again = fs::read_to_string(root.join(".bbox/config.toml")).unwrap();
+        assert_eq!(config, again, "second init is idempotent");
+    }
+
+    #[test]
+    fn onboard_probe_reads_checkout_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        init_fixture_repo(&root);
+        init_project_scaffolding(&root).unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+            .unwrap();
+        let first_commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        fs::write(
+            root.join(".bbox/config.toml"),
+            format!("[project]\nrepo_id = \"{first_commit}\"\naliases = [\"demo\"]\n"),
+        )
+        .unwrap();
+        git(&root, &["add", ".bbox"]);
+        git(&root, &["commit", "--quiet", "-m", "identity"]);
+
+        let project = ProjectConfig {
+            root: root.clone(),
+            scope: PublishedScope::try_new(first_commit.clone(), ".").unwrap(),
+            git_history: true,
+            provenance: true,
+            published_knowledge: None,
+        };
+        let request = probe_onboard_request(&project).unwrap();
+        assert_eq!(request.canonical_checkout_dir, root.to_string_lossy());
+        assert_eq!(request.checkout_kind, "base");
+        assert_eq!(request.project_root_relpath, ".");
+        assert_eq!(
+            request.committed_repo_id.as_deref(),
+            Some(first_commit.as_str())
+        );
+        assert_eq!(request.declared_aliases, vec!["demo".to_string()]);
+        assert_eq!(request.checkout_id.len(), 32);
+        assert!(request.capabilities.git_history);
+        assert!(request.capabilities.repo_knowledge);
+
+        // A managed checkout marker flips the probed kind.
+        fs::write(
+            root.join(".git/blackbox-managed-checkout"),
+            "blackbox-managed-checkout-v1\n",
+        )
+        .unwrap();
+        let managed = probe_onboard_request(&project).unwrap();
+        assert_eq!(managed.checkout_kind, "managed_clone");
     }
 
     #[test]
