@@ -599,21 +599,20 @@ impl KnowledgeTransportCutoverRuntimeV1 {
         let Some(accepted) = accepted else {
             return KnowledgeTransportRuntimeCoverageV1::AcceptedSourcePendingRecutover;
         };
-        if accepted.content_stamp().accepted_scope() != &row.scope
-            || accepted.content_stamp().generation_id() != row.accepted_generation_id
-            || accepted.content_stamp().generation_hash() != row.accepted_generation_sha256
-            || accepted.binding_stamp().pointer_sha256() != row.accepted_pointer_sha256
-        {
+        // Tolerant advancement (the same model 1c3d334b gave the code-source
+        // marker): the row pins stable producer/scope authority, not an
+        // immutable evidence generation. An accepted publication that
+        // advanced through the same authenticated producer channel stays
+        // current, because the transport is the only way content arrives.
+        // The pinned generation/pointer hashes remain in the row as cutover
+        // evidence but no longer gate currency; a missing accepted
+        // publication or a non-producer binding still pend re-cutover.
+        if accepted.content_stamp().accepted_scope() != &row.scope {
             return KnowledgeTransportRuntimeCoverageV1::AcceptedSourcePendingRecutover;
         }
         match accepted.binding_stamp().source() {
-            AcceptedPublicationSourceBinding::Producer {
-                producer_id,
-                source_generation_id,
-                source_generation_sha256,
-            } if producer_id == &row.producer_id
-                && source_generation_id == &row.source_generation_id
-                && source_generation_sha256 == &row.source_generation_sha256 =>
+            AcceptedPublicationSourceBinding::Producer { producer_id, .. }
+                if producer_id == &row.producer_id =>
             {
                 KnowledgeTransportRuntimeCoverageV1::Current
             }
@@ -2439,6 +2438,13 @@ mod tests {
     #[test]
     fn every_runtime_drift_state_preserves_the_no_fallback_boundary() {
         let (mut catalog, scope, row) = coverage_fixture();
+        let row_evidence = (
+            row.accepted_generation_id.clone(),
+            row.accepted_generation_sha256.clone(),
+            row.accepted_pointer_sha256.clone(),
+            row.source_generation_id.clone(),
+            row.source_generation_sha256.clone(),
+        );
         let runtime = KnowledgeTransportCutoverRuntimeV1::from_marker(Some(
             KnowledgeTransportCutoverMarkerV1 {
                 version: MARKER_VERSION,
@@ -2474,6 +2480,76 @@ mod tests {
             assert!(actual.transport_governed());
             assert!(!actual.current());
         }
+
+        // Tolerant advancement: an accepted publication that advanced through
+        // the same producer stays current even though every pinned evidence
+        // hash now differs from the row. A different producer or a missing
+        // accepted publication still pend re-cutover.
+        let assignments = BTreeMap::from([(scope.clone(), "producer-1".to_string())]);
+        let accepted_at_row =
+            crate::accepted_publication_runtime::VerifiedAcceptedPublication::for_test(
+                &project_id(),
+                &scope,
+                &row_evidence.0,
+                &row_evidence.1,
+                &row_evidence.2,
+                crate::accepted_publication_runtime::AcceptedPublicationSourceBinding::Producer {
+                    producer_id: "producer-1".into(),
+                    source_generation_id: row_evidence.3.clone(),
+                    source_generation_sha256: row_evidence.4.clone(),
+                },
+            );
+        let current = runtime.classify_project(
+            &catalog,
+            &assignments,
+            &project_id(),
+            Some(&accepted_at_row),
+        );
+        assert_eq!(current, KnowledgeTransportRuntimeCoverageV1::Current);
+
+        let advanced = crate::accepted_publication_runtime::VerifiedAcceptedPublication::for_test(
+            &project_id(),
+            &scope,
+            &"9".repeat(64),
+            &"8".repeat(64),
+            &"7".repeat(64),
+            crate::accepted_publication_runtime::AcceptedPublicationSourceBinding::Producer {
+                producer_id: "producer-1".into(),
+                source_generation_id: format!("kps_{}", "6".repeat(64)),
+                source_generation_sha256: "5".repeat(64),
+            },
+        );
+        let after_advance =
+            runtime.classify_project(&catalog, &assignments, &project_id(), Some(&advanced));
+        assert_eq!(
+            after_advance,
+            KnowledgeTransportRuntimeCoverageV1::Current,
+            "an accepted advance through the same producer must stay current"
+        );
+
+        let foreign_producer =
+            crate::accepted_publication_runtime::VerifiedAcceptedPublication::for_test(
+                &project_id(),
+                &scope,
+                &"9".repeat(64),
+                &"8".repeat(64),
+                &"7".repeat(64),
+                crate::accepted_publication_runtime::AcceptedPublicationSourceBinding::Producer {
+                    producer_id: "producer-2".into(),
+                    source_generation_id: format!("kps_{}", "6".repeat(64)),
+                    source_generation_sha256: "5".repeat(64),
+                },
+            );
+        let foreign = runtime.classify_project(
+            &catalog,
+            &assignments,
+            &project_id(),
+            Some(&foreign_producer),
+        );
+        assert_eq!(
+            foreign,
+            KnowledgeTransportRuntimeCoverageV1::AcceptedSourcePendingRecutover
+        );
 
         catalog.projects.get_mut(&project_id()).unwrap().scope =
             ProjectScope::Published(PublishedScope::try_new("repo", "moved").unwrap());

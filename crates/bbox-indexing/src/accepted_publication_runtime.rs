@@ -372,6 +372,68 @@ pub struct VerifiedAcceptedPublication {
     binding: AcceptedPublicationBindingStamp,
 }
 
+#[cfg(test)]
+impl VerifiedAcceptedPublication {
+    /// A verified-shaped value for classifier tests: full authority stamps
+    /// over an empty content generation. Classifiers read only the stamps.
+    pub(crate) fn for_test(
+        project_id: &bbox_corpus_core::project_catalog::ProjectId,
+        scope: &bbox_corpus_core::identity::PublishedScope,
+        generation_id: &str,
+        generation_hash: &str,
+        pointer_sha256: &str,
+        source: AcceptedPublicationSourceBinding,
+    ) -> Self {
+        use crate::accepted_publication_store::{
+            AcceptedPublicationCountsV1, AcceptedPublicationGenerationV1,
+            AcceptedPublicationHashesV1, FullPublisherRef, GitObjectId, PublicationSha256,
+        };
+        let sha = || PublicationSha256::parse("0".repeat(64)).unwrap();
+        let stamp = AcceptedPublicationContentStamp {
+            project_id: project_id.clone(),
+            accepted_scope: scope.clone(),
+            full_ref: "refs/heads/main".into(),
+            accepted_commit: "f".repeat(40),
+            generation_id: generation_id.to_string(),
+            generation_hash: generation_hash.to_string(),
+        };
+        let generation = AcceptedPublicationGenerationV1 {
+            version: 1,
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            full_ref: FullPublisherRef::parse("refs/heads/main").unwrap(),
+            accepted_commit: GitObjectId::parse("f".repeat(40)).unwrap(),
+            knowledge_file_manifest: Default::default(),
+            gap_file_manifest: Default::default(),
+            normalized_knowledge: Default::default(),
+            normalized_gaps: Default::default(),
+            hashes: AcceptedPublicationHashesV1 {
+                knowledge_file_manifest_sha256: sha(),
+                gap_file_manifest_sha256: sha(),
+                normalized_knowledge_sha256: sha(),
+                normalized_gaps_sha256: sha(),
+            },
+            counts: AcceptedPublicationCountsV1 {
+                knowledge_files: 0,
+                knowledge_entries: 0,
+                gap_files: 0,
+                gap_entries: 0,
+            },
+            total_encoded_bytes: 0,
+        };
+        Self {
+            content: Arc::new(AcceptedContent { stamp, generation }),
+            binding: AcceptedPublicationBindingStamp {
+                project_id: project_id.clone(),
+                source,
+                pointer_sha256: pointer_sha256.to_string(),
+                selection: AcceptedPublicationSelection::Current,
+                accepted_scope: scope.clone(),
+            },
+        }
+    }
+}
+
 impl VerifiedAcceptedPublication {
     pub fn content_stamp(&self) -> &AcceptedPublicationContentStamp {
         &self.content.stamp

@@ -323,6 +323,17 @@ A scope migration, producer assignment change, or accepted-source binding
 change makes only the affected row pending re-cutover. It never silently
 reopens local fallback for a previously covered published project.
 
+Marker rows pin stable producer/scope authority, not an immutable evidence
+generation (the same model `1c3d334b` gave the code-source marker). An
+accepted publication that advances through the same authenticated producer
+channel stays current, because the transport is the only way content
+arrives; the pinned generation and pointer hashes remain in the row as
+cutover evidence but do not gate currency. A missing accepted publication or
+a non-producer binding still pends re-cutover. Without this, every routine
+knowledge commit on a covered project would freeze its provisional views
+until a daemon-stopping offline ceremony, which is untenable under a
+continuously running collector.
+
 ### KT-D12: Read-your-writes stays local to the writing harness
 
 The harness continues reading and writing its own `.bbox` files directly.
