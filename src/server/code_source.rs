@@ -1178,6 +1178,26 @@ async fn catalog_onboard(
         })
     })
     .await?;
+    // Promote the onboarded scope into the producer grant now that the
+    // catalog knows the project: rebuild the auth snapshot from the live
+    // config and drive the resulting activation transition. Without this the
+    // publication lanes would keep refusing the scope until a reload. Skip
+    // when this daemon does not run code collection: rebuilding auth from a
+    // collection-disabled config would replace the runtime with a disabled
+    // one.
+    if receipt.created_project || !receipt.already_attached {
+        let config = state.config.read().clone();
+        if config.code_collection.enabled {
+            let projects = state.records_provider.records_snapshot().records;
+            match state.code_sources.reload(&config, &projects) {
+                Ok(transitions) => apply_source_transitions(state.clone(), transitions),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "post-onboard auth reload failed; the scope is admitted on the next reload"
+                ),
+            }
+        }
+    }
     state.nudge_edge_index_rebuild();
     Ok((StatusCode::CREATED, Json(receipt)))
 }
