@@ -67,7 +67,7 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 
 ## OOM mitigation in progress (2026-08-11)
 
-- The continuous collector service drives per-cycle activation, edge rebuild, and embed churn the daemon never carried before; a full reindex on top OOMKilled the pod at the 24Gi limit (three kills). The limit is raised to 48Gi (cage commit `299b607`, monkey has ~90Gi free) as mitigation while the peak composition is instrumented. A memory watch samples the pod across collector cycles.
+- The continuous collector service drives per-cycle activation, edge rebuild, and embed churn the daemon never carried before; a full reindex on top OOMKilled the pod at the 24Gi limit (three kills). The limit is raised to 48Gi (cage commit `299b607`). Follow-up measurement (lgtm prometheus, current image): the working set oscillates in a 36-39Gi band with real dips, not a monotonic leak; the earlier 22.5Gi reading was a different pod on a different image and the doubling comparison was invalid. The band composition is the legitimate working set (EdgeIndex graph, tantivy reader, three loaded vector partitions, session-pinned read views). An hourly tripwire checks the ceiling against the 48Gi cap until the question closes.
 - Known minor wrinkles: pg-tools' active generation still carries the one-file sentinel proof (the cleanup re-upload mapped to an older generation id and did not re-activate; self-heals on the next real pg-tools change), and the 30-second checkout-reconciliation loop warns for collector-onboarded projects it cannot rediscover (cosmetic; rediscovery probing should skip collector-onboarded attachments).
 
 ## Residual sweep (2026-08-11)
