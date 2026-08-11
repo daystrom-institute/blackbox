@@ -80,7 +80,8 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 - **Git current-file overlay unavailable (20 projects)**: REAL feature gap, not noise. The overlay validates only against a local git root at index time; a cage daemon has none, so transport-governed projects never validate it. Kept as an honest warning. Needs a transport-backed overlay design slice.
 - **transcript-search git history** flagged `failed_last_refresh` / activation-journal disagreement during the post-restart warmup window (retries deferred on vector-store warmup), then the typed activation committed at 01:57. Confirming clearance on the next cycle.
 - **pg-flare freshness** warning is its first-cycle state; its git-history activation lands on collector cycles after the grant promotion.
-- Unchanged and known: 87 pre-existing unresolved inbox notes and 4 failed dispatch tasks (documented causes: provider usage limit, ceremony-window victims).
+- transcript-search git history recovered through the warmup window: the typed activation committed at 01:57, the action-level items cleared on the next doctor, and the repo history now reads as recovering ("lagging: head could not be compared against the recorded cursor"), which resolves as refresh cycles land. pg-flare's git-history activation is committed (20 activations across 20 projects).
+- Sweep end state: one action finding remains (the visual embedding partition, whose remedy is the operator-scheduled embed-compaction-arc workflow). Warn-level remainders are the honest ones: the current-file-overlay feature gap (needs a transport-backed design slice), the by-design big-graph refresh deferral, the historical degraded-operations counter, and the two pre-existing attention items. Daemon stable at 48Gi with zero restarts since the limit change; collector cycles clean over the TLS ingress.
 
 
 
