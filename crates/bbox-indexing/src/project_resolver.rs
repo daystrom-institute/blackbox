@@ -23,7 +23,7 @@
 //! [`resolve_attached`]: ProjectResolverEngine::resolve_attached
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bbox_corpus_core::project_catalog::{
     AttachmentKind, AttachmentSnapshotV1, AttachmentStatus, CatalogSnapshotV2, CheckoutAttachment,
@@ -277,9 +277,14 @@ fn v2_resolve(
     if !path.is_absolute() {
         return miss(req, raw);
     }
-    let Ok(canonical) = fs::canonicalize(path) else {
-        return miss(req, raw);
-    };
+    // Canonicalize against the local filesystem when possible. A daemon
+    // with zero checkout authority (the cage deployment) cannot stat
+    // checkout-host paths at all, so fall back to lexical normalization:
+    // attachment dirs are recorded canonical on their own host, and the
+    // fallback only activates when the path does not exist locally, which
+    // leaves bridge/local behavior unchanged.
+    let canonical =
+        fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize_selector_path(path));
     let selected = v2_path_attachment(attachments, &canonical)?;
     let Some(attachment) = selected else {
         return miss(req, raw);
@@ -292,6 +297,25 @@ fn v2_resolve(
         return miss(req, raw);
     }
     v2_attached_outcome(catalog, attachments, attachment)
+}
+
+/// Symlink-free normalization for selector paths that live on a remote
+/// checkout host and cannot be stat'ed locally: resolves `.` and `..`
+/// lexically and drops redundant separators. Never resolves symlinks; the
+/// recorded attachment dirs it matches against are canonical on their own
+/// host.
+fn lexical_normalize_selector_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Exact match on active `checkout_project_dir`, then deepest containing
@@ -917,6 +941,51 @@ mod tests {
         };
         let err = engine.resolve(&unknown).expect_err("unowned scope");
         assert_eq!(err.code(), "error.project_scope_unknown");
+    }
+
+    #[test]
+    fn v2_path_arms_resolve_without_local_fs_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Deliberately skip make_dirs: the selector paths cannot be
+        // canonicalized locally, which is the permanent shape on a
+        // zero-checkout-authority daemon. Attachment dirs are recorded
+        // canonical on the checkout host, so the lexical fallback must
+        // still resolve them.
+        let fx = v2_fixture(&root);
+        let engine = ProjectResolverEngine::v2(&fx.catalog, &fx.attachments);
+
+        let outcome = engine
+            .resolve(&selection(
+                root.join("solo").to_str().unwrap(),
+                ResolveIntent::Read,
+            ))
+            .unwrap();
+        assert_eq!(
+            outcome.project_id(),
+            Some("p_0000000000000000000000000000solo")
+        );
+
+        // Lexical normalization handles non-canonical spellings, then
+        // deepest-containment still applies.
+        let outcome = engine
+            .resolve(&selection(
+                root.join("multi-base/../multi-wt/deep").to_str().unwrap(),
+                ResolveIntent::Read,
+            ))
+            .unwrap();
+        assert_eq!(
+            outcome.project_id(),
+            Some("p_000000000000000000000000000multi")
+        );
+
+        // Unknown absolute paths still manufacture nothing.
+        let outcome = engine
+            .resolve(&ProjectSelectorRequest::filter(
+                root.join("never-attached").to_str().unwrap(),
+            ))
+            .unwrap();
+        assert!(matches!(outcome, ProjectResolution::LiteralFilter { .. }));
     }
 
     #[test]
