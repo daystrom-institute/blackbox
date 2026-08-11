@@ -70,6 +70,18 @@ Commit `e0c260bd15bd` is pushed and addresses both live validation defects:
 - The continuous collector service drives per-cycle activation, edge rebuild, and embed churn the daemon never carried before; a full reindex on top OOMKilled the pod at the 24Gi limit (three kills). The limit is raised to 48Gi (cage commit `299b607`, monkey has ~90Gi free) as mitigation while the peak composition is instrumented. A memory watch samples the pod across collector cycles.
 - Known minor wrinkles: pg-tools' active generation still carries the one-file sentinel proof (the cleanup re-upload mapped to an older generation id and did not re-activate; self-heals on the next real pg-tools change), and the 30-second checkout-reconciliation loop warns for collector-onboarded projects it cannot rediscover (cosmetic; rediscovery probing should skip collector-onboarded attachments).
 
+## Residual sweep (2026-08-11)
+
+- **OOM analysis**: the memory watch shows warm steady state at ~22.5Gi (one-time warmup cost on the first post-boot EdgeIndex rebuild, then flat across later rebuilds). The 24Gi OOM kills came from full-reindex transients on top of warm state, not an unbounded leak. The 48Gi limit covers it; watch restart counts across cycles before calling it closed.
+- **Knowledge re-cutover rerun**: the morning's ceremony at 16:10 preceded the final 18:07 convergence, leaving 14 rows stale; a second ceremony on 2026-08-11 restamped all 20 projects (pg-flare included after its PublishedGaps view was exercised; its first preflight refusal was that evidence gap). Marker checksum `2763503933b0fe6f6881f789553be34e5001f4a018c10ee62032edfd85283a90`, 20/20 covered and current, daemon restored. Operational reality recorded: every accepted-knowledge advance on a covered project requires a re-cutover ceremony, which is heavy for a continuously-collected estate; whether the knowledge marker needs the code-source marker's tolerant-advance model is an open design question for the operator.
+- **Doctor noise fixed in code** (`9954aabc974e`, cluster-verified, deployed as `79ef7a6a...`): path-existence checks skipped under catalog authority, transport-governed freshness and quiet-repo generation age demoted to info, and the zero-local-registration artifact watcher reported as one process-level info instead of 20 warnings.
+- **Ghost record removed**: the v1-orphan health record for `14b75965` (2026-08-05, no catalog project) was removed from the admin pod with an audit copy under `state/cutover-artifacts/`.
+- **Visual embedding partition**: 6.66% zero-in-degree on `voyage_visual`; the named remedy is the embed-compaction-arc workflow. A backfill refill was started; the full arc is operator-scheduled work, not fired unilaterally.
+- **Git current-file overlay unavailable (20 projects)**: REAL feature gap, not noise. The overlay validates only against a local git root at index time; a cage daemon has none, so transport-governed projects never validate it. Kept as an honest warning. Needs a transport-backed overlay design slice.
+- **transcript-search git history** flagged `failed_last_refresh` / activation-journal disagreement during the post-restart warmup window (retries deferred on vector-store warmup), then the typed activation committed at 01:57. Confirming clearance on the next cycle.
+- **pg-flare freshness** warning is its first-cycle state; its git-history activation lands on collector cycles after the grant promotion.
+- Unchanged and known: 87 pre-existing unresolved inbox notes and 4 failed dispatch tasks (documented causes: provider usage limit, ceremony-window victims).
+
 
 
 
