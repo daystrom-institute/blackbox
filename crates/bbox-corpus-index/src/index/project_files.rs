@@ -1578,15 +1578,27 @@ fn index_active_collected_project(
         }
         stats
     } else {
-        if let Err(error) = store.record_health_failure(
-            project_id,
-            "git_history_unavailable",
-            "active code generation has no validated GitHistory attachment",
-        ) {
+        // In catalog record mode the Git lane is transport-owned: there is
+        // no local git root by design (the cage daemon holds no checkouts),
+        // so "no validated attachment" is the steady state, not a
+        // degradation, and the transport lane's own health records carry any
+        // real failure. Clear the stale record from same-host catalog
+        // deployments instead of re-recording it on every pass.
+        let record_result =
+            if store.record_mode() == bbox_code_source_store::RuntimeRecordMode::CatalogV2 {
+                store.clear_health_failure(project_id, "git_history_unavailable")
+            } else {
+                store.record_health_failure(
+                    project_id,
+                    "git_history_unavailable",
+                    "active code generation has no validated GitHistory attachment",
+                )
+            };
+        if let Err(error) = record_result {
             tracing::warn!(
                 project_id = %project_id,
                 error = %error,
-                "failed to persist GitHistory degradation record"
+                "failed to update GitHistory degradation record"
             );
         }
         super::git_history::GitIndexStats::default()
