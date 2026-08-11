@@ -1348,6 +1348,27 @@ impl Partition {
                 ..VectorDeleteBatchResult::default()
             });
         }
+        let requested = entity_ids.len();
+        // Fan-out callers (`delete_entities_all_routes`) fire every entity
+        // id at every route, so most ids a partition sees belong to other
+        // routes' buckets. A tombstone for an entity this partition does
+        // not hold is pure WAL churn: the in-memory projection is a no-op,
+        // and replay can never diverge because the slab always reflects the
+        // full WAL after open (snapshot restore replays the tail). Filter
+        // to ids with an active entry first so foreign-id batches append
+        // nothing.
+        let entity_ids = entity_ids
+            .into_iter()
+            .filter(|entity_id| self.slab.has_active(entity_id))
+            .collect::<Vec<_>>();
+        if entity_ids.is_empty() {
+            return Ok(VectorDeleteBatchResult {
+                requested,
+                already_absent: requested,
+                checkpointed: true,
+                ..VectorDeleteBatchResult::default()
+            });
+        }
         let records = entity_ids
             .iter()
             .map(|entity_id| WalRecord::delete(&self.route, entity_id))
@@ -1396,10 +1417,10 @@ impl Partition {
         checkpoint_result?;
 
         Ok(VectorDeleteBatchResult {
-            requested: entity_ids.len(),
+            requested,
             tombstones_appended: records.len(),
             active_removed,
-            already_absent: entity_ids.len().saturating_sub(active_removed),
+            already_absent: requested.saturating_sub(active_removed),
             checkpointed: true,
         })
     }
@@ -2299,7 +2320,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.requested, 3);
-        assert_eq!(result.tombstones_appended, 3);
+        assert_eq!(result.tombstones_appended, 2);
         assert_eq!(result.active_removed, 2);
         assert_eq!(result.already_absent, 1);
         assert!(result.checkpointed);
@@ -2316,18 +2337,18 @@ mod tests {
 
         let records = wal::read_all(&tmp.path().join("voyage-1024").join("records.wal"))
             .expect("WAL should read");
-        assert_eq!(records.len(), 6);
+        assert_eq!(records.len(), 5);
         assert_eq!(
             records
                 .iter()
                 .filter(|row| row.deleted_at.is_some())
                 .count(),
-            3
+            2
         );
     }
 
     #[test]
-    fn all_absent_batch_still_persists_unconditional_tombstones() {
+    fn all_absent_batch_appends_no_tombstones() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
         store
@@ -2336,6 +2357,8 @@ mod tests {
         let result = store
             .delete_batch("voyage-1024", &["absent-a".into(), "absent-b".into()])
             .unwrap();
+        assert_eq!(result.requested, 2);
+        assert_eq!(result.tombstones_appended, 0);
         assert_eq!(result.active_removed, 0);
         assert_eq!(result.already_absent, 2);
         assert!(result.checkpointed);
@@ -2343,7 +2366,10 @@ mod tests {
         drop(store);
         let restored = VectorStore::open(tmp.path()).unwrap();
         let metrics = restored.metrics().remove("voyage-1024").unwrap();
-        assert_eq!(metrics.wal_records, 3);
+        assert_eq!(
+            metrics.wal_records, 1,
+            "absent-entity deletes must not grow the WAL"
+        );
         assert_eq!(metrics.active_count, 1);
     }
 
@@ -2364,12 +2390,16 @@ mod tests {
         assert_eq!(result.routes.len(), 2);
         for route in result.routes {
             assert_eq!(route.requested, 513);
-            assert_eq!(route.tombstones_appended, 513);
+            assert_eq!(route.tombstones_appended, 1);
             assert_eq!(route.active_removed, 1);
             assert_eq!(route.already_absent, 512);
             assert_eq!(route.chunks_completed, 2);
             let wal = wal::read_all(&tmp.path().join(route.route).join("records.wal")).unwrap();
-            assert_eq!(wal.len(), 514);
+            assert_eq!(
+                wal.len(),
+                2,
+                "only the present entity earns a tombstone record"
+            );
         }
     }
 

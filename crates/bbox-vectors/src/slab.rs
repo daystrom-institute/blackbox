@@ -161,6 +161,13 @@ impl VectorSlab {
         Ok(true)
     }
 
+    /// True when `entity_id` currently holds an active entry. Builds the
+    /// active index lazily on first use, matching `delete`.
+    pub fn has_active(&mut self, entity_id: &str) -> bool {
+        self.ensure_index_built();
+        self.active_index.contains_key(entity_id)
+    }
+
     pub fn delete(&mut self, entity_id: &str) -> bool {
         self.ensure_index_built();
         match self.active_index.remove(entity_id) {
