@@ -471,7 +471,10 @@ pub struct GapListParams {
     /// Filter by resolution: unresolved, acknowledged, addressed.
     #[serde(default)]
     pub resolution: Option<String>,
-    /// Filter by project substring.
+    /// Restrict to one project's gaps. Accepts an absolute project path
+    /// (e.g. `/home/user/repos/my-app`), a project_id, or a registered
+    /// project alias; an unresolvable value keeps literal substring-filter
+    /// semantics.
     #[serde(default)]
     pub project: Option<String>,
     /// Provisional visibility policy: published, own, or all.

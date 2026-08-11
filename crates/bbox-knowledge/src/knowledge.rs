@@ -112,6 +112,11 @@ pub struct KnowledgeListParams {
     pub category: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+    /// Restrict to one project's entries. Accepts an absolute project path
+    /// (e.g. `/home/user/repos/my-app`), a project_id, or a registered
+    /// project alias (declared in the repo's `.bbox/config.toml`
+    /// `[project] aliases`). An unresolvable value keeps literal
+    /// substring-filter semantics and notes the miss in diagnostics.
     #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
