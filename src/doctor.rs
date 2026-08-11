@@ -589,6 +589,20 @@ fn artifact_watcher_section(
     }
     for status in statuses {
         registered += status.watcher.registered_attachments.len();
+    }
+    if registered == 0 {
+        // The cage signature: a watcher runs, but every capable attachment
+        // lives on another host, so nothing local can register. One
+        // process-level note instead of a warning per project. A partial
+        // registration set still reports per project below.
+        return SectionReport {
+            section: "artifact_watcher",
+            findings: vec![Finding::info(
+                "artifact watcher has zero local registrations; every capable attachment lives on another host",
+            )],
+        };
+    }
+    for status in statuses {
         if status.watcher.capable_but_unregistered.is_empty() {
             continue;
         }
@@ -1009,11 +1023,22 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                     .checked_div(3_600)
                     .unwrap_or_default();
                 if age_hours >= stale_hours {
-                    findings.push(Finding::warn(format!(
+                    // Transport-governed projects get fresh generations from
+                    // the collector, not from local probing, so a quiet repo's
+                    // generation age is content age, not pipeline staleness.
+                    let governed = state
+                        .git_transport_governs_project(activation.project_id())
+                        .unwrap_or(false);
+                    let message = format!(
                         "project `{}` collected generation is {} hours old",
                         activation.project_id(),
                         age_hours
-                    )));
+                    );
+                    findings.push(if governed {
+                        Finding::info(message)
+                    } else {
+                        Finding::warn(message)
+                    });
                 } else if generation.state() == bbox_code_source::GenerationState::Active {
                     findings.push(Finding::ok(format!(
                         "project `{}` collected generation active ({} files, {} bytes, age {}h)",
@@ -1035,7 +1060,9 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                         .git_transport_governs_project(&project.project_id)
                         .unwrap_or(true)
                     {
-                        findings.push(Finding::warn(format!(
+                        // Transport-governed freshness is the designed steady
+                        // state, not a warning: the collector owns it.
+                        findings.push(Finding::info(format!(
                             "project `{}` Git-history freshness is governed by producer transport; checkout freshness probing is disabled",
                             activation.project_id(),
                         )));
@@ -1486,7 +1513,15 @@ fn projects_section(state: &crate::server::state::SharedState) -> SectionReport 
     let records = state.records_provider.records_snapshot().records;
     let mut findings = Vec::new();
     let mut present = 0usize;
+    // Catalog authority with no local attachments means this daemon holds no
+    // checkouts at all (the cage topology): a path-existence check is
+    // meaningless here, not a per-project warning.
+    let paths_meaningful = state.project_authority.is_bridge();
     for record in records.iter() {
+        if !paths_meaningful {
+            present += 1;
+            continue;
+        }
         if std::path::Path::new(&record.canonical_path).exists() {
             present += 1;
         } else {
