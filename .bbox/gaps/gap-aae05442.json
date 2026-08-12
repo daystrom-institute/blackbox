@@ -14,8 +14,10 @@
   "impact": "medium",
   "blocking_level": "blocks_task",
   "dedupe_key": "tooling/knowledge-source/workspace-binding-operator-issuance",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-12T18:55:55Z",
-  "updated_at": "2026-08-12T18:55:55Z"
+  "updated_at": "2026-08-12T23:00:00Z",
+  "resolution_note": "Operator mint shipped and folded to beta/blackbox-v2 (feat/workspace-binding-mint @ e2e1f5cc, verify bbox-verify-hv7n6): POST /admin/workspace-binding/mint plus bro workspace-binding mint. The managed spawn path's binding machinery was hoisted into shared free functions and reused verbatim (no second token model); operator leases key on the workspace id so re-minting replaces prior bindings. Verification is identity-based per the ownership ratchet: registered scope, live attachment, workspace id matching the recorded checkout identity; the declared path is honest unverified context. Absent from the MCP catalog by construction and by test. E2E proves mint, real WorkspaceCaptureClient capture, and own-visibility reads over uncommitted graph state invisible to the published lane. Runbook documents the flow.",
+  "resolved_at": "2026-08-12T23:00:00Z"
 }
