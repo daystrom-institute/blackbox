@@ -280,6 +280,27 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "bbox_project_graph_list",
+        category: ToolCategory::Graph,
+        summary: "List accepted and visible provisional reflective project graphs. visibility accepts published, own, or all and defaults to own only with authoritative checkout context.",
+        when_to_use: "Use before exact graph reads to discover graph ids and per-generation validity. Own is the default only when the MCP session has authoritative checkout context; all is always explicit.",
+        example: Some(r#"bbox_project_graph_list(project="d723917f", visibility="published")"#),
+    },
+    ToolDoc {
+        name: "bbox_project_graph_describe",
+        category: ToolCategory::Graph,
+        summary: "Describe one reflective project graph generation, including descriptor, schema, validity, source, checkout label, and generation identity.",
+        when_to_use: "Use for descriptor, schema, source, checkout label, counts, and generation identity before inspecting exact vertex refs.",
+        example: Some(r#"bbox_project_graph_describe(project="d723917f", graph_id="governance-record", visibility="own")"#),
+    },
+    ToolDoc {
+        name: "bbox_project_graph_validate",
+        category: ToolCategory::Graph,
+        summary: "Report validity for one visible reflective project graph. Invalid provisional graphs remain visible with stable kernel error codes, file names, line numbers, and messages.",
+        when_to_use: "Use to inspect file, line, stable code, and message diagnostics. Invalid provisional graphs remain graph-local and never fall back to the published copy in own mode.",
+        example: Some(r#"bbox_project_graph_validate(project="d723917f", graph_id="governance-record", visibility="own")"#),
+    },
+    ToolDoc {
         name: "bbox_describe_schema",
         category: ToolCategory::Graph,
         summary: "Catalog agentic-corpus entity types and edge families. Default is compact orientation for grounding: graph vocabulary, filterable fields, population counts, and traversal tips without the installed-agent catalog. Pass include_agents=true or mode=\"full\" only when you need installed-agent discovery.",

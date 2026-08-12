@@ -16,6 +16,9 @@ const RENDERED_TEXT_CAP_BYTES: usize = 30 * 1024;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindPathsParams {
     pub from: String,
+    /// Project graph visibility policy: published, own, or all.
+    #[serde(default)]
+    pub provisional: Option<String>,
     pub to: Option<String>,
     pub to_type: Option<String>,
     pub edge_types: Option<EdgeTypesParam>,
@@ -42,14 +45,18 @@ pub fn find_paths(
     edge_index: &EdgeIndex,
     cache: &mut PathCache,
 ) -> Result<String> {
-    let from = match EntityRef::parse(&p.from) {
+    let mut from = match EntityRef::parse(&p.from) {
         Ok(from) => from,
         Err(err) => return Ok(bad_input("from", err.to_string())),
     };
-    let to = match p.to.as_deref().map(EntityRef::parse).transpose() {
+    let mut to = match p.to.as_deref().map(EntityRef::parse).transpose() {
         Ok(to) => to,
         Err(err) => return Ok(bad_input("to", err.to_string())),
     };
+    from = canonical_graph_ref(ctx, from)?;
+    if let Some(target) = to.take() {
+        to = Some(canonical_graph_ref(ctx, target)?);
+    }
     let to_type = if let Some(raw) = p.to_type.as_deref() {
         match EntityType::from_prefix(raw) {
             Some(to_type) => Some(to_type),
@@ -74,6 +81,7 @@ pub fn find_paths(
     // of breadth across other files reachable in the same step budget.
     let raw_limit = limit.saturating_mul(8).max(20);
     let raw = bfs(
+        ctx,
         edge_index,
         from,
         to.as_ref(),
@@ -85,6 +93,18 @@ pub fn find_paths(
     let collapsed = collapse_paths_by_terminal_file(raw, limit);
     let cached = cache.insert_paths(PROCESS_SESSION_KEY, collapsed);
     Ok(render_response(ctx, &cached))
+}
+
+fn canonical_graph_ref(ctx: &ProviderContext<'_>, r: EntityRef) -> Result<EntityRef> {
+    if matches!(
+        r.entity_type(),
+        EntityType::ProjectGraphVertex | EntityType::ProvisionalProjectGraphVertex
+    ) {
+        let entity = bbox_providers::entity_loader::load(ctx, &r)?;
+        Ok(EntityRef::parse(&entity.ref_string)?)
+    } else {
+        Ok(r)
+    }
 }
 
 /// Collapses paths whose terminal step lands on a different chunk of the
@@ -128,6 +148,7 @@ fn path_terminal_file_key(entity: &EntityRef) -> Option<String> {
 }
 
 fn bfs(
+    ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
     from: EntityRef,
     to: Option<&EntityRef>,
@@ -149,7 +170,7 @@ fn bfs(
         if entry.steps.len() >= max_depth {
             continue;
         }
-        for (edge_kind, direction, next) in expansions(edge_index, &entry.current, edge_filter) {
+        for (edge_kind, direction, next) in expansions(ctx, edge_index, &entry.current, edge_filter) {
             if entry.visited.contains(&next) {
                 continue;
             }
@@ -181,11 +202,30 @@ fn bfs(
 }
 
 fn expansions(
+    ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
     current: &EntityRef,
     edge_filter: Option<&HashSet<String>>,
 ) -> Vec<(String, PathDirection, EntityRef)> {
     let mut out = Vec::new();
+    if matches!(
+        current.entity_type(),
+        EntityType::ProjectGraphVertex | EntityType::ProvisionalProjectGraphVertex
+    ) {
+        if let Ok(entity) = bbox_providers::entity_loader::load(ctx, current) {
+            for edge in entity.neighborhood.forward {
+                if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
+                    out.push((edge.kind, PathDirection::Out, edge.target));
+                }
+            }
+            for edge in entity.neighborhood.reverse {
+                if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
+                    out.push((edge.kind, PathDirection::In, edge.source));
+                }
+            }
+        }
+        return out;
+    }
     // forward_edges_with_synthesis surfaces the transcript -> session
     // IN_SESSION edge at query time (see its doc comment on EdgeIndex) so a
     // transcript ref is reachable to its session even without a materialized
@@ -313,7 +353,8 @@ mod tests {
             project_id: None,
         };
         let index = EdgeIndex::from_edges_for_tests(vec![edge]);
-        let paths = bfs(&index, a, Some(&b), None, None, 3, 5);
+        let ctx = ProviderContext::empty_for_tests();
+        let paths = bfs(&ctx, &index, a, Some(&b), None, None, 3, 5);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0][0].direction, PathDirection::Out);
     }
@@ -326,8 +367,18 @@ mod tests {
         let transcript = EntityRef::parse("transcript:claude:sess-1:42:0").unwrap();
         let session = EntityRef::parse("session:claude:sess-1").unwrap();
         let index = EdgeIndex::default();
+        let ctx = ProviderContext::empty_for_tests();
 
-        let paths = bfs(&index, transcript.clone(), Some(&session), None, None, 3, 5);
+        let paths = bfs(
+            &ctx,
+            &index,
+            transcript.clone(),
+            Some(&session),
+            None,
+            None,
+            3,
+            5,
+        );
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].len(), 1);
         assert_eq!(paths[0][0].edge_kind, "IN_SESSION");
@@ -337,6 +388,7 @@ mod tests {
         // Reachable by to_type too (mirrors the max-depth/limit-boundary
         // traversal an agent would actually run).
         let by_type = bfs(
+            &ctx,
             &index,
             transcript,
             None,

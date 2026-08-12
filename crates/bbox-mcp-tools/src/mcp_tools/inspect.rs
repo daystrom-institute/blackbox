@@ -142,9 +142,23 @@ pub fn inspect_entity(
         Err(error) if error.to_string().starts_with("error.checkout_access.") => {
             return Err(error);
         }
+        Err(error) if error.to_string().starts_with("error.project_graph_")
+            || error.to_string().starts_with("error.not_found: project graph") =>
+        {
+            return Err(error);
+        }
         Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
     };
-    let full_neighborhood = full_neighborhood(edge_index, r);
+    let canonical_ref = EntityRef::parse(&entity.ref_string).unwrap_or_else(|_| r.clone());
+    let full_neighborhood = if matches!(
+        r.entity_type(),
+        bbox_corpus_core::entity_ref::EntityType::ProjectGraphVertex
+            | bbox_corpus_core::entity_ref::EntityType::ProvisionalProjectGraphVertex
+    ) {
+        entity.neighborhood.clone()
+    } else {
+        full_neighborhood(edge_index, r)
+    };
     entity.neighborhood = filtered_neighborhood(
         &full_neighborhood,
         direction,
@@ -181,7 +195,7 @@ pub fn inspect_entity(
     let properties = render_properties(&entity, property_mode);
     let text = render_text(InspectText {
         ctx,
-        r,
+        r: &canonical_ref,
         entity: &entity,
         properties: &properties,
         forward: &rendered_forward,
@@ -203,8 +217,8 @@ pub fn inspect_entity(
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "text": text,
-        "entity_ref": r.to_string(),
-        "entity_type": r.entity_type().as_str(),
+        "entity_ref": canonical_ref.to_string(),
+        "entity_type": canonical_ref.entity_type().as_str(),
         "properties": properties,
         "edges": {
             "out": rendered_forward,
