@@ -351,6 +351,12 @@ impl BlackboxServer {
             if !matches!(p.action.as_deref().unwrap_or("list"), "approve" | "reject") {
                 return server.review_session_knowledge(&p);
             }
+            if let Some(text) = server.enqueue_review_via_checkout_owner(
+                p.action.as_deref().unwrap_or("list"),
+                p.id.as_deref().unwrap_or_default(),
+            )? {
+                return Ok(text);
+            }
             let target =
                 server.prepare_existing_knowledge_mutation(p.id.as_deref().unwrap_or_default())?;
             p.id = Some(target.id.clone());

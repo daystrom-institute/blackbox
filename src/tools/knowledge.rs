@@ -424,9 +424,204 @@ impl BlackboxServer {
         }
     }
 
+    /// Id-addressed coverage lookup for knowledge mutations that carry no
+    /// project selector (forget, review, link, learn-by-id): the served
+    /// entry's stamped project id decides. Entries the published view does
+    /// not serve fall through to the store path unchanged.
+    fn covered_knowledge_entry_scope(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<
+        Option<(
+            crate::knowledge::KnowledgeEntry,
+            String,
+            bbox_corpus_core::identity::PublishedScope,
+        )>,
+    > {
+        let id = id.strip_prefix("knowledge:").unwrap_or(id);
+        let view = self.session_knowledge_view(None, None)?;
+        let Some(entry) = view
+            .knowledge
+            .all_entries()
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(project_id) = entry.project_id.clone() else {
+            return Ok(None);
+        };
+        let Some(scope) = self.covered_scope_for_project_id(&project_id) else {
+            return Ok(None);
+        };
+        Ok(Some((entry, project_id, scope)))
+    }
+
+    /// Apply a learn write's field patch to a served entry (the store's
+    /// update-branch semantics).
+    fn patch_entry_from_learn(
+        &self,
+        entry: &mut crate::knowledge::KnowledgeEntry,
+        p: &LearnParams,
+    ) -> anyhow::Result<()> {
+        let category = p
+            .category
+            .parse::<crate::knowledge::Category>()
+            .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
+        entry.content = p.content.clone();
+        entry.cluster = p
+            .cluster
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        entry.title = Self::checkout_lane_title(&p.content, &p.title);
+        entry.category = category;
+        entry.priority = Self::checkout_lane_priority(p.priority.as_deref())?;
+        entry.weight = p.weight.unwrap_or(100);
+        entry.providers = p.providers.clone().unwrap_or_default();
+        entry.updated_at = bbox_util::util::now_iso();
+        if let Some(exp) = p.expires_at.clone() {
+            entry.expires_at = Some(exp);
+        }
+        Ok(())
+    }
+
+    /// Covered-project learn update addressed purely by id (no project
+    /// selector): coverage comes from the served entry itself.
+    fn enqueue_learn_update_by_id_via_checkout_owner(
+        &self,
+        p: &LearnParams,
+        id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)?
+        else {
+            return Ok(None);
+        };
+        self.patch_entry_from_learn(&mut entry, p)?;
+        let delivery = self.enqueue_knowledge_entry(
+            &project_id,
+            scope,
+            &entry,
+            "write",
+            &format!("bbox_learn update (project_id={project_id})"),
+        )?;
+        Ok(Some((
+            format!(
+                "Updated entry {} via the checkout-owner lane ({delivery})",
+                entry.id
+            ),
+            entry.id.clone(),
+        )))
+    }
+
+    /// Covered-project review (approve/reject), id-addressed.
+    pub(crate) fn enqueue_review_via_checkout_owner(
+        &self,
+        action: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)?
+        else {
+            return Ok(None);
+        };
+        entry.updated_at = bbox_util::util::now_iso();
+        match action {
+            "approve" => {
+                entry.approval = crate::knowledge::Approval::UserConfirmed;
+                let delivery = self.enqueue_knowledge_entry(
+                    &project_id,
+                    scope,
+                    &entry,
+                    "write",
+                    &format!("bbox_review approve (project_id={project_id})"),
+                )?;
+                Ok(Some(format!(
+                    "Approved entry {} via the checkout-owner lane ({delivery})",
+                    entry.id
+                )))
+            }
+            "reject" => {
+                entry.status = crate::knowledge::Status::Deleted;
+                let delivery = self.enqueue_knowledge_entry(
+                    &project_id,
+                    scope,
+                    &entry,
+                    "delete",
+                    &format!("bbox_review reject (project_id={project_id})"),
+                )?;
+                Ok(Some(format!(
+                    "Rejected entry {} via the checkout-owner lane ({delivery})",
+                    entry.id
+                )))
+            }
+            other => anyhow::bail!("unknown review action {other}"),
+        }
+    }
+
+    /// Covered-project knowledge link: append the edge to the served
+    /// source entry and enqueue its rewrite.
+    fn enqueue_link_via_checkout_owner(
+        &self,
+        p: &KnowledgeLinkParams,
+    ) -> anyhow::Result<Option<String>> {
+        let source_id = match bbox_corpus_core::entity_ref::EntityRef::parse(&p.source) {
+            Ok(bbox_corpus_core::entity_ref::EntityRef::Knowledge { id }) => id,
+            Ok(other) => anyhow::bail!("source must be a knowledge ref, got {other}"),
+            Err(_) => p.source.trim_start_matches("knowledge:").to_string(),
+        };
+        let Some((mut entry, project_id, scope)) =
+            self.covered_knowledge_entry_scope(&source_id)?
+        else {
+            return Ok(None);
+        };
+        bbox_corpus_core::entity_ref::EntityRef::parse(&p.target)
+            .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
+        let kind = crate::knowledge::KnowledgeEdgeKind::parse(&p.kind)?;
+        let confidence = match p.confidence.as_deref().unwrap_or("heuristic") {
+            "exact" | "Exact" | "EXACT" => crate::knowledge::EdgeConfidence::Exact,
+            "heuristic" | "Heuristic" | "HEURISTIC" => crate::knowledge::EdgeConfidence::Heuristic,
+            "unknown" | "Unknown" | "UNKNOWN" => crate::knowledge::EdgeConfidence::Unknown,
+            other => anyhow::bail!(
+                "invalid edge confidence '{other}' (expected exact, heuristic, or unknown)"
+            ),
+        };
+        let edge = crate::knowledge::KnowledgeEdge {
+            target: p.target.clone(),
+            kind,
+            note: p.note.clone(),
+            source_arc: p.source_arc.clone(),
+            confidence,
+        };
+        let duplicate = entry.links.iter().any(|existing| {
+            existing.target == edge.target
+                && existing.kind == edge.kind
+                && existing.source_arc == edge.source_arc
+        });
+        if duplicate {
+            return Ok(Some(format!(
+                "Link already present on {} (same target, kind, and arc)",
+                entry.id
+            )));
+        }
+        entry.links.push(edge);
+        entry.updated_at = bbox_util::util::now_iso();
+        let delivery = self.enqueue_knowledge_entry(
+            &project_id,
+            scope,
+            &entry,
+            "write",
+            &format!("bbox_knowledge_link (project_id={project_id})"),
+        )?;
+        Ok(Some(format!(
+            "Linked {} -> {} via the checkout-owner lane ({delivery})",
+            entry.id, p.target
+        )))
+    }
+
     /// Covered-project learn: create or update through the checkout-owner
-    /// backchannel, mirroring the store's field semantics. None = project
-    /// not covered; the caller takes the local-carrier path.
+    /// backchannel, mirroring the store's field semantics.
     fn enqueue_learn_via_checkout_owner(
         &self,
         p: &LearnParams,
@@ -451,17 +646,7 @@ impl BlackboxServer {
         let now = bbox_util::util::now_iso();
         if let Some(id) = p.id.as_deref() {
             let mut entry = self.served_knowledge_entry(raw, id)?;
-            entry.content = p.content.clone();
-            entry.cluster = cluster;
-            entry.title = title;
-            entry.category = category;
-            entry.priority = priority;
-            entry.weight = weight;
-            entry.providers = providers;
-            entry.updated_at = now;
-            if let Some(exp) = p.expires_at.clone() {
-                entry.expires_at = Some(exp);
-            }
+            self.patch_entry_from_learn(&mut entry, p)?;
             let delivery = self.enqueue_knowledge_entry(
                 project_id,
                 scope,
@@ -1082,6 +1267,26 @@ impl BlackboxServer {
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
+            // Update-by-id without an explicit project selector: coverage
+            // comes from the served entry itself.
+            if p.project.as_deref().is_none_or(|s| s.trim().is_empty())
+                && let Some(existing_ref) = p.id.as_deref()
+                && let Some((message, entry_id)) =
+                    server.enqueue_learn_update_by_id_via_checkout_owner(&p, existing_ref)?
+            {
+                return Ok::<_, anyhow::Error>((
+                    crate::knowledge::LearnWriteResult {
+                        id: entry_id,
+                        action: "updated".to_string(),
+                        rendered: false,
+                        render_pending: true,
+                        summary: None,
+                        message,
+                    },
+                    None,
+                    true,
+                ));
+            }
             let update = match p.id.as_deref() {
                 Some(existing_ref) => {
                     let existing = server.prepare_existing_knowledge_mutation(existing_ref)?;
@@ -1549,6 +1754,9 @@ impl BlackboxServer {
         let server = self.clone();
         let write_result = tokio::task::spawn_blocking(move || {
             let mut p = p;
+            if let Some(text) = server.enqueue_link_via_checkout_owner(&p)? {
+                return Ok::<_, anyhow::Error>((text, false));
+            }
             let target = server.prepare_existing_knowledge_mutation(&p.source)?;
             p.source = format!("knowledge:{}", target.id);
             let edge = server.state.kb.write().append_link_with_write_dir(
