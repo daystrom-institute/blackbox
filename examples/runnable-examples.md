@@ -43,6 +43,15 @@ bootstrap, install, and run script.
 | [Slack](slack/slack-example.md) | Slack Socket Mode events | Sidecar normalizes Slack events into daemon webhooks, routing packets classify mentions/slash commands/reactions, and workflows dispatch Badgey or command arcs. |
 | [System Events](system-events/system-events-example.md) | EventHub reaction examples | Reaction and packet artifacts for `task.completed` and Forgejo identity provisioning flows. |
 
+## Live exercises
+
+Self-contained scripts that drive real surfaces against a throwaway daemon and
+print a PASS or FAIL row per step.
+
+| Path | What it proves |
+|------|----------------|
+| [Graph live exercise](graph-live-exercise.md) | The reflective project graph stack end to end: catalog genesis, producer onboarding, committed-candidate publication including the graphs lane, acceptance through the merge gate, published graph reads and traversal, an operator-minted workspace binding, a real provisional capture of uncommitted edits, own versus published visibility, compound provisional refs, and per-graph Invalid diagnostics. Run it with `examples/graph-live-exercise.sh`. |
+
 ## Agents
 
 Drop-in subagent definitions for Claude Code. Install by copying into
