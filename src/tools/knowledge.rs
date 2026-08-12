@@ -580,9 +580,9 @@ impl BlackboxServer {
             .map_err(|err| anyhow::anyhow!("target must be a valid entity ref: {err}"))?;
         let kind = crate::knowledge::KnowledgeEdgeKind::parse(&p.kind)?;
         let confidence = match p.confidence.as_deref().unwrap_or("heuristic") {
-            "exact" | "Exact" | "EXACT" => crate::knowledge::EdgeConfidence::Exact,
-            "heuristic" | "Heuristic" | "HEURISTIC" => crate::knowledge::EdgeConfidence::Heuristic,
-            "unknown" | "Unknown" | "UNKNOWN" => crate::knowledge::EdgeConfidence::Unknown,
+            "exact" | "Exact" | "EXACT" => bbox_chunker::EdgeConfidence::Exact,
+            "heuristic" | "Heuristic" | "HEURISTIC" => bbox_chunker::EdgeConfidence::Heuristic,
+            "unknown" | "Unknown" | "UNKNOWN" => bbox_chunker::EdgeConfidence::Unknown,
             other => anyhow::bail!(
                 "invalid edge confidence '{other}' (expected exact, heuristic, or unknown)"
             ),
