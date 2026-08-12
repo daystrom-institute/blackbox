@@ -1511,6 +1511,50 @@ impl BlackboxServer {
             .remove(project_id);
     }
 
+    /// Rebuild the published project-graph view for one catalog project
+    /// after its accepted content moved.
+    ///
+    /// Unlike knowledge and gaps, the graph read surface
+    /// (`project_graph_views`) has no lazy rebuild-on-read path: reads
+    /// serve whatever was last installed. Advance must actively refresh it
+    /// here, or a project's graphs stay invisible (or stale) after an
+    /// accept until something unrelated, such as binding a checkout,
+    /// happens to install a fresh view. Failure degrades rather than
+    /// propagates, matching `converge_published_knowledge_index`: the
+    /// pointer is already correct, and the next accept reconciles the view.
+    pub(crate) fn refresh_published_graph_views(&self, project_id: &ProjectId) {
+        let Some(runtime) = &self.state.accepted_publications else {
+            return;
+        };
+        let verified = match runtime.load_verified(project_id) {
+            Ok(verified) => verified,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    code = error.code(),
+                    "published graph view refresh skipped: no verified accepted content"
+                );
+                return;
+            }
+        };
+        match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
+            Ok(view) => {
+                self.state
+                    .project_graph_views
+                    .write()
+                    .install_published(view);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "published graph view refresh failed; graph reads may serve stale content \
+                     until the next accept"
+                );
+            }
+        }
+    }
+
     fn cached_published_knowledge_snapshot(
         &self,
         publisher: &super::knowledge_lifecycle::AuthorizedPublisher,
