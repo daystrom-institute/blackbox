@@ -3378,6 +3378,7 @@ fn prepare_publisher_generation(
             accepted_commit,
             knowledge,
             gaps,
+            graphs: Vec::new(),
             prior_pointer: None,
         },
         &AcceptedPublicationLimits::default(),

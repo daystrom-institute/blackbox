@@ -23,10 +23,11 @@ use bbox_corpus_core::project_catalog::{AttachmentId, ProjectId};
 use parking_lot::RwLock;
 
 use crate::accepted_publication_store::{
-    AcceptedGapSourceV1, AcceptedKnowledgeSourceV1, AcceptedPublicationBuildInputV1,
-    AcceptedPublicationBuildSourceV1, AcceptedPublicationFaultInjector,
-    AcceptedPublicationGenerationId, AcceptedPublicationGenerationV1, AcceptedPublicationLimits,
-    AcceptedPublicationLockGuard, AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
+    AcceptedGapSourceV1, AcceptedGraphSourceV1Input, AcceptedKnowledgeSourceV1,
+    AcceptedPublicationBuildInputV1, AcceptedPublicationBuildSourceV1,
+    AcceptedPublicationFaultInjector, AcceptedPublicationGenerationId,
+    AcceptedPublicationGenerationV1, AcceptedPublicationLimits, AcceptedPublicationLockGuard,
+    AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
     AcceptedPublicationSourceBindingV2, AcceptedPublicationStoreError,
     AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId, PointerExpectationV1,
     PreparedAcceptedPublicationV1, VerifiedAcceptedPublicationSelectionV1,
@@ -43,7 +44,7 @@ use crate::accepted_publication_store::{
 /// hold them remain crate-private.
 pub use crate::accepted_publication_store::{
     AcceptedBlockingLevelV1, AcceptedEdgeConfidenceV1, AcceptedGapEntryV1, AcceptedGapImpactV1,
-    AcceptedGapKindV1, AcceptedGapResolutionV1, AcceptedKnowledgeApprovalV1,
+    AcceptedGapKindV1, AcceptedGapResolutionV1, AcceptedGraphSourceV1, AcceptedKnowledgeApprovalV1,
     AcceptedKnowledgeCategoryV1, AcceptedKnowledgeEdgeKindV1, AcceptedKnowledgeEdgeV1,
     AcceptedKnowledgeEntryV1, AcceptedKnowledgePriorityV1, AcceptedKnowledgeScopeV1,
     AcceptedKnowledgeStatusV1, AcceptedPublicationCountsV1, NormalizedRepoRelativeFilename,
@@ -407,17 +408,20 @@ impl VerifiedAcceptedPublication {
             gap_file_manifest: Default::default(),
             normalized_knowledge: Default::default(),
             normalized_gaps: Default::default(),
+            graph_sources: Default::default(),
             hashes: AcceptedPublicationHashesV1 {
                 knowledge_file_manifest_sha256: sha(),
                 gap_file_manifest_sha256: sha(),
                 normalized_knowledge_sha256: sha(),
                 normalized_gaps_sha256: sha(),
+                graph_sources_sha256: None,
             },
             counts: AcceptedPublicationCountsV1 {
                 knowledge_files: 0,
                 knowledge_entries: 0,
                 gap_files: 0,
                 gap_entries: 0,
+                graph_files: 0,
             },
             total_encoded_bytes: 0,
         };
@@ -461,6 +465,12 @@ impl VerifiedAcceptedPublication {
 
     pub fn gap_records(&self) -> &BTreeMap<PublicationRecordId, AcceptedGapEntryV1> {
         &self.content.generation.normalized_gaps
+    }
+
+    pub fn graph_sources(
+        &self,
+    ) -> &BTreeMap<NormalizedRepoRelativeFilename, AcceptedGraphSourceV1> {
+        &self.content.generation.graph_sources
     }
 
     pub fn counts(&self) -> &AcceptedPublicationCountsV1 {
@@ -687,6 +697,7 @@ pub struct PublishSourceFile {
 pub struct PublishSources {
     pub knowledge: Vec<PublishSourceFile>,
     pub gaps: Vec<PublishSourceFile>,
+    pub graphs: Vec<PublishSourceFile>,
 }
 
 /// A publish request after the caller has resolved Git and read sources.
@@ -1253,6 +1264,14 @@ impl AcceptedPublicationRuntime {
                     .gaps
                     .into_iter()
                     .map(|file| AcceptedGapSourceV1 {
+                        repository_relative_filename: file.repository_relative_filename,
+                        source_bytes: file.source_bytes,
+                    })
+                    .collect(),
+                graphs: sources
+                    .graphs
+                    .into_iter()
+                    .map(|file| AcceptedGraphSourceV1Input {
                         repository_relative_filename: file.repository_relative_filename,
                         source_bytes: file.source_bytes,
                     })
@@ -2292,6 +2311,7 @@ mod tests {
                 repository_relative_filename: ".bbox/gaps/gap-1234abcd.json".into(),
                 source_bytes: serde_json::to_vec(&fixtures::gap_note("gap-1234abcd")).unwrap(),
             }],
+            graphs: Vec::new(),
         }
     }
 

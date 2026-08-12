@@ -199,6 +199,10 @@ pub(crate) struct SharedState {
             super::gap_view::CatalogPublishedGapCacheEntry,
         >,
     >,
+    /// Accepted project graphs plus whole-graph provisional overlays. B2 read
+    /// tools consume this source-neutral catalog without reopening transport.
+    pub(crate) project_graph_views:
+        RwLock<bbox_indexing::project_graph_view::ProjectGraphViewCatalog>,
     /// Successful publisher authority resolutions are memoized briefly.
     /// The project inventory is part of each cache entry, so registry changes
     /// bypass the cached decision immediately.
@@ -1015,6 +1019,7 @@ impl SharedState {
             gap_published_cache: RwLock::new(BTreeMap::new()),
             catalog_knowledge_published_cache: RwLock::new(BTreeMap::new()),
             catalog_gap_published_cache: RwLock::new(BTreeMap::new()),
+            project_graph_views: RwLock::new(Default::default()),
             publisher_authorization_cache: RwLock::new(Default::default()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),

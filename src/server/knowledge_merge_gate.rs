@@ -37,6 +37,7 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
     let mut projects = Vec::new();
     let mut render_mismatch_count = 0usize;
     let mut contradiction_count = 0usize;
+    let mut graph_error_count = 0usize;
     for root in roots {
         let mut render = knowledge.check_project_render(&root)?;
         for mismatch in &mut render.mismatches {
@@ -47,8 +48,11 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
                 .replace('\\', "/");
         }
         let contradictions = knowledge.project_contradictions(&root);
+        let graph_validation =
+            bbox_indexing::project_graph_view::validate_project_graph_tree("candidate", &root)?;
         render_mismatch_count += render.mismatches.len();
         contradiction_count += contradictions.len();
+        graph_error_count += graph_validation.errors.len();
         let relative_root = root
             .strip_prefix(&tree_root)
             .unwrap_or(root.as_path())
@@ -58,19 +62,24 @@ pub(crate) fn evaluate(candidate: &CandidateTree) -> Result<CandidateGateReport>
             "root": if relative_root.is_empty() { "." } else { &relative_root },
             "render": render,
             "contradictions": contradictions,
+            "graphs": {
+                "graph_count": graph_validation.graph_count,
+                "errors": graph_validation.errors,
+            },
         }));
     }
 
-    let ok = render_mismatch_count == 0 && contradiction_count == 0;
+    let ok = render_mismatch_count == 0 && contradiction_count == 0 && graph_error_count == 0;
     Ok(CandidateGateReport {
         ok,
         content: serde_json::json!({
             "error": (!ok).then_some(format!(
-                "candidate knowledge gate found {render_mismatch_count} stale render projection(s) and {contradiction_count} scoped contradiction(s)"
+                "candidate knowledge gate found {render_mismatch_count} stale render projection(s), {contradiction_count} scoped contradiction(s), and {graph_error_count} graph validation error(s)"
             )),
             "projects_checked": projects.len(),
             "render_mismatches": render_mismatch_count,
             "contradictions": contradiction_count,
+            "graph_errors": graph_error_count,
             "projects": projects,
         }),
     })
@@ -318,6 +327,65 @@ mod tests {
         let stale = evaluate(&candidate(&root)).unwrap();
         assert!(!stale.ok);
         assert_eq!(stale.content["render_mismatches"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn candidate_gate_rejects_structurally_invalid_project_graphs() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        let graph = root.join(".bbox/graphs/governance-record");
+        std::fs::create_dir_all(&graph).unwrap();
+        std::fs::write(
+            root.join(".bbox/config.toml"),
+            "[project]\nrepo_id = \"merge-gate-graph-fixture\"\n",
+        )
+        .unwrap();
+        for (name, bytes) in [
+            (
+                "schema.json",
+                include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/schema.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "vertices.jsonl",
+                include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/vertices.jsonl"
+                )
+                .as_slice(),
+            ),
+            (
+                "edges.jsonl",
+                include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/edges.jsonl"
+                )
+                .as_slice(),
+            ),
+        ] {
+            std::fs::write(graph.join(name), bytes).unwrap();
+        }
+        git(&root, &["add", ".bbox"]);
+        git(&root, &["commit", "-q", "-m", "valid graph"]);
+        let valid = evaluate(&candidate(&root)).unwrap();
+        assert!(valid.ok, "{:?}", valid.content);
+
+        std::fs::write(
+            graph.join("edges.jsonl"),
+            r#"{"from":"missing","type":"gov:OWNED_BY","to":"team-platform"}"#,
+        )
+        .unwrap();
+        git(
+            &root,
+            &["add", ".bbox/graphs/governance-record/edges.jsonl"],
+        );
+        git(&root, &["commit", "-q", "-m", "invalid graph"]);
+        let invalid = evaluate(&candidate(&root)).unwrap();
+        assert!(!invalid.ok);
+        assert_ne!(invalid.content["graph_errors"], serde_json::json!(0));
     }
 
     #[cfg(unix)]

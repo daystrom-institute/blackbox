@@ -7397,6 +7397,7 @@ mod publisher_publish_tests {
                         source_bytes: serde_json::to_vec(&fixtures::gap_note("gap-1234abcd"))
                             .unwrap(),
                     }],
+                    graphs: Vec::new(),
                 },
                 revalidate_checkout: Box::new(|| Ok(())),
                 revalidate_ref: Box::new(move || Some(revalidated.clone())),

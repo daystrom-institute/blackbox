@@ -170,6 +170,7 @@ fn publication_page_cursors() -> BTreeMap<String, u64> {
     [
         (lane_name(SourceLaneV1::Knowledge).to_string(), 0),
         (lane_name(SourceLaneV1::Gaps).to_string(), 0),
+        (lane_name(SourceLaneV1::Graphs).to_string(), 0),
     ]
     .into_iter()
     .collect()
@@ -178,7 +179,11 @@ fn publication_page_cursors() -> BTreeMap<String, u64> {
 fn provisional_page_cursors() -> BTreeMap<String, u64> {
     let mut cursors = BTreeMap::new();
     for class in [SnapshotClassV1::Baseline, SnapshotClassV1::Working] {
-        for lane in [SourceLaneV1::Knowledge, SourceLaneV1::Gaps] {
+        for lane in [
+            SourceLaneV1::Knowledge,
+            SourceLaneV1::Gaps,
+            SourceLaneV1::Graphs,
+        ] {
             cursors.insert(provisional_slot_key(class, lane), 0);
         }
     }
@@ -189,6 +194,7 @@ fn lane_name(lane: SourceLaneV1) -> &'static str {
     match lane {
         SourceLaneV1::Knowledge => "knowledge",
         SourceLaneV1::Gaps => "gaps",
+        SourceLaneV1::Graphs => "graphs",
     }
 }
 
@@ -210,6 +216,7 @@ fn publication_manifest_descriptor(
     match lane {
         SourceLaneV1::Knowledge => &descriptor.knowledge,
         SourceLaneV1::Gaps => &descriptor.gaps,
+        SourceLaneV1::Graphs => &descriptor.graphs,
     }
 }
 
@@ -221,8 +228,10 @@ fn provisional_manifest_descriptor(
     match (class, lane) {
         (SnapshotClassV1::Baseline, SourceLaneV1::Knowledge) => &descriptor.baseline_knowledge,
         (SnapshotClassV1::Baseline, SourceLaneV1::Gaps) => &descriptor.baseline_gaps,
+        (SnapshotClassV1::Baseline, SourceLaneV1::Graphs) => &descriptor.baseline_graphs,
         (SnapshotClassV1::Working, SourceLaneV1::Knowledge) => &descriptor.working_knowledge,
         (SnapshotClassV1::Working, SourceLaneV1::Gaps) => &descriptor.working_gaps,
+        (SnapshotClassV1::Working, SourceLaneV1::Graphs) => &descriptor.working_graphs,
     }
 }
 
@@ -324,16 +333,18 @@ fn load_publication_manifests(
 ) -> Result<(
     Vec<SourceFileManifestEntryV1>,
     Vec<SourceFileManifestEntryV1>,
+    Vec<SourceFileManifestEntryV1>,
 )> {
     Ok((
         read_required_json(path, "manifest-knowledge.json", "knowledge manifest")?,
         read_required_json(path, "manifest-gaps.json", "gap manifest")?,
+        read_required_json(path, "manifest-graphs.json", "graph manifest")?,
     ))
 }
 
 fn load_provisional_manifests(
     path: &Path,
-) -> Result<(Vec<AncestryCommitV1>, [Vec<SourceFileManifestEntryV1>; 4])> {
+) -> Result<(Vec<AncestryCommitV1>, [Vec<SourceFileManifestEntryV1>; 6])> {
     Ok((
         read_required_json(path, "ancestry.json", "ancestry witness")?,
         [
@@ -345,10 +356,20 @@ fn load_provisional_manifests(
             read_required_json(path, "manifest-baseline-gaps.json", "baseline gap manifest")?,
             read_required_json(
                 path,
+                "manifest-baseline-graphs.json",
+                "baseline graph manifest",
+            )?,
+            read_required_json(
+                path,
                 "manifest-working-knowledge.json",
                 "working knowledge manifest",
             )?,
             read_required_json(path, "manifest-working-gaps.json", "working gap manifest")?,
+            read_required_json(
+                path,
+                "manifest-working-graphs.json",
+                "working graph manifest",
+            )?,
         ],
     ))
 }
@@ -358,10 +379,13 @@ fn load_expected_blobs(path: &Path) -> Result<BTreeMap<String, u64>> {
     for name in [
         "manifest-knowledge.json",
         "manifest-gaps.json",
+        "manifest-graphs.json",
         "manifest-baseline-knowledge.json",
         "manifest-baseline-gaps.json",
+        "manifest-baseline-graphs.json",
         "manifest-working-knowledge.json",
         "manifest-working-gaps.json",
+        "manifest-working-graphs.json",
     ] {
         let Some(manifest) = read_json::<Vec<SourceFileManifestEntryV1>>(
             path,
@@ -428,13 +452,16 @@ fn publication_status(
         observed_at_unix_secs: source.created_unix_secs,
         knowledge_manifest_sha256: source.descriptor.knowledge.manifest_sha256.clone(),
         gap_manifest_sha256: source.descriptor.gaps.manifest_sha256.clone(),
+        graph_manifest_sha256: source.descriptor.graphs.manifest_sha256.clone(),
         knowledge_files: source.descriptor.knowledge.file_count,
         gap_files: source.descriptor.gaps.file_count,
+        graph_files: source.descriptor.graphs.file_count,
         logical_bytes: source
             .descriptor
             .knowledge
             .logical_bytes
             .checked_add(source.descriptor.gaps.logical_bytes)
+            .and_then(|bytes| bytes.checked_add(source.descriptor.graphs.logical_bytes))
             .ok_or(StoreRequestError::LimitExceeded)?,
         diagnostic: source.diagnostic.clone(),
     })
@@ -460,12 +487,14 @@ fn provisional_status(
             .manifest_sha256
             .clone(),
         baseline_gap_manifest_sha256: source.descriptor.baseline_gaps.manifest_sha256.clone(),
+        baseline_graph_manifest_sha256: source.descriptor.baseline_graphs.manifest_sha256.clone(),
         working_knowledge_manifest_sha256: source
             .descriptor
             .working_knowledge
             .manifest_sha256
             .clone(),
         working_gap_manifest_sha256: source.descriptor.working_gaps.manifest_sha256.clone(),
+        working_graph_manifest_sha256: source.descriptor.working_graphs.manifest_sha256.clone(),
         lease_expires_unix_secs: Some(source.lease_expires_unix_secs),
         diagnostic: source.diagnostic.clone(),
     })
@@ -607,8 +636,10 @@ fn remove_upload_directory(path: &Path, provisional: bool) -> Result<()> {
             "ancestry.json",
             "manifest-baseline-knowledge.json",
             "manifest-baseline-gaps.json",
+            "manifest-baseline-graphs.json",
             "manifest-working-knowledge.json",
             "manifest-working-gaps.json",
+            "manifest-working-graphs.json",
         ] {
             remove_regular_file(&path.join(name))?;
         }
@@ -618,6 +649,7 @@ fn remove_upload_directory(path: &Path, provisional: bool) -> Result<()> {
             "upload.json",
             "manifest-knowledge.json",
             "manifest-gaps.json",
+            "manifest-graphs.json",
         ] {
             remove_regular_file(&path.join(name))?;
         }
@@ -654,8 +686,10 @@ fn remove_generation_directory(path: &Path, provisional: bool) -> Result<()> {
             "ancestry.json",
             "manifest-baseline-knowledge.json",
             "manifest-baseline-gaps.json",
+            "manifest-baseline-graphs.json",
             "manifest-working-knowledge.json",
             "manifest-working-gaps.json",
+            "manifest-working-graphs.json",
             "source.json",
         ]
     } else {
@@ -663,6 +697,7 @@ fn remove_generation_directory(path: &Path, provisional: bool) -> Result<()> {
             "descriptor.json",
             "manifest-knowledge.json",
             "manifest-gaps.json",
+            "manifest-graphs.json",
             "source.json",
         ]
     };
@@ -759,10 +794,11 @@ fn publication_source_generation_sha256(
     source: &StoredPublicationCandidateV1,
     knowledge: &[SourceFileManifestEntryV1],
     gaps: &[SourceFileManifestEntryV1],
+    graphs: &[SourceFileManifestEntryV1],
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"bbox-knowledge-publication-source-evidence-v1\0");
-    hasher.update(serde_json::to_vec(&(source, knowledge, gaps))?);
+    hasher.update(serde_json::to_vec(&(source, knowledge, gaps, graphs))?);
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -1060,6 +1096,7 @@ pub struct ReadyPublicationCandidate {
     pub observed_at_unix_secs: u64,
     pub knowledge: Vec<ReadyPublicationFile>,
     pub gaps: Vec<ReadyPublicationFile>,
+    pub graphs: Vec<ReadyPublicationFile>,
 }
 
 /// Fully detached bytes for the exact live provisional pointer selected under
@@ -1074,8 +1111,10 @@ pub struct ReadyProvisionalWorkspace {
     pub ancestry: Vec<AncestryCommitV1>,
     pub baseline_knowledge: Vec<ReadyPublicationFile>,
     pub baseline_gaps: Vec<ReadyPublicationFile>,
+    pub baseline_graphs: Vec<ReadyPublicationFile>,
     pub working_knowledge: Vec<ReadyPublicationFile>,
     pub working_gaps: Vec<ReadyPublicationFile>,
+    pub working_graphs: Vec<ReadyPublicationFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -1450,17 +1489,24 @@ impl KnowledgeSourceStore {
             bail!(StoreRequestError::InvalidState);
         }
         let generation_path = self.publication_generation_path(&index.project_id, generation_id)?;
-        let (knowledge_manifest, gap_manifest) = load_publication_manifests(&generation_path)?;
+        let (knowledge_manifest, gap_manifest, graph_manifest) =
+            load_publication_manifests(&generation_path)?;
         validate_publication_candidate(
             &source.descriptor,
             &knowledge_manifest,
             &gap_manifest,
+            &graph_manifest,
             self.current_limits()?.contract,
         )?;
         let knowledge = self.materialize_ready_publication_files(&knowledge_manifest)?;
         let gaps = self.materialize_ready_publication_files(&gap_manifest)?;
-        let source_generation_sha256 =
-            publication_source_generation_sha256(&source, &knowledge_manifest, &gap_manifest)?;
+        let graphs = self.materialize_ready_publication_files(&graph_manifest)?;
+        let source_generation_sha256 = publication_source_generation_sha256(
+            &source,
+            &knowledge_manifest,
+            &gap_manifest,
+            &graph_manifest,
+        )?;
         let mut pins = self
             .publication_pins
             .lock()
@@ -1477,6 +1523,7 @@ impl KnowledgeSourceStore {
                 observed_at_unix_secs: source.created_unix_secs,
                 knowledge,
                 gaps,
+                graphs,
             },
             _pin: PublicationPinGuard {
                 generation_id: generation_id.to_string(),
@@ -1939,6 +1986,8 @@ impl KnowledgeSourceStore {
             &manifests[1],
             &manifests[2],
             &manifests[3],
+            &manifests[4],
+            &manifests[5],
             self.current_limits()?.contract,
         )?;
         Ok(Some(ReadyProvisionalWorkspace {
@@ -1949,8 +1998,10 @@ impl KnowledgeSourceStore {
             ancestry,
             baseline_knowledge: self.materialize_ready_publication_files(&manifests[0])?,
             baseline_gaps: self.materialize_ready_publication_files(&manifests[1])?,
-            working_knowledge: self.materialize_ready_publication_files(&manifests[2])?,
-            working_gaps: self.materialize_ready_publication_files(&manifests[3])?,
+            baseline_graphs: self.materialize_ready_publication_files(&manifests[2])?,
+            working_knowledge: self.materialize_ready_publication_files(&manifests[3])?,
+            working_gaps: self.materialize_ready_publication_files(&manifests[4])?,
+            working_graphs: self.materialize_ready_publication_files(&manifests[5])?,
         }))
     }
 
@@ -2395,15 +2446,23 @@ impl KnowledgeSourceStore {
             record.next_pages[lane_name(SourceLaneV1::Gaps)],
             record.descriptor.gaps.page_count,
         )?;
+        let graphs = load_manifest_pages(
+            path,
+            lane_name(SourceLaneV1::Graphs),
+            record.next_pages[lane_name(SourceLaneV1::Graphs)],
+            record.descriptor.graphs.page_count,
+        )?;
         validate_publication_candidate(
             &record.descriptor,
             &knowledge,
             &gaps,
+            &graphs,
             self.current_limits()?.contract,
         )?;
         let directory = existing_directory(path)?;
         install_immutable_json(&directory, "manifest-knowledge.json", &knowledge)?;
         install_immutable_json(&directory, "manifest-gaps.json", &gaps)?;
+        install_immutable_json(&directory, "manifest-graphs.json", &graphs)?;
         record.state = SourceGenerationStateV1::MissingBlobs;
         record.updated_unix_secs = now_unix_secs();
         write_json(&directory, "upload.json", record)
@@ -2431,6 +2490,13 @@ impl KnowledgeSourceStore {
             record.next_pages[&provisional_slot_key(SnapshotClassV1::Baseline, SourceLaneV1::Gaps)],
             record.descriptor.baseline_gaps.page_count,
         )?;
+        let baseline_graphs = load_manifest_pages(
+            path,
+            &provisional_slot_key(SnapshotClassV1::Baseline, SourceLaneV1::Graphs),
+            record.next_pages
+                [&provisional_slot_key(SnapshotClassV1::Baseline, SourceLaneV1::Graphs)],
+            record.descriptor.baseline_graphs.page_count,
+        )?;
         let working_knowledge = load_manifest_pages(
             path,
             &provisional_slot_key(SnapshotClassV1::Working, SourceLaneV1::Knowledge),
@@ -2444,13 +2510,22 @@ impl KnowledgeSourceStore {
             record.next_pages[&provisional_slot_key(SnapshotClassV1::Working, SourceLaneV1::Gaps)],
             record.descriptor.working_gaps.page_count,
         )?;
+        let working_graphs = load_manifest_pages(
+            path,
+            &provisional_slot_key(SnapshotClassV1::Working, SourceLaneV1::Graphs),
+            record.next_pages
+                [&provisional_slot_key(SnapshotClassV1::Working, SourceLaneV1::Graphs)],
+            record.descriptor.working_graphs.page_count,
+        )?;
         validate_provisional_workspace(
             &record.descriptor,
             &ancestry,
             &baseline_knowledge,
             &baseline_gaps,
+            &baseline_graphs,
             &working_knowledge,
             &working_gaps,
+            &working_graphs,
             self.current_limits()?.contract,
         )?;
         let directory = existing_directory(path)?;
@@ -2458,8 +2533,10 @@ impl KnowledgeSourceStore {
         for (name, manifest) in [
             ("manifest-baseline-knowledge.json", baseline_knowledge),
             ("manifest-baseline-gaps.json", baseline_gaps),
+            ("manifest-baseline-graphs.json", baseline_graphs),
             ("manifest-working-knowledge.json", working_knowledge),
             ("manifest-working-gaps.json", working_gaps),
+            ("manifest-working-graphs.json", working_graphs),
         ] {
             install_immutable_json(&directory, name, &manifest)?;
         }
@@ -2601,6 +2678,7 @@ impl KnowledgeSourceStore {
         install_immutable_json(&directory, "descriptor.json", &upload.descriptor)?;
         install_immutable_json(&directory, "manifest-knowledge.json", &manifests.0)?;
         install_immutable_json(&directory, "manifest-gaps.json", &manifests.1)?;
+        install_immutable_json(&directory, "manifest-graphs.json", &manifests.2)?;
         install_immutable_json(&directory, "source.json", &generation)?;
         journal.stage = FinalizeStageV1::GenerationInstalled;
         journal = self.write_finalize_journal(journal)?;
@@ -2714,8 +2792,10 @@ impl KnowledgeSourceStore {
         for (name, manifest) in [
             ("manifest-baseline-knowledge.json", &manifests[0]),
             ("manifest-baseline-gaps.json", &manifests[1]),
-            ("manifest-working-knowledge.json", &manifests[2]),
-            ("manifest-working-gaps.json", &manifests[3]),
+            ("manifest-baseline-graphs.json", &manifests[2]),
+            ("manifest-working-knowledge.json", &manifests[3]),
+            ("manifest-working-gaps.json", &manifests[4]),
+            ("manifest-working-graphs.json", &manifests[5]),
         ] {
             install_immutable_json(&directory, name, manifest)?;
         }
@@ -2851,6 +2931,7 @@ impl KnowledgeSourceStore {
             &source.descriptor,
             &manifests.0,
             &manifests.1,
+            &manifests.2,
             self.current_limits()?.contract,
         )?;
         self.verify_all_upload_blobs(&generation_path)
@@ -2903,6 +2984,8 @@ impl KnowledgeSourceStore {
             &manifests[1],
             &manifests[2],
             &manifests[3],
+            &manifests[4],
+            &manifests[5],
             self.current_limits()?.contract,
         )?;
         self.verify_all_upload_blobs(&generation_path)
@@ -3963,6 +4046,7 @@ mod tests {
             object_format: GitObjectFormatV1::Sha1,
             knowledge: manifest(SourceLaneV1::Knowledge, &knowledge),
             gaps: manifest(SourceLaneV1::Gaps, &gaps),
+            graphs: SourceManifestDescriptorV1::default(),
         };
         (descriptor, knowledge, gaps)
     }
@@ -4009,7 +4093,8 @@ mod tests {
         let baseline_gaps = manifest(SourceLaneV1::Gaps, &gaps);
         let working_knowledge = baseline_knowledge.clone();
         let working_gaps = baseline_gaps.clone();
-        let working_pair = working_pair_sha256(&working_knowledge, &working_gaps);
+        let empty_graphs = SourceManifestDescriptorV1::default();
+        let working_pair = working_pair_sha256(&working_knowledge, &working_gaps, &empty_graphs);
         let (ancestry, nodes) = ancestry_fixture();
         (
             ProvisionalWorkspaceDescriptorV1 {
@@ -4031,8 +4116,10 @@ mod tests {
                 },
                 baseline_knowledge,
                 baseline_gaps,
+                baseline_graphs: empty_graphs.clone(),
                 working_knowledge,
                 working_gaps,
+                working_graphs: empty_graphs,
             },
             nodes,
             knowledge,
@@ -4758,6 +4845,7 @@ mod tests {
         install_immutable_json(&directory, "descriptor.json", &upload.descriptor).unwrap();
         install_immutable_json(&directory, "manifest-knowledge.json", &manifests.0).unwrap();
         install_immutable_json(&directory, "manifest-gaps.json", &manifests.1).unwrap();
+        install_immutable_json(&directory, "manifest-graphs.json", &manifests.2).unwrap();
         install_immutable_json(
             &directory,
             "source.json",
@@ -4816,6 +4904,7 @@ mod tests {
             object_format: GitObjectFormatV1::Sha1,
             knowledge: manifest(SourceLaneV1::Knowledge, &knowledge),
             gaps: manifest(SourceLaneV1::Gaps, &[]),
+            graphs: SourceManifestDescriptorV1::default(),
         };
         let begin = store
             .begin_publication_upload(&authority, descriptor)

@@ -634,6 +634,15 @@ impl super::BlackboxServer {
             &working_gaps,
         )
         .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        let graphs =
+            bbox_indexing::project_graph_view::build_provisional_graph_overlay(&source, verified)?;
+        {
+            let published =
+                bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
+            let mut views = self.state.project_graph_views.write();
+            views.install_published(published);
+            views.install_provisional(graphs.clone());
+        }
 
         Ok(RemoteProvisionalOverlayPair { knowledge, gaps })
     }
@@ -1311,6 +1320,7 @@ fn parse_lane(value: &str) -> Result<SourceLaneV1, HttpError> {
     match value {
         "knowledge" => Ok(SourceLaneV1::Knowledge),
         "gaps" => Ok(SourceLaneV1::Gaps),
+        "graphs" => Ok(SourceLaneV1::Graphs),
         _ => Err(HttpError::unprocessable(
             "knowledge_source_manifest_invalid",
             "knowledge-source lane is invalid",
@@ -1918,8 +1928,12 @@ mod tests {
         let working_knowledge_descriptor =
             manifest(SourceLaneV1::Knowledge, &working_knowledge_manifest);
         let working_gap_descriptor = manifest(SourceLaneV1::Gaps, &working_gap_manifest);
-        let working_pair =
-            working_pair_sha256(&working_knowledge_descriptor, &working_gap_descriptor);
+        let empty_graphs = bbox_knowledge_source::SourceManifestDescriptorV1::default();
+        let working_pair = working_pair_sha256(
+            &working_knowledge_descriptor,
+            &working_gap_descriptor,
+            &empty_graphs,
+        );
         let descriptor = bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1 {
             schema_version: SCHEMA_VERSION,
             scope: scope.clone(),
@@ -1944,8 +1958,10 @@ mod tests {
             },
             baseline_knowledge: baseline_knowledge_descriptor,
             baseline_gaps: baseline_gap_descriptor,
+            baseline_graphs: empty_graphs.clone(),
             working_knowledge: working_knowledge_descriptor,
             working_gaps: working_gap_descriptor,
+            working_graphs: empty_graphs,
         };
         let store = server.state.knowledge_sources.store();
         let upload = store
@@ -2157,6 +2173,7 @@ mod tests {
             object_format: GitObjectFormatV1::Sha1,
             knowledge: manifest(SourceLaneV1::Knowledge, &entries),
             gaps: manifest(SourceLaneV1::Gaps, &[]),
+            graphs: SourceManifestDescriptorV1::default(),
         }
     }
 
@@ -2187,7 +2204,9 @@ mod tests {
         let knowledge = vec![entry()];
         let knowledge_manifest = manifest(SourceLaneV1::Knowledge, &knowledge);
         let gaps_manifest = manifest(SourceLaneV1::Gaps, &[]);
-        let working_pair = working_pair_sha256(&knowledge_manifest, &gaps_manifest);
+        let graphs_manifest = SourceManifestDescriptorV1::default();
+        let working_pair =
+            working_pair_sha256(&knowledge_manifest, &gaps_manifest, &graphs_manifest);
         (
             bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1 {
                 schema_version: SCHEMA_VERSION,
@@ -2213,8 +2232,10 @@ mod tests {
                 },
                 baseline_knowledge: knowledge_manifest.clone(),
                 baseline_gaps: gaps_manifest.clone(),
+                baseline_graphs: graphs_manifest.clone(),
                 working_knowledge: knowledge_manifest,
                 working_gaps: gaps_manifest,
+                working_graphs: graphs_manifest,
             },
             nodes,
         )

@@ -16,6 +16,28 @@ const VERTICES_FILE: &str = "vertices.jsonl";
 const EDGES_FILE: &str = "edges.jsonl";
 const SOURCE_FILES: [&str; 4] = [GRAPH_FILE, SCHEMA_FILE, VERTICES_FILE, EDGES_FILE];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphParseLimits {
+    pub max_vertices: usize,
+    pub max_edges: usize,
+}
+
+impl Default for GraphParseLimits {
+    fn default() -> Self {
+        Self {
+            max_vertices: usize::MAX,
+            max_edges: usize::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GraphDocumentBytes<'a> {
+    pub schema: &'a [u8],
+    pub vertices: &'a [u8],
+    pub edges: &'a [u8],
+}
+
 #[derive(Debug, Clone)]
 pub struct GraphLocation {
     pub graph_id: String,
@@ -129,8 +151,9 @@ pub fn load_graph(scope_id: &str, project_root: &Path, location: &GraphLocation)
 
     let descriptor = parse_json::<GraphDescriptor>(&documents[0], GRAPH_FILE, &mut errors);
     let schema = parse_json::<GraphSchema>(&documents[1], SCHEMA_FILE, &mut errors);
-    let vertices = parse_jsonl::<ProjectGraphVertex>(&documents[2], VERTICES_FILE, &mut errors);
-    let edges = parse_jsonl::<ProjectGraphEdge>(&documents[3], EDGES_FILE, &mut errors);
+    let vertices =
+        parse_jsonl::<ProjectGraphVertex>(&documents[2], VERTICES_FILE, usize::MAX, &mut errors);
+    let edges = parse_jsonl::<ProjectGraphEdge>(&documents[3], EDGES_FILE, usize::MAX, &mut errors);
     if let (Some(descriptor), Some(schema)) = (&descriptor, &schema) {
         errors.extend(validate_graph(
             &location.graph_id,
@@ -165,6 +188,89 @@ pub fn load_graph(scope_id: &str, project_root: &Path, location: &GraphLocation)
             edges.into_iter().map(|(_, edge)| edge).collect(),
             fingerprint,
             project_root.to_path_buf(),
+        ))
+    } else {
+        None
+    };
+    GraphLoad { report, generation }
+}
+
+pub fn load_graph_documents(
+    scope_id: &str,
+    graph_id: &str,
+    documents: GraphDocumentBytes<'_>,
+    limits: GraphParseLimits,
+    source_root: PathBuf,
+) -> GraphLoad {
+    let location = GraphLocation {
+        graph_id: graph_id.to_string(),
+        source: GraphSource::Committed,
+        directory: source_root.clone(),
+    };
+    let mut errors = Vec::new();
+    if let Err(message) = validate_graph_id(graph_id) {
+        errors.push(ValidationError::new(
+            "descriptor.invalid_graph_id",
+            GRAPH_FILE,
+            None,
+            message,
+        ));
+    }
+    let schema = parse_json::<GraphSchema>(documents.schema, SCHEMA_FILE, &mut errors);
+    let vertices = parse_jsonl::<ProjectGraphVertex>(
+        documents.vertices,
+        VERTICES_FILE,
+        limits.max_vertices,
+        &mut errors,
+    );
+    let edges =
+        parse_jsonl::<ProjectGraphEdge>(documents.edges, EDGES_FILE, limits.max_edges, &mut errors);
+    let descriptor = schema.as_ref().map(|schema| GraphDescriptor {
+        descriptor_version: crate::DESCRIPTOR_VERSION,
+        scope: crate::GraphScope::Project,
+        graph_id: graph_id.to_string(),
+        authority: crate::GraphAuthority::Project,
+        schema_id: format!("{}:schema", schema.namespace),
+        schema_version: schema.version,
+        projection_version: None,
+        source_connector: None,
+        retention_policy: crate::RetentionPolicy::ProjectOwned,
+        generation: 1,
+    });
+    if let (Some(descriptor), Some(schema)) = (&descriptor, &schema) {
+        errors.extend(validate_graph(
+            graph_id,
+            GraphSource::Committed,
+            descriptor,
+            schema,
+            &vertices,
+            &edges,
+        ));
+    }
+    let fingerprint = fingerprint_transport_documents(documents);
+    let report = report(
+        scope_id,
+        &location,
+        errors,
+        descriptor.clone(),
+        schema.as_ref().map(|schema| schema.namespace.clone()),
+        vertices.len(),
+        edges.len(),
+        Some(fingerprint.clone()),
+    );
+    let generation = if report.valid {
+        Some(project_generation(
+            GraphKey {
+                scope_id: scope_id.to_string(),
+                graph_id: graph_id.to_string(),
+                source: GraphSource::Committed,
+            },
+            descriptor.expect("valid report requires descriptor"),
+            schema.expect("valid report requires schema"),
+            vertices.into_iter().map(|(_, vertex)| vertex).collect(),
+            edges.into_iter().map(|(_, edge)| edge).collect(),
+            fingerprint,
+            source_root,
         ))
     } else {
         None
@@ -255,6 +361,7 @@ fn parse_json<T: serde::de::DeserializeOwned>(
 fn parse_jsonl<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     file: &str,
+    max_rows: usize,
     errors: &mut Vec<ValidationError>,
 ) -> Vec<(usize, T)> {
     let text = match std::str::from_utf8(bytes) {
@@ -269,32 +376,54 @@ fn parse_jsonl<T: serde::de::DeserializeOwned>(
             return Vec::new();
         }
     };
-    text.lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let line_number = index + 1;
-            if line.trim().is_empty() {
-                return None;
-            }
-            match serde_json::from_str(line) {
-                Ok(value) => Some((line_number, value)),
-                Err(error) => {
-                    errors.push(ValidationError::new(
-                        "jsonl.malformed",
-                        file,
-                        Some(line_number),
-                        error.to_string(),
-                    ));
-                    None
-                }
-            }
-        })
-        .collect()
+    let mut rows = Vec::new();
+    let mut decoded_rows = 0_usize;
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        decoded_rows = decoded_rows.saturating_add(1);
+        if decoded_rows > max_rows {
+            errors.push(ValidationError::new(
+                "jsonl.row_limit_exceeded",
+                file,
+                Some(line_number),
+                format!("{file} exceeds the decoded row maximum of {max_rows}"),
+            ));
+            break;
+        }
+        match serde_json::from_str(line) {
+            Ok(value) => rows.push((line_number, value)),
+            Err(error) => errors.push(ValidationError::new(
+                "jsonl.malformed",
+                file,
+                Some(line_number),
+                error.to_string(),
+            )),
+        }
+    }
+    rows
 }
 
 fn fingerprint_documents(documents: &[Vec<u8>]) -> String {
     let mut hasher = Sha256::new();
     for (name, bytes) in SOURCE_FILES.iter().zip(documents) {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn fingerprint_transport_documents(documents: GraphDocumentBytes<'_>) -> String {
+    let mut hasher = Sha256::new();
+    for (name, bytes) in [
+        (SCHEMA_FILE, documents.schema),
+        (VERTICES_FILE, documents.vertices),
+        (EDGES_FILE, documents.edges),
+    ] {
         hasher.update((name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
         hasher.update((bytes.len() as u64).to_le_bytes());
