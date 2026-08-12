@@ -1,0 +1,20 @@
+{
+  "id": "gap-616857f8",
+  "title": "Graph vertices and existing entities cannot be generic evidence-edge endpoints",
+  "gap_kind": "ontology",
+  "domain": "agentic-corpus/graph",
+  "wanted_capability": "Reflective project-graph vertices (project_graph_vertex refs) and existing blackbox entities (project files, sessions, knowledge) able to serve as endpoints of generic, provenance-carrying evidence edges that cross source graphs and record graphs within an authorized scope: assertion authority, observation or mapping provenance, and freshness on each edge; traversal reporting missing, stale, and unauthorized endpoints explicitly. Needed so tenant records can bind to connector source facts and materialized bytes without collapsing authority planes. Tracked by design/connectors/reflective-graph-connector-program.md; donor implementation (.bbox/evidence/bindings.json overlay) exists on salvage branch campaign/reflective-graph-r2-projection.",
+  "missing_primitive": "Tenant-owned evidence-binding overlay with canonical EntityRef endpoints and generic edge kinds",
+  "evidence": [
+    "design/connectors/reflective-graph-connector-program.md",
+    "design/corpus/agentic-corpus/reflective-project-graph.md (v1 defers edges beyond project-graph vertices)"
+  ],
+  "impact": "medium",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "ontology/agentic-corpus/cross-entity-evidence-endpoints",
+  "suggested_owner": "blackbox",
+  "notes": "Re-filed 2026-08-11 for the modernized connector campaign; replaces a pre-locality gap reference that was never present in any surviving store.",
+  "resolution": "unresolved",
+  "created_at": "2026-08-11T00:00:00Z",
+  "updated_at": "2026-08-11T00:00:00Z"
+}

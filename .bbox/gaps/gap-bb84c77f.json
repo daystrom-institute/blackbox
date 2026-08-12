@@ -1,0 +1,21 @@
+{
+  "id": "gap-bb84c77f",
+  "title": "Producer grants accept exactly one token per producer: rotation has a guaranteed failure window",
+  "gap_kind": "tooling",
+  "domain": "daemon-runtime/producer-auth",
+  "wanted_capability": "Overlap-tolerant producer-grant rotation: a producer grant should accept an ordered list of tokens per producer_id (constant-time verification, matched-token observability) so a token rotation can stage the new token on both sides before retiring the old one. Today a grant names exactly one token_file per producer, so every rotation is a simultaneous two-sided cutover with a guaranteed window where the producer's publishes are refused. Proposed as phase 6 of design/operations/config-artifacts/secrets-provider.md.",
+  "missing_primitive": "Multi-token producer grant (ordered accepted-token list) with per-token match observability",
+  "evidence": [
+    "design/operations/config-artifacts/secrets-provider.md (ServiceToken producer grants section)",
+    "design/daemon-runtime/distributed-code-source-collector-impl.md (producer identity and auth)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "fallback_used": "Rotate during a quiet window and accept the refusal gap; or tolerate a brief red publish cycle since a full rescan is always safe.",
+  "dedupe_key": "tooling/daemon-runtime/producer-grant-rotation-overlap",
+  "suggested_owner": "blackbox",
+  "notes": "Surfaced 2026-08-11 while modernizing the secrets-provider design for the connector campaign.",
+  "resolution": "unresolved",
+  "created_at": "2026-08-11T00:00:00Z",
+  "updated_at": "2026-08-11T00:00:00Z"
+}

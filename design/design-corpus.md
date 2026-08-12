@@ -16,6 +16,9 @@ describes behavior that matters for implementation, verify it against the code,
 
 ## Topic Hubs
 
+- [Connectors](connectors/connectors.md) - producer-plane observers of remote
+  stores and API datasets (drives, Xero, Slack) publishing into the corpus;
+  file-tree, API-dataset, and conversation profiles.
 - [Corpus](corpus/corpus.md) - search, provenance, knowledge, notes, storage,
   code navigation, and corpus-facing assistants.
 - [Orchestration](orchestration/orchestration.md) - atoms, agents, workflows,

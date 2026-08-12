@@ -122,7 +122,14 @@ project concepts should stay above the floor as user schema.
 
 ## Project Ownership
 
-A project graph belongs to one registered project root.
+A project graph belongs to one catalog project. In the durable project
+catalog, a project is a `ProjectScope` with zero or more checkout
+attachments; the graph's files live in the project's committed `.bbox/` tree
+on the checkout plane, and reach the corpus through the repo-owned state
+lane like other committed project knowledge. Graph-fact reads need the same
+published-versus-provisional visibility answer the knowledge lane carries
+(`published | own | all`), so provisional checkout graphs never masquerade
+as accepted publication.
 
 Project-owned schema and facts should be reviewable, diffable, and deletable by
 the project.
@@ -594,3 +601,20 @@ The first useful version needs only:
 - exact inspect and graph traversal.
 
 Everything else is optional pressure discovered from use.
+
+## Relationship To Connector Delivery
+
+The
+[Graph-native connector campaign](../../connectors/reflective-graph-connector-program.md)
+pulls this kernel forward as the substrate for connector-owned source graphs
+and tenant-owned record graphs. That program sequences the additional
+contracts this design deliberately defers: source authority and versioned
+projections, generic evidence endpoints across entity families, and
+participation in unified retrieval. A donor implementation of the kernel
+exists on the salvage branch `campaign/reflective-graph-r2-projection`
+(pre-locality base); porting it is campaign work tracked there.
+
+Later indexing and retrieval integration is owned by
+[Agentic Corpus Platform](agentic-corpus-platform.md). Connector observation,
+byte placement, credential custody, and witness history stay outside the
+graph kernel.

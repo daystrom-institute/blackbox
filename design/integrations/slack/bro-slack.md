@@ -185,7 +185,7 @@ capability to a tier. Implementation phases will live in a companion
 |---|---|
 | **v1** | Outbound notifications via `http_json`; sidecar binary with Socket Mode; webhook envelope contract; routing-packet domain; slash-command and app-mention handling; reaction-as-signal for non-destructive verbs; Block Kit approval messages |
 | **v1.5** | Per-user identity claim flow (§9); App Home rendering of `bbox_inbox`; modal-based cosession kickoff; modal rejection-rationale capture; durable retry/backoff for outbound throttling (§14); council channels with polling-loop streaming; daemon-side `start_arc` idempotency; persistent `WaitStore` |
-| **Phase II** | Slack as a first-class entity in agentic-corpus (§12.9 + §12.10); file ingestion via the agentic-corpus chunker registry (§12.8); permalink-anchored provenance |
+| **Phase II** | Slack as a first-class entity in agentic-corpus (§12.9 + §12.10); file ingestion via the agentic-corpus chunker registry (§12.8); permalink-anchored provenance. Ownership moved: these ingestion items are now owned by `design/connectors/slack-ingestion-connector.md` |
 | **Future possibility** | Multi-workspace Enterprise Grid; one-app-per-persona for council voice fidelity; daemon-side Slack signature awareness (only if the sidecar pattern is abandoned) |
 
 ## 5. Sidecar binary — `bro-slack`
@@ -1078,6 +1078,15 @@ references; `bbox_blame` walks `file:line` → `commit` → `session`
 Depends on Slack entity refs in agentic-corpus (§12.10). Not v1.
 
 ### 12.10 Slack as first-class entity in agentic-corpus [Phase II]
+
+Ownership note (2026-08-11): channel indexing, ingestion, and
+permalink-anchored provenance are now owned by
+`design/connectors/slack-ingestion-connector.md`, which re-homes them onto
+the producer-plane connector architecture and retires the
+`/bbox index-channel` per-channel opt-in below (agent- or user-triggered
+mutation of corpus scope is disallowed by the onboarding trust model). The
+entity grammar sketch remains salvage input to the graph-projection phase of
+the connector program.
 
 Extend the entity-ref grammar:
 

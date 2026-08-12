@@ -1089,6 +1089,9 @@ workflow proves otherwise.
 6. How much Slack-specific state should become first-class
    agentic-corpus entities? Bias: only after the Slack UX iteration is
    stable; live app UX and durable corpus ingestion are separate arcs.
+   The ingestion arc now has its own design:
+   `design/connectors/slack-ingestion-connector.md` owns message
+   observation and corpus ingestion; this doc owns interaction only.
 
 ## 15. Recommended next cut
 

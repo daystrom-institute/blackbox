@@ -1,0 +1,20 @@
+{
+  "id": "gap-5d57d2bb",
+  "title": "Reflective graph vertices do not participate in unified retrieval",
+  "gap_kind": "ontology",
+  "domain": "agentic-corpus/retrieval",
+  "wanted_capability": "Reflective project-graph vertices participating in exact and text retrieval (bbox_hybrid_search and the graph tools) according to per-graph policy: source and record results retaining graph and authority identity, evidence-path expansion accompanying search results, materialized file chunks linking back to remote source vertices, and authorization filters applied before ranking and traversal expansion. Vector indexing optional and schema-directed. The reflective graph v1 deliberately ships exact-ref inspection and traversal only; this gap tracks the retrieval integration the connector program needs for its unified-retrieval milestone. Tracked by design/connectors/reflective-graph-connector-program.md.",
+  "fallback_used": "Exact-ref inspection and traversal of graph vertices; text search over the materialized files only.",
+  "evidence": [
+    "design/connectors/reflective-graph-connector-program.md",
+    "design/corpus/agentic-corpus/reflective-project-graph.md (no full-text or vector indexing in v1)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "ontology/agentic-corpus/graph-retrieval-participation",
+  "suggested_owner": "blackbox",
+  "notes": "Re-filed 2026-08-11 for the modernized connector campaign; replaces a pre-locality gap reference that was never present in any surviving store.",
+  "resolution": "unresolved",
+  "created_at": "2026-08-11T00:00:00Z",
+  "updated_at": "2026-08-11T00:00:00Z"
+}

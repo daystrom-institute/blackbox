@@ -1,0 +1,21 @@
+{
+  "id": "gap-0c7ec76c",
+  "title": "No durable catalog scope family for non-git connector sources",
+  "gap_kind": "ontology",
+  "domain": "connectors/identity",
+  "wanted_capability": "A durable project-catalog scope identity for connector sources that have no git repository and no committed .bbox/config.toml (a Drive folder, a SharePoint library, a Slack workspace, a Xero tenant). PublishedScope mints repo_id from a committed config at local HEAD; connector sources need an equivalent durable, host-independent identity that producer grants can bind and the catalog can hold, with provider coordinates (folder ids, workspace ids) treated as attachment observations rather than identity. Candidate shapes analyzed in design/connectors/remote-source-connectors.md (ConnectorScope variant; grant-time synthetic connector_source_id; committed-config-in-cache, rejected).",
+  "missing_primitive": "Connector scope family in the durable project catalog plus grant-time minting rules",
+  "evidence": [
+    "design/connectors/remote-source-connectors.md (identity section)",
+    "design/connectors/slack-ingestion-connector.md (inherits the question)",
+    "crates/bbox-corpus-core project catalog (PublishedScope)"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "ontology/connectors/non-git-scope-minting",
+  "suggested_owner": "blackbox",
+  "notes": "Phase 0 of the remote-source connector design blocks on this; every network connector profile (file-tree, conversation, API-dataset) inherits it.",
+  "resolution": "unresolved",
+  "created_at": "2026-08-11T00:00:00Z",
+  "updated_at": "2026-08-11T00:00:00Z"
+}
