@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use anyhow::Context;
 
 use crate::knowledge::{
     DecideParams, ForgetParams, KnowledgeLinkParams, KnowledgeListParams, LearnParams,
@@ -432,18 +431,6 @@ impl BlackboxServer {
                 .parse::<crate::knowledge::Priority>()
                 .map_err(|_| anyhow::anyhow!("invalid priority: {value}")),
         }
-    }
-
-    /// Pending backchannel write content for a repo path, when one is in
-    /// flight: chained mutations inside one collector cycle must see each
-    /// other, so the pending record supersedes the published view.
-    fn pending_mutation_content(&self, relative_path: &str) -> Option<String> {
-        self.state
-            .checkout_mutations
-            .read()
-            .pending_for_path(relative_path)
-            .filter(|pending| pending.mutation.mode == "write")
-            .and_then(|pending| pending.mutation.content_json.clone())
     }
 
     /// Id-addressed coverage lookup for knowledge mutations that carry no

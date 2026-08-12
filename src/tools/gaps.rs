@@ -1,5 +1,4 @@
 use crate::gaps::{GapFileParams, GapListParams, GapResolveParams, GapUpdateParams};
-use anyhow::Context;
 use crate::server::BlackboxServer;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -334,7 +333,7 @@ impl BlackboxServer {
     /// Pending backchannel write content for a repo path, when one is in
     /// flight: chained mutations inside one collector cycle must see each
     /// other, so the pending record supersedes the published view.
-    fn pending_mutation_content(&self, relative_path: &str) -> Option<String> {
+    pub(crate) fn pending_mutation_content(&self, relative_path: &str) -> Option<String> {
         self.state
             .checkout_mutations
             .read()
