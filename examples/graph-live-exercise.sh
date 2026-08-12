@@ -701,12 +701,22 @@ step_provisional_capture() {
 }
 
 step_own_visibility() {
-    # First read the bound session's own knowledge view. That call is what
-    # recomputes this workspace's provisional overlay pair, and installing the
-    # captured project graph overlay rides along with it: a graph read on its
-    # own does not materialize the overlay, so an own graph list issued before
-    # any knowledge or gap own read still answers from the published lane.
-    mcp_call "$BOUND_SESSION" bbox_project_graph_list '{"visibility":"own"}' own-graph-list-cold
+    # A cold read: this session has issued no knowledge or gap own read, so
+    # nothing but the capture's own finalize could have installed the overlay.
+    mcp_call "$BOUND_SESSION" bbox_project_graph_list '{"visibility":"own"}' own-graph-list-cold || {
+        cat "$EVIDENCE/own-graph-list-cold.json" >&2
+        return 1
+    }
+    jq -e --arg graph "$GRAPH_ID" --arg checkout "$CHECKOUT_ID" '
+        [.graphs[] | select(.graph_id == $graph)] as $rows |
+        ($rows | length) == 1 and
+        ($rows[0].source == "provisional") and
+        ($rows[0].checkout_id == $checkout)
+    ' "$EVIDENCE/own-graph-list-cold.json" >/dev/null || {
+        echo "a cold own read did not serve the captured generation" >&2
+        cat "$EVIDENCE/own-graph-list-cold.json" >&2
+        return 1
+    }
     mcp_call "$BOUND_SESSION" bbox_knowledge '{"provisional":"own","limit":5}' own-knowledge || {
         cat "$EVIDENCE/own-knowledge.json" >&2
         return 1
@@ -764,7 +774,7 @@ step_own_visibility() {
         echo "own describe did not reflect the overlay" >&2
         return 1
     }
-    note "own visibility shows $((PUBLISHED_VERTEX_COUNT + 1)) vertices from the overlay; published still shows $PUBLISHED_VERTEX_COUNT"
+    note "a cold own read already serves the overlay: $((PUBLISHED_VERTEX_COUNT + 1)) vertices against $PUBLISHED_VERTEX_COUNT published"
 }
 
 step_provisional_ref() {
@@ -839,14 +849,8 @@ step_invalid_diagnostics() {
         cat "$EVIDENCE/invalid-capture.err" >&2
         return 1
     }
-    # Same overlay coupling as the step above: the freshly captured generation
-    # reaches the graph views when the bound session recomputes its own
-    # knowledge overlay, so read that first or the graph calls below answer
-    # from the previous provisional generation.
-    mcp_call "$BOUND_SESSION" bbox_knowledge '{"provisional":"own","limit":5}' own-knowledge-after-invalid || {
-        cat "$EVIDENCE/own-knowledge-after-invalid.json" >&2
-        return 1
-    }
+    # No knowledge read in between: the second capture's finalize is what makes
+    # this generation the one the own lane answers from.
     mcp_call "$BOUND_SESSION" bbox_project_graph_validate \
         "$(jq -cn --arg project "$PROJECT_ID" --arg graph "$GRAPH_ID" \
             '{project:$project,graph_id:$graph,visibility:"own"}')" own-graph-validate || {
