@@ -137,6 +137,57 @@ env overrides applied on top of compiled defaults, so no config file is needed.
 If you need config-file-only settings (e.g. provider overrides), create a
 minimal `config.toml` and point `BLACKBOX_CONFIG` at it.
 
+## Standing the throwaway daemon up in catalog mode
+
+By default a throwaway daemon boots in **bridge mode**: its state root has no
+projects store, the startup probe reports `AbsentBridge`, and the version-1
+project registry becomes the runtime authority. That is the right default for
+probing routes and dispatch, and the wrong one for validating anything on the
+catalog plane (zero-checkout-authority reads, collector-published projects,
+attachment admission, publisher advance).
+
+Catalog mode needs a version-2 store at the resolved projects path, and a fresh
+state root cannot get one by migrating: `project-catalog migrate --preflight`
+inventories owner stores that a never-written bundle does not have, emits
+`immutable_lane_missing` for each, and the apply then refuses the unclean report
+with `error.project_catalog_migration_report_not_clean`. Migration carries an
+occupied bundle across; it has nothing to carry here.
+
+Initialize the store explicitly instead, before first boot:
+
+```bash
+STATE=/tmp/blackbox-dev-throwaway/state
+
+blackbox project-catalog genesis --state-dir "$STATE"
+```
+
+The verb writes the `fresh_v2` catalog and attachment pair at epoch one and
+nothing else: no migration marker, no immutable assets, no rollback backups
+(a fresh origin legitimately carries none of those, and strict pair open
+refuses a fresh catalog that has a marker). Point the daemon at the same state
+root afterwards and startup selects catalog mode with no further steps.
+
+Genesis is for bundles with no project state, and proves that before it writes.
+It refuses, naming the offending store, when:
+
+| Refusal | Meaning |
+|---|---|
+| `error.project_catalog_genesis_catalog_exists` | a version-2 catalog is already there; genesis never replaces one |
+| `error.project_catalog_genesis_catalog_state_present` | the bundle carries catalog-owned artifacts (attachments, journal, marker, receipt, assets, stage, backups, accepted publications) |
+| `error.project_catalog_genesis_owner_not_empty` | a legacy owner store holds project-scoped rows; that bundle is migration input, so run `project-catalog migrate` |
+| `error.project_catalog_genesis_owner_unprobeable` | an owner store could not be read, so its emptiness cannot be proved; an unreadable store is never counted as empty |
+
+A version-1 projects store registering **zero** projects is the one legacy
+artifact genesis accepts: it is what a bridge daemon that registered nothing
+leaves behind. It is set aside as `projects.json.pre-genesis` beside the new
+catalog rather than deleted.
+
+Options mirror `migrate`: `--config <path>` selects the same configuration file
+the daemon reads, `--state-dir <path>` overrides the whole conventional bundle,
+and `--projects-path <path>` overrides only the projects store location. The
+receipt on stdout carries the epoch, both pair hashes, and the full owner
+census, so a refusal and a success are equally auditable.
+
 ## Connecting `bro fleet` / `bro`
 
 The `bro` CLI and `bro fleet` TUI resolve the daemon URL in this order:
