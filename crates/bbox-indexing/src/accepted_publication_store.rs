@@ -1374,7 +1374,15 @@ pub(crate) fn prepare_accepted_publication_v1(
         let edges = files
             .get("edges.jsonl")
             .ok_or_else(|| invalid_generation("accepted graph is missing edges.jsonl"))?;
-        if files.len() != 3 {
+        let descriptor = files.get("graph.json").map(Vec::as_slice);
+        if files.len() > 4
+            || files.keys().any(|filename| {
+                !matches!(
+                    filename.as_str(),
+                    "graph.json" | "schema.json" | "vertices.jsonl" | "edges.jsonl"
+                )
+            })
+        {
             return Err(invalid_generation(
                 "accepted graph contains an unknown source file",
             ));
@@ -1383,6 +1391,7 @@ pub(crate) fn prepare_accepted_publication_v1(
             input.project_id.as_str(),
             &graph_id,
             bbox_project_graph::GraphDocumentBytes {
+                descriptor,
                 schema,
                 vertices,
                 edges,
@@ -1852,7 +1861,15 @@ fn validate_accepted_graph_sources(
         let edges = files
             .get("edges.jsonl")
             .ok_or_else(|| invalid_generation("accepted graph is missing edges.jsonl"))?;
-        if files.len() != 3 {
+        let descriptor = files.get("graph.json").copied();
+        if files.len() > 4
+            || files.keys().any(|filename| {
+                !matches!(
+                    filename.as_str(),
+                    "graph.json" | "schema.json" | "vertices.jsonl" | "edges.jsonl"
+                )
+            })
+        {
             return Err(invalid_generation(
                 "accepted graph contains an unknown source file",
             ));
@@ -1861,6 +1878,7 @@ fn validate_accepted_graph_sources(
             project_id.as_str(),
             &graph_id,
             bbox_project_graph::GraphDocumentBytes {
+                descriptor,
                 schema,
                 vertices,
                 edges,
@@ -2941,6 +2959,13 @@ mod tests {
     fn governance_graph_sources() -> Vec<AcceptedGraphSourceV1Input> {
         [
             (
+                "graph.json",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/graph.json"
+                )
+                .as_slice(),
+            ),
+            (
                 "schema.json",
                 include_bytes!(
                     "../../bbox-project-graph/tests/fixtures/governance-record/schema.json"
@@ -2976,9 +3001,24 @@ mod tests {
         input.graphs = governance_graph_sources();
         let prepared =
             prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
+        assert_eq!(prepared.generation.counts.graph_files, 4);
+        assert_eq!(prepared.generation.graph_sources.len(), 4);
+        assert!(prepared.generation.hashes.graph_sources_sha256.is_some());
+    }
+
+    #[test]
+    fn candidate_builder_accepts_a_graph_without_the_optional_descriptor() {
+        let mut input = build_input();
+        input.graphs = governance_graph_sources()
+            .into_iter()
+            .filter(|source| !source.repository_relative_filename.ends_with("/graph.json"))
+            .collect();
+
+        let prepared =
+            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
+
         assert_eq!(prepared.generation.counts.graph_files, 3);
         assert_eq!(prepared.generation.graph_sources.len(), 3);
-        assert!(prepared.generation.hashes.graph_sources_sha256.is_some());
     }
 
     #[test]

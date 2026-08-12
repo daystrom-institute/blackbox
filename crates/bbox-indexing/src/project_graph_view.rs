@@ -493,6 +493,7 @@ fn parse_graph_entry(
         scope_id,
         graph_id,
         GraphDocumentBytes {
+            descriptor: files.get("graph.json").map(Vec::as_slice),
             schema,
             vertices,
             edges,

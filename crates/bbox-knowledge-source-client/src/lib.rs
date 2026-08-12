@@ -838,6 +838,7 @@ fn capture_working_graphs(
     }
     let prefix = lane_repository_directory(scope, SourceLaneV1::Graphs);
     let required = BTreeSet::from(["schema.json", "vertices.jsonl", "edges.jsonl"]);
+    let allowed = BTreeSet::from(["graph.json", "schema.json", "vertices.jsonl", "edges.jsonl"]);
     let mut entries = Vec::with_capacity(graph_ids.len().saturating_mul(3));
     for graph_id in graph_ids {
         let graph_path = directory_path.join(&graph_id);
@@ -854,13 +855,14 @@ fn capture_working_graphs(
                 .map_err(|_| anyhow!("bound graph filename is not UTF-8"))?;
             if entry.file_type()?.is_symlink()
                 || !entry.file_type()?.is_file()
-                || !required.contains(name.as_str())
+                || !allowed.contains(name.as_str())
             {
                 bail!("bound graph directory contains an unknown or unsafe file");
             }
             names.insert(name);
         }
-        if names.iter().map(String::as_str).collect::<BTreeSet<_>>() != required {
+        let present = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if !required.is_subset(&present) || !present.is_subset(&allowed) {
             bail!("bound graph directory is missing a required source file");
         }
         let before = entries.len();
@@ -1248,6 +1250,80 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("unknown or unsafe file"));
+    }
+
+    #[test]
+    fn graph_capture_accepts_three_files_and_the_optional_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let graph = write_working_graph(&root, "records");
+        let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
+            .unwrap()
+            .unwrap();
+        let mut blobs = BTreeMap::new();
+        let three_files = capture_working_graphs(
+            &root.join(".bbox/graphs"),
+            &lane,
+            &PublishedScope::try_new("capture-test", ".").unwrap(),
+            KnowledgeSourceLimits::default(),
+            &mut blobs,
+        )
+        .unwrap();
+        assert_eq!(three_files.len(), 3);
+
+        fs::remove_dir_all(&graph).unwrap();
+        fs::create_dir_all(&graph).unwrap();
+        for (filename, bytes) in [
+            (
+                "graph.json",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/graph.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "schema.json",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/schema.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "vertices.jsonl",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/vertices.jsonl"
+                )
+                .as_slice(),
+            ),
+            (
+                "edges.jsonl",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/edges.jsonl"
+                )
+                .as_slice(),
+            ),
+        ] {
+            fs::write(graph.join(filename), bytes).unwrap();
+        }
+        let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
+            .unwrap()
+            .unwrap();
+        let mut blobs = BTreeMap::new();
+        let governance = capture_working_graphs(
+            &root.join(".bbox/graphs"),
+            &lane,
+            &PublishedScope::try_new("capture-test", ".").unwrap(),
+            KnowledgeSourceLimits::default(),
+            &mut blobs,
+        )
+        .unwrap();
+
+        assert_eq!(governance.len(), 4);
+        assert!(
+            governance
+                .iter()
+                .any(|entry| { entry.repository_relative_filename.ends_with("/graph.json") })
+        );
     }
 
     #[cfg(unix)]
