@@ -1257,6 +1257,7 @@ async fn ack_checkout_mutation(
         }));
     };
     require_scope(&grant, &scope)?;
+    let persist_state = state.clone();
     let settled = blocking(move || {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let mut store = state.checkout_mutations.write();
@@ -1280,7 +1281,7 @@ async fn ack_checkout_mutation(
             status: "already_settled".to_string(),
         }));
     }
-    state
+    persist_state
         .persist_checkout_mutations_durable()
         .await
         .map_err(HttpError::from_store)?;

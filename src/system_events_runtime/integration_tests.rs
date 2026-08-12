@@ -53,6 +53,15 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let pins_path = tmp.path().join("pins.json");
     let pins = Arc::new(RwLock::new(Pins::open(&pins_path).unwrap()));
     let pins_persister = StorePersister::spawn("pins-test", pins.clone(), pins_path);
+    let checkout_mutations_path = tmp.path().join("checkout-mutations.json");
+    let checkout_mutations = Arc::new(RwLock::new(
+        crate::checkout_mutations::CheckoutMutations::open(&checkout_mutations_path).unwrap(),
+    ));
+    let checkout_mutations_persister = StorePersister::spawn(
+        "checkout-mutations-test",
+        checkout_mutations.clone(),
+        checkout_mutations_path,
+    );
     let projects_path = tmp.path().join("projects.json");
     let projects = Arc::new(RwLock::new(
         ProjectRegistry::open(projects_path.clone()).unwrap(),
@@ -108,6 +117,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         notes_persister,
         pins,
         pins_persister,
+        checkout_mutations,
+        checkout_mutations_persister,
         project_authority: crate::server::state::ProjectAuthority::Bridge {
             registry: projects,
             persister: projects_persister,
