@@ -1,0 +1,20 @@
+{
+  "id": "0df17423bb28b239",
+  "title": "Project knowledge/gap MCP writes ride the checkout-owner backchannel; commit to publish",
+  "content": "Project-scoped knowledge and gap MCP writes (bbox_learn/bbox_remember/bbox_decide/bbox_forget, bbox_gap family, bbox_review, bbox_knowledge_link) on cutover-covered projects ride the checkout-mutation backchannel: the daemon validates and enqueues the exact .bbox/ file bytes, the checkout-owner collector applies them within one cycle. The tool response names the landing path; commit the delivered file with your change to publish it. Never hand-author .bbox/knowledge or .bbox/gaps records; if the lane errors, surface it rather than falling back to manual JSON.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "project_id": "89bd722f",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-08-12T06:18:29Z",
+  "updated_at": "2026-08-12T06:18:29Z",
+  "recall_count": 0
+}
