@@ -145,7 +145,55 @@ impl HnswIndex {
                 .min(50.max(index.options.ef_construction * idx.min(1000) / 1000));
             index.insert_internal_with_ef(ordinal, ramped_ef);
         }
+        index.reconnect_zero_in_degree_orphans();
         Ok(index)
+    }
+
+    /// Post-build repair for the exact/near-duplicate degeneracy documented
+    /// in gap-2eabd96d. In pockets tighter than the selection heuristic can
+    /// discriminate (pairwise distances tied within f32 noise), deterministic
+    /// near-tie evictions starve the same members of inbound edges no matter
+    /// which shrink rule runs, and forward-edge search can never reach them.
+    /// Diversity cannot break exact ties, so after the bulk build, attach
+    /// every remaining zero-in-degree active node to its nearest connected
+    /// layer-0 neighbor (its cluster twin, which answers the same queries).
+    /// The twin's adjacency may exceed max_neighbors by the orphan count; a
+    /// bounded degree overflow costs search nothing meaningful, while an
+    /// unreachable node costs recall outright.
+    fn reconnect_zero_in_degree_orphans(&mut self) {
+        let mut has_inbound = vec![false; self.ids.len()];
+        if let Some(entry_point) = self.entry_point {
+            has_inbound[entry_point] = true;
+        }
+        for (ordinal, layers) in self.graph.iter().enumerate() {
+            if !self.active[ordinal] {
+                continue;
+            }
+            for neighbors in layers {
+                for &neighbor in neighbors {
+                    has_inbound[neighbor] = true;
+                }
+            }
+        }
+        let Some(entry_point) = self.entry_point else {
+            return;
+        };
+        let orphans: Vec<usize> = (0..self.ids.len())
+            .filter(|&ordinal| self.active[ordinal] && !has_inbound[ordinal])
+            .collect();
+        if orphans.is_empty() {
+            return;
+        }
+        let ef = self.options.ef_search.max(16);
+        for ordinal in orphans {
+            let candidates =
+                self.search_layer(self.vectors.get(ordinal), &[entry_point], ef, 0);
+            if let Some((nearest, _)) = candidates.first()
+                && *nearest != ordinal
+            {
+                self.graph[*nearest][0].push(ordinal);
+            }
+        }
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchHit> {
@@ -861,6 +909,69 @@ mod tests {
         );
         let self_recall = index.self_recall_probe(5, 10);
         assert!(self_recall >= 0.98, "self-recall {self_recall}");
+    }
+
+    /// The production visual partition's shape: near-duplicate pockets far
+    /// tighter than the diversity heuristic can discriminate (hundreds of
+    /// members within f32 noise of each other, e.g. identical screenshots
+    /// under distinct entity ids). Deterministic near-tie evictions starve
+    /// the same members of inbound edges on every selection path, so the
+    /// bulk build ends with a post-pass that reconnects any remaining
+    /// zero-in-degree node to its nearest connected neighbor.
+    #[test]
+    fn bulk_build_reconnects_exact_duplicate_pockets() {
+        let dims = 32;
+        let mut rng = SplitMix64::new(11);
+        let mut corpus = Vec::new();
+        for c in 0..4 {
+            let centroid = gaussian_unit_vector(&mut rng, dims);
+            for i in 0..150 {
+                // Half exact copies, half within 1e-4 noise: both tie every
+                // distance comparison a selection heuristic can make.
+                let mut vector = if i % 2 == 0 {
+                    centroid.clone()
+                } else {
+                    centroid
+                        .iter()
+                        .map(|value| value + gaussian(&mut rng) * 0.0001)
+                        .collect::<Vec<f32>>()
+                };
+                normalize(&mut vector);
+                corpus.push((format!("c{c}-n{i}"), vector));
+            }
+        }
+        for i in 0..300 {
+            corpus.push((format!("spread-{i}"), gaussian_unit_vector(&mut rng, dims)));
+        }
+
+        let index = HnswIndex::build(corpus, HnswOptions::default()).unwrap();
+        let metrics = index.diagnostics();
+        assert_eq!(
+            metrics.zero_in_degree_nodes, 0,
+            "every orphan must be reconnected (disconnected {})",
+            metrics.disconnected_nodes
+        );
+        // Exact-own-id self-recall is the wrong target under exact
+        // duplicates (a query's top-k fills with identical twins), so
+        // assert semantic recall: every sampled member finds a twin from
+        // its own cluster.
+        let mut found = 0usize;
+        let mut sampled = 0usize;
+        for c in 0..4 {
+            for i in (0..150).step_by(15) {
+                let id = format!("c{c}-n{i}");
+                let ordinal = index.active_ordinal_by_id[&id];
+                let hits = index.search(index.vectors.get(ordinal), 10);
+                sampled += 1;
+                if hits
+                    .iter()
+                    .any(|hit| hit.id.starts_with(&format!("c{c}-")))
+                {
+                    found += 1;
+                }
+            }
+        }
+        assert_eq!(found, sampled, "every cluster member must find a twin");
     }
 
     #[test]
