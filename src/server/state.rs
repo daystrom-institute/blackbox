@@ -104,6 +104,12 @@ pub(crate) struct SharedState {
     pub(crate) notes_persister: StorePersister<Notes>,
     pub(crate) pins: Arc<RwLock<Pins>>,
     pub(crate) pins_persister: StorePersister<Pins>,
+    /// Durable pending checkout mutations (repo-owned file writes the
+    /// daemon validated but cannot apply; the checkout-owner collector
+    /// polls and acks them over the producer channel).
+    pub(crate) checkout_mutations: Arc<RwLock<crate::checkout_mutations::CheckoutMutations>>,
+    pub(crate) checkout_mutations_persister:
+        StorePersister<crate::checkout_mutations::CheckoutMutations>,
     /// The runtime project authority selected by the startup store-version
     /// probe (phase-2 §4.1). Consumers never match this directly outside
     /// the defined seams: record enumeration goes through
@@ -680,6 +686,10 @@ impl SharedState {
         self.pins_persister.request_durable().await
     }
 
+    pub(crate) async fn persist_checkout_mutations_durable(&self) -> anyhow::Result<()> {
+        self.checkout_mutations_persister.request_durable().await
+    }
+
     pub(crate) async fn persist_projects_durable(&self) -> anyhow::Result<()> {
         match &self.project_authority {
             ProjectAuthority::Bridge { persister, .. } => persister.request_durable().await,
@@ -933,6 +943,15 @@ impl SharedState {
         let pins_path = store_dir.join("pins.json");
         let pins_store = Arc::new(RwLock::new(Pins::open(&pins_path).unwrap()));
         let pins_persister = StorePersister::spawn("pins-test", pins_store.clone(), pins_path);
+        let checkout_mutations_path = store_dir.join("checkout-mutations.json");
+        let checkout_mutations_store = Arc::new(RwLock::new(
+            crate::checkout_mutations::CheckoutMutations::open(&checkout_mutations_path).unwrap(),
+        ));
+        let checkout_mutations_persister = StorePersister::spawn(
+            "checkout-mutations-test",
+            checkout_mutations_store.clone(),
+            checkout_mutations_path,
+        );
         let projects_persister =
             StorePersister::spawn("projects-test", projects_store.clone(), projects_path);
         if projects_needs_persist {
@@ -960,6 +979,8 @@ impl SharedState {
             notes_persister,
             pins: pins_store,
             pins_persister,
+            checkout_mutations: checkout_mutations_store,
+            checkout_mutations_persister,
             project_authority,
             // `for_test` builds the bridge authority, which never has an
             // accepted-publication runtime.

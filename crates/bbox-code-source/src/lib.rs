@@ -38,6 +38,8 @@ pub enum ContractError {
     InvalidScope(String),
     #[error("invalid catalog onboard request field: {0}")]
     InvalidOnboardField(&'static str),
+    #[error("invalid checkout mutation field: {0}")]
+    InvalidCheckoutMutationField(&'static str),
     #[error("invalid producer id")]
     InvalidProducerId,
     #[error("invalid relative path: {0}")]
@@ -336,6 +338,161 @@ pub struct CatalogOnboardResponseV1 {
     #[serde(default)]
     pub nominated_aliases: Vec<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Checkout-mutation backchannel (v1)
+//
+// The daemon computes repo-owned file mutations it cannot apply itself (zero
+// checkout authority): a validated gap record, a rewritten knowledge entry, a
+// deletion. The checkout-owner collector polls for pending mutations over the
+// authenticated producer channel, applies them byte-for-byte, and acks. All
+// schema intelligence stays daemon-side; the collector is a dumb writer. The
+// path constraint below is the safety boundary: this lane can only ever touch
+// committed `.bbox/` state, never arbitrary checkout files.
+// ---------------------------------------------------------------------------
+
+pub const CHECKOUT_MUTATION_SCHEMA_VERSION: u32 = 1;
+pub const MAX_CHECKOUT_MUTATIONS_PER_POLL: usize = 64;
+pub const MAX_CHECKOUT_MUTATION_PATH_BYTES: usize = 1024;
+pub const MAX_CHECKOUT_MUTATION_CONTENT_BYTES: usize = 256 * 1024;
+pub const MAX_CHECKOUT_MUTATION_REASON_BYTES: usize = 2048;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutMutationV1 {
+    pub schema_version: u32,
+    /// `cm-<16hex>`, minted by the daemon at enqueue time.
+    pub mutation_id: String,
+    /// The published scope whose checkout receives the write.
+    pub scope: PublishedScope,
+    /// Repo-relative path, always below `.bbox/` (the lane's boundary).
+    pub relative_path: String,
+    /// `write` (exact bytes in `content_json`) or `delete`.
+    pub mode: String,
+    pub content_json: Option<String>,
+    /// Short agent/operator-facing provenance (which tool call enqueued).
+    pub reason: String,
+    pub enqueued_at: String,
+}
+
+impl CheckoutMutationV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != CHECKOUT_MUTATION_SCHEMA_VERSION {
+            return Err(ContractError::UnsupportedSchema(self.schema_version));
+        }
+        validate_scope(&self.scope)?;
+        if self.mutation_id.len() != 19
+            || !self.mutation_id.starts_with("cm-")
+            || !self.mutation_id[3..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ContractError::InvalidCheckoutMutationField("mutation_id"));
+        }
+        if self.relative_path.len() > MAX_CHECKOUT_MUTATION_PATH_BYTES
+            || validate_relative_path(&self.relative_path).is_err()
+            || !self.relative_path.starts_with(".bbox/")
+        {
+            return Err(ContractError::InvalidCheckoutMutationField(
+                "relative_path must be a clean path below .bbox/",
+            ));
+        }
+        match self.mode.as_str() {
+            "write" => match &self.content_json {
+                Some(content) if content.len() <= MAX_CHECKOUT_MUTATION_CONTENT_BYTES => {}
+                _ => {
+                    return Err(ContractError::InvalidCheckoutMutationField(
+                        "write mode requires content_json within the byte cap",
+                    ));
+                }
+            },
+            "delete" => {
+                if self.content_json.is_some() {
+                    return Err(ContractError::InvalidCheckoutMutationField(
+                        "delete mode carries no content_json",
+                    ));
+                }
+            }
+            _ => return Err(ContractError::InvalidCheckoutMutationField("mode")),
+        }
+        if self.reason.is_empty() || self.reason.len() > MAX_CHECKOUT_MUTATION_REASON_BYTES {
+            return Err(ContractError::InvalidCheckoutMutationField("reason"));
+        }
+        if self.enqueued_at.is_empty() {
+            return Err(ContractError::InvalidCheckoutMutationField("enqueued_at"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutMutationPollRequestV1 {
+    pub schema_version: u32,
+}
+
+impl CheckoutMutationPollRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != CHECKOUT_MUTATION_SCHEMA_VERSION {
+            return Err(ContractError::UnsupportedSchema(self.schema_version));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutMutationPollResponseV1 {
+    /// Pending mutations whose scopes the producer grant covers, oldest
+    /// first, capped at MAX_CHECKOUT_MUTATIONS_PER_POLL.
+    pub mutations: Vec<CheckoutMutationV1>,
+    /// Pending mutations behind the cap or outside the grant, for
+    /// observability (the producer re-polls next cycle).
+    pub deferred: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutMutationAckRequestV1 {
+    pub schema_version: u32,
+    pub mutation_id: String,
+    /// `applied` or `failed`.
+    pub outcome: String,
+    pub error: Option<String>,
+    /// sha256 of the bytes written, when outcome is `applied` on a write.
+    pub content_sha256: Option<String>,
+}
+
+impl CheckoutMutationAckRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version != CHECKOUT_MUTATION_SCHEMA_VERSION {
+            return Err(ContractError::UnsupportedSchema(self.schema_version));
+        }
+        if !matches!(self.outcome.as_str(), "applied" | "failed") {
+            return Err(ContractError::InvalidCheckoutMutationField("outcome"));
+        }
+        if let Some(error) = &self.error {
+            if error.len() > MAX_CHECKOUT_MUTATION_REASON_BYTES {
+                return Err(ContractError::InvalidCheckoutMutationField("error"));
+            }
+        }
+        if let Some(digest) = &self.content_sha256 {
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(ContractError::InvalidDigest);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutMutationAckResponseV1 {
+    /// `applied`, `failed`, `already_settled` (duplicate terminal ack), or
+    /// `unknown_mutation`.
+    pub status: String,
+}
+
 
 pub fn validate_scope(scope: &PublishedScope) -> Result<(), ContractError> {
     if scope.repo_id().trim().is_empty()
@@ -837,6 +994,85 @@ mod tests {
     #[test]
     fn catalog_onboard_request_accepts_a_valid_probe() {
         valid_onboard_request().validate().unwrap();
+    }
+
+    fn valid_checkout_mutation() -> CheckoutMutationV1 {
+        CheckoutMutationV1 {
+            schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: "cm-0123456789abcdef".into(),
+            scope: scope(),
+            relative_path: ".bbox/gaps/gap-0123abcd.json".into(),
+            mode: "write".into(),
+            content_json: Some("{\"id\":\"gap-0123abcd\"}".into()),
+            reason: "bbox_gap(scope=project) via checkout-owner lane".into(),
+            enqueued_at: "2026-08-12T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn checkout_mutation_accepts_a_valid_write() {
+        valid_checkout_mutation().validate().unwrap();
+        let mut delete = valid_checkout_mutation();
+        delete.mode = "delete".into();
+        delete.content_json = None;
+        delete.validate().unwrap();
+    }
+
+    #[test]
+    fn checkout_mutation_rejects_paths_outside_bbox_state() {
+        for bad in [
+            "src/main.rs",
+            ".bbox",
+            ".bbox/../Cargo.toml",
+            "/abs/.bbox/gaps/gap-x.json",
+            ".bbox/gaps/../escape",
+        ] {
+            let mut mutation = valid_checkout_mutation();
+            mutation.relative_path = bad.into();
+            assert!(mutation.validate().is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn checkout_mutation_rejects_mode_content_mismatches() {
+        let mut write_without_content = valid_checkout_mutation();
+        write_without_content.content_json = None;
+        assert!(write_without_content.validate().is_err());
+
+        let mut delete_with_content = valid_checkout_mutation();
+        delete_with_content.mode = "delete".into();
+        assert!(delete_with_content.validate().is_err());
+
+        let mut unknown_mode = valid_checkout_mutation();
+        unknown_mode.mode = "append".into();
+        assert!(unknown_mode.validate().is_err());
+
+        let mut bad_id = valid_checkout_mutation();
+        bad_id.mutation_id = "0123456789abcdef".into();
+        assert!(bad_id.validate().is_err());
+    }
+
+    #[test]
+    fn checkout_mutation_ack_validates_outcome_and_digest() {
+        let valid = CheckoutMutationAckRequestV1 {
+            schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: "cm-0123456789abcdef".into(),
+            outcome: "applied".into(),
+            error: None,
+            content_sha256: Some("a".repeat(64)),
+        };
+        valid.validate().unwrap();
+
+        let mut bad_outcome = valid.clone();
+        bad_outcome.outcome = "maybe".into();
+        assert!(bad_outcome.validate().is_err());
+
+        let mut bad_digest = valid.clone();
+        bad_digest.content_sha256 = Some("xyz".into());
+        assert!(matches!(
+            bad_digest.validate(),
+            Err(ContractError::InvalidDigest)
+        ));
     }
 
     #[test]

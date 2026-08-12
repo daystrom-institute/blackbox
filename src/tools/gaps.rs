@@ -1,4 +1,5 @@
 use crate::gaps::{GapFileParams, GapListParams, GapResolveParams, GapUpdateParams};
+use anyhow::Context;
 use crate::server::BlackboxServer;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -56,25 +57,6 @@ impl BlackboxServer {
         Option<String>,
         Option<bbox_corpus_core::project_record::ResolvedCheckoutScope>,
     )> {
-        // The coverage refusal must precede the checkout lease: acquiring a
-        // RepositoryMutation lease canonicalizes the authority root, which a
-        // zero-checkout-authority daemon cannot do, and the resulting
-        // attachment_inactive would mask this lane's real guidance.
-        if let Ok(project_id) = self.validate_project_selection(raw)
-            && self
-                .state
-                .knowledge_transport_cutover
-                .covers_project_str(&project_id)
-        {
-            self.observe_knowledge_transport_operation(
-                &project_id,
-                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
-                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
-            );
-            anyhow::bail!(
-                "error.knowledge_transport_authoritative: this project's gaps are transport-governed and the daemon holds no checkout authority; write the gap as a committed .bbox/gaps/gap-<id>.json record on the checkout host (same schema as the existing files there) and the collector will publish it"
-            );
-        }
         let resolution = self.resolve_project_write(raw)?;
         let durable_scope = resolution.durable_scope;
         let resolved_project_id = resolution.project_id;
@@ -142,6 +124,347 @@ impl BlackboxServer {
         }
         Ok(())
     }
+
+    /// The catalog-published scope when the selector names a
+    /// cutover-covered project. Covered projects mutate repo-owned state
+    /// through the checkout-owner backchannel, never through a daemon-local
+    /// checkout lease (a zero-authority daemon has none).
+    fn covered_project_scope(
+        &self,
+        raw: &str,
+    ) -> Option<(String, bbox_corpus_core::identity::PublishedScope)> {
+        let project_id = self.validate_project_selection(raw).ok()?;
+        self.covered_scope_for_project_id(&project_id)
+            .map(|scope| (project_id, scope))
+    }
+
+    /// Coverage and scope lookup by durable project id (for id-addressed
+    /// mutations like bbox_forget, which carry no project selector).
+    fn covered_scope_for_project_id(
+        &self,
+        project_id: &str,
+    ) -> Option<bbox_corpus_core::identity::PublishedScope> {
+        if !self
+            .state
+            .knowledge_transport_cutover
+            .covers_project_str(project_id)
+        {
+            return None;
+        }
+        let store = self.state.project_authority.catalog_store()?.clone();
+        let snapshot = store.snapshot().ok()?;
+        let id = bbox_corpus_core::project_catalog::ProjectId::parse(project_id).ok()?;
+        let project = snapshot.catalog().projects.get(&id)?;
+        match &project.scope {
+            bbox_corpus_core::project_catalog::ProjectScope::Published(scope) => {
+                Some(scope.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Enqueue the exact committed-file bytes for checkout-owner delivery
+    /// and record the transport observation. Returns the mutation id.
+    fn enqueue_gap_file(
+        &self,
+        project_id: &str,
+        scope: bbox_corpus_core::identity::PublishedScope,
+        gap: &crate::gaps::GapNote,
+        reason: &str,
+    ) -> anyhow::Result<String> {
+        let bytes = crate::gaps::committed_gap_note_bytes(gap)?;
+        let content = String::from_utf8(bytes)?;
+        let relative_path = format!(".bbox/gaps/{}.json", gap.id);
+        let mutation_id = self
+            .state
+            .checkout_mutations
+            .write()
+            .enqueue_file_mutation(
+                scope,
+                relative_path.clone(),
+                "write",
+                Some(content),
+                reason.to_string(),
+                bbox_util::util::now_iso(),
+            )?;
+        self.state.checkout_mutations_persister.request();
+        self.observe_knowledge_transport_operation(
+            project_id,
+            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
+            bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::Remote,
+        );
+        Ok(format!(
+            "queued {mutation_id} -> {relative_path}; it lands in the checkout within one collector cycle and publishes when committed"
+        ))
+    }
+
+    /// Covered-project gap filing through the checkout-owner backchannel.
+    /// Mirrors GapStore::file_locked's validation and open-duplicate
+    /// dedupe against the served view. None = project not covered; the
+    /// caller takes the local-carrier path.
+    fn enqueue_gap_file_via_checkout_owner(
+        &self,
+        p: &GapFileParams,
+        raw: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some((project_id, scope)) = self.covered_project_scope(raw) else {
+            return Ok(None);
+        };
+        if !p.allow_recurrence.unwrap_or(false) {
+            let view = self.session_gap_view(Some(raw), None)?;
+            let probe = GapListParams {
+                dedupe_key: Some(p.dedupe_key.trim().to_string()),
+                ..Default::default()
+            };
+            if let Some(existing) = view
+                .gaps
+                .query(&probe)
+                .into_iter()
+                .find(|gap| gap.resolution != crate::gaps::GapResolution::Addressed)
+            {
+                return Ok(Some(format!(
+                    "Gap already open as {} (same dedupe_key); pass allow_recurrence=true to tally a recurrence, or reference {} from a follow-up",
+                    existing.id, existing.id
+                )));
+            }
+        }
+        let mut envelope = serde_json::json!({
+            "type": "blackbox.gap_note.v1",
+            "title": p.title,
+            "gap_kind": p.gap_kind,
+            "domain": p.domain,
+            "wanted_capability": p.wanted_capability,
+            "dedupe_key": p.dedupe_key,
+        });
+        let object = envelope.as_object_mut().expect("object envelope");
+        for (key, value) in [
+            ("impact", &p.impact),
+            ("blocking_level", &p.blocking_level),
+            ("missing_primitive", &p.missing_primitive),
+            ("fallback_used", &p.fallback_used),
+            ("notes", &p.notes),
+            ("suggested_owner", &p.suggested_owner),
+        ] {
+            if let Some(value) = value {
+                object.insert(key.to_string(), value.clone().into());
+            }
+        }
+        if let Some(evidence) = &p.evidence {
+            object.insert("evidence".to_string(), evidence.clone().into());
+        }
+        let id = self.mint_gap_id(raw)?;
+        let now = bbox_util::util::now_iso();
+        let mut gap = crate::gaps::GapNote::from_envelope(&envelope, id.clone(), now)?;
+        gap.project_id = Some(project_id.clone());
+        gap.task_id = p.task_id.clone();
+        gap.session_id = p.session_id.clone();
+        gap.provider = p.provider.clone();
+        gap.bro = p.bro.clone();
+        gap.thread_id = p.thread_id.clone();
+        let delivery = self.enqueue_gap_file(
+            &project_id,
+            scope,
+            &gap,
+            &format!("bbox_gap(project_id={project_id})"),
+        )?;
+        Ok(Some(format!(
+            "Gap {id} filed via the checkout-owner lane ({delivery})"
+        )))
+    }
+
+    /// Canonical `gap-<8hex>` comparison (the gap crate's matcher is
+    /// crate-private; the shape is fixed).
+    fn gap_id_matches(gap_id: &str, needle: &str) -> bool {
+        let canonical = if needle.starts_with("gap-") {
+            needle.to_string()
+        } else {
+            format!("gap-{needle}")
+        };
+        gap_id == canonical
+    }
+
+    /// Mint a gap id that collides with nothing visible: neither the served
+    /// view nor a pending checkout mutation's target file.
+    fn mint_gap_id(&self, raw: &str) -> anyhow::Result<String> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let view = self.session_gap_view(Some(raw), None)?;
+        loop {
+            let mut h = DefaultHasher::new();
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut h);
+            std::process::id().hash(&mut h);
+            std::thread::current().id().hash(&mut h);
+            let id = format!("gap-{:08x}", h.finish() as u32);
+            if !view
+                .gaps
+                .all()
+                .iter()
+                .any(|gap| Self::gap_id_matches(&gap.id, &id))
+            {
+                return Ok(id);
+            }
+        }
+    }
+
+    /// Load one gap from the served view for a covered-project mutation.
+    fn served_gap(&self, raw: &str, id: &str) -> anyhow::Result<crate::gaps::GapNote> {
+        let view = self.session_gap_view(Some(raw), None)?;
+        view.gaps
+            .all()
+            .iter()
+            .find(|gap| Self::gap_id_matches(&gap.id, id))
+            .cloned()
+            .with_context(|| format!("Gap not found: {id} (expected `gap-<8hex>`)"))
+    }
+
+    /// Covered-project gap update: patch the served record exactly like
+    /// GapStore::update_locked and enqueue the rewritten file.
+    fn enqueue_gap_update_via_checkout_owner(
+        &self,
+        p: &GapUpdateParams,
+        raw: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some((project_id, scope)) = self.covered_project_scope(raw) else {
+            return Ok(None);
+        };
+        let mut gap = self.served_gap(raw, &p.id)?;
+        if let Some(value) = p.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            gap.title = value.to_string();
+        }
+        if let Some(value) = p.domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            gap.domain = value.to_string();
+        }
+        if let Some(value) = p
+            .wanted_capability
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            gap.wanted_capability = value.to_string();
+        }
+        if let Some(value) = &p.impact {
+            let mut envelope = serde_json::json!({
+                "type": "blackbox.gap_note.v1",
+                "title": gap.title,
+                "gap_kind": gap.gap_kind.as_ref(),
+                "domain": gap.domain,
+                "wanted_capability": gap.wanted_capability,
+                "impact": value,
+            });
+            envelope
+                .as_object_mut()
+                .expect("object envelope")
+                .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
+            let checked = crate::gaps::GapNote::from_envelope(&envelope, gap.id.clone(), gap.created_at.clone())?;
+            gap.impact = checked.impact;
+        }
+        if let Some(value) = &p.blocking_level {
+            let mut envelope = serde_json::json!({
+                "type": "blackbox.gap_note.v1",
+                "title": gap.title,
+                "gap_kind": gap.gap_kind.as_ref(),
+                "domain": gap.domain,
+                "wanted_capability": gap.wanted_capability,
+                "blocking_level": value,
+            });
+            envelope
+                .as_object_mut()
+                .expect("object envelope")
+                .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
+            let checked = crate::gaps::GapNote::from_envelope(&envelope, gap.id.clone(), gap.created_at.clone())?;
+            gap.blocking_level = checked.blocking_level;
+        }
+        if let Some(value) = &p.missing_primitive {
+            gap.missing_primitive = Some(value.clone()).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(value) = &p.fallback_used {
+            gap.fallback_used = Some(value.clone()).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(value) = &p.evidence {
+            gap.evidence = value.clone();
+        }
+        if let Some(value) = &p.suggested_owner {
+            gap.suggested_owner = Some(value.clone()).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(value) = &p.notes {
+            gap.notes = Some(value.clone()).filter(|s| !s.trim().is_empty());
+        }
+        gap.updated_at = bbox_util::util::now_iso();
+        let id = gap.id.clone();
+        let delivery = self.enqueue_gap_file(
+            &project_id,
+            scope,
+            &gap,
+            &format!("bbox_gap_update(project_id={project_id})"),
+        )?;
+        Ok(Some(format!(
+            "Gap {id} updated via the checkout-owner lane ({delivery})"
+        )))
+    }
+
+    /// Covered-project gap resolve: apply the store's transition semantics
+    /// (resolution, resolved_at, note, supersession wiring) and enqueue the
+    /// rewritten file(s).
+    fn enqueue_gap_resolve_via_checkout_owner(
+        &self,
+        p: &GapResolveParams,
+        raw: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some((project_id, scope)) = self.covered_project_scope(raw) else {
+            return Ok(None);
+        };
+        let resolution = p.resolution.as_str();
+        let mut gap = self.served_gap(raw, &p.id)?;
+        let now = bbox_util::util::now_iso();
+        gap.resolution = match resolution {
+            "unresolved" => crate::gaps::GapResolution::Unresolved,
+            "acknowledged" => crate::gaps::GapResolution::Acknowledged,
+            "addressed" => crate::gaps::GapResolution::Addressed,
+            other => anyhow::bail!(
+                "resolution must be unresolved, acknowledged, or addressed, got `{other}`"
+            ),
+        };
+        gap.updated_at = now.clone();
+        gap.resolved_at = if resolution == "unresolved" {
+            None
+        } else {
+            Some(now.clone())
+        };
+        if let Some(note) = p.note.as_deref() {
+            gap.resolution_note = Some(note.to_string());
+        }
+        let mut supersessor = None;
+        if let Some(by) = p.superseded_by.as_deref() {
+            let mut other = self.served_gap(raw, by)?;
+            gap.superseded_by = Some(other.id.clone());
+            other.supersedes = Some(gap.id.clone());
+            other.updated_at = now;
+            supersessor = Some(other);
+        }
+        let id = gap.id.clone();
+        let delivery = self.enqueue_gap_file(
+            &project_id,
+            scope.clone(),
+            &gap,
+            &format!("bbox_gap_resolve(project_id={project_id})"),
+        )?;
+        let mut text = format!("Gap {id} → {resolution} via the checkout-owner lane ({delivery})");
+        if let Some(other) = supersessor {
+            let other_id = other.id.clone();
+            let other_delivery = self.enqueue_gap_file(
+                &project_id,
+                scope,
+                &other,
+                &format!("bbox_gap_resolve supersession link (project_id={project_id})"),
+            )?;
+            text.push_str(&format!("; supersessor {other_id} relinked ({other_delivery})"));
+        }
+        Ok(Some(text))
+    }
 }
 
 #[tool_router(router = gaps_tools)]
@@ -173,6 +496,9 @@ impl BlackboxServer {
                         .map(|checkout| checkout.checkout_project_dir.clone())
                 });
             if let Some(raw) = raw_project {
+                if let Some(text) = server.enqueue_gap_file_via_checkout_owner(&p, &raw)? {
+                    return Ok(text);
+                }
                 let (project, resolved_project_id, write_dir, resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
@@ -304,6 +630,9 @@ impl BlackboxServer {
                 });
             server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
             if let Some(raw) = raw_project {
+                if let Some(text) = server.enqueue_gap_resolve_via_checkout_owner(&p, &raw)? {
+                    return Ok(text);
+                }
                 let (project, _resolved_project_id, write_dir, resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
@@ -345,6 +674,9 @@ impl BlackboxServer {
                 });
             server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
             if let Some(raw) = raw_project {
+                if let Some(text) = server.enqueue_gap_update_via_checkout_owner(&p, &raw)? {
+                    return Ok(text);
+                }
                 let (project, _resolved_project_id, write_dir, resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);

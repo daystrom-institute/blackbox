@@ -277,7 +277,156 @@ async fn run_loop(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
         _ = run_history_lane(runtime, config) => unreachable!("history lane is an endless loop"),
         _ = run_provenance_lane(runtime, config) => unreachable!("provenance lane is an endless loop"),
         _ = run_published_knowledge_lane(runtime, config) => unreachable!("published knowledge lane is an endless loop"),
+        _ = run_checkout_mutation_lane(runtime, config) => unreachable!("checkout mutation lane is an endless loop"),
         _ = tokio::signal::ctrl_c() => Ok(()),
+    }
+}
+
+/// Checkout-mutation delivery lane: poll the daemon for pending repo-owned
+/// file mutations (gap/knowledge writes it validated but cannot apply with
+/// zero checkout authority), write the bytes into the matching configured
+/// checkout, and ack each outcome. Runs ahead of the knowledge lane so a
+/// freshly applied record rides the same cycle's publication candidate.
+async fn run_checkout_mutation_lane(runtime: &Runtime, config: &CollectorConfig) {
+    let interval = Duration::from_secs(config.interval_secs.max(1));
+    let mut backoff = interval;
+    loop {
+        match apply_checkout_mutations(runtime, config).await {
+            Ok(applied) => {
+                if applied > 0 {
+                    tracing::info!(applied, "checkout mutations delivered");
+                }
+                backoff = interval;
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "checkout mutation lane failed");
+                backoff = (backoff * 2).min(Duration::from_secs(15 * 60));
+            }
+        }
+        tokio::time::sleep(jittered(backoff)).await;
+    }
+}
+
+async fn apply_checkout_mutations(runtime: &Runtime, config: &CollectorConfig) -> Result<usize> {
+    let url = runtime.endpoint("internal/code-source/v1/checkout-mutations/poll")?;
+    let response = runtime
+        .request(reqwest::Method::POST, url)
+        .json(&bbox_code_source::CheckoutMutationPollRequestV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+        })
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(response_error_value(response).await);
+    }
+    let page: bbox_code_source::CheckoutMutationPollResponseV1 = response.json().await?;
+    if page.deferred > 0 {
+        tracing::warn!(
+            deferred = page.deferred,
+            "checkout mutations deferred (grant scope or poll cap); they redeliver on a later cycle"
+        );
+    }
+    let mut applied = 0usize;
+    for mutation in &page.mutations {
+        let outcome = apply_checkout_mutation(config, mutation);
+        let (outcome_name, error, content_sha256) = match outcome {
+            Ok(digest) => {
+                applied += 1;
+                ("applied", None, digest)
+            }
+            Err(error) => ("failed", Some(format!("{error:#}")), None),
+        };
+        let url = runtime.endpoint("internal/code-source/v1/checkout-mutations/ack")?;
+        let response = runtime
+            .request(reqwest::Method::POST, url)
+            .json(&bbox_code_source::CheckoutMutationAckRequestV1 {
+                schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                mutation_id: mutation.mutation_id.clone(),
+                outcome: outcome_name.to_string(),
+                error: error.clone(),
+                content_sha256,
+            })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            // Un-acked mutations stay pending and redeliver next cycle; the
+            // apply is idempotent so a redelivery is harmless.
+            return Err(response_error_value(response).await);
+        }
+        if let Some(error) = error {
+            tracing::error!(
+                mutation_id = %mutation.mutation_id,
+                error = %error,
+                "checkout mutation failed; acked failed"
+            );
+        }
+    }
+    Ok(applied)
+}
+
+/// Apply one mutation byte-for-byte under the configured checkout root for
+/// its scope. Idempotent: rewriting identical bytes is a success.
+fn apply_checkout_mutation(
+    config: &CollectorConfig,
+    mutation: &bbox_code_source::CheckoutMutationV1,
+) -> Result<Option<String>> {
+    mutation
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid checkout mutation: {error}"))?;
+    let project = config
+        .projects
+        .iter()
+        .find(|project| project.scope == mutation.scope)
+        .with_context(|| {
+            format!(
+                "no configured project covers mutation scope {}",
+                mutation.scope.repo_id()
+            )
+        })?;
+    let root = project
+        .root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", project.root.display()))?;
+    let target = root.join(&mutation.relative_path);
+    if !target.starts_with(&root) {
+        bail!("mutation path escapes the checkout root");
+    }
+    match mutation.mode.as_str() {
+        "write" => {
+            let content = mutation.content_json.as_deref().expect("validated write");
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if target.is_file() && fs::read_to_string(&target).ok().as_deref() == Some(content) {
+                // Idempotent redelivery: already applied.
+            } else {
+                fs::write(&target, content)
+                    .with_context(|| format!("writing {}", target.display()))?;
+            }
+            let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+            tracing::info!(
+                mutation_id = %mutation.mutation_id,
+                path = %mutation.relative_path,
+                "checkout mutation applied"
+            );
+            Ok(Some(digest))
+        }
+        "delete" => {
+            match fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).context(format!("deleting {}", target.display()))
+                }
+            }
+            tracing::info!(
+                mutation_id = %mutation.mutation_id,
+                path = %mutation.relative_path,
+                "checkout mutation delete applied"
+            );
+            Ok(None)
+        }
+        other => bail!("unvalidated mutation mode {other}"),
     }
 }
 
@@ -516,6 +665,7 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     let code = publish_code_projects(runtime, config).await;
     let history = publish_history_repositories(runtime, config).await;
     let provenance = publish_provenance_projects(runtime, config).await;
+    let mutations = apply_checkout_mutations(runtime, config).await;
     let published_knowledge = publish_knowledge_projects(runtime, config).await;
     let onboard = onboard_projects(runtime, config).await;
     let mut failures = Vec::new();
@@ -527,6 +677,9 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     }
     if let Err(error) = provenance {
         failures.push(format!("provenance lane failed: {error:#}"));
+    }
+    if let Err(error) = mutations {
+        failures.push(format!("checkout mutation lane failed: {error:#}"));
     }
     if let Err(error) = published_knowledge {
         failures.push(format!("published knowledge lane failed: {error:#}"));
@@ -2450,6 +2603,81 @@ mod tests {
         assert!(validate_server_url(&Url::parse("http://127.0.0.1:7264/").unwrap(), false).is_ok());
         assert!(validate_server_url(&Url::parse("https://example.test/").unwrap(), false).is_ok());
     }
+
+    fn mutation_config(root: &Path, scope: PublishedScope) -> CollectorConfig {
+        CollectorConfig {
+            server_url: "https://collector.test".into(),
+            token_file: root.join("token"),
+            trusted_encrypted_network: false,
+            interval_secs: 1,
+            status_timeout_secs: 1,
+            projects: vec![ProjectConfig {
+                root: root.to_path_buf(),
+                scope,
+                git_history: false,
+                provenance: false,
+                published_knowledge: None,
+            }],
+        }
+    }
+
+    fn write_mutation(scope: &PublishedScope, path: &str, content: &str) -> bbox_code_source::CheckoutMutationV1 {
+        bbox_code_source::CheckoutMutationV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: "cm-00000000000000aa".into(),
+            scope: scope.clone(),
+            relative_path: path.into(),
+            mode: "write".into(),
+            content_json: Some(content.into()),
+            reason: "collector test".into(),
+            enqueued_at: "2026-08-12T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn checkout_mutation_apply_writes_deletes_and_stays_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let scope = PublishedScope::try_new("repo-mutations", ".").unwrap();
+        let config = mutation_config(&root, scope.clone());
+
+        let mutation = write_mutation(&scope, ".bbox/gaps/gap-0123abcd.json", "{\"id\":\"gap-0123abcd\"}");
+        let digest = apply_checkout_mutation(&config, &mutation).unwrap();
+        assert!(digest.is_some());
+        let target = root.join(".bbox/gaps/gap-0123abcd.json");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"id\":\"gap-0123abcd\"}");
+        // Redelivery rewrites identical bytes without error.
+        apply_checkout_mutation(&config, &mutation).unwrap();
+
+        let mut delete = mutation.clone();
+        delete.mode = "delete".into();
+        delete.content_json = None;
+        assert!(apply_checkout_mutation(&config, &delete).unwrap().is_none());
+        assert!(!target.exists());
+        // Deleting an absent file is also a success (idempotent redelivery).
+        apply_checkout_mutation(&config, &delete).unwrap();
+    }
+
+    #[test]
+    fn checkout_mutation_apply_rejects_foreign_scopes_and_bad_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let scope = PublishedScope::try_new("repo-mutations", ".").unwrap();
+        let config = mutation_config(&root, scope.clone());
+
+        let foreign = write_mutation(
+            &PublishedScope::try_new("repo-foreign", ".").unwrap(),
+            ".bbox/gaps/gap-99999999.json",
+            "{}",
+        );
+        assert!(apply_checkout_mutation(&config, &foreign).is_err());
+
+        let mut outside = write_mutation(&scope, "src/main.rs", "nope");
+        assert!(apply_checkout_mutation(&config, &outside).is_err());
+        outside.relative_path = ".bbox/../escape".into();
+        assert!(apply_checkout_mutation(&config, &outside).is_err());
+    }
+
 
     #[test]
     fn trusted_encrypted_network_admits_configured_plaintext_endpoint() {

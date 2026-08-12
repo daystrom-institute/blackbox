@@ -577,6 +577,7 @@ pub struct ResolvedPathConfig {
     pub roadmap_path: PathBuf,
     pub notes_path: PathBuf,
     pub pins_path: PathBuf,
+    pub checkout_mutations_path: PathBuf,
     pub projects_path: PathBuf,
     pub packets_dir: PathBuf,
     pub artifacts_dir: PathBuf,
@@ -1614,6 +1615,12 @@ fn resolve_paths(
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-pins.json"));
 
+    let checkout_mutations_path = std::env::var("BLACKBOX_CHECKOUT_MUTATIONS_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("checkout-mutations.json"));
+
     let projects_path = std::env::var("BLACKBOX_PROJECTS_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -1736,6 +1743,7 @@ fn resolve_paths(
         roadmap_path,
         notes_path,
         pins_path,
+        checkout_mutations_path,
         projects_path,
         packets_dir,
         artifacts_dir,

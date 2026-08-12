@@ -2773,13 +2773,13 @@ mod tests {
         );
     }
 
-    /// A covered project gap write must reach the informative
-    /// transport-authority refusal even when the checkout is absent from
-    /// the daemon's filesystem (the zero-authority cage shape). Before the
-    /// ordering fix the checkout lease's canonicalization failed first and
-    /// the caller got an opaque attachment_inactive instead.
+    /// A covered project gap write must reach the checkout-owner
+    /// backchannel even when the checkout is absent from the daemon's
+    /// filesystem (the zero-authority cage shape): the daemon validates,
+    /// mints, and enqueues the exact committed-file bytes for collector
+    /// delivery instead of touching a checkout lease.
     #[tokio::test]
-    async fn covered_project_gap_write_refuses_before_checkout_acquisition() {
+    async fn covered_project_gap_write_enqueues_for_checkout_owner_delivery() {
         use crate::server::state::catalog_fixture::CatalogFixture;
 
         const PROJECT_ID: &str = "p_covered_gap_write0";
@@ -2801,8 +2801,9 @@ mod tests {
             true,
         );
         let mut server = fixture.server_with_checkout_authority();
-        cover_knowledge_transport_project(&mut server, PROJECT_ID, scope);
+        cover_knowledge_transport_project(&mut server, PROJECT_ID, scope.clone());
 
+        let before = server.state.checkout_access.health().sequence;
         let result = server
             .bbox_gap(Parameters(crate::gaps::GapFileParams {
                 title: "covered gap".into(),
@@ -2829,13 +2830,24 @@ mod tests {
                 allow_recurrence: None,
             }))
             .await;
-        let text = error_text(&result);
-        assert!(result.is_error.unwrap_or(false), "{text}");
-        assert!(
-            text.contains("error.knowledge_transport_authoritative"),
-            "{text}"
+        let text = format!("{:?}", result.content);
+        assert!(!result.is_error.unwrap_or(false), "{text}");
+        assert!(text.contains("checkout-owner lane"), "{text}");
+        assert_eq!(
+            server.state.checkout_access.health().sequence,
+            before,
+            "the backchannel must not acquire a checkout lease"
         );
-        assert!(!text.contains("attachment_inactive"), "{text}");
+        let pending = server.state.checkout_mutations.read();
+        assert_eq!(pending.pending_count(), 1);
+        let (mutations, deferred) = pending.poll(&std::collections::BTreeSet::from([scope]));
+        assert_eq!(deferred, 0);
+        let mutation = &mutations[0];
+        assert_eq!(mutation.mode, "write");
+        assert!(mutation.relative_path.starts_with(".bbox/gaps/gap-"));
+        let content = mutation.content_json.as_deref().unwrap();
+        assert!(content.contains("covered gap"), "{content}");
+        assert!(content.contains("tooling/test-domain/covered-gap"), "{content}");
     }
 
     /// Denied publish requests must not touch a repository.

@@ -11,9 +11,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bbox_code_source::{
-    BeginUploadRequest, CatalogOnboardRequestV1, CatalogOnboardResponseV1, ContractError,
-    CutbackErrorClass, CutbackReason, CutbackStateV2, ErrorResponse, FinalizeResponse,
-    GenerationState, GenerationStatus, ManifestPage, MissingBlobsPage,
+    BeginUploadRequest, CatalogOnboardRequestV1, CatalogOnboardResponseV1,
+    CheckoutMutationAckRequestV1, CheckoutMutationAckResponseV1, CheckoutMutationPollRequestV1,
+    CheckoutMutationPollResponseV1, ContractError, CutbackErrorClass, CutbackReason,
+    CutbackStateV2, ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus,
+    ManifestPage, MissingBlobsPage,
 };
 use bbox_code_source_store::{
     ActivationFence, ActivationFenceConflict, ActivationRecord, ActivationRecordV2,
@@ -863,6 +865,14 @@ pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
             "/internal/code-source/v1/catalog/onboard",
             post(catalog_onboard).layer(DefaultBodyLimit::max(64 * 1024)),
         )
+        .route(
+            "/internal/code-source/v1/checkout-mutations/poll",
+            post(poll_checkout_mutations).layer(DefaultBodyLimit::max(1024)),
+        )
+        .route(
+            "/internal/code-source/v1/checkout-mutations/ack",
+            post(ack_checkout_mutation).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             super::producer_auth::authenticate_code_source_request,
@@ -1200,6 +1210,78 @@ async fn catalog_onboard(
     }
     state.nudge_edge_index_rebuild();
     Ok((StatusCode::CREATED, Json(receipt)))
+}
+
+/// Checkout-owner delivery lane: the collector polls pending repo-owned
+/// file mutations for the scopes its producer grant covers. Read-only on
+/// the store; the ack endpoint is the mutation.
+async fn poll_checkout_mutations(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<CheckoutMutationPollRequestV1>,
+) -> Result<impl IntoResponse, HttpError> {
+    request
+        .validate()
+        .map_err(|error| HttpError::unprocessable("invalid_poll_request", error.to_string()))?;
+    let scopes: std::collections::BTreeSet<PublishedScope> =
+        grant.projects.keys().cloned().collect();
+    let (mutations, deferred) = blocking(move || {
+        let store = state.checkout_mutations.read();
+        Ok::<_, anyhow::Error>(store.poll(&scopes))
+    })
+    .await?;
+    Ok(Json(CheckoutMutationPollResponseV1 {
+        mutations,
+        deferred,
+    }))
+}
+
+/// Terminal outcome for one delivered mutation. The ack's scope must sit
+/// inside the producer grant: a producer may only settle mutations for
+/// checkouts it owns.
+async fn ack_checkout_mutation(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<CheckoutMutationAckRequestV1>,
+) -> Result<impl IntoResponse, HttpError> {
+    request
+        .validate()
+        .map_err(|error| HttpError::unprocessable("invalid_ack_request", error.to_string()))?;
+    let scope = {
+        let store = state.checkout_mutations.read();
+        store.scope_of(&request.mutation_id)
+    };
+    let Some(scope) = scope else {
+        return Ok(Json(CheckoutMutationAckResponseV1 {
+            status: "unknown_mutation".to_string(),
+        }));
+    };
+    require_scope(&grant, &scope)?;
+    let settled = blocking(move || {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut store = state.checkout_mutations.write();
+        let settled = store
+            .ack(
+                &request.mutation_id,
+                &request.outcome,
+                request.error.clone(),
+                request.content_sha256.clone(),
+                &now,
+            )
+            .map_err(|error| anyhow!("{error}"))?;
+        Ok::<_, anyhow::Error>((settled, request.outcome.clone()))
+    })
+    .await?;
+    let (settled, outcome) = settled;
+    if !settled {
+        // Known but already terminal: a duplicated ack after a crash or
+        // retry must not rewrite history.
+        return Ok(Json(CheckoutMutationAckResponseV1 {
+            status: "already_settled".to_string(),
+        }));
+    }
+    state.persist_checkout_mutations_durable().await?;
+    Ok(Json(CheckoutMutationAckResponseV1 { status: outcome }))
 }
 
 fn schedule_activation(
@@ -7620,6 +7702,198 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    fn checkout_mutation(scope: &PublishedScope, id: &str) -> bbox_code_source::CheckoutMutationV1 {
+        bbox_code_source::CheckoutMutationV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: id.into(),
+            scope: scope.clone(),
+            relative_path: ".bbox/gaps/gap-0123abcd.json".into(),
+            mode: "write".into(),
+            content_json: Some("{\"id\":\"gap-0123abcd\"}".into()),
+            reason: "route test".into(),
+            enqueued_at: "2026-08-12T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_mutations_poll_and_ack_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let (state, token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        state
+            .checkout_mutations
+            .write()
+            .enqueue(checkout_mutation(&scope, "cm-00000000000000aa"))
+            .unwrap();
+        let app = router(state.clone()).with_state(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/poll",
+                &token,
+                Body::from(
+                    serde_json::to_vec(&CheckoutMutationPollRequestV1 {
+                        schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let page: CheckoutMutationPollResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.mutations.len(), 1);
+        assert_eq!(page.mutations[0].mutation_id, "cm-00000000000000aa");
+        assert_eq!(page.deferred, 0);
+
+        let ack = |outcome: &str| CheckoutMutationAckRequestV1 {
+            schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+            mutation_id: "cm-00000000000000aa".into(),
+            outcome: outcome.into(),
+            error: None,
+            content_sha256: Some("a".repeat(64)),
+        };
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/ack",
+                &token,
+                Body::from(serde_json::to_vec(&ack("applied")).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let settled: CheckoutMutationAckResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settled.status, "applied");
+
+        // A duplicate terminal ack settles nothing twice.
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/ack",
+                &token,
+                Body::from(serde_json::to_vec(&ack("applied")).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let duplicate: CheckoutMutationAckResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert_eq!(duplicate.status, "already_settled");
+
+        // Settled mutations no longer poll.
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/poll",
+                &token,
+                Body::from(
+                    serde_json::to_vec(&CheckoutMutationPollRequestV1 {
+                        schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let page: CheckoutMutationPollResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert!(page.mutations.is_empty());
+        assert_eq!(page.deferred, 0);
+    }
+
+    #[tokio::test]
+    async fn checkout_mutation_ack_requires_the_mutations_scope_in_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let catalog_projects_path = root.join("catalog").join("projects.json");
+        fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
+        let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
+        let other_scope = PublishedScope::try_new("repo_other", ".").unwrap();
+        let (state, _token) =
+            enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        // A second producer whose grant covers a different scope.
+        let other_secret = "e".repeat(64);
+        let other_token = bro_rpc::ServiceToken::parse(other_secret.clone()).unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test(
+                true,
+                false,
+                vec![
+                    (
+                        bro_rpc::ServiceToken::parse("f".repeat(64)).unwrap(),
+                        ProducerGrant {
+                            producer_id: "onboard-producer".into(),
+                            projects: BTreeMap::from([(scope.clone(), "onboard-project".into())]),
+                        },
+                    ),
+                    (
+                        other_token,
+                        ProducerGrant {
+                            producer_id: "other-producer".into(),
+                            projects: BTreeMap::from([(other_scope, "other-project".into())]),
+                        },
+                    ),
+                ],
+            )));
+        state
+            .checkout_mutations
+            .write()
+            .enqueue(checkout_mutation(&scope, "cm-00000000000000bb"))
+            .unwrap();
+        let app = router(state.clone()).with_state(state);
+
+        // The other producer neither polls nor acks the mutation.
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/poll",
+                &other_secret,
+                Body::from(
+                    serde_json::to_vec(&CheckoutMutationPollRequestV1 {
+                        schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let page: CheckoutMutationPollResponseV1 = serde_json::from_slice(&body).unwrap();
+        assert!(page.mutations.is_empty());
+        assert_eq!(page.deferred, 1);
+
+        let response = app
+            .oneshot(authenticated_request(
+                "POST",
+                "/internal/code-source/v1/checkout-mutations/ack",
+                &other_secret,
+                Body::from(
+                    serde_json::to_vec(&CheckoutMutationAckRequestV1 {
+                        schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
+                        mutation_id: "cm-00000000000000bb".into(),
+                        outcome: "applied".into(),
+                        error: None,
+                        content_sha256: None,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

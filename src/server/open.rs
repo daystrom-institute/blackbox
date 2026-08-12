@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::index::TranscriptIndex;
+use crate::checkout_mutations::CheckoutMutations;
 use crate::knowledge::Knowledge;
 use crate::notes::Notes;
 use crate::orchestration::TaskStore;
@@ -668,6 +669,20 @@ pub(super) fn open_shared_state(
     let pins_persister = StorePersister::spawn("pins", pins_store.clone(), pins_path.clone());
     tracing::info!("Pins store: {}", pins_path.display());
 
+    let checkout_mutations_path = cfg.paths.checkout_mutations_path.clone();
+    let checkout_mutations_store = Arc::new(RwLock::new(CheckoutMutations::open(
+        &checkout_mutations_path,
+    )?));
+    let checkout_mutations_persister = StorePersister::spawn(
+        "checkout-mutations",
+        checkout_mutations_store.clone(),
+        checkout_mutations_path.clone(),
+    );
+    tracing::info!(
+        "Checkout mutations store: {}",
+        checkout_mutations_path.display()
+    );
+
     let project_authority = match (&projects_store, &catalog_store) {
         (Some(registry), None) => {
             let persister =
@@ -919,6 +934,8 @@ pub(super) fn open_shared_state(
         notes_persister,
         pins: pins_store,
         pins_persister,
+        checkout_mutations: checkout_mutations_store,
+        checkout_mutations_persister,
         project_authority,
         accepted_publications,
         records_provider,
