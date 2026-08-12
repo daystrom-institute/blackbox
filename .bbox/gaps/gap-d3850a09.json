@@ -1,0 +1,20 @@
+{
+  "id": "gap-d3850a09",
+  "title": "No empty-catalog initialization path for an isolated dev daemon",
+  "gap_kind": "tooling",
+  "domain": "daemon-runtime/project-catalog",
+  "wanted_capability": "A supported way to initialize an empty catalog-v2 store for a throwaway/isolated blackboxd so collector-backchannel onboarding works from scratch. Remote onboarding requires the daemon to start in catalog mode, but the offline catalog CLI only adds to an existing catalog; a fresh isolated state dir has none. Possibly addressable via the migration workflow (unverified). Blocks reproducible live-validation scripts that stand up a daemon from nothing (docs/operations-isolated-dev-daemon.md flows) and onboard a project through the real backchannel.",
+  "fallback_used": "Investigate the migration workflow as the bootstrap route in the live-exercise script; if that fails, document manual store seeding.",
+  "evidence": [
+    "thread-60b151fb",
+    "note-efc43df1",
+    "docs/operations-isolated-dev-daemon.md"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-catalog/empty-catalog-bootstrap",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-12T18:56:01Z",
+  "updated_at": "2026-08-12T18:56:01Z"
+}

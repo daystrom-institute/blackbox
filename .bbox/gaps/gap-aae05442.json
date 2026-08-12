@@ -1,0 +1,21 @@
+{
+  "id": "gap-aae05442",
+  "title": "No operator surface to mint a workspace binding token for an existing checkout",
+  "gap_kind": "tooling",
+  "domain": "daemon-runtime/knowledge-source",
+  "wanted_capability": "An operator-gated, non-interactive way to issue and install a WorkspaceBindingToken for a named existing checkout, so provisional-workspace capture (WorkspaceCaptureClient) and own-visibility MCP sessions can be exercised against an isolated dev daemon. Today production issuance happens only inside DaemonWorkspaceBindingAuthority during managed harness worker spawn; the only direct installation helper is cfg(test). This blocks live validation of any provisional-lane feature (knowledge, gaps, and now project graphs) outside a managed worker, including the reflective-graph live exercise's own-visibility and invalid-provisional legs. Wanted shape: an operator control-plane route or CLI verb that mints a binding for an explicit checkout path under explicit operator authority, mirroring the managed spawn path's stapling; explicitly not agent self-service.",
+  "fallback_used": "Phase C live exercise reduced to the published leg; provisional behavior covered by integration tests only.",
+  "evidence": [
+    "thread-60b151fb",
+    "note-efc43df1",
+    "crates/bbox-knowledge-source-client (WorkspaceCaptureClient binding requirement)",
+    "src/server/knowledge_source.rs (DaemonWorkspaceBindingAuthority)"
+  ],
+  "impact": "medium",
+  "blocking_level": "blocks_task",
+  "dedupe_key": "tooling/knowledge-source/workspace-binding-operator-issuance",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-12T18:55:55Z",
+  "updated_at": "2026-08-12T18:55:55Z"
+}
