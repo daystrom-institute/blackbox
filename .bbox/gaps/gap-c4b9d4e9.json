@@ -1,0 +1,19 @@
+{
+  "id": "gap-c4b9d4e9",
+  "title": "self_recall_probe conflates unreachability with exact-duplicate dilution",
+  "gap_kind": "eval_coverage",
+  "domain": "embed",
+  "wanted_capability": "A recall diagnostic that stays meaningful on duplicate-heavy partitions. self_recall_probe requires a vector's own id in top-k; with N identical vectors sharing a query, own-id probability is ~k/N regardless of graph health, so the probe reads 0.78 on a fully connected duplicate-heavy partition (voyage_visual, 334 distinct payloads over 16925 entities). Options: probe for any same-content member (needs a content-hash side index), report a reachability-based metric instead, or document the dilution bound in the probe output so operators stop reading it as graph damage.",
+  "evidence": [
+    "voyage_visual partition 2026-08-12: probe 0.7788 both at 6.7% zero-in-degree AND at 0 orphans after the reconnect pass",
+    "crates/bbox-vectors/src/hnsw.rs self_recall_probe",
+    "crates/bbox-vectors/AGENTS.md probe calibration"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "eval_coverage/embed/self-recall-probe-duplicate-dilution",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-12T15:58:42Z",
+  "updated_at": "2026-08-12T15:58:42Z"
+}
