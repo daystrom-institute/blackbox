@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
 
 pub const DESCRIPTOR_VERSION: u32 = 1;
@@ -73,17 +73,67 @@ pub struct VertexTypeDefinition {
     pub properties: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct EdgeTypeDefinition {
     #[serde(rename = "type")]
     pub type_name: String,
-    pub from_type: String,
-    pub to_type: String,
+    pub endpoints: Vec<EdgeEndpointDefinition>,
     #[serde(default)]
     pub required: Vec<String>,
     #[serde(default)]
     pub properties: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeEndpointDefinition {
+    #[serde(rename = "from")]
+    pub from_type: String,
+    #[serde(rename = "to")]
+    pub to_type: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EdgeTypeDefinitionWire {
+    #[serde(rename = "type")]
+    type_name: String,
+    #[serde(default)]
+    from_type: Option<String>,
+    #[serde(default)]
+    to_type: Option<String>,
+    #[serde(default)]
+    endpoints: Option<Vec<EdgeEndpointDefinition>>,
+    #[serde(default)]
+    required: Vec<String>,
+    #[serde(default)]
+    properties: BTreeMap<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for EdgeTypeDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = EdgeTypeDefinitionWire::deserialize(deserializer)?;
+        let endpoints = match (wire.from_type, wire.to_type, wire.endpoints) {
+            (Some(from_type), Some(to_type), None) => {
+                vec![EdgeEndpointDefinition { from_type, to_type }]
+            }
+            (None, None, Some(endpoints)) => endpoints,
+            _ => {
+                return Err(de::Error::custom(
+                    "edge type must declare either from_type/to_type or endpoints",
+                ));
+            }
+        };
+        Ok(Self {
+            type_name: wire.type_name,
+            endpoints,
+            required: wire.required,
+            properties: wire.properties,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -224,19 +274,23 @@ pub(crate) fn project_generation(
         );
     }
     for definition in &schema.edge_types {
+        let mut properties = BTreeMap::from([
+            ("endpoints".into(), json!(definition.endpoints)),
+            ("required".into(), json!(definition.required)),
+            ("properties".into(), json!(definition.properties)),
+            ("schema_definition".into(), Value::Bool(true)),
+        ]);
+        if let [endpoint] = definition.endpoints.as_slice() {
+            properties.insert("from_type".into(), json!(endpoint.from_type));
+            properties.insert("to_type".into(), json!(endpoint.to_type));
+        }
         vertices.insert(
             definition.type_name.clone(),
             ProjectGraphVertex {
                 id: definition.type_name.clone(),
                 type_name: META_EDGE_TYPE.to_string(),
                 label: definition.type_name.clone(),
-                properties: BTreeMap::from([
-                    ("from_type".into(), json!(definition.from_type)),
-                    ("to_type".into(), json!(definition.to_type)),
-                    ("required".into(), json!(definition.required)),
-                    ("properties".into(), json!(definition.properties)),
-                    ("schema_definition".into(), Value::Bool(true)),
-                ]),
+                properties,
             },
         );
     }
@@ -254,26 +308,28 @@ pub(crate) fn project_generation(
         });
     }
     for edge_type in &schema.edge_types {
-        all_edges.extend([
-            ProjectGraphEdge {
-                from: edge_type.type_name.clone(),
-                type_name: META_INSTANCE_OF.to_string(),
-                to: META_EDGE_TYPE.to_string(),
-                properties: BTreeMap::new(),
-            },
-            ProjectGraphEdge {
-                from: edge_type.type_name.clone(),
-                type_name: META_FROM_TYPE.to_string(),
-                to: edge_type.from_type.clone(),
-                properties: BTreeMap::new(),
-            },
-            ProjectGraphEdge {
-                from: edge_type.type_name.clone(),
-                type_name: META_TO_TYPE.to_string(),
-                to: edge_type.to_type.clone(),
-                properties: BTreeMap::new(),
-            },
-        ]);
+        all_edges.push(ProjectGraphEdge {
+            from: edge_type.type_name.clone(),
+            type_name: META_INSTANCE_OF.to_string(),
+            to: META_EDGE_TYPE.to_string(),
+            properties: BTreeMap::new(),
+        });
+        for endpoint in &edge_type.endpoints {
+            all_edges.extend([
+                ProjectGraphEdge {
+                    from: edge_type.type_name.clone(),
+                    type_name: META_FROM_TYPE.to_string(),
+                    to: endpoint.from_type.clone(),
+                    properties: BTreeMap::new(),
+                },
+                ProjectGraphEdge {
+                    from: edge_type.type_name.clone(),
+                    type_name: META_TO_TYPE.to_string(),
+                    to: endpoint.to_type.clone(),
+                    properties: BTreeMap::new(),
+                },
+            ]);
+        }
     }
     for vertex in vertices.values() {
         if FIXED_META_VERTICES.contains(&vertex.id.as_str())

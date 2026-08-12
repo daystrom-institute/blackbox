@@ -218,20 +218,43 @@ fn validate_schema(schema: &GraphSchema, errors: &mut Vec<ValidationError>) {
                 ),
             ));
         }
-        for (role, endpoint) in [
-            ("from_type", &definition.from_type),
-            ("to_type", &definition.to_type),
-        ] {
-            if !schema.vertex_types.contains_key(endpoint) {
+        if definition.endpoints.is_empty() {
+            errors.push(ValidationError::new(
+                "schema.empty_endpoint_pairs",
+                "schema.json",
+                None,
+                format!(
+                    "edge type `{}` must declare at least one endpoint pair",
+                    definition.type_name
+                ),
+            ));
+        }
+        let mut endpoint_pairs = BTreeSet::new();
+        for endpoint in &definition.endpoints {
+            if !endpoint_pairs.insert((&endpoint.from_type, &endpoint.to_type)) {
                 errors.push(ValidationError::new(
-                    "schema.missing_endpoint_type",
+                    "schema.duplicate_endpoint_pair",
                     "schema.json",
                     None,
                     format!(
-                        "edge type `{}` {role} `{endpoint}` is not a declared vertex type",
-                        definition.type_name
+                        "edge type `{}` repeats endpoint pair (`{}`, `{}`)",
+                        definition.type_name, endpoint.from_type, endpoint.to_type
                     ),
                 ));
+            }
+            for (role, endpoint_type) in [("from", &endpoint.from_type), ("to", &endpoint.to_type)]
+            {
+                if !schema.vertex_types.contains_key(endpoint_type) {
+                    errors.push(ValidationError::new(
+                        "schema.missing_endpoint_type",
+                        "schema.json",
+                        None,
+                        format!(
+                            "edge type `{}` endpoint pair (`{}`, `{}`) {role} type `{endpoint_type}` is not a declared vertex type",
+                            definition.type_name, endpoint.from_type, endpoint.to_type
+                        ),
+                    ));
+                }
             }
         }
         validate_edge_property_definition(definition, errors);
@@ -366,25 +389,19 @@ fn validate_facts(
             ));
             continue;
         };
-        if from.type_name != definition.from_type {
+        if !definition.endpoints.iter().any(|endpoint| {
+            from.type_name == endpoint.from_type && to.type_name == endpoint.to_type
+        }) {
             errors.push(ValidationError::new(
-                "edge.source_type_mismatch",
+                "edge.endpoint_type_mismatch",
                 "edges.jsonl",
                 Some(*line),
                 format!(
-                    "edge source `{}` has type `{}`; `{}` requires `{}`",
-                    edge.from, from.type_name, edge.type_name, definition.from_type
-                ),
-            ));
-        }
-        if to.type_name != definition.to_type {
-            errors.push(ValidationError::new(
-                "edge.target_type_mismatch",
-                "edges.jsonl",
-                Some(*line),
-                format!(
-                    "edge target `{}` has type `{}`; `{}` requires `{}`",
-                    edge.to, to.type_name, edge.type_name, definition.to_type
+                    "edge type `{}` does not allow endpoint types (`{}`, `{}`); declared pairs: {}",
+                    edge.type_name,
+                    from.type_name,
+                    to.type_name,
+                    format_endpoint_pairs(&definition.endpoints)
                 ),
             ));
         }
@@ -401,6 +418,14 @@ fn validate_facts(
             errors,
         );
     }
+}
+
+fn format_endpoint_pairs(endpoints: &[crate::EdgeEndpointDefinition]) -> String {
+    endpoints
+        .iter()
+        .map(|endpoint| format!("(`{}`, `{}`)", endpoint.from_type, endpoint.to_type))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn valid_namespace(namespace: &str) -> bool {
@@ -493,6 +518,44 @@ fn validate_property_term(
 ) {
     match term {
         Value::String(name) if matches!(name.as_str(), "string" | "number" | "boolean") => {}
+        Value::Object(fields) if fields.len() == 1 && fields.contains_key("enum") => {
+            let Some(members) = fields["enum"].as_array() else {
+                errors.push(ValidationError::new(
+                    "schema.invalid_enum_property_term",
+                    "schema.json",
+                    None,
+                    format!(
+                        "{owner} property `{path}` enum term must contain a non-empty array of unique strings"
+                    ),
+                ));
+                return;
+            };
+            if members.is_empty() || members.iter().any(|member| !member.is_string()) {
+                errors.push(ValidationError::new(
+                    "schema.invalid_enum_property_term",
+                    "schema.json",
+                    None,
+                    format!(
+                        "{owner} property `{path}` enum term must contain a non-empty array of unique strings"
+                    ),
+                ));
+                return;
+            }
+            let mut unique = BTreeSet::new();
+            for member in members {
+                let member = member.as_str().expect("enum members checked as strings");
+                if !unique.insert(member) {
+                    errors.push(ValidationError::new(
+                        "schema.duplicate_enum_member",
+                        "schema.json",
+                        None,
+                        format!(
+                            "{owner} property `{path}` enum term repeats member `{member}`"
+                        ),
+                    ));
+                }
+            }
+        }
         Value::Object(fields) if !fields.is_empty() => {
             for (name, nested) in fields {
                 validate_property_term(owner, &format!("{path}.{name}"), nested, errors);
@@ -561,6 +624,36 @@ fn validate_property_shape(
             "boolean" => value.is_boolean(),
             _ => false,
         },
+        Value::Object(fields) if fields.len() == 1 && fields.contains_key("enum") => {
+            let Some(candidate) = value.as_str() else {
+                return push_property_shape_mismatch(owner, path, file, line, errors);
+            };
+            let allowed = fields["enum"]
+                .as_array()
+                .is_some_and(|members| members.iter().any(|member| member == candidate));
+            if !allowed {
+                let declared = fields["enum"]
+                    .as_array()
+                    .map(|members| {
+                        members
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|member| format!("`{member}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                errors.push(ValidationError::new(
+                    "property.enum_violation",
+                    file,
+                    Some(line),
+                    format!(
+                        "{owner} property `{path}` value `{candidate}` is not one of: {declared}"
+                    ),
+                ));
+            }
+            return;
+        }
         Value::Object(fields) => match value.as_object() {
             Some(object) => {
                 for field in object.keys() {
@@ -616,13 +709,23 @@ fn validate_property_shape(
         _ => false,
     };
     if !matches {
-        errors.push(ValidationError::new(
-            "property.shape_mismatch",
-            file,
-            Some(line),
-            format!("{owner} property `{path}` does not match its declared JSON shape"),
-        ));
+        push_property_shape_mismatch(owner, path, file, line, errors);
     }
+}
+
+fn push_property_shape_mismatch(
+    owner: &str,
+    path: &str,
+    file: &str,
+    line: usize,
+    errors: &mut Vec<ValidationError>,
+) {
+    errors.push(ValidationError::new(
+        "property.shape_mismatch",
+        file,
+        Some(line),
+        format!("{owner} property `{path}` does not match its declared JSON shape"),
+    ));
 }
 
 fn uses_reserved_namespace(id: &str) -> bool {
@@ -721,6 +824,65 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.code == "property.shape_mismatch" && error.line == Some(4))
+        );
+    }
+
+    #[test]
+    fn invalid_enum_terms_are_rejected() {
+        for (term, expected_code) in [
+            (json!({"enum": []}), "schema.invalid_enum_property_term"),
+            (
+                json!({"enum": ["draft", 2]}),
+                "schema.invalid_enum_property_term",
+            ),
+            (
+                json!({"enum": ["draft", "draft"]}),
+                "schema.duplicate_enum_member",
+            ),
+        ] {
+            let mut schema = schema();
+            schema
+                .vertex_types
+                .get_mut("repo:Claim")
+                .unwrap()
+                .properties
+                .insert("status".into(), term);
+            let errors = validate_graph(
+                "repo",
+                GraphSource::Committed,
+                &descriptor(),
+                &schema,
+                &[],
+                &[],
+            );
+            assert!(
+                errors.iter().any(|error| error.code == expected_code),
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_endpoint_list_is_rejected() {
+        let mut schema = schema();
+        schema.edge_types.push(EdgeTypeDefinition {
+            type_name: "repo:CITES".into(),
+            endpoints: Vec::new(),
+            required: Vec::new(),
+            properties: BTreeMap::new(),
+        });
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "schema.empty_endpoint_pairs")
         );
     }
 }

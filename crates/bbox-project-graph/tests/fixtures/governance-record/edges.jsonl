@@ -1,0 +1,20 @@
+{"from":"claim/scope@2","type":"gov:CITES","to":"evidence/document@1","properties":{"version_pin":"evidence/document@1","note":"Primary supporting material"}}
+{"from":"claim/scope@2","type":"gov:CITES","to":"review/scope@1","properties":{"version_pin":"review/scope@1","note":"Completed review"}}
+{"from":"claim/scope@2","type":"gov:CITES","to":"decision/accept@1","properties":{"version_pin":"decision/accept@1","note":"Approved disposition"}}
+{"from":"decision/accept@1","type":"gov:RESOLVES","to":"tension/coverage@1","properties":{"version_pin":"tension/coverage@1"}}
+{"from":"decision/accept@1","type":"gov:RESOLVES","to":"subject/scope@1","properties":{"version_pin":"subject/scope@1"}}
+{"from":"claim/scope@2","type":"gov:SUPERSEDES","to":"claim/scope@1","properties":{"prior_version":"claim/scope@1"}}
+{"from":"policy/review@2","type":"gov:SUPERSEDES","to":"policy/review@1","properties":{"prior_version":"policy/review@1"}}
+{"from":"record/case@2","type":"gov:SUPERSEDES","to":"record/case@1","properties":{"prior_version":"record/case@1"}}
+{"from":"correction/record@1","type":"gov:DELTA","to":"record/case@2","properties":{"op":"replace","order":1,"base_version":"record/case@1"}}
+{"from":"approval/accept@1","type":"gov:PRECONDITION","to":"decision/accept@1","properties":{"version":"decision/accept@1"}}
+{"from":"authority-grant/reviewer@1","type":"gov:PRECONDITION","to":"approval/accept@1","properties":{"version":"approval/accept@1"}}
+{"from":"agreement/terms@1","type":"gov:INVOLVES","to":"party/example-co"}
+{"from":"claim/scope@2","type":"gov:ABOUT","to":"subject/scope@1"}
+{"from":"evidence/document@1","type":"gov:SUPPORTS","to":"claim/scope@2"}
+{"from":"review/scope@1","type":"gov:ASSESSES","to":"claim/scope@2"}
+{"from":"decision/accept@1","type":"gov:APPROVED_BY","to":"approval/accept@1"}
+{"from":"policy/review@2","type":"gov:AUTHORIZED_BY","to":"authority-grant/reviewer@1"}
+{"from":"event/review@1","type":"gov:RECORDED_IN","to":"record/case@2"}
+{"from":"correction/record@1","type":"gov:CORRECTS","to":"claim/scope@2"}
+{"from":"policy/review@2","type":"gov:GOVERNS","to":"agreement/terms@1"}

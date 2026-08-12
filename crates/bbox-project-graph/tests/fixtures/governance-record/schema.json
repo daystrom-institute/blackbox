@@ -1,0 +1,217 @@
+{
+  "version": 1,
+  "namespace": "gov",
+  "vertex_types": {
+    "gov:Record": {
+      "required": ["status", "version", "summary"],
+      "properties": {
+        "status": {"enum": ["draft", "active", "retired"]},
+        "version": "number",
+        "summary": "string"
+      }
+    },
+    "gov:Party": {
+      "required": ["role"],
+      "properties": {
+        "role": {"enum": ["organization", "person"]}
+      }
+    },
+    "gov:Agreement": {
+      "required": ["status", "version"],
+      "properties": {
+        "status": {"enum": ["draft", "active", "retired"]},
+        "version": "number"
+      }
+    },
+    "gov:Event": {
+      "required": ["status", "occurred_at"],
+      "properties": {
+        "status": {"enum": ["planned", "occurred", "cancelled"]},
+        "occurred_at": "string"
+      }
+    },
+    "gov:Subject": {
+      "required": ["category"],
+      "properties": {
+        "category": "string"
+      }
+    },
+    "gov:Claim": {
+      "required": ["status", "version", "text"],
+      "properties": {
+        "status": {"enum": ["draft", "active", "retired"]},
+        "version": "number",
+        "text": "string"
+      }
+    },
+    "gov:Evidence": {
+      "required": ["kind", "version", "locator"],
+      "properties": {
+        "kind": {"enum": ["document", "observation"]},
+        "version": "number",
+        "locator": "string"
+      }
+    },
+    "gov:Review": {
+      "required": ["status", "version", "summary"],
+      "properties": {
+        "status": {"enum": ["pending", "active", "complete"]},
+        "version": "number",
+        "summary": "string"
+      }
+    },
+    "gov:Tension": {
+      "required": ["status", "description"],
+      "properties": {
+        "status": {"enum": ["open", "resolved"]},
+        "description": "string"
+      }
+    },
+    "gov:Decision": {
+      "required": ["status", "version", "rationale"],
+      "properties": {
+        "status": {"enum": ["proposed", "approved", "retired"]},
+        "version": "number",
+        "rationale": "string"
+      }
+    },
+    "gov:Policy": {
+      "required": ["status", "version", "text"],
+      "properties": {
+        "status": {"enum": ["draft", "active", "retired"]},
+        "version": "number",
+        "text": "string"
+      }
+    },
+    "gov:Approval": {
+      "required": ["status", "version"],
+      "properties": {
+        "status": {"enum": ["pending", "granted", "revoked"]},
+        "version": "number"
+      }
+    },
+    "gov:AuthorityGrant": {
+      "required": ["status", "version", "scope"],
+      "properties": {
+        "status": {"enum": ["active", "expired", "revoked"]},
+        "version": "number",
+        "scope": "string"
+      }
+    },
+    "gov:Correction": {
+      "required": ["status", "version", "reason"],
+      "properties": {
+        "status": {"enum": ["proposed", "applied", "withdrawn"]},
+        "version": "number",
+        "reason": "string"
+      }
+    }
+  },
+  "edge_types": [
+    {
+      "type": "gov:CITES",
+      "endpoints": [
+        {"from": "gov:Claim", "to": "gov:Evidence"},
+        {"from": "gov:Claim", "to": "gov:Review"},
+        {"from": "gov:Claim", "to": "gov:Decision"}
+      ],
+      "required": ["version_pin"],
+      "properties": {
+        "version_pin": "string",
+        "note": "string"
+      }
+    },
+    {
+      "type": "gov:RESOLVES",
+      "endpoints": [
+        {"from": "gov:Decision", "to": "gov:Tension"},
+        {"from": "gov:Decision", "to": "gov:Subject"}
+      ],
+      "required": ["version_pin"],
+      "properties": {
+        "version_pin": "string"
+      }
+    },
+    {
+      "type": "gov:SUPERSEDES",
+      "endpoints": [
+        {"from": "gov:Claim", "to": "gov:Claim"},
+        {"from": "gov:Policy", "to": "gov:Policy"},
+        {"from": "gov:Record", "to": "gov:Record"}
+      ],
+      "required": ["prior_version"],
+      "properties": {
+        "prior_version": "string"
+      }
+    },
+    {
+      "type": "gov:DELTA",
+      "endpoints": [
+        {"from": "gov:Correction", "to": "gov:Record"},
+        {"from": "gov:Correction", "to": "gov:Agreement"}
+      ],
+      "required": ["op", "order", "base_version"],
+      "properties": {
+        "op": {"enum": ["add", "replace", "remove"]},
+        "order": "number",
+        "base_version": "string"
+      }
+    },
+    {
+      "type": "gov:PRECONDITION",
+      "endpoints": [
+        {"from": "gov:Approval", "to": "gov:Decision"},
+        {"from": "gov:AuthorityGrant", "to": "gov:Approval"}
+      ],
+      "required": ["version"],
+      "properties": {
+        "version": "string"
+      }
+    },
+    {
+      "type": "gov:INVOLVES",
+      "from_type": "gov:Agreement",
+      "to_type": "gov:Party"
+    },
+    {
+      "type": "gov:ABOUT",
+      "from_type": "gov:Claim",
+      "to_type": "gov:Subject"
+    },
+    {
+      "type": "gov:SUPPORTS",
+      "from_type": "gov:Evidence",
+      "to_type": "gov:Claim"
+    },
+    {
+      "type": "gov:ASSESSES",
+      "from_type": "gov:Review",
+      "to_type": "gov:Claim"
+    },
+    {
+      "type": "gov:APPROVED_BY",
+      "from_type": "gov:Decision",
+      "to_type": "gov:Approval"
+    },
+    {
+      "type": "gov:AUTHORIZED_BY",
+      "from_type": "gov:Policy",
+      "to_type": "gov:AuthorityGrant"
+    },
+    {
+      "type": "gov:RECORDED_IN",
+      "from_type": "gov:Event",
+      "to_type": "gov:Record"
+    },
+    {
+      "type": "gov:CORRECTS",
+      "from_type": "gov:Correction",
+      "to_type": "gov:Claim"
+    },
+    {
+      "type": "gov:GOVERNS",
+      "from_type": "gov:Policy",
+      "to_type": "gov:Agreement"
+    }
+  ]
+}

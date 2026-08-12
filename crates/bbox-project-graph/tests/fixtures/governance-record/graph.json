@@ -1,0 +1,10 @@
+{
+  "descriptor_version": 1,
+  "scope": "project",
+  "graph_id": "governance-record",
+  "authority": "project",
+  "schema_id": "governance-record-schema",
+  "schema_version": 1,
+  "retention_policy": "project_owned",
+  "generation": 1
+}
