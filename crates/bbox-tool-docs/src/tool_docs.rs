@@ -23,6 +23,7 @@ pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 pub enum ToolCategory {
     Transcripts,
     Graph,
+    ProjectGraphs,
     Projects,
     ProjectCatalog,
     Knowledge,
@@ -46,6 +47,7 @@ impl ToolCategory {
         match self {
             Self::Transcripts => "Transcripts",
             Self::Graph => "Agentic graph",
+            Self::ProjectGraphs => "Reflective project graphs",
             Self::Projects => "Projects",
             Self::ProjectCatalog => "Project catalog administration",
             Self::Knowledge => "Knowledge",
@@ -71,6 +73,7 @@ impl ToolCategory {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
             Self::Graph => "Inspect entities, graph vocabulary, paths, bundles, and retrieval.",
+            Self::ProjectGraphs => "Read project-owned reflective graph generations.",
             Self::Projects => "Register project roots for later file indexing.",
             Self::ProjectCatalog => {
                 "Durable project-catalog administration: attach and detach local checkouts, select the default attachment, promote a legacy-local project to its committed scope, migrate a published scope, and rebind the publisher attachment. Every one of these refuses with `error.project_catalog_inactive` while the version-1 registry is the runtime authority; the proofless-authority operations (catalog add, alias accept and reject, retire) live on the offline `blackbox project-catalog` CLI instead."
@@ -127,6 +130,7 @@ fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
         ToolCategory::Workflows => Some("sm-workflow-orchestration"),
         ToolCategory::Whiteboards => Some("sm-whiteboards"),
         ToolCategory::StorageHealth => Some("sm-storage-health"),
+        ToolCategory::ProjectGraphs => Some("sm-agentic-opening-sequence"),
         _ => None,
     }
 }
@@ -281,24 +285,24 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     },
     ToolDoc {
         name: "bbox_project_graph_list",
-        category: ToolCategory::Graph,
-        summary: "List accepted and visible provisional reflective project graphs. visibility accepts published, own, or all and defaults to own only with authoritative checkout context.",
-        when_to_use: "Use before exact graph reads to discover graph ids and per-generation validity. Own is the default only when the MCP session has authoritative checkout context; all is always explicit.",
-        example: Some(r#"bbox_project_graph_list(project="d723917f", visibility="published")"#),
+        category: ToolCategory::ProjectGraphs,
+        summary: "List visible project graphs.",
+        when_to_use: "Discover graph ids.",
+        example: None,
     },
     ToolDoc {
         name: "bbox_project_graph_describe",
-        category: ToolCategory::Graph,
-        summary: "Describe one reflective project graph generation, including descriptor, schema, validity, source, checkout label, and generation identity.",
-        when_to_use: "Use for descriptor, schema, source, checkout label, counts, and generation identity before inspecting exact vertex refs.",
-        example: Some(r#"bbox_project_graph_describe(project="d723917f", graph_id="governance-record", visibility="own")"#),
+        category: ToolCategory::ProjectGraphs,
+        summary: "Describe one visible project graph.",
+        when_to_use: "Read schema and generation identity.",
+        example: None,
     },
     ToolDoc {
         name: "bbox_project_graph_validate",
-        category: ToolCategory::Graph,
-        summary: "Report validity for one visible reflective project graph. Invalid provisional graphs remain visible with stable kernel error codes, file names, line numbers, and messages.",
-        when_to_use: "Use to inspect file, line, stable code, and message diagnostics. Invalid provisional graphs remain graph-local and never fall back to the published copy in own mode.",
-        example: Some(r#"bbox_project_graph_validate(project="d723917f", graph_id="governance-record", visibility="own")"#),
+        category: ToolCategory::ProjectGraphs,
+        summary: "Validate one visible project graph.",
+        when_to_use: "Inspect kernel diagnostics.",
+        example: None,
     },
     ToolDoc {
         name: "bbox_describe_schema",

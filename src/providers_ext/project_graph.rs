@@ -39,7 +39,23 @@ impl InspectableEntityProvider for ProjectGraphVertexProvider {
     }
 
     fn schema(&self) -> EntitySchemaView {
-        schema(self.entity_type(), &["id", "type", "label", "project_id", "graph_id", "logical_ref", "content_hash", "source", "checkout_id", "properties"], &[], &["project_id", "graph_id", "type", "source"])
+        schema(
+            self.entity_type(),
+            &[
+                "id",
+                "type",
+                "label",
+                "project_id",
+                "graph_id",
+                "logical_ref",
+                "content_hash",
+                "source",
+                "checkout_id",
+                "properties",
+            ],
+            &[],
+            &["project_id", "graph_id", "type", "source"],
+        )
     }
 
     fn expected_edge_families(&self, _r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
@@ -51,11 +67,19 @@ impl InspectableEntityProvider for ProjectGraphVertexProvider {
         for edge in full.forward.iter().chain(full.reverse.iter()) {
             *counts.entry(edge.kind.clone()).or_default() += 1;
         }
-        counts.into_iter().map(|(edge_family_name, count)| NextHop { edge_family_name, count }).collect()
+        counts
+            .into_iter()
+            .map(|(edge_family_name, count)| NextHop {
+                edge_family_name,
+                count,
+            })
+            .collect()
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
-        self.get_entity(ctx, r).ok().and_then(|view| view.properties.get("label").map(truncate_label))
+        self.get_entity(ctx, r)
+            .ok()
+            .and_then(|view| view.properties.get("label").map(truncate_label))
     }
 }
 use std::collections::BTreeMap;

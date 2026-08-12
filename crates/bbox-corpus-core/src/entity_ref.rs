@@ -770,12 +770,8 @@ fn parse_project_file_v2(input: &str, rest: &str) -> Result<EntityRef, EntityRef
     })
 }
 
-fn parse_project_graph_vertex(
-    input: &str,
-    rest: &str,
-) -> Result<EntityRef, EntityRefParseError> {
-    let (project_id, tail) =
-        split_first(input, rest, EntityType::ProjectGraphVertex, "graph_id")?;
+fn parse_project_graph_vertex(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    let (project_id, tail) = split_first(input, rest, EntityType::ProjectGraphVertex, "graph_id")?;
     let (graph_id, vertex_id) =
         split_first(input, tail, EntityType::ProjectGraphVertex, "vertex_id")?;
     validate_parsed_graph_ref_field(input, project_id, EntityType::ProjectGraphVertex)?;
@@ -1374,8 +1370,7 @@ mod tests {
 
     #[test]
     fn project_graph_vertex_ref_round_trips_with_colons_in_vertex_id() {
-        let rendered =
-            "project_graph_vertex:d723917f:governance-record:gov:Decision:decision-001";
+        let rendered = "project_graph_vertex:d723917f:governance-record:gov:Decision:decision-001";
         let parsed = EntityRef::parse(rendered).unwrap();
         assert_eq!(parsed.render(), rendered);
         assert_eq!(parsed.entity_type(), EntityType::ProjectGraphVertex);
@@ -1405,9 +1400,7 @@ mod tests {
 
     #[test]
     fn project_graph_refs_reject_invalid_fixed_segments() {
-        assert!(
-            EntityRef::parse("project_graph_vertex::governance-record:decision-001").is_err()
-        );
+        assert!(EntityRef::parse("project_graph_vertex::governance-record:decision-001").is_err());
         assert!(
             EntityRef::parse(
                 "provisional_project_graph_vertex:abcd:0123456789abcdef0123456789abcdef:governance-record:decision-001"

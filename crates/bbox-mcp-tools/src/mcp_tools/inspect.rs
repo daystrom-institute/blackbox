@@ -142,8 +142,11 @@ pub fn inspect_entity(
         Err(error) if error.to_string().starts_with("error.checkout_access.") => {
             return Err(error);
         }
-        Err(error) if error.to_string().starts_with("error.project_graph_")
-            || error.to_string().starts_with("error.not_found: project graph") =>
+        Err(error)
+            if error.to_string().starts_with("error.project_graph_")
+                || error
+                    .to_string()
+                    .starts_with("error.not_found: project graph") =>
         {
             return Err(error);
         }

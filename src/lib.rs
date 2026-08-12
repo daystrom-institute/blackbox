@@ -79,8 +79,8 @@ pub mod project_catalog_rebuild_admin;
 pub mod project_catalog_stamper;
 use bbox_indexing::projects;
 use bbox_providers::providers;
-mod providers_ext;
 mod project_graph_read;
+mod providers_ext;
 // `search` (rrf/rerank) and `template` extracted into bbox-corpus-core;
 // aliased back so existing call sites resolve unchanged. (`query` callers
 // now use bbox_corpus_core::query directly.)

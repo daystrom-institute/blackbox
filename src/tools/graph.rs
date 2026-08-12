@@ -1008,7 +1008,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_list",
-        description = "List accepted and visible provisional reflective project graphs. visibility accepts published, own, or all and defaults to own only with authoritative checkout context."
+        description = "List visible project graphs."
     )]
     pub(crate) async fn bbox_project_graph_list(
         &self,
@@ -1016,10 +1016,8 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_project_graph_list", move || {
-            let graphs = server.project_graph_list_domain(
-                p.project.as_deref(),
-                p.visibility.as_deref(),
-            )?;
+            let graphs =
+                server.project_graph_list_domain(p.project.as_deref(), p.visibility.as_deref())?;
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "visibility": p.visibility,
@@ -1031,7 +1029,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_describe",
-        description = "Describe one reflective project graph generation, including descriptor, schema, validity, source, checkout label, and generation identity."
+        description = "Describe one visible project graph."
     )]
     pub(crate) async fn bbox_project_graph_describe(
         &self,
@@ -1054,7 +1052,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_validate",
-        description = "Report validity for one visible reflective project graph. Invalid provisional graphs remain visible with stable kernel error codes, file names, line numbers, and messages."
+        description = "Validate one visible project graph."
     )]
     pub(crate) async fn bbox_project_graph_validate(
         &self,
@@ -1655,7 +1653,8 @@ mod tests {
             .register_path(root)
             .unwrap();
         let project_id =
-            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone()).unwrap();
+            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone())
+                .unwrap();
         let graph_id = "governance-record";
         let loaded = bbox_project_graph::load_graph_documents(
             project_id.as_str(),
@@ -1738,7 +1737,7 @@ mod tests {
         assert!(extract_text(&validated).contains("\"valid\": true"));
 
         let vertex_ref =
-            format!("project_graph_vertex:{project_id}:governance-record:decision-retain-history");
+            format!("project_graph_vertex:{project_id}:governance-record:record/case@1");
         let inspected = server
             .bbox_inspect_entity(Parameters(InspectEntityParams {
                 entity_ref: vertex_ref.clone(),
@@ -1750,7 +1749,7 @@ mod tests {
             }))
             .await;
         let inspected_text = extract_text(&inspected);
-        assert!(inspected_text.contains("decision-retain-history"), "{inspected_text}");
+        assert!(inspected_text.contains("record/case@1"), "{inspected_text}");
 
         let paths = server
             .bbox_find_paths(Parameters(FindPathsParams {
@@ -1764,6 +1763,82 @@ mod tests {
             }))
             .await;
         assert!(extract_text(&paths).contains("\"paths\""));
+    }
+
+    #[tokio::test]
+    async fn project_graph_tools_surface_invalid_own_overlay_without_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_governance_graph(&server, &root);
+        let scope = PublishedScope::try_new("repo-governance", ".").unwrap();
+        let workspace_id = bro_core::WorkspaceId::parse("a".repeat(32)).unwrap();
+        server.set_session_checkout_for_test(
+            project_id.clone(),
+            scope.clone(),
+            workspace_id.to_string(),
+            root,
+        );
+        server
+            .state
+            .project_graph_views
+            .write()
+            .install_provisional(
+                bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
+                    project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
+                        project_id.clone(),
+                    )
+                    .unwrap(),
+                    scope,
+                    workspace_id: workspace_id.clone(),
+                    source_generation_id: "working-one".into(),
+                    graphs: std::collections::BTreeMap::from([(
+                        "governance-record".into(),
+                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
+                            bbox_indexing::project_graph_view::ProjectGraphViewEntry::invalid(
+                                "governance-record".into(),
+                                bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                                    accepted_generation: "generation-one".into(),
+                                    accepted_commit: "a".repeat(40),
+                                    source_generation: Some("working-one".into()),
+                                    workspace_id: Some(workspace_id),
+                                    content_hash: "invalid-content".into(),
+                                },
+                                vec![bbox_project_graph::ValidationError::new(
+                                    "edge.missing_vertex",
+                                    "edges.jsonl",
+                                    Some(7),
+                                    "edge target is missing",
+                                )],
+                            ),
+                        ),
+                    )]),
+                },
+            );
+
+        let own = server
+            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                project: project_id.clone(),
+                graph_id: "governance-record".into(),
+                visibility: Some("own".into()),
+            }))
+            .await;
+        let own_text = extract_text(&own);
+        assert!(own_text.contains("\"valid\": false"), "{own_text}");
+        assert!(own_text.contains("edge.missing_vertex"), "{own_text}");
+        assert!(
+            own_text.contains("\"source\": \"provisional\""),
+            "{own_text}"
+        );
+
+        let published = server
+            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                project: project_id,
+                graph_id: "governance-record".into(),
+                visibility: Some("published".into()),
+            }))
+            .await;
+        assert!(extract_text(&published).contains("\"valid\": true"));
     }
 
     #[tokio::test]

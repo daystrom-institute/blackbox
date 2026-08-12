@@ -170,7 +170,8 @@ fn bfs(
         if entry.steps.len() >= max_depth {
             continue;
         }
-        for (edge_kind, direction, next) in expansions(ctx, edge_index, &entry.current, edge_filter) {
+        for (edge_kind, direction, next) in expansions(ctx, edge_index, &entry.current, edge_filter)
+        {
             if entry.visited.contains(&next) {
                 continue;
             }
