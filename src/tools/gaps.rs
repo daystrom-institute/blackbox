@@ -72,7 +72,7 @@ impl BlackboxServer {
                 bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
             );
             anyhow::bail!(
-                "error.knowledge_transport_authoritative: this project's gaps are transport-governed and the daemon holds no checkout authority; write the blackbox.gap_note.v1 envelope into .bbox/gaps/inbox/ on the checkout host (sm-gap-notes) and the checkout-owner lanes will ingest and publish it"
+                "error.knowledge_transport_authoritative: this project's gaps are transport-governed and the daemon holds no checkout authority; write the gap as a committed .bbox/gaps/gap-<id>.json record on the checkout host (same schema as the existing files there) and the collector will publish it"
             );
         }
         let resolution = self.resolve_project_write(raw)?;
