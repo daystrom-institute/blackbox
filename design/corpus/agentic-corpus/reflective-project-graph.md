@@ -223,8 +223,8 @@ encoding of graph facts about types:
 - each `vertex_types` key projects to a vertex that instantiates
   `meta:VertexType`,
 - each `edge_types` row projects to a vertex that instantiates `meta:EdgeType`,
-- each `edge_types` row also projects to `meta:FROM_TYPE` and `meta:TO_TYPE`
-  edges.
+- each declared endpoint pair in an `edge_types` row also projects to
+  `meta:FROM_TYPE` and `meta:TO_TYPE` edges.
 
 `vertices.jsonl` and `edges.jsonl` are the authoritative data facts that
 instantiate that schema. If they reference a type not declared by `schema.json`,
@@ -283,6 +283,22 @@ Example `schema.json`:
 
 Vertex type names and edge type names must use the graph namespace as a prefix.
 Bare names are rejected.
+
+An edge type may use the single-pair `from_type` and `to_type` form shown above,
+or an `endpoints` list with one or more `{ "from": ..., "to": ... }` pairs:
+
+```json
+{
+  "type": "repo:REFERENCES",
+  "endpoints": [
+    {"from": "repo:Module", "to": "repo:Invariant"},
+    {"from": "repo:DesignClaim", "to": "repo:Invariant"}
+  ]
+}
+```
+
+The single-pair form is equivalent to a one-element `endpoints` list. Duplicate
+pairs within one edge type declaration are invalid.
 
 Project graph edges connect project graph vertices in v1. References to
 existing bbox entities such as `project_file:*`, `knowledge:*`, or `commit:*`
@@ -371,11 +387,14 @@ V1 property schema terms:
 - `"string"`
 - `"number"`
 - `"boolean"`
+- enumerated strings, such as `{"enum": ["draft", "active", "retired"]}`,
 - nested objects, whose values are property schema terms,
 - arrays with one element schema, such as `["string"]` or `[{"path":"string"}]`.
 
 `null` is not a schema term in v1. Missing optional properties are allowed;
-present properties must match their declared shape.
+present properties must match their declared shape. Enum members must be a
+non-empty list of unique strings. Enum validation checks only membership; it
+does not define or enforce lifecycle transitions.
 
 ## Edge Facts
 
@@ -400,8 +419,8 @@ Example edge:
 }
 ```
 
-The edge `type` must be declared in `schema.json`. In v1 each edge type has one
-declared `(from_type, to_type)` pair. Edge properties use the same JSON shape
+The edge `type` must be declared in `schema.json`. Its source and target types
+must match any declared endpoint pair. Edge properties use the same JSON shape
 rules as vertex properties.
 
 ## Query Semantics
@@ -575,8 +594,8 @@ implementation is probably too large.
 
 - Local scratch graphs do not participate in traversal by default. Callers must
   explicitly include `.bbox/local/graphs/*`.
-- Each edge type declaration allows one `(from_type, to_type)` pair. Polymorphic
-  edge types can be added later if real graphs need them.
+- Each edge type declaration allows one or more `(from_type, to_type)` pairs.
+  The original `from_type` and `to_type` form remains the one-pair shorthand.
 - Property validation supports JSON objects and arrays, not only flat scalar
   fields.
 - Project graph vertices are not indexed into full-text or vector search in V1.
@@ -592,7 +611,7 @@ Deferred beyond v1:
 - Cross-project graph references.
 - Traversable edges to existing bbox entities such as project files,
   knowledge, commits, notes, or threads.
-- Multiple endpoint pairs for one edge type.
+- Lifecycle-transition legality, such as which enum status may follow another.
 - Full JSON Schema compatibility.
 - Full-text or vector indexing of project graph vertices.
 

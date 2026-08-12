@@ -1,0 +1,17 @@
+{"id":"record/case@1","type":"gov:Record","label":"Case record version 1","properties":{"status":"retired","version":1,"summary":"Initial governance record"}}
+{"id":"record/case@2","type":"gov:Record","label":"Case record version 2","properties":{"status":"active","version":2,"summary":"Current governance record"}}
+{"id":"party/example-co","type":"gov:Party","label":"Example Company","properties":{"role":"organization"}}
+{"id":"agreement/terms@1","type":"gov:Agreement","label":"Terms agreement","properties":{"status":"active","version":1}}
+{"id":"event/review@1","type":"gov:Event","label":"Review event","properties":{"status":"occurred","occurred_at":"2026-01-15"}}
+{"id":"subject/scope@1","type":"gov:Subject","label":"Review scope","properties":{"category":"scope"}}
+{"id":"claim/scope@1","type":"gov:Claim","label":"Scope claim version 1","properties":{"status":"retired","version":1,"text":"The record covers the stated subject"}}
+{"id":"claim/scope@2","type":"gov:Claim","label":"Scope claim version 2","properties":{"status":"active","version":2,"text":"The current record covers the reviewed subject"}}
+{"id":"evidence/document@1","type":"gov:Evidence","label":"Supporting document","properties":{"kind":"document","version":1,"locator":"records/supporting-document.txt"}}
+{"id":"review/scope@1","type":"gov:Review","label":"Scope review","properties":{"status":"complete","version":1,"summary":"The claim and evidence were reviewed"}}
+{"id":"tension/coverage@1","type":"gov:Tension","label":"Coverage tension","properties":{"status":"resolved","description":"The original record did not fully describe coverage"}}
+{"id":"decision/accept@1","type":"gov:Decision","label":"Acceptance decision","properties":{"status":"approved","version":1,"rationale":"The updated record addresses the review"}}
+{"id":"policy/review@1","type":"gov:Policy","label":"Review policy version 1","properties":{"status":"retired","version":1,"text":"Reviews require one evidence item"}}
+{"id":"policy/review@2","type":"gov:Policy","label":"Review policy version 2","properties":{"status":"active","version":2,"text":"Reviews require evidence and approval"}}
+{"id":"approval/accept@1","type":"gov:Approval","label":"Acceptance approval","properties":{"status":"granted","version":1}}
+{"id":"authority-grant/reviewer@1","type":"gov:AuthorityGrant","label":"Reviewer authority grant","properties":{"status":"active","version":1,"scope":"record review"}}
+{"id":"correction/record@1","type":"gov:Correction","label":"Record correction","properties":{"status":"applied","version":1,"reason":"Clarify the reviewed coverage"}}
