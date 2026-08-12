@@ -58,6 +58,8 @@ Optional: `impact` (default `medium`), `blocking_level`, `missing_primitive`, `f
 Pass `project` (the working dir) and `scope`:
 
 - `scope="project"` (default) → the gap is **repo-owned**: one file per gap under `<project>/.bbox/gaps/gap-<8hex>.json`, committed and travelling with the checkout.
+
+On a transport-governed (locality-cutover) estate the daemon holds no checkout authority, so a project-scoped `bbox_gap` does not write the file directly: it validates, mints the id, dedupes against the served view, and enqueues the exact committed-file bytes for the checkout-owner collector, which applies them within one collector cycle. The tool response says where the file lands; commit it with your change to publish. The same backchannel carries `bbox_gap_update` / `bbox_gap_resolve` and project-scoped knowledge writes (`bbox_learn` / `bbox_remember` / `bbox_decide` / `bbox_forget`).
 - `scope="global"` → cross-project substrate gaps that aren't about the current repo land in the central host store.
 
 ## Advisory vocabularies
@@ -126,7 +128,7 @@ If you are actively authoring a packet and the AST is the missing surface, use `
 
 ## File-drop spool (non-MCP agents)
 
-An agent without the `bbox_gap` tool can drop a `blackbox.gap_note.v1` JSON file into `<project>/.bbox/gaps/inbox/` (or the host spool `~/.local/share/blackbox/gaps/inbox/`). `bbox_inbox(import_gap_spool=true)` ingests each into the typed gap store and moves the file to `inbox/imported/`. The envelope mirrors the `bbox_gap` fields with a `"type": "blackbox.gap_note.v1"` routing tag.
+An agent without the `bbox_gap` tool can drop a `blackbox.gap_note.v1` JSON file into `<project>/.bbox/gaps/inbox/` (or the host spool `~/.local/share/blackbox/gaps/inbox/`). `bbox_inbox(import_gap_spool=true)` ingests each into the typed gap store and moves the file to `inbox/imported/`. The envelope mirrors the `bbox_gap` fields with a `"type": "blackbox.gap_note.v1"` routing tag. The spool requires a daemon with local checkout access to ingest; on a transport-governed estate nothing consumes it there, so non-MCP agents on such estates hand the envelope to an agent that has the tool instead.
 
 ## Lifecycle
 
