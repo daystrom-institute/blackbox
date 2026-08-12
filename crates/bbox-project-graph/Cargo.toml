@@ -1,0 +1,13 @@
+[package]
+name = "bbox-project-graph"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
