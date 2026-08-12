@@ -1260,7 +1260,11 @@ impl KnowledgeSourceStore {
         let upload_id = Uuid::new_v4().simple().to_string();
         let upload_path = producer_root.join(&upload_id);
         let upload_dir = NofollowDirectory::open_or_create(&upload_path)?;
-        for lane in [SourceLaneV1::Knowledge, SourceLaneV1::Gaps] {
+        for lane in [
+            SourceLaneV1::Knowledge,
+            SourceLaneV1::Gaps,
+            SourceLaneV1::Graphs,
+        ] {
             NofollowDirectory::open_or_create(&upload_path.join("pages").join(lane_name(lane)))?;
         }
         write_json(
@@ -1641,7 +1645,11 @@ impl KnowledgeSourceStore {
         let directory = NofollowDirectory::open_or_create(&path)?;
         NofollowDirectory::open_or_create(&path.join("ancestry"))?;
         for class in [SnapshotClassV1::Baseline, SnapshotClassV1::Working] {
-            for lane in [SourceLaneV1::Knowledge, SourceLaneV1::Gaps] {
+            for lane in [
+                SourceLaneV1::Knowledge,
+                SourceLaneV1::Gaps,
+                SourceLaneV1::Graphs,
+            ] {
                 NofollowDirectory::open_or_create(
                     &path
                         .join("pages")

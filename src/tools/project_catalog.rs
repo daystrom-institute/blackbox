@@ -1303,6 +1303,7 @@ impl BlackboxServer {
             // Binding-only operations never reach this path.
             self.invalidate_catalog_published_content(&project_id);
             self.converge_published_knowledge_index(&project_id);
+            self.refresh_published_graph_views(&project_id);
         }
         if succeeded && !dry_run {
             self.observe_knowledge_transport_operation(
@@ -2999,6 +3000,44 @@ mod tests {
             content_sha256: source_file_blob_sha256(&source_bytes),
         };
         let knowledge_manifest = vec![manifest_entry.clone()];
+        let graph_sources = [
+            (
+                "edges.jsonl",
+                include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/edges.jsonl"
+                )
+                .as_slice(),
+            ),
+            (
+                "graph.json",
+                include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/graph.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "schema.json",
+                include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/schema.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "vertices.jsonl",
+                include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/vertices.jsonl"
+                )
+                .as_slice(),
+            ),
+        ];
+        let graph_manifest = graph_sources
+            .iter()
+            .map(|(filename, bytes)| SourceFileManifestEntryV1 {
+                repository_relative_filename: format!(".bbox/graphs/governance-record/{filename}"),
+                encoded_bytes: bytes.len() as u64,
+                content_sha256: source_file_blob_sha256(bytes),
+            })
+            .collect::<Vec<_>>();
         let descriptor = PublicationCandidateDescriptorV1 {
             schema_version: SCHEMA_VERSION,
             scope: scope.clone(),
@@ -3020,7 +3059,15 @@ mod tests {
                 logical_bytes: 0,
                 page_count: 0,
             },
-            graphs: SourceManifestDescriptorV1::default(),
+            graphs: SourceManifestDescriptorV1 {
+                manifest_sha256: source_manifest_sha256(SourceLaneV1::Graphs, &graph_manifest),
+                file_count: graph_manifest.len() as u64,
+                logical_bytes: graph_sources
+                    .iter()
+                    .map(|(_, bytes)| bytes.len() as u64)
+                    .sum(),
+                page_count: 1,
+            },
         };
         let authority = PublicationAuthorityV1 {
             producer_id: "producer-a".into(),
@@ -3043,6 +3090,18 @@ mod tests {
             )
             .unwrap();
         store
+            .put_publication_manifest_page(
+                &authority,
+                &upload.upload_id,
+                SourceLaneV1::Graphs,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: graph_manifest.clone(),
+                },
+            )
+            .unwrap();
+        store
             .missing_publication_blobs(&authority, &upload.upload_id, None)
             .unwrap();
         store
@@ -3054,6 +3113,17 @@ mod tests {
                 Cursor::new(source_bytes),
             )
             .unwrap();
+        for ((_, source_bytes), manifest_entry) in graph_sources.iter().zip(&graph_manifest) {
+            store
+                .install_publication_blob(
+                    &authority,
+                    &upload.upload_id,
+                    &manifest_entry.content_sha256,
+                    manifest_entry.encoded_bytes,
+                    Cursor::new(*source_bytes),
+                )
+                .unwrap();
+        }
         let source_generation_id = store
             .finalize_publication_upload(&authority, &upload.upload_id)
             .unwrap()
@@ -3096,6 +3166,42 @@ mod tests {
             source_generation_id
         );
         assert!(body["attachment_id"].is_null());
+
+        let listed = server
+            .bbox_project_graph_list(Parameters(crate::tools::graph::ProjectGraphListParams {
+                project: Some("p_candidate_tool".into()),
+                visibility: Some("published".into()),
+            }))
+            .await;
+        let listed_text = error_text(&listed);
+        assert!(listed_text.contains("governance-record"), "{listed_text}");
+
+        let described = server
+            .bbox_project_graph_describe(Parameters(crate::tools::graph::ProjectGraphExactParams {
+                project: "p_candidate_tool".into(),
+                graph_id: "governance-record".into(),
+                visibility: Some("published".into()),
+            }))
+            .await;
+        let described_text = error_text(&described);
+        assert!(
+            described_text.contains("governance-record-schema"),
+            "{described_text}"
+        );
+
+        let inspected = server
+            .bbox_inspect_entity(Parameters(crate::mcp_tools::inspect::InspectEntityParams {
+                entity_ref: "project_graph_vertex:p_candidate_tool:governance-record:record/case@2"
+                    .into(),
+                provisional: Some("published".into()),
+                edge_types: None,
+                direction: Some("both".into()),
+                per_type_limit: Some(10),
+                property_mode: Some("full".into()),
+            }))
+            .await;
+        let inspected_text = error_text(&inspected);
+        assert!(inspected_text.contains("record/case@2"), "{inspected_text}");
     }
 
     /// Convergence after a publish: the published knowledge reaches the
