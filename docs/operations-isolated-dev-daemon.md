@@ -209,6 +209,81 @@ bro fleet --daemon-url http://127.0.0.1:7299
 BLACKBOX_FLEET_DAEMON_URL=http://127.0.0.1:7299 bro fleet
 ```
 
+## Minting a workspace binding for provisional-lane validation
+
+The provisional lane (uncommitted knowledge, gaps, and project graphs captured
+from a checkout, then read back with `own` visibility) is gated by a
+**workspace binding**. In production the only issuer is the managed harness
+worker spawn path, so a dev daemon has no binding until you mint one.
+
+`bro workspace-binding mint` is the operator-side half. Run it from inside the
+checkout you want to bind:
+
+```bash
+# The project must already be registered and its checkout attached on this
+# daemon, and the checkout needs its .bbox/local/checkout-id marker.
+BBOX_PORT=7299 bro workspace-binding mint
+```
+
+It resolves the checkout's committed published scope and durable workspace
+identity locally, asks the daemon to mint, and writes the capability into
+`.bbox/local/workspace-binding.env` with `0600` permissions:
+
+```
+BRO_WORKSPACE_BINDING_TOKEN=<64 hex>
+BRO_KNOWLEDGE_SOURCE_URL=http://127.0.0.1:7299
+BRO_WORKSPACE_PUBLISHED_SCOPE={"repo_id":"...","bbox_root_relpath":"."}
+```
+
+Those are the same three variables the managed spawn path exports, so a harness
+or capture client started with them behaves exactly as a dispatched worker
+would:
+
+```bash
+set -a; . .bbox/local/workspace-binding.env; set +a
+```
+
+Use `--print` instead when the checkout is not writable; the token is printed
+once and nothing is stored. The binding lives 24 hours, and minting again for
+the same checkout replaces the previous one.
+
+Behind the CLI is `POST /admin/workspace-binding/mint`. It is **operator
+authority**: like every other `/admin/*` route its only gate is the daemon's
+loopback bind, and it is deliberately absent from the MCP tool catalog, so no
+agent can mint itself a binding. Do not expose the listener beyond loopback
+while relying on that.
+
+What the daemon proves before minting, from catalog state alone (it neither
+reads nor writes the checkout, and never resolves the path you declare):
+
+- the claimed published scope is registered and resolves to exactly one project;
+- that project has a live attachment whose validated scope is the scope you
+  claimed;
+- the workspace identity you present is the `checkout_id` that attachment
+  records.
+
+The workspace identity, not the path, is what a binding binds: every provisional
+generation is keyed by it, so a binding carrying an identity the catalog never
+recorded can select nothing.
+
+What it does not prove, and is honest about:
+
+- **the checkout path is not verified at all.** Catalog runtime code may reach a
+  checkout root only through a capability lease, and the knowledge transport
+  cutover closes the lease kinds that could resolve one for exactly the projects
+  this mint serves. The daemon only checks that the declared path is a confined
+  absolute path, logs it, and echoes it back as `declared_checkout_path`. Your
+  checkout is what the CLI read the identity marker from, which is what makes
+  the pair coherent in practice.
+- anything about a project with no live local attachment. A remote or
+  catalog-only project is refused with
+  `error.workspace_binding_attachment_unknown` rather than minted on trust.
+
+Other refusals you may hit: `error.workspace_binding_scope_unknown` (scope not
+registered here), `error.workspace_binding_workspace_id_mismatch` (no live
+attachment for that scope records the identity you presented), and
+`error.workspace_binding_checkout_path_invalid`.
+
 ## Teardown
 
 The throwaway daemon runs in the foreground. Ctrl-C triggers a graceful

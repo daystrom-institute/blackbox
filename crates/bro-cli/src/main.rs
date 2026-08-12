@@ -32,6 +32,7 @@ mod mcp_call;
 mod provenance;
 #[cfg(test)]
 mod test_backend;
+mod workspace_binding;
 
 #[derive(Default, Debug, Clone)]
 struct TailSelectors {
@@ -64,6 +65,9 @@ enum BroCommand {
     Provenance(provenance::ProvenanceArgs),
     /// Checkout-local Git blame with central corpus enrichment
     Blame(blame::BlameArgs),
+    /// Operator workspace binding lifecycle for one local checkout
+    #[command(name = "workspace-binding")]
+    WorkspaceBinding(workspace_binding::WorkspaceBindingArgs),
     /// Fleet cockpit — dispatch and live-drive many top-level agents
     Fleet(FleetArgs),
     /// Single-agent cockpit — launch one agent into the Fleet transcript view
@@ -696,6 +700,7 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
         BroCommand::Provenance(args) => rt.block_on(provenance::run(args)),
         BroCommand::Blame(args) => rt.block_on(blame::run(args)),
+        BroCommand::WorkspaceBinding(args) => rt.block_on(workspace_binding::run(args)),
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
             rt.block_on(fleet_tui::run(args.cwd, args.daemon_url, args.force))
