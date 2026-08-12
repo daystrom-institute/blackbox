@@ -70,6 +70,11 @@ struct WorkspaceBindingEntry {
 pub(crate) struct KnowledgeSourceRuntime {
     store: Arc<KnowledgeSourceStore>,
     workspace_bindings: parking_lot::RwLock<Vec<WorkspaceBindingEntry>>,
+    /// Renewal cancellation handles keyed by the task id that owns the
+    /// binding. This lives on the runtime that owns the bindings themselves
+    /// so every minting path (managed worker spawn and the operator mint
+    /// route) shares one registry instead of one per authority instance.
+    workspace_binding_renewals: parking_lot::Mutex<BTreeMap<String, CancellationToken>>,
 }
 
 pub(crate) struct KnowledgeTransportCheckoutPolicy {
@@ -120,6 +125,7 @@ impl KnowledgeSourceRuntime {
         Ok(Self {
             store,
             workspace_bindings: parking_lot::RwLock::new(Vec::new()),
+            workspace_binding_renewals: parking_lot::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -131,6 +137,7 @@ impl KnowledgeSourceRuntime {
                     .unwrap(),
             ),
             workspace_bindings: parking_lot::RwLock::new(Vec::new()),
+            workspace_binding_renewals: parking_lot::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -224,175 +231,199 @@ impl KnowledgeSourceRuntime {
 
 /// Production adapter joining managed-checkout authority to the path-free
 /// session capability retained by fleetd. It never persists or logs a token.
+///
+/// The grant/mint/install mechanics themselves are free functions below so the
+/// operator mint route (`super::workspace_binding_mint`) issues byte-identical
+/// bindings through exactly this code rather than a forked token model.
 pub(crate) struct DaemonWorkspaceBindingAuthority {
     state: Arc<SharedState>,
-    renewals: parking_lot::Mutex<BTreeMap<String, CancellationToken>>,
 }
 
 impl DaemonWorkspaceBindingAuthority {
     pub(crate) fn new(state: Arc<SharedState>) -> Self {
-        Self {
-            state,
-            renewals: parking_lot::Mutex::new(BTreeMap::new()),
-        }
+        Self { state }
     }
+}
 
-    fn grant(
-        &self,
-        task_id: &str,
-        session_id: &str,
-        identity: &bro_protocol::WorkerWorkspaceIdentity,
-    ) -> Result<WorkspaceBindingGrant> {
-        let scope = bbox_corpus_core::identity::PublishedScope::try_new(
-            identity.scope.repo_id().to_string(),
-            identity.scope.bbox_root_relpath().to_string(),
-        )?;
-        let project_id = self.project_id_for_scope(&scope)?.ok_or_else(|| {
-            anyhow::anyhow!("managed workspace scope is not present in current project authority")
-        })?;
-        Ok(WorkspaceBindingGrant {
-            task_id: task_id.to_string(),
-            session_id: session_id.to_string(),
-            project_id,
-            scope,
-            workspace_id: identity.workspace_id.clone(),
-            expires_unix_secs: now_unix_secs().saturating_add(WORKSPACE_BINDING_TTL_SECS),
-        })
-    }
+/// Build the exact grant a managed worker spawn installs: catalog-resolved
+/// project id, the worker-proved workspace identity, and the fixed binding TTL.
+pub(crate) fn workspace_binding_grant(
+    state: &SharedState,
+    task_id: &str,
+    session_id: &str,
+    identity: &bro_protocol::WorkerWorkspaceIdentity,
+) -> Result<WorkspaceBindingGrant> {
+    let scope = bbox_corpus_core::identity::PublishedScope::try_new(
+        identity.scope.repo_id().to_string(),
+        identity.scope.bbox_root_relpath().to_string(),
+    )?;
+    let project_id = project_id_for_scope(state, &scope)?.ok_or_else(|| {
+        anyhow::anyhow!("managed workspace scope is not present in current project authority")
+    })?;
+    Ok(WorkspaceBindingGrant {
+        task_id: task_id.to_string(),
+        session_id: session_id.to_string(),
+        project_id,
+        scope,
+        workspace_id: identity.workspace_id.clone(),
+        expires_unix_secs: now_unix_secs().saturating_add(WORKSPACE_BINDING_TTL_SECS),
+    })
+}
 
-    fn published_scopes(&self) -> Result<Vec<bbox_corpus_core::identity::PublishedScope>> {
-        let mut scopes = BTreeMap::<bbox_corpus_core::identity::PublishedScope, ()>::new();
-        if let Some(store) = self.state.project_authority.catalog_store() {
-            let snapshot = store.snapshot()?;
-            for project in snapshot.catalog().projects.values() {
-                if let bbox_corpus_core::project_catalog::ProjectScope::Published(scope) =
-                    &project.scope
-                {
-                    scopes.insert(scope.clone(), ());
-                }
-            }
-        } else {
-            let records = self.state.records_provider.records_snapshot();
-            for record in records.records.iter() {
-                if let Some(scope) = super::checkout_access::published_scope_for_project(
-                    &self.state.checkout_access,
-                    &record.project_id,
-                )? {
-                    scopes.insert(scope, ());
-                }
+fn published_scopes(
+    state: &SharedState,
+) -> Result<Vec<bbox_corpus_core::identity::PublishedScope>> {
+    let mut scopes = BTreeMap::<bbox_corpus_core::identity::PublishedScope, ()>::new();
+    if let Some(store) = state.project_authority.catalog_store() {
+        let snapshot = store.snapshot()?;
+        for project in snapshot.catalog().projects.values() {
+            if let bbox_corpus_core::project_catalog::ProjectScope::Published(scope) =
+                &project.scope
+            {
+                scopes.insert(scope.clone(), ());
             }
         }
-        Ok(scopes.into_keys().collect())
+    } else {
+        let records = state.records_provider.records_snapshot();
+        for record in records.records.iter() {
+            if let Some(scope) = super::checkout_access::published_scope_for_project(
+                &state.checkout_access,
+                &record.project_id,
+            )? {
+                scopes.insert(scope, ());
+            }
+        }
     }
+    Ok(scopes.into_keys().collect())
+}
 
-    fn project_id_for_scope(
-        &self,
-        expected: &bbox_corpus_core::identity::PublishedScope,
-    ) -> Result<Option<String>> {
-        if let Some(store) = self.state.project_authority.catalog_store() {
-            let snapshot = store.snapshot()?;
-            let mut matched = None;
-            for (project_id, project) in &snapshot.catalog().projects {
-                if matches!(
-                    &project.scope,
-                    bbox_corpus_core::project_catalog::ProjectScope::Published(scope)
-                        if scope == expected
-                ) {
-                    if matched.replace(project_id.to_string()).is_some() {
-                        bail!("managed workspace scope resolves to more than one catalog project");
+/// Resolve one published scope to the single catalog project that owns it.
+/// `Ok(None)` is an unregistered scope; an error is an ambiguous one.
+pub(crate) fn project_id_for_scope(
+    state: &SharedState,
+    expected: &bbox_corpus_core::identity::PublishedScope,
+) -> Result<Option<String>> {
+    if let Some(store) = state.project_authority.catalog_store() {
+        let snapshot = store.snapshot()?;
+        let mut matched = None;
+        for (project_id, project) in &snapshot.catalog().projects {
+            if matches!(
+                &project.scope,
+                bbox_corpus_core::project_catalog::ProjectScope::Published(scope)
+                    if scope == expected
+            ) {
+                if matched.replace(project_id.to_string()).is_some() {
+                    bail!("managed workspace scope resolves to more than one catalog project");
+                }
+            }
+        }
+        return Ok(matched);
+    }
+    let records = state.records_provider.records_snapshot();
+    super::checkout_access::project_id_for_published_scope(
+        &state.checkout_access,
+        records
+            .records
+            .iter()
+            .map(|record| record.project_id.clone()),
+        expected,
+    )
+}
+
+/// Mint one fresh binding secret for an already-validated grant and install it.
+/// This is the only place a workspace binding secret is generated.
+pub(crate) fn mint_workspace_binding(
+    state: &Arc<SharedState>,
+    task_id: &str,
+    session_id: &str,
+    identity: &bro_protocol::WorkerWorkspaceIdentity,
+) -> Result<crate::orchestration::MintedWorkspaceBinding> {
+    let grant = workspace_binding_grant(state, task_id, session_id, identity)?;
+    let secret = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let token = bro_protocol::WorkspaceBindingToken::parse(secret)?;
+    let scope = grant.scope.clone();
+    install_workspace_binding(state, grant, &token)?;
+    Ok(crate::orchestration::MintedWorkspaceBinding { token, scope })
+}
+
+pub(crate) fn install_workspace_binding(
+    state: &Arc<SharedState>,
+    grant: WorkspaceBindingGrant,
+    token: &bro_protocol::WorkspaceBindingToken,
+) -> Result<()> {
+    let interval_secs = state
+        .knowledge_sources
+        .store()
+        .provisional_renew_interval_secs()?;
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| anyhow::anyhow!("workspace binding requires an async runtime"))?;
+    let token = ServiceToken::parse(token.expose_secret().to_string())?;
+    state
+        .knowledge_sources
+        .install_workspace_binding(token, grant.clone(), now_unix_secs());
+    let cancellation = CancellationToken::new();
+    if let Some(prior) = state
+        .knowledge_sources
+        .workspace_binding_renewals
+        .lock()
+        .insert(grant.task_id.clone(), cancellation.clone())
+    {
+        prior.cancel();
+    }
+    let state = state.clone();
+    runtime.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {
+                    state.knowledge_sources.extend_workspace_binding(
+                        &grant.task_id,
+                        &grant.session_id,
+                        now_unix_secs(),
+                    );
+                    let renewal_state = state.clone();
+                    let renewal_grant = grant.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        renew_selected_provisional_if_current(
+                            &renewal_state,
+                            &renewal_grant,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(ProvisionalRenewal::RetiredStale)) => tracing::info!(
+                            task_id = %grant.task_id,
+                            workspace_id = %grant.workspace_id,
+                            "retired provisional workspace after accepted publication advanced"
+                        ),
+                        Ok(Ok(ProvisionalRenewal::Absent | ProvisionalRenewal::Renewed)) => {}
+                        Ok(Err(error)) => tracing::warn!(
+                            task_id = %grant.task_id,
+                            workspace_id = %grant.workspace_id,
+                            error = %error,
+                            "failed to reconcile live provisional workspace renewal"
+                        ),
+                        Err(error) => tracing::warn!(
+                            task_id = %grant.task_id,
+                            workspace_id = %grant.workspace_id,
+                            error = %error,
+                            "provisional workspace renewal task failed"
+                        ),
                     }
                 }
             }
-            return Ok(matched);
         }
-        let records = self.state.records_provider.records_snapshot();
-        super::checkout_access::project_id_for_published_scope(
-            &self.state.checkout_access,
-            records
-                .records
-                .iter()
-                .map(|record| record.project_id.clone()),
-            expected,
-        )
-    }
-
-    fn install(
-        &self,
-        grant: WorkspaceBindingGrant,
-        token: &bro_protocol::WorkspaceBindingToken,
-    ) -> Result<()> {
-        let interval_secs = self
-            .state
-            .knowledge_sources
-            .store()
-            .provisional_renew_interval_secs()?;
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| anyhow::anyhow!("workspace binding requires an async runtime"))?;
-        let token = ServiceToken::parse(token.expose_secret().to_string())?;
-        self.state.knowledge_sources.install_workspace_binding(
-            token,
-            grant.clone(),
-            now_unix_secs(),
-        );
-        let cancellation = CancellationToken::new();
-        if let Some(prior) = self
-            .renewals
-            .lock()
-            .insert(grant.task_id.clone(), cancellation.clone())
-        {
-            prior.cancel();
-        }
-        let state = self.state.clone();
-        runtime.spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancellation.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {
-                        state.knowledge_sources.extend_workspace_binding(
-                            &grant.task_id,
-                            &grant.session_id,
-                            now_unix_secs(),
-                        );
-                        let renewal_state = state.clone();
-                        let renewal_grant = grant.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            renew_selected_provisional_if_current(
-                                &renewal_state,
-                                &renewal_grant,
-                            )
-                        })
-                        .await
-                        {
-                            Ok(Ok(ProvisionalRenewal::RetiredStale)) => tracing::info!(
-                                task_id = %grant.task_id,
-                                workspace_id = %grant.workspace_id,
-                                "retired provisional workspace after accepted publication advanced"
-                            ),
-                            Ok(Ok(ProvisionalRenewal::Absent | ProvisionalRenewal::Renewed)) => {}
-                            Ok(Err(error)) => tracing::warn!(
-                                task_id = %grant.task_id,
-                                workspace_id = %grant.workspace_id,
-                                error = %error,
-                                "failed to reconcile live provisional workspace renewal"
-                            ),
-                            Err(error) => tracing::warn!(
-                                task_id = %grant.task_id,
-                                workspace_id = %grant.workspace_id,
-                                error = %error,
-                                "provisional workspace renewal task failed"
-                            ),
-                        }
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
+    });
+    Ok(())
 }
 
 impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingAuthority {
     fn candidate_scopes(&self) -> Result<Vec<bro_protocol::WorkerWorkspaceScope>> {
-        self.published_scopes()?
+        published_scopes(&self.state)?
             .into_iter()
             .map(|scope| {
                 bro_protocol::WorkerWorkspaceScope::try_new(
@@ -410,16 +441,7 @@ impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingA
         session_id: &str,
         identity: &bro_protocol::WorkerWorkspaceIdentity,
     ) -> Result<crate::orchestration::MintedWorkspaceBinding> {
-        let grant = self.grant(task_id, session_id, identity)?;
-        let secret = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let token = bro_protocol::WorkspaceBindingToken::parse(secret)?;
-        let scope = grant.scope.clone();
-        self.install(grant, &token)?;
-        Ok(crate::orchestration::MintedWorkspaceBinding { token, scope })
+        mint_workspace_binding(&self.state, task_id, session_id, identity)
     }
 
     fn restore(
@@ -429,12 +451,18 @@ impl crate::orchestration::WorkspaceBindingAuthority for DaemonWorkspaceBindingA
         identity: &bro_protocol::WorkerWorkspaceIdentity,
         token: &bro_protocol::WorkspaceBindingToken,
     ) -> Result<()> {
-        let grant = self.grant(task_id, session_id, identity)?;
-        self.install(grant, token)
+        let grant = workspace_binding_grant(&self.state, task_id, session_id, identity)?;
+        install_workspace_binding(&self.state, grant, token)
     }
 
     fn revoke_task(&self, task_id: &str) {
-        if let Some(cancellation) = self.renewals.lock().remove(task_id) {
+        if let Some(cancellation) = self
+            .state
+            .knowledge_sources
+            .workspace_binding_renewals
+            .lock()
+            .remove(task_id)
+        {
             cancellation.cancel();
         }
         for grant in self
