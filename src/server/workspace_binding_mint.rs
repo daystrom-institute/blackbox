@@ -354,6 +354,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::server::BlackboxServer;
     use crate::server::producer_auth::{ProducerAuthRuntime, ProducerGrant};
     use crate::server::state::catalog_fixture::{CatalogFixture, gap_note, knowledge_entry};
 
@@ -651,12 +652,23 @@ mod tests {
         ),
     ];
 
-    /// End to end: an operator mints a binding through the route, the real
-    /// capture client uses it to publish a provisional workspace, and an MCP
-    /// session presenting the same binding reads its own uncommitted state
-    /// through the knowledge, gap, and project-graph read services.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn minted_binding_drives_a_real_capture_and_own_visibility() {
+    /// One published project whose accepted content is committed in a real
+    /// checkout, attached, with producer auth carrying knowledge transport and
+    /// the daemon serving on loopback. The working tree is left clean: each
+    /// test writes its own uncommitted edits before minting.
+    struct LiveCapture {
+        /// Owns the tempdir the checkout and every store live in; dropping it
+        /// early would delete the fixture out from under the serving daemon.
+        #[allow(dead_code)]
+        fixture: CatalogFixture,
+        scope: PublishedScope,
+        checkout: PathBuf,
+        server: BlackboxServer,
+        base_url: String,
+        serving: tokio::task::JoinHandle<()>,
+    }
+
+    async fn live_capture_fixture() -> LiveCapture {
         let fixture = CatalogFixture::new();
         let scope = CatalogFixture::scope(".");
         let checkout = fixture.root().join("live-checkout");
@@ -703,37 +715,6 @@ mod tests {
             &[published_gap],
         );
 
-        // The uncommitted working change is exactly what `own` visibility must
-        // surface and `published` must not.
-        std::fs::write(
-            checkout.join(".bbox/knowledge/k-operator-mint.json"),
-            bbox_knowledge::knowledge::committed_knowledge_entry_bytes(&knowledge_entry(
-                "k-operator-mint",
-                "uncommitted workspace content",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            checkout.join(".bbox/gaps/gap-0000ab01.json"),
-            bbox_gaps::gaps::committed_gap_note_bytes(&gap_note(
-                "gap-0000ab01",
-                "uncommitted workspace title",
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-        let vertices = checkout.join(".bbox/graphs/governance-record/vertices.jsonl");
-        std::fs::write(
-            &vertices,
-            format!(
-                "{}{}\n",
-                std::fs::read_to_string(&vertices).unwrap(),
-                UNCOMMITTED_VERTEX
-            ),
-        )
-        .unwrap();
-
         let server = fixture.server();
         let state = server.state.clone();
         let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
@@ -766,11 +747,21 @@ mod tests {
             let app = app_for(&state);
             async move { axum::serve(listener, app).await.unwrap() }
         });
-        let base_url = format!("http://{address}");
 
+        LiveCapture {
+            fixture,
+            scope,
+            checkout,
+            server,
+            base_url: format!("http://{address}"),
+            serving,
+        }
+    }
+
+    async fn mint_over_http(live: &LiveCapture) -> String {
         let minted: serde_json::Value = reqwest::Client::new()
-            .post(format!("{base_url}/admin/workspace-binding/mint"))
-            .json(&mint_request(&checkout.to_string_lossy(), &scope))
+            .post(format!("{}/admin/workspace-binding/mint", live.base_url))
+            .json(&mint_request(&live.checkout.to_string_lossy(), &live.scope))
             .send()
             .await
             .unwrap()
@@ -780,17 +771,72 @@ mod tests {
         let token = minted["token"].as_str().expect("minted token").to_string();
         assert_eq!(minted["workspace_id"], CHECKOUT_ID);
         assert_eq!(minted["provisional_capture_enabled"], true);
+        token
+    }
 
-        let capture = bbox_knowledge_source_client::WorkspaceCaptureClient::new(
-            &base_url,
-            bro_protocol::WorkspaceBindingToken::parse(token.clone()).unwrap(),
-            checkout.clone(),
-            checkout.clone(),
+    async fn capture_workspace(
+        live: &LiveCapture,
+        token: &str,
+    ) -> bbox_knowledge_source_client::CaptureOutcome {
+        bbox_knowledge_source_client::WorkspaceCaptureClient::new(
+            &live.base_url,
+            bro_protocol::WorkspaceBindingToken::parse(token.to_string()).unwrap(),
+            live.checkout.clone(),
+            live.checkout.clone(),
             WorkspaceId::parse(CHECKOUT_ID.to_string()).unwrap(),
-            scope.clone(),
+            live.scope.clone(),
+        )
+        .unwrap()
+        .sync_once()
+        .await
+        .expect("provisional capture")
+    }
+
+    fn append_working_vertex(checkout: &Path, row: &str) {
+        let vertices = checkout.join(".bbox/graphs/governance-record/vertices.jsonl");
+        std::fs::write(
+            &vertices,
+            format!("{}{row}\n", std::fs::read_to_string(&vertices).unwrap()),
         )
         .unwrap();
-        let outcome = capture.sync_once().await.expect("provisional capture");
+    }
+
+    /// End to end: an operator mints a binding through the route, the real
+    /// capture client uses it to publish a provisional workspace, and an MCP
+    /// session presenting the same binding reads its own uncommitted state
+    /// through the knowledge, gap, and project-graph read services.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn minted_binding_drives_a_real_capture_and_own_visibility() {
+        let live = live_capture_fixture().await;
+        let checkout = live.checkout.clone();
+
+        // The uncommitted working change is exactly what `own` visibility must
+        // surface and `published` must not.
+        std::fs::write(
+            checkout.join(".bbox/knowledge/k-operator-mint.json"),
+            bbox_knowledge::knowledge::committed_knowledge_entry_bytes(&knowledge_entry(
+                "k-operator-mint",
+                "uncommitted workspace content",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join(".bbox/gaps/gap-0000ab01.json"),
+            bbox_gaps::gaps::committed_gap_note_bytes(&gap_note(
+                "gap-0000ab01",
+                "uncommitted workspace title",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        append_working_vertex(&checkout, UNCOMMITTED_VERTEX);
+
+        let server = live.server.clone();
+        let state = server.state.clone();
+        let serving = &live.serving;
+        let token = mint_over_http(&live).await;
+        let outcome = capture_workspace(&live, &token).await;
         assert!(!outcome.reused);
 
         // Present the same minted binding as an MCP session authority.
@@ -862,5 +908,95 @@ mod tests {
         );
 
         serving.abort();
+    }
+
+    /// A second working vertex, so the "captured again" leg reads a generation
+    /// that is newer than the one the first capture installed.
+    const SECOND_UNCOMMITTED_VERTEX: &str = r#"{"id":"record/case@5","type":"gov:Record","label":"Uncommitted case record version 5","properties":{"status":"draft","version":5,"summary":"Second uncommitted governance record"}}"#;
+
+    /// A finalized capture installs its own graph views at the finalize
+    /// chokepoint, the mirror of what advance does for the published lane.
+    ///
+    /// Cold is the whole point: this session never reads knowledge or gaps, so
+    /// nothing recomputes the overlay pair. Before the finalize-time refresh,
+    /// the first read answered from the published lane and the read after a
+    /// second capture answered from the first capture's generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finalized_capture_refreshes_own_graph_views_without_a_knowledge_read() {
+        let live = live_capture_fixture().await;
+        let checkout = live.checkout.clone();
+        let server = live.server.clone();
+        let state = server.state.clone();
+
+        append_working_vertex(&checkout, UNCOMMITTED_VERTEX);
+        let token = mint_over_http(&live).await;
+        let first = capture_workspace(&live, &token).await;
+        assert!(!first.reused);
+
+        let grant = state
+            .knowledge_sources
+            .authenticate_workspace_binding_now(&token)
+            .expect("minted binding authenticates");
+        assert!(
+            server
+                .session_workspace_binding
+                .set(Some(Arc::new(grant)))
+                .is_ok()
+        );
+
+        let cold = server
+            .project_graph_list_domain(None, Some("own"))
+            .expect("own visibility reaches the project graph read service");
+        let row = cold
+            .iter()
+            .find(|graph| graph.graph_id == "governance-record")
+            .expect("the captured graph is visible without a knowledge read");
+        assert_eq!(row.source, "provisional", "{cold:?}");
+        assert_eq!(row.checkout_id.as_deref(), Some(CHECKOUT_ID), "{cold:?}");
+        let first_hash = row.content_hash.clone();
+
+        let first_vertex = bbox_corpus_core::entity_ref::EntityRef::parse(&format!(
+            "project_graph_vertex:{PROJECT}:governance-record:record/case@3"
+        ))
+        .unwrap();
+        let resolved = server
+            .resolve_project_graph_vertex(&first_vertex, Some("own"))
+            .expect("the first capture's vertex resolves on a cold read");
+        assert!(resolved.provisional);
+
+        // Capture again. A cold read must move to the newer generation rather
+        // than keep serving the one the first capture installed.
+        append_working_vertex(&checkout, SECOND_UNCOMMITTED_VERTEX);
+        let second = capture_workspace(&live, &token).await;
+        assert!(!second.reused);
+        assert_ne!(second.source_generation_id, first.source_generation_id);
+
+        let colder = server
+            .project_graph_list_domain(None, Some("own"))
+            .expect("own visibility still reaches the read service");
+        let row = colder
+            .iter()
+            .find(|graph| graph.graph_id == "governance-record")
+            .expect("the second captured graph is visible without a knowledge read");
+        assert_eq!(row.source, "provisional", "{colder:?}");
+        assert_ne!(
+            row.content_hash, first_hash,
+            "a cold own read must serve the newest captured generation: {colder:?}"
+        );
+
+        let second_vertex = bbox_corpus_core::entity_ref::EntityRef::parse(&format!(
+            "project_graph_vertex:{PROJECT}:governance-record:record/case@5"
+        ))
+        .unwrap();
+        let resolved = server
+            .resolve_project_graph_vertex(&second_vertex, Some("own"))
+            .expect("the second capture's vertex resolves on a cold read");
+        assert!(resolved.provisional);
+        assert_eq!(
+            resolved.checkout_id.as_ref().map(|id| id.as_str()),
+            Some(CHECKOUT_ID)
+        );
+
+        live.serving.abort();
     }
 }

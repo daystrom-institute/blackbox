@@ -676,6 +676,108 @@ impl super::BlackboxServer {
     }
 }
 
+/// Install one workspace's provisional project-graph views for the generation
+/// it just finalized.
+///
+/// The mirror of `refresh_published_graph_views` on the accept path. The graph
+/// read surface has no lazy rebuild-on-read: reads serve whatever was last
+/// installed, so whoever commits a generation has to install it. Without this
+/// a cold own-visibility graph read answers from the published lane, and a
+/// read after a second capture answers from the previous provisional
+/// generation, until some knowledge or gap own read happens to recompute the
+/// overlay pair and install the graphs alongside it.
+///
+/// Failure degrades rather than propagates, matching the accept path: the
+/// generation is already durable and selected, and the next capture or overlay
+/// recomputation reconciles the view.
+fn refresh_provisional_graph_views(state: &SharedState, authority: &ProvisionalAuthorityV1) {
+    let Some(runtime) = &state.accepted_publications else {
+        return;
+    };
+    let project_id =
+        match bbox_corpus_core::project_catalog::ProjectId::parse(authority.project_id.clone()) {
+            Ok(project_id) => project_id,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %authority.project_id,
+                    error = %error,
+                    "provisional graph view refresh skipped: unparseable project id"
+                );
+                return;
+            }
+        };
+    let verified = match runtime.load_verified(&project_id) {
+        Ok(verified) => verified,
+        Err(error) => {
+            tracing::warn!(
+                project_id = %project_id,
+                workspace_id = %authority.workspace_id,
+                code = error.code(),
+                "provisional graph view refresh skipped: no verified accepted content"
+            );
+            return;
+        }
+    };
+    let source = match state
+        .knowledge_sources
+        .store()
+        .materialize_selected_provisional(authority, now_unix_secs())
+    {
+        Ok(Some(source)) => source,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                project_id = %project_id,
+                workspace_id = %authority.workspace_id,
+                error = %error,
+                "provisional graph view refresh failed to materialize the selected generation"
+            );
+            return;
+        }
+    };
+    let built =
+        bbox_indexing::project_graph_view::build_provisional_graph_overlay(&source, &verified);
+    let overlay = match built {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            tracing::warn!(
+                project_id = %project_id,
+                workspace_id = %authority.workspace_id,
+                error = %error,
+                "provisional graph view refresh failed; own graph reads may serve stale \
+                 content until the next capture"
+            );
+            return;
+        }
+    };
+    // Own visibility is the published view overlaid by this workspace, so a
+    // daemon that never installed the published side (a restart after the
+    // accept) would answer own reads from the overlay alone. Build it only
+    // when it is missing: it is unchanged by a capture, and rebuilding it on
+    // every capture would pay for the whole accepted graph tree per mutation.
+    let published_missing = state
+        .project_graph_views
+        .read()
+        .published_view(&project_id)
+        .is_none();
+    let published = published_missing
+        .then(|| bbox_indexing::project_graph_view::build_published_graph_view(&verified))
+        .transpose()
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "published graph view rebuild failed during a provisional refresh"
+            );
+            None
+        });
+    let mut views = state.project_graph_views.write();
+    if let Some(published) = published {
+        views.install_published(published);
+    }
+    views.install_provisional(overlay);
+}
+
 fn provisional_file_map(
     files: &[ReadyPublicationFile],
     lane: &str,
@@ -1164,10 +1266,24 @@ async fn finalize_provisional_upload(
         blocking(move || store.provisional_upload_descriptor(&authority, &upload_id)).await?
     };
     require_current_provisional_descriptor(&state, &grant, &descriptor)?;
-    let response = blocking(move || {
-        store.finalize_provisional_upload(&authority, &upload_id, request.lease_ttl_secs)
-    })
-    .await?;
+    let response = {
+        let authority = authority.clone();
+        blocking(move || {
+            store.finalize_provisional_upload(&authority, &upload_id, request.lease_ttl_secs)
+        })
+        .await?
+    };
+    // The generation is durable and selected by the time finalize returns, so
+    // this is where its graph views become the workspace's own lane.
+    {
+        let state = state.clone();
+        let authority = authority.clone();
+        blocking(move || {
+            refresh_provisional_graph_views(&state, &authority);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    }
     for operation in [
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
         bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectGapMutation,
