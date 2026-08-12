@@ -100,6 +100,7 @@ pub fn install_accepted_publication_for_test(
                     source_bytes: file.source_bytes,
                 })
                 .collect(),
+            graphs: Vec::new(),
             prior_pointer,
         },
         &limits,

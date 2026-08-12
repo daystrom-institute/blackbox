@@ -11050,6 +11050,7 @@ mod tests {
                 accepted_commit: accepted_commit.clone(),
                 knowledge: Vec::new(),
                 gaps: Vec::new(),
+                graphs: Vec::new(),
                 prior_pointer: None,
             },
             &AcceptedPublicationLimits::default(),

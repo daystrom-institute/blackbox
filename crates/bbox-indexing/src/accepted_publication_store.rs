@@ -468,11 +468,21 @@ pub struct PublicationFileManifestEntryV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AcceptedGraphSourceV1 {
+    pub source_content_sha256: PublicationSha256,
+    pub encoded_bytes: u64,
+    pub source_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptedPublicationHashesV1 {
     pub knowledge_file_manifest_sha256: PublicationSha256,
     pub gap_file_manifest_sha256: PublicationSha256,
     pub normalized_knowledge_sha256: PublicationSha256,
     pub normalized_gaps_sha256: PublicationSha256,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_sources_sha256: Option<PublicationSha256>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +492,8 @@ pub struct AcceptedPublicationCountsV1 {
     pub knowledge_entries: u64,
     pub gap_files: u64,
     pub gap_entries: u64,
+    #[serde(default)]
+    pub graph_files: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +514,8 @@ pub(crate) struct AcceptedPublicationGenerationV1 {
     pub(crate) normalized_knowledge: BTreeMap<PublicationRecordId, AcceptedKnowledgeEntryV1>,
     #[serde(deserialize_with = "deserialize_unique_btree_map")]
     pub(crate) normalized_gaps: BTreeMap<PublicationRecordId, AcceptedGapEntryV1>,
+    #[serde(default, deserialize_with = "deserialize_unique_btree_map")]
+    pub(crate) graph_sources: BTreeMap<NormalizedRepoRelativeFilename, AcceptedGraphSourceV1>,
     pub(crate) hashes: AcceptedPublicationHashesV1,
     pub(crate) counts: AcceptedPublicationCountsV1,
     pub(crate) total_encoded_bytes: u64,
@@ -572,7 +586,14 @@ pub(crate) struct AcceptedPublicationBuildInputV1 {
     pub(crate) accepted_commit: GitObjectId,
     pub(crate) knowledge: Vec<AcceptedKnowledgeSourceV1>,
     pub(crate) gaps: Vec<AcceptedGapSourceV1>,
+    pub(crate) graphs: Vec<AcceptedGraphSourceV1Input>,
     pub(crate) prior_pointer: Option<AcceptedPublicationPriorPointerV1>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AcceptedGraphSourceV1Input {
+    pub(crate) repository_relative_filename: String,
+    pub(crate) source_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,6 +701,7 @@ pub(crate) struct AcceptedPublicationLimits {
     pub(crate) max_gap_entries: usize,
     pub(crate) max_knowledge_source_bytes: u64,
     pub(crate) max_gap_source_bytes: u64,
+    pub(crate) max_graph_source_bytes: u64,
     pub(crate) max_generation_bytes: usize,
     pub(crate) max_pointer_bytes: usize,
 }
@@ -692,6 +714,7 @@ impl Default for AcceptedPublicationLimits {
             max_gap_entries: MAX_ACCEPTED_PUBLICATION_ENTRIES_PER_LANE,
             max_knowledge_source_bytes: MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
             max_gap_source_bytes: MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
+            max_graph_source_bytes: MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
             max_generation_bytes: MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES,
             max_pointer_bytes: MAX_ACCEPTED_PUBLICATION_POINTER_BYTES,
         }
@@ -710,6 +733,8 @@ impl AcceptedPublicationLimits {
             && self.max_knowledge_source_bytes <= MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE
             && self.max_gap_source_bytes > 0
             && self.max_gap_source_bytes <= MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE
+            && self.max_graph_source_bytes > 0
+            && self.max_graph_source_bytes <= MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE
             && self.max_generation_bytes > 0
             && self.max_generation_bytes <= MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES
             && self.max_pointer_bytes > 0
@@ -1278,8 +1303,120 @@ pub(crate) fn prepare_accepted_publication_v1(
         }
     }
 
+    let graph_limits = bbox_knowledge_source::KnowledgeSourceLimits::default();
+    let graph_prefix = if input.scope.bbox_root_relpath() == "." {
+        ".bbox/graphs/".to_string()
+    } else {
+        format!("{}/.bbox/graphs/", input.scope.bbox_root_relpath())
+    };
+    let mut graph_sources = BTreeMap::new();
+    let mut graph_documents = BTreeMap::<String, BTreeMap<String, Vec<u8>>>::new();
+    let mut graph_source_bytes = 0_u64;
+    for source in input.graphs {
+        let encoded_bytes = u64::try_from(source.source_bytes.len())
+            .map_err(|_| byte_limit("accepted graph source file"))?;
+        let graph_jsonl = source
+            .repository_relative_filename
+            .ends_with("/vertices.jsonl")
+            || source
+                .repository_relative_filename
+                .ends_with("/edges.jsonl");
+        if (!graph_jsonl && encoded_bytes == 0) || encoded_bytes > limits.max_source_file_bytes {
+            return Err(byte_limit("accepted graph source file"));
+        }
+        graph_source_bytes = graph_source_bytes
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| byte_limit("accepted graph source lane"))?;
+        if graph_source_bytes > limits.max_graph_source_bytes {
+            return Err(byte_limit("accepted graph source lane"));
+        }
+        let supplied =
+            NormalizedRepoRelativeFilename::parse(source.repository_relative_filename.clone())?;
+        let relative = source
+            .repository_relative_filename
+            .strip_prefix(&graph_prefix)
+            .ok_or_else(|| invalid_generation("accepted graph filename is outside graph scope"))?;
+        let (graph_id, filename) = relative
+            .split_once('/')
+            .ok_or_else(|| invalid_generation("accepted graph filename has invalid depth"))?;
+        if relative.matches('/').count() != 1 {
+            return Err(invalid_generation(
+                "accepted graph filename has invalid depth",
+            ));
+        }
+        let files = graph_documents.entry(graph_id.to_string()).or_default();
+        if files
+            .insert(filename.to_string(), source.source_bytes.clone())
+            .is_some()
+            || graph_sources
+                .insert(
+                    supplied,
+                    AcceptedGraphSourceV1 {
+                        source_content_sha256: PublicationSha256::digest(&source.source_bytes),
+                        encoded_bytes,
+                        source_bytes: source.source_bytes,
+                    },
+                )
+                .is_some()
+        {
+            return Err(invalid_generation(
+                "accepted graph publication contains a duplicate source file",
+            ));
+        }
+    }
+    for (graph_id, files) in graph_documents {
+        let schema = files
+            .get("schema.json")
+            .ok_or_else(|| invalid_generation("accepted graph is missing schema.json"))?;
+        let vertices = files
+            .get("vertices.jsonl")
+            .ok_or_else(|| invalid_generation("accepted graph is missing vertices.jsonl"))?;
+        let edges = files
+            .get("edges.jsonl")
+            .ok_or_else(|| invalid_generation("accepted graph is missing edges.jsonl"))?;
+        if files.len() != 3 {
+            return Err(invalid_generation(
+                "accepted graph contains an unknown source file",
+            ));
+        }
+        let loaded = bbox_project_graph::load_graph_documents(
+            input.project_id.as_str(),
+            &graph_id,
+            bbox_project_graph::GraphDocumentBytes {
+                schema,
+                vertices,
+                edges,
+            },
+            bbox_project_graph::GraphParseLimits {
+                max_vertices: graph_limits.max_graph_rows_per_file as usize,
+                max_edges: graph_limits.max_graph_rows_per_file as usize,
+            },
+            std::path::PathBuf::new(),
+        );
+        if !loaded.report.valid {
+            let diagnostic = loaded
+                .report
+                .errors
+                .iter()
+                .map(|error| {
+                    format!(
+                        "{}:{}:{}",
+                        error.file,
+                        error.line.unwrap_or_default(),
+                        error.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(invalid_generation(format!(
+                "accepted graph `{graph_id}` failed validation: {diagnostic}"
+            )));
+        }
+    }
+
     let total_encoded_bytes = knowledge_source_bytes
         .checked_add(gap_source_bytes)
+        .and_then(|bytes| bytes.checked_add(graph_source_bytes))
         .ok_or_else(|| byte_limit("accepted publication source total"))?;
     let hashes = AcceptedPublicationHashesV1 {
         knowledge_file_manifest_sha256: canonical_json_hash(
@@ -1292,12 +1429,21 @@ pub(crate) fn prepare_accepted_publication_v1(
             "normalized accepted knowledge",
         )?,
         normalized_gaps_sha256: canonical_json_hash(&normalized_gaps, "normalized accepted gaps")?,
+        graph_sources_sha256: if graph_sources.is_empty() {
+            None
+        } else {
+            Some(canonical_json_hash(
+                &graph_sources,
+                "accepted graph sources",
+            )?)
+        },
     };
     let counts = AcceptedPublicationCountsV1 {
         knowledge_files: usize_to_u64(knowledge_file_manifest.len(), "accepted knowledge file")?,
         knowledge_entries: usize_to_u64(normalized_knowledge.len(), "accepted knowledge entry")?,
         gap_files: usize_to_u64(gap_file_manifest.len(), "accepted gap file")?,
         gap_entries: usize_to_u64(normalized_gaps.len(), "accepted gap entry")?,
+        graph_files: usize_to_u64(graph_sources.len(), "accepted graph file")?,
     };
     let generation = AcceptedPublicationGenerationV1 {
         version: ACCEPTED_PUBLICATION_VERSION,
@@ -1309,6 +1455,7 @@ pub(crate) fn prepare_accepted_publication_v1(
         gap_file_manifest,
         normalized_knowledge,
         normalized_gaps,
+        graph_sources,
         hashes,
         counts,
         total_encoded_bytes,
@@ -1577,8 +1724,15 @@ fn validate_generation_v1(
         }
     }
 
+    let graph_source_bytes = validate_accepted_graph_sources(
+        &generation.project_id,
+        &generation.scope,
+        &generation.graph_sources,
+        limits,
+    )?;
     let expected_total = knowledge_source_bytes
         .checked_add(gap_source_bytes)
+        .and_then(|bytes| bytes.checked_add(graph_source_bytes))
         .ok_or_else(|| byte_limit("accepted publication source total"))?;
     if generation.total_encoded_bytes != expected_total {
         return Err(invalid_generation(
@@ -1596,6 +1750,7 @@ fn validate_generation_v1(
         )?,
         gap_files: usize_to_u64(generation.gap_file_manifest.len(), "accepted gap file")?,
         gap_entries: usize_to_u64(generation.normalized_gaps.len(), "accepted gap entry")?,
+        graph_files: usize_to_u64(generation.graph_sources.len(), "accepted graph file")?,
     };
     if generation.counts != expected_counts {
         return Err(invalid_generation(
@@ -1619,6 +1774,14 @@ fn validate_generation_v1(
             &generation.normalized_gaps,
             "normalized accepted gaps",
         )?,
+        graph_sources_sha256: if generation.graph_sources.is_empty() {
+            None
+        } else {
+            Some(canonical_json_hash(
+                &generation.graph_sources,
+                "accepted graph sources",
+            )?)
+        },
     };
     if generation.hashes != expected_hashes {
         return Err(invalid_generation(
@@ -1626,6 +1789,102 @@ fn validate_generation_v1(
         ));
     }
     Ok(())
+}
+
+fn validate_accepted_graph_sources(
+    project_id: &ProjectId,
+    scope: &PublishedScope,
+    sources: &BTreeMap<NormalizedRepoRelativeFilename, AcceptedGraphSourceV1>,
+    limits: &AcceptedPublicationLimits,
+) -> AcceptedPublicationStoreResult<u64> {
+    let graph_prefix = if scope.bbox_root_relpath() == "." {
+        ".bbox/graphs/".to_string()
+    } else {
+        format!("{}/.bbox/graphs/", scope.bbox_root_relpath())
+    };
+    let graph_limits = bbox_knowledge_source::KnowledgeSourceLimits::default();
+    let mut total = 0_u64;
+    let mut graph_documents = BTreeMap::<String, BTreeMap<String, &[u8]>>::new();
+    for (filename, source) in sources {
+        let graph_jsonl = filename.as_str().ends_with("/vertices.jsonl")
+            || filename.as_str().ends_with("/edges.jsonl");
+        if (!graph_jsonl && source.encoded_bytes == 0)
+            || source.encoded_bytes > limits.max_source_file_bytes
+            || source.encoded_bytes != source.source_bytes.len() as u64
+            || source.source_content_sha256 != PublicationSha256::digest(&source.source_bytes)
+        {
+            return Err(invalid_generation(
+                "accepted graph source bytes disagree with their manifest",
+            ));
+        }
+        total = total
+            .checked_add(source.encoded_bytes)
+            .ok_or_else(|| byte_limit("accepted graph source lane"))?;
+        if total > limits.max_graph_source_bytes {
+            return Err(byte_limit("accepted graph source lane"));
+        }
+        let relative = filename
+            .as_str()
+            .strip_prefix(&graph_prefix)
+            .ok_or_else(|| invalid_generation("accepted graph filename is outside graph scope"))?;
+        let (graph_id, graph_file) = relative
+            .split_once('/')
+            .ok_or_else(|| invalid_generation("accepted graph filename has invalid depth"))?;
+        if relative.matches('/').count() != 1
+            || graph_documents
+                .entry(graph_id.to_string())
+                .or_default()
+                .insert(graph_file.to_string(), &source.source_bytes)
+                .is_some()
+        {
+            return Err(invalid_generation(
+                "accepted graph source path is duplicate or invalid",
+            ));
+        }
+    }
+    for (graph_id, files) in graph_documents {
+        let schema = files
+            .get("schema.json")
+            .ok_or_else(|| invalid_generation("accepted graph is missing schema.json"))?;
+        let vertices = files
+            .get("vertices.jsonl")
+            .ok_or_else(|| invalid_generation("accepted graph is missing vertices.jsonl"))?;
+        let edges = files
+            .get("edges.jsonl")
+            .ok_or_else(|| invalid_generation("accepted graph is missing edges.jsonl"))?;
+        if files.len() != 3 {
+            return Err(invalid_generation(
+                "accepted graph contains an unknown source file",
+            ));
+        }
+        let loaded = bbox_project_graph::load_graph_documents(
+            project_id.as_str(),
+            &graph_id,
+            bbox_project_graph::GraphDocumentBytes {
+                schema,
+                vertices,
+                edges,
+            },
+            bbox_project_graph::GraphParseLimits {
+                max_vertices: graph_limits.max_graph_rows_per_file as usize,
+                max_edges: graph_limits.max_graph_rows_per_file as usize,
+            },
+            std::path::PathBuf::new(),
+        );
+        if !loaded.report.valid {
+            return Err(invalid_generation(format!(
+                "accepted graph `{graph_id}` failed validation: {}",
+                loaded
+                    .report
+                    .errors
+                    .iter()
+                    .map(|error| error.code.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Ok(total)
 }
 
 fn validate_normalized_gap_v1(gap: &AcceptedGapEntryV1) -> AcceptedPublicationStoreResult<()> {
@@ -2504,6 +2763,7 @@ pub(crate) mod fixtures {
                 repository_relative_filename: relative("gaps", "gap-1234abcd"),
                 source_bytes: serde_json::to_vec(&gap_note("gap-1234abcd")).unwrap(),
             }],
+            graphs: Vec::new(),
             prior_pointer,
         };
         prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap()
@@ -2673,8 +2933,72 @@ mod tests {
                 ".bbox/knowledge/knowledge-a.json",
             )],
             gaps: vec![gap_source("gap-1234abcd", ".bbox/gaps/gap-1234abcd.json")],
+            graphs: Vec::new(),
             prior_pointer: None,
         }
+    }
+
+    fn governance_graph_sources() -> Vec<AcceptedGraphSourceV1Input> {
+        [
+            (
+                "schema.json",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/schema.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "vertices.jsonl",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/vertices.jsonl"
+                )
+                .as_slice(),
+            ),
+            (
+                "edges.jsonl",
+                include_bytes!(
+                    "../../bbox-project-graph/tests/fixtures/governance-record/edges.jsonl"
+                )
+                .as_slice(),
+            ),
+        ]
+        .into_iter()
+        .map(|(filename, source_bytes)| AcceptedGraphSourceV1Input {
+            repository_relative_filename: format!(".bbox/graphs/governance-record/{filename}"),
+            source_bytes: source_bytes.to_vec(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn candidate_builder_accepts_the_governance_record_graph_fixture() {
+        let mut input = build_input();
+        input.graphs = governance_graph_sources();
+        let prepared =
+            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
+        assert_eq!(prepared.generation.counts.graph_files, 3);
+        assert_eq!(prepared.generation.graph_sources.len(), 3);
+        assert!(prepared.generation.hashes.graph_sources_sha256.is_some());
+    }
+
+    #[test]
+    fn candidate_builder_rejects_structurally_invalid_graphs_before_install() {
+        let mut input = build_input();
+        input.graphs = governance_graph_sources();
+        let edges = input
+            .graphs
+            .iter_mut()
+            .find(|source| source.repository_relative_filename.ends_with("edges.jsonl"))
+            .unwrap();
+        edges.source_bytes =
+            br#"{"from":"missing","type":"gov:OWNED_BY","to":"team-platform"}"#.to_vec();
+        let error = prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default())
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.accepted_publication_invalid_generation"
+        );
+        assert!(error.to_string().contains("failed validation"));
     }
 
     fn prepared() -> PreparedAcceptedPublicationV1 {

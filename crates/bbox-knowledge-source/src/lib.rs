@@ -12,6 +12,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_SOURCE_FILES_PER_LANE: u64 = 100_000;
 pub const MAX_SOURCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_SOURCE_LANE_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_GRAPHS_PER_LANE: u64 = 1_024;
+pub const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_GRAPH_ROWS_PER_FILE: u64 = 1_000_000;
 pub const MAX_ANCESTRY_NODES: u64 = 2_000_000;
 pub const MAX_ANCESTRY_EDGES: u64 = 8_000_000;
 pub const MAX_ANCESTRY_PAGE_NODES: u64 = 2_000;
@@ -29,6 +32,9 @@ pub struct KnowledgeSourceLimits {
     pub max_files_per_lane: u64,
     pub max_file_bytes: u64,
     pub max_lane_bytes: u64,
+    pub max_graphs_per_lane: u64,
+    pub max_graph_bytes: u64,
+    pub max_graph_rows_per_file: u64,
     pub max_ancestry_nodes: u64,
     pub max_ancestry_edges: u64,
     pub max_ancestry_page_nodes: u64,
@@ -46,6 +52,9 @@ impl Default for KnowledgeSourceLimits {
             max_files_per_lane: MAX_SOURCE_FILES_PER_LANE,
             max_file_bytes: MAX_SOURCE_FILE_BYTES,
             max_lane_bytes: MAX_SOURCE_LANE_BYTES,
+            max_graphs_per_lane: MAX_GRAPHS_PER_LANE,
+            max_graph_bytes: MAX_GRAPH_BYTES,
+            max_graph_rows_per_file: MAX_GRAPH_ROWS_PER_FILE,
             max_ancestry_nodes: MAX_ANCESTRY_NODES,
             max_ancestry_edges: MAX_ANCESTRY_EDGES,
             max_ancestry_page_nodes: MAX_ANCESTRY_PAGE_NODES,
@@ -64,6 +73,9 @@ impl KnowledgeSourceLimits {
         validate_limit(self.max_files_per_lane, MAX_SOURCE_FILES_PER_LANE)?;
         validate_limit(self.max_file_bytes, MAX_SOURCE_FILE_BYTES)?;
         validate_limit(self.max_lane_bytes, MAX_SOURCE_LANE_BYTES)?;
+        validate_limit(self.max_graphs_per_lane, MAX_GRAPHS_PER_LANE)?;
+        validate_limit(self.max_graph_bytes, MAX_GRAPH_BYTES)?;
+        validate_limit(self.max_graph_rows_per_file, MAX_GRAPH_ROWS_PER_FILE)?;
         validate_limit(self.max_ancestry_nodes, MAX_ANCESTRY_NODES)?;
         validate_limit(self.max_ancestry_edges, MAX_ANCESTRY_EDGES)?;
         validate_limit(self.max_ancestry_page_nodes, MAX_ANCESTRY_PAGE_NODES)?;
@@ -127,6 +139,14 @@ pub enum ContractError {
     AncestryLimitExceeded,
     #[error("generation exceeds its enforced byte limit")]
     GenerationLimitExceeded,
+    #[error("graph source path is not exactly <graph-id>/<known-file>")]
+    InvalidGraphSourcePath,
+    #[error(
+        "graph source manifest does not contain exactly one schema and two fact files per graph"
+    )]
+    IncompleteGraphSource,
+    #[error("graph source exceeds an enforced graph limit")]
+    GraphLimitExceeded,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +177,7 @@ impl GitObjectFormatV1 {
 pub enum SourceLaneV1 {
     Knowledge,
     Gaps,
+    Graphs,
 }
 
 impl SourceLaneV1 {
@@ -164,6 +185,7 @@ impl SourceLaneV1 {
         match self {
             Self::Knowledge => "knowledge",
             Self::Gaps => "gaps",
+            Self::Graphs => "graphs",
         }
     }
 
@@ -171,6 +193,7 @@ impl SourceLaneV1 {
         match self {
             Self::Knowledge => 1,
             Self::Gaps => 2,
+            Self::Graphs => 3,
         }
     }
 }
@@ -189,6 +212,17 @@ pub struct SourceManifestDescriptorV1 {
     pub file_count: u64,
     pub logical_bytes: u64,
     pub page_count: u64,
+}
+
+impl Default for SourceManifestDescriptorV1 {
+    fn default() -> Self {
+        Self {
+            manifest_sha256: source_manifest_sha256(SourceLaneV1::Graphs, &[]),
+            file_count: 0,
+            logical_bytes: 0,
+            page_count: 0,
+        }
+    }
 }
 
 impl SourceManifestDescriptorV1 {
@@ -234,6 +268,8 @@ pub struct PublicationCandidateDescriptorV1 {
     pub object_format: GitObjectFormatV1,
     pub knowledge: SourceManifestDescriptorV1,
     pub gaps: SourceManifestDescriptorV1,
+    #[serde(default)]
+    pub graphs: SourceManifestDescriptorV1,
 }
 
 impl PublicationCandidateDescriptorV1 {
@@ -244,8 +280,13 @@ impl PublicationCandidateDescriptorV1 {
         validate_object_id(&self.publisher_commit, self.object_format)?;
         self.knowledge.validate_header(limits)?;
         self.gaps.validate_header(limits)?;
+        self.graphs.validate_header(limits)?;
         validate_total_bytes(
-            [self.knowledge.logical_bytes, self.gaps.logical_bytes],
+            [
+                self.knowledge.logical_bytes,
+                self.gaps.logical_bytes,
+                self.graphs.logical_bytes,
+            ],
             limits.max_generation_bytes,
         )
     }
@@ -299,8 +340,12 @@ pub struct ProvisionalWorkspaceDescriptorV1 {
     pub capture: StableCaptureV1,
     pub baseline_knowledge: SourceManifestDescriptorV1,
     pub baseline_gaps: SourceManifestDescriptorV1,
+    #[serde(default)]
+    pub baseline_graphs: SourceManifestDescriptorV1,
     pub working_knowledge: SourceManifestDescriptorV1,
     pub working_gaps: SourceManifestDescriptorV1,
+    #[serde(default)]
+    pub working_graphs: SourceManifestDescriptorV1,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,8 +514,12 @@ pub struct PublicationCandidateStatusV1 {
     pub observed_at_unix_secs: u64,
     pub knowledge_manifest_sha256: String,
     pub gap_manifest_sha256: String,
+    #[serde(default)]
+    pub graph_manifest_sha256: String,
     pub knowledge_files: u64,
     pub gap_files: u64,
+    #[serde(default)]
+    pub graph_files: u64,
     pub logical_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
@@ -488,8 +537,12 @@ pub struct ProvisionalWorkspaceStatusV1 {
     pub observed_at_unix_secs: u64,
     pub baseline_knowledge_manifest_sha256: String,
     pub baseline_gap_manifest_sha256: String,
+    #[serde(default)]
+    pub baseline_graph_manifest_sha256: String,
     pub working_knowledge_manifest_sha256: String,
     pub working_gap_manifest_sha256: String,
+    #[serde(default)]
+    pub working_graph_manifest_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expires_unix_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,9 +561,15 @@ impl ProvisionalWorkspaceDescriptorV1 {
         self.capture.validate()?;
         self.baseline_knowledge.validate_header(limits)?;
         self.baseline_gaps.validate_header(limits)?;
+        self.baseline_graphs.validate_header(limits)?;
         self.working_knowledge.validate_header(limits)?;
         self.working_gaps.validate_header(limits)?;
-        let working_pair = working_pair_sha256(&self.working_knowledge, &self.working_gaps);
+        self.working_graphs.validate_header(limits)?;
+        let working_pair = working_pair_sha256(
+            &self.working_knowledge,
+            &self.working_gaps,
+            &self.working_graphs,
+        );
         if self.capture.first_working_pair_sha256 != working_pair {
             return Err(ContractError::InvalidInput);
         }
@@ -518,8 +577,10 @@ impl ProvisionalWorkspaceDescriptorV1 {
             [
                 self.baseline_knowledge.logical_bytes,
                 self.baseline_gaps.logical_bytes,
+                self.baseline_graphs.logical_bytes,
                 self.working_knowledge.logical_bytes,
                 self.working_gaps.logical_bytes,
+                self.working_graphs.logical_bytes,
             ],
             limits.max_generation_bytes,
         )
@@ -547,11 +608,13 @@ pub fn source_file_blob_sha256(bytes: &[u8]) -> String {
 pub fn working_pair_sha256(
     knowledge: &SourceManifestDescriptorV1,
     gaps: &SourceManifestDescriptorV1,
+    graphs: &SourceManifestDescriptorV1,
 ) -> String {
     let mut encoded = Vec::new();
     push_field(&mut encoded, b"bbox-knowledge-working-pair-v1");
     hash_manifest_descriptor(&mut encoded, knowledge);
     hash_manifest_descriptor(&mut encoded, gaps);
+    hash_manifest_descriptor(&mut encoded, graphs);
     sha256(&encoded)
 }
 
@@ -562,7 +625,7 @@ pub fn validate_source_blob(
 ) -> Result<(), ContractError> {
     limits.validate()?;
     validate_sha256(&entry.content_sha256)?;
-    if entry.encoded_bytes == 0
+    if (!graph_source_may_be_empty(&entry.repository_relative_filename) && entry.encoded_bytes == 0)
         || entry.encoded_bytes > limits.max_file_bytes
         || bytes.len() as u64 != entry.encoded_bytes
     {
@@ -643,7 +706,10 @@ pub fn validate_source_manifest(
         }
         validate_source_filename(scope, lane, &entry.repository_relative_filename)?;
         validate_sha256(&entry.content_sha256)?;
-        if entry.encoded_bytes == 0 || entry.encoded_bytes > limits.max_file_bytes {
+        if (!graph_source_may_be_empty(&entry.repository_relative_filename)
+            && entry.encoded_bytes == 0)
+            || entry.encoded_bytes > limits.max_file_bytes
+        {
             return Err(ContractError::ManifestLimitExceeded);
         }
         logical_bytes = logical_bytes
@@ -664,6 +730,7 @@ pub fn validate_publication_candidate(
     descriptor: &PublicationCandidateDescriptorV1,
     knowledge: &[SourceFileManifestEntryV1],
     gaps: &[SourceFileManifestEntryV1],
+    graphs: &[SourceFileManifestEntryV1],
     limits: KnowledgeSourceLimits,
 ) -> Result<(), ContractError> {
     descriptor.validate_header(limits)?;
@@ -680,7 +747,15 @@ pub fn validate_publication_candidate(
         &descriptor.gaps,
         gaps,
         limits,
-    )
+    )?;
+    validate_source_manifest(
+        &descriptor.scope,
+        SourceLaneV1::Graphs,
+        &descriptor.graphs,
+        graphs,
+        limits,
+    )?;
+    validate_graph_source_manifest(&descriptor.scope, graphs, limits)
 }
 
 pub fn ancestry_sha256(format: GitObjectFormatV1, nodes: &[AncestryCommitV1]) -> String {
@@ -791,8 +866,10 @@ pub fn validate_provisional_workspace(
     ancestry: &[AncestryCommitV1],
     baseline_knowledge: &[SourceFileManifestEntryV1],
     baseline_gaps: &[SourceFileManifestEntryV1],
+    baseline_graphs: &[SourceFileManifestEntryV1],
     working_knowledge: &[SourceFileManifestEntryV1],
     working_gaps: &[SourceFileManifestEntryV1],
+    working_graphs: &[SourceFileManifestEntryV1],
     limits: KnowledgeSourceLimits,
 ) -> Result<(), ContractError> {
     descriptor.validate_header(limits)?;
@@ -813,14 +890,26 @@ pub fn validate_provisional_workspace(
         ),
         (SourceLaneV1::Gaps, &descriptor.baseline_gaps, baseline_gaps),
         (
+            SourceLaneV1::Graphs,
+            &descriptor.baseline_graphs,
+            baseline_graphs,
+        ),
+        (
             SourceLaneV1::Knowledge,
             &descriptor.working_knowledge,
             working_knowledge,
         ),
         (SourceLaneV1::Gaps, &descriptor.working_gaps, working_gaps),
+        (
+            SourceLaneV1::Graphs,
+            &descriptor.working_graphs,
+            working_graphs,
+        ),
     ] {
         validate_source_manifest(&descriptor.scope, lane, manifest, entries, limits)?;
     }
+    validate_graph_source_manifest(&descriptor.scope, baseline_graphs, limits)?;
+    validate_graph_source_manifest(&descriptor.scope, working_graphs, limits)?;
     Ok(())
 }
 
@@ -842,6 +931,7 @@ pub fn publication_candidate_generation_id(
     encoded.push(descriptor.object_format.tag());
     hash_manifest_descriptor(&mut encoded, &descriptor.knowledge);
     hash_manifest_descriptor(&mut encoded, &descriptor.gaps);
+    hash_manifest_descriptor(&mut encoded, &descriptor.graphs);
     Ok(format!("kps_{}", sha256(&encoded)))
 }
 
@@ -879,8 +969,10 @@ pub fn provisional_workspace_generation_id(
     );
     hash_manifest_descriptor(&mut encoded, &descriptor.baseline_knowledge);
     hash_manifest_descriptor(&mut encoded, &descriptor.baseline_gaps);
+    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_graphs);
     hash_manifest_descriptor(&mut encoded, &descriptor.working_knowledge);
     hash_manifest_descriptor(&mut encoded, &descriptor.working_gaps);
+    hash_manifest_descriptor(&mut encoded, &descriptor.working_graphs);
     Ok(format!("kws_{}", sha256(&encoded)))
 }
 
@@ -1014,6 +1106,27 @@ fn validate_source_filename(
     let Some(filename) = value.strip_prefix(&prefix) else {
         return Err(ContractError::InvalidSourceFilename);
     };
+    if lane == SourceLaneV1::Graphs {
+        let mut components = filename.split('/');
+        let Some(graph_id) = components.next() else {
+            return Err(ContractError::InvalidGraphSourcePath);
+        };
+        let Some(graph_file) = components.next() else {
+            return Err(ContractError::InvalidGraphSourcePath);
+        };
+        if components.next().is_some()
+            || graph_id.is_empty()
+            || graph_id.len() > 128
+            || graph_id.contains(':')
+            || !graph_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            || !matches!(graph_file, "schema.json" | "vertices.jsonl" | "edges.jsonl")
+        {
+            return Err(ContractError::InvalidGraphSourcePath);
+        }
+        return Ok(());
+    }
     let Some(record_id) = filename.strip_suffix(".json") else {
         return Err(ContractError::InvalidSourceFilename);
     };
@@ -1027,6 +1140,54 @@ fn validate_source_filename(
         return Err(ContractError::InvalidSourceFilename);
     }
     Ok(())
+}
+
+fn validate_graph_source_manifest(
+    scope: &PublishedScope,
+    entries: &[SourceFileManifestEntryV1],
+    limits: KnowledgeSourceLimits,
+) -> Result<(), ContractError> {
+    let prefix = if scope.bbox_root_relpath() == "." {
+        ".bbox/graphs/".to_string()
+    } else {
+        format!("{}/.bbox/graphs/", scope.bbox_root_relpath())
+    };
+    let mut graphs = BTreeMap::<&str, (u64, BTreeSet<&str>)>::new();
+    for entry in entries {
+        let relative = entry
+            .repository_relative_filename
+            .strip_prefix(&prefix)
+            .ok_or(ContractError::InvalidGraphSourcePath)?;
+        let (graph_id, graph_file) = relative
+            .split_once('/')
+            .ok_or(ContractError::InvalidGraphSourcePath)?;
+        let graph = graphs
+            .entry(graph_id)
+            .or_insert_with(|| (0, BTreeSet::new()));
+        graph.0 = graph
+            .0
+            .checked_add(entry.encoded_bytes)
+            .ok_or(ContractError::GraphLimitExceeded)?;
+        if graph.0 > limits.max_graph_bytes {
+            return Err(ContractError::GraphLimitExceeded);
+        }
+        if !graph.1.insert(graph_file) {
+            return Err(ContractError::IncompleteGraphSource);
+        }
+    }
+    if graphs.len() as u64 > limits.max_graphs_per_lane {
+        return Err(ContractError::GraphLimitExceeded);
+    }
+    let required = BTreeSet::from(["schema.json", "vertices.jsonl", "edges.jsonl"]);
+    if graphs.values().any(|(_, files)| files != &required) {
+        return Err(ContractError::IncompleteGraphSource);
+    }
+    Ok(())
+}
+
+fn graph_source_may_be_empty(path: &str) -> bool {
+    (path.contains("/.bbox/graphs/") || path.starts_with(".bbox/graphs/"))
+        && (path.ends_with("/vertices.jsonl") || path.ends_with("/edges.jsonl"))
 }
 
 fn validate_ancestry_descriptor(
@@ -1216,6 +1377,22 @@ mod tests {
         }
     }
 
+    fn graph_entries(graph_id: &str) -> Vec<SourceFileManifestEntryV1> {
+        let mut entries = [
+            ("schema.json", br#"{"version":1}"#.as_slice()),
+            ("vertices.jsonl", br#"{"id":"one"}"#.as_slice()),
+            ("edges.jsonl", br#"{"from":"one"}"#.as_slice()),
+        ]
+        .into_iter()
+        .map(|(filename, bytes)| entry(&format!(".bbox/graphs/{graph_id}/{filename}"), bytes))
+        .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.repository_relative_filename
+                .cmp(&right.repository_relative_filename)
+        });
+        entries
+    }
+
     fn publication() -> (
         PublicationCandidateDescriptorV1,
         Vec<SourceFileManifestEntryV1>,
@@ -1237,6 +1414,7 @@ mod tests {
             object_format: GitObjectFormatV1::Sha1,
             knowledge: manifest(SourceLaneV1::Knowledge, &knowledge),
             gaps: manifest(SourceLaneV1::Gaps, &gaps),
+            graphs: SourceManifestDescriptorV1::default(),
         };
         (descriptor, knowledge, gaps)
     }
@@ -1288,7 +1466,8 @@ mod tests {
         let baseline_gaps = manifest(SourceLaneV1::Gaps, &gaps);
         let working_knowledge = manifest(SourceLaneV1::Knowledge, &knowledge);
         let working_gaps = manifest(SourceLaneV1::Gaps, &gaps);
-        let working_pair = working_pair_sha256(&working_knowledge, &working_gaps);
+        let empty_graphs = SourceManifestDescriptorV1::default();
+        let working_pair = working_pair_sha256(&working_knowledge, &working_gaps, &empty_graphs);
         let descriptor = ProvisionalWorkspaceDescriptorV1 {
             schema_version: SCHEMA_VERSION,
             scope: scope(),
@@ -1308,8 +1487,10 @@ mod tests {
             },
             baseline_knowledge,
             baseline_gaps,
+            baseline_graphs: empty_graphs.clone(),
             working_knowledge,
             working_gaps,
+            working_graphs: empty_graphs,
         };
         (descriptor, nodes, knowledge, gaps)
     }
@@ -1321,6 +1502,7 @@ mod tests {
             &descriptor,
             &knowledge,
             &gaps,
+            &[],
             KnowledgeSourceLimits::default(),
         )
         .unwrap();
@@ -1330,8 +1512,73 @@ mod tests {
         );
         assert_eq!(
             publication_candidate_generation_id("producer-a", &descriptor).unwrap(),
-            "kps_ed7b6e9e7378e05714065e1bac8f6ac8c12e47d2b758c5eb6a41edfd62a5df56"
+            "kps_262e2277635441315066c6b9cb60a6243a14833da7f6c7729b518acecd5f6e71"
         );
+    }
+
+    #[test]
+    fn graph_lane_admits_only_complete_known_three_file_directories() {
+        let entries = graph_entries("records");
+        let descriptor = manifest(SourceLaneV1::Graphs, &entries);
+        validate_source_manifest(
+            &scope(),
+            SourceLaneV1::Graphs,
+            &descriptor,
+            &entries,
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+        validate_graph_source_manifest(&scope(), &entries, KnowledgeSourceLimits::default())
+            .unwrap();
+
+        for path in [
+            ".bbox/graphs/records/unknown.json",
+            ".bbox/graphs/records/nested/schema.json",
+            ".bbox/graphs/../schema.json",
+            ".bbox/graphs/bad:id/schema.json",
+        ] {
+            let invalid = vec![entry(path, b"{}")];
+            assert!(matches!(
+                validate_source_manifest(
+                    &scope(),
+                    SourceLaneV1::Graphs,
+                    &manifest(SourceLaneV1::Graphs, &invalid),
+                    &invalid,
+                    KnowledgeSourceLimits::default(),
+                ),
+                Err(ContractError::InvalidGraphSourcePath | ContractError::InvalidSourceFilename)
+            ));
+        }
+
+        let incomplete = entries[..2].to_vec();
+        assert!(matches!(
+            validate_graph_source_manifest(&scope(), &incomplete, KnowledgeSourceLimits::default()),
+            Err(ContractError::IncompleteGraphSource)
+        ));
+    }
+
+    #[test]
+    fn graph_lane_enforces_per_graph_and_graph_count_ceilings() {
+        let entries = graph_entries("records");
+        let mut limits = KnowledgeSourceLimits::default();
+        limits.max_graph_bytes = entries.iter().map(|entry| entry.encoded_bytes).sum::<u64>() - 1;
+        assert!(matches!(
+            validate_graph_source_manifest(&scope(), &entries, limits),
+            Err(ContractError::GraphLimitExceeded)
+        ));
+
+        let mut limits = KnowledgeSourceLimits::default();
+        limits.max_graphs_per_lane = 1;
+        let mut two_graphs = entries;
+        two_graphs.extend(graph_entries("second"));
+        two_graphs.sort_by(|left, right| {
+            left.repository_relative_filename
+                .cmp(&right.repository_relative_filename)
+        });
+        assert!(matches!(
+            validate_graph_source_manifest(&scope(), &two_graphs, limits),
+            Err(ContractError::GraphLimitExceeded)
+        ));
     }
 
     #[test]
@@ -1342,8 +1589,10 @@ mod tests {
             &nodes,
             &knowledge,
             &gaps,
+            &[],
             &knowledge,
             &gaps,
+            &[],
             KnowledgeSourceLimits::default(),
         )
         .unwrap();
@@ -1353,7 +1602,7 @@ mod tests {
         );
         assert_eq!(
             provisional_workspace_generation_id(&descriptor).unwrap(),
-            "kws_b2ef389d2c997a9c6aac48af0c7af608412d26f4dabf682e7b293b36e5feb37a"
+            "kws_1c65ac3aec908e12d6b741901abb05a23a9026cd303887cbdff0d6c759a99672"
         );
     }
 
@@ -1683,7 +1932,11 @@ mod tests {
         assert_ne!(base, provisional_workspace_generation_id(&changed).unwrap());
         let mut changed = provisional.clone();
         changed.working_gaps.manifest_sha256 = "b".repeat(64);
-        let changed_pair = working_pair_sha256(&changed.working_knowledge, &changed.working_gaps);
+        let changed_pair = working_pair_sha256(
+            &changed.working_knowledge,
+            &changed.working_gaps,
+            &changed.working_graphs,
+        );
         changed.capture.first_working_pair_sha256 = changed_pair.clone();
         changed.capture.second_working_pair_sha256 = changed_pair;
         assert_ne!(base, provisional_workspace_generation_id(&changed).unwrap());

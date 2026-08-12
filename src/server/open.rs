@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::index::TranscriptIndex;
 use crate::checkout_mutations::CheckoutMutations;
+use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
 use crate::notes::Notes;
 use crate::orchestration::TaskStore;
@@ -964,6 +964,7 @@ pub(super) fn open_shared_state(
         gap_published_cache: RwLock::new(Default::default()),
         catalog_knowledge_published_cache: RwLock::new(Default::default()),
         catalog_gap_published_cache: RwLock::new(Default::default()),
+        project_graph_views: RwLock::new(Default::default()),
         publisher_authorization_cache: RwLock::new(Default::default()),
         packets: RwLock::new(packets_store),
         surface_decisions: crate::server::surface::SurfaceDecisionCache::default(),

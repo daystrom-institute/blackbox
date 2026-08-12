@@ -305,6 +305,12 @@ impl WorkspaceCaptureClient {
                 captured.descriptor.baseline_gaps.page_count,
             ),
             (
+                SnapshotClassV1::Baseline,
+                SourceLaneV1::Graphs,
+                captured.baseline_graphs.as_slice(),
+                captured.descriptor.baseline_graphs.page_count,
+            ),
+            (
                 SnapshotClassV1::Working,
                 SourceLaneV1::Knowledge,
                 captured.working_knowledge.as_slice(),
@@ -315,6 +321,12 @@ impl WorkspaceCaptureClient {
                 SourceLaneV1::Gaps,
                 captured.working_gaps.as_slice(),
                 captured.descriptor.working_gaps.page_count,
+            ),
+            (
+                SnapshotClassV1::Working,
+                SourceLaneV1::Graphs,
+                captured.working_graphs.as_slice(),
+                captured.descriptor.working_graphs.page_count,
             ),
         ] {
             let pages = pack_manifest_pages(
@@ -488,8 +500,10 @@ struct CapturedWorkspace {
     ancestry: Vec<AncestryCommitV1>,
     baseline_knowledge: Vec<SourceFileManifestEntryV1>,
     baseline_gaps: Vec<SourceFileManifestEntryV1>,
+    baseline_graphs: Vec<SourceFileManifestEntryV1>,
     working_knowledge: Vec<SourceFileManifestEntryV1>,
     working_gaps: Vec<SourceFileManifestEntryV1>,
+    working_graphs: Vec<SourceFileManifestEntryV1>,
     blobs: BTreeMap<String, Vec<u8>>,
 }
 
@@ -570,6 +584,13 @@ fn capture_workspace(
         limits,
         &mut blobs,
     )?;
+    let baseline_graphs = capture_committed_lane(
+        &baseline_commit,
+        &context.scope,
+        SourceLaneV1::Graphs,
+        limits,
+        &mut blobs,
+    )?;
     let working_knowledge = capture_working_lane(
         project_root,
         &context.scope,
@@ -584,13 +605,28 @@ fn capture_workspace(
         limits,
         &mut blobs,
     )?;
+    let working_graphs = capture_working_lane(
+        project_root,
+        &context.scope,
+        SourceLaneV1::Graphs,
+        limits,
+        &mut blobs,
+    )?;
     let baseline_knowledge_descriptor =
         manifest_descriptor(SourceLaneV1::Knowledge, &baseline_knowledge, limits)?;
     let baseline_gaps_descriptor = manifest_descriptor(SourceLaneV1::Gaps, &baseline_gaps, limits)?;
+    let baseline_graphs_descriptor =
+        manifest_descriptor(SourceLaneV1::Graphs, &baseline_graphs, limits)?;
     let working_knowledge_descriptor =
         manifest_descriptor(SourceLaneV1::Knowledge, &working_knowledge, limits)?;
     let working_gaps_descriptor = manifest_descriptor(SourceLaneV1::Gaps, &working_gaps, limits)?;
-    let first_pair = working_pair_sha256(&working_knowledge_descriptor, &working_gaps_descriptor);
+    let working_graphs_descriptor =
+        manifest_descriptor(SourceLaneV1::Graphs, &working_graphs, limits)?;
+    let first_pair = working_pair_sha256(
+        &working_knowledge_descriptor,
+        &working_gaps_descriptor,
+        &working_graphs_descriptor,
+    );
 
     let mut second_blobs = BTreeMap::new();
     let second_knowledge = capture_working_lane(
@@ -607,13 +643,22 @@ fn capture_workspace(
         limits,
         &mut second_blobs,
     )?;
+    let second_graphs = capture_working_lane(
+        project_root,
+        &context.scope,
+        SourceLaneV1::Graphs,
+        limits,
+        &mut second_blobs,
+    )?;
     let second_pair = working_pair_sha256(
         &manifest_descriptor(SourceLaneV1::Knowledge, &second_knowledge, limits)?,
         &manifest_descriptor(SourceLaneV1::Gaps, &second_gaps, limits)?,
+        &manifest_descriptor(SourceLaneV1::Graphs, &second_graphs, limits)?,
     );
     if first_pair != second_pair
         || working_knowledge != second_knowledge
         || working_gaps != second_gaps
+        || working_graphs != second_graphs
     {
         bail!("knowledge-source working files moved during stable capture");
     }
@@ -651,16 +696,20 @@ fn capture_workspace(
         },
         baseline_knowledge: baseline_knowledge_descriptor,
         baseline_gaps: baseline_gaps_descriptor,
+        baseline_graphs: baseline_graphs_descriptor,
         working_knowledge: working_knowledge_descriptor,
         working_gaps: working_gaps_descriptor,
+        working_graphs: working_graphs_descriptor,
     };
     validate_provisional_workspace(
         &descriptor,
         &ancestry,
         &baseline_knowledge,
         &baseline_gaps,
+        &baseline_graphs,
         &working_knowledge,
         &working_gaps,
+        &working_graphs,
         limits,
     )?;
     Ok(CapturedWorkspace {
@@ -668,8 +717,10 @@ fn capture_workspace(
         ancestry,
         baseline_knowledge,
         baseline_gaps,
+        baseline_graphs,
         working_knowledge,
         working_gaps,
+        working_graphs,
         blobs,
     })
 }
@@ -719,6 +770,9 @@ fn capture_working_lane(
     let Some(directory) = NofollowDirectory::open_existing(&directory_path)? else {
         return Ok(Vec::new());
     };
+    if lane == SourceLaneV1::Graphs {
+        return capture_working_graphs(&directory_path, &directory, scope, limits, blobs);
+    }
     let mut names = BTreeSet::new();
     for entry in fs::read_dir(&directory_path)
         .with_context(|| format!("reading bound source lane {}", directory_path.display()))?
@@ -757,6 +811,83 @@ fn capture_working_lane(
     Ok(entries)
 }
 
+#[allow(clippy::disallowed_methods)]
+fn capture_working_graphs(
+    directory_path: &Path,
+    directory: &NofollowDirectory,
+    scope: &PublishedScope,
+    limits: KnowledgeSourceLimits,
+    blobs: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<SourceFileManifestEntryV1>> {
+    let mut graph_ids = BTreeSet::new();
+    for entry in fs::read_dir(directory_path)
+        .with_context(|| format!("reading bound graph lane {}", directory_path.display()))?
+    {
+        let entry = entry?;
+        let graph_id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("bound graph id is not UTF-8"))?;
+        if entry.file_type()?.is_symlink() || !entry.file_type()?.is_dir() {
+            bail!("bound graph lane contains a non-directory or symlink entry");
+        }
+        graph_ids.insert(graph_id);
+    }
+    if graph_ids.len() as u64 > limits.max_graphs_per_lane {
+        bail!("bound graph lane exceeds its graph limit");
+    }
+    let prefix = lane_repository_directory(scope, SourceLaneV1::Graphs);
+    let required = BTreeSet::from(["schema.json", "vertices.jsonl", "edges.jsonl"]);
+    let mut entries = Vec::with_capacity(graph_ids.len().saturating_mul(3));
+    for graph_id in graph_ids {
+        let graph_path = directory_path.join(&graph_id);
+        let graph_directory = NofollowDirectory::open_existing(&graph_path)?
+            .context("bound graph directory disappeared during capture")?;
+        let mut names = BTreeSet::new();
+        for entry in fs::read_dir(&graph_path)
+            .with_context(|| format!("reading bound graph {}", graph_path.display()))?
+        {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow!("bound graph filename is not UTF-8"))?;
+            if entry.file_type()?.is_symlink()
+                || !entry.file_type()?.is_file()
+                || !required.contains(name.as_str())
+            {
+                bail!("bound graph directory contains an unknown or unsafe file");
+            }
+            names.insert(name);
+        }
+        if names.iter().map(String::as_str).collect::<BTreeSet<_>>() != required {
+            bail!("bound graph directory is missing a required source file");
+        }
+        let before = entries.len();
+        for name in names {
+            let bytes = graph_directory
+                .read_regular(&name, limits.max_file_bytes as usize, "bound graph source")?
+                .context("bound graph source disappeared during capture")?;
+            push_source_entry(
+                &mut entries,
+                blobs,
+                format!("{prefix}/{graph_id}/{name}"),
+                bytes,
+                limits,
+            )?;
+        }
+        let graph_bytes = entries[before..]
+            .iter()
+            .try_fold(0_u64, |total, entry| total.checked_add(entry.encoded_bytes));
+        if graph_bytes.context("graph byte count overflow")? > limits.max_graph_bytes {
+            bail!("bound graph exceeds its byte limit");
+        }
+        graph_directory.ensure_still_current()?;
+    }
+    directory.ensure_still_current()?;
+    Ok(entries)
+}
+
 fn push_source_entry(
     entries: &mut Vec<SourceFileManifestEntryV1>,
     blobs: &mut BTreeMap<String, Vec<u8>>,
@@ -764,7 +895,11 @@ fn push_source_entry(
     bytes: Vec<u8>,
     limits: KnowledgeSourceLimits,
 ) -> Result<()> {
-    if bytes.is_empty() || bytes.len() as u64 > limits.max_file_bytes {
+    let graph_jsonl = (repository_relative_filename.contains("/.bbox/graphs/")
+        || repository_relative_filename.starts_with(".bbox/graphs/"))
+        && (repository_relative_filename.ends_with("/vertices.jsonl")
+            || repository_relative_filename.ends_with("/edges.jsonl"));
+    if (!graph_jsonl && bytes.is_empty()) || bytes.len() as u64 > limits.max_file_bytes {
         bail!("bound source record violates its byte limit");
     }
     let current_bytes = entries
@@ -901,8 +1036,10 @@ fn current_matches(
         && current.baseline_knowledge_manifest_sha256
             == descriptor.baseline_knowledge.manifest_sha256
         && current.baseline_gap_manifest_sha256 == descriptor.baseline_gaps.manifest_sha256
+        && current.baseline_graph_manifest_sha256 == descriptor.baseline_graphs.manifest_sha256
         && current.working_knowledge_manifest_sha256 == descriptor.working_knowledge.manifest_sha256
         && current.working_gap_manifest_sha256 == descriptor.working_gaps.manifest_sha256
+        && current.working_graph_manifest_sha256 == descriptor.working_graphs.manifest_sha256
 }
 
 fn lane_repository_directory(scope: &PublishedScope, lane: SourceLaneV1) -> String {
@@ -917,6 +1054,7 @@ fn lane_name(lane: SourceLaneV1) -> &'static str {
     match lane {
         SourceLaneV1::Knowledge => "knowledge",
         SourceLaneV1::Gaps => "gaps",
+        SourceLaneV1::Graphs => "graphs",
     }
 }
 
@@ -1078,6 +1216,84 @@ mod tests {
         .err()
         .expect("pending transaction must fail closed");
         assert!(format!("{error:#}").contains("transaction is pending"));
+    }
+
+    fn write_working_graph(root: &Path, graph_id: &str) -> PathBuf {
+        let graph = root.join(".bbox/graphs").join(graph_id);
+        fs::create_dir_all(&graph).unwrap();
+        fs::write(graph.join("schema.json"), b"{}\n").unwrap();
+        fs::write(graph.join("vertices.jsonl"), b"{}\n").unwrap();
+        fs::write(graph.join("edges.jsonl"), b"{}\n").unwrap();
+        graph
+    }
+
+    #[test]
+    fn graph_capture_rejects_unknown_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let graph = write_working_graph(&root, "records");
+        fs::write(graph.join("unknown.json"), b"{}\n").unwrap();
+        let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
+            .unwrap()
+            .unwrap();
+        let mut blobs = BTreeMap::new();
+
+        let error = capture_working_graphs(
+            &root.join(".bbox/graphs"),
+            &lane,
+            &PublishedScope::try_new("capture-test", ".").unwrap(),
+            KnowledgeSourceLimits::default(),
+            &mut blobs,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown or unsafe file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_capture_rejects_symlinked_directories_and_files() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let graph = write_working_graph(&root, "records");
+        let external = root.join("external.json");
+        fs::write(&external, b"{}\n").unwrap();
+        fs::remove_file(graph.join("schema.json")).unwrap();
+        symlink(&external, graph.join("schema.json")).unwrap();
+        let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
+            .unwrap()
+            .unwrap();
+        let mut blobs = BTreeMap::new();
+        assert!(
+            capture_working_graphs(
+                &root.join(".bbox/graphs"),
+                &lane,
+                &PublishedScope::try_new("capture-test", ".").unwrap(),
+                KnowledgeSourceLimits::default(),
+                &mut blobs,
+            )
+            .is_err()
+        );
+
+        fs::remove_dir_all(root.join(".bbox/graphs")).unwrap();
+        fs::create_dir_all(root.join(".bbox/graphs")).unwrap();
+        let external_graph = write_working_graph(&root.join("external"), "records");
+        symlink(external_graph, root.join(".bbox/graphs/linked")).unwrap();
+        let lane = NofollowDirectory::open_existing(&root.join(".bbox/graphs"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            capture_working_graphs(
+                &root.join(".bbox/graphs"),
+                &lane,
+                &PublishedScope::try_new("capture-test", ".").unwrap(),
+                KnowledgeSourceLimits::default(),
+                &mut blobs,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1249,8 +1465,10 @@ mod tests {
             observed_at_unix_secs: 1,
             baseline_knowledge_manifest_sha256: descriptor.baseline_knowledge.manifest_sha256,
             baseline_gap_manifest_sha256: descriptor.baseline_gaps.manifest_sha256,
+            baseline_graph_manifest_sha256: descriptor.baseline_graphs.manifest_sha256,
             working_knowledge_manifest_sha256: descriptor.working_knowledge.manifest_sha256,
             working_gap_manifest_sha256: descriptor.working_gaps.manifest_sha256,
+            working_graph_manifest_sha256: descriptor.working_graphs.manifest_sha256,
             lease_expires_unix_secs: Some(61),
             diagnostic: None,
         });

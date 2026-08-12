@@ -154,6 +154,7 @@ struct CapturedPublicationCandidate {
     descriptor: PublicationCandidateDescriptorV1,
     knowledge_entries: Vec<SourceFileManifestEntryV1>,
     gap_entries: Vec<SourceFileManifestEntryV1>,
+    graph_entries: Vec<SourceFileManifestEntryV1>,
     blobs: tempfile::TempDir,
 }
 
@@ -749,6 +750,8 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
     )?;
     let gap_entries =
         capture_publication_lane(&commit, &actual_scope, SourceLaneV1::Gaps, &blobs, limits)?;
+    let graph_entries =
+        capture_publication_lane(&commit, &actual_scope, SourceLaneV1::Graphs, &blobs, limits)?;
     let knowledge_pages = pack_source_manifest_pages(
         &knowledge_entries,
         limits.max_manifest_page_entries as usize,
@@ -756,6 +759,11 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
     )?;
     let gap_pages = pack_source_manifest_pages(
         &gap_entries,
+        limits.max_manifest_page_entries as usize,
+        limits.max_manifest_page_bytes as usize,
+    )?;
+    let graph_pages = pack_source_manifest_pages(
+        &graph_entries,
         limits.max_manifest_page_entries as usize,
         limits.max_manifest_page_bytes as usize,
     )?;
@@ -771,11 +779,17 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
             knowledge_pages.len(),
         )?,
         gaps: source_manifest_descriptor(SourceLaneV1::Gaps, &gap_entries, gap_pages.len())?,
+        graphs: source_manifest_descriptor(
+            SourceLaneV1::Graphs,
+            &graph_entries,
+            graph_pages.len(),
+        )?,
     };
     bbox_knowledge_source::validate_publication_candidate(
         &descriptor,
         &knowledge_entries,
         &gap_entries,
+        &graph_entries,
         limits,
     )?;
     let stable_commit = repository
@@ -788,6 +802,7 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
         descriptor,
         knowledge_entries,
         gap_entries,
+        graph_entries,
         blobs,
     })
 }
@@ -802,6 +817,7 @@ fn capture_publication_lane(
     let lane_name = match lane {
         SourceLaneV1::Knowledge => "knowledge",
         SourceLaneV1::Gaps => "gaps",
+        SourceLaneV1::Graphs => "graphs",
     };
     let directory = if scope.bbox_root_relpath() == "." {
         format!(".bbox/{lane_name}")
@@ -972,6 +988,11 @@ async fn publish_publication_candidate(
             captured.gap_entries.as_slice(),
             captured.descriptor.gaps.page_count,
         ),
+        (
+            SourceLaneV1::Graphs,
+            captured.graph_entries.as_slice(),
+            captured.descriptor.graphs.page_count,
+        ),
     ] {
         let pages = pack_source_manifest_pages(
             entries,
@@ -984,6 +1005,7 @@ async fn publish_publication_candidate(
         let lane_name = match lane {
             SourceLaneV1::Knowledge => "knowledge",
             SourceLaneV1::Gaps => "gaps",
+            SourceLaneV1::Graphs => "graphs",
         };
         for page in pages {
             let url = runtime.endpoint(&format!(
@@ -1005,6 +1027,7 @@ async fn publish_publication_candidate(
         .knowledge_entries
         .iter()
         .chain(&captured.gap_entries)
+        .chain(&captured.graph_entries)
         .map(|entry| (entry.content_sha256.as_str(), entry))
         .collect::<HashMap<_, _>>();
     loop {
@@ -2621,7 +2644,11 @@ mod tests {
         }
     }
 
-    fn write_mutation(scope: &PublishedScope, path: &str, content: &str) -> bbox_code_source::CheckoutMutationV1 {
+    fn write_mutation(
+        scope: &PublishedScope,
+        path: &str,
+        content: &str,
+    ) -> bbox_code_source::CheckoutMutationV1 {
         bbox_code_source::CheckoutMutationV1 {
             schema_version: bbox_code_source::CHECKOUT_MUTATION_SCHEMA_VERSION,
             mutation_id: "cm-00000000000000aa".into(),
@@ -2641,11 +2668,18 @@ mod tests {
         let scope = PublishedScope::try_new("repo-mutations", ".").unwrap();
         let config = mutation_config(&root, scope.clone());
 
-        let mutation = write_mutation(&scope, ".bbox/gaps/gap-0123abcd.json", "{\"id\":\"gap-0123abcd\"}");
+        let mutation = write_mutation(
+            &scope,
+            ".bbox/gaps/gap-0123abcd.json",
+            "{\"id\":\"gap-0123abcd\"}",
+        );
         let digest = apply_checkout_mutation(&config, &mutation).unwrap();
         assert!(digest.is_some());
         let target = root.join(".bbox/gaps/gap-0123abcd.json");
-        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"id\":\"gap-0123abcd\"}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "{\"id\":\"gap-0123abcd\"}"
+        );
         // Redelivery rewrites identical bytes without error.
         apply_checkout_mutation(&config, &mutation).unwrap();
 
@@ -2677,7 +2711,6 @@ mod tests {
         outside.relative_path = ".bbox/../escape".into();
         assert!(apply_checkout_mutation(&config, &outside).is_err());
     }
-
 
     #[test]
     fn trusted_encrypted_network_admits_configured_plaintext_endpoint() {

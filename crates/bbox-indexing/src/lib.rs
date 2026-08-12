@@ -32,6 +32,7 @@ pub mod project_catalog_probe;
 pub mod project_catalog_rebuild;
 pub mod project_catalog_rebuild_planning;
 pub mod project_catalog_store;
+pub mod project_graph_view;
 pub mod project_resolver;
 pub mod projects;
 pub mod publisher;

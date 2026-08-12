@@ -1201,6 +1201,17 @@ impl BlackboxServer {
                                     source_bytes: file.source_bytes.clone(),
                                 })
                                 .collect(),
+                            graphs: candidate
+                                .graphs
+                                .iter()
+                                .map(|file| PublishSourceFile {
+                                    repository_relative_filename: file
+                                        .manifest
+                                        .repository_relative_filename
+                                        .clone(),
+                                    source_bytes: file.source_bytes.clone(),
+                                })
+                                .collect(),
                         },
                         revalidate_source: Box::new(move || {
                             let candidate = revalidate_pin.candidate();
@@ -1760,6 +1771,7 @@ fn publisher_publish_probe(
                     source_bytes: file.source_bytes,
                 })
                 .collect(),
+            graphs: Vec::new(),
         },
         revalidate_checkout,
         revalidate_ref: Box::new(move || {
@@ -2847,7 +2859,10 @@ mod tests {
         assert!(mutation.relative_path.starts_with(".bbox/gaps/gap-"));
         let content = mutation.content_json.as_deref().unwrap();
         assert!(content.contains("covered gap"), "{content}");
-        assert!(content.contains("tooling/test-domain/covered-gap"), "{content}");
+        assert!(
+            content.contains("tooling/test-domain/covered-gap"),
+            "{content}"
+        );
     }
 
     /// Denied publish requests must not touch a repository.
@@ -3005,6 +3020,7 @@ mod tests {
                 logical_bytes: 0,
                 page_count: 0,
             },
+            graphs: SourceManifestDescriptorV1::default(),
         };
         let authority = PublicationAuthorityV1 {
             producer_id: "producer-a".into(),
@@ -3239,6 +3255,7 @@ mod tests {
                         .unwrap(),
                     }],
                     gaps: Vec::new(),
+                    graphs: Vec::new(),
                 },
             )
             .unwrap();
