@@ -1280,7 +1280,10 @@ async fn ack_checkout_mutation(
             status: "already_settled".to_string(),
         }));
     }
-    state.persist_checkout_mutations_durable().await?;
+    state
+        .persist_checkout_mutations_durable()
+        .await
+        .map_err(HttpError::from_store)?;
     Ok(Json(CheckoutMutationAckResponseV1 { status: outcome }))
 }
 

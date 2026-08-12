@@ -129,7 +129,7 @@ impl BlackboxServer {
     /// cutover-covered project. Covered projects mutate repo-owned state
     /// through the checkout-owner backchannel, never through a daemon-local
     /// checkout lease (a zero-authority daemon has none).
-    fn covered_project_scope(
+    pub(crate) fn covered_project_scope(
         &self,
         raw: &str,
     ) -> Option<(String, bbox_corpus_core::identity::PublishedScope)> {
@@ -140,7 +140,7 @@ impl BlackboxServer {
 
     /// Coverage and scope lookup by durable project id (for id-addressed
     /// mutations like bbox_forget, which carry no project selector).
-    fn covered_scope_for_project_id(
+    pub(crate) fn covered_scope_for_project_id(
         &self,
         project_id: &str,
     ) -> Option<bbox_corpus_core::identity::PublishedScope> {
