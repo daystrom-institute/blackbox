@@ -1,0 +1,20 @@
+{
+  "id": "gap-b404ab83",
+  "title": "bbox_render scope=global silently writes pod-local provider files on the cage daemon",
+  "gap_kind": "mcp_surface",
+  "domain": "render",
+  "wanted_capability": "A global render on a zero-authority daemon either delivers the managed provider-file regions to the operator's interactive hosts or refuses; it must never report success while writing files nobody reads. Needs a target policy (which hosts receive global renders) and a delivery lane (the checkout-mutation backchannel shape fits, but targets are per-host home files, not one checkout).",
+  "missing_primitive": "global-render target policy + delivery lane",
+  "evidence": [
+    "design/daemon-runtime/mcp-surface-locality-audit.md (class C)",
+    "src/tools/render.rs global arm writes cfg.paths.global_* targets",
+    "thread-c7e376be"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/render/global-render-wrong-target",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-12T04:22:11Z",
+  "updated_at": "2026-08-12T04:22:11Z"
+}
