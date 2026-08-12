@@ -14,7 +14,7 @@ const GRAPH_FILE: &str = "graph.json";
 const SCHEMA_FILE: &str = "schema.json";
 const VERTICES_FILE: &str = "vertices.jsonl";
 const EDGES_FILE: &str = "edges.jsonl";
-const SOURCE_FILES: [&str; 4] = [GRAPH_FILE, SCHEMA_FILE, VERTICES_FILE, EDGES_FILE];
+const REQUIRED_SOURCE_FILES: [&str; 3] = [SCHEMA_FILE, VERTICES_FILE, EDGES_FILE];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphParseLimits {
@@ -33,9 +33,18 @@ impl Default for GraphParseLimits {
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphDocumentBytes<'a> {
+    pub descriptor: Option<&'a [u8]>,
     pub schema: &'a [u8],
     pub vertices: &'a [u8],
     pub edges: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedGraphDocuments {
+    descriptor: Option<Vec<u8>>,
+    schema: Vec<u8>,
+    vertices: Vec<u8>,
+    edges: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,11 +158,22 @@ pub fn load_graph(scope_id: &str, project_root: &Path, location: &GraphLocation)
         }
     };
 
-    let descriptor = parse_json::<GraphDescriptor>(&documents[0], GRAPH_FILE, &mut errors);
-    let schema = parse_json::<GraphSchema>(&documents[1], SCHEMA_FILE, &mut errors);
-    let vertices =
-        parse_jsonl::<ProjectGraphVertex>(&documents[2], VERTICES_FILE, usize::MAX, &mut errors);
-    let edges = parse_jsonl::<ProjectGraphEdge>(&documents[3], EDGES_FILE, usize::MAX, &mut errors);
+    let schema = parse_json::<GraphSchema>(&documents.schema, SCHEMA_FILE, &mut errors);
+    let descriptor = descriptor_from_documents(
+        &location.graph_id,
+        location.source,
+        documents.descriptor.as_deref(),
+        schema.as_ref(),
+        &mut errors,
+    );
+    let vertices = parse_jsonl::<ProjectGraphVertex>(
+        &documents.vertices,
+        VERTICES_FILE,
+        usize::MAX,
+        &mut errors,
+    );
+    let edges =
+        parse_jsonl::<ProjectGraphEdge>(&documents.edges, EDGES_FILE, usize::MAX, &mut errors);
     if let (Some(descriptor), Some(schema)) = (&descriptor, &schema) {
         errors.extend(validate_graph(
             &location.graph_id,
@@ -225,18 +245,13 @@ pub fn load_graph_documents(
     );
     let edges =
         parse_jsonl::<ProjectGraphEdge>(documents.edges, EDGES_FILE, limits.max_edges, &mut errors);
-    let descriptor = schema.as_ref().map(|schema| GraphDescriptor {
-        descriptor_version: crate::DESCRIPTOR_VERSION,
-        scope: crate::GraphScope::Project,
-        graph_id: graph_id.to_string(),
-        authority: crate::GraphAuthority::Project,
-        schema_id: format!("{}:schema", schema.namespace),
-        schema_version: schema.version,
-        projection_version: None,
-        source_connector: None,
-        retention_policy: crate::RetentionPolicy::ProjectOwned,
-        generation: 1,
-    });
+    let descriptor = descriptor_from_documents(
+        graph_id,
+        GraphSource::Committed,
+        documents.descriptor,
+        schema.as_ref(),
+        &mut errors,
+    );
     if let (Some(descriptor), Some(schema)) = (&descriptor, &schema) {
         errors.extend(validate_graph(
             graph_id,
@@ -303,7 +318,7 @@ fn graph_directory(project_root: &Path, source: GraphSource, graph_id: &str) -> 
     project_root.join(source.relative_root()).join(graph_id)
 }
 
-fn read_stable_documents(directory: &Path) -> Result<Vec<Vec<u8>>, Vec<ValidationError>> {
+fn read_stable_documents(directory: &Path) -> Result<OwnedGraphDocuments, Vec<ValidationError>> {
     let first = read_documents(directory)?;
     let second = read_documents(directory)?;
     if first != second {
@@ -317,13 +332,26 @@ fn read_stable_documents(directory: &Path) -> Result<Vec<Vec<u8>>, Vec<Validatio
     Ok(first)
 }
 
-fn read_documents(directory: &Path) -> Result<Vec<Vec<u8>>, Vec<ValidationError>> {
-    let mut documents = Vec::with_capacity(SOURCE_FILES.len());
+fn read_documents(directory: &Path) -> Result<OwnedGraphDocuments, Vec<ValidationError>> {
     let mut errors = Vec::new();
-    for file in SOURCE_FILES {
+    let descriptor = match fs::read(directory.join(GRAPH_FILE)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            errors.push(ValidationError::new(
+                "file.read_failed",
+                GRAPH_FILE,
+                None,
+                format!("failed to read {GRAPH_FILE}: {error}"),
+            ));
+            None
+        }
+    };
+    let mut required = Vec::with_capacity(REQUIRED_SOURCE_FILES.len());
+    for file in REQUIRED_SOURCE_FILES {
         let path = directory.join(file);
         match fs::read(&path) {
-            Ok(bytes) => documents.push(bytes),
+            Ok(bytes) => required.push(bytes),
             Err(error) => errors.push(ValidationError::new(
                 "file.read_failed",
                 file,
@@ -333,10 +361,45 @@ fn read_documents(directory: &Path) -> Result<Vec<Vec<u8>>, Vec<ValidationError>
         }
     }
     if errors.is_empty() {
-        Ok(documents)
+        let [schema, vertices, edges]: [Vec<u8>; 3] = required
+            .try_into()
+            .expect("all required graph documents were read");
+        Ok(OwnedGraphDocuments {
+            descriptor,
+            schema,
+            vertices,
+            edges,
+        })
     } else {
         Err(errors)
     }
+}
+
+fn descriptor_from_documents(
+    graph_id: &str,
+    source: GraphSource,
+    descriptor_bytes: Option<&[u8]>,
+    schema: Option<&GraphSchema>,
+    errors: &mut Vec<ValidationError>,
+) -> Option<GraphDescriptor> {
+    if let Some(bytes) = descriptor_bytes {
+        return parse_json::<GraphDescriptor>(bytes, GRAPH_FILE, errors);
+    }
+    schema.map(|schema| GraphDescriptor {
+        descriptor_version: crate::DESCRIPTOR_VERSION,
+        scope: crate::GraphScope::Project,
+        graph_id: graph_id.to_string(),
+        authority: crate::GraphAuthority::Project,
+        schema_id: format!("{}:schema", schema.namespace),
+        schema_version: schema.version,
+        projection_version: None,
+        source_connector: None,
+        retention_policy: match source {
+            GraphSource::Committed => crate::RetentionPolicy::ProjectOwned,
+            GraphSource::LocalScratch => crate::RetentionPolicy::LocalScratch,
+        },
+        generation: 1,
+    })
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(
@@ -406,9 +469,19 @@ fn parse_jsonl<T: serde::de::DeserializeOwned>(
     rows
 }
 
-fn fingerprint_documents(documents: &[Vec<u8>]) -> String {
+fn fingerprint_documents(documents: &OwnedGraphDocuments) -> String {
     let mut hasher = Sha256::new();
-    for (name, bytes) in SOURCE_FILES.iter().zip(documents) {
+    for (name, bytes) in documents
+        .descriptor
+        .as_deref()
+        .map(|bytes| (GRAPH_FILE, bytes))
+        .into_iter()
+        .chain([
+            (SCHEMA_FILE, documents.schema.as_slice()),
+            (VERTICES_FILE, documents.vertices.as_slice()),
+            (EDGES_FILE, documents.edges.as_slice()),
+        ])
+    {
         hasher.update((name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
         hasher.update((bytes.len() as u64).to_le_bytes());
@@ -419,11 +492,16 @@ fn fingerprint_documents(documents: &[Vec<u8>]) -> String {
 
 fn fingerprint_transport_documents(documents: GraphDocumentBytes<'_>) -> String {
     let mut hasher = Sha256::new();
-    for (name, bytes) in [
-        (SCHEMA_FILE, documents.schema),
-        (VERTICES_FILE, documents.vertices),
-        (EDGES_FILE, documents.edges),
-    ] {
+    for (name, bytes) in documents
+        .descriptor
+        .map(|bytes| (GRAPH_FILE, bytes))
+        .into_iter()
+        .chain([
+            (SCHEMA_FILE, documents.schema),
+            (VERTICES_FILE, documents.vertices),
+            (EDGES_FILE, documents.edges),
+        ])
+    {
         hasher.update((name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
         hasher.update((bytes.len() as u64).to_le_bytes());
@@ -542,6 +620,24 @@ mod tests {
                 && edge.type_name == crate::META_FROM_TYPE
                 && edge.to == "repo:Module"
         }));
+    }
+
+    #[test]
+    fn graph_without_optional_descriptor_loads_from_the_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_graph(&root, "repo", 1, false);
+        fs::remove_file(graph_directory(&root, GraphSource::Committed, "repo").join(GRAPH_FILE))
+            .unwrap();
+
+        let location = locate_graph(&root, "repo", false).unwrap();
+        let loaded = load_graph("scope123", &root, &location);
+
+        assert!(loaded.report.valid, "{:?}", loaded.report.errors);
+        let descriptor = loaded.report.descriptor.unwrap();
+        assert_eq!(descriptor.graph_id, "repo");
+        assert_eq!(descriptor.schema_id, "repo:schema");
+        assert_eq!(descriptor.generation, 1);
     }
 
     #[test]
