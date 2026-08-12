@@ -460,6 +460,49 @@ impl fmt::Debug for ProjectCatalogStore {
     }
 }
 
+/// Which pre-state a v2 initialization is willing to find at the catalog path.
+///
+/// The two initialization entries differ in exactly this and nothing else, so
+/// they share one body rather than growing a second copy of the lock, journal
+/// recovery, and pair-commit sequence that could drift from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitializationPreStateV1 {
+    /// Nothing at the catalog path at all.
+    StrictlyAbsent,
+    /// Nothing, or a version-1 legacy store registering zero projects.
+    EmptyLegacyV1Admitted,
+}
+
+/// The suffix genesis appends when it sets a zero-project legacy store aside.
+///
+/// Deliberately not one of the reserved catalog-family basenames: this file is
+/// retained operator state, not catalog authority, so the startup half-pair
+/// probe must keep ignoring it.
+pub const LEGACY_PRE_GENESIS_RETENTION_SUFFIX: &str = ".pre-genesis";
+
+/// Where a set-aside legacy store is retained: beside the catalog path, under
+/// the catalog basename plus [`LEGACY_PRE_GENESIS_RETENTION_SUFFIX`].
+pub fn legacy_pre_genesis_retention_path(
+    catalog_path: &Path,
+) -> ProjectCatalogStoreResult<PathBuf> {
+    let basename = catalog_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ProjectCatalogStoreError::new(
+                "error.project_catalog_unsafe_path",
+                "configured projects filename is unsafe",
+            )
+        })?;
+    let parent = catalog_path.parent().ok_or_else(|| {
+        ProjectCatalogStoreError::new(
+            "error.project_catalog_unsafe_path",
+            "configured projects path has no parent",
+        )
+    })?;
+    Ok(parent.join(format!("{basename}{LEGACY_PRE_GENESIS_RETENTION_SUFFIX}")))
+}
+
 /// Outcome of the daemon's startup store-version probe (phase-2 §4.1).
 /// The probe decides which runtime authority opens the store; it never
 /// opens, repairs, or creates anything itself.
@@ -777,7 +820,42 @@ impl ProjectCatalogStore {
     /// Initialization requires exclusive process-lifetime authority and
     /// rejects any pre-existing catalog or attachment image.
     pub fn initialize_empty(projects_path: impl Into<PathBuf>) -> ProjectCatalogStoreResult<Self> {
-        Self::initialize_empty_with_io(projects_path.into(), Arc::new(RealCatalogStoreIo))
+        Self::initialize_empty_with_io(
+            projects_path.into(),
+            Arc::new(RealCatalogStoreIo),
+            InitializationPreStateV1::StrictlyAbsent,
+        )
+    }
+
+    /// Initialize a fresh v2 pair over a bundle that never held catalog
+    /// authority, admitting the one legacy pre-state a registration-free
+    /// bridge boot leaves behind.
+    ///
+    /// [`Self::initialize_empty`] refuses ANY byte at the catalog path, which
+    /// is the right rule for a caller that believes it is creating a store
+    /// from nothing. The operator genesis path knows one more thing: a bridge
+    /// daemon that booted and registered nothing leaves a version-1
+    /// `LegacyProjectStoreV1` file carrying zero project records, and that
+    /// file holds no project identity for a migration to carry across.
+    /// Refusing it would leave hand-deleting a state file as the only route
+    /// into catalog mode, which is the unsupported step this entry exists to
+    /// remove. The file is SET ASIDE, not overwritten: it is renamed to
+    /// [`legacy_pre_genesis_retention_path`] before the pair transaction, so
+    /// its bytes stay recoverable and the transaction still sees the absent
+    /// catalog its journal invariants describe.
+    ///
+    /// A legacy store carrying ANY project record still refuses: those
+    /// identities are exactly what `project-catalog migrate` exists to carry
+    /// across, and admitting them here would make genesis a migration bypass.
+    /// An attachment snapshot or migration marker refuses under both entries.
+    pub fn initialize_empty_over_fresh_bundle(
+        projects_path: impl Into<PathBuf>,
+    ) -> ProjectCatalogStoreResult<Self> {
+        Self::initialize_empty_with_io(
+            projects_path.into(),
+            Arc::new(RealCatalogStoreIo),
+            InitializationPreStateV1::EmptyLegacyV1Admitted,
+        )
     }
 
     pub fn snapshot(&self) -> ProjectCatalogStoreResult<Arc<ProjectCatalogState>> {
@@ -1268,6 +1346,7 @@ impl ProjectCatalogStore {
     fn initialize_empty_with_io(
         projects_path: PathBuf,
         io: Arc<dyn CatalogStoreIo>,
+        admitted: InitializationPreStateV1,
     ) -> ProjectCatalogStoreResult<Self> {
         let paths = ProjectCatalogPaths::derive(&projects_path)?;
         let exclusive = ProjectCatalogMigrationLock::try_acquire_exclusive(&paths.catalog)
@@ -1285,10 +1364,12 @@ impl ProjectCatalogStore {
         };
         let _mutation_lock = owner.io.acquire_mutation_lock(&owner.paths.catalog)?;
         owner.recover_locked()?;
+        // The attachment snapshot and the migration marker must be absent
+        // under BOTH pre-states: either one is durable evidence that some
+        // catalog authority already owns this bundle, and neither has an
+        // "empty and therefore replaceable" reading the way a zero-project
+        // legacy store does.
         match (
-            owner
-                .io
-                .read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?,
             owner
                 .io
                 .read_regular_nofollow(&paths.attachments, MAX_PROJECT_CATALOG_BYTES)?,
@@ -1296,8 +1377,63 @@ impl ProjectCatalogStore {
                 .io
                 .read_regular_nofollow(&paths.migration_marker, MAX_MARKER_BYTES)?,
         ) {
-            (None, None, None) => {}
+            (None, None) => {}
             _ => {
+                return Err(ProjectCatalogStoreError::new(
+                    "error.project_catalog_already_initialized",
+                    "new-store initialization found existing strict state",
+                ));
+            }
+        }
+        let existing_catalog_bytes = owner
+            .io
+            .read_regular_nofollow(&paths.catalog, MAX_LEGACY_PROJECT_STORE_BYTES)?;
+        match (&existing_catalog_bytes, admitted) {
+            (None, _) => {}
+            (Some(bytes), InitializationPreStateV1::EmptyLegacyV1Admitted) => {
+                // Re-decoded HERE rather than trusted from a caller's earlier
+                // read: the caller's census necessarily ran before this
+                // exclusive claim existed, so only a read under the claim can
+                // rule out a registration that landed in between.
+                let legacy = decode_legacy_project_store(bytes).map_err(|_| {
+                    ProjectCatalogStoreError::new(
+                        "error.project_catalog_already_initialized",
+                        "new-store initialization found existing strict state",
+                    )
+                })?;
+                legacy.validate().map_err(contract_error)?;
+                if !legacy.projects.is_empty() {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_legacy_store_requires_migration",
+                        format!(
+                            "the version-1 project store registers {} project(s); \
+                             those identities are migration input, not genesis input",
+                            legacy.projects.len()
+                        ),
+                    ));
+                }
+                // Set aside rather than overwritten. A regular-pair journal
+                // with `old_epoch` zero requires every participant's old image
+                // to be Absent, which is the structural statement "no prior
+                // pair existed"; installing over the legacy file in place
+                // would record a Present old image against a zero old epoch
+                // and produce a journal the store refuses to validate. Setting
+                // the file aside makes the absent-catalog precondition true
+                // instead of asserting it falsely, and a rename keeps the
+                // bytes recoverable rather than destroying operator state.
+                let retained = legacy_pre_genesis_retention_path(&paths.catalog)?;
+                if retained.symlink_metadata().is_ok() {
+                    return Err(ProjectCatalogStoreError::new(
+                        "error.project_catalog_already_initialized",
+                        "a prior set-aside legacy project store is still present beside the \
+                         catalog path; resolve it before initializing a new store",
+                    ));
+                }
+                std::fs::rename(&paths.catalog, &retained).map_err(|error| {
+                    io_error("set aside legacy store at", &paths.catalog, error)
+                })?;
+            }
+            (Some(_), InitializationPreStateV1::StrictlyAbsent) => {
                 return Err(ProjectCatalogStoreError::new(
                     "error.project_catalog_already_initialized",
                     "new-store initialization found existing strict state",
@@ -14370,8 +14506,12 @@ mod tests {
     fn empty_initialization_fault_matrix_reopens_to_one_coherent_state() {
         let (_trace_directory, trace_path) = projects_path();
         let recording = Arc::new(TracingIo::recording());
-        let store =
-            ProjectCatalogStore::initialize_empty_with_io(trace_path, recording.clone()).unwrap();
+        let store = ProjectCatalogStore::initialize_empty_with_io(
+            trace_path,
+            recording.clone(),
+            InitializationPreStateV1::StrictlyAbsent,
+        )
+        .unwrap();
         let initialized = state_fingerprint(&store.snapshot().unwrap());
         drop(store);
         let trace = recording.trace();
@@ -14382,7 +14522,11 @@ mod tests {
         for index in 0..trace.len() {
             let (_directory, path) = projects_path();
             let failing = Arc::new(TracingIo::failing_at(index));
-            let _ = ProjectCatalogStore::initialize_empty_with_io(path.clone(), failing);
+            let _ = ProjectCatalogStore::initialize_empty_with_io(
+                path.clone(),
+                failing,
+                InitializationPreStateV1::StrictlyAbsent,
+            );
             assert_known_state_or_absent(&path, std::slice::from_ref(&initialized));
             assert_retained_journal_artifacts(&path);
         }
@@ -14684,9 +14828,12 @@ mod tests {
     fn rollback_recovery_fault_matrix_deletes_only_the_exact_new_image() {
         let (_trace_directory, successful_path) = projects_path();
         let recording = Arc::new(TracingIo::recording());
-        let initialized =
-            ProjectCatalogStore::initialize_empty_with_io(successful_path, recording.clone())
-                .unwrap();
+        let initialized = ProjectCatalogStore::initialize_empty_with_io(
+            successful_path,
+            recording.clone(),
+            InitializationPreStateV1::StrictlyAbsent,
+        )
+        .unwrap();
         drop(initialized);
         let install_points = recording
             .trace()
@@ -14704,7 +14851,12 @@ mod tests {
                 std::iter::empty(),
             ));
             assert!(
-                ProjectCatalogStore::initialize_empty_with_io(path.to_path_buf(), failing).is_err()
+                ProjectCatalogStore::initialize_empty_with_io(
+                    path.to_path_buf(),
+                    failing,
+                    InitializationPreStateV1::StrictlyAbsent,
+                )
+                .is_err()
             );
             corrupt_staged_role(path, ParticipantRoleV1::Attachments);
         }

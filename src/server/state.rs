@@ -2805,6 +2805,72 @@ pub(crate) mod catalog_fixture {
             }
         }
 
+        /// The same fixture over a store stood up by the OPERATOR genesis
+        /// path instead of the library initializer.
+        ///
+        /// It exists so the daemon-side admission surfaces are exercised
+        /// against the exact bytes an operator's `project-catalog genesis`
+        /// produces, rather than against a store only tests can create. The
+        /// two pairs are proved byte-identical in the genesis facade suite;
+        /// this fixture is what turns that identity into runtime coverage.
+        pub(crate) fn new_over_genesis_store() -> Self {
+            use bbox_indexing::project_catalog_genesis::{
+                ProjectCatalogGenesisFacadeV1, ProjectCatalogGenesisRequestV1,
+            };
+            use bbox_indexing::project_catalog_migration::{
+                ProjectCatalogMigrationLayoutOverridesV1, ProjectCatalogMigrationResolvedLayoutV1,
+            };
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let catalog_root = root.join("catalog");
+            std::fs::create_dir_all(&catalog_root).unwrap();
+            let config_path = root.join("config.toml");
+            // `vectors_dir` is explicit so the genesis census reads this
+            // fixture's vector root rather than the platform state directory.
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[paths]\nstate_dir = {:?}\nvectors_dir = {:?}\n",
+                    catalog_root,
+                    catalog_root.join("vectors")
+                ),
+            )
+            .unwrap();
+            let config = {
+                let _guard = bbox_util::util::test_env_lock();
+                bbox_config::config::load_with(bbox_config::config::LoadOptions {
+                    config_path: Some(config_path),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+            let target_layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+                &config,
+                ProjectCatalogMigrationLayoutOverridesV1 {
+                    projects_path: None,
+                    state_dir: Some(catalog_root.clone()),
+                },
+            )
+            .unwrap();
+            ProjectCatalogGenesisFacadeV1::initialize(ProjectCatalogGenesisRequestV1 {
+                target_layout,
+            })
+            .unwrap();
+
+            let catalog_projects_path = catalog_root.join("projects.json");
+            // Opened through the same strict entry daemon startup uses, so a
+            // genesis store that startup would refuse fails here too.
+            let store =
+                Arc::new(ProjectCatalogStore::open_existing(&catalog_projects_path).unwrap());
+            Self {
+                _directory: directory,
+                root,
+                catalog_projects_path,
+                store,
+            }
+        }
+
         pub(crate) fn scope(relative: &str) -> PublishedScope {
             PublishedScope::try_new("repo_example", relative).unwrap()
         }

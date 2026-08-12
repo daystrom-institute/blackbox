@@ -37,6 +37,9 @@ use bbox_indexing::project_catalog_backfill::{
     DurableBackfillVerifyRequestV1, LegacyRowOwnerReaderV1, LegacyRowStamperV1,
     ProjectCatalogDurableBackfillFacadeV1,
 };
+use bbox_indexing::project_catalog_genesis::{
+    ProjectCatalogGenesisError, ProjectCatalogGenesisFacadeV1, ProjectCatalogGenesisRequestV1,
+};
 use bbox_indexing::project_catalog_migration::ProjectCatalogTargetSelectionV1;
 use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationApplyConfiguredRequestV1, ProjectCatalogMigrationApplyRequestV1,
@@ -87,6 +90,8 @@ struct ProjectCatalogArgs {
 enum ProjectCatalogCommand {
     /// Produce reviewed migration artifacts or apply them to an isolated root.
     Migrate(MigrateArgs),
+    /// Initialize an empty catalog-v2 store on a bundle with no project state.
+    Genesis(GenesisArgs),
     /// Verify exact installed migration state in an isolated root.
     Verify(VerifyArgs),
     /// Stamp the path-keyed durable-store rows with stable project ids.
@@ -575,6 +580,20 @@ struct MigrateArgs {
     config: ConfigArgs,
 }
 
+/// The greenfield onboarding verb.
+///
+/// Genesis has ONE mode and ONE target, so it carries no mode group and no
+/// two-layer target mechanism: it initializes the bundle that `ConfigArgs`
+/// resolves, which is the same resolution `migrate --configured` applies to
+/// its own target. There are no reviewed artifacts either, because there is
+/// no source state to review; the refusals ARE the review, and they run
+/// before any byte is written.
+#[derive(Debug, Args)]
+struct GenesisArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+}
+
 /// The new-verb surface (plan section 3.1).
 ///
 /// ONE exclusive mode group over the full triple. Verify is a MODE inside the
@@ -736,6 +755,12 @@ impl From<ProjectCatalogMigrationError> for CommandFailure {
     }
 }
 
+impl From<ProjectCatalogGenesisError> for CommandFailure {
+    fn from(error: ProjectCatalogGenesisError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
 impl From<ProjectCatalogStoreError> for CommandFailure {
     fn from(error: ProjectCatalogStoreError) -> Self {
         Self::new(error.code(), error.to_string())
@@ -824,6 +849,9 @@ fn command_name(cli: &Cli) -> &'static str {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Migrate(_),
         }) => "project_catalog_migrate_apply",
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::Genesis(_),
+        }) => "project_catalog_genesis",
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Verify(_),
         }) => "project_catalog_verify",
@@ -937,6 +965,9 @@ fn execute(cli: Cli) -> Result<serde_json::Value, CommandFailure> {
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Migrate(args),
         }) => execute_migrate(args),
+        TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
+            command: ProjectCatalogCommand::Genesis(args),
+        }) => execute_genesis(args),
         TopLevelCommand::ProjectCatalog(ProjectCatalogArgs {
             command: ProjectCatalogCommand::Verify(args),
         }) => execute_verify(args),
@@ -2025,6 +2056,28 @@ fn execute_migrate(args: MigrateArgs) -> Result<serde_json::Value, CommandFailur
             report_path: args.report,
             resolution_path: args.resolution,
         })?;
+    serialize_result(&result.receipt)
+}
+
+/// Initialize an empty catalog-v2 store on a bundle with no project state.
+///
+/// The sibling of `migrate --apply --configured`: same configuration
+/// resolution, same single configured target, opposite precondition. Migration
+/// carries an occupied version-1 bundle across; genesis stands a version-2
+/// bundle up where there is nothing to carry. A bundle that has ANY project
+/// state belongs to migration, and the facade refuses it here by name.
+fn execute_genesis(args: GenesisArgs) -> Result<serde_json::Value, CommandFailure> {
+    let config = load_config(args.config.config)?;
+    let target_layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(
+        &config,
+        ProjectCatalogMigrationLayoutOverridesV1 {
+            projects_path: args.config.projects_path,
+            state_dir: args.config.state_dir,
+        },
+    )?;
+    let result = ProjectCatalogGenesisFacadeV1::initialize(ProjectCatalogGenesisRequestV1 {
+        target_layout,
+    })?;
     serialize_result(&result.receipt)
 }
 

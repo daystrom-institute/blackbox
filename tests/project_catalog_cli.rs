@@ -2054,3 +2054,198 @@ fn verify_require_exclusive_availability_refuses_while_the_bridge_holds_the_lock
     assert_eq!(refused["error"]["code"], "error.project_catalog_cli_lock");
     drop(held);
 }
+
+/// A state bundle with no catalog and no owner state at all: the greenfield
+/// deployment shape `project-catalog genesis` exists to serve. Returns the
+/// state directory, the projects path, and the isolated configuration file.
+///
+/// Deliberately does NOT call `initialize_empty_owner_state`: the whole point
+/// is a bundle where nothing has ever been written, which is exactly the
+/// bundle the migration preflight cannot produce a clean report for.
+fn fresh_unwritten_bundle(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let config_path = root.join("config.toml");
+    let vectors = state.join("vectors");
+    write(
+        &config_path,
+        format!("[paths]\nstate_dir = {state:?}\nvectors_dir = {vectors:?}\n").as_bytes(),
+    );
+    (state.clone(), state.join("projects.json"), config_path)
+}
+
+fn genesis_command(state: &Path, config: &Path) -> Output {
+    run(&[
+        "project-catalog",
+        "genesis",
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ])
+}
+
+/// The greenfield path end to end: genesis on an unwritten bundle, the daemon
+/// startup probe selecting catalog mode over the result, and the catalog
+/// admitting an onboarded project through the same offline surface a migrated
+/// store admits it through.
+#[test]
+fn genesis_stands_a_fresh_bundle_up_in_catalog_mode() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path) = fresh_unwritten_bundle(&root);
+
+    let receipt = success_json(&genesis_command(&state, &config_path));
+    let receipt = &receipt["result"];
+    assert_eq!(receipt["catalog_origin"], "fresh_v2");
+    assert_eq!(receipt["epoch"], 1);
+    assert_eq!(receipt["set_aside_empty_legacy_store"], false);
+    assert!(
+        receipt["owner_census"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["disposition"] == "empty"),
+        "{receipt}"
+    );
+
+    // The decision daemon startup makes. A genesis store is a version-2 store
+    // to the probe, and the strict open behind it is origin-aware rather than
+    // origin-specific.
+    assert!(matches!(
+        bbox_indexing::project_catalog_store::probe_project_store_mode(&projects_path).unwrap(),
+        bbox_indexing::project_catalog_store::ProjectStoreProbe::CatalogV2
+    ));
+    {
+        // Scoped: the open holds a SHARED lifetime claim for as long as the
+        // handle lives, and the offline verbs below take an exclusive one.
+        let store = ProjectCatalogStore::open_existing(&projects_path).unwrap();
+        assert!(matches!(
+            store.snapshot().unwrap().catalog().origin,
+            bbox_corpus_core::project_catalog::CatalogOriginV2::FreshV2 {}
+        ));
+    }
+
+    // Onboarding admission: the catalog takes a published project through the
+    // same verb a migrated catalog takes it through, and reads it back.
+    let project_id = add_published_project(
+        projects_path.to_str().unwrap(),
+        "neutral-repository",
+        ".",
+        "2026-08-08T00:00:00Z",
+    );
+    let listed = success_json(&run(&[
+        "project-catalog",
+        "list",
+        "--projects-path",
+        projects_path.to_str().unwrap(),
+    ]));
+    let projects = listed["result"]["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["project_id"], project_id);
+}
+
+/// A bundle whose version-1 store registers a project belongs to migration.
+/// Genesis refuses it by name rather than standing a catalog up beside
+/// identities nothing carried across.
+#[test]
+fn genesis_refuses_a_bundle_that_registers_a_legacy_project() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path) = fresh_unwritten_bundle(&root);
+    write(
+        &projects_path,
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "projects": [{
+                "project_id": "p_legacy_one00000",
+                "canonical_path": root.join("absent-checkout"),
+                "registered_at": "2026-08-08T00:00:00Z",
+                "is_git_repo": false,
+            }],
+        }))
+        .unwrap(),
+    );
+
+    let refused = genesis_command(&state, &config_path);
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"], "error.project_catalog_genesis_owner_not_empty",
+        "{refused}"
+    );
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("legacy-projects"), "{message}");
+    assert!(message.contains("migrate"), "{message}");
+}
+
+/// A bundle holding project-scoped coordination rows is migration input even
+/// when its project registry is gone. The refusal names the occupied store.
+#[test]
+fn genesis_refuses_a_bundle_holding_project_scoped_owner_rows() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, projects_path, config_path) = fresh_unwritten_bundle(&root);
+    // Encoded through the shipped type: a hand-written row that drifted from
+    // the schema would capture as undecodable, and the census would then
+    // refuse as UNPROBEABLE rather than as the occupancy under test.
+    write(
+        &state.join("blackbox-threads.json"),
+        &serde_json::to_vec(&bbox_threads::threads::ThreadStore {
+            version: 1,
+            threads: vec![bbox_threads::threads::Thread {
+                id: "thread-0000000a".into(),
+                name: None,
+                topic: "scoped thread".into(),
+                project: root.join("absent-checkout").display().to_string(),
+                project_id: None,
+                record_dir: None,
+                status: bbox_threads::threads::ThreadStatus::Open,
+                kind: None,
+                origin: None,
+                sessions: Vec::new(),
+                handoff_doc: None,
+                notes: Vec::new(),
+                edges: Vec::new(),
+                promoted_to: None,
+                created_at: "2026-08-08T00:00:00Z".into(),
+                last_activity: "2026-08-08T00:00:00Z".into(),
+                resolved_at: None,
+            }],
+        })
+        .unwrap(),
+    );
+
+    let refused = genesis_command(&state, &config_path);
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_genesis_owner_not_empty"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("thread-rows"),
+        "{refused}"
+    );
+    assert!(!projects_path.exists());
+}
+
+/// Genesis never replaces live catalog authority.
+#[test]
+fn genesis_refuses_when_a_catalog_already_exists() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (state, _projects_path, config_path) = fresh_unwritten_bundle(&root);
+    success_json(&genesis_command(&state, &config_path));
+
+    let refused = genesis_command(&state, &config_path);
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        refused["error"]["code"],
+        "error.project_catalog_genesis_catalog_exists"
+    );
+}

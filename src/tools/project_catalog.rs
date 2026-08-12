@@ -2795,6 +2795,26 @@ mod tests {
     async fn covered_project_gap_write_enqueues_for_checkout_owner_delivery() {
         use crate::server::state::catalog_fixture::CatalogFixture;
 
+        covered_project_gap_write_enqueues(CatalogFixture::new()).await;
+    }
+
+    /// The same admission over a store the OPERATOR genesis path produced.
+    ///
+    /// Greenfield onboarding is the case `project-catalog genesis` exists to
+    /// serve, and it is only useful if the resulting store admits the
+    /// collector backchannel exactly as a store reached any other way does.
+    /// Running the identical assertions over both fixtures is what proves the
+    /// genesis store is not a second-class one.
+    #[tokio::test]
+    async fn genesis_store_admits_the_covered_project_gap_backchannel() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
+        covered_project_gap_write_enqueues(CatalogFixture::new_over_genesis_store()).await;
+    }
+
+    async fn covered_project_gap_write_enqueues(
+        fixture: crate::server::state::catalog_fixture::CatalogFixture,
+    ) {
         const PROJECT_ID: &str = "p_covered_gap_write0";
         const ATTACHMENT_ID: &str = "att_00000000000000000000000000000e03";
         const CHECKOUT_ID: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeee03";
@@ -2803,7 +2823,6 @@ mod tests {
         let checkout = tmp.path().canonicalize().unwrap().join("absent-checkout");
         let scope = PublishedScope::try_new("repo_probe", ".").unwrap();
 
-        let fixture = CatalogFixture::new();
         fixture.add_published_project(PROJECT_ID, &scope);
         fixture.attach_overlay_checkout(
             PROJECT_ID,

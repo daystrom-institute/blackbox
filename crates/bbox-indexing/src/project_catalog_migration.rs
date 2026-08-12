@@ -381,6 +381,44 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
         &self.index_root
     }
 
+    /// Every artifact role only catalog authority ever writes, paired with the
+    /// operator-facing name genesis reports when one of them is present.
+    ///
+    /// It lives on the layout rather than in the genesis module so the role
+    /// set stays beside the path derivation it comes from: a future catalog
+    /// artifact added to `CatalogDerivedPathsV1` is one edit away from being
+    /// covered here, instead of silently escaping a list kept elsewhere.
+    pub(crate) fn catalog_family_artifacts_for_genesis(&self) -> Vec<(&'static str, &Path)> {
+        vec![
+            ("project-attachments.json", self.attachments_path.as_path()),
+            (
+                "project-catalog-transaction.json",
+                self.transaction_journal_path.as_path(),
+            ),
+            (
+                "project-catalog-migration.json",
+                self.migration_marker_path.as_path(),
+            ),
+            (
+                "project-catalog-migration-receipt.json",
+                self.migration_receipt_path.as_path(),
+            ),
+            (
+                "project-catalog-migration-assets",
+                self.catalog_immutable_root.as_path(),
+            ),
+            (
+                "project-catalog-stage",
+                self.transaction_stage_dir.as_path(),
+            ),
+            ("project-catalog-backups", self.catalog_backup_dir.as_path()),
+            (
+                "accepted-publications",
+                self.accepted_publications_root.as_path(),
+            ),
+        ]
+    }
+
     /// The RESOLVED vector-store root. The materializer's equality proof
     /// recomputes a fingerprint over exactly this store, so deriving it
     /// anywhere else would compare against a different store and could never
@@ -538,7 +576,9 @@ impl ProjectCatalogMigrationResolvedLayoutV1 {
         })
     }
 
-    fn validate(&self) -> Result<(), ProjectCatalogMigrationError> {
+    /// `pub(crate)` for the genesis facade, which must validate the layout it
+    /// was handed before touching any owner path.
+    pub(crate) fn validate(&self) -> Result<(), ProjectCatalogMigrationError> {
         for path in self.all_paths() {
             validate_absolute_path(path)?;
         }
@@ -5120,7 +5160,12 @@ fn prepare_attachment_identity_plan(
     Ok(AttachmentCandidateIdentityPlanV1 { identities })
 }
 
-fn owner_inventory_paths(
+/// The owner locations one layout administers.
+///
+/// `pub(crate)` for the genesis census, which must look at the SAME owner set
+/// the migration inventory looks at. Deriving that set independently would let
+/// genesis prove a bundle empty by looking at stores migration never opens.
+pub(crate) fn owner_inventory_paths(
     layout: &ProjectCatalogMigrationResolvedLayoutV1,
 ) -> ProjectCatalogOwnerInventoryPathsV1 {
     ProjectCatalogOwnerInventoryPathsV1 {

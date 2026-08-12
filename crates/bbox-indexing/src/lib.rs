@@ -24,6 +24,7 @@ pub mod knowledge_transport_cutover;
 pub mod knowledge_transport_observations;
 pub mod project_catalog_admin;
 pub mod project_catalog_backfill;
+pub mod project_catalog_genesis;
 pub mod project_catalog_inventory;
 pub(crate) mod project_catalog_inventory_adapters;
 pub mod project_catalog_migration;
