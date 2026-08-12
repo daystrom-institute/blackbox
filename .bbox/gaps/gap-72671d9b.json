@@ -14,7 +14,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/knowledge-transport/checkout-owner-mutation-lane",
   "notes": "The .bbox/gaps/inbox/ file-drop spool does not work on the zero-authority estate: spool import moves files through checkout access, which needs local fs, and the collector publishes only committed .bbox/gaps/*.json records. Candidate shapes: a collector subcommand (bbox-code-collector gap-file) that validates and writes the record, a bro CLI verb, or a producer-backchannel mutation endpoint mirroring catalog onboarding. sm-gap-notes still teaches the inbox lane, which is bridge-era guidance.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-08-12T02:58:20Z",
-  "updated_at": "2026-08-12T02:58:20Z"
+  "updated_at": "2026-08-12T04:26:23Z",
+  "resolved_at": "2026-08-12T04:26:23Z",
+  "resolution_note": "implemented in 58cb98c3 + 5813cb0c + 8e6f2b4a: the checkout-mutation backchannel (daemon validates/mints/enqueues exact .bbox file bytes; collector poll/apply/ack) covers project gap file/update/resolve and knowledge learn/remember/decide/forget via the original MCP tools. Live-proven 2026-08-12: gap-b404ab83 filed via bbox_gap on a covered project, delivered by the collector in seconds. Knowledge updates and bbox_knowledge_link on covered project entries still fall to manual file edits; that residue is smaller than the filing lane this gap tracked."
 }
