@@ -1,0 +1,21 @@
+{
+  "id": "4b7b8ab0433dae9a",
+  "title": "Connector scope identity is operator-minted; vendor coordinates are observations",
+  "content": "Connector source identity is operator-minted: the operator mints an opaque durable connector_source_id once at grant time and writes it into both sides of the two-sided config (the daemon's connector producer grant and the satellite's source config). Vendor coordinates (Drive folder ids, Graph drive/site ids, Slack workspace ids, bucket+prefix) are recorded as attachment observations on the catalog record and publication status, never as identity. For Slack the minted scope corresponds to the observer bot identity: the token's grant plus channel membership bounds everything the source can ever see, and the operator channel allowlist constrains further within that bound. Cross-producer convergence (two operators independently minting scopes for the same remote store) is accepted and closable later by an operator-declared alias. This resolves the section 8 leaning in design/connectors/remote-source-connectors.md (grant-time synthetic scope with provider-coordinate observations); gap-0c7ec76c stays open to track the catalog implementation (additive ProjectScope variant, migration, validators, publisher-status rendering).",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "project_id": "89bd722f",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Vendor identifiers are softer than commit hashes: tenant migrations, account transfers, and shared-drive reparenting break them, and WebDAV/S3 have no stable root id at all, so vendor-coordinate identity degenerates to path-shaped identity, the exact defect the durable catalog retired. The operator's two-sided declaration is already the onboarding trust root, so minting identity there adds no new trust surface, keeps the daemon from pretending to verify vendor claims it cannot recompute, and mirrors the settled catalog principle that durable scope is identity while observed paths are attachment facts. Operator call 2026-08-12.",
+  "source": "user",
+  "created_at": "2026-08-12T06:13:29Z",
+  "updated_at": "2026-08-12T06:13:29Z",
+  "recall_count": 0
+}

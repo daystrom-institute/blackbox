@@ -450,6 +450,14 @@ it beyond basic safety and round-tripping.
 `graph-id` must not contain `:`. `vertex-id` may contain `:`. The parser splits
 out the project id and graph id first; the remainder is the raw vertex id.
 
+The `project-id` segment is the durable catalog project identity, not a hash
+of a host-local checkout path. A path-derived id does not travel between the
+checkout that authored the graph and the corpus host that serves it; the
+catalog id does. Provisional (checkout-authored, not yet published) graph
+state uses the distinct provisional ref family defined in
+[Reflective graph state transport and visibility](reflective-graph-state-transport.md),
+so a provisional vertex can never be mistaken for a published one.
+
 Example:
 
 ```text
