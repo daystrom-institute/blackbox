@@ -77,10 +77,15 @@ a state the checkout never had.
 JSON file per entry; the graph lane is two levels. A manifest path is relative
 to `.bbox/graphs/` and must be exactly `<graph-id>/<file>`, where `<graph-id>`
 matches the kernel charset (no `:`, no separator, no dot segment, bounded
-length) and `<file>` is one of `schema.json`, `vertices.jsonl`, `edges.jsonl`.
-Other depths, other filenames, and symlinks fail admission. Unknown files in a
-graph directory are rejected, not ignored: dropping them silently makes the
-corpus view differ from the checkout's for a reason no reviewer sees.
+length) and `<file>` is one of the three required fact files `schema.json`,
+`vertices.jsonl`, `edges.jsonl`, or the optional descriptor `graph.json`.
+The kernel's loader treats the descriptor as optional on both sides of the
+wire: absent, the descriptor is synthesized deterministically; present, it is
+parsed and consistency-checked, and it ships so accept-side validation sees
+the same bytes the checkout validated. Other depths, other filenames, and
+symlinks fail admission. Unknown files in a graph directory are rejected, not
+ignored: dropping them silently makes the corpus view differ from the
+checkout's for a reason no reviewer sees.
 
 **Size and count bounds.** Knowledge entries are small by construction; a
 `vertices.jsonl` is not. The lane needs ceilings on per-file bytes, per-graph
