@@ -232,16 +232,39 @@ identity locally, asks the daemon to mint, and writes the capability into
 ```
 BRO_WORKSPACE_BINDING_TOKEN=<64 hex>
 BRO_KNOWLEDGE_SOURCE_URL=http://127.0.0.1:7299
-BRO_WORKSPACE_PUBLISHED_SCOPE={"repo_id":"...","bbox_root_relpath":"."}
+BRO_WORKSPACE_PUBLISHED_SCOPE='{"repo_id":"...","bbox_root_relpath":"."}'
 ```
 
 Those are the same three variables the managed spawn path exports, so a harness
 or capture client started with them behaves exactly as a dispatched worker
-would:
+would. The scope is single-quoted because the file is meant to be sourced and
+its value is JSON:
 
 ```bash
 set -a; . .bbox/local/workspace-binding.env; set +a
 ```
+
+`bro workspace-binding capture` is the checkout-owner half. It runs one
+provisional capture of the checkout's working state through the same client a
+managed harness constructs at session start, reading the three variables from
+the installed file by default (`--token`, `--daemon-url`, `--scope`, and
+`--binding-env` override), so an operator authoring a schema or a graph can run
+the whole loop by hand without dispatching an agent:
+
+```bash
+BBOX_PORT=7299 bro workspace-binding mint      # once per checkout, 24h
+$EDITOR .bbox/graphs/<graph>/vertices.jsonl    # uncommitted working edits
+bro workspace-binding capture                  # into this workspace's own lane
+```
+
+Repeat the edit and capture legs as often as you like: each capture supersedes
+this workspace's previous provisional generation.
+
+The query leg needs a session that presents the binding. `bro mcp call` has no
+flag for it, so read the own lane from an MCP session that carries the
+`x-blackbox-workspace-binding` header on its `initialize` request, the way a
+managed harness does. `examples/graph-live-exercise.sh` is a worked example of
+that handshake against this same throwaway daemon.
 
 Use `--print` instead when the checkout is not writable; the token is printed
 once and nothing is stored. The binding lives 24 hours, and minting again for

@@ -111,10 +111,6 @@ require_tools() {
             return 1
         }
     done
-    [ -x "$BIN/examples/workspace-capture" ] || {
-        echo "missing $BIN/examples/workspace-capture (cargo build -p bbox-knowledge-source-client --example workspace-capture)" >&2
-        return 1
-    }
     [ -f "$FIXTURE/graph.json" ] || {
         echo "missing project graph fixture at $FIXTURE" >&2
         return 1
@@ -636,18 +632,41 @@ step_mint_binding() {
         echo "binding environment file is missing one of the three variables" >&2
         return 1
     }
-    note "minted a workspace binding for checkout $CHECKOUT_ID"
+    # The file is meant to be sourced, so the scope it carries has to survive a
+    # shell round-trip and still parse as the scope this checkout publishes.
+    local sourced_scope
+    sourced_scope="$(
+        set -a
+        # shellcheck disable=SC1091
+        . "$env_file"
+        set +a
+        printf '%s' "$BRO_WORKSPACE_PUBLISHED_SCOPE"
+    )"
+    printf '%s' "$sourced_scope" > "$EVIDENCE/sourced-scope.json"
+    jq -e --arg repo "$REPO_ID" '.repo_id == $repo and .bbox_root_relpath == "."' \
+        "$EVIDENCE/sourced-scope.json" >/dev/null || {
+        echo "the sourced binding scope is not the checkout's published scope" >&2
+        cat "$EVIDENCE/sourced-scope.json" >&2
+        return 1
+    }
+    note "minted a workspace binding for checkout $CHECKOUT_ID; the sourced scope round-trips"
 }
 
-binding_var() {
-    sed -n "s/^$1=//p" "$CHECKOUT/.bbox/local/workspace-binding.env" | head -1
+# Load the minted binding the way the runbook documents. The capture verb
+# reads the same file itself; this is here for the MCP session, which presents
+# the token as a header.
+binding_token() {
+    (
+        set -a
+        # shellcheck disable=SC1091
+        . "$CHECKOUT/.bbox/local/workspace-binding.env"
+        set +a
+        printf '%s' "$BRO_WORKSPACE_BINDING_TOKEN"
+    )
 }
 
-# The three variables are read by explicit key extraction rather than by
-# sourcing the file. The runbook documents `set -a; . <file>; set +a`, but the
-# scope value is written as bare JSON, so a shell strips its double quotes and
-# every capture client then refuses the scope with "key must be a string".
-# Sourcing here would hide that; extraction keeps the exercise honest about it.
+# One provisional capture through the operator verb, which is the same client
+# construction a managed harness performs at session start.
 capture_once() {
     local label="$1"
     env \
@@ -655,10 +674,7 @@ capture_once() {
         "XDG_CONFIG_HOME=$THROWAWAY/config" \
         "XDG_DATA_HOME=$THROWAWAY/data" \
         "XDG_STATE_HOME=$THROWAWAY/xdg-state" \
-        "BRO_WORKSPACE_BINDING_TOKEN=$(binding_var BRO_WORKSPACE_BINDING_TOKEN)" \
-        "BRO_KNOWLEDGE_SOURCE_URL=$(binding_var BRO_KNOWLEDGE_SOURCE_URL)" \
-        "BRO_WORKSPACE_PUBLISHED_SCOPE=$(binding_var BRO_WORKSPACE_PUBLISHED_SCOPE)" \
-        "$BIN/examples/workspace-capture" "$CHECKOUT" \
+        "$BIN/bro" workspace-binding capture --project-root "$CHECKOUT" \
         > "$EVIDENCE/$label.json" 2>"$EVIDENCE/$label.err"
 }
 
@@ -675,12 +691,12 @@ step_provisional_capture() {
         cat "$EVIDENCE/provisional-capture.err" >&2
         return 1
     }
-    jq -e '.reused == false and (.source_generation_id | length > 0)' \
+    jq -e '.status == "captured" and .reused == false and (.source_generation_id | length > 0)' \
         "$EVIDENCE/provisional-capture.json" >/dev/null || {
         cat "$EVIDENCE/provisional-capture.json" >&2
         return 1
     }
-    BOUND_SESSION="$(mcp_session bound "$(binding_var BRO_WORKSPACE_BINDING_TOKEN)")" || return 1
+    BOUND_SESSION="$(mcp_session bound "$(binding_token)")" || return 1
     note "captured provisional generation $(jq -r '.source_generation_id' "$EVIDENCE/provisional-capture.json")"
 }
 

@@ -13,6 +13,7 @@
 //! against catalog attachment state, and does not re-prove the checkout on
 //! disk.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -30,7 +31,7 @@ const CHECKOUT_ID_RELPATH: &str = ".bbox/local/checkout-id";
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Subcommands:\n  mint    ask the daemon to mint a workspace binding for this checkout"
+    after_help = "Subcommands:\n  mint       ask the daemon to mint a workspace binding for this checkout\n  capture    run one provisional capture of this checkout's working state"
 )]
 pub(crate) struct WorkspaceBindingArgs {
     #[command(subcommand)]
@@ -41,6 +42,8 @@ pub(crate) struct WorkspaceBindingArgs {
 enum WorkspaceBindingCommand {
     /// Mint a workspace binding for one local checkout and install it
     Mint(MintArgs),
+    /// Capture this checkout's working state into a provisional generation
+    Capture(CaptureArgs),
 }
 
 #[derive(Debug, Args)]
@@ -55,6 +58,26 @@ struct MintArgs {
     /// environment file. Use when the checkout is not writable.
     #[arg(long)]
     print: bool,
+}
+
+#[derive(Debug, Args)]
+struct CaptureArgs {
+    /// Checkout project root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR")]
+    project_root: Option<PathBuf>,
+    /// Binding environment file. Defaults to the checkout's
+    /// .bbox/local/workspace-binding.env, which `mint` writes.
+    #[arg(long, value_name = "PATH")]
+    binding_env: Option<PathBuf>,
+    /// Binding capability token. Overrides the environment and the file.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Daemon base URL. Overrides the environment and the file.
+    #[arg(long, value_name = "URL")]
+    daemon_url: Option<String>,
+    /// Published scope as JSON. Overrides the environment and the file.
+    #[arg(long, value_name = "JSON")]
+    scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +114,7 @@ struct MintError {
 pub(crate) async fn run(args: WorkspaceBindingArgs) -> anyhow::Result<()> {
     match args.command {
         WorkspaceBindingCommand::Mint(args) => mint(args).await,
+        WorkspaceBindingCommand::Capture(args) => capture(args).await,
     }
 }
 
@@ -199,15 +223,195 @@ async fn mint(args: MintArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Capture this checkout's working state into one provisional generation.
+///
+/// The checkout-owner half of the provisional lane. It is the same client
+/// construction a managed harness performs at session start, with no agent
+/// loop around it, so an operator authoring a schema can run the
+/// mint, edit, capture, query loop by hand.
+async fn capture(args: CaptureArgs) -> anyhow::Result<()> {
+    let requested_root = match args.project_root {
+        Some(root) => root,
+        None => std::env::current_dir().context("reading current directory")?,
+    };
+    let project_root = requested_root.canonicalize().with_context(|| {
+        format!(
+            "canonicalizing workspace capture project root {}",
+            requested_root.display()
+        )
+    })?;
+    if !project_root.is_dir() {
+        bail!("workspace capture project root is not a directory");
+    }
+    let workspace_root = bbox_corpus_core::git::git_root_for_path(&project_root)
+        .context("workspace capture project is not inside a Git checkout")?
+        .canonicalize()
+        .context("canonicalizing workspace capture Git root")?;
+    if !project_root.starts_with(&workspace_root) {
+        bail!("workspace capture project root is outside its Git checkout");
+    }
+
+    let env_path = args
+        .binding_env
+        .unwrap_or_else(|| workspace_root.join(BINDING_ENV_RELPATH));
+    let file_values = match std::fs::read_to_string(&env_path) {
+        Ok(contents) => parse_binding_env(&contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", env_path.display()));
+        }
+    };
+    let resolved = resolve_capture_inputs(
+        CaptureOverrides {
+            token: args.token,
+            daemon_url: args.daemon_url,
+            scope: args.scope,
+        },
+        &file_values,
+        |name| std::env::var(name).ok(),
+        &env_path,
+    )?;
+
+    let scope: bbox_corpus_core::identity::PublishedScope =
+        serde_json::from_str(&resolved.scope).context("decoding the bound published scope")?;
+    scope.validate()?;
+    let expected_project = if scope.bbox_root_relpath() == "." {
+        workspace_root.clone()
+    } else {
+        workspace_root.join(scope.bbox_root_relpath())
+    };
+    if expected_project.canonicalize().ok().as_ref() != Some(&project_root) {
+        bail!("workspace capture project root does not match the bound published scope");
+    }
+    // Read, never mint: the identity the daemon bound is the one the capture
+    // must present, so a missing marker is a refusal rather than a fresh id.
+    let workspace_id =
+        bbox_corpus_core::identity::read_checkout_id(&workspace_root.join(CHECKOUT_ID_RELPATH))
+            .context("reading checkout identity marker")?
+            .context(
+                "checkout has no .bbox/local/checkout-id marker; attach this checkout to its \
+                 project before capturing",
+            )?;
+
+    let client = bbox_knowledge_source_client::WorkspaceCaptureClient::new(
+        &resolved.daemon_url,
+        bro_protocol::WorkspaceBindingToken::parse(resolved.token)?,
+        workspace_root.clone(),
+        project_root.clone(),
+        bro_core::WorkspaceId::parse(workspace_id.clone())?,
+        scope.clone(),
+    )?;
+    let outcome = client
+        .sync_once()
+        .await
+        .context("capturing the bound workspace")?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "captured",
+            "source_generation_id": outcome.source_generation_id,
+            "sequence": outcome.sequence,
+            "reused": outcome.reused,
+            "workspace_id": workspace_id,
+            "project_root": project_root,
+            "scope": {
+                "repo_id": scope.repo_id(),
+                "bbox_root_relpath": scope.bbox_root_relpath(),
+            },
+        }))?
+    );
+    Ok(())
+}
+
+struct CaptureOverrides {
+    token: Option<String>,
+    daemon_url: Option<String>,
+    scope: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedCaptureInputs {
+    token: String,
+    daemon_url: String,
+    scope: String,
+}
+
+/// Resolve the three binding values a capture needs. A flag wins over the
+/// process environment, which wins over the installed binding file, so a
+/// session already carrying a managed spawn's variables captures with no file
+/// at all and an operator can point one run somewhere else without editing it.
+fn resolve_capture_inputs(
+    overrides: CaptureOverrides,
+    file_values: &BTreeMap<String, String>,
+    process_env: impl Fn(&str) -> Option<String>,
+    env_path: &Path,
+) -> anyhow::Result<ResolvedCaptureInputs> {
+    let resolve = |flag: Option<String>, name: &str| -> anyhow::Result<String> {
+        let value = flag
+            .or_else(|| process_env(name).filter(|value| !value.trim().is_empty()))
+            .or_else(|| file_values.get(name).cloned())
+            .with_context(|| {
+                format!(
+                    "{name} is not set and {} does not carry it; mint a binding for this \
+                     checkout first",
+                    env_path.display()
+                )
+            })?;
+        if value.trim().is_empty() {
+            bail!("{name} is empty");
+        }
+        Ok(value)
+    };
+    Ok(ResolvedCaptureInputs {
+        token: resolve(overrides.token, bro_protocol::WORKSPACE_BINDING_ENV)?,
+        daemon_url: resolve(overrides.daemon_url, bro_protocol::KNOWLEDGE_SOURCE_URL_ENV)?,
+        scope: resolve(overrides.scope, bro_protocol::WORKSPACE_SCOPE_ENV)?,
+    })
+}
+
+/// Read a binding environment file the way a shell would: `KEY=value` lines,
+/// blanks and `#` comments skipped, and one layer of surrounding single or
+/// double quotes removed.
+fn parse_binding_env(contents: &str) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        values.insert(key.trim().to_string(), unquote(value).to_string());
+    }
+    values
+}
+
+fn unquote(value: &str) -> &str {
+    for quote in ['\'', '"'] {
+        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
 /// Render the three environment variables a bound harness or capture client
 /// reads, using the same names the managed spawn path exports.
+///
+/// The scope is single-quoted. It is JSON, and the documented way to load this
+/// file is to source it, so an unquoted value would reach the reader with its
+/// double quotes stripped by the shell and fail to parse. JSON never contains
+/// a single quote, so the quoting is unambiguous, and it reads correctly both
+/// through a shell and through an EnvironmentFile-style reader.
 fn binding_env_contents(
     minted: &MintResponse,
     base_url: &str,
     scope: &bbox_corpus_core::identity::PublishedScope,
 ) -> anyhow::Result<String> {
     Ok(format!(
-        "{}={}\n{}={}\n{}={}\n",
+        "{}={}\n{}={}\n{}='{}'\n",
         bro_protocol::WORKSPACE_BINDING_ENV,
         minted.token,
         bro_protocol::KNOWLEDGE_SOURCE_URL_ENV,
@@ -283,9 +487,123 @@ mod tests {
             bro_protocol::KNOWLEDGE_SOURCE_URL_ENV
         )));
         assert!(rendered.contains(&format!(
-            "{}={{\"repo_id\":\"repo\",\"bbox_root_relpath\":\".\"}}",
+            "{}='{{\"repo_id\":\"repo\",\"bbox_root_relpath\":\".\"}}'",
             bro_protocol::WORKSPACE_SCOPE_ENV
         )));
+    }
+
+    /// The runbook loads this file by sourcing it. An unquoted JSON value
+    /// reaches the reader with its double quotes stripped, so the scope must
+    /// survive a real shell round-trip and still parse.
+    #[cfg(unix)]
+    #[test]
+    fn binding_env_scope_survives_being_sourced_by_a_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("workspace-binding.env");
+        let scope =
+            bbox_corpus_core::identity::PublishedScope::try_new("repo", "services/api").unwrap();
+        write_binding_env(&path, &minted(), "http://127.0.0.1:7299", &scope).unwrap();
+
+        let script = format!(
+            "set -a; . '{}'; set +a; printf '%s' \"${}\"",
+            path.display(),
+            bro_protocol::WORKSPACE_SCOPE_ENV
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let sourced = String::from_utf8(output.stdout).unwrap();
+
+        let parsed: bbox_corpus_core::identity::PublishedScope =
+            serde_json::from_str(&sourced).expect("sourced scope must still be JSON");
+        assert_eq!(parsed, scope);
+    }
+
+    #[test]
+    fn binding_env_parses_quoted_and_unquoted_values() {
+        let contents = format!(
+            "# a comment\n\n{}=abc\n{}=http://127.0.0.1:7299\n{}='{{\"repo_id\":\"repo\",\"bbox_root_relpath\":\".\"}}'\n",
+            bro_protocol::WORKSPACE_BINDING_ENV,
+            bro_protocol::KNOWLEDGE_SOURCE_URL_ENV,
+            bro_protocol::WORKSPACE_SCOPE_ENV,
+        );
+        let values = parse_binding_env(&contents);
+        assert_eq!(
+            values.get(bro_protocol::WORKSPACE_BINDING_ENV).unwrap(),
+            "abc"
+        );
+        assert_eq!(
+            values.get(bro_protocol::KNOWLEDGE_SOURCE_URL_ENV).unwrap(),
+            "http://127.0.0.1:7299"
+        );
+        assert_eq!(
+            values.get(bro_protocol::WORKSPACE_SCOPE_ENV).unwrap(),
+            "{\"repo_id\":\"repo\",\"bbox_root_relpath\":\".\"}"
+        );
+    }
+
+    #[test]
+    fn capture_inputs_prefer_flags_then_environment_then_file() {
+        let file_values = BTreeMap::from([
+            (
+                bro_protocol::WORKSPACE_BINDING_ENV.to_string(),
+                "file-token".to_string(),
+            ),
+            (
+                bro_protocol::KNOWLEDGE_SOURCE_URL_ENV.to_string(),
+                "http://file".to_string(),
+            ),
+            (
+                bro_protocol::WORKSPACE_SCOPE_ENV.to_string(),
+                "{\"repo_id\":\"repo\",\"bbox_root_relpath\":\".\"}".to_string(),
+            ),
+        ]);
+        let resolved = resolve_capture_inputs(
+            CaptureOverrides {
+                token: Some("flag-token".to_string()),
+                daemon_url: None,
+                scope: None,
+            },
+            &file_values,
+            |name| {
+                (name == bro_protocol::KNOWLEDGE_SOURCE_URL_ENV).then(|| "http://env".to_string())
+            },
+            Path::new("/checkout/.bbox/local/workspace-binding.env"),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.token, "flag-token");
+        assert_eq!(resolved.daemon_url, "http://env");
+        assert_eq!(
+            resolved.scope,
+            "{\"repo_id\":\"repo\",\"bbox_root_relpath\":\".\"}"
+        );
+    }
+
+    #[test]
+    fn capture_inputs_name_the_missing_variable_and_the_file() {
+        let error = resolve_capture_inputs(
+            CaptureOverrides {
+                token: None,
+                daemon_url: None,
+                scope: None,
+            },
+            &BTreeMap::new(),
+            |_| None,
+            Path::new("/checkout/.bbox/local/workspace-binding.env"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains(bro_protocol::WORKSPACE_BINDING_ENV),
+            "{error}"
+        );
+        assert!(error.contains("workspace-binding.env"), "{error}");
     }
 
     #[cfg(unix)]

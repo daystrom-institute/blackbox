@@ -18,9 +18,13 @@ path = "src/main.rs"
 [dependencies]
 bro-fleet-client = { path = "../bro-fleet-client" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
+# Checkout-owner capture client for `workspace-binding capture`. It speaks the
+# typed knowledge-source transport and links no daemon store, index, or server.
+bbox-knowledge-source-client = { path = "../bbox-knowledge-source-client" }
 bbox-provenance = { path = "../bbox-provenance" }
 bro-rpc = { path = "../bro-rpc" }
 bro-protocol = { path = "../bro-protocol" }
+bro-core = { path = "../bro-core" }
 
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
