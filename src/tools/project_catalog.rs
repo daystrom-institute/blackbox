@@ -2773,6 +2773,71 @@ mod tests {
         );
     }
 
+    /// A covered project gap write must reach the informative
+    /// transport-authority refusal even when the checkout is absent from
+    /// the daemon's filesystem (the zero-authority cage shape). Before the
+    /// ordering fix the checkout lease's canonicalization failed first and
+    /// the caller got an opaque attachment_inactive instead.
+    #[tokio::test]
+    async fn covered_project_gap_write_refuses_before_checkout_acquisition() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+
+        const PROJECT_ID: &str = "p_covered_gap_write0";
+        const ATTACHMENT_ID: &str = "att_00000000000000000000000000000e03";
+        const CHECKOUT_ID: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeee03";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().canonicalize().unwrap().join("absent-checkout");
+        let scope = PublishedScope::try_new("repo_probe", ".").unwrap();
+
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT_ID, &scope);
+        fixture.attach_overlay_checkout(
+            PROJECT_ID,
+            &scope,
+            &checkout,
+            ATTACHMENT_ID,
+            CHECKOUT_ID,
+            true,
+        );
+        let mut server = fixture.server_with_checkout_authority();
+        cover_knowledge_transport_project(&mut server, PROJECT_ID, scope);
+
+        let result = server
+            .bbox_gap(Parameters(crate::gaps::GapFileParams {
+                title: "covered gap".into(),
+                gap_kind: "tooling".into(),
+                domain: "test-domain".into(),
+                wanted_capability: "file through the daemon".into(),
+                dedupe_key: "tooling/test-domain/covered-gap".into(),
+                impact: None,
+                blocking_level: None,
+                missing_primitive: None,
+                fallback_used: None,
+                evidence: None,
+                suggested_owner: None,
+                notes: None,
+                scope: Some("project".into()),
+                project: Some(checkout.to_string_lossy().into_owned()),
+                project_id: None,
+                write_dir: None,
+                task_id: None,
+                session_id: None,
+                provider: None,
+                bro: None,
+                thread_id: None,
+                allow_recurrence: None,
+            }))
+            .await;
+        let text = error_text(&result);
+        assert!(result.is_error.unwrap_or(false), "{text}");
+        assert!(
+            text.contains("error.knowledge_transport_authoritative"),
+            "{text}"
+        );
+        assert!(!text.contains("attachment_inactive"), "{text}");
+    }
+
     /// Denied publish requests must not touch a repository.
     ///
     /// The fixture has no checkout anywhere: the catalog holds one

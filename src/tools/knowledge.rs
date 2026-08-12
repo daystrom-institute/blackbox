@@ -257,6 +257,25 @@ impl BlackboxServer {
         let Some(raw) = project.clone().filter(|s| !s.trim().is_empty()) else {
             return Ok((None, None));
         };
+        // The coverage refusal must precede the checkout lease: acquiring a
+        // RepositoryMutation lease canonicalizes the authority root, which a
+        // zero-checkout-authority daemon cannot do, and the resulting
+        // attachment_inactive would mask this lane's real guidance.
+        if let Ok(project_id) = self.validate_project_selection(&raw)
+            && self
+                .state
+                .knowledge_transport_cutover
+                .covers_project_str(&project_id)
+        {
+            self.observe_knowledge_transport_operation(
+                &project_id,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::ProjectKnowledgeMutation,
+                bbox_indexing::knowledge_transport_observations::KnowledgeTransportOutcomeV1::AuthoritativeRefusal,
+            );
+            anyhow::bail!(
+                "error.knowledge_transport_authoritative: this project's knowledge is transport-governed and the daemon holds no checkout authority; write the entry as a committed .bbox/knowledge/ file on the checkout host and the collector will publish it"
+            );
+        }
         let resolution = self.resolve_project_write(&raw)?;
         let durable_scope = resolution.durable_scope;
         if let Some(project_id) = resolution.project_id.as_deref().filter(|project_id| {
