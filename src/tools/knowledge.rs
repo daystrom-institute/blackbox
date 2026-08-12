@@ -380,19 +380,29 @@ impl BlackboxServer {
         ))
     }
 
-    /// Load one entry from the served view for a covered-project mutation.
+    /// Load one entry for a selector-scoped covered mutation: published
+    /// view first, then the pending-delivery overlay.
     fn served_knowledge_entry(
         &self,
         raw: &str,
         id: &str,
     ) -> anyhow::Result<crate::knowledge::KnowledgeEntry> {
         let view = self.session_knowledge_view(Some(raw), None)?;
-        view.knowledge
+        if let Some(entry) = view
+            .knowledge
             .all_entries()
             .iter()
             .find(|entry| entry.id == id)
-            .cloned()
-            .with_context(|| format!("knowledge entry not found in the served view: {id}"))
+        {
+            return Ok(entry.clone());
+        }
+        if let Some(content) =
+            self.pending_mutation_content(&format!(".bbox/knowledge/{id}.json"))
+            && let Ok(entry) = serde_json::from_str::<crate::knowledge::KnowledgeEntry>(&content)
+        {
+            return Ok(entry);
+        }
+        anyhow::bail!("knowledge entry not found in the served view: {id}")
     }
 
     /// Cosmetic title derivation for the checkout-owner lane (the store's
@@ -424,10 +434,23 @@ impl BlackboxServer {
         }
     }
 
+    /// Pending backchannel write content for a repo path, when one is in
+    /// flight: chained mutations inside one collector cycle must see each
+    /// other, so the pending record supersedes the published view.
+    fn pending_mutation_content(&self, relative_path: &str) -> Option<String> {
+        self.state
+            .checkout_mutations
+            .read()
+            .pending_for_path(relative_path)
+            .filter(|pending| pending.mutation.mode == "write")
+            .and_then(|pending| pending.mutation.content_json.clone())
+    }
+
     /// Id-addressed coverage lookup for knowledge mutations that carry no
     /// project selector (forget, review, link, learn-by-id): the served
-    /// entry's stamped project id decides. Entries the published view does
-    /// not serve fall through to the store path unchanged.
+    /// entry's stamped project id decides, with the pending-delivery
+    /// overlay standing in for records not yet published. Entries neither
+    /// published nor pending fall through to the store path unchanged.
     fn covered_knowledge_entry_scope(
         &self,
         id: &str,
@@ -440,13 +463,19 @@ impl BlackboxServer {
     > {
         let id = id.strip_prefix("knowledge:").unwrap_or(id);
         let view = self.session_knowledge_view(None, None)?;
-        let Some(entry) = view
+        let entry = view
             .knowledge
             .all_entries()
             .iter()
             .find(|entry| entry.id == id)
             .cloned()
-        else {
+            .or_else(|| {
+                self.pending_mutation_content(&format!(".bbox/knowledge/{id}.json"))
+                    .and_then(|content| {
+                        serde_json::from_str::<crate::knowledge::KnowledgeEntry>(&content).ok()
+                    })
+            });
+        let Some(entry) = entry else {
             return Ok(None);
         };
         let Some(project_id) = entry.project_id.clone() else {
@@ -717,7 +746,14 @@ impl BlackboxServer {
             std::process::id().hash(&mut h);
             std::thread::current().id().hash(&mut h);
             let id = format!("{:016x}", h.finish());
-            if !view.knowledge.all_entries().iter().any(|entry| entry.id == id) {
+            let taken_by_view = view.knowledge.all_entries().iter().any(|entry| entry.id == id);
+            let taken_by_pending = self
+                .state
+                .checkout_mutations
+                .read()
+                .pending_for_path(&format!(".bbox/knowledge/{id}.json"))
+                .is_some();
+            if !taken_by_view && !taken_by_pending {
                 return Ok(id);
             }
         }

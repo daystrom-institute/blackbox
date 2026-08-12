@@ -184,6 +184,38 @@ impl CheckoutMutations {
             .map(|pending| pending.mutation.scope.clone())
     }
 
+    /// Latest pending mutation for one repo-relative path. Mutation arms
+    /// overlay this on the published view so chained writes inside one
+    /// collector cycle see each other.
+    pub fn pending_for_path(&self, relative_path: &str) -> Option<&PendingCheckoutMutation> {
+        self.store
+            .mutations
+            .iter()
+            .rev()
+            .find(|pending| {
+                pending.status == CheckoutMutationStatus::Pending
+                    && pending.mutation.relative_path == relative_path
+            })
+    }
+
+    /// Every pending write's (relative_path, content_json) pair.
+    pub fn pending_writes(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.store
+            .mutations
+            .iter()
+            .filter(|pending| {
+                pending.status == CheckoutMutationStatus::Pending
+                    && pending.mutation.mode == "write"
+            })
+            .filter_map(|pending| {
+                pending
+                    .mutation
+                    .content_json
+                    .as_deref()
+                    .map(|content| (pending.mutation.relative_path.as_str(), content))
+            })
+    }
+
     pub fn failed(&self) -> Vec<&PendingCheckoutMutation> {
         self.store
             .mutations

@@ -211,20 +211,35 @@ impl BlackboxServer {
             return Ok(None);
         };
         if !p.allow_recurrence.unwrap_or(false) {
+            let key = p.dedupe_key.trim().to_string();
             let view = self.session_gap_view(Some(raw), None)?;
             let probe = GapListParams {
-                dedupe_key: Some(p.dedupe_key.trim().to_string()),
+                dedupe_key: Some(key.clone()),
                 ..Default::default()
             };
-            if let Some(existing) = view
+            let published = view
                 .gaps
                 .query(&probe)
                 .into_iter()
                 .find(|gap| gap.resolution != crate::gaps::GapResolution::Addressed)
-            {
+                .map(|gap| gap.id);
+            let pending = {
+                let store = self.state.checkout_mutations.read();
+                store
+                    .pending_writes()
+                    .filter(|(path, _)| path.starts_with(".bbox/gaps/"))
+                    .filter_map(|(_, content)| {
+                        serde_json::from_str::<crate::gaps::GapNote>(content).ok()
+                    })
+                    .find(|gap| {
+                        gap.dedupe_key == key
+                            && gap.resolution != crate::gaps::GapResolution::Addressed
+                    })
+                    .map(|gap| gap.id)
+            };
+            if let Some(existing) = published.or(pending) {
                 return Ok(Some(format!(
-                    "Gap already open as {} (same dedupe_key); pass allow_recurrence=true to tally a recurrence, or reference {} from a follow-up",
-                    existing.id, existing.id
+                    "Gap already open as {existing} (same dedupe_key); pass allow_recurrence=true to tally a recurrence, or reference {existing} from a follow-up"
                 )));
             }
         }
@@ -299,26 +314,59 @@ impl BlackboxServer {
             std::process::id().hash(&mut h);
             std::thread::current().id().hash(&mut h);
             let id = format!("gap-{:08x}", h.finish() as u32);
-            if !view
+            let taken_by_view = view
                 .gaps
                 .all()
                 .iter()
-                .any(|gap| Self::gap_id_matches(&gap.id, &id))
-            {
+                .any(|gap| Self::gap_id_matches(&gap.id, &id));
+            let taken_by_pending = self
+                .state
+                .checkout_mutations
+                .read()
+                .pending_for_path(&format!(".bbox/gaps/{id}.json"))
+                .is_some();
+            if !taken_by_view && !taken_by_pending {
                 return Ok(id);
             }
         }
     }
 
-    /// Load one gap from the served view for a covered-project mutation.
+    /// Pending backchannel write content for a repo path, when one is in
+    /// flight: chained mutations inside one collector cycle must see each
+    /// other, so the pending record supersedes the published view.
+    fn pending_mutation_content(&self, relative_path: &str) -> Option<String> {
+        self.state
+            .checkout_mutations
+            .read()
+            .pending_for_path(relative_path)
+            .filter(|pending| pending.mutation.mode == "write")
+            .and_then(|pending| pending.mutation.content_json.clone())
+    }
+
+    /// Load one gap for a covered-project mutation: published view first,
+    /// then the pending-delivery overlay.
     fn served_gap(&self, raw: &str, id: &str) -> anyhow::Result<crate::gaps::GapNote> {
         let view = self.session_gap_view(Some(raw), None)?;
-        view.gaps
+        if let Some(gap) = view
+            .gaps
             .all()
             .iter()
             .find(|gap| Self::gap_id_matches(&gap.id, id))
-            .cloned()
-            .with_context(|| format!("Gap not found: {id} (expected `gap-<8hex>`)"))
+        {
+            return Ok(gap.clone());
+        }
+        let canonical = if id.starts_with("gap-") {
+            id.to_string()
+        } else {
+            format!("gap-{id}")
+        };
+        if let Some(content) =
+            self.pending_mutation_content(&format!(".bbox/gaps/{canonical}.json"))
+            && let Ok(gap) = serde_json::from_str::<crate::gaps::GapNote>(&content)
+        {
+            return Ok(gap);
+        }
+        anyhow::bail!("Gap not found: {id} (expected `gap-<8hex>`)")
     }
 
     /// Covered-project gap update: patch the served record exactly like
