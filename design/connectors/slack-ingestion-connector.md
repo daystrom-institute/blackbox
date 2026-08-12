@@ -182,7 +182,9 @@ on what it still needs" invariant and making producer restarts, reinstalls, and
 host moves recoverable with no producer-side durable state. There is no spool:
 Slack is the durable backlog, and a resweep from an older watermark is always
 safe because landing is idempotent on
-`(scope, channel_id, message_ts, revision)`.
+`(workspace_id, channel_id, message_ts, revision)`: workspace-level
+conversation identity, not per-scope identity, so two sources observing the
+same channel converge on one document (section 4.2).
 
 Auth is the collector's, unchanged: bearer `ServiceToken` with its owner, mode,
 symlink, and shape checks; the header authenticates a producer before the
@@ -210,6 +212,20 @@ Independent of the outcome:
 - The scope is minted at grant time and recorded in the producer grant. A
   request can never introduce a scope the operator did not already write into
   the corpus host's config.
+
+**Disjoint observers, one workspace (an intended use case, not an edge
+case).** Two bot identities installed in the same workspace are two sources:
+each gets its own minted scope, its own token, its own producer grant, and a
+visibility bound defined by its own grant plus channel membership. They are
+indexed separately and searchable through the same corpus instance. Identity
+converges beneath them: conversation and message identity is workspace-level
+(`workspace_id`, `channel_id`, `message_ts`), so where the two observers'
+visibility overlaps, their observations land on one document rather than two.
+The minted scopes govern authorization, enrollment, and provenance: each
+document records which enrolled sources observed it, and a search hit is one
+message regardless of how many observers cover its channel. Deleting or
+unenrolling one observer never removes a document another enrolled observer
+still covers.
 
 Depends on the connector-class work tracked as `gap-0378c305`.
 
@@ -316,9 +332,11 @@ on the status endpoint, not as errors.
   scope; the producer asserts this at startup and refuses to run otherwise. The
   operator's standing no-writes-to-Slack rule is untouched by this design, and
   this connector could not post if instructed to.
-- **Unenrollment purges.** Removing a channel from the allowlist removes its
-  documents rather than freezing them. An unenrolled channel must stop being
-  searchable.
+- **Unenrollment purges, per remaining coverage.** Removing a channel from a
+  source's allowlist removes that source's observation claim; the channel's
+  documents are purged when no enrolled source still covers them, and remain
+  searchable (with updated attribution) while another observer does. A channel
+  no enrolled source covers must stop being searchable.
 
 ## 7. Retrieval
 
