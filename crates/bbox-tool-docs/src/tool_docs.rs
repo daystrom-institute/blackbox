@@ -23,6 +23,7 @@ pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 pub enum ToolCategory {
     Transcripts,
     Graph,
+    ProjectGraphs,
     Projects,
     ProjectCatalog,
     Knowledge,
@@ -46,6 +47,7 @@ impl ToolCategory {
         match self {
             Self::Transcripts => "Transcripts",
             Self::Graph => "Agentic graph",
+            Self::ProjectGraphs => "Reflective project graphs",
             Self::Projects => "Projects",
             Self::ProjectCatalog => "Project catalog administration",
             Self::Knowledge => "Knowledge",
@@ -71,6 +73,7 @@ impl ToolCategory {
                 "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
             }
             Self::Graph => "Inspect entities, graph vocabulary, paths, bundles, and retrieval.",
+            Self::ProjectGraphs => "Read project-owned reflective graph generations.",
             Self::Projects => "Register project roots for later file indexing.",
             Self::ProjectCatalog => {
                 "Durable project-catalog administration: attach and detach local checkouts, select the default attachment, promote a legacy-local project to its committed scope, migrate a published scope, and rebind the publisher attachment. Every one of these refuses with `error.project_catalog_inactive` while the version-1 registry is the runtime authority; the proofless-authority operations (catalog add, alias accept and reject, retire) live on the offline `blackbox project-catalog` CLI instead."
@@ -127,6 +130,7 @@ fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
         ToolCategory::Workflows => Some("sm-workflow-orchestration"),
         ToolCategory::Whiteboards => Some("sm-whiteboards"),
         ToolCategory::StorageHealth => Some("sm-storage-health"),
+        ToolCategory::ProjectGraphs => Some("sm-agentic-opening-sequence"),
         _ => None,
     }
 }
@@ -278,6 +282,27 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(
             r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#,
         ),
+    },
+    ToolDoc {
+        name: "bbox_project_graph_list",
+        category: ToolCategory::ProjectGraphs,
+        summary: "List visible project graphs.",
+        when_to_use: "Discover graph ids.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_graph_describe",
+        category: ToolCategory::ProjectGraphs,
+        summary: "Describe one visible project graph.",
+        when_to_use: "Read schema and generation identity.",
+        example: None,
+    },
+    ToolDoc {
+        name: "bbox_project_graph_validate",
+        category: ToolCategory::ProjectGraphs,
+        summary: "Validate one visible project graph.",
+        when_to_use: "Inspect kernel diagnostics.",
+        example: None,
     },
     ToolDoc {
         name: "bbox_describe_schema",

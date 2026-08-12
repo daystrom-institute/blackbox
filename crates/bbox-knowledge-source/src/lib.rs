@@ -1121,7 +1121,10 @@ fn validate_source_filename(
             || !graph_id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-            || !matches!(graph_file, "schema.json" | "vertices.jsonl" | "edges.jsonl")
+            || !matches!(
+                graph_file,
+                "graph.json" | "schema.json" | "vertices.jsonl" | "edges.jsonl"
+            )
         {
             return Err(ContractError::InvalidGraphSourcePath);
         }
@@ -1179,7 +1182,11 @@ fn validate_graph_source_manifest(
         return Err(ContractError::GraphLimitExceeded);
     }
     let required = BTreeSet::from(["schema.json", "vertices.jsonl", "edges.jsonl"]);
-    if graphs.values().any(|(_, files)| files != &required) {
+    let allowed = BTreeSet::from(["graph.json", "schema.json", "vertices.jsonl", "edges.jsonl"]);
+    if graphs
+        .values()
+        .any(|(_, files)| !required.is_subset(files) || !files.is_subset(&allowed))
+    {
         return Err(ContractError::IncompleteGraphSource);
     }
     Ok(())
@@ -1530,6 +1537,30 @@ mod tests {
         .unwrap();
         validate_graph_source_manifest(&scope(), &entries, KnowledgeSourceLimits::default())
             .unwrap();
+
+        let mut with_descriptor = entries.clone();
+        with_descriptor.push(entry(
+            ".bbox/graphs/records/graph.json",
+            br#"{"graph_id":"records"}"#,
+        ));
+        with_descriptor.sort_by(|left, right| {
+            left.repository_relative_filename
+                .cmp(&right.repository_relative_filename)
+        });
+        validate_source_manifest(
+            &scope(),
+            SourceLaneV1::Graphs,
+            &manifest(SourceLaneV1::Graphs, &with_descriptor),
+            &with_descriptor,
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+        validate_graph_source_manifest(
+            &scope(),
+            &with_descriptor,
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
 
         for path in [
             ".bbox/graphs/records/unknown.json",

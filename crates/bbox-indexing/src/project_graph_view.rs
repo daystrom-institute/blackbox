@@ -21,7 +21,7 @@ pub enum ProjectGraphValidity {
     Invalid { errors: Vec<ValidationError> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectGraphGenerationIdentity {
     pub accepted_generation: String,
     pub accepted_commit: String,
@@ -41,6 +41,32 @@ pub struct ProjectGraphViewEntry {
 impl ProjectGraphViewEntry {
     pub fn graph(&self) -> Option<&Arc<GraphGeneration>> {
         self.graph.as_ref()
+    }
+
+    pub fn valid(
+        graph_id: String,
+        generation: ProjectGraphGenerationIdentity,
+        graph: GraphGeneration,
+    ) -> Self {
+        Self {
+            graph_id,
+            validity: ProjectGraphValidity::Valid,
+            generation,
+            graph: Some(Arc::new(graph)),
+        }
+    }
+
+    pub fn invalid(
+        graph_id: String,
+        generation: ProjectGraphGenerationIdentity,
+        errors: Vec<ValidationError>,
+    ) -> Self {
+        Self {
+            graph_id,
+            validity: ProjectGraphValidity::Invalid { errors },
+            generation,
+            graph: None,
+        }
     }
 }
 
@@ -179,6 +205,19 @@ impl ProjectGraphViewCatalog {
             .iter()
             .filter_map(|((candidate, _), overlay)| (candidate == project_id).then_some(overlay))
             .collect()
+    }
+
+    pub fn published_view(&self, project_id: &ProjectId) -> Option<&PublishedProjectGraphView> {
+        self.published.get(project_id)
+    }
+
+    pub fn provisional_overlay(
+        &self,
+        project_id: &ProjectId,
+        workspace_id: &WorkspaceId,
+    ) -> Option<&ProvisionalProjectGraphOverlay> {
+        self.provisional
+            .get(&(project_id.clone(), workspace_id.clone()))
     }
 }
 
@@ -454,6 +493,7 @@ fn parse_graph_entry(
         scope_id,
         graph_id,
         GraphDocumentBytes {
+            descriptor: files.get("graph.json").map(Vec::as_slice),
             schema,
             vertices,
             edges,

@@ -140,6 +140,12 @@ pub struct ProviderContext<'a> {
     /// pinned selector map and edge sidecar so provider properties and labels
     /// cannot reopen a newer reader mid-request.
     searcher: Option<&'a tantivy::Searcher>,
+    project_graph_resolver: Option<&'a dyn ProjectGraphEntityResolver>,
+    provisional: Option<&'a str>,
+}
+
+pub trait ProjectGraphEntityResolver: Send + Sync {
+    fn resolve_entity(&self, r: &EntityRef, provisional: Option<&str>) -> Result<EntityView>;
 }
 
 impl<'a> ProviderContext<'a> {
@@ -151,6 +157,8 @@ impl<'a> ProviderContext<'a> {
             ext: None,
             edges: None,
             searcher: None,
+            project_graph_resolver: None,
+            provisional: None,
         }
     }
 
@@ -165,6 +173,8 @@ impl<'a> ProviderContext<'a> {
             ext: Some(ext),
             edges: None,
             searcher: None,
+            project_graph_resolver: None,
+            provisional: None,
         }
     }
 
@@ -188,6 +198,16 @@ impl<'a> ProviderContext<'a> {
         self
     }
 
+    pub fn with_project_graph_resolver(
+        mut self,
+        resolver: &'a dyn ProjectGraphEntityResolver,
+        provisional: Option<&'a str>,
+    ) -> Self {
+        self.project_graph_resolver = Some(resolver);
+        self.provisional = provisional;
+        self
+    }
+
     pub fn empty_for_tests() -> Self {
         Self {
             stores: None,
@@ -196,6 +216,8 @@ impl<'a> ProviderContext<'a> {
             ext: None,
             edges: None,
             searcher: None,
+            project_graph_resolver: None,
+            provisional: None,
         }
     }
 
@@ -217,6 +239,14 @@ impl<'a> ProviderContext<'a> {
 
     pub fn edge_index(&self) -> Option<&'a bbox_edge_index::edge_index::EdgeIndex> {
         self.edges
+    }
+
+    pub fn project_graph_resolver(&self) -> Option<&'a dyn ProjectGraphEntityResolver> {
+        self.project_graph_resolver
+    }
+
+    pub fn provisional_mode(&self) -> Option<&'a str> {
+        self.provisional
     }
 
     pub fn indexed_entity_properties(

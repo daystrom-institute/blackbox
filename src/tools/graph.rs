@@ -923,6 +923,23 @@ pub(crate) struct DescribeSchemaParams {
     pub mode: Option<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProjectGraphListParams {
+    /// Registered project id, alias, base path, or worktree path.
+    pub project: Option<String>,
+    /// Visibility policy: published, own, or all.
+    pub visibility: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProjectGraphExactParams {
+    /// Registered project id, alias, base path, or worktree path.
+    pub project: String,
+    pub graph_id: String,
+    /// Visibility policy: published, own, or all.
+    pub visibility: Option<String>,
+}
+
 impl DescribeSchemaParams {
     fn include_agents_resolved(&self) -> bool {
         self.include_agents.unwrap_or_else(|| {
@@ -980,10 +997,78 @@ impl BlackboxServer {
                 .provider_context()
                 .with_knowledge_view(&knowledge_view.knowledge)
                 .with_edge_index(edge_index)
-                .with_searcher(&read_view.searcher);
+                .with_searcher(&read_view.searcher)
+                .with_project_graph_resolver(&server, p.provisional.as_deref());
             let output =
                 mcp_tools::inspect::inspect_entity(&p, &provider_ctx, &entity_ref, edge_index)?;
             knowledge_view.enrich_json_response(output)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "bbox_project_graph_list",
+        description = "List visible project graphs."
+    )]
+    pub(crate) async fn bbox_project_graph_list(
+        &self,
+        Parameters(p): Parameters<ProjectGraphListParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_project_graph_list", move || {
+            let graphs =
+                server.project_graph_list_domain(p.project.as_deref(), p.visibility.as_deref())?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "visibility": p.visibility,
+                "graphs": graphs,
+            }))?)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "bbox_project_graph_describe",
+        description = "Describe one visible project graph."
+    )]
+    pub(crate) async fn bbox_project_graph_describe(
+        &self,
+        Parameters(p): Parameters<ProjectGraphExactParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_project_graph_describe", move || {
+            let graphs = server.project_graph_describe_domain(
+                &p.project,
+                &p.graph_id,
+                p.visibility.as_deref(),
+            )?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "graphs": graphs,
+            }))?)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "bbox_project_graph_validate",
+        description = "Validate one visible project graph."
+    )]
+    pub(crate) async fn bbox_project_graph_validate(
+        &self,
+        Parameters(p): Parameters<ProjectGraphExactParams>,
+    ) -> CallToolResult {
+        let server = self.clone();
+        Self::run_blocking("bbox_project_graph_validate", move || {
+            let graphs = server.project_graph_validate_domain(
+                &p.project,
+                &p.graph_id,
+                p.visibility.as_deref(),
+            )?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "ok",
+                "graphs": graphs,
+            }))?)
         })
         .await
     }
@@ -1025,7 +1110,8 @@ impl BlackboxServer {
             let provider_ctx = server
                 .provider_context()
                 .with_edge_index(edge_index)
-                .with_searcher(&read_view.searcher);
+                .with_searcher(&read_view.searcher)
+                .with_project_graph_resolver(&server, p.provisional.as_deref());
             mcp_tools::find_paths::find_paths(
                 &p,
                 &provider_ctx,
@@ -1053,7 +1139,8 @@ impl BlackboxServer {
                 .provider_context()
                 .with_knowledge_view(&knowledge_view.knowledge)
                 .with_edge_index(edge_index)
-                .with_searcher(&read_view.searcher);
+                .with_searcher(&read_view.searcher)
+                .with_project_graph_resolver(&server, p.provisional.as_deref());
             let output = mcp_tools::bundle_evidence::bundle_evidence(
                 &p,
                 &provider_ctx,
@@ -1554,6 +1641,204 @@ mod tests {
     fn extract_text(result: &CallToolResult) -> String {
         let wire = serde_json::to_value(result).unwrap();
         wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    fn install_governance_graph(server: &BlackboxServer, root: &std::path::Path) -> String {
+        let project = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(root)
+            .unwrap();
+        let project_id =
+            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone())
+                .unwrap();
+        let graph_id = "governance-record";
+        let loaded = bbox_project_graph::load_graph_documents(
+            project_id.as_str(),
+            graph_id,
+            bbox_project_graph::GraphDocumentBytes {
+                descriptor: Some(include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/graph.json"
+                )),
+                schema: include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/schema.json"
+                ),
+                vertices: include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/vertices.jsonl"
+                ),
+                edges: include_bytes!(
+                    "../../crates/bbox-project-graph/tests/fixtures/governance-record/edges.jsonl"
+                ),
+            },
+            bbox_project_graph::GraphParseLimits::default(),
+            root.to_path_buf(),
+        );
+        assert!(loaded.report.valid, "{:?}", loaded.report.errors);
+        let graph = loaded.generation.unwrap();
+        let scope = PublishedScope::try_new("repo-governance", ".").unwrap();
+        server.state.project_graph_views.write().install_published(
+            bbox_indexing::project_graph_view::PublishedProjectGraphView {
+                project_id,
+                scope,
+                graphs: std::collections::BTreeMap::from([(
+                    graph_id.to_string(),
+                    bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
+                        graph_id.to_string(),
+                        bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                            accepted_generation: "generation-one".into(),
+                            accepted_commit: "a".repeat(40),
+                            source_generation: None,
+                            workspace_id: None,
+                            content_hash: graph.fingerprint.clone(),
+                        },
+                        graph,
+                    ),
+                )]),
+            },
+        );
+        project.project_id
+    }
+
+    #[tokio::test]
+    async fn project_graph_tools_inspect_and_traverse_governance_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_governance_graph(&server, &root);
+
+        let listed = server
+            .bbox_project_graph_list(Parameters(ProjectGraphListParams {
+                project: Some(project_id.clone()),
+                visibility: Some("published".into()),
+            }))
+            .await;
+        let listed_text = extract_text(&listed);
+        assert!(listed_text.contains("governance-record"), "{listed_text}");
+
+        let described = server
+            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+                project: project_id.clone(),
+                graph_id: "governance-record".into(),
+                visibility: Some("published".into()),
+            }))
+            .await;
+        assert!(extract_text(&described).contains("governance-record-schema"));
+
+        let validated = server
+            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                project: project_id.clone(),
+                graph_id: "governance-record".into(),
+                visibility: Some("published".into()),
+            }))
+            .await;
+        assert!(extract_text(&validated).contains("\"valid\": true"));
+
+        let vertex_ref =
+            format!("project_graph_vertex:{project_id}:governance-record:record/case@1");
+        let inspected = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: vertex_ref.clone(),
+                provisional: Some("published".into()),
+                edge_types: None,
+                direction: Some("both".into()),
+                per_type_limit: Some(10),
+                property_mode: Some("full".into()),
+            }))
+            .await;
+        let inspected_text = extract_text(&inspected);
+        assert!(inspected_text.contains("record/case@1"), "{inspected_text}");
+
+        let paths = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: vertex_ref,
+                provisional: Some("published".into()),
+                to: None,
+                to_type: Some("project_graph_vertex".into()),
+                edge_types: None,
+                max_depth: Some(2),
+                limit: Some(5),
+            }))
+            .await;
+        assert!(extract_text(&paths).contains("\"paths\""));
+    }
+
+    #[tokio::test]
+    async fn project_graph_tools_surface_invalid_own_overlay_without_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_governance_graph(&server, &root);
+        let scope = PublishedScope::try_new("repo-governance", ".").unwrap();
+        let workspace_id = bro_core::WorkspaceId::parse("a".repeat(32)).unwrap();
+        server.set_session_checkout_for_test(
+            project_id.clone(),
+            scope.clone(),
+            workspace_id.to_string(),
+            root,
+        );
+        server
+            .state
+            .project_graph_views
+            .write()
+            .install_provisional(
+                bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
+                    project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
+                        project_id.clone(),
+                    )
+                    .unwrap(),
+                    scope,
+                    workspace_id: workspace_id.clone(),
+                    source_generation_id: "working-one".into(),
+                    graphs: std::collections::BTreeMap::from([(
+                        "governance-record".into(),
+                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
+                            bbox_indexing::project_graph_view::ProjectGraphViewEntry::invalid(
+                                "governance-record".into(),
+                                bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                                    accepted_generation: "generation-one".into(),
+                                    accepted_commit: "a".repeat(40),
+                                    source_generation: Some("working-one".into()),
+                                    workspace_id: Some(workspace_id),
+                                    content_hash: "invalid-content".into(),
+                                },
+                                vec![bbox_project_graph::ValidationError::new(
+                                    "edge.missing_vertex",
+                                    "edges.jsonl",
+                                    Some(7),
+                                    "edge target is missing",
+                                )],
+                            ),
+                        ),
+                    )]),
+                },
+            );
+
+        let own = server
+            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                project: project_id.clone(),
+                graph_id: "governance-record".into(),
+                visibility: Some("own".into()),
+            }))
+            .await;
+        let own_text = extract_text(&own);
+        assert!(own_text.contains("\"valid\": false"), "{own_text}");
+        assert!(own_text.contains("edge.missing_vertex"), "{own_text}");
+        assert!(
+            own_text.contains("\"source\": \"provisional\""),
+            "{own_text}"
+        );
+
+        let published = server
+            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+                project: project_id,
+                graph_id: "governance-record".into(),
+                visibility: Some("published".into()),
+            }))
+            .await;
+        assert!(extract_text(&published).contains("\"valid\": true"));
     }
 
     #[tokio::test]

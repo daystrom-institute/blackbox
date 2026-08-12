@@ -5,6 +5,7 @@
 //! handed to `providers::register_extra_providers` at SharedState
 //! construction.
 mod brofile;
+mod project_graph;
 mod virtual_task;
 
 use crate::providers::InspectableEntityProvider;
@@ -13,6 +14,8 @@ pub(crate) fn extra_providers() -> Vec<Box<dyn InspectableEntityProvider>> {
     vec![
         Box::new(virtual_task::TaskProvider),
         Box::new(brofile::BrofileProvider),
+        Box::new(project_graph::ProjectGraphVertexProvider::published()),
+        Box::new(project_graph::ProjectGraphVertexProvider::provisional()),
     ]
 }
 

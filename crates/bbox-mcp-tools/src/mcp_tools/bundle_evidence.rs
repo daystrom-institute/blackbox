@@ -70,7 +70,8 @@ pub fn bundle_evidence(
                 continue;
             }
         };
-        entities.push((r, view.properties));
+        let canonical = EntityRef::parse(&view.ref_string).unwrap_or(r);
+        entities.push((canonical, view.properties));
     }
     if entities.is_empty() {
         return Ok(not_found_bundle(unresolved_entity_refs));
