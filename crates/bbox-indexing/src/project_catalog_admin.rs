@@ -8022,6 +8022,7 @@ mod publisher_publish_tests {
                             .unwrap(),
                     }],
                     graphs: Vec::new(),
+                    evidence: Vec::new(),
                 },
                 revalidate_checkout: Box::new(|| Ok(())),
                 revalidate_ref: Box::new(move || Some(revalidated.clone())),

@@ -8,7 +8,9 @@ use bbox_corpus_core::project_catalog::ProjectId;
 use bbox_knowledge_source::KnowledgeSourceLimits;
 use bbox_knowledge_source_store::{ReadyProvisionalWorkspace, ReadyPublicationFile};
 use bbox_project_graph::{
-    GraphDocumentBytes, GraphGeneration, GraphParseLimits, ValidationError, load_graph_documents,
+    EvidenceBindingSet, EvidenceParseLimits, EvidenceValidationError, GraphDocumentBytes,
+    GraphGeneration, GraphParseLimits, ValidationError, load_graph_documents,
+    parse_evidence_document,
 };
 use bro_core::WorkspaceId;
 
@@ -79,11 +81,30 @@ pub enum ProjectGraphOverlayValue {
     },
 }
 
+/// What a checkout's evidence lane does to the accepted binding set.
+///
+/// There is no partial state: one complete valid document replaces the whole
+/// set, an absent document tombstones it, and an invalid one is `Invalid`,
+/// which the read plane treats as "keep what was already accepted" while
+/// still being able to report why.
+#[derive(Debug, Clone)]
+pub enum EvidenceOverlayValue {
+    Upsert(EvidenceBindingSet),
+    Tombstone,
+    Invalid {
+        errors: Vec<EvidenceValidationError>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct PublishedProjectGraphView {
     pub project_id: ProjectId,
     pub scope: PublishedScope,
     pub graphs: BTreeMap<String, ProjectGraphViewEntry>,
+    /// The project's accepted binding set. Empty for a publication written
+    /// before the evidence lane existed, which is indistinguishable from a
+    /// publication that simply asserts nothing, and correctly so.
+    pub evidence: EvidenceBindingSet,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +114,9 @@ pub struct ProvisionalProjectGraphOverlay {
     pub workspace_id: WorkspaceId,
     pub source_generation_id: String,
     pub graphs: BTreeMap<String, ProjectGraphOverlayValue>,
+    /// `None` when the checkout's evidence lane matches its baseline, so the
+    /// published set already describes it.
+    pub evidence: Option<EvidenceOverlayValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +243,61 @@ impl ProjectGraphViewCatalog {
         self.provisional
             .get(&(project_id.clone(), workspace_id.clone()))
     }
+
+    /// The accepted binding set under published visibility.
+    ///
+    /// An unknown project and a project with no evidence lane both read as
+    /// the empty set: an absent lane is not an error, it is an absence of
+    /// assertions.
+    pub fn evidence_published(&self, project_id: &ProjectId) -> EvidenceBindingSet {
+        self.published
+            .get(project_id)
+            .map(|view| view.evidence.clone())
+            .unwrap_or_default()
+    }
+
+    /// The binding set one checkout sees under own visibility: its own
+    /// document when it committed a valid one, the published set otherwise.
+    ///
+    /// An `Invalid` overlay deliberately falls through to the published set.
+    /// That is the replacement rule at the read plane: a bad candidate leaves
+    /// the prior accepted set intact rather than blanking the caller's graph.
+    pub fn evidence_own(
+        &self,
+        project_id: &ProjectId,
+        workspace_id: &WorkspaceId,
+    ) -> EvidenceBindingSet {
+        match self
+            .provisional
+            .get(&(project_id.clone(), workspace_id.clone()))
+            .and_then(|overlay| overlay.evidence.as_ref())
+        {
+            Some(EvidenceOverlayValue::Upsert(bindings)) => bindings.clone(),
+            Some(EvidenceOverlayValue::Tombstone) => EvidenceBindingSet::default(),
+            Some(EvidenceOverlayValue::Invalid { .. }) | None => {
+                self.evidence_published(project_id)
+            }
+        }
+    }
+
+    /// Every binding set visible for a project under all visibility: the
+    /// published set plus each live checkout's own replacement.
+    ///
+    /// Sets are returned separately rather than merged, because two checkouts
+    /// can assert contradicting bindings for the same id and merging would
+    /// silently pick one.
+    pub fn evidence_all(&self, project_id: &ProjectId) -> Vec<EvidenceBindingSet> {
+        let mut sets = vec![self.evidence_published(project_id)];
+        for overlay in self.provisional_for_project(project_id) {
+            match overlay.evidence.as_ref() {
+                Some(EvidenceOverlayValue::Upsert(bindings)) => sets.push(bindings.clone()),
+                Some(EvidenceOverlayValue::Tombstone)
+                | Some(EvidenceOverlayValue::Invalid { .. })
+                | None => {}
+            }
+        }
+        sets
+    }
 }
 
 fn read_from_entry(entry: ProjectGraphViewEntry) -> ProjectGraphRead {
@@ -254,10 +333,28 @@ pub fn build_published_graph_view(
         }
         graphs.insert(graph_id, entry);
     }
+    // The accepted publication already refused an invalid document at prepare
+    // and re-validated it on read, so anything that failed here would be a
+    // store integrity failure, not a user error. Bail rather than silently
+    // publishing a project with its bindings quietly dropped.
+    let evidence = match verified.evidence_sources().values().next() {
+        Some(source) => {
+            let load = parse_evidence_document(
+                project_id.as_str(),
+                &source.source_bytes,
+                EvidenceParseLimits::default(),
+            );
+            load.bindings.ok_or_else(|| {
+                anyhow::anyhow!("accepted publication contains an invalid evidence document")
+            })?
+        }
+        None => EvidenceBindingSet::default(),
+    };
     Ok(PublishedProjectGraphView {
         project_id,
         scope,
         graphs,
+        evidence,
     })
 }
 
@@ -426,13 +523,50 @@ pub fn build_provisional_graph_overlay(
             (None, None) => {}
         }
     }
+    let evidence = evidence_overlay(
+        stamp.project_id().as_str(),
+        source.baseline_evidence.first(),
+        source.working_evidence.first(),
+    );
     Ok(ProvisionalProjectGraphOverlay {
         project_id: stamp.project_id().clone(),
         scope: source.descriptor.scope.clone(),
         workspace_id: source.descriptor.workspace_id.clone(),
         source_generation_id: source.source_generation_id.clone(),
         graphs,
+        evidence,
     })
+}
+
+/// What this checkout's evidence lane does relative to its baseline.
+///
+/// The lane is a single document, so the diff is a four-way case rather than
+/// the per-graph-id union the graph lane needs. An unchanged document
+/// produces no overlay at all, which keeps the published set authoritative
+/// and avoids minting a redundant per-checkout copy of it.
+fn evidence_overlay(
+    project_id: &str,
+    baseline: Option<&ReadyPublicationFile>,
+    working: Option<&ReadyPublicationFile>,
+) -> Option<EvidenceOverlayValue> {
+    match (baseline, working) {
+        (Some(before), Some(after)) if before.source_bytes == after.source_bytes => None,
+        (_, Some(after)) => {
+            let load = parse_evidence_document(
+                project_id,
+                &after.source_bytes,
+                EvidenceParseLimits::default(),
+            );
+            Some(match load.bindings {
+                Some(bindings) => EvidenceOverlayValue::Upsert(bindings),
+                None => EvidenceOverlayValue::Invalid {
+                    errors: load.errors,
+                },
+            })
+        }
+        (Some(_), None) => Some(EvidenceOverlayValue::Tombstone),
+        (None, None) => None,
+    }
 }
 
 fn parse_graph_entry(
@@ -646,6 +780,201 @@ mod tests {
         }
     }
 
+    fn bindings_document(binding_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "bindings": [{
+                "binding_id": binding_id,
+                "source": {"kind": "graph_vertex", "graph_id": "records", "vertex_id": "record-1"},
+                "kind": "record:CORRESPONDS_TO",
+                "target": {"kind": "graph_vertex", "graph_id": "source", "vertex_id": "asset-1"},
+                "assertion_authority": "project",
+                "mapping_version": "mapping-v1",
+                "asserted_at": "2026-01-01T00:00:00Z"
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn ready_evidence(bytes: Vec<u8>) -> ReadyPublicationFile {
+        ReadyPublicationFile {
+            manifest: bbox_knowledge_source::SourceFileManifestEntryV1 {
+                repository_relative_filename: ".bbox/evidence/bindings.json".to_string(),
+                encoded_bytes: bytes.len() as u64,
+                content_sha256: bbox_knowledge_source::source_file_blob_sha256(&bytes),
+            },
+            source_bytes: bytes,
+        }
+    }
+
+    fn published_with_evidence(
+        project_id: &ProjectId,
+        scope: &PublishedScope,
+        evidence: EvidenceBindingSet,
+    ) -> PublishedProjectGraphView {
+        PublishedProjectGraphView {
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            graphs: BTreeMap::new(),
+            evidence,
+        }
+    }
+
+    fn accepted_set(binding_id: &str) -> EvidenceBindingSet {
+        parse_evidence_document(
+            "proj-a",
+            &bindings_document(binding_id),
+            EvidenceParseLimits::default(),
+        )
+        .bindings
+        .expect("fixture document is valid")
+    }
+
+    /// An unchanged evidence document mints no overlay: the published set
+    /// stays authoritative rather than being copied per checkout.
+    #[test]
+    fn an_unchanged_evidence_document_produces_no_overlay() {
+        let file = ready_evidence(bindings_document("b1"));
+        assert!(evidence_overlay("proj-a", Some(&file), Some(&file)).is_none());
+        assert!(evidence_overlay("proj-a", None, None).is_none());
+    }
+
+    /// A changed document replaces the whole set; a deleted one tombstones it.
+    #[test]
+    fn a_changed_evidence_document_upserts_and_a_deleted_one_tombstones() {
+        let baseline = ready_evidence(bindings_document("b1"));
+        let working = ready_evidence(bindings_document("b2"));
+        let Some(EvidenceOverlayValue::Upsert(bindings)) =
+            evidence_overlay("proj-a", Some(&baseline), Some(&working))
+        else {
+            panic!("a changed document should upsert the whole set");
+        };
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.iter().next().unwrap().binding_id, "b2");
+
+        assert!(matches!(
+            evidence_overlay("proj-a", Some(&baseline), None),
+            Some(EvidenceOverlayValue::Tombstone)
+        ));
+        // A checkout that adds the lane where the baseline had none upserts.
+        assert!(matches!(
+            evidence_overlay("proj-a", None, Some(&working)),
+            Some(EvidenceOverlayValue::Upsert(_))
+        ));
+    }
+
+    /// Contract: an invalid candidate leaves the prior accepted set intact.
+    /// The overlay records why, and own visibility still reads published.
+    #[test]
+    fn an_invalid_evidence_document_keeps_the_published_set() {
+        let baseline = ready_evidence(bindings_document("b1"));
+        let broken = ready_evidence(br#"{"version":1,"bindings":[{"binding_id":""}]}"#.to_vec());
+        let Some(EvidenceOverlayValue::Invalid { errors }) =
+            evidence_overlay("proj-a", Some(&baseline), Some(&broken))
+        else {
+            panic!("an invalid document should not replace the accepted set");
+        };
+        assert!(!errors.is_empty());
+
+        let project_id = project_id();
+        let workspace_id = workspace_id();
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let mut catalog = ProjectGraphViewCatalog::default();
+        catalog.install_published(published_with_evidence(
+            &project_id,
+            &scope,
+            accepted_set("published-binding"),
+        ));
+        catalog.install_provisional(ProvisionalProjectGraphOverlay {
+            project_id: project_id.clone(),
+            scope,
+            workspace_id: workspace_id.clone(),
+            source_generation_id: "kws_source".into(),
+            graphs: BTreeMap::new(),
+            evidence: Some(EvidenceOverlayValue::Invalid { errors }),
+        });
+        let own = catalog.evidence_own(&project_id, &workspace_id);
+        assert_eq!(own.len(), 1);
+        assert_eq!(
+            own.iter().next().unwrap().binding_id,
+            "published-binding",
+            "an invalid candidate must leave the prior accepted set intact"
+        );
+    }
+
+    /// An absent evidence lane reads as the empty accepted set, for an
+    /// unknown project and for a pre-evidence publication alike.
+    #[test]
+    fn an_absent_evidence_lane_reads_as_the_empty_set() {
+        let project_id = project_id();
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let mut catalog = ProjectGraphViewCatalog::default();
+        assert!(catalog.evidence_published(&project_id).is_empty());
+        catalog.install_published(published_with_evidence(
+            &project_id,
+            &scope,
+            EvidenceBindingSet::default(),
+        ));
+        assert!(catalog.evidence_published(&project_id).is_empty());
+        assert_eq!(catalog.evidence_all(&project_id).len(), 1);
+    }
+
+    /// Own visibility replaces the whole published set, and a tombstone
+    /// empties it, without disturbing what published visibility reports.
+    #[test]
+    fn own_evidence_replaces_the_published_set_without_changing_published() {
+        let project_id = project_id();
+        let workspace_id = workspace_id();
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let mut catalog = ProjectGraphViewCatalog::default();
+        catalog.install_published(published_with_evidence(
+            &project_id,
+            &scope,
+            accepted_set("published-binding"),
+        ));
+        catalog.install_provisional(ProvisionalProjectGraphOverlay {
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            workspace_id: workspace_id.clone(),
+            source_generation_id: "kws_source".into(),
+            graphs: BTreeMap::new(),
+            evidence: Some(EvidenceOverlayValue::Upsert(accepted_set("own-binding"))),
+        });
+        assert_eq!(
+            catalog
+                .evidence_own(&project_id, &workspace_id)
+                .iter()
+                .next()
+                .unwrap()
+                .binding_id,
+            "own-binding"
+        );
+        assert_eq!(
+            catalog
+                .evidence_published(&project_id)
+                .iter()
+                .next()
+                .unwrap()
+                .binding_id,
+            "published-binding"
+        );
+        // All visibility keeps the two sets separate rather than merging two
+        // possibly contradicting assertions for one binding id.
+        assert_eq!(catalog.evidence_all(&project_id).len(), 2);
+
+        catalog.install_provisional(ProvisionalProjectGraphOverlay {
+            project_id: project_id.clone(),
+            scope,
+            workspace_id: workspace_id.clone(),
+            source_generation_id: "kws_source".into(),
+            graphs: BTreeMap::new(),
+            evidence: Some(EvidenceOverlayValue::Tombstone),
+        });
+        assert!(catalog.evidence_own(&project_id, &workspace_id).is_empty());
+        assert!(!catalog.evidence_published(&project_id).is_empty());
+        assert_eq!(catalog.evidence_all(&project_id).len(), 1);
+    }
+
     #[test]
     fn own_view_replaces_one_whole_graph_without_changing_published() {
         let project_id = project_id();
@@ -659,6 +988,7 @@ mod tests {
                 ("records".into(), valid_entry("records", "published", false)),
                 ("other".into(), valid_entry("other", "other", false)),
             ]),
+            evidence: EvidenceBindingSet::default(),
         });
         catalog.install_provisional(ProvisionalProjectGraphOverlay {
             project_id: project_id.clone(),
@@ -669,6 +999,7 @@ mod tests {
                 "records".into(),
                 ProjectGraphOverlayValue::Upsert(valid_entry("records", "working", true)),
             )]),
+            evidence: None,
         });
 
         let ProjectGraphRead::Valid(published) = catalog.load_published(&project_id, "records")
@@ -697,6 +1028,7 @@ mod tests {
                 ("records".into(), valid_entry("records", "published", false)),
                 ("other".into(), valid_entry("other", "other", false)),
             ]),
+            evidence: EvidenceBindingSet::default(),
         });
         catalog.install_provisional(ProvisionalProjectGraphOverlay {
             project_id: project_id.clone(),
@@ -707,6 +1039,7 @@ mod tests {
                 "records".into(),
                 ProjectGraphOverlayValue::Upsert(invalid_overlay("records")),
             )]),
+            evidence: None,
         });
 
         assert!(matches!(
@@ -736,6 +1069,7 @@ mod tests {
                 ("records".into(), valid_entry("records", "published", false)),
                 ("other".into(), valid_entry("other", "other", false)),
             ]),
+            evidence: EvidenceBindingSet::default(),
         });
         catalog.install_provisional(ProvisionalProjectGraphOverlay {
             project_id: project_id.clone(),
@@ -749,6 +1083,7 @@ mod tests {
                     generation: identity("deleted", true),
                 },
             )]),
+            evidence: None,
         });
         assert!(matches!(
             catalog.load_own(&project_id, &workspace_id, "records"),

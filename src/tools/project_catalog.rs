@@ -1790,6 +1790,7 @@ fn publisher_publish_probe(
                 })
                 .collect(),
             graphs: Vec::new(),
+            evidence: Vec::new(),
         },
         revalidate_checkout,
         revalidate_ref: Box::new(move || {
@@ -3941,6 +3942,7 @@ mod tests {
                     }],
                     gaps: Vec::new(),
                     graphs: Vec::new(),
+                    evidence: Vec::new(),
                 },
             )
             .unwrap();
