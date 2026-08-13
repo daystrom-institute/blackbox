@@ -9,6 +9,7 @@ pub(crate) mod catalog_ownership_scan;
 pub(crate) mod checkout_access;
 pub(crate) mod code_source;
 pub(crate) mod connector_grants;
+pub(crate) mod conversation_source;
 pub mod dispatch;
 pub(crate) mod file_source;
 pub(crate) mod file_source_activation;

@@ -746,6 +746,12 @@ pub(super) fn open_shared_state(
     // is configured costs two `mkdir -p` calls and keeps `SharedState`
     // non-optional for every reader.
     let file_sources = Arc::new(super::file_source::FileSourceRuntime::open(&cfg)?);
+    // Same reasoning as the file lane above: a directory tree with no
+    // producer state, so opening it unconditionally keeps every reader's
+    // access non-optional.
+    let conversation_sources = Arc::new(
+        super::conversation_source::ConversationSourceRuntime::open(&cfg)?,
+    );
     if let Some(catalog_store) = catalog_store.as_ref() {
         code_source_locality_cutover.verify_live(
             catalog_store,
@@ -980,6 +986,7 @@ pub(super) fn open_shared_state(
         edge_index_ready: std::sync::atomic::AtomicBool::new(cfg.index.edge_index_boot_rebuild),
         code_sources,
         file_sources,
+        conversation_sources,
         git_sources,
         knowledge_sources,
         git_transport_cutover,

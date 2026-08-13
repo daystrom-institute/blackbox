@@ -230,6 +230,11 @@ pub(crate) struct SharedState {
     /// Separate from `code_sources` because the generation model, the key,
     /// and the retention window are this lane's own.
     pub(crate) file_sources: Arc<super::file_source::FileSourceRuntime>,
+    /// Conversation landing store for the `/internal/conversation-source/v1/*`
+    /// lane. Separate from `file_sources` because this lane has no
+    /// generation model at all: records land append-only against
+    /// server-owned per-channel cursors.
+    pub(crate) conversation_sources: Arc<super::conversation_source::ConversationSourceRuntime>,
     pub(crate) git_sources: Arc<super::git_source::GitSourceRuntime>,
     pub(crate) knowledge_sources: Arc<super::knowledge_source::KnowledgeSourceRuntime>,
     /// Strict per-repository Git transport authority loaded from the
@@ -1040,6 +1045,9 @@ impl SharedState {
             edge_index_ready: AtomicBool::new(true),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
             file_sources: Arc::new(super::file_source::FileSourceRuntime::for_test(store_dir)),
+            conversation_sources: Arc::new(
+                super::conversation_source::ConversationSourceRuntime::for_test(store_dir),
+            ),
             git_sources: Arc::new(super::git_source::GitSourceRuntime::for_test(store_dir)),
             knowledge_sources: Arc::new(super::knowledge_source::KnowledgeSourceRuntime::for_test(
                 store_dir,

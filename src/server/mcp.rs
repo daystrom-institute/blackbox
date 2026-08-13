@@ -171,6 +171,7 @@ pub(super) fn build_http_app(
         )
         .merge(super::code_source::router(shared.clone()))
         .merge(super::file_source::router(shared.clone()))
+        .merge(super::conversation_source::router(shared.clone()))
         .merge(super::git_source::router(shared.clone()))
         .merge(super::knowledge_source::router(shared.clone()))
         .with_state(shared)

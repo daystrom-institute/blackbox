@@ -693,6 +693,30 @@ pub(crate) async fn authenticate_knowledge_source_request(
 /// code-collection early return precisely so that stays true here.
 pub(crate) async fn authenticate_file_source_request(
     State(state): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authenticate_connector_request(state, request, next).await
+}
+
+/// The conversation lane authenticates through the SAME producer table.
+///
+/// A separate entry point rather than a shared route layer because the two
+/// families mount separately and a reader following either router must land on
+/// a name that says which lane it is reading. Which lane a producer's grant
+/// actually opens is checked per handler against
+/// `ConnectorGrantRuntime::profile_for`; authentication answers only "which
+/// producer is this bearer", which is lane-independent by construction.
+pub(crate) async fn authenticate_conversation_source_request(
+    State(state): State<Arc<SharedState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authenticate_connector_request(state, request, next).await
+}
+
+async fn authenticate_connector_request(
+    state: Arc<SharedState>,
     mut request: Request,
     next: Next,
 ) -> Response {
