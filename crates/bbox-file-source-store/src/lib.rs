@@ -378,8 +378,29 @@ impl FileSourceStore {
         }
         // An already-finalized generation replays to its own record rather
         // than minting a second upload for bytes the store already holds.
+        //
+        // The record is PERSISTED, not merely returned. Every verb after
+        // begin -- manifest page, complete, missing, finalize -- is keyed on
+        // the upload id and resolves it through `load_upload`, and `finalize`
+        // deliberately deletes the record once the generation becomes the
+        // authority. A returned-but-unsaved record therefore answers "unknown
+        // upload" to every one of those calls, which is exactly the case this
+        // branch exists to serve: a producer whose finalize response was lost,
+        // or one resuming after a crash, re-presents the descriptor and must
+        // be able to drive the conversation to an idempotent finalize.
+        //
+        // The pages are rehydrated from the generation's durable manifest
+        // rather than left empty. An empty page set would make `missing_blobs`
+        // report that the producer owes NOTHING (it recomputes the owed set
+        // from these entries), and would make a replayed `complete_manifest`
+        // fail its own descriptor's file-count check. `finalize` writes the
+        // manifest before it saves the generation, so a generation that loads
+        // always has one; a generation without a manifest is a corrupt store
+        // rather than a state to paper over, and failing here is louder than
+        // handing back a record claiming a complete manifest with no entries.
         if let Some(stored) = self.load_generation(&descriptor.scope, &generation_id)? {
-            return Ok(UploadRecord {
+            let entries = self.manifest(&descriptor.scope, &generation_id)?;
+            let record = UploadRecord {
                 upload_id,
                 generation_id,
                 scope: descriptor.scope.clone(),
@@ -388,9 +409,11 @@ impl FileSourceStore {
                 descriptor: descriptor.clone(),
                 telemetry: telemetry.clone(),
                 degradation: degradation.cloned(),
-                pages: BTreeMap::new(),
+                pages: BTreeMap::from([(0, entries)]),
                 manifest_complete: true,
-            });
+            };
+            self.save_upload(&record)?;
+            return Ok(record);
         }
 
         let ordinal = self.max_ordinal(&descriptor.scope)?.saturating_add(1);
@@ -420,6 +443,19 @@ impl FileSourceStore {
 
     /// Receive one manifest page. Redelivery replaces the page in place, so a
     /// retry after a lost response is not a duplicated entry set.
+    ///
+    /// After the manifest is COMPLETE an identical redelivery is accepted as a
+    /// no-op and a differing page is refused. The asymmetry is the point: a
+    /// completed manifest was validated against its descriptor, so letting a
+    /// producer change it would silently invalidate that check, while
+    /// re-sending the same bytes changes nothing. Accepting the identical case
+    /// is not a convenience -- [`BeginFileUploadResponseV1`] carries no
+    /// "manifest already received" signal, so a producer re-driving the
+    /// conversation after a crash CANNOT know to skip its pages, which makes
+    /// redelivery the ordinary shape of a resume rather than a protocol
+    /// violation.
+    ///
+    /// [`BeginFileUploadResponseV1`]: bbox_file_source::BeginFileUploadResponseV1
     pub fn append_manifest_page(
         &self,
         upload_id: &str,
@@ -430,6 +466,9 @@ impl FileSourceStore {
             .load_upload(upload_id)?
             .with_context(|| format!("unknown upload {upload_id}"))?;
         if record.manifest_complete {
+            if record.pages.get(&page_index) == Some(&entries) {
+                return Ok(());
+            }
             bail!("upload {upload_id} already completed its manifest");
         }
         for entry in &entries {
@@ -498,6 +537,12 @@ impl FileSourceStore {
             // Idempotent finalize: a redelivered finalize returns the record
             // that already exists rather than rewriting a generation that may
             // already be Active.
+            //
+            // The replayed working state is retired here for the same reason
+            // the fresh path retires it below: once the generation exists it
+            // is the authority, so leaving the record behind would accumulate
+            // one dead upload per redelivery.
+            let _ = std::fs::remove_file(self.upload_path(upload_id));
             return Ok(existing);
         }
         let entries = record.entries();
@@ -1243,6 +1288,121 @@ mod tests {
         assert!(
             store.load_generation(&scope(), &ids[0]).unwrap().is_none(),
             "generations beyond the retention window are pruned"
+        );
+    }
+
+    #[test]
+    fn a_completed_manifest_accepts_an_identical_page_and_refuses_a_changed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let entries = vec![entry("a.md", b"alpha", "r1")];
+        let descriptor = descriptor(&entries, 0);
+        let upload = store
+            .begin_upload(
+                PRODUCER,
+                &descriptor,
+                &PublicationTelemetryV1::default(),
+                None,
+            )
+            .unwrap();
+        store
+            .append_manifest_page(&upload.upload_id, 0, entries.clone())
+            .unwrap();
+        store.complete_manifest(&upload.upload_id).unwrap();
+
+        // A resuming producer cannot know the manifest already landed, so an
+        // identical redelivery is a no-op rather than a refusal.
+        store
+            .append_manifest_page(&upload.upload_id, 0, entries.clone())
+            .expect("an identical page after completion is idempotent");
+        assert_eq!(
+            store
+                .load_upload(&upload.upload_id)
+                .unwrap()
+                .unwrap()
+                .entries(),
+            entries,
+            "and it does not duplicate the entry set"
+        );
+
+        // A DIFFERENT page would invalidate the descriptor check that
+        // completion already performed, so it stays refused.
+        let error = store
+            .append_manifest_page(&upload.upload_id, 0, vec![entry("b.md", b"bravo", "r2")])
+            .unwrap_err();
+        assert!(error.to_string().contains("already completed its manifest"));
+    }
+
+    #[test]
+    fn a_replay_after_finalize_is_durable_and_drivable_to_an_idempotent_finalize() {
+        // The regression this pins: the already-finalized replay branch used
+        // to RETURN an upload record without saving it. Every verb after
+        // begin resolves the id through `load_upload`, and finalize deletes
+        // the record once the generation is authority, so a memory-only
+        // record answered "unknown upload" to everything that followed. That
+        // breaks the redelivery contract directly: a producer whose finalize
+        // response was lost re-presents the same descriptor and must be able
+        // to reach a successful, idempotent finalize.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let entries = vec![entry("a.md", b"alpha", "r1")];
+        let descriptor = descriptor(&entries, 0);
+        let first = publish(&store, &[("a.md", b"alpha", "r1")], 0);
+
+        // Finalize retired the working state; the generation is authority.
+        let upload_id = format!("fsu-{}", &first.generation_id[..24]);
+        assert!(
+            store.load_upload(&upload_id).unwrap().is_none(),
+            "finalize retires the upload record"
+        );
+
+        let replayed = store
+            .begin_upload(
+                PRODUCER,
+                &descriptor,
+                &PublicationTelemetryV1::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            replayed.upload_id, upload_id,
+            "an exact replay derives the same id"
+        );
+        assert_eq!(replayed.ordinal, first.ordinal, "and keeps the ordinal");
+        assert!(
+            store.load_upload(&replayed.upload_id).unwrap().is_some(),
+            "the replayed record must be DURABLE: every later verb resolves \
+             the upload id through the store, not through the returned value"
+        );
+
+        // Rehydrated from the durable manifest, so the owed set is computed
+        // honestly. An empty page set would report that a producer owes
+        // nothing regardless of what the CAS actually holds.
+        let reloaded = store.load_upload(&replayed.upload_id).unwrap().unwrap();
+        assert_eq!(
+            reloaded.entries(),
+            entries,
+            "the replayed record carries the generation's real manifest"
+        );
+        assert!(
+            store.missing_blobs(&replayed.upload_id).unwrap().is_empty(),
+            "the store already holds these blobs"
+        );
+
+        // The whole point: the conversation reaches an idempotent finalize.
+        assert_eq!(
+            store.finalize(&replayed.upload_id).unwrap().generation_id,
+            first.generation_id
+        );
+        assert_eq!(
+            store.generations(&scope()).unwrap().len(),
+            1,
+            "a redelivery is not a second generation"
+        );
+        assert!(
+            store.load_upload(&replayed.upload_id).unwrap().is_none(),
+            "and the replayed working state is retired again rather than \
+             accumulating one dead upload per redelivery"
         );
     }
 
