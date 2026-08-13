@@ -15,6 +15,7 @@ fn empty_sink() -> EventSink {
         num_turns: None,
         session_id: None,
         interrupted: false,
+        ..Default::default()
     }
 }
 
@@ -312,6 +313,126 @@ fn harness_streaming_accumulates_text_across_blocks_and_turns() {
     assert_eq!(
         sink.last_assistant_message.as_deref(),
         Some("Substantive answer.\n\nNo response requested.")
+    );
+}
+
+#[test]
+fn context_pressure_event_captures_occupancy_and_window() {
+    let mut sink = empty_sink();
+    Provider::Glm.parse_event(
+        &serde_json::json!({
+            "type": "system",
+            "subtype": "context_pressure",
+            "session_id": "s1",
+            "context": {
+                "last_turn_input_tokens": 164_000,
+                "context_window": 200_000,
+                "compaction_threshold": 150_000,
+            }
+        }),
+        &mut sink,
+    );
+    assert_eq!(sink.last_turn_input_tokens, Some(164_000));
+    assert_eq!(sink.context_window, Some(200_000));
+}
+
+#[test]
+fn context_pressure_event_without_a_window_reports_occupancy_only() {
+    // A producer that does not know the model's window omits it. The daemon
+    // must not substitute one: it does not link the harness's model table, and
+    // a locally-invented denominator would drift from the real policy.
+    let mut sink = empty_sink();
+    Provider::Glm.parse_event(
+        &serde_json::json!({
+            "type": "system",
+            "subtype": "context_pressure",
+            "context": { "last_turn_input_tokens": 9_000 }
+        }),
+        &mut sink,
+    );
+    assert_eq!(sink.last_turn_input_tokens, Some(9_000));
+    assert_eq!(sink.context_window, None);
+}
+
+#[test]
+fn assistant_step_usage_supplies_occupancy_without_a_pressure_event() {
+    // Fallback path for a producer that emits per-step usage but no dedicated
+    // pressure event. Occupancy is cache-INCLUSIVE: cached prompt tokens still
+    // sit in the window even though the model did not reprocess them.
+    let mut sink = empty_sink();
+    Provider::Glm.parse_event(
+        &serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "ok" }],
+                "usage": {
+                    "input_tokens": 1_000,
+                    "output_tokens": 40,
+                    "cache_read_input_tokens": 120_000,
+                    "cache_creation_input_tokens": 500,
+                }
+            }
+        }),
+        &mut sink,
+    );
+    assert_eq!(sink.last_turn_input_tokens, Some(121_500));
+    assert_eq!(sink.context_window, None);
+}
+
+#[test]
+fn pressure_event_wins_over_the_assistant_step_fallback() {
+    // The dedicated event arrives after the assistant message for the same
+    // step and is authoritative, because it also carries the window.
+    let mut sink = empty_sink();
+    Provider::Glm.parse_event(
+        &serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [],
+                "usage": { "input_tokens": 100, "output_tokens": 1 }
+            }
+        }),
+        &mut sink,
+    );
+    assert_eq!(sink.last_turn_input_tokens, Some(100));
+    Provider::Glm.parse_event(
+        &serde_json::json!({
+            "type": "system",
+            "subtype": "context_pressure",
+            "context": { "last_turn_input_tokens": 100, "context_window": 200_000 }
+        }),
+        &mut sink,
+    );
+    assert_eq!(sink.last_turn_input_tokens, Some(100));
+    assert_eq!(sink.context_window, Some(200_000));
+}
+
+#[test]
+fn result_usage_does_not_masquerade_as_turn_occupancy() {
+    // Session totals measure work done, not window occupancy. A result event
+    // must never populate the pressure signal, or a long arc reads as a full
+    // window on its very first status check.
+    let mut sink = empty_sink();
+    Provider::Glm.parse_event(
+        &serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "done",
+            "num_turns": 40,
+            "usage": {
+                "input_tokens": 90_000_000u64,
+                "output_tokens": 400_000,
+                "cache_read_input_tokens": 12_000_000u64,
+                "cache_creation_input_tokens": 0,
+            }
+        }),
+        &mut sink,
+    );
+    assert!(sink.usage.is_some(), "result usage still lands as usage");
+    assert_eq!(
+        sink.last_turn_input_tokens, None,
+        "cumulative session totals must not be read as turn occupancy"
     );
 }
 

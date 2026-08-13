@@ -860,6 +860,7 @@ mod tests {
             num_turns: None,
             session_id: None,
             interrupted: false,
+            ..Default::default()
         }
     }
 
@@ -871,6 +872,7 @@ mod tests {
             num_turns: None,
             session_id: None,
             interrupted: false,
+            ..Default::default()
         }
     }
 
@@ -1198,6 +1200,7 @@ mod tests {
             num_turns: None,
             session_id: None,
             interrupted: false,
+            ..Default::default()
         };
         state.observe_event(&serde_json::json!({"note": "n"}), &sink, &cfg(), 1_000);
 
