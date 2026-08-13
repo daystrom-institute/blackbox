@@ -155,6 +155,7 @@ struct CapturedPublicationCandidate {
     knowledge_entries: Vec<SourceFileManifestEntryV1>,
     gap_entries: Vec<SourceFileManifestEntryV1>,
     graph_entries: Vec<SourceFileManifestEntryV1>,
+    evidence_entries: Vec<SourceFileManifestEntryV1>,
     blobs: tempfile::TempDir,
 }
 
@@ -750,6 +751,13 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
         capture_publication_lane(&commit, &actual_scope, SourceLaneV1::Gaps, &blobs, limits)?;
     let graph_entries =
         capture_publication_lane(&commit, &actual_scope, SourceLaneV1::Graphs, &blobs, limits)?;
+    let evidence_entries = capture_publication_lane(
+        &commit,
+        &actual_scope,
+        SourceLaneV1::Evidence,
+        &blobs,
+        limits,
+    )?;
     let knowledge_pages = pack_source_manifest_pages(
         &knowledge_entries,
         limits.max_manifest_page_entries as usize,
@@ -762,6 +770,11 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
     )?;
     let graph_pages = pack_source_manifest_pages(
         &graph_entries,
+        limits.max_manifest_page_entries as usize,
+        limits.max_manifest_page_bytes as usize,
+    )?;
+    let evidence_pages = pack_source_manifest_pages(
+        &evidence_entries,
         limits.max_manifest_page_entries as usize,
         limits.max_manifest_page_bytes as usize,
     )?;
@@ -782,12 +795,18 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
             &graph_entries,
             graph_pages.len(),
         )?,
+        evidence: source_manifest_descriptor(
+            SourceLaneV1::Evidence,
+            &evidence_entries,
+            evidence_pages.len(),
+        )?,
     };
     bbox_knowledge_source::validate_publication_candidate(
         &descriptor,
         &knowledge_entries,
         &gap_entries,
         &graph_entries,
+        &evidence_entries,
         limits,
     )?;
     let stable_commit = repository
@@ -801,6 +820,7 @@ fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPubli
         knowledge_entries,
         gap_entries,
         graph_entries,
+        evidence_entries,
         blobs,
     })
 }
@@ -816,6 +836,7 @@ fn capture_publication_lane(
         SourceLaneV1::Knowledge => "knowledge",
         SourceLaneV1::Gaps => "gaps",
         SourceLaneV1::Graphs => "graphs",
+        SourceLaneV1::Evidence => "evidence",
     };
     let directory = if scope.bbox_root_relpath() == "." {
         format!(".bbox/{lane_name}")
@@ -991,6 +1012,11 @@ async fn publish_publication_candidate(
             captured.graph_entries.as_slice(),
             captured.descriptor.graphs.page_count,
         ),
+        (
+            SourceLaneV1::Evidence,
+            captured.evidence_entries.as_slice(),
+            captured.descriptor.evidence.page_count,
+        ),
     ] {
         let pages = pack_source_manifest_pages(
             entries,
@@ -1004,6 +1030,7 @@ async fn publish_publication_candidate(
             SourceLaneV1::Knowledge => "knowledge",
             SourceLaneV1::Gaps => "gaps",
             SourceLaneV1::Graphs => "graphs",
+            SourceLaneV1::Evidence => "evidence",
         };
         for page in pages {
             let url = runtime.endpoint(&format!(
@@ -1026,6 +1053,7 @@ async fn publish_publication_candidate(
         .iter()
         .chain(&captured.gap_entries)
         .chain(&captured.graph_entries)
+        .chain(&captured.evidence_entries)
         .map(|entry| (entry.content_sha256.as_str(), entry))
         .collect::<HashMap<_, _>>();
     loop {

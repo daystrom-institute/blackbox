@@ -257,6 +257,15 @@ pub struct SourceManifestDescriptorV1 {
 }
 
 impl Default for SourceManifestDescriptorV1 {
+    /// The canonical absent lane, shared by every lane.
+    ///
+    /// The digest below is graphs-tagged for historical reasons: this impl
+    /// landed with the graphs lane. Do NOT re-derive it per lane. This exact
+    /// value is what a lane absent from a stored record decodes to, so it is
+    /// durable on disk and `is_absent_lane` compares against it. Because the
+    /// manifest hash is domain-separated by lane tag, it does not equal any
+    /// other lane's own empty-manifest digest, which is why
+    /// `validate_source_manifest` admits it explicitly for an empty lane.
     fn default() -> Self {
         Self {
             manifest_sha256: source_manifest_sha256(SourceLaneV1::Graphs, &[]),
@@ -882,10 +891,33 @@ pub fn validate_source_manifest(
     if logical_bytes != descriptor.logical_bytes {
         return Err(ContractError::ManifestCountMismatch);
     }
-    if source_manifest_sha256(lane, entries) != descriptor.manifest_sha256 {
+    if source_manifest_sha256(lane, entries) != descriptor.manifest_sha256
+        && !absent_lane_commitment(descriptor, entries)
+    {
         return Err(ContractError::ManifestCommitmentMismatch);
     }
     Ok(())
+}
+
+/// Whether this descriptor is the canonical absent lane rather than this
+/// lane's own empty commitment.
+///
+/// `SourceManifestDescriptorV1::default()` carries ONE digest for every lane,
+/// and that digest is now durable in stored state: it is exactly what a lane
+/// absent from a stored record decodes to. It is not the same value as this
+/// lane's own empty-manifest digest, because the manifest hash is
+/// domain-separated by lane tag. The graphs lane never noticed, because
+/// `Default` happens to carry the graphs tag; every lane added after it would
+/// otherwise refuse every pre-lane record on disk.
+///
+/// The exemption is deliberately narrow: it applies only when the lane is
+/// ACTUALLY empty, so a descriptor claiming content can never pass validation
+/// on another lane's commitment.
+fn absent_lane_commitment(
+    descriptor: &SourceManifestDescriptorV1,
+    entries: &[SourceFileManifestEntryV1],
+) -> bool {
+    entries.is_empty() && descriptor.is_absent_lane()
 }
 
 pub fn validate_publication_candidate(
@@ -2166,6 +2198,57 @@ mod tests {
         assert!(matches!(
             validate_evidence_source_manifest(&two),
             Err(ContractError::InvalidEvidenceSourcePath)
+        ));
+    }
+
+    /// A lane absent from stored state decodes to the shared canonical empty
+    /// descriptor, whose digest is graphs-tagged rather than this lane's own.
+    /// That shape has to validate, or every pre-evidence record on disk
+    /// becomes unreadable; a lane claiming content must not.
+    #[test]
+    fn the_canonical_absent_lane_validates_on_any_lane() {
+        let absent = SourceManifestDescriptorV1::default();
+        for lane in [
+            SourceLaneV1::Knowledge,
+            SourceLaneV1::Gaps,
+            SourceLaneV1::Graphs,
+            SourceLaneV1::Evidence,
+        ] {
+            validate_source_manifest(
+                &scope(),
+                lane,
+                &absent,
+                &[],
+                KnowledgeSourceLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("absent {lane:?} lane must validate: {error:?}"));
+        }
+
+        // A live capture of an empty lane commits to that lane's OWN empty
+        // digest, which is a different value and is not the absent lane.
+        let live_empty = manifest(SourceLaneV1::Evidence, &[]);
+        assert_ne!(live_empty.manifest_sha256, absent.manifest_sha256);
+        assert!(!live_empty.is_absent_lane());
+        validate_source_manifest(
+            &scope(),
+            SourceLaneV1::Evidence,
+            &live_empty,
+            &[],
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+
+        // The exemption never covers a lane that claims content.
+        let entries = evidence_entries();
+        assert!(matches!(
+            validate_source_manifest(
+                &scope(),
+                SourceLaneV1::Evidence,
+                &absent,
+                &entries,
+                KnowledgeSourceLimits::default(),
+            ),
+            Err(ContractError::ManifestCountMismatch)
         ));
     }
 

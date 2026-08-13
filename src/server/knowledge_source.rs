@@ -1530,6 +1530,7 @@ fn parse_lane(value: &str) -> Result<SourceLaneV1, HttpError> {
         "knowledge" => Ok(SourceLaneV1::Knowledge),
         "gaps" => Ok(SourceLaneV1::Gaps),
         "graphs" => Ok(SourceLaneV1::Graphs),
+        "evidence" => Ok(SourceLaneV1::Evidence),
         _ => Err(HttpError::unprocessable(
             "knowledge_source_manifest_invalid",
             "knowledge-source lane is invalid",
@@ -2162,10 +2163,12 @@ mod tests {
             manifest(SourceLaneV1::Knowledge, &working_knowledge_manifest);
         let working_gap_descriptor = manifest(SourceLaneV1::Gaps, &working_gap_manifest);
         let empty_graphs = bbox_knowledge_source::SourceManifestDescriptorV1::default();
+        let empty_evidence = bbox_knowledge_source::SourceManifestDescriptorV1::default();
         let working_pair = working_pair_sha256(
             &working_knowledge_descriptor,
             &working_gap_descriptor,
             &empty_graphs,
+            &empty_evidence,
         );
         let descriptor = bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1 {
             schema_version: SCHEMA_VERSION,
@@ -2192,9 +2195,11 @@ mod tests {
             baseline_knowledge: baseline_knowledge_descriptor,
             baseline_gaps: baseline_gap_descriptor,
             baseline_graphs: empty_graphs.clone(),
+            baseline_evidence: empty_evidence.clone(),
             working_knowledge: working_knowledge_descriptor,
             working_gaps: working_gap_descriptor,
             working_graphs: empty_graphs,
+            working_evidence: empty_evidence,
         };
         let store = server.state.knowledge_sources.store();
         let upload = store
@@ -2407,6 +2412,7 @@ mod tests {
             knowledge: manifest(SourceLaneV1::Knowledge, &entries),
             gaps: manifest(SourceLaneV1::Gaps, &[]),
             graphs: SourceManifestDescriptorV1::default(),
+            evidence: SourceManifestDescriptorV1::default(),
         }
     }
 
@@ -2438,8 +2444,13 @@ mod tests {
         let knowledge_manifest = manifest(SourceLaneV1::Knowledge, &knowledge);
         let gaps_manifest = manifest(SourceLaneV1::Gaps, &[]);
         let graphs_manifest = SourceManifestDescriptorV1::default();
-        let working_pair =
-            working_pair_sha256(&knowledge_manifest, &gaps_manifest, &graphs_manifest);
+        let evidence_manifest = SourceManifestDescriptorV1::default();
+        let working_pair = working_pair_sha256(
+            &knowledge_manifest,
+            &gaps_manifest,
+            &graphs_manifest,
+            &evidence_manifest,
+        );
         (
             bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1 {
                 schema_version: SCHEMA_VERSION,
@@ -2466,9 +2477,11 @@ mod tests {
                 baseline_knowledge: knowledge_manifest.clone(),
                 baseline_gaps: gaps_manifest.clone(),
                 baseline_graphs: graphs_manifest.clone(),
+                baseline_evidence: evidence_manifest.clone(),
                 working_knowledge: knowledge_manifest,
                 working_gaps: gaps_manifest,
                 working_graphs: graphs_manifest,
+                working_evidence: evidence_manifest,
             },
             nodes,
         )
