@@ -385,11 +385,26 @@ report and compared for nothing.
 chosen: v2 while no connector scope exists, v3 the moment one does. So a
 connector-free catalog written by a connector-aware daemon is byte-identical to
 a pre-connector write and opens under the old reader unchanged. A catalog that
-DOES hold connector scopes fails an older daemon closed with
-`error.project_catalog_unsupported_version`. That is deliberate: opening it
-minus the projects the old reader cannot represent would orphan their content
-and free a durable scope for reuse, so refusing is the only honest outcome and
-the remedy is to roll forward. Tracked as `gap-0c7ec76c`.
+DOES hold connector scopes fails an older daemon closed. That is deliberate:
+opening it minus the projects the old reader cannot represent would orphan
+their content and free a durable scope for reuse, so refusing is the only
+honest outcome and the remedy is to roll forward.
+
+The refusal has two shapes, and an operator mid-rollback should recognize
+either:
+
+- the **startup version probe** (`probe_project_store_mode`, run before any
+  project-scoped subsystem starts) reads only the `version` field and refuses
+  an unknown one with `error.project_catalog_unsupported_version`. This is what
+  a real rolled-back daemon hits; it never parses a project row. The version
+  number is load-bearing rather than forensic: it is the entire mechanism by
+  which an older build knows to stop;
+- a **strict row decode** reached some other way refuses later and differently,
+  with serde's `unknown variant 'connector', expected 'published' or
+  'legacy_local'`, because the scope enum denies unknown variants.
+
+Both are pinned by test so neither can quietly become a partial success.
+Tracked as `gap-0c7ec76c`.
 
 ## 9. Onboarding and lifecycle
 
