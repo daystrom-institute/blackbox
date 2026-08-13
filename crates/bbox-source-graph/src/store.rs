@@ -254,8 +254,13 @@ impl SourceProjectionStore {
     /// state only: the accepted generation is never touched.
     pub fn sweep_retained_observations(&self, now_unix: u64) -> Result<ObservationSweepStats> {
         let accepted = self.accepted_generation_number().unwrap_or(0);
-        let snapshot_path = self.paths.snapshot(&self.scope_id, &self.graph_id)?;
         let retained = self.retained_batches()?;
+        if retained.is_empty() {
+            // Nothing to reclaim, and the store directory may not exist yet:
+            // do not mint a lock file just to discover that.
+            return Ok(ObservationSweepStats::default());
+        }
+        let snapshot_path = self.paths.snapshot(&self.scope_id, &self.graph_id)?;
         let policy = self.retention;
         with_store_lock(&snapshot_path, || {
             let mut stats = ObservationSweepStats::default();

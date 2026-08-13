@@ -567,7 +567,7 @@ mod tests {
         } else {
             GraphSource::Committed
         };
-        let dir = graph_directory(root, source, graph_id);
+        let dir = graph_directory(root, source, graph_id).expect("checkout sources have a root");
         fs::create_dir_all(&dir).unwrap();
         let retention = if local {
             "local_scratch"
@@ -663,8 +663,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         write_graph(&root, "repo", 1, false);
-        fs::remove_file(graph_directory(&root, GraphSource::Committed, "repo").join(GRAPH_FILE))
-            .unwrap();
+        let committed = graph_directory(&root, GraphSource::Committed, "repo")
+            .expect("committed graphs have a root");
+        fs::remove_file(committed.join(GRAPH_FILE)).unwrap();
 
         let location = locate_graph(&root, "repo", false).unwrap();
         let loaded = load_graph("scope123", &root, &location);
