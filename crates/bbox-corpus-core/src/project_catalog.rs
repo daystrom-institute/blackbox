@@ -794,13 +794,27 @@ impl CatalogSnapshotV2 {
     /// chosen: a catalog holding no connector scope reports
     /// [`CATALOG_VERSION_V2`] and is written as v2 bytes, so a daemon
     /// predating the connector family opens it unchanged. The moment one
-    /// connector scope exists the catalog reports [`CATALOG_VERSION_V3`],
-    /// and an older daemon then FAILS CLOSED on it with
-    /// `error.project_catalog_unsupported_version` rather than silently
-    /// dropping projects it cannot represent. Losing a connector project to
-    /// a downgrade would orphan its content and free its scope for reuse;
-    /// refusing to open is the only honest outcome, and it is named here so
-    /// nobody rediscovers it during an incident.
+    /// connector scope exists the catalog reports [`CATALOG_VERSION_V3`] and
+    /// an older daemon FAILS CLOSED rather than silently dropping projects
+    /// it cannot represent. Losing a connector project to a downgrade would
+    /// orphan its content and free its scope for reuse, so refusing to open
+    /// is the only honest outcome.
+    ///
+    /// Where that refusal comes from, because the two layers produce
+    /// different-looking errors and an operator mid-rollback should
+    /// recognize either:
+    ///
+    /// - **The startup version probe** (`probe_project_store_mode`, run by
+    ///   `src/server/open.rs` before any project-scoped subsystem starts)
+    ///   deserializes only the `version` field and refuses an unknown one
+    ///   with `error.project_catalog_unsupported_version`. This is what a
+    ///   real rolled-back daemon hits, and it never parses a project row.
+    ///   The version number is therefore load-bearing, not forensic: it is
+    ///   the entire mechanism by which an older build knows to stop.
+    /// - **A strict row decode** reached some other way refuses later and
+    ///   differently, with serde's `unknown variant 'connector'`, because
+    ///   the scope enum denies unknown variants. Still fail-closed, just not
+    ///   the typed refusal.
     pub fn required_version(&self) -> u32 {
         if self
             .projects
@@ -4675,7 +4689,33 @@ mod tests {
         scope_migrations: BTreeMap<ScopeMigrationId, ScopeMigrationRecord>,
     }
 
+    /// The pre-connector reader's REAL two-stage sequence.
+    ///
+    /// Stage order is the whole point and an earlier version of this mirror
+    /// got it wrong by modelling only `decode_catalog_snapshot`. That
+    /// function decodes rows and then validates, but nothing reaches it
+    /// until the probe has already approved the version: daemon startup runs
+    /// `probe_project_store_mode` first, described in `src/server/open.rs` as
+    /// "one strict probe decides the runtime authority for the process
+    /// lifetime, before any project-scoped subsystem starts". The probe
+    /// deserializes ONLY `{ version }` and refuses an unknown one, so a
+    /// rolled-back daemon never parses a single project row.
     fn decode_as_pre_connector_reader(raw: &[u8]) -> Result<PreConnectorCatalogSnapshot, String> {
+        // Stage 1: the startup version probe, row-blind by construction.
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            version: u64,
+        }
+        let probe: VersionProbe = serde_json::from_slice(raw).map_err(|error| error.to_string())?;
+        match probe.version {
+            // 1 selects the version-1 bridge store, a different document
+            // shape entirely; 2 is the catalog this reader understands.
+            1 | 2 => {}
+            _ => return Err("error.project_catalog_unsupported_version".to_string()),
+        }
+
+        // Stage 2: only a probe-approved store is opened and strictly
+        // decoded, rows and all.
         let snapshot: PreConnectorCatalogSnapshot =
             serde_json::from_slice(raw).map_err(|error| error.to_string())?;
         if snapshot.version != CATALOG_VERSION_V2 {
@@ -4717,8 +4757,27 @@ mod tests {
         // free a durable scope for reuse; refusing is the only honest
         // outcome, and the remedy is to roll forward, never to hand-edit
         // the version field.
+        //
+        // The refusal an operator actually SEES during a rollback comes from
+        // the startup version probe, so it is the typed one. The version
+        // number is therefore load-bearing, not forensic decoration: it is
+        // the entire mechanism by which an older daemon knows to stop.
         let error = decode_as_pre_connector_reader(&raw)
             .expect_err("a v3 catalog must refuse to open under v2 expectations");
         assert_eq!(error, "error.project_catalog_unsupported_version");
+
+        // Second line, different shape. Anything that skips the probe and
+        // hands these bytes straight to a strict row decode still fails
+        // closed, but with serde's unknown-variant parse error rather than
+        // the typed refusal. Both shapes are pinned here so an operator
+        // staring at either one during a rollback recognizes it, and so a
+        // future change cannot quietly turn one into a silent success.
+        let strict_row_decode = serde_json::from_slice::<PreConnectorCatalogSnapshot>(&raw)
+            .expect_err("strict row decode must refuse an unknown scope variant");
+        let rendered = strict_row_decode.to_string();
+        assert!(
+            rendered.contains("unknown variant") && rendered.contains("connector"),
+            "the raw-decode refusal must name the variant it could not represent: {rendered}"
+        );
     }
 }
