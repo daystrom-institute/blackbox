@@ -159,6 +159,8 @@ pub enum ConversationSourceError {
     RecordsNotOrdered,
     #[error("batch carries duplicate message_ts {0}")]
     DuplicateMessageTs(String),
+    #[error("roster carries duplicate channel_id {0}")]
+    DuplicateChannelId(String),
     #[error("record names channel {actual}, batch declares {declared}")]
     ChannelMismatch { declared: String, actual: String },
     #[error("batch declares {actual} records, limit is {limit}")]
@@ -690,7 +692,7 @@ impl ChannelRosterRequestV1 {
             channel.validate()?;
             if let Some(previous) = previous {
                 if channel.channel_id.as_str() == previous {
-                    return Err(ConversationSourceError::DuplicateMessageTs(
+                    return Err(ConversationSourceError::DuplicateChannelId(
                         channel.channel_id.clone(),
                     ));
                 }

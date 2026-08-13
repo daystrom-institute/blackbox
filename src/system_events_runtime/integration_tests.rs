@@ -171,6 +171,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         file_sources: Arc::new(crate::server::file_source::FileSourceRuntime::for_test(
             tmp.path(),
         )),
+        conversation_sources: Arc::new(
+            crate::server::conversation_source::ConversationSourceRuntime::for_test(tmp.path()),
+        ),
         git_sources: Arc::new(crate::server::git_source::GitSourceRuntime::for_test(
             tmp.path(),
         )),

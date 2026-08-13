@@ -3482,6 +3482,7 @@ profile = "conversation"
                     connector_source_id: ConnectorSourceId::parse("csrc_5f2c1d9a4b6e470e").unwrap(),
                     connector_kind: ConnectorKind::parse("gdrive").unwrap(),
                     remote_authority: authority.to_string(),
+                    profile: ConnectorProfile::File,
                 }],
             );
             assert!(
