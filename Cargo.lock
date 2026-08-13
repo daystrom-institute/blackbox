@@ -871,6 +871,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-source-graph"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-project-graph",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "bbox-stores"
 version = "0.0.1"
 dependencies = [
