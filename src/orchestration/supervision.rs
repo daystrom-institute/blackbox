@@ -53,6 +53,14 @@ pub struct SupervisionConfig {
     pub token_burn_amber_ratio: f64,
     #[serde(default = "default_token_burn_red_ratio")]
     pub token_burn_red_ratio: f64,
+    /// Fraction of the model's context window at which a task's status is
+    /// flagged as approaching the ceiling. Distinct from the token-burn
+    /// ratios above: those compare consumption against a baseline (is this
+    /// task working harder than expected), while this compares the LAST
+    /// TURN's prompt against the window (is this session about to be
+    /// rejected outright).
+    #[serde(default = "default_context_ceiling_ratio")]
+    pub context_ceiling_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +169,7 @@ impl Default for SupervisionConfig {
             max_snapshot_alerts: DEFAULT_MAX_ALERTS,
             token_burn_amber_ratio: 2.0,
             token_burn_red_ratio: 3.0,
+            context_ceiling_ratio: bro_protocol::ContextPressure::DEFAULT_CEILING_RATIO,
         }
     }
 }
@@ -675,6 +684,41 @@ fn default_token_burn_red_ratio() -> f64 {
     3.0
 }
 
+fn default_context_ceiling_ratio() -> f64 {
+    bro_protocol::ContextPressure::DEFAULT_CEILING_RATIO
+}
+
+/// Operator override for the context-ceiling threshold.
+///
+/// Read once and cached: the ratio is consulted on every status assembly, and
+/// this is a process-lifetime knob rather than a hot-reloadable one. A value
+/// outside `(0.0, 1.0]` is ignored with a warning rather than accepted: a
+/// non-positive ratio would flag every session and a ratio above 1.0 could
+/// never flag at all, and silently honoring either turns the signal into
+/// noise or into nothing.
+pub(crate) fn context_ceiling_ratio() -> f64 {
+    static RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RATIO.get_or_init(|| {
+        let default = default_context_ceiling_ratio();
+        // Env read happens once per process, off any hot path.
+        #[allow(clippy::disallowed_methods)]
+        let raw = std::env::var("BBOX_CONTEXT_CEILING_RATIO").ok();
+        match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => default,
+            Some(s) => match s.parse::<f64>() {
+                Ok(v) if v.is_finite() && v > 0.0 && v <= 1.0 => v,
+                _ => {
+                    tracing::warn!(
+                        value = s,
+                        "BBOX_CONTEXT_CEILING_RATIO must be a number in (0, 1]; using {default}"
+                    );
+                    default
+                }
+            },
+        }
+    })
+}
+
 pub(crate) fn config() -> SupervisionConfig {
     SupervisionConfig::default()
 }
@@ -929,6 +973,33 @@ mod tests {
         assert_eq!(amber, 1);
         assert_eq!(red, 1);
         assert_eq!(state.max_loop_count(), 6);
+    }
+
+    #[test]
+    fn context_ceiling_ratio_defaults_to_the_shared_protocol_constant() {
+        // The daemon and the wire DTO must agree on the untuned threshold, or
+        // a consumer reading `ceiling_ratio` off the block would see a number
+        // that did not actually judge the flag.
+        assert_eq!(
+            SupervisionConfig::default().context_ceiling_ratio,
+            bro_protocol::ContextPressure::DEFAULT_CEILING_RATIO
+        );
+        assert_eq!(
+            SupervisionConfig::default().context_ceiling_ratio,
+            0.8,
+            "the documented default is 0.8 of the model's context window"
+        );
+    }
+
+    #[test]
+    fn context_ceiling_ratio_is_distinct_from_the_token_burn_ratios() {
+        // Token burn compares consumption against a baseline and is therefore
+        // unbounded above 1.0; the ceiling ratio is a fraction of a window and
+        // must stay inside (0, 1]. Conflating them would make either signal
+        // meaningless.
+        let cfg = SupervisionConfig::default();
+        assert!(cfg.token_burn_amber_ratio > 1.0);
+        assert!(cfg.context_ceiling_ratio > 0.0 && cfg.context_ceiling_ratio <= 1.0);
     }
 
     #[test]

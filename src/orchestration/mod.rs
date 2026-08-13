@@ -1438,7 +1438,9 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .as_ref()
             .filter(|_| !inner.session_id.is_empty() && inner.session_id != "pending")
             .map(|location| location.path.to_string_lossy().into_owned()),
-        context: None,
+        // Same signal bro_status carries, projected onto the roster plane so
+        // the dashboard can render it without re-locking per-task state.
+        context: context_pressure_for_inner(&inner),
     }
 }
 
@@ -4838,6 +4840,22 @@ pub fn task_result_json(task: &Task) -> Value {
     task_result_json_from_inner(&inner)
 }
 
+/// Derive the context-window pressure block for a task.
+///
+/// `None` until some turn has reported occupancy: a task with no measurement
+/// yet must report nothing rather than a zero that reads as "plenty of room".
+pub(crate) fn context_pressure_for_inner(
+    inner: &TaskInner,
+) -> Option<bro_protocol::ContextPressure> {
+    inner.last_turn_input_tokens.map(|tokens| {
+        bro_protocol::ContextPressure::derive(
+            tokens,
+            inner.context_window,
+            supervision::context_ceiling_ratio(),
+        )
+    })
+}
+
 fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     let mut obj = serde_json::json!({
         "taskId": inner.id,
@@ -4905,6 +4923,16 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
                 "transcriptLocated": inner.transcript_location.is_some(),
             });
         }
+    }
+    // Context-window pressure is deliberately NOT behind the terminal-status
+    // gate the usage/cost/turns block sits behind. A finished task's window
+    // occupancy is a curiosity; a RUNNING task's is the entire point, because
+    // it is the only state in which an orchestrator can still act on it by
+    // rotating to a fresh session.
+    if let Some(pressure) = context_pressure_for_inner(inner)
+        && let Ok(value) = serde_json::to_value(pressure)
+    {
+        obj["context"] = value;
     }
     if let Some(ref label) = inner.bro_label {
         obj["broLabel"] = Value::String(label.clone());
@@ -8504,6 +8532,136 @@ mod tests {
             json["supervision"].is_object(),
             "running task must keep supervision: {json}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Context-ceiling telemetry in the status projection
+    // -----------------------------------------------------------------
+
+    /// A task carrying a measured turn occupancy and, optionally, a window.
+    fn task_with_context(
+        status: TaskStatus,
+        last_turn_input_tokens: Option<u64>,
+        context_window: Option<u64>,
+    ) -> Task {
+        let task = task_with(status, "", vec![]);
+        {
+            let mut inner = task.inner.lock();
+            inner.last_turn_input_tokens = last_turn_input_tokens;
+            inner.context_window = context_window;
+        }
+        task
+    }
+
+    #[test]
+    fn context_block_is_absent_without_a_measurement() {
+        let task = task_with_context(TaskStatus::Running, None, Some(200_000));
+        let json = task_result_json(&task);
+        assert!(
+            json.get("context").is_none(),
+            "a task with no reported turn must report no pressure, not a zero \
+             that reads as plenty of room: {json}"
+        );
+    }
+
+    #[test]
+    fn context_block_is_reported_while_the_task_is_still_running() {
+        // The whole point of the signal: usage/costUsd/numTurns are gated to
+        // terminal status, but a RUNNING task is the only one an orchestrator
+        // can still rescue by rotating the session.
+        let task = task_with_context(TaskStatus::Running, Some(50_000), Some(200_000));
+        task.inner.lock().usage = Some(Usage {
+            input_tokens: 1_000,
+            output_tokens: 20,
+            ..Default::default()
+        });
+        let json = task_result_json(&task);
+        let context = &json["context"];
+        assert!(
+            context.is_object(),
+            "running task must carry context pressure: {json}"
+        );
+        assert_eq!(context["last_turn_input_tokens"], 50_000);
+        assert_eq!(context["context_window"], 200_000);
+        assert_eq!(context["utilization"], 0.25);
+        assert_eq!(context["approaching_ceiling"], false);
+        assert!(
+            json.get("usage").is_none(),
+            "the terminal-only usage gate must stay closed for a running task, \
+             which is exactly why context needs its own ungated path: {json}"
+        );
+    }
+
+    #[test]
+    fn context_block_omits_utilization_when_the_window_is_unknown() {
+        let task = task_with_context(TaskStatus::Running, Some(180_000), None);
+        let json = task_result_json(&task);
+        let context = &json["context"];
+        assert_eq!(context["last_turn_input_tokens"], 180_000);
+        assert!(
+            context["context_window"].is_null(),
+            "an unknown window must surface as null, never as a guess: {json}"
+        );
+        assert!(
+            context["utilization"].is_null(),
+            "utilization must be absent without a denominator: {json}"
+        );
+        assert_eq!(
+            context["approaching_ceiling"], false,
+            "an unmeasurable session must never be flagged"
+        );
+    }
+
+    #[test]
+    fn context_block_flags_a_session_at_its_ceiling() {
+        // Occupancy equal to the window flags under any admissible ratio, so
+        // this assertion holds whatever threshold the host is configured with.
+        let task = task_with_context(TaskStatus::Running, Some(200_000), Some(200_000));
+        let json = task_result_json(&task);
+        assert_eq!(json["context"]["utilization"], 1.0);
+        assert_eq!(json["context"]["approaching_ceiling"], true);
+        assert_eq!(
+            json["context"]["ceiling_ratio"],
+            serde_json::json!(supervision::context_ceiling_ratio()),
+            "the block must publish the threshold it was judged against"
+        );
+    }
+
+    #[test]
+    fn context_block_survives_into_terminal_status() {
+        let task = task_with_context(TaskStatus::Completed, Some(160_000), Some(200_000));
+        let json = task_result_json(&task);
+        assert_eq!(json["context"]["last_turn_input_tokens"], 160_000);
+    }
+
+    #[test]
+    fn roster_summary_carries_the_same_context_block() {
+        // bro_dashboard renders from the roster projection, not from
+        // task_result_json, so the two must agree or a fleet-wide scan
+        // silently loses the signal that a per-task check would show.
+        let task = Arc::new(task_with_context(
+            TaskStatus::Running,
+            Some(160_000),
+            Some(200_000),
+        ));
+        let summary = roster_summary_from_task(&task);
+        let pressure = summary.context.expect("roster summary must carry context");
+        assert_eq!(pressure.last_turn_input_tokens, 160_000);
+        assert_eq!(pressure.context_window, Some(200_000));
+        assert_eq!(pressure.utilization, Some(0.8));
+
+        let status = task_result_json(&task);
+        assert_eq!(
+            serde_json::to_value(pressure).unwrap(),
+            status["context"],
+            "roster and status projections must publish identical blocks"
+        );
+    }
+
+    #[test]
+    fn roster_summary_context_absent_without_a_measurement() {
+        let task = Arc::new(task_with_context(TaskStatus::Running, None, None));
+        assert!(roster_summary_from_task(&task).context.is_none());
     }
 
     #[test]
