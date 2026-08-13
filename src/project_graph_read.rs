@@ -343,6 +343,10 @@ impl BlackboxServer {
         entity: &EntityRef,
         provisional: Option<&str>,
     ) -> (Vec<Edge>, Vec<Edge>) {
+        // The read context is resolved BEFORE the view guard is taken and then
+        // threaded down. Re-deriving it under the lock would re-enter the same
+        // RwLock through validate_project_selection, which deadlocks the
+        // moment a writer is queued between the two acquisitions.
         let Ok((_, mode, own)) = self.graph_read_context(Some(project_id.as_str()), provisional)
         else {
             return (Vec::new(), Vec::new());
@@ -362,111 +366,16 @@ impl BlackboxServer {
         for set in &sets {
             for binding in set.forward(entity) {
                 if seen.insert((binding.binding_id.clone(), true)) {
-                    forward.push(self.evidence_edge(binding, &views, provisional));
+                    forward.push(evidence_edge(binding, &views, mode, own.as_ref()));
                 }
             }
             for binding in set.reverse(entity) {
                 if seen.insert((binding.binding_id.clone(), false)) {
-                    reverse.push(self.evidence_edge(binding, &views, provisional));
+                    reverse.push(evidence_edge(binding, &views, mode, own.as_ref()));
                 }
             }
         }
         (forward, reverse)
-    }
-
-    fn evidence_edge(
-        &self,
-        binding: &EvidenceBinding,
-        views: &bbox_indexing::project_graph_view::ProjectGraphViewCatalog,
-        provisional: Option<&str>,
-    ) -> Edge {
-        let source_status = self.observe_endpoint(
-            binding,
-            &binding.source,
-            binding.source_generation,
-            views,
-            provisional,
-        );
-        let target_status = self.observe_endpoint(
-            binding,
-            &binding.target,
-            binding.target_generation,
-            views,
-            provisional,
-        );
-        Edge {
-            source: binding.source.clone(),
-            kind: binding.kind.clone(),
-            target: binding.target.clone(),
-            provenance: EdgeProvenance::Explicit,
-            confidence: EdgeConfidence::Exact,
-            metadata: bbox_project_graph::binding_metadata(binding, source_status, target_status),
-            project_id: Some(binding.project_id.clone()),
-        }
-    }
-
-    fn observe_endpoint(
-        &self,
-        binding: &EvidenceBinding,
-        endpoint: &EntityRef,
-        expected_generation: Option<u64>,
-        views: &bbox_indexing::project_graph_view::ProjectGraphViewCatalog,
-        provisional: Option<&str>,
-    ) -> EvidenceEndpointStatus {
-        // Scope first: an endpoint in another project is unauthorized whatever
-        // its liveness, and path traversal must never cross it.
-        if bbox_project_graph::entity_project_scope(endpoint)
-            .is_some_and(|scope| scope != binding.project_id)
-        {
-            return bbox_project_graph::resolve_endpoint_status(
-                EvidenceEndpointObservation::OutOfScope,
-                expected_generation,
-            );
-        }
-        let EntityRef::ProjectGraphVertex {
-            project_id,
-            graph_id,
-            vertex_id,
-        } = endpoint
-        else {
-            // Not a graph vertex: this layer has nothing to compare. The read
-            // plane refines it once the provider registry is in hand.
-            return bbox_project_graph::resolve_endpoint_status(
-                EvidenceEndpointObservation::Unresolvable,
-                expected_generation,
-            );
-        };
-        let Ok(parsed) = ProjectId::parse(project_id.clone()) else {
-            return bbox_project_graph::resolve_endpoint_status(
-                EvidenceEndpointObservation::Absent,
-                expected_generation,
-            );
-        };
-        let read = match self.graph_read_context(Some(project_id), provisional) {
-            Ok((_, ProvisionalMode::Own, Some(workspace))) => {
-                views.load_own(&parsed, &workspace, graph_id)
-            }
-            Ok((_, ProvisionalMode::All, _)) | Ok((_, ProvisionalMode::Published, _)) | Err(_) => {
-                views.load_published(&parsed, graph_id)
-            }
-            Ok((_, ProvisionalMode::Own, None)) => views.load_published(&parsed, graph_id),
-        };
-        let observation = match read {
-            ProjectGraphRead::Valid(entry) | ProjectGraphRead::Invalid(entry) => {
-                match entry.graph() {
-                    Some(graph) if graph.vertices.contains_key(vertex_id) => {
-                        EvidenceEndpointObservation::Present {
-                            generation: Some(graph.descriptor.generation),
-                        }
-                    }
-                    _ => EvidenceEndpointObservation::Absent,
-                }
-            }
-            ProjectGraphRead::Missing | ProjectGraphRead::Tombstoned(_) => {
-                EvidenceEndpointObservation::Absent
-            }
-        };
-        bbox_project_graph::resolve_endpoint_status(observation, expected_generation)
     }
 
     fn graph_read_context(
@@ -588,6 +497,103 @@ impl ProjectGraphEntityResolver for BlackboxServer {
         let (forward, reverse) = self.evidence_neighborhood(&project_id, r, provisional);
         forward.into_iter().chain(reverse).collect()
     }
+}
+
+/// Builds one evidence edge with both endpoints scored.
+///
+/// A free function, not a method: it runs while the view guard is held, and a
+/// method could reach back through `self` into the same lock.
+fn evidence_edge(
+    binding: &EvidenceBinding,
+    views: &bbox_indexing::project_graph_view::ProjectGraphViewCatalog,
+    mode: ProvisionalMode,
+    own: Option<&WorkspaceId>,
+) -> Edge {
+    let source_status = observe_endpoint(
+        binding,
+        &binding.source,
+        binding.source_generation,
+        views,
+        mode,
+        own,
+    );
+    let target_status = observe_endpoint(
+        binding,
+        &binding.target,
+        binding.target_generation,
+        views,
+        mode,
+        own,
+    );
+    Edge {
+        source: binding.source.clone(),
+        kind: binding.kind.clone(),
+        target: binding.target.clone(),
+        provenance: EdgeProvenance::Explicit,
+        confidence: EdgeConfidence::Exact,
+        metadata: bbox_project_graph::binding_metadata(binding, source_status, target_status),
+        project_id: Some(binding.project_id.clone()),
+    }
+}
+
+/// Scores one endpoint against the generation the binding recorded.
+///
+/// Only project graph vertices are observable here. Anything else is left
+/// `unresolved` for the read plane, which holds the provider registry and can
+/// settle it by trying to load the entity.
+fn observe_endpoint(
+    binding: &EvidenceBinding,
+    endpoint: &EntityRef,
+    expected_generation: Option<u64>,
+    views: &bbox_indexing::project_graph_view::ProjectGraphViewCatalog,
+    mode: ProvisionalMode,
+    own: Option<&WorkspaceId>,
+) -> EvidenceEndpointStatus {
+    // Scope first: an endpoint in another project is unauthorized whatever its
+    // liveness, and path traversal must never cross it.
+    if bbox_project_graph::entity_project_scope(endpoint)
+        .is_some_and(|scope| scope != binding.project_id)
+    {
+        return bbox_project_graph::resolve_endpoint_status(
+            EvidenceEndpointObservation::OutOfScope,
+            expected_generation,
+        );
+    }
+    let EntityRef::ProjectGraphVertex {
+        project_id,
+        graph_id,
+        vertex_id,
+    } = endpoint
+    else {
+        return bbox_project_graph::resolve_endpoint_status(
+            EvidenceEndpointObservation::Unresolvable,
+            expected_generation,
+        );
+    };
+    let Ok(parsed) = ProjectId::parse(project_id.clone()) else {
+        return bbox_project_graph::resolve_endpoint_status(
+            EvidenceEndpointObservation::Absent,
+            expected_generation,
+        );
+    };
+    let read = match (mode, own) {
+        (ProvisionalMode::Own, Some(workspace)) => views.load_own(&parsed, workspace, graph_id),
+        _ => views.load_published(&parsed, graph_id),
+    };
+    let observation = match read {
+        ProjectGraphRead::Valid(entry) | ProjectGraphRead::Invalid(entry) => match entry.graph() {
+            Some(graph) if graph.vertices.contains_key(vertex_id) => {
+                EvidenceEndpointObservation::Present {
+                    generation: Some(graph.descriptor.generation),
+                }
+            }
+            _ => EvidenceEndpointObservation::Absent,
+        },
+        ProjectGraphRead::Missing | ProjectGraphRead::Tombstoned(_) => {
+            EvidenceEndpointObservation::Absent
+        }
+    };
+    bbox_project_graph::resolve_endpoint_status(observation, expected_generation)
 }
 
 fn read_entry(entry: ProjectGraphViewEntry) -> ProjectGraphRead {
