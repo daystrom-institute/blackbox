@@ -1,0 +1,22 @@
+{
+  "id": "gap-7e44ee3b",
+  "title": "Connector lane has no retirement redrive; a deferral strands one corpus",
+  "gap_kind": "tooling",
+  "domain": "file-source-activation",
+  "wanted_capability": "Retirement redrive for the file-source connector lane. When a connector generation activates, the superseded generation's documents are retired best-effort after the flip; if run_selector_retirement defers on the vector-store readiness gate (observed live: \"selector retirement attempt deferred ... the vector store is still warming up\" during post-boot warming), the connector lane never retries, and the next activation supersedes a different predecessor, so the deferred selector's corpus is stranded permanently. Bounded at one corpus per deferral and loudly logged, but real: an activation landing during post-boot vector warming leaves a whole superseded generation addressable forever. Wanted: reuse the code lane's RetirementCoordinator (wired to the code store's retirement journal) or an equivalent journaled redrive for connector selectors, so deferred retirements are retried to completion after the vector store warms.",
+  "missing_primitive": "journaled retirement redrive on the connector activation lane",
+  "fallback_used": "Deferral is logged with the stranded selector named; a manual retirement can be driven once the vector store is warm. The count==0 short-circuit means empty selectors never strand.",
+  "evidence": [
+    "thread-21347ce5",
+    "feat/file-source-phase1 (retirement placement and the selector_retirement_retryable predicate reuse)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/file-source-activation/retirement-redrive",
+  "notes": "Named by the phase-1 implementing agent rather than half-built; the RetirementCoordinator reuse is the follow-up shape. Fits naturally into M4 (graph-aware connector runtime) or a small standalone slice.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-21347ce5",
+  "created_at": "2026-08-13T21:40:36Z",
+  "updated_at": "2026-08-13T21:40:36Z"
+}
