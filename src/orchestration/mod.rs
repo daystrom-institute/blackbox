@@ -1141,6 +1141,7 @@ mod roster_view_tests {
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
+            context: None,
         };
         view.upsert("t1".into(), summary.clone());
         let snap = view.snapshot();
@@ -1176,6 +1177,7 @@ mod roster_view_tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             },
         );
         assert_eq!(view.snapshot().len(), 1);
@@ -1299,6 +1301,7 @@ mod roster_view_tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             },
         );
         let mut store = TaskStore::new();
@@ -1425,6 +1428,7 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .as_ref()
             .filter(|_| !inner.session_id.is_empty() && inner.session_id != "pending")
             .map(|location| location.path.to_string_lossy().into_owned()),
+        context: None,
     }
 }
 

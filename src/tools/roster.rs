@@ -1524,6 +1524,7 @@ mod tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             }
         }
 
@@ -1556,6 +1557,7 @@ mod tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             }
         }
 
