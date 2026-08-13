@@ -738,11 +738,17 @@ fn apply(fold: &mut ChannelFold, entry: JournalEntryV1) {
     match entry {
         JournalEntryV1::Message(record) => {
             let revision = record.revision;
-            match fold.messages.get_mut(&key) {
-                Some(landed) if landed.key.revision >= revision => {}
-                Some(landed) => {
-                    landed.key.revision = revision;
-                    landed.record = record;
+            // The revision already held, read out as a plain number rather
+            // than matched on a live `get_mut`. The insert-and-drain arm below
+            // needs `&mut fold` while a borrow taken from `fold.messages` would
+            // still be in scope, and a Copy scrutinee sidesteps that entirely.
+            match fold.messages.get(&key).map(|landed| landed.key.revision) {
+                Some(held) if held >= revision => {}
+                Some(_) => {
+                    if let Some(landed) = fold.messages.get_mut(&key) {
+                        landed.key.revision = revision;
+                        landed.record = record;
+                    }
                 }
                 None => {
                     let landed = LandedMessageV1 {
