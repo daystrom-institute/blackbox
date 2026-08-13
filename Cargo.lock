@@ -748,6 +748,7 @@ dependencies = [
  "bbox-embed",
  "bbox-indexing",
  "bbox-knowledge",
+ "bbox-project-graph",
  "bbox-provenance",
  "bbox-providers",
  "bbox-system-memory",
@@ -785,6 +786,7 @@ dependencies = [
 name = "bbox-project-graph"
 version = "0.0.1"
 dependencies = [
+ "bbox-corpus-core",
  "hex",
  "serde",
  "serde_json",
