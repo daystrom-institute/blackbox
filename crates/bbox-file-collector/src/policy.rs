@@ -77,6 +77,15 @@ impl Default for SourcePolicy {
 
 /// A compiled policy. Globs are compiled once per publication cycle rather
 /// than per entry.
+///
+/// `Debug` is derived because every field is operator-declared policy -- globs
+/// and byte caps -- and none of it is credential material, so rendering it in a
+/// panic message or a tracing field leaks nothing. That is the same reasoning
+/// the grant table applies in reverse: `ConnectorGrantRuntime` writes `Debug`
+/// by hand precisely because it DOES retain bearers, and renders only a token
+/// count. Here there is no secret to hide, so the derive is the honest choice
+/// and it lets a failed `compile` be asserted on with `unwrap_err`.
+#[derive(Debug)]
 pub struct CompiledPolicy {
     include: Option<GlobSet>,
     exclude: Option<GlobSet>,
