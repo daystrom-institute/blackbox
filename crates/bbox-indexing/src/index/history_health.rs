@@ -227,7 +227,7 @@ fn derive_one(
             .get(&selected.project_id)
             .and_then(|project| match &project.scope {
                 ProjectScope::Published(scope) => Some(scope),
-                ProjectScope::LegacyLocal => None,
+                ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
             });
     match (attachment_scope, member_scope) {
         (Some(attachment_scope), Some(member_scope))

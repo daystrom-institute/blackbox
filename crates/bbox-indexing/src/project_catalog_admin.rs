@@ -112,6 +112,13 @@ pub fn attach_checkout(
                      project instead of attaching new authority silently",
                 ));
             }
+            (ProjectScope::Connector(_), _) => {
+                return Err(admin_error(
+                    "error.project_catalog_admin_connector_not_attachable",
+                    "a connector-scoped project has no local checkout and accepts no \
+                     attachment; its content arrives only through its producer",
+                ));
+            }
         }
         for existing in attachments.attachments.values() {
             if existing.status != AttachmentStatus::Attached {
@@ -388,7 +395,10 @@ pub fn promote_project(
                         continue;
                     }
                     let conflicting = match &other.scope {
-                        ProjectScope::LegacyLocal => false,
+                        // Neither claims repository authority, so neither can
+                        // conflict with the proposed one. A connector project
+                        // never shares a repo history to begin with.
+                        ProjectScope::LegacyLocal | ProjectScope::Connector(_) => false,
                         ProjectScope::Published(scope) => {
                             scope.repo_id() != proposed.repo_id()
                         }
@@ -1647,6 +1657,17 @@ fn check_register_scope_agreement(
                 owner.project_id,
             ),
         )),
+        // Register resolves a local checkout, and a connector project has
+        // none. Reaching here means a checkout claimed a project that is
+        // owned by a remote source; refuse rather than bind the two.
+        (ProjectScope::Connector(_), _) => Err(admin_error(
+            "error.project_catalog_admin_connector_not_attachable",
+            format!(
+                "project {} is connector-scoped and owns no local checkout; register \
+                 cannot bind one to it",
+                owner.project_id,
+            ),
+        )),
     }
 }
 
@@ -2339,7 +2360,7 @@ pub fn clear_scope_bridge(
                 .get(project_id)
                 .and_then(|project| match &project.scope {
                     ProjectScope::Published(scope) => Some(scope),
-                    ProjectScope::LegacyLocal => None,
+                    ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
                 })
                 .ok_or_else(|| {
                     admin_error(

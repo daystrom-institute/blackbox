@@ -159,7 +159,7 @@ fn published_scope_of(project: &ResolvedProjectIdentity) -> Option<PublishedScop
     match project {
         ResolvedProjectIdentity::Catalog { project } => match &project.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         },
         ResolvedProjectIdentity::V1Compat { .. } => None,
     }
@@ -184,7 +184,7 @@ fn unique_active_base(
         attachment_id: base.attachment_id.as_str().to_string(),
         expected_scope: match &project.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         },
     })
 }

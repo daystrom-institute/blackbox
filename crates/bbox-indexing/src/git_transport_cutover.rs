@@ -1043,7 +1043,8 @@ impl GitTransportCutoverRuntimeV1 {
                 .filter(|project| project.repo_history.as_ref() == Some(repo_history_id))
                 .filter_map(|project| match &project.scope {
                     ProjectScope::Published(scope) => Some(scope),
-                    ProjectScope::LegacyLocal => None,
+                    // Neither carries git history to transport.
+                    ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
                 })
                 .all(|scope| !assignments.contains_key(scope)) =>
             {
@@ -1120,7 +1121,9 @@ fn carried_repo_evidence(
                 ready: true,
                 defects: Vec::new(),
             }),
-            ProjectScope::LegacyLocal => None,
+            // A repo history never holds a connector-scoped member: a
+            // connector project carries no repo_history at all.
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         })
         .collect::<Vec<_>>();
     projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));

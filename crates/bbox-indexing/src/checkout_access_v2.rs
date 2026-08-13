@@ -116,6 +116,7 @@ impl CheckoutAccessAuthority for V2CatalogCheckoutAccessAuthority {
                 CheckoutRecordedProjectScope::Published(scope.clone())
             }
             ProjectScope::LegacyLocal => CheckoutRecordedProjectScope::LegacyLocal,
+            ProjectScope::Connector(_) => CheckoutRecordedProjectScope::Connector,
         })
     }
 }

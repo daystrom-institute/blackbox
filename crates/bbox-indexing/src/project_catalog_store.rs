@@ -583,7 +583,11 @@ pub fn probe_project_store_mode(
     })?;
     match probe.version {
         1 => Ok(ProjectStoreProbe::LegacyV1),
-        2 => Ok(ProjectStoreProbe::CatalogV2),
+        // The catalog family spans wire versions 2 and 3: 3 is the same
+        // store shape carrying at least one connector scope. The probe
+        // answers WHICH AUTHORITY opens the store, so both select catalog
+        // mode; the strict open enforces the version-versus-content rule.
+        2 | 3 => Ok(ProjectStoreProbe::CatalogV2),
         other => Err(ProjectCatalogStoreError::new(
             "error.project_catalog_unsupported_version",
             format!("projects store version {other} is not supported"),
@@ -1075,6 +1079,12 @@ impl ProjectCatalogStore {
         })?;
         catalog.epoch = new_epoch;
         attachments.epoch = new_epoch;
+        // The wire version is owner-controlled and DERIVED from content, so
+        // the closure above is refused if it touches `version` and the store
+        // recomputes it here instead. A catalog that just lost its last
+        // connector scope drops back to version-2 bytes on this write, and
+        // one that just gained its first is written as version 3.
+        catalog.sync_version();
         let candidate = PreparedPair::new(catalog, attachments)?;
 
         let _mutation_lock = self
@@ -2351,7 +2361,9 @@ fn published_catalog_scopes(catalog: &CatalogSnapshotV2) -> BTreeSet<PublishedSc
         .values()
         .filter_map(|project| match &project.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
+            // Neither family owns a published scope: one has no committed
+            // authority, the other has no repository at all.
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         })
         .collect()
 }
@@ -16585,6 +16597,7 @@ mod tests {
             repo_histories: BTreeMap::new(),
             ambiguous_namespaces: BTreeMap::new(),
             scope_migrations: BTreeMap::new(),
+            connector_observations: BTreeMap::new(),
         };
         let attachments = AttachmentSnapshotV1 {
             version: ATTACHMENT_VERSION_V1,
@@ -16687,9 +16700,17 @@ mod probe_tests {
         let root = dir.path().canonicalize().unwrap();
         let path = projects_path(&root);
 
-        std::fs::write(&path, br#"{"version":3}"#).unwrap();
+        std::fs::write(&path, br#"{"version":4}"#).unwrap();
         let error = probe_project_store_mode(&path).unwrap_err();
         assert_eq!(error.code(), "error.project_catalog_unsupported_version");
+
+        // Version 3 is the connector-bearing catalog write and selects
+        // catalog mode, not a refusal.
+        std::fs::write(&path, br#"{"version":3}"#).unwrap();
+        assert_eq!(
+            probe_project_store_mode(&path).unwrap(),
+            ProjectStoreProbe::CatalogV2
+        );
 
         std::fs::write(&path, b"not json").unwrap();
         let error = probe_project_store_mode(&path).unwrap_err();
