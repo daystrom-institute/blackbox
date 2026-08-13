@@ -444,18 +444,26 @@ impl super::BlackboxServer {
         project_id: &str,
         source_generation_id: &str,
     ) -> (String, AutoAdvanceOutcome) {
-        let unknown_producer = String::new();
+        // Each early exit builds its own empty producer label: the
+        // producer is not known until the accepted binding is read.
+        let unknown_producer = String::new;
         let Some(store) = self.state.project_authority.catalog_store().cloned() else {
-            return (unknown_producer, AutoAdvanceOutcome::NoAcceptedPublication);
+            return (
+                unknown_producer(),
+                AutoAdvanceOutcome::NoAcceptedPublication,
+            );
         };
         let Some(runtime) = self.state.accepted_publications.clone() else {
-            return (unknown_producer, AutoAdvanceOutcome::NoAcceptedPublication);
+            return (
+                unknown_producer(),
+                AutoAdvanceOutcome::NoAcceptedPublication,
+            );
         };
         let parsed = match ProjectId::parse(project_id.to_string()) {
             Ok(parsed) => parsed,
             Err(error) => {
                 return (
-                    unknown_producer,
+                    unknown_producer(),
                     AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
@@ -466,17 +474,20 @@ impl super::BlackboxServer {
         let grant = match runtime.auto_advance_grant(&parsed) {
             Ok(Some(grant)) => grant,
             Ok(None) => {
-                return (unknown_producer, AutoAdvanceOutcome::NoAcceptedPublication);
+                return (
+                    unknown_producer(),
+                    AutoAdvanceOutcome::NoAcceptedPublication,
+                );
             }
             Err(error) => {
                 return (
-                    unknown_producer,
+                    unknown_producer(),
                     AutoAdvanceOutcome::refused(&anyhow::anyhow!("{error}")),
                 );
             }
         };
         if !grant.enabled {
-            return (unknown_producer, AutoAdvanceOutcome::PolicyDisabled);
+            return (unknown_producer(), AutoAdvanceOutcome::PolicyDisabled);
         }
         let (accepted_producer, accepted_source_generation) = match (
             grant.source.producer_id(),
@@ -486,7 +497,7 @@ impl super::BlackboxServer {
             // An attachment-bound project is out of scope: its accepted
             // content comes from a checkout the operator drives, and the
             // linear fast path this policy covers does not exist there.
-            _ => return (unknown_producer, AutoAdvanceOutcome::BindingNotProducer),
+            _ => return (unknown_producer(), AutoAdvanceOutcome::BindingNotProducer),
         };
         if accepted_source_generation == source_generation_id {
             return (accepted_producer, AutoAdvanceOutcome::AlreadyAccepted);
