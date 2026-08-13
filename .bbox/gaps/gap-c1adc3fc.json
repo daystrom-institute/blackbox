@@ -15,9 +15,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/daemon-runtime-concurrency/healthz-starvation-under-ingest",
   "notes": "Sequence from the incident: 04:37Z collector uploads a multi-project code-source batch; 04:39Z liveness probes time out repeatedly; orchestrator kills the daemon mid-activation; boot then refuses on the torn journal/manifest pair (fixed by the reconciliation sweep). The probe tolerance change makes recurrence unlikely to kill, but the underlying starvation still degrades every MCP caller during ingest windows.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-13T06:45:26Z",
-  "updated_at": "2026-08-13T06:45:26Z"
+  "updated_at": "2026-08-13T15:59:28Z",
+  "resolved_at": "2026-08-13T15:59:28Z",
+  "resolution_note": "Root cause found and fixed (fix/healthz-ingest-starvation, live as image 23160889e04e): four provisional knowledge-source handlers ran a 15s std::thread::sleep spin-wait on the accepted-publication disk lock directly on tokio workers, parking every worker at once so nothing polled, healthz included. Waits relocated to the blocking pool via an HttpError-preserving blocking_http helper, plus an off-runtime scheduler-latency probe. Proof: zero probe kills in 8+ hours under continuous ingest, versus repeated liveness kills before (the last one punched through even a 5-minute probe budget). Residual I2 candidates (catalog_onboard park) noted in design/daemon-runtime/healthz-ingest-starvation.md as follow-up."
 }

@@ -15,9 +15,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/project-catalog-publisher/auto-advance-producer-candidates",
   "notes": "Surfaced driving the graph-authoring exemplar end to end against prod: commit -> collector publish (durable terminal success) -> nothing serves until an out-of-band advance. The publish-loop mental model documented for graph authoring (\"acceptance validates at the merge gate; views serve the new generation immediately on accept\") only holds today if an orchestrator remembers the advance step. Acceptance validation already refuses broken candidates and keeps the prior generation, so the safety property the manual gate provides is redundant for the linear same-producer fast path.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-13T03:37:12Z",
-  "updated_at": "2026-08-13T03:37:12Z"
+  "updated_at": "2026-08-13T15:59:23Z",
+  "resolved_at": "2026-08-13T15:59:23Z",
+  "resolution_note": "Shipped (feat/publisher-auto-advance) and proven in prod: opt-in default-off auto-advance grant on the accepted-publication pointer, operator-installed via advance auto_advance:true, read from the currently accepted pointer, reusing the manual acceptance path with an audited attempt ledger (live decline recorded as policy_disabled pre-grant; grant installed on the blackbox lane 2026-08-13 with operator approval, keeper-cage grant rides the next candidate)."
 }

@@ -1,0 +1,23 @@
+{
+  "id": "gap-40ab1102",
+  "title": "Knowledge/gaps project filter drops project_id-stamped rows; gap_resolve needs a project param for a globally unique id",
+  "gap_kind": "mcp_surface",
+  "domain": "knowledge-gaps-read-plane",
+  "wanted_capability": "Two coupled defects observed live against the path-free cage daemon (2026-08-13). (1) bbox_knowledge and bbox_gaps with a `project` filter return ZERO rows whether the filter is an absolute path or the bare project_id, while the identical unfiltered query returns rows plainly carrying project_id=\"89bd722f\" with valid built_from stamps; the filter should resolve project_id/alias/path through the catalog and match the rows' project_id, and an unresolvable filter value should say so in diagnostics instead of silently matching nothing. (2) bbox_gap_resolve with only the globally unique gap id errors \"Gap not found\" and succeeds the moment project=\"89bd722f\" is passed; either id-only resolution should consult the same published view the unfiltered list reads, or the error must name the real precondition (missing project context) instead of implying the gap does not exist. Together these presented as a broken daemon during a routine closeout (three addressed gaps looked unresolvable; the operator saw \"lots of mcp errors\").",
+  "missing_primitive": "catalog-backed project-filter resolution on the knowledge/gaps list surfaces and project-context-free id lookup (or honest precondition errors) on gap_resolve",
+  "fallback_used": "Query unfiltered and filter client-side on rows' project_id; pass project=&lt;project_id&gt; explicitly to gap_resolve.",
+  "evidence": [
+    "thread-a2062843",
+    "gap-72fd5932 (transcript-lane precedent: filters must resolve project_id/alias/path)",
+    "gap-518d7215 (prior list-vs-resolve divergence, threads)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/knowledge-gaps-read-plane/project-filter-and-id-resolve-context",
+  "notes": "Both prior gaps in this family were fixed by routing filter values through the shared resolver (project_id, alias, path) and by making lookup errors carry store identity; this is the same medicine on the knowledge/gaps surfaces. Note the constant \"legacy_compatibility rows have no provable built_from stamp\" diagnostic fires on every call including fully-stamped result sets, which trains callers to ignore diagnostics; it should fire only when legacy rows are actually present in the result.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-a2062843",
+  "created_at": "2026-08-13T15:59:58Z",
+  "updated_at": "2026-08-13T15:59:58Z"
+}
