@@ -303,7 +303,13 @@ Two honest wrinkles, both inherited:
 
 ## 8. Identity: minting a durable scope for a non-git source
 
-This is the hardest surface here and it is presented as open.
+**RESOLVED by operator decision, 2026-08-12: option B.** Identity is a
+grant-time, operator-minted, opaque durable `connector_source_id` written into
+both sides of the two-sided config, with option A's provider coordinates
+recorded as observations on the catalog record and publication status, never as
+identity. Cross-producer convergence is accepted and closable later by an
+operator-declared alias. The analysis below is retained because it is why, not
+because the question is open.
 
 The catalog keys a project by `ProjectScope::Published(PublishedScope { repo_id,
 bbox_root_relpath }) | LegacyLocal`. A producer resolves `PublishedScope` from the
@@ -359,10 +365,31 @@ describe the folder the operator meant. That residual producer trust is the same
 class the code-source lane already accepts for the canonical path string, named
 here rather than papered over.
 
-**This blocks phase 2.** `ProjectScope` is a durable serde-versioned enum with
-strict deserialization, so a new variant is an additive catalog migration with a
-version bump and a downgrade story, plus updates to every scope-shaped selector,
-publisher-status surface, and onboarding validator. Tracked as `gap-0c7ec76c`.
+**Landed shape (phase 0).** `ProjectScope::Connector(ConnectorScope {
+connector_source_id, connector_kind })`. Both halves are operator declarations;
+catalog uniqueness and every grant lookup key on `connector_source_id` ALONE, so
+a mistyped kind produces a named mismatch instead of a second project under an
+owned id. `connector_kind` is a validated opaque token rather than a closed enum,
+per the campaign's first invariant.
+
+`connector_source_id` shape rule: opaque, 8 to 128 bytes, lowercase ASCII
+alphanumerics plus `_`, `-`, `.`, first and last byte alphanumeric, no `..`.
+That refuses path, authority, and case-confusion shapes without mandating a mint
+algorithm the operator owns. Recommended form is a short prefix plus a UUID.
+
+Coordinates live in `CatalogSnapshotV2.connector_observations`, keyed by project
+id, valid only for a connector-scoped project, refreshed on every onboarding
+report and compared for nothing.
+
+**Downgrade story.** The catalog wire version is DERIVED from content, not
+chosen: v2 while no connector scope exists, v3 the moment one does. So a
+connector-free catalog written by a connector-aware daemon is byte-identical to
+a pre-connector write and opens under the old reader unchanged. A catalog that
+DOES hold connector scopes fails an older daemon closed with
+`error.project_catalog_unsupported_version`. That is deliberate: opening it
+minus the projects the old reader cannot represent would orphan their content
+and free a durable scope for reuse, so refusing is the only honest outcome and
+the remedy is to roll forward. Tracked as `gap-0c7ec76c`.
 
 ## 9. Onboarding and lifecycle
 
@@ -807,10 +834,11 @@ auth flow.
 
 ## 20. Open questions
 
-- **Durable scope minting for non-git sources** (section 8), the primary blocker.
-  Grant-time synthetic scope with provider coordinates as observations is the
-  leaning; it needs an owner decision, a catalog migration plan, and a stance on
-  cross-producer convergence. `gap-0c7ec76c`.
+- ~~**Durable scope minting for non-git sources**~~ (section 8). RESOLVED by
+  operator decision 2026-08-12 and implemented in phase 0: grant-time
+  operator-minted `connector_source_id`, provider coordinates as observations,
+  cross-producer convergence accepted and closable by an operator-declared
+  alias. See section 8 for the landed shape and the downgrade story.
 - **Remote provenance on the wire.** Whether `remote_id`, `remote_version`, and a
   renderable remote URL should reach the corpus as manifest-entry metadata so
   evidence can cite the source document, or whether the logical path is identity
