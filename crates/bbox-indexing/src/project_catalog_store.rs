@@ -11187,6 +11187,7 @@ mod tests {
                 knowledge: Vec::new(),
                 gaps: Vec::new(),
                 graphs: Vec::new(),
+                auto_advance: None,
                 prior_pointer: None,
             },
             &AcceptedPublicationLimits::default(),

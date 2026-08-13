@@ -3866,6 +3866,7 @@ mod clause_three_exit_proof {
                     full_ref: Some("refs/heads/main".into()),
                     expected_generation_id: status.accepted.generation_id.clone(),
                     expected_pointer_sha256: status.binding.pointer_sha256.clone(),
+                    auto_advance: None,
                     dry_run: false,
                     expected_catalog_epoch: fixture.epoch(),
                     audit_reason: "clause three walk".into(),

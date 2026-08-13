@@ -24,8 +24,17 @@ pub(crate) struct GraphSummary {
     pub status: &'static str,
     pub source: &'static str,
     pub checkout_id: Option<String>,
+    /// Reflected counts: authored rows plus schema-as-data vertices/edges
+    /// (vertex/edge type definitions) plus `meta:INSTANCE_OF` edges. Kept
+    /// for compatibility with existing callers that read the full
+    /// materialized graph.
     pub vertex_count: usize,
     pub edge_count: usize,
+    /// Authored counts: rows sourced directly from vertices.jsonl and
+    /// edges.jsonl, before schema-as-data reflection. This is what an
+    /// author comparing against their source files expects to see.
+    pub authored_vertex_count: usize,
+    pub authored_edge_count: usize,
     pub content_hash: String,
 }
 
@@ -502,6 +511,14 @@ fn summary(entry: ProjectGraphViewEntry) -> GraphSummary {
             .map(ToString::to_string),
         vertex_count: entry.graph().map(|graph| graph.vertices.len()).unwrap_or(0),
         edge_count: entry.graph().map(|graph| graph.edges.len()).unwrap_or(0),
+        authored_vertex_count: entry
+            .graph()
+            .map(|graph| graph.authored_vertex_count)
+            .unwrap_or(0),
+        authored_edge_count: entry
+            .graph()
+            .map(|graph| graph.authored_edge_count)
+            .unwrap_or(0),
         content_hash: entry.generation.content_hash,
     }
 }

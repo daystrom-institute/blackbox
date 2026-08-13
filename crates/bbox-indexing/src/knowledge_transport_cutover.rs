@@ -1549,6 +1549,9 @@ fn capture_publication_parity(
                 full_ref: candidate.descriptor.full_ref.clone(),
                 accepted_commit: candidate.descriptor.publisher_commit.clone(),
                 dry_run: true,
+                // A parity rebuild must not touch the standing grant, and a
+                // dry run installs no pointer to touch it on.
+                auto_advance: Default::default(),
             },
             PublishSources {
                 knowledge: candidate

@@ -93,6 +93,40 @@ fn governance_fixture_loads_projects_all_endpoints_and_traverses() {
 }
 
 #[test]
+fn authored_counts_reflect_only_source_rows_not_schema_as_data() {
+    let (_temp, root) = copy_fixture();
+    let loaded = load_fixture(&root);
+    assert!(loaded.report.valid, "{:?}", loaded.report.errors);
+    let generation = loaded.generation.unwrap();
+
+    // The fixture's vertices.jsonl / edges.jsonl carry 17 vertices and 20
+    // edges. authored_vertex_count / authored_edge_count must report those
+    // raw source counts, matching the fact_vertex_count / fact_edge_count
+    // already carried on the validation report.
+    assert_eq!(generation.authored_vertex_count, 17);
+    assert_eq!(generation.authored_edge_count, 20);
+    assert_eq!(loaded.report.fact_vertex_count, 17);
+    assert_eq!(loaded.report.fact_edge_count, 20);
+
+    // The reflected graph (vertices/edges on GraphGeneration) additionally
+    // carries schema-as-data vertex/edge type definitions plus
+    // meta:INSTANCE_OF / meta:FROM_TYPE / meta:TO_TYPE edges, so the
+    // reflected totals must be strictly larger than the authored counts.
+    assert!(
+        generation.vertices.len() > generation.authored_vertex_count,
+        "reflected vertex count {} should exceed authored count {}",
+        generation.vertices.len(),
+        generation.authored_vertex_count
+    );
+    assert!(
+        generation.edges.len() > generation.authored_edge_count,
+        "reflected edge count {} should exceed authored count {}",
+        generation.edges.len(),
+        generation.authored_edge_count
+    );
+}
+
+#[test]
 fn edge_endpoint_mismatch_enumerates_declared_pairs() {
     let (_temp, root) = copy_fixture();
     let edges = root

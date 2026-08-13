@@ -63,20 +63,27 @@ pub fn install_accepted_publication_for_test(
 ) -> anyhow::Result<InstalledAcceptedPublicationForTest> {
     let paths = AcceptedPublicationStorePaths::derive(projects_path)?;
     let limits = AcceptedPublicationLimits::default();
-    let prior_pointer = match fs::read(paths.pointer(project_id)) {
+    // The installed pointer supplies both the prior arm and the standing
+    // auto-advance grant: a test install is a plain advance and must not
+    // silently revoke an operator grant the fixture already installed.
+    let (prior_pointer, inherited_auto_advance) = match fs::read(paths.pointer(project_id)) {
         Ok(bytes) => {
             let pointer = decode_pointer_v1(&bytes, &limits)?;
-            Some(AcceptedPublicationPriorPointerV1 {
-                attachment_id: pointer.attachment_id,
-                source_binding: pointer.source_binding,
-                full_ref: pointer.full_ref,
-                accepted_commit: pointer.accepted_commit,
-                accepted_scope: pointer.accepted_scope,
-                accepted_generation: pointer.accepted_generation,
-                generation_hash: pointer.generation_hash,
-            })
+            let inherited = pointer.auto_advance.clone();
+            (
+                Some(AcceptedPublicationPriorPointerV1 {
+                    attachment_id: pointer.attachment_id,
+                    source_binding: pointer.source_binding,
+                    full_ref: pointer.full_ref,
+                    accepted_commit: pointer.accepted_commit,
+                    accepted_scope: pointer.accepted_scope,
+                    accepted_generation: pointer.accepted_generation,
+                    generation_hash: pointer.generation_hash,
+                }),
+                inherited,
+            )
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(error) => return Err(error.into()),
     };
     let prepared = prepare_accepted_publication_v1(
@@ -101,6 +108,7 @@ pub fn install_accepted_publication_for_test(
                 })
                 .collect(),
             graphs: Vec::new(),
+            auto_advance: inherited_auto_advance,
             prior_pointer,
         },
         &limits,
