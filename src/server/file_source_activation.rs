@@ -175,8 +175,65 @@ pub(crate) fn activate_generation(
     // Release the writer lane only after the flip: the actor is parked on
     // this token, so holding it past here costs nothing and dropping it
     // earlier would let a reindex pass reclaim documents mid-activation.
+    let superseded = record.superseded_generation_id.clone();
     drop(staged);
+    // Retirement is enqueued only AFTER the staged hold is released. The
+    // writer actor is parked on that hold, so sending it another op while the
+    // token is alive would deadlock the lane against itself.
+    retire_superseded_generation(state, &project_id, superseded.as_deref());
     Ok(())
+}
+
+/// Delete the superseded generation's documents from the index.
+///
+/// Every generation mints its OWN selector (the derivation folds in the
+/// generation id), so activating a new one does not overwrite the previous
+/// one's documents: staging deletes only the incoming selector's term, which
+/// is what makes a restage idempotent. Without an explicit retirement the
+/// outgoing generation's documents stay in the index forever, one full corpus
+/// per publication cycle. That is the same reason the code lane retires its
+/// predecessor rather than relying on replacement.
+///
+/// Best effort, and deliberately AFTER the flip. The generation is already
+/// published at this point, so a retirement failure must degrade to a warning
+/// rather than unpublish a valid generation; the writer refuses to retire a
+/// selector that is still active in the manifest, so the failure mode is a
+/// retained corpus, never a live one deleted out from under readers.
+///
+/// Blobs and sidecar snapshots are not touched here: they are content
+/// addressed and shared across generations, and their reclamation is a
+/// separate sweep with its own grace window.
+fn retire_superseded_generation(
+    state: &Arc<SharedState>,
+    project_id: &str,
+    superseded_generation_id: Option<&str>,
+) {
+    let Some(superseded) = superseded_generation_id else {
+        // The first generation for a scope supersedes nothing.
+        return;
+    };
+    let selector =
+        crate::index::project_files::collected_materialization_selector(project_id, superseded);
+    match state.index_writer.retire_code_selector(selector) {
+        Ok(retired) => {
+            tracing::info!(
+                project_id,
+                superseded_generation = %superseded,
+                documents = retired.document_count,
+                "retired the superseded connector generation"
+            );
+            // Dropping the token releases the writer lane's retirement hold.
+            drop(retired);
+        }
+        Err(error) => tracing::warn!(
+            project_id,
+            superseded_generation = %superseded,
+            error = %error,
+            "could not retire the superseded connector generation; its \
+             documents remain in the index and are not reachable through the \
+             active selector"
+        ),
+    }
 }
 
 /// Replace the workspace manifest so readers select this generation, and swap
@@ -502,6 +559,45 @@ mod tests {
         path
     }
 
+    /// Install one connector producer grant into BOTH the daemon's config and
+    /// its live auth table, and return the bearer.
+    ///
+    /// Writing it into `state.config` is not decoration. The onboard route
+    /// promotes a freshly minted scope by REBUILDING producer auth from
+    /// `state.config`, and other paths rebuild it too. A fixture that installs
+    /// only the auth table leaves the daemon self-inconsistent -- the table
+    /// says the connector family is enabled while the config says it is
+    /// disabled -- so the first rebuild silently replaces the table with a
+    /// disabled one and the NEXT request dies in the middleware's
+    /// `enabled()` gate with a 503 that looks nothing like the fixture bug it
+    /// actually is. Keeping the two agreeing is what makes the rebuild a
+    /// no-op instead of a demolition.
+    fn install_connectors(
+        state: &Arc<SharedState>,
+        root: &std::path::Path,
+        catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    ) -> String {
+        let token_secret = "a".repeat(64);
+        let config = crate::config::SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![crate::config::ConnectorProducerConfig {
+                producer_id: PRODUCER.into(),
+                token_file: token_file(root, &token_secret),
+                scopes: vec![crate::config::ConnectorScopeGrant {
+                    connector_source_id: ConnectorSourceId::parse(SOURCE_ID).unwrap(),
+                    connector_kind: ConnectorKind::parse("fixture").unwrap(),
+                    remote_authority: "fixture.invalid".to_string(),
+                }],
+            }],
+        };
+        state.config.write().source_connectors = config.clone();
+        let connectors = ConnectorGrantRuntime::build(&config, Some(catalog)).unwrap();
+        state.code_sources.install_auth_for_test(Arc::new(
+            ProducerAuthRuntime::for_test_connectors(Arc::new(connectors)),
+        ));
+        token_secret
+    }
+
     /// A catalog-backed daemon whose only producer authority is a connector
     /// grant on [`SOURCE_ID`], already onboarded to a catalog project.
     fn onboarded_state(root: &std::path::Path) -> (Arc<SharedState>, String) {
@@ -540,29 +636,16 @@ mod tests {
             })
             .unwrap();
 
-        let token_secret = "a".repeat(64);
-        let token_path = token_file(root, &token_secret);
-        let config = crate::config::SourceConnectorsConfig {
-            enabled: true,
-            producers: vec![crate::config::ConnectorProducerConfig {
-                producer_id: PRODUCER.into(),
-                token_file: token_path,
-                scopes: vec![crate::config::ConnectorScopeGrant {
-                    connector_source_id: ConnectorSourceId::parse(SOURCE_ID).unwrap(),
-                    connector_kind: ConnectorKind::parse("fixture").unwrap(),
-                    remote_authority: "fixture.invalid".to_string(),
-                }],
-            }],
-        };
         let pinned = store.snapshot().unwrap();
-        let connectors = ConnectorGrantRuntime::build(&config, Some(pinned.catalog())).unwrap();
+        let token_secret = install_connectors(&state, root, pinned.catalog());
         assert!(
-            !connectors.is_pending_onboard(&scope()),
+            !state
+                .code_sources
+                .producer_auth()
+                .connectors()
+                .is_pending_onboard(&scope()),
             "the fixture scope must be onboarded before any publication route admits it"
         );
-        state.code_sources.install_auth_for_test(Arc::new(
-            ProducerAuthRuntime::for_test_connectors(Arc::new(connectors)),
-        ));
         (state, token_secret)
     }
 
@@ -761,30 +844,17 @@ mod tests {
         )
         .unwrap();
         let state = Arc::new(SharedState::for_test_catalog(root, &catalog_projects_path));
-        let token_secret = "a".repeat(64);
-        let token_path = token_file(root, &token_secret);
-        let config = crate::config::SourceConnectorsConfig {
-            enabled: true,
-            producers: vec![crate::config::ConnectorProducerConfig {
-                producer_id: PRODUCER.into(),
-                token_file: token_path,
-                scopes: vec![crate::config::ConnectorScopeGrant {
-                    connector_source_id: ConnectorSourceId::parse(SOURCE_ID).unwrap(),
-                    connector_kind: ConnectorKind::parse("fixture").unwrap(),
-                    remote_authority: "fixture.invalid".to_string(),
-                }],
-            }],
-        };
         let store = state.project_authority.catalog_store().unwrap().clone();
         let pinned = store.snapshot().unwrap();
-        let connectors = ConnectorGrantRuntime::build(&config, Some(pinned.catalog())).unwrap();
+        let token_secret = install_connectors(&state, root, pinned.catalog());
         assert!(
-            connectors.is_pending_onboard(&scope()),
+            state
+                .code_sources
+                .producer_auth()
+                .connectors()
+                .is_pending_onboard(&scope()),
             "a granted scope with no catalog project is pending onboarding"
         );
-        state.code_sources.install_auth_for_test(Arc::new(
-            ProducerAuthRuntime::for_test_connectors(Arc::new(connectors)),
-        ));
         (state, token_secret)
     }
 
@@ -1030,10 +1100,25 @@ mod tests {
             !documents_under(&state, &second_selector).is_empty(),
             "the new generation is populated"
         );
+
+        // Every generation mints its OWN selector, so activation does not
+        // overwrite the predecessor's documents; they are deleted by an
+        // explicit retirement that runs AFTER the state flip. The flip is what
+        // a producer observes, so polling here is not papering over a race: it
+        // is the honest statement that cleanup follows publication rather than
+        // riding inside it.
+        let mut retired = false;
+        for _ in 0..600 {
+            if documents_under(&state, &first_selector).is_empty() {
+                retired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         assert!(
-            documents_under(&state, &first_selector).is_empty(),
-            "staging replaces the outgoing selector's documents rather than \
-             leaving two generations addressable at once"
+            retired,
+            "the superseded generation's documents must be retired; leaving \
+             them behind accumulates one whole corpus per publication cycle"
         );
 
         // The predecessor is RETAINED, not pruned: it is where a tear between
