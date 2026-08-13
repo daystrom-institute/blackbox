@@ -59,12 +59,19 @@ pub fn find_paths(
     }
     let to_type = if let Some(raw) = p.to_type.as_deref() {
         match EntityType::from_prefix(raw) {
-            Some(to_type) => Some(to_type),
+            Some(to_type) => Some(TargetTypeFilter::new(to_type, ctx.provisional_mode())),
             None => return Ok(bad_input("to_type", "unknown entity type")),
         }
     } else {
         None
     };
+    // A traversal with no target has no acceptance test, so every candidate
+    // path is rejected and the caller reads "No paths found" as evidence of
+    // an empty neighborhood rather than of a malformed call (gap-e41499a9).
+    // Refuse loudly instead.
+    if to.is_none() && to_type.is_none() {
+        return Ok(missing_target_bad_input());
+    }
     let max_depth = p.max_depth.unwrap_or(3);
     if !(1..=5).contains(&max_depth) {
         return Ok(bad_input("max_depth", "max_depth must be between 1 and 5"));
@@ -93,6 +100,53 @@ pub fn find_paths(
     let collapsed = collapse_paths_by_terminal_file(raw, limit);
     let cached = cache.insert_paths(PROCESS_SESSION_KEY, collapsed);
     Ok(render_response(ctx, &cached))
+}
+
+/// The `to_type` acceptance test for a traversal.
+///
+/// `project_graph_vertex` is the logical entity type a caller reads off the
+/// graph schema. Under a visibility policy that admits provisional overlay
+/// generations, the very same vertex materializes as an overlay-scoped
+/// `provisional_project_graph_vertex` compound ref, so a logical filter that
+/// compared entity types by equality matched nothing and forced the caller to
+/// know the overlay type name (gap-e41499a9). `bbox_inspect_entity` already
+/// resolves logical refs to their provisional form; this extends the same
+/// transparency to the type filter.
+///
+/// The widening is one-directional on purpose: an explicit
+/// `to_type="provisional_project_graph_vertex"` keeps matching provisional
+/// vertices only, so a caller can still target the overlay form exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetTypeFilter {
+    requested: EntityType,
+    admit_provisional_graph_vertex: bool,
+}
+
+impl TargetTypeFilter {
+    fn new(requested: EntityType, provisional_mode: Option<&str>) -> Self {
+        Self {
+            requested,
+            admit_provisional_graph_vertex: requested == EntityType::ProjectGraphVertex
+                && visibility_admits_provisional(provisional_mode),
+        }
+    }
+
+    fn matches(&self, candidate: &EntityRef) -> bool {
+        let candidate_type = candidate.entity_type();
+        candidate_type == self.requested
+            || (self.admit_provisional_graph_vertex
+                && candidate_type == EntityType::ProvisionalProjectGraphVertex)
+    }
+}
+
+/// Whether the effective visibility policy can surface provisional overlay
+/// vertices at all. `published` is the one policy that cannot. `None` defers
+/// to the daemon, which resolves it to `own` when the session holds checkout
+/// authority and to `published` otherwise; without that authority no
+/// provisional vertex is reachable in the first place, so admitting the type
+/// is inert rather than a visibility leak.
+fn visibility_admits_provisional(provisional_mode: Option<&str>) -> bool {
+    !matches!(provisional_mode.map(str::trim), Some("published"))
 }
 
 fn canonical_graph_ref(ctx: &ProviderContext<'_>, r: EntityRef) -> Result<EntityRef> {
@@ -152,7 +206,7 @@ fn bfs(
     edge_index: &EdgeIndex,
     from: EntityRef,
     to: Option<&EntityRef>,
-    to_type: Option<EntityType>,
+    to_type: Option<TargetTypeFilter>,
     edge_filter: Option<&HashSet<String>>,
     max_depth: usize,
     limit: usize,
@@ -183,7 +237,7 @@ fn bfs(
                 direction,
             });
             if to.is_some_and(|target| target == &next)
-                || to_type.is_some_and(|target_type| next.entity_type() == target_type)
+                || to_type.is_some_and(|filter| filter.matches(&next))
             {
                 found.push(steps.clone());
                 if found.len() >= limit {
@@ -334,6 +388,19 @@ fn bad_input(field: &str, message: impl AsRef<str>) -> String {
     .to_string()
 }
 
+fn missing_target_bad_input() -> String {
+    json!({
+        "status": "error.bad_input",
+        "error": {
+            "code": "error.bad_input",
+            "message": "find_paths requires a target: neither `to` nor `to_type` was supplied, so no candidate path can be accepted",
+            "field": "to|to_type",
+            "suggested_fix": "Pass `to` with one exact EntityRef to walk toward it, or `to_type` with an entity type (for example to_type=\"project_graph_vertex\") for an open-ended walk to the nearest entities of that type. Under own/all visibility, to_type=\"project_graph_vertex\" also matches provisional overlay vertices."
+        }
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,11 +460,109 @@ mod tests {
             &index,
             transcript,
             None,
-            Some(EntityType::Session),
+            Some(TargetTypeFilter::new(EntityType::Session, None)),
             None,
             3,
             5,
         );
         assert_eq!(by_type.len(), 1);
+    }
+
+    #[test]
+    fn find_paths_without_a_target_refuses_loudly() {
+        // gap-e41499a9: a call with neither `to` nor `to_type` used to walk
+        // the whole neighborhood, accept nothing, and answer "No paths
+        // found." That reads as an empty graph rather than a malformed call.
+        let ctx = ProviderContext::empty_for_tests();
+        let index = EdgeIndex::default();
+        let mut cache = PathCache::default();
+        let params = FindPathsParams {
+            from: "knowledge:abcd1234".into(),
+            provisional: None,
+            to: None,
+            to_type: None,
+            edge_types: None,
+            max_depth: None,
+            limit: None,
+        };
+
+        let raw = find_paths(&params, &ctx, &index, &mut cache).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(value["status"], "error.bad_input");
+        assert_eq!(value["error"]["code"], "error.bad_input");
+        assert_eq!(value["error"]["field"], "to|to_type");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("requires a target"), "{message}");
+        let fix = value["error"]["suggested_fix"].as_str().unwrap();
+        assert!(fix.contains("`to`"), "{fix}");
+        assert!(fix.contains("`to_type`"), "{fix}");
+        assert!(!raw.contains("No paths found"), "{raw}");
+    }
+
+    #[test]
+    fn find_paths_still_answers_when_only_to_type_is_supplied() {
+        // The refusal above must not swallow the open-ended walk shape:
+        // to_type alone is a complete target.
+        let transcript = EntityRef::parse("transcript:claude:sess-1:42:0").unwrap();
+        let ctx = ProviderContext::empty_for_tests();
+        let index = EdgeIndex::default();
+        let mut cache = PathCache::default();
+        let params = FindPathsParams {
+            from: transcript.to_string(),
+            provisional: None,
+            to: None,
+            to_type: Some("session".into()),
+            edge_types: None,
+            max_depth: None,
+            limit: None,
+        };
+
+        let raw = find_paths(&params, &ctx, &index, &mut cache).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["paths"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn logical_graph_vertex_to_type_matches_provisional_overlay_vertices() {
+        // gap-e41499a9: under a visibility policy that admits the overlay,
+        // to_type="project_graph_vertex" must accept the provisional compound
+        // form the traversal actually yields.
+        let provisional = EntityRef::parse(&format!(
+            "provisional_project_graph_vertex:{}:{}:domain:concept/alpha",
+            "b".repeat(64),
+            "a".repeat(32)
+        ))
+        .unwrap();
+        let published =
+            EntityRef::parse("project_graph_vertex:proj1234:domain:concept/alpha").unwrap();
+
+        for mode in [None, Some("own"), Some("all")] {
+            let filter = TargetTypeFilter::new(EntityType::ProjectGraphVertex, mode);
+            assert!(filter.matches(&provisional), "mode {mode:?}");
+            assert!(filter.matches(&published), "mode {mode:?}");
+        }
+
+        // published visibility cannot surface an overlay vertex, so the
+        // filter stays exact there.
+        let published_only =
+            TargetTypeFilter::new(EntityType::ProjectGraphVertex, Some("published"));
+        assert!(!published_only.matches(&provisional));
+        assert!(published_only.matches(&published));
+
+        // The explicit overlay type name keeps its exact meaning in every
+        // policy: it never widens back to the published form.
+        for mode in [None, Some("own"), Some("all"), Some("published")] {
+            let explicit = TargetTypeFilter::new(EntityType::ProvisionalProjectGraphVertex, mode);
+            assert!(explicit.matches(&provisional), "mode {mode:?}");
+            assert!(!explicit.matches(&published), "mode {mode:?}");
+        }
+
+        // The widening is scoped to the graph-vertex pair; unrelated types
+        // are untouched by the visibility policy.
+        let sessions = TargetTypeFilter::new(EntityType::Session, Some("own"));
+        assert!(!sessions.matches(&provisional));
     }
 }

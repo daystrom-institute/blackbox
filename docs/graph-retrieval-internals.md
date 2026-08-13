@@ -45,10 +45,21 @@ The ref encodes details that are not reliably reconstructible by hand.
 
 ### `bbox_find_paths`
 
-Input: a source ref, optional destination ref or destination type, and
-optional edge filters.
+Input: a source ref, a destination (an exact `to` ref or a `to_type`
+entity type, at least one of which is required), and optional edge
+filters. A call with neither destination is refused with
+`error.bad_input`; it is a malformed call, not an empty neighborhood.
 
-Output: direction-preserving paths plus opaque `path_ids`.
+Over project graphs, pass the logical `to_type="project_graph_vertex"`
+under any visibility. Under `own` and `all` it also matches the
+`provisional_project_graph_vertex` refs that a working generation
+materializes as, so the caller never has to know the overlay type name.
+Pass `to_type="provisional_project_graph_vertex"` only to target overlay
+vertices exclusively.
+
+Output: direction-preserving paths plus opaque `path_ids`. Each step
+carries its own direction label, so backward hops come back as `in`
+steps next to forward `out` steps; state them as returned.
 
 `path_ids` are server-held handles for validated traversals. Pass them
 to `bbox_bundle_evidence`; do not restate the path from memory.
