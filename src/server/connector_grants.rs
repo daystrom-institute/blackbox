@@ -294,6 +294,9 @@ mod tests {
     use std::path::Path;
 
     const SOURCE_A: &str = "csrc_5f2c1d9a4b6e470e";
+    /// A second operator-minted source id, granted alongside `SOURCE_A` but
+    /// deliberately absent from the test catalog.
+    const SOURCE_B: &str = "csrc_00000000deadbeef";
 
     fn token_file(root: &Path, name: &str, value: &str) -> std::path::PathBuf {
         let path = root.join(name);
@@ -377,27 +380,76 @@ mod tests {
         assert_eq!(runtime.producer_ids(), BTreeSet::from(["producer-a"]));
     }
 
+    /// SUPERSESSION (phase 1). This test previously asserted that an
+    /// onboarded scope "still claims no publication lane", pinning the phase-0
+    /// contract from when the connector family shipped deliberately unwired.
+    /// Phase 1 opens the lane in exactly one place --
+    /// [`ConnectorGrantRuntime::publication_project_ids`] -- and the file-source
+    /// publication routes plus the activation lane are the consumers. The
+    /// phase-0 pin was retired ON PURPOSE, not lost; what replaces it is the
+    /// sharper half of the same rule, which phase 0 could not express because
+    /// nothing was eligible: eligibility is CATALOG MEMBERSHIP, not grant
+    /// presence.
     #[test]
-    fn an_onboarded_scope_resolves_and_still_claims_no_publication_lane() {
+    fn an_onboarded_scope_is_publication_eligible_and_a_pending_one_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let config = config_with(
-            vec![ConnectorProducerConfig {
-                producer_id: "producer-a".into(),
-                token_file: token_file(&root, "token-a", &"a".repeat(64)),
-                scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
-            }],
+            vec![
+                ConnectorProducerConfig {
+                    producer_id: "producer-a".into(),
+                    token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                    scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+                },
+                // Granted identically, and deliberately absent from the
+                // catalog: the ONLY difference between these two scopes is
+                // onboarding.
+                ConnectorProducerConfig {
+                    producer_id: "producer-b".into(),
+                    token_file: token_file(&root, "token-b", &"b".repeat(64)),
+                    scopes: vec![grant(SOURCE_B, "gdrive", "tenant.example")],
+                },
+            ],
             true,
         );
         let catalog = catalog_with_connector(SOURCE_A, "gdrive");
         let runtime = ConnectorGrantRuntime::build(&config, Some(&catalog)).unwrap();
 
-        let scope = ConnectorScope::try_new(SOURCE_A, "gdrive").unwrap();
-        assert!(!runtime.is_pending_onboard(&scope));
-        assert!(runtime.project_for(scope.connector_source_id()).is_some());
+        // The onboarded scope resolves through the catalog surfaces, which is
+        // what the phase-0 test proved and still holds.
+        let onboarded = ConnectorScope::try_new(SOURCE_A, "gdrive").unwrap();
+        assert!(!runtime.is_pending_onboard(&onboarded));
+        let project = runtime
+            .project_for(onboarded.connector_source_id())
+            .expect("an onboarded scope resolves to its catalog project");
+        assert_eq!(
+            runtime.scope_for_project(project),
+            Some(&onboarded),
+            "and the inverse resolution agrees, so the two directions cannot \
+             disagree about which scope owns a project"
+        );
+
+        // The phase-1 contract: it IS publication-eligible.
+        assert_eq!(
+            runtime.publication_project_ids(),
+            BTreeSet::from([project.as_str().to_string()]),
+            "phase 1 opens the publication lane for an onboarded connector \
+             scope; the activation lane publishes into exactly this project"
+        );
+
+        // And the pending scope is not, even though it is equally granted.
+        let pending = ConnectorScope::try_new(SOURCE_B, "gdrive").unwrap();
+        assert!(runtime.is_pending_onboard(&pending));
         assert!(
-            runtime.publication_project_ids().is_empty(),
-            "Phase 0 opens no publication lane even for an onboarded scope"
+            runtime.project_for(pending.connector_source_id()).is_none(),
+            "a pending scope resolves to no project, so there is nothing for a \
+             publication lane to name"
+        );
+        assert_eq!(
+            runtime.grants().len(),
+            2,
+            "both scopes remain visible to onboarding: eligibility is catalog \
+             membership, not grant presence"
         );
     }
 
