@@ -43,6 +43,18 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
 - The `threshold()` function returns `window × ratio` rounded down.
   Resolution walks exact-model → longest-glob → "default" independently for
   each field, so a glob can set the window while inheriting the ratio.
+- `context_window()` is the TELEMETRY accessor and is deliberately stricter
+  than `resolve()`: exact → longest-glob only, never the `default` entry, and
+  independent of the `enabled` flag. Compaction must pick some number for an
+  unrecognized model; telemetry must not, because a default window published
+  as a utilization denominator manufactures false ceiling alarms on model
+  families the table has not learned yet. Unknown means `None`, all the way
+  out to the consumer.
+- The per-step `context_pressure` system event carries occupancy
+  (cache-inclusive `last_turn_input_tokens`) plus the window and threshold.
+  It fires every model step on purpose: the terminal `result` event reports
+  window pressure only once the session is already over, which is useless to
+  an orchestrator whose job is to rotate the session before it hits the wall.
 
 ## Session + loop model
 

@@ -300,6 +300,53 @@ impl Emitter {
         }));
     }
 
+    /// Per-step context-window pressure: how much of the model's window the
+    /// prompt just processed occupied.
+    ///
+    /// Emitted after every model step, not only at session termination. The
+    /// terminal `result` event is far too late for the consumer that needs
+    /// this signal: an orchestrator would learn the session was near its
+    /// ceiling only once the session was over, which is precisely the failure
+    /// this exists to prevent. Consumers get a warning every step instead, and
+    /// can rotate to a fresh session while the current one still answers.
+    ///
+    /// `last_turn_input_tokens` is cache-INCLUSIVE
+    /// (`Usage::total_input_tokens`), because cached prompt tokens still
+    /// occupy the window even though the model did not reprocess them.
+    ///
+    /// `context_window` is `None` when the compaction table does not know this
+    /// model's window. The consumer must then report occupancy without a
+    /// utilization fraction rather than inventing a denominator. Carrying the
+    /// window on the wire is the crate rule for policy values a downstream
+    /// consumer needs: the table lives here and duplicating it downstream
+    /// guarantees drift.
+    ///
+    /// A `system` subtype keeps this purely additive — the daemon's parser
+    /// ignores system subtypes it does not recognize, so an older daemon
+    /// paired with a newer harness simply sees no pressure block.
+    pub fn context_pressure(
+        &self,
+        last_turn_input_tokens: u64,
+        context_window: Option<u64>,
+        compaction_threshold: Option<u64>,
+    ) {
+        let mut context = json!({
+            "last_turn_input_tokens": last_turn_input_tokens,
+        });
+        if let Some(w) = context_window {
+            context["context_window"] = json!(w);
+        }
+        if let Some(t) = compaction_threshold {
+            context["compaction_threshold"] = json!(t);
+        }
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "context_pressure",
+            "session_id": self.session_id,
+            "context": context,
+        }));
+    }
+
     /// Terminal `result` event with usage/turns/cost. `suspicious_turn_end`
     /// carries the turn-end diagnostics when the loop flagged the stop as
     /// suspicious (empty-output stop, outstanding async work) — the session
@@ -729,5 +776,51 @@ mod tests {
         // system_init=1, assistant_message=2, (stream_event=3, excluded),
         // result=4.
         assert_eq!(logged_seqs, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn context_pressure_carries_occupancy_and_window() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-pressure".into(), sink);
+
+        emitter.context_pressure(164_000, Some(200_000), Some(150_000));
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "system");
+        assert_eq!(events[0]["subtype"], "context_pressure");
+        assert_eq!(events[0]["session_id"], "session-pressure");
+        assert_eq!(events[0]["context"]["last_turn_input_tokens"], 164_000);
+        assert_eq!(events[0]["context"]["context_window"], 200_000);
+        assert_eq!(events[0]["context"]["compaction_threshold"], 150_000);
+    }
+
+    #[test]
+    fn context_pressure_omits_an_unknown_window() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-unknown".into(), sink);
+
+        emitter.context_pressure(9_000, None, None);
+
+        let events = captured.lock().unwrap();
+        let context = &events[0]["context"];
+        assert_eq!(context["last_turn_input_tokens"], 9_000);
+        assert!(
+            context.get("context_window").is_none(),
+            "an unknown window must be omitted, never emitted as a guess or zero"
+        );
+        assert!(context.get("compaction_threshold").is_none());
     }
 }
