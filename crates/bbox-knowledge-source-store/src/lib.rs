@@ -20,8 +20,9 @@ use bbox_knowledge_source::{
     KnowledgeSourceLimits, MissingSourceBlobsPageV1, ProvisionalWorkspaceDescriptorV1,
     ProvisionalWorkspaceStatusV1, PublicationCandidateDescriptorV1, PublicationCandidateStatusV1,
     SnapshotClassV1, SourceFileManifestEntryV1, SourceGenerationStateV1, SourceLaneV1,
-    SourceManifestDescriptorV1, SourceManifestPageV1, provisional_workspace_generation_id,
-    publication_candidate_generation_id, validate_ancestry_page, validate_manifest_page,
+    SourceManifestDescriptorV1, SourceManifestPageV1, provisional_generation_id_matches,
+    provisional_workspace_generation_id, publication_candidate_generation_id,
+    publication_generation_id_matches, validate_ancestry_page, validate_manifest_page,
     validate_provisional_generation_id, validate_provisional_workspace,
     validate_publication_candidate, validate_publication_generation_id, validate_source_blob,
 };
@@ -124,7 +125,15 @@ fn validate_blob_hash(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_publication_upload(record: &PublicationUploadV1) -> Result<()> {
+/// Admit a stored upload record and normalize its page cursors.
+///
+/// State written before the graphs lane existed carries neither a graph
+/// descriptor nor a graph page cursor, and its generation identity was minted
+/// without the graph descriptor. Both are legacy vintage, not corruption: the
+/// absent lane cursors are backfilled empty in memory, and the pre-graphs
+/// identity stays admissible for exactly the shape that could have produced
+/// it. Everything else remains a refusal.
+fn validate_publication_upload(record: &mut PublicationUploadV1) -> Result<()> {
     if record.version != STORE_VERSION {
         bail!(StoreRequestError::InvalidState);
     }
@@ -135,15 +144,18 @@ fn validate_publication_upload(record: &PublicationUploadV1) -> Result<()> {
         .descriptor
         .validate_header(KnowledgeSourceLimits::default())?;
     validate_publication_generation_id(&record.source_generation_id)?;
-    if publication_candidate_generation_id(&record.producer_id, &record.descriptor)?
-        != record.source_generation_id
-    {
+    if !publication_generation_id_matches(
+        &record.producer_id,
+        &record.descriptor,
+        &record.source_generation_id,
+    )? {
         bail!(StoreRequestError::InvalidState);
     }
+    backfill_absent_page_cursors(&mut record.next_pages, publication_page_cursors());
     Ok(())
 }
 
-fn validate_provisional_upload(record: &ProvisionalUploadV1) -> Result<()> {
+fn validate_provisional_upload(record: &mut ProvisionalUploadV1) -> Result<()> {
     if record.version != STORE_VERSION {
         bail!(StoreRequestError::InvalidState);
     }
@@ -153,10 +165,23 @@ fn validate_provisional_upload(record: &ProvisionalUploadV1) -> Result<()> {
         .descriptor
         .validate_header(KnowledgeSourceLimits::default())?;
     validate_provisional_generation_id(&record.source_generation_id)?;
-    if provisional_workspace_generation_id(&record.descriptor)? != record.source_generation_id {
+    if !provisional_generation_id_matches(&record.descriptor, &record.source_generation_id)? {
         bail!(StoreRequestError::InvalidState);
     }
+    backfill_absent_page_cursors(&mut record.next_pages, provisional_page_cursors());
     Ok(())
+}
+
+/// Give a lane the store now knows about an empty cursor when the record
+/// predates it. Existing cursors are never touched, so a resumable upload
+/// keeps its exact durable position.
+fn backfill_absent_page_cursors(
+    cursors: &mut BTreeMap<String, u64>,
+    expected: BTreeMap<String, u64>,
+) {
+    for (slot, empty) in expected {
+        cursors.entry(slot).or_insert(empty);
+    }
 }
 
 fn is_open(state: SourceGenerationStateV1) -> bool {
@@ -265,7 +290,10 @@ fn put_manifest_page_locked(
     if page_index != *next {
         bail!(StoreRequestError::InvalidInput);
     }
-    let page_dir = existing_directory(&upload_path.join("pages").join(slot))?;
+    // An upload begun before this lane existed has no page directory for it.
+    // Create it on the first write rather than assuming the vintage that laid
+    // the upload out also knew about every lane.
+    let page_dir = NofollowDirectory::open_or_create(&upload_path.join("pages").join(slot))?;
     page_dir.atomic_replace(&page_filename(page_index), raw)?;
     page_digests.insert(digest_key, digest);
     *next = next
@@ -328,8 +356,26 @@ fn page_filename(page_index: u64) -> String {
     format!("{page_index:020}.json")
 }
 
+/// Read a graph manifest that state written before the graphs lane existed
+/// never wrote. An absent file is legacy only when the descriptor also carries
+/// an absent graph lane; a descriptor that claims graph content with no
+/// manifest on disk is malformed and stays a refusal.
+fn read_graph_manifest(
+    path: &Path,
+    name: &str,
+    label: &str,
+    descriptor: &SourceManifestDescriptorV1,
+) -> Result<Vec<SourceFileManifestEntryV1>> {
+    match read_json::<Vec<SourceFileManifestEntryV1>>(path, name, MAX_MANIFEST_BYTES, label)? {
+        Some(manifest) => Ok(manifest),
+        None if descriptor.is_absent_lane() => Ok(Vec::new()),
+        None => bail!(StoreRequestError::InvalidState),
+    }
+}
+
 fn load_publication_manifests(
     path: &Path,
+    descriptor: &PublicationCandidateDescriptorV1,
 ) -> Result<(
     Vec<SourceFileManifestEntryV1>,
     Vec<SourceFileManifestEntryV1>,
@@ -338,12 +384,18 @@ fn load_publication_manifests(
     Ok((
         read_required_json(path, "manifest-knowledge.json", "knowledge manifest")?,
         read_required_json(path, "manifest-gaps.json", "gap manifest")?,
-        read_required_json(path, "manifest-graphs.json", "graph manifest")?,
+        read_graph_manifest(
+            path,
+            "manifest-graphs.json",
+            "graph manifest",
+            &descriptor.graphs,
+        )?,
     ))
 }
 
 fn load_provisional_manifests(
     path: &Path,
+    descriptor: &ProvisionalWorkspaceDescriptorV1,
 ) -> Result<(Vec<AncestryCommitV1>, [Vec<SourceFileManifestEntryV1>; 6])> {
     Ok((
         read_required_json(path, "ancestry.json", "ancestry witness")?,
@@ -354,10 +406,11 @@ fn load_provisional_manifests(
                 "baseline knowledge manifest",
             )?,
             read_required_json(path, "manifest-baseline-gaps.json", "baseline gap manifest")?,
-            read_required_json(
+            read_graph_manifest(
                 path,
                 "manifest-baseline-graphs.json",
                 "baseline graph manifest",
+                &descriptor.baseline_graphs,
             )?,
             read_required_json(
                 path,
@@ -365,10 +418,11 @@ fn load_provisional_manifests(
                 "working knowledge manifest",
             )?,
             read_required_json(path, "manifest-working-gaps.json", "working gap manifest")?,
-            read_required_json(
+            read_graph_manifest(
                 path,
                 "manifest-working-graphs.json",
                 "working graph manifest",
+                &descriptor.working_graphs,
             )?,
         ],
     ))
@@ -529,6 +583,33 @@ fn install_immutable_json<T: Serialize>(
         return Ok(());
     }
     directory.atomic_replace(name, &bytes)
+}
+
+/// Install an immutable record whose serialized shape has grown since it may
+/// have been written. Byte equality still short-circuits; a byte difference is
+/// admitted only when the stored bytes decode to exactly the value being
+/// installed, which is what a pre-graphs-lane encoding of the same record
+/// does. Genuine content drift still conflicts, and the durable bytes are
+/// never rewritten.
+fn install_immutable_record<T: Serialize + DeserializeOwned + PartialEq>(
+    directory: &NofollowDirectory,
+    name: &str,
+    value: &T,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let Some(existing) = directory.read_regular(name, MAX_MANIFEST_BYTES, "immutable record")?
+    else {
+        return directory.atomic_replace(name, &bytes);
+    };
+    if existing == bytes {
+        return Ok(());
+    }
+    let decoded: T = serde_json::from_slice(&existing)
+        .with_context(|| format!("decoding stored immutable record {name}"))?;
+    if &decoded != value {
+        bail!(StoreRequestError::Conflict);
+    }
+    Ok(())
 }
 
 fn read_json<T: DeserializeOwned>(
@@ -1230,7 +1311,7 @@ impl KnowledgeSourceStore {
         let producer_root = self.publication_upload_authority_root(&authority.producer_id)?;
         let mut open = 0_usize;
         for path in read_child_directories(&producer_root, &[])? {
-            let Some(record) = read_json::<PublicationUploadV1>(
+            let Some(mut record) = read_json::<PublicationUploadV1>(
                 &path,
                 "upload.json",
                 MAX_UPLOAD_RECORD_BYTES,
@@ -1239,7 +1320,7 @@ impl KnowledgeSourceStore {
             else {
                 continue;
             };
-            validate_publication_upload(&record)?;
+            validate_publication_upload(&mut record)?;
             if record.producer_id == authority.producer_id
                 && record.project_id == authority.project_id
                 && record.descriptor == descriptor
@@ -1293,14 +1374,14 @@ impl KnowledgeSourceStore {
     ) -> Result<PublicationAuthorityV1> {
         validate_producer_id(producer_id)?;
         let path = self.publication_upload_path(producer_id, upload_id)?;
-        let record = read_json::<PublicationUploadV1>(
+        let mut record = read_json::<PublicationUploadV1>(
             &path,
             "upload.json",
             MAX_UPLOAD_RECORD_BYTES,
             "publication upload",
         )?
         .ok_or(StoreRequestError::NotFound)?;
-        validate_publication_upload(&record)?;
+        validate_publication_upload(&mut record)?;
         if record.producer_id != producer_id || record.upload_id != upload_id {
             bail!(StoreRequestError::NotFound);
         }
@@ -1494,7 +1575,7 @@ impl KnowledgeSourceStore {
         }
         let generation_path = self.publication_generation_path(&index.project_id, generation_id)?;
         let (knowledge_manifest, gap_manifest, graph_manifest) =
-            load_publication_manifests(&generation_path)?;
+            load_publication_manifests(&generation_path, &source.descriptor)?;
         validate_publication_candidate(
             &source.descriptor,
             &knowledge_manifest,
@@ -1590,7 +1671,7 @@ impl KnowledgeSourceStore {
         let workspace_root = self.provisional_upload_authority_root(&authority.workspace_id)?;
         let mut open = 0_usize;
         for path in read_child_directories(&workspace_root, &[])? {
-            let Some(record) = read_json::<ProvisionalUploadV1>(
+            let Some(mut record) = read_json::<ProvisionalUploadV1>(
                 &path,
                 "upload.json",
                 MAX_UPLOAD_RECORD_BYTES,
@@ -1599,7 +1680,7 @@ impl KnowledgeSourceStore {
             else {
                 continue;
             };
-            validate_provisional_upload(&record)?;
+            validate_provisional_upload(&mut record)?;
             if record.project_id == authority.project_id
                 && record.descriptor == descriptor
                 && is_open(record.state)
@@ -1986,7 +2067,8 @@ impl KnowledgeSourceStore {
             &authority.workspace_id,
             &source.source_generation_id,
         )?;
-        let (ancestry, manifests) = load_provisional_manifests(&generation_path)?;
+        let (ancestry, manifests) =
+            load_provisional_manifests(&generation_path, &source.descriptor)?;
         validate_provisional_workspace(
             &source.descriptor,
             &ancestry,
@@ -2029,14 +2111,14 @@ impl KnowledgeSourceStore {
         for producer in read_child_directories(&self.root.join("publications/uploads"), &[])? {
             validate_producer_id(&file_name(&producer)?)?;
             for upload_path in read_child_directories(&producer, &[])? {
-                let upload = read_json::<PublicationUploadV1>(
+                let mut upload = read_json::<PublicationUploadV1>(
                     &upload_path,
                     "upload.json",
                     MAX_UPLOAD_RECORD_BYTES,
                     "publication upload",
                 )?
                 .ok_or(StoreRequestError::InvalidState)?;
-                validate_publication_upload(&upload)?;
+                validate_publication_upload(&mut upload)?;
                 if upload.project_id == project_id && is_open(upload.state) {
                     prepared_upload_count = prepared_upload_count.saturating_add(1);
                 }
@@ -2045,14 +2127,14 @@ impl KnowledgeSourceStore {
         for workspace in read_child_directories(&self.root.join("provisional/uploads"), &[])? {
             WorkspaceId::parse(file_name(&workspace)?)?;
             for upload_path in read_child_directories(&workspace, &[])? {
-                let upload = read_json::<ProvisionalUploadV1>(
+                let mut upload = read_json::<ProvisionalUploadV1>(
                     &upload_path,
                     "upload.json",
                     MAX_UPLOAD_RECORD_BYTES,
                     "provisional upload",
                 )?
                 .ok_or(StoreRequestError::InvalidState)?;
-                validate_provisional_upload(&upload)?;
+                validate_provisional_upload(&mut upload)?;
                 if upload.project_id == project_id && is_open(upload.state) {
                     prepared_upload_count = prepared_upload_count.saturating_add(1);
                 }
@@ -2668,7 +2750,7 @@ impl KnowledgeSourceStore {
                 checksum_sha256: String::new(),
             })?,
         };
-        let manifests = load_publication_manifests(&path)?;
+        let manifests = load_publication_manifests(&path, &upload.descriptor)?;
         let generation_path =
             self.publication_generation_path(&authority.project_id, &upload.source_generation_id)?;
         let generation = StoredPublicationCandidateV1 {
@@ -2683,11 +2765,11 @@ impl KnowledgeSourceStore {
             diagnostic: None,
         };
         let directory = NofollowDirectory::open_or_create(&generation_path)?;
-        install_immutable_json(&directory, "descriptor.json", &upload.descriptor)?;
+        install_immutable_record(&directory, "descriptor.json", &upload.descriptor)?;
         install_immutable_json(&directory, "manifest-knowledge.json", &manifests.0)?;
         install_immutable_json(&directory, "manifest-gaps.json", &manifests.1)?;
         install_immutable_json(&directory, "manifest-graphs.json", &manifests.2)?;
-        install_immutable_json(&directory, "source.json", &generation)?;
+        install_immutable_record(&directory, "source.json", &generation)?;
         journal.stage = FinalizeStageV1::GenerationInstalled;
         journal = self.write_finalize_journal(journal)?;
 
@@ -2777,7 +2859,7 @@ impl KnowledgeSourceStore {
                 checksum_sha256: String::new(),
             })?,
         };
-        let (ancestry, manifests) = load_provisional_manifests(&path)?;
+        let (ancestry, manifests) = load_provisional_manifests(&path, &upload.descriptor)?;
         let generation_path = self.provisional_generation_path(
             &authority.project_id,
             &authority.workspace_id,
@@ -2795,7 +2877,7 @@ impl KnowledgeSourceStore {
             diagnostic: None,
         };
         let directory = NofollowDirectory::open_or_create(&generation_path)?;
-        install_immutable_json(&directory, "descriptor.json", &upload.descriptor)?;
+        install_immutable_record(&directory, "descriptor.json", &upload.descriptor)?;
         install_immutable_json(&directory, "ancestry.json", &ancestry)?;
         for (name, manifest) in [
             ("manifest-baseline-knowledge.json", &manifests[0]),
@@ -2807,7 +2889,7 @@ impl KnowledgeSourceStore {
         ] {
             install_immutable_json(&directory, name, manifest)?;
         }
-        install_immutable_json(&directory, "source.json", &generation)?;
+        install_immutable_record(&directory, "source.json", &generation)?;
         journal.stage = FinalizeStageV1::GenerationInstalled;
         journal = self.write_finalize_journal(journal)?;
 
@@ -2934,7 +3016,7 @@ impl KnowledgeSourceStore {
         }
         let generation_path =
             self.publication_generation_path(&authority.project_id, &upload.source_generation_id)?;
-        let manifests = load_publication_manifests(&generation_path)?;
+        let manifests = load_publication_manifests(&generation_path, &source.descriptor)?;
         validate_publication_candidate(
             &source.descriptor,
             &manifests.0,
@@ -2984,7 +3066,8 @@ impl KnowledgeSourceStore {
             &authority.workspace_id,
             &upload.source_generation_id,
         )?;
-        let (ancestry, manifests) = load_provisional_manifests(&generation_path)?;
+        let (ancestry, manifests) =
+            load_provisional_manifests(&generation_path, &source.descriptor)?;
         validate_provisional_workspace(
             &source.descriptor,
             &ancestry,
@@ -3189,14 +3272,14 @@ impl KnowledgeSourceStore {
         authority: &PublicationAuthorityV1,
         upload_id: &str,
     ) -> Result<PublicationUploadV1> {
-        let record = read_json::<PublicationUploadV1>(
+        let mut record = read_json::<PublicationUploadV1>(
             path,
             "upload.json",
             MAX_UPLOAD_RECORD_BYTES,
             "publication upload",
         )?
         .ok_or(StoreRequestError::NotFound)?;
-        validate_publication_upload(&record)?;
+        validate_publication_upload(&mut record)?;
         if record.upload_id != upload_id
             || record.producer_id != authority.producer_id
             || record.project_id != authority.project_id
@@ -3213,14 +3296,14 @@ impl KnowledgeSourceStore {
         authority: &ProvisionalAuthorityV1,
         upload_id: &str,
     ) -> Result<ProvisionalUploadV1> {
-        let record = read_json::<ProvisionalUploadV1>(
+        let mut record = read_json::<ProvisionalUploadV1>(
             path,
             "upload.json",
             MAX_UPLOAD_RECORD_BYTES,
             "provisional upload",
         )?
         .ok_or(StoreRequestError::NotFound)?;
-        validate_provisional_upload(&record)?;
+        validate_provisional_upload(&mut record)?;
         if record.upload_id != upload_id
             || record.project_id != authority.project_id
             || record.descriptor.scope != authority.scope
@@ -3507,28 +3590,28 @@ impl KnowledgeSourceStore {
         for producer in read_child_directories(&self.root.join("publications/uploads"), &[])? {
             validate_producer_id(&file_name(&producer)?)?;
             for upload_path in read_child_directories(&producer, &[])? {
-                let upload = read_json::<PublicationUploadV1>(
+                let mut upload = read_json::<PublicationUploadV1>(
                     &upload_path,
                     "upload.json",
                     MAX_UPLOAD_RECORD_BYTES,
                     "publication upload",
                 )?
                 .ok_or(StoreRequestError::InvalidState)?;
-                validate_publication_upload(&upload)?;
+                validate_publication_upload(&mut upload)?;
                 open = open.saturating_add(is_open(upload.state) as u64);
             }
         }
         for workspace in read_child_directories(&self.root.join("provisional/uploads"), &[])? {
             WorkspaceId::parse(file_name(&workspace)?)?;
             for upload_path in read_child_directories(&workspace, &[])? {
-                let upload = read_json::<ProvisionalUploadV1>(
+                let mut upload = read_json::<ProvisionalUploadV1>(
                     &upload_path,
                     "upload.json",
                     MAX_UPLOAD_RECORD_BYTES,
                     "provisional upload",
                 )?
                 .ok_or(StoreRequestError::InvalidState)?;
-                validate_provisional_upload(&upload)?;
+                validate_provisional_upload(&mut upload)?;
                 open = open.saturating_add(is_open(upload.state) as u64);
             }
         }
@@ -3606,14 +3689,14 @@ impl KnowledgeSourceStore {
             let producer_name = file_name(&producer)?;
             validate_producer_id(&producer_name)?;
             for upload_path in read_child_directories(&producer, &[])? {
-                let upload = read_json::<PublicationUploadV1>(
+                let mut upload = read_json::<PublicationUploadV1>(
                     &upload_path,
                     "upload.json",
                     MAX_UPLOAD_RECORD_BYTES,
                     "publication upload",
                 )?
                 .ok_or(StoreRequestError::InvalidState)?;
-                validate_publication_upload(&upload)?;
+                validate_publication_upload(&mut upload)?;
                 if is_open(upload.state)
                     && now.saturating_sub(upload.updated_unix_secs) >= limits.upload_idle_ttl_secs
                     && !protected.contains(&(FinalizeKindV1::Publication, upload.upload_id.clone()))
@@ -3626,14 +3709,14 @@ impl KnowledgeSourceStore {
         for workspace in read_child_directories(&self.root.join("provisional/uploads"), &[])? {
             WorkspaceId::parse(file_name(&workspace)?)?;
             for upload_path in read_child_directories(&workspace, &[])? {
-                let upload = read_json::<ProvisionalUploadV1>(
+                let mut upload = read_json::<ProvisionalUploadV1>(
                     &upload_path,
                     "upload.json",
                     MAX_UPLOAD_RECORD_BYTES,
                     "provisional upload",
                 )?
                 .ok_or(StoreRequestError::InvalidState)?;
-                validate_provisional_upload(&upload)?;
+                validate_provisional_upload(&mut upload)?;
                 if is_open(upload.state)
                     && now.saturating_sub(upload.updated_unix_secs) >= limits.upload_idle_ttl_secs
                     && !protected.contains(&(FinalizeKindV1::Provisional, upload.upload_id.clone()))
@@ -3990,7 +4073,9 @@ mod tests {
 
     use bbox_knowledge_source::{
         AncestryDescriptorV1, GitObjectFormatV1, SCHEMA_VERSION, StableCaptureV1, ancestry_sha256,
-        source_file_blob_sha256, source_manifest_sha256, working_pair_sha256,
+        legacy_provisional_workspace_generation_id, legacy_publication_candidate_generation_id,
+        legacy_working_pair_sha256, source_file_blob_sha256, source_manifest_sha256,
+        working_pair_sha256,
     };
     use tempfile::TempDir;
 
@@ -4849,7 +4934,7 @@ mod tests {
             .publication_generation_path(&authority.project_id, &upload.source_generation_id)
             .unwrap();
         let directory = NofollowDirectory::open_or_create(&generation_path).unwrap();
-        let manifests = load_publication_manifests(&upload_path).unwrap();
+        let manifests = load_publication_manifests(&upload_path, &upload.descriptor).unwrap();
         install_immutable_json(&directory, "descriptor.json", &upload.descriptor).unwrap();
         install_immutable_json(&directory, "manifest-knowledge.json", &manifests.0).unwrap();
         install_immutable_json(&directory, "manifest-gaps.json", &manifests.1).unwrap();
@@ -5210,5 +5295,989 @@ mod tests {
             store.publication_status(&authority.producer_id, &first_generation),
             StoreRequestError::NotFound,
         );
+    }
+
+    // ---- pre-graphs-lane state ----
+    //
+    // The records below are the shapes the binary that predates the graphs
+    // lane wrote: the current records minus every graph field, in the same
+    // field order, so a downgraded fixture is byte-faithful to what a
+    // production state volume actually holds.
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyPublicationDescriptor {
+        schema_version: u32,
+        scope: PublishedScope,
+        full_ref: String,
+        publisher_commit: String,
+        object_format: bbox_knowledge_source::GitObjectFormatV1,
+        knowledge: SourceManifestDescriptorV1,
+        gaps: SourceManifestDescriptorV1,
+    }
+
+    impl From<PublicationCandidateDescriptorV1> for LegacyPublicationDescriptor {
+        fn from(descriptor: PublicationCandidateDescriptorV1) -> Self {
+            assert!(
+                descriptor.graphs.is_absent_lane(),
+                "only an empty graph lane has a pre-graphs vintage"
+            );
+            Self {
+                schema_version: descriptor.schema_version,
+                scope: descriptor.scope,
+                full_ref: descriptor.full_ref,
+                publisher_commit: descriptor.publisher_commit,
+                object_format: descriptor.object_format,
+                knowledge: descriptor.knowledge,
+                gaps: descriptor.gaps,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyProvisionalDescriptor {
+        schema_version: u32,
+        scope: PublishedScope,
+        workspace_id: WorkspaceId,
+        sequence: u64,
+        accepted_generation: String,
+        accepted_commit: String,
+        checkout_head: String,
+        merge_base: String,
+        object_format: bbox_knowledge_source::GitObjectFormatV1,
+        ancestry: AncestryDescriptorV1,
+        capture: StableCaptureV1,
+        baseline_knowledge: SourceManifestDescriptorV1,
+        baseline_gaps: SourceManifestDescriptorV1,
+        working_knowledge: SourceManifestDescriptorV1,
+        working_gaps: SourceManifestDescriptorV1,
+    }
+
+    impl From<ProvisionalWorkspaceDescriptorV1> for LegacyProvisionalDescriptor {
+        fn from(descriptor: ProvisionalWorkspaceDescriptorV1) -> Self {
+            assert!(
+                descriptor.baseline_graphs.is_absent_lane()
+                    && descriptor.working_graphs.is_absent_lane(),
+                "only an empty graph lane has a pre-graphs vintage"
+            );
+            Self {
+                schema_version: descriptor.schema_version,
+                scope: descriptor.scope,
+                workspace_id: descriptor.workspace_id,
+                sequence: descriptor.sequence,
+                accepted_generation: descriptor.accepted_generation,
+                accepted_commit: descriptor.accepted_commit,
+                checkout_head: descriptor.checkout_head,
+                merge_base: descriptor.merge_base,
+                object_format: descriptor.object_format,
+                ancestry: descriptor.ancestry,
+                capture: descriptor.capture,
+                baseline_knowledge: descriptor.baseline_knowledge,
+                baseline_gaps: descriptor.baseline_gaps,
+                working_knowledge: descriptor.working_knowledge,
+                working_gaps: descriptor.working_gaps,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyPublicationUpload {
+        version: u32,
+        upload_id: String,
+        producer_id: String,
+        project_id: String,
+        descriptor: LegacyPublicationDescriptor,
+        source_generation_id: String,
+        state: SourceGenerationStateV1,
+        next_pages: BTreeMap<String, u64>,
+        page_digests: BTreeMap<String, String>,
+        updated_unix_secs: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyProvisionalUpload {
+        version: u32,
+        upload_id: String,
+        project_id: String,
+        descriptor: LegacyProvisionalDescriptor,
+        source_generation_id: String,
+        state: SourceGenerationStateV1,
+        next_ancestry_page: u64,
+        ancestry_page_digests: BTreeMap<u64, String>,
+        next_pages: BTreeMap<String, u64>,
+        page_digests: BTreeMap<String, String>,
+        updated_unix_secs: u64,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyStoredPublication {
+        version: u32,
+        source_generation_id: String,
+        producer_id: String,
+        project_id: String,
+        descriptor: LegacyPublicationDescriptor,
+        state: SourceGenerationStateV1,
+        created_unix_secs: u64,
+        created_unix_nanos: u128,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyStoredProvisional {
+        version: u32,
+        source_generation_id: String,
+        project_id: String,
+        descriptor: LegacyProvisionalDescriptor,
+        state: SourceGenerationStateV1,
+        created_unix_secs: u64,
+        created_unix_nanos: u128,
+        lease_expires_unix_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
+    }
+
+    fn drop_graph_slots(slots: BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+        slots
+            .into_iter()
+            .filter(|(slot, _)| !mentions_graphs(slot))
+            .collect()
+    }
+
+    fn drop_graph_digests(digests: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        digests
+            .into_iter()
+            .filter(|(slot, _)| !mentions_graphs(slot))
+            .collect()
+    }
+
+    fn mentions_graphs(key: &str) -> bool {
+        key.split(['/', '_']).any(|segment| segment == "graphs")
+    }
+
+    /// Rewrite a store the current binary produced into the on-disk shape the
+    /// pre-graphs-lane binary produced: descriptors with no graph lanes, page
+    /// cursors with no graph slots, no graph page directories, no graph
+    /// manifests, working-pair commitments over knowledge and gaps only, and
+    /// the pre-graphs generation identity wherever it appears.
+    fn downgrade_store_to_pre_graphs(root: &Path) {
+        let mut substitutions = BTreeMap::new();
+        collect_pre_graphs_substitutions(root, &mut substitutions);
+        assert!(
+            !substitutions.is_empty(),
+            "the fixture must hold at least one downgradable resource"
+        );
+        rewrite_records_to_pre_graphs(root);
+        substitute_pre_graphs_strings(root, &substitutions);
+        remove_graph_lane_members(root);
+        reseal_journals(root);
+        rename_to_pre_graphs_ids(root, &substitutions);
+    }
+
+    fn json_children(path: &Path) -> Vec<PathBuf> {
+        let mut children: Vec<PathBuf> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        children.sort();
+        children
+    }
+
+    fn collect_pre_graphs_substitutions(path: &Path, substitutions: &mut BTreeMap<String, String>) {
+        for child in json_children(path) {
+            if child.is_dir() {
+                collect_pre_graphs_substitutions(&child, substitutions);
+                continue;
+            }
+            if child.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&child).unwrap()).unwrap();
+            let Some(record) = value.as_object() else {
+                continue;
+            };
+            let (Some(stored_id), Some(descriptor)) = (
+                record
+                    .get("source_generation_id")
+                    .and_then(|id| id.as_str()),
+                record.get("descriptor"),
+            ) else {
+                continue;
+            };
+            if descriptor.get("knowledge").is_some() {
+                let descriptor: PublicationCandidateDescriptorV1 =
+                    serde_json::from_value(descriptor.clone()).unwrap();
+                let producer_id = record
+                    .get("producer_id")
+                    .and_then(|id| id.as_str())
+                    .expect("a publication record names its producer");
+                substitutions.insert(
+                    stored_id.to_string(),
+                    legacy_publication_candidate_generation_id(producer_id, &descriptor),
+                );
+            } else if descriptor.get("baseline_knowledge").is_some() {
+                let mut descriptor: ProvisionalWorkspaceDescriptorV1 =
+                    serde_json::from_value(descriptor.clone()).unwrap();
+                let legacy_pair = legacy_working_pair_sha256(
+                    &descriptor.working_knowledge,
+                    &descriptor.working_gaps,
+                );
+                substitutions.insert(
+                    descriptor.capture.first_working_pair_sha256.clone(),
+                    legacy_pair.clone(),
+                );
+                descriptor.capture.first_working_pair_sha256 = legacy_pair.clone();
+                descriptor.capture.second_working_pair_sha256 = legacy_pair;
+                substitutions.insert(
+                    stored_id.to_string(),
+                    legacy_provisional_workspace_generation_id(&descriptor),
+                );
+            }
+        }
+    }
+
+    fn rewrite_records_to_pre_graphs(path: &Path) {
+        for child in json_children(path) {
+            if child.is_dir() {
+                rewrite_records_to_pre_graphs(&child);
+                continue;
+            }
+            let name = file_name(&child).unwrap();
+            let bytes = match name.as_str() {
+                "upload.json" | "source.json" | "descriptor.json" => fs::read(&child).unwrap(),
+                _ => continue,
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let publication = match name.as_str() {
+                "descriptor.json" => value.get("knowledge").is_some(),
+                _ => value
+                    .get("descriptor")
+                    .and_then(|descriptor| descriptor.get("knowledge"))
+                    .is_some(),
+            };
+            let legacy = match (name.as_str(), publication) {
+                ("descriptor.json", true) => {
+                    serde_json::to_vec_pretty(&LegacyPublicationDescriptor::from(
+                        serde_json::from_value::<PublicationCandidateDescriptorV1>(value).unwrap(),
+                    ))
+                }
+                ("descriptor.json", false) => {
+                    serde_json::to_vec_pretty(&LegacyProvisionalDescriptor::from(
+                        serde_json::from_value::<ProvisionalWorkspaceDescriptorV1>(value).unwrap(),
+                    ))
+                }
+                ("upload.json", true) => {
+                    let record: PublicationUploadV1 = serde_json::from_value(value).unwrap();
+                    serde_json::to_vec_pretty(&LegacyPublicationUpload {
+                        version: record.version,
+                        upload_id: record.upload_id,
+                        producer_id: record.producer_id,
+                        project_id: record.project_id,
+                        descriptor: record.descriptor.into(),
+                        source_generation_id: record.source_generation_id,
+                        state: record.state,
+                        next_pages: drop_graph_slots(record.next_pages),
+                        page_digests: drop_graph_digests(record.page_digests),
+                        updated_unix_secs: record.updated_unix_secs,
+                    })
+                }
+                ("upload.json", false) => {
+                    let record: ProvisionalUploadV1 = serde_json::from_value(value).unwrap();
+                    serde_json::to_vec_pretty(&LegacyProvisionalUpload {
+                        version: record.version,
+                        upload_id: record.upload_id,
+                        project_id: record.project_id,
+                        descriptor: record.descriptor.into(),
+                        source_generation_id: record.source_generation_id,
+                        state: record.state,
+                        next_ancestry_page: record.next_ancestry_page,
+                        ancestry_page_digests: record.ancestry_page_digests,
+                        next_pages: drop_graph_slots(record.next_pages),
+                        page_digests: drop_graph_digests(record.page_digests),
+                        updated_unix_secs: record.updated_unix_secs,
+                    })
+                }
+                ("source.json", true) => {
+                    let record: StoredPublicationCandidateV1 =
+                        serde_json::from_value(value).unwrap();
+                    serde_json::to_vec_pretty(&LegacyStoredPublication {
+                        version: record.version,
+                        source_generation_id: record.source_generation_id,
+                        producer_id: record.producer_id,
+                        project_id: record.project_id,
+                        descriptor: record.descriptor.into(),
+                        state: record.state,
+                        created_unix_secs: record.created_unix_secs,
+                        created_unix_nanos: record.created_unix_nanos,
+                        diagnostic: record.diagnostic,
+                    })
+                }
+                ("source.json", false) => {
+                    let record: StoredProvisionalWorkspaceV1 =
+                        serde_json::from_value(value).unwrap();
+                    serde_json::to_vec_pretty(&LegacyStoredProvisional {
+                        version: record.version,
+                        source_generation_id: record.source_generation_id,
+                        project_id: record.project_id,
+                        descriptor: record.descriptor.into(),
+                        state: record.state,
+                        created_unix_secs: record.created_unix_secs,
+                        created_unix_nanos: record.created_unix_nanos,
+                        lease_expires_unix_secs: record.lease_expires_unix_secs,
+                        diagnostic: record.diagnostic,
+                    })
+                }
+                _ => unreachable!("every legacy record shape is handled"),
+            };
+            fs::write(&child, legacy.unwrap()).unwrap();
+        }
+    }
+
+    fn substitute_pre_graphs_strings(path: &Path, substitutions: &BTreeMap<String, String>) {
+        for child in json_children(path) {
+            if child.is_dir() {
+                substitute_pre_graphs_strings(&child, substitutions);
+                continue;
+            }
+            if child.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let mut text = String::from_utf8(fs::read(&child).unwrap()).unwrap();
+            for (current, legacy) in substitutions {
+                text = text.replace(current.as_str(), legacy.as_str());
+            }
+            fs::write(&child, text.as_bytes()).unwrap();
+        }
+    }
+
+    fn remove_graph_lane_members(path: &Path) {
+        for child in json_children(path) {
+            let name = file_name(&child).unwrap();
+            if child.is_dir() {
+                if name == "graphs" {
+                    fs::remove_dir_all(&child).unwrap();
+                    continue;
+                }
+                remove_graph_lane_members(&child);
+            } else if matches!(
+                name.as_str(),
+                "manifest-graphs.json"
+                    | "manifest-baseline-graphs.json"
+                    | "manifest-working-graphs.json"
+            ) {
+                fs::remove_file(&child).unwrap();
+            }
+        }
+    }
+
+    fn reseal_journals(root: &Path) {
+        let journals = root.join("journals");
+        for child in json_children(&journals) {
+            let journal: FinalizeJournalV1 =
+                serde_json::from_slice(&fs::read(&child).unwrap()).unwrap();
+            let resealed = journal.seal().unwrap();
+            fs::write(&child, serde_json::to_vec_pretty(&resealed).unwrap()).unwrap();
+        }
+    }
+
+    fn rename_to_pre_graphs_ids(path: &Path, substitutions: &BTreeMap<String, String>) {
+        for child in json_children(path) {
+            if child.is_dir() {
+                rename_to_pre_graphs_ids(&child, substitutions);
+            }
+            let name = file_name(&child).unwrap();
+            let mut renamed = name.clone();
+            for (current, legacy) in substitutions {
+                renamed = renamed.replace(current.as_str(), legacy.as_str());
+            }
+            if renamed != name {
+                fs::rename(&child, child.with_file_name(renamed)).unwrap();
+            }
+        }
+    }
+
+    /// A production-shaped store as the pre-graphs binary left it: one accepted
+    /// publication generation with its committed finalize journal, one
+    /// publication upload interrupted after its generation was installed, one
+    /// accepted provisional workspace, and one provisional upload interrupted
+    /// before its generation was installed.
+    /// The fixture keeps several uploads open at once, which the default
+    /// per-authority ceiling of two would refuse.
+    fn pre_graphs_limits() -> StoreLimits {
+        StoreLimits {
+            max_open_uploads_per_authority: 4,
+            ..StoreLimits::default()
+        }
+    }
+
+    fn pre_graphs_state(root: &Path) -> PreGraphsState {
+        let store = KnowledgeSourceStore::open(root, pre_graphs_limits()).unwrap();
+        let publisher = publication_authority();
+        let (descriptor, knowledge, gaps) = publication_fixture();
+        let accepted = store
+            .begin_publication_upload(&publisher, descriptor)
+            .unwrap();
+        put_publication_pages(&store, &publisher, &accepted.upload_id, &knowledge, &gaps);
+        store
+            .missing_publication_blobs(&publisher, &accepted.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_publication(&store, &publisher, &accepted.upload_id);
+        let accepted_generation = store
+            .finalize_publication_upload(&publisher, &accepted.upload_id)
+            .unwrap()
+            .source_generation_id;
+
+        let (mut interrupted_descriptor, _, _) = publication_fixture();
+        interrupted_descriptor.publisher_commit = "2".repeat(40);
+        let interrupted = store
+            .begin_publication_upload(&publisher, interrupted_descriptor)
+            .unwrap();
+        put_publication_pages(
+            &store,
+            &publisher,
+            &interrupted.upload_id,
+            &knowledge,
+            &gaps,
+        );
+        store
+            .missing_publication_blobs(&publisher, &interrupted.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_publication(&store, &publisher, &interrupted.upload_id);
+        install_publication_generation_without_index(&store, &publisher, &interrupted.upload_id);
+
+        // An upload the producer never finished sending manifest pages for.
+        // Its page cursors are the pre-graphs set, so resuming it after the
+        // graphs lane landed has to tolerate the absent lane cursor.
+        let (mut resumable_descriptor, _, _) = publication_fixture();
+        resumable_descriptor.publisher_commit = "4".repeat(40);
+        let resumable = store
+            .begin_publication_upload(&publisher, resumable_descriptor)
+            .unwrap();
+        store
+            .put_publication_manifest_page(
+                &publisher,
+                &resumable.upload_id,
+                SourceLaneV1::Knowledge,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: knowledge.clone(),
+                },
+            )
+            .unwrap();
+
+        let workspace = provisional_authority();
+        let (workspace_descriptor, nodes, workspace_knowledge, workspace_gaps) =
+            provisional_fixture(7);
+        let ready = store
+            .begin_provisional_upload(&workspace, workspace_descriptor)
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &workspace,
+            &ready.upload_id,
+            &nodes,
+            &workspace_knowledge,
+            &workspace_gaps,
+        );
+        store
+            .missing_provisional_blobs(&workspace, &ready.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_provisional(&store, &workspace, &ready.upload_id);
+        let ready_workspace_generation = store
+            .finalize_provisional_upload(&workspace, &ready.upload_id, 3_600)
+            .unwrap()
+            .source_generation_id;
+
+        let (next_descriptor, ..) = provisional_fixture(8);
+        let pending = store
+            .begin_provisional_upload(&workspace, next_descriptor)
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &workspace,
+            &pending.upload_id,
+            &nodes,
+            &workspace_knowledge,
+            &workspace_gaps,
+        );
+        store
+            .missing_provisional_blobs(&workspace, &pending.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_provisional(&store, &workspace, &pending.upload_id);
+        write_prepared_provisional_journal(&store, &workspace, &pending.upload_id);
+
+        drop(store);
+        PreGraphsState {
+            accepted_generation,
+            interrupted_upload: interrupted.upload_id,
+            resumable_upload: resumable.upload_id,
+            ready_workspace_generation,
+            pending_upload: pending.upload_id,
+        }
+    }
+
+    struct PreGraphsState {
+        accepted_generation: String,
+        interrupted_upload: String,
+        resumable_upload: String,
+        ready_workspace_generation: String,
+        pending_upload: String,
+    }
+
+    /// The identity a resource carries once the store is downgraded: the
+    /// pre-graphs mint of the same descriptor.
+    fn legacy_publication_generation(descriptor: &PublicationCandidateDescriptorV1) -> String {
+        legacy_publication_candidate_generation_id(&publication_authority().producer_id, descriptor)
+    }
+
+    fn legacy_provisional_generation(sequence: u64) -> String {
+        let (mut descriptor, ..) = provisional_fixture(sequence);
+        let legacy_pair =
+            legacy_working_pair_sha256(&descriptor.working_knowledge, &descriptor.working_gaps);
+        descriptor.capture.first_working_pair_sha256 = legacy_pair.clone();
+        descriptor.capture.second_working_pair_sha256 = legacy_pair;
+        legacy_provisional_workspace_generation_id(&descriptor)
+    }
+
+    /// Replay the exact crash window between generation install and generation
+    /// index install, leaving a `GenerationInstalled` journal behind.
+    fn install_publication_generation_without_index(
+        store: &KnowledgeSourceStore,
+        authority: &PublicationAuthorityV1,
+        upload_id: &str,
+    ) {
+        let upload_path = store
+            .publication_upload_path(&authority.producer_id, upload_id)
+            .unwrap();
+        let upload = store
+            .load_publication_upload(&upload_path, authority, upload_id)
+            .unwrap();
+        let mut journal = store
+            .write_finalize_journal(FinalizeJournalV1 {
+                version: STORE_VERSION,
+                kind: FinalizeKindV1::Publication,
+                stage: FinalizeStageV1::Prepared,
+                upload_id: upload_id.to_string(),
+                source_generation_id: upload.source_generation_id.clone(),
+                authority_key: authority.producer_id.clone(),
+                project_id: authority.project_id.clone(),
+                created_unix_secs: 1,
+                created_unix_nanos: 1,
+                lease_expires_unix_secs: None,
+                prior_generation_id: None,
+                provisional_sequence: None,
+                checksum_sha256: String::new(),
+            })
+            .unwrap();
+        let generation_path = store
+            .publication_generation_path(&authority.project_id, &upload.source_generation_id)
+            .unwrap();
+        let directory = NofollowDirectory::open_or_create(&generation_path).unwrap();
+        let manifests = load_publication_manifests(&upload_path, &upload.descriptor).unwrap();
+        install_immutable_json(&directory, "descriptor.json", &upload.descriptor).unwrap();
+        install_immutable_json(&directory, "manifest-knowledge.json", &manifests.0).unwrap();
+        install_immutable_json(&directory, "manifest-gaps.json", &manifests.1).unwrap();
+        install_immutable_json(&directory, "manifest-graphs.json", &manifests.2).unwrap();
+        install_immutable_json(
+            &directory,
+            "source.json",
+            &StoredPublicationCandidateV1 {
+                version: STORE_VERSION,
+                source_generation_id: upload.source_generation_id.clone(),
+                producer_id: authority.producer_id.clone(),
+                project_id: authority.project_id.clone(),
+                descriptor: upload.descriptor,
+                state: SourceGenerationStateV1::Ready,
+                created_unix_secs: 1,
+                created_unix_nanos: 1,
+                diagnostic: None,
+            },
+        )
+        .unwrap();
+        journal.stage = FinalizeStageV1::GenerationInstalled;
+        store.write_finalize_journal(journal).unwrap();
+    }
+
+    fn write_prepared_provisional_journal(
+        store: &KnowledgeSourceStore,
+        authority: &ProvisionalAuthorityV1,
+        upload_id: &str,
+    ) {
+        let upload_path = store
+            .provisional_upload_path(&authority.workspace_id, upload_id)
+            .unwrap();
+        let upload = store
+            .load_provisional_upload(&upload_path, authority, upload_id)
+            .unwrap();
+        store
+            .write_finalize_journal(FinalizeJournalV1 {
+                version: STORE_VERSION,
+                kind: FinalizeKindV1::Provisional,
+                stage: FinalizeStageV1::Prepared,
+                upload_id: upload_id.to_string(),
+                source_generation_id: upload.source_generation_id.clone(),
+                authority_key: authority.workspace_id.to_string(),
+                project_id: authority.project_id.clone(),
+                created_unix_secs: 2,
+                created_unix_nanos: 2,
+                lease_expires_unix_secs: Some(u64::MAX / 2),
+                prior_generation_id: None,
+                provisional_sequence: Some(upload.descriptor.sequence),
+                checksum_sha256: String::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn pre_graphs_state_opens_and_recovers_every_resource() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("source-store");
+        let state = pre_graphs_state(&root);
+        downgrade_store_to_pre_graphs(&root);
+
+        // This is the production failure: opening a state volume that a
+        // binary predating the graphs lane wrote.
+        let store = KnowledgeSourceStore::open(&root, StoreLimits::default()).unwrap();
+
+        // Every legacy resource kept the identity its own binary minted.
+        let publisher = publication_authority();
+        let accepted_generation = legacy_publication_generation(&publication_fixture().0);
+        assert_ne!(accepted_generation, state.accepted_generation);
+        let accepted = store
+            .publication_status(&publisher.producer_id, &accepted_generation)
+            .unwrap();
+        assert_eq!(accepted.state, SourceGenerationStateV1::Ready);
+        assert_eq!(accepted.knowledge_files, 1);
+        assert_eq!(accepted.graph_files, 0);
+        assert_eq!(accepted.graph_manifest_sha256, empty_graph_lane_sha256());
+        let pinned = store
+            .pin_ready_publication_candidate(&accepted_generation)
+            .unwrap();
+        assert_eq!(pinned.candidate().knowledge.len(), 1);
+        assert!(pinned.candidate().graphs.is_empty());
+        drop(pinned);
+
+        // The publication interrupted between generation install and index
+        // install was replayed by recovery onto its own legacy identity.
+        let mut interrupted_descriptor = publication_fixture().0;
+        interrupted_descriptor.publisher_commit = "2".repeat(40);
+        let interrupted_generation = legacy_publication_generation(&interrupted_descriptor);
+        assert_eq!(
+            store
+                .publication_status(&publisher.producer_id, &interrupted_generation)
+                .unwrap()
+                .state,
+            SourceGenerationStateV1::Ready
+        );
+        assert_eq!(
+            store
+                .finalize_publication_upload(&publisher, &state.interrupted_upload)
+                .unwrap()
+                .source_generation_id,
+            interrupted_generation
+        );
+
+        let workspace = provisional_authority();
+        let workspace_generation = legacy_provisional_generation(7);
+        assert_ne!(workspace_generation, state.ready_workspace_generation);
+        let ready = store
+            .provisional_status(&workspace, &workspace_generation)
+            .unwrap();
+        assert_eq!(ready.sequence, 7);
+        assert_eq!(
+            ready.working_graph_manifest_sha256,
+            empty_graph_lane_sha256()
+        );
+
+        // The workspace upload holding a Prepared journal was finalized by
+        // recovery and now owns the live pointer.
+        let pending_generation = legacy_provisional_generation(8);
+        assert_eq!(
+            store
+                .provisional_status(&workspace, &pending_generation)
+                .unwrap()
+                .sequence,
+            8
+        );
+        assert_eq!(
+            store
+                .finalize_provisional_upload(&workspace, &state.pending_upload, 3_600)
+                .unwrap()
+                .source_generation_id,
+            pending_generation
+        );
+        // The half-sent upload resumes on the same durable upload id and
+        // finishes through a lane its own binary never knew about.
+        let mut resumable_descriptor = publication_fixture().0;
+        resumable_descriptor.publisher_commit = "4".repeat(40);
+        assert_eq!(
+            store
+                .begin_publication_upload(&publisher, resumable_descriptor.clone())
+                .unwrap()
+                .upload_id,
+            state.resumable_upload
+        );
+        let (_, _, gaps) = publication_fixture();
+        store
+            .put_publication_manifest_page(
+                &publisher,
+                &state.resumable_upload,
+                SourceLaneV1::Gaps,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: gaps,
+                },
+            )
+            .unwrap();
+        store
+            .missing_publication_blobs(&publisher, &state.resumable_upload, None)
+            .unwrap();
+        assert_eq!(
+            store
+                .finalize_publication_upload(&publisher, &state.resumable_upload)
+                .unwrap()
+                .source_generation_id,
+            legacy_publication_generation(&resumable_descriptor)
+        );
+
+        let selected = store
+            .materialize_selected_provisionals_for_project(&workspace.project_id, now_unix_secs())
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].source_generation_id, pending_generation);
+        assert!(selected[0].working_graphs.is_empty());
+        assert!(selected[0].baseline_graphs.is_empty());
+    }
+
+    /// Legacy tolerance is keyed on an absent lane, so state that claims
+    /// graph content and cannot produce it stays a refusal, and an immutable
+    /// record whose stored bytes decode to different content still conflicts.
+    #[test]
+    fn malformed_graph_lane_state_is_still_refused() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let publisher = publication_authority();
+        let (mut descriptor, knowledge, gaps) = publication_fixture();
+        let graphs = graph_fixture_entries();
+        descriptor.graphs = manifest(SourceLaneV1::Graphs, &graphs);
+        let begin = store
+            .begin_publication_upload(&publisher, descriptor.clone())
+            .unwrap();
+        put_publication_pages(&store, &publisher, &begin.upload_id, &knowledge, &gaps);
+        store
+            .put_publication_manifest_page(
+                &publisher,
+                &begin.upload_id,
+                SourceLaneV1::Graphs,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: graphs,
+                },
+            )
+            .unwrap();
+        store
+            .missing_publication_blobs(&publisher, &begin.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_publication(&store, &publisher, &begin.upload_id);
+        for bytes in GRAPH_FIXTURE_BYTES {
+            store
+                .install_publication_blob(
+                    &publisher,
+                    &begin.upload_id,
+                    &source_file_blob_sha256(bytes),
+                    bytes.len() as u64,
+                    Cursor::new(bytes),
+                )
+                .unwrap();
+        }
+        let generation = store
+            .finalize_publication_upload(&publisher, &begin.upload_id)
+            .unwrap()
+            .source_generation_id;
+
+        let generation_path = store
+            .publication_generation_path(&publisher.project_id, &generation)
+            .unwrap();
+        fs::remove_file(generation_path.join("manifest-graphs.json")).unwrap();
+        assert_store_error(
+            store.pin_ready_publication_candidate(&generation),
+            StoreRequestError::InvalidState,
+        );
+
+        let directory = existing_directory(&generation_path).unwrap();
+        let mut drifted = descriptor;
+        drifted.full_ref = "refs/heads/other".to_string();
+        assert_store_error(
+            install_immutable_record(&directory, "descriptor.json", &drifted),
+            StoreRequestError::Conflict,
+        );
+        assert!(root.join("blobs/sha256").is_dir());
+    }
+
+    #[test]
+    fn absent_lane_page_directory_is_created_on_first_write() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let publisher = publication_authority();
+        let (mut descriptor, knowledge, gaps) = publication_fixture();
+        let graphs = graph_fixture_entries();
+        descriptor.graphs = manifest(SourceLaneV1::Graphs, &graphs);
+        let begin = store
+            .begin_publication_upload(&publisher, descriptor)
+            .unwrap();
+        put_publication_pages(&store, &publisher, &begin.upload_id, &knowledge, &gaps);
+
+        // A store laid out by a binary that did not know this lane has no
+        // page directory for it. The first page write creates it.
+        let upload_path = store
+            .publication_upload_path(&publisher.producer_id, &begin.upload_id)
+            .unwrap();
+        let lane_pages = upload_path
+            .join("pages")
+            .join(lane_name(SourceLaneV1::Graphs));
+        fs::remove_dir(&lane_pages).unwrap();
+        store
+            .put_publication_manifest_page(
+                &publisher,
+                &begin.upload_id,
+                SourceLaneV1::Graphs,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: graphs,
+                },
+            )
+            .unwrap();
+        assert!(lane_pages.is_dir());
+        assert!(root.join("publications").is_dir());
+    }
+
+    fn empty_graph_lane_sha256() -> String {
+        SourceManifestDescriptorV1::default().manifest_sha256
+    }
+
+    #[test]
+    fn pre_graphs_accepted_publication_alone_opens() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("source-store");
+        let store = KnowledgeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        let publisher = publication_authority();
+        let (descriptor, knowledge, gaps) = publication_fixture();
+        let begin = store
+            .begin_publication_upload(&publisher, descriptor)
+            .unwrap();
+        put_publication_pages(&store, &publisher, &begin.upload_id, &knowledge, &gaps);
+        store
+            .missing_publication_blobs(&publisher, &begin.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_publication(&store, &publisher, &begin.upload_id);
+        store
+            .finalize_publication_upload(&publisher, &begin.upload_id)
+            .unwrap();
+        let (descriptor, ..) = publication_fixture();
+        let generation =
+            legacy_publication_candidate_generation_id(&publisher.producer_id, &descriptor);
+        drop(store);
+        downgrade_store_to_pre_graphs(&root);
+
+        let store = KnowledgeSourceStore::open(&root, StoreLimits::default()).unwrap();
+        assert_eq!(
+            store
+                .publication_status(&publisher.producer_id, &generation)
+                .unwrap()
+                .state,
+            SourceGenerationStateV1::Ready
+        );
+    }
+
+    #[test]
+    fn pre_graphs_state_accepts_graph_content_after_opening() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("source-store");
+        pre_graphs_state(&root);
+        downgrade_store_to_pre_graphs(&root);
+        let store = KnowledgeSourceStore::open(&root, pre_graphs_limits()).unwrap();
+
+        let publisher = publication_authority();
+        let (mut descriptor, knowledge, gaps) = publication_fixture();
+        let graphs = graph_fixture_entries();
+        descriptor.publisher_commit = "3".repeat(40);
+        descriptor.graphs = manifest(SourceLaneV1::Graphs, &graphs);
+        let begin = store
+            .begin_publication_upload(&publisher, descriptor)
+            .unwrap();
+        put_publication_pages(&store, &publisher, &begin.upload_id, &knowledge, &gaps);
+        store
+            .put_publication_manifest_page(
+                &publisher,
+                &begin.upload_id,
+                SourceLaneV1::Graphs,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: graphs.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .missing_publication_blobs(&publisher, &begin.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_publication(&store, &publisher, &begin.upload_id);
+        for bytes in GRAPH_FIXTURE_BYTES {
+            store
+                .install_publication_blob(
+                    &publisher,
+                    &begin.upload_id,
+                    &source_file_blob_sha256(bytes),
+                    bytes.len() as u64,
+                    Cursor::new(bytes),
+                )
+                .unwrap();
+        }
+        let generation = store
+            .finalize_publication_upload(&publisher, &begin.upload_id)
+            .unwrap()
+            .source_generation_id;
+        assert_eq!(
+            store
+                .publication_status(&publisher.producer_id, &generation)
+                .unwrap()
+                .graph_files,
+            3
+        );
+        let pinned = store.pin_ready_publication_candidate(&generation).unwrap();
+        assert_eq!(pinned.candidate().graphs.len(), 3);
+    }
+
+    const GRAPH_FIXTURE_BYTES: [&[u8]; 3] = [
+        br#"{"version":1}"#,
+        br#"{"id":"one"}"#,
+        br#"{"from":"one"}"#,
+    ];
+
+    fn graph_fixture_entries() -> Vec<SourceFileManifestEntryV1> {
+        let mut entries = ["schema.json", "vertices.jsonl", "edges.jsonl"]
+            .into_iter()
+            .zip(GRAPH_FIXTURE_BYTES)
+            .map(|(name, bytes)| entry(&format!(".bbox/graphs/records/{name}"), bytes))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.repository_relative_filename
+                .cmp(&right.repository_relative_filename)
+        });
+        entries
     }
 }

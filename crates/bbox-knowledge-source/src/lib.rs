@@ -226,6 +226,15 @@ impl Default for SourceManifestDescriptorV1 {
 }
 
 impl SourceManifestDescriptorV1 {
+    /// True when this descriptor is exactly the canonical empty lane, which is
+    /// also what a lane absent from stored state decodes to. State written
+    /// before the graphs lane existed carries no graph descriptor at all, so
+    /// this is the only shape a pre-graphs resource can present for a graph
+    /// lane, and it is the discriminator every legacy tolerance keys on.
+    pub fn is_absent_lane(&self) -> bool {
+        *self == Self::default()
+    }
+
     pub fn validate_header(&self, limits: KnowledgeSourceLimits) -> Result<(), ContractError> {
         limits.validate()?;
         validate_sha256(&self.manifest_sha256)?;
@@ -570,7 +579,16 @@ impl ProvisionalWorkspaceDescriptorV1 {
             &self.working_gaps,
             &self.working_graphs,
         );
-        if self.capture.first_working_pair_sha256 != working_pair {
+        // A workspace captured before the graphs lane existed committed to a
+        // working pair over the knowledge and gap descriptors only. Such a
+        // descriptor decodes with an absent working graph lane, so the
+        // pre-graphs commitment stays admissible for exactly that shape and
+        // for nothing else.
+        if self.capture.first_working_pair_sha256 != working_pair
+            && !(self.working_graphs.is_absent_lane()
+                && self.capture.first_working_pair_sha256
+                    == legacy_working_pair_sha256(&self.working_knowledge, &self.working_gaps))
+        {
             return Err(ContractError::InvalidInput);
         }
         validate_total_bytes(
@@ -615,6 +633,20 @@ pub fn working_pair_sha256(
     hash_manifest_descriptor(&mut encoded, knowledge);
     hash_manifest_descriptor(&mut encoded, gaps);
     hash_manifest_descriptor(&mut encoded, graphs);
+    sha256(&encoded)
+}
+
+/// The working-pair commitment exactly as it was computed before the graphs
+/// lane existed: knowledge and gaps only. Never mint with this; it exists so
+/// stored pre-graphs captures stay readable.
+pub fn legacy_working_pair_sha256(
+    knowledge: &SourceManifestDescriptorV1,
+    gaps: &SourceManifestDescriptorV1,
+) -> String {
+    let mut encoded = Vec::new();
+    push_field(&mut encoded, b"bbox-knowledge-working-pair-v1");
+    hash_manifest_descriptor(&mut encoded, knowledge);
+    hash_manifest_descriptor(&mut encoded, gaps);
     sha256(&encoded)
 }
 
@@ -935,6 +967,49 @@ pub fn publication_candidate_generation_id(
     Ok(format!("kps_{}", sha256(&encoded)))
 }
 
+/// The publication generation identity exactly as it was minted before the
+/// graphs lane existed: the graph descriptor contributed nothing to the hash.
+///
+/// This is a re-derivation of an identity already durable on disk, so it does
+/// not re-validate the header; callers validate the descriptor first and use
+/// this only to recognize stored state. Never mint with it.
+pub fn legacy_publication_candidate_generation_id(
+    producer_id: &str,
+    descriptor: &PublicationCandidateDescriptorV1,
+) -> String {
+    let mut encoded = Vec::new();
+    push_field(
+        &mut encoded,
+        b"bbox-knowledge-publication-source-generation-v1",
+    );
+    push_field(&mut encoded, producer_id.as_bytes());
+    hash_scope(&mut encoded, &descriptor.scope);
+    push_field(&mut encoded, descriptor.full_ref.as_bytes());
+    push_field(&mut encoded, descriptor.publisher_commit.as_bytes());
+    encoded.push(descriptor.object_format.tag());
+    hash_manifest_descriptor(&mut encoded, &descriptor.knowledge);
+    hash_manifest_descriptor(&mut encoded, &descriptor.gaps);
+    format!("kps_{}", sha256(&encoded))
+}
+
+/// Whether `stored_id` is an identity this descriptor can legitimately carry.
+///
+/// The current identity always matches. A resource whose graph lane is absent
+/// may additionally carry the pre-graphs identity, because that is what the
+/// binary that wrote it minted. A resource that carries graph content has no
+/// pre-graphs vintage and is held to the current identity alone.
+pub fn publication_generation_id_matches(
+    producer_id: &str,
+    descriptor: &PublicationCandidateDescriptorV1,
+    stored_id: &str,
+) -> Result<bool, ContractError> {
+    if publication_candidate_generation_id(producer_id, descriptor)? == stored_id {
+        return Ok(true);
+    }
+    Ok(descriptor.graphs.is_absent_lane()
+        && legacy_publication_candidate_generation_id(producer_id, descriptor) == stored_id)
+}
+
 pub fn validate_publication_generation_id(value: &str) -> Result<(), ContractError> {
     validate_prefixed_generation_id(value, "kps_")
 }
@@ -974,6 +1049,58 @@ pub fn provisional_workspace_generation_id(
     hash_manifest_descriptor(&mut encoded, &descriptor.working_gaps);
     hash_manifest_descriptor(&mut encoded, &descriptor.working_graphs);
     Ok(format!("kws_{}", sha256(&encoded)))
+}
+
+/// The provisional generation identity exactly as it was minted before the
+/// graphs lane existed. Same contract as the publication variant: a
+/// re-derivation for recognizing stored state, never a minting path.
+pub fn legacy_provisional_workspace_generation_id(
+    descriptor: &ProvisionalWorkspaceDescriptorV1,
+) -> String {
+    let mut encoded = Vec::new();
+    push_field(
+        &mut encoded,
+        b"bbox-knowledge-provisional-source-generation-v1",
+    );
+    hash_scope(&mut encoded, &descriptor.scope);
+    push_field(&mut encoded, descriptor.workspace_id.as_str().as_bytes());
+    encoded.extend_from_slice(&descriptor.sequence.to_be_bytes());
+    push_field(&mut encoded, descriptor.accepted_generation.as_bytes());
+    push_field(&mut encoded, descriptor.accepted_commit.as_bytes());
+    push_field(&mut encoded, descriptor.checkout_head.as_bytes());
+    push_field(&mut encoded, descriptor.merge_base.as_bytes());
+    encoded.push(descriptor.object_format.tag());
+    hash_ancestry_descriptor(&mut encoded, &descriptor.ancestry);
+    encoded.push(u8::from(descriptor.capture.transaction_pending_before));
+    encoded.push(u8::from(descriptor.capture.transaction_pending_after));
+    push_field(
+        &mut encoded,
+        descriptor.capture.first_working_pair_sha256.as_bytes(),
+    );
+    push_field(
+        &mut encoded,
+        descriptor.capture.second_working_pair_sha256.as_bytes(),
+    );
+    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_knowledge);
+    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_gaps);
+    hash_manifest_descriptor(&mut encoded, &descriptor.working_knowledge);
+    hash_manifest_descriptor(&mut encoded, &descriptor.working_gaps);
+    format!("kws_{}", sha256(&encoded))
+}
+
+/// Whether `stored_id` is an identity this workspace descriptor can carry.
+/// The pre-graphs identity is admissible only when both graph lanes are
+/// absent, which is the only shape a pre-graphs capture can present.
+pub fn provisional_generation_id_matches(
+    descriptor: &ProvisionalWorkspaceDescriptorV1,
+    stored_id: &str,
+) -> Result<bool, ContractError> {
+    if provisional_workspace_generation_id(descriptor)? == stored_id {
+        return Ok(true);
+    }
+    Ok(descriptor.baseline_graphs.is_absent_lane()
+        && descriptor.working_graphs.is_absent_lane()
+        && legacy_provisional_workspace_generation_id(descriptor) == stored_id)
 }
 
 pub fn validate_provisional_generation_id(value: &str) -> Result<(), ContractError> {
@@ -1634,6 +1761,69 @@ mod tests {
         assert_eq!(
             provisional_workspace_generation_id(&descriptor).unwrap(),
             "kws_1c65ac3aec908e12d6b741901abb05a23a9026cd303887cbdff0d6c759a99672"
+        );
+    }
+
+    /// Both goldens below are the values the pre-graphs-lane binary minted for
+    /// these exact fixtures, taken from the assertions this crate carried
+    /// before the graphs lane landed. They pin the legacy derivations to real
+    /// on-disk identity rather than to a restatement of the current code.
+    #[test]
+    fn legacy_derivations_reproduce_pre_graphs_identity() {
+        let (publication_descriptor, _, _) = publication();
+        assert_eq!(
+            legacy_publication_candidate_generation_id("producer-a", &publication_descriptor),
+            "kps_ed7b6e9e7378e05714065e1bac8f6ac8c12e47d2b758c5eb6a41edfd62a5df56"
+        );
+
+        let (mut descriptor, ..) = provisional();
+        let legacy_pair =
+            legacy_working_pair_sha256(&descriptor.working_knowledge, &descriptor.working_gaps);
+        descriptor.capture.first_working_pair_sha256 = legacy_pair.clone();
+        descriptor.capture.second_working_pair_sha256 = legacy_pair;
+        assert_eq!(
+            legacy_provisional_workspace_generation_id(&descriptor),
+            "kws_b2ef389d2c997a9c6aac48af0c7af608412d26f4dabf682e7b293b36e5feb37a"
+        );
+        // A pre-graphs working-pair commitment stays admissible while the
+        // graph lane is absent, and stops being admissible the moment the
+        // workspace carries graph content.
+        descriptor
+            .validate_header(KnowledgeSourceLimits::default())
+            .unwrap();
+        assert!(
+            provisional_generation_id_matches(
+                &descriptor,
+                &legacy_provisional_workspace_generation_id(&descriptor)
+            )
+            .unwrap()
+        );
+        descriptor.working_graphs = manifest(SourceLaneV1::Graphs, &graph_entries("records"));
+        assert!(matches!(
+            descriptor.validate_header(KnowledgeSourceLimits::default()),
+            Err(ContractError::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn legacy_publication_identity_is_admissible_only_without_graph_content() {
+        let (mut descriptor, ..) = publication();
+        let legacy = legacy_publication_candidate_generation_id("producer-a", &descriptor);
+        let current = publication_candidate_generation_id("producer-a", &descriptor).unwrap();
+        assert_ne!(legacy, current);
+        assert!(publication_generation_id_matches("producer-a", &descriptor, &legacy).unwrap());
+        assert!(publication_generation_id_matches("producer-a", &descriptor, &current).unwrap());
+
+        let graphs = graph_entries("records");
+        descriptor.graphs = manifest(SourceLaneV1::Graphs, &graphs);
+        assert!(!publication_generation_id_matches("producer-a", &descriptor, &legacy).unwrap());
+        assert!(
+            publication_generation_id_matches(
+                "producer-a",
+                &descriptor,
+                &publication_candidate_generation_id("producer-a", &descriptor).unwrap(),
+            )
+            .unwrap()
         );
     }
 
