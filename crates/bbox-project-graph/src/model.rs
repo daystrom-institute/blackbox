@@ -310,10 +310,13 @@ impl GraphSource {
         }
     }
 
-    /// The read-surface label for this source: `project` for checkout-authored
-    /// graphs, `provisional` for opt-in local scratch, and `connector` for
-    /// connector-managed source projections.
-    pub fn read_surface_label(self) -> &'static str {
+    /// The AUTHORITY-plane label for this source, used in diagnostics.
+    ///
+    /// Deliberately not the read-surface vocabulary: the read plane labels an
+    /// accepted checkout graph `published` (and a workspace's own uncommitted
+    /// one `provisional`), which is a visibility distinction this enum does
+    /// not carry. Do not wire this into tool output.
+    pub fn authority_label(self) -> &'static str {
         match self {
             Self::Committed => "project",
             Self::LocalScratch => "provisional",
@@ -665,7 +668,7 @@ impl ProjectGraphCatalog {
                     "graph `{}` already has an accepted generation from the {} source; \
                      one graph id cannot hold two authorities",
                     candidate.key.graph_id,
-                    existing.source.read_surface_label()
+                    existing.source.authority_label()
                 ),
             });
         }

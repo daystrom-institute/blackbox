@@ -398,15 +398,22 @@ fn descriptor_from_documents(
         descriptor_version: crate::DESCRIPTOR_VERSION,
         scope: crate::GraphScope::Project,
         graph_id: graph_id.to_string(),
+        // A synthesized descriptor is project authored by definition: it is
+        // reconstructed from checkout documents. A connector-managed source
+        // reaching here therefore fails closed in validation on the
+        // authority/source pair rather than minting a project descriptor over
+        // connector storage.
         authority: crate::GraphAuthority::Project,
         schema_id: format!("{}:schema", schema.namespace),
         schema_version: schema.version,
         projection_version: None,
         source_connector: None,
-        retention_policy: match source {
-            GraphSource::Committed => crate::RetentionPolicy::ProjectOwned,
-            GraphSource::LocalScratch => crate::RetentionPolicy::LocalScratch,
-        },
+        // Delegate rather than re-deriving the mapping: `retention_policy()`
+        // is the single source of truth that `validate_descriptor` checks
+        // against, so a duplicate match here can only drift as sources are
+        // added. Connector-managed maps to ConnectorManaged, which is what the
+        // source projection store stamps on every descriptor it accepts.
+        retention_policy: source.retention_policy(),
         generation: 1,
     })
 }
@@ -749,6 +756,59 @@ mod tests {
                 .authority,
             crate::GraphAuthority::Project,
             "the project-authored generation stays accepted"
+        );
+    }
+
+    /// A synthesized descriptor takes its retention from the source rather
+    /// than from a mapping copied into the loader, so adding a graph source
+    /// cannot silently mislabel custody here.
+    #[test]
+    fn a_synthesized_descriptor_takes_its_retention_from_its_source() {
+        let schema: GraphSchema = serde_json::from_str(
+            r#"{"version":1,"namespace":"repo","vertex_types":{"repo:Module":{"required":[],"properties":{}}},"edge_types":[]}"#,
+        )
+        .unwrap();
+        for source in [
+            GraphSource::Committed,
+            GraphSource::LocalScratch,
+            GraphSource::ConnectorManaged,
+        ] {
+            let mut errors = Vec::new();
+            let descriptor =
+                descriptor_from_documents("repo", source, None, Some(&schema), &mut errors)
+                    .expect("a schema is enough to synthesize a descriptor");
+            assert!(errors.is_empty(), "{source:?}: {errors:?}");
+            assert_eq!(
+                descriptor.retention_policy,
+                source.retention_policy(),
+                "{source:?}"
+            );
+        }
+
+        // A synthesized descriptor is project authored by definition, so a
+        // connector-managed source fails closed on the authority pair instead
+        // of minting a project descriptor over connector storage.
+        let connector = descriptor_from_documents(
+            "repo",
+            GraphSource::ConnectorManaged,
+            None,
+            Some(&schema),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let errors = validate_graph(
+            "repo",
+            GraphSource::ConnectorManaged,
+            &connector,
+            &schema,
+            &[],
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "descriptor.authority_source_mismatch"),
+            "{errors:?}"
         );
     }
 
