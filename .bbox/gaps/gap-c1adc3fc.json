@@ -1,0 +1,23 @@
+{
+  "id": "gap-c1adc3fc",
+  "title": "healthz starved for minutes under heavy code-source ingest",
+  "gap_kind": "tooling",
+  "domain": "daemon-runtime-concurrency",
+  "wanted_capability": "The liveness surface (/healthz) should answer within its probe timeout regardless of ingest load. During a large code-source batch (one generation of 4.6k files / 1.5GB among a multi-project sweep), /healthz stopped answering within 5s for over two minutes, so the orchestrator killed a healthy daemon mid-activation and tore a multi-store update (the 2026-08-13 boot-refusal outage). The plane-isolation model (design/daemon-runtime/concurrency-model.md) intends the HTTP plane to stay responsive while ingest runs; either a blocking section in the ingest/activation path is riding the serving runtime, or /healthz shares a resource (lock, runtime, IO pool) with ingest that it should not. Wanted: identify the starvation mechanism (tokio blocking, held lock, fs contention on the PVC) and isolate the health endpoint so it answers from cheap process-local state; secondarily consider a load-shedding readiness signal distinct from liveness so heavy ingest degrades to not-ready instead of dead.",
+  "missing_primitive": "ingest-independent liveness answer (health from process-local state, no shared locks/runtime with ingest)",
+  "fallback_used": "Raised cage probe tolerance (liveness 15s timeout, 15 failures at 20s period, bbox-cage 6694a11) so a busy daemon is not killed; treats the symptom, not the starvation.",
+  "evidence": [
+    "thread-a2062843",
+    "design/daemon-runtime/concurrency-model.md",
+    "crates/bbox-indexing/src/code_source_locality_manifest.rs (write-ordering doc born from the torn update)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/daemon-runtime-concurrency/healthz-starvation-under-ingest",
+  "notes": "Sequence from the incident: 04:37Z collector uploads a multi-project code-source batch; 04:39Z liveness probes time out repeatedly; orchestrator kills the daemon mid-activation; boot then refuses on the torn journal/manifest pair (fixed by the reconciliation sweep). The probe tolerance change makes recurrence unlikely to kill, but the underlying starvation still degrades every MCP caller during ingest windows.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-a2062843",
+  "created_at": "2026-08-13T06:45:26Z",
+  "updated_at": "2026-08-13T06:45:26Z"
+}
