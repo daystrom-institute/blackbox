@@ -226,6 +226,10 @@ pub(crate) struct SharedState {
     /// valid graph to callers.
     pub(crate) edge_index_ready: AtomicBool,
     pub(crate) code_sources: Arc<super::code_source::CodeSourceRuntime>,
+    /// Connector generation store for the `/internal/file-source/v1/*` lane.
+    /// Separate from `code_sources` because the generation model, the key,
+    /// and the retention window are this lane's own.
+    pub(crate) file_sources: Arc<super::file_source::FileSourceRuntime>,
     pub(crate) git_sources: Arc<super::git_source::GitSourceRuntime>,
     pub(crate) knowledge_sources: Arc<super::knowledge_source::KnowledgeSourceRuntime>,
     /// Strict per-repository Git transport authority loaded from the
@@ -1035,6 +1039,7 @@ impl SharedState {
             })),
             edge_index_ready: AtomicBool::new(true),
             code_sources: Arc::new(super::code_source::CodeSourceRuntime::for_test(store_dir)),
+            file_sources: Arc::new(super::file_source::FileSourceRuntime::for_test(store_dir)),
             git_sources: Arc::new(super::git_source::GitSourceRuntime::for_test(store_dir)),
             knowledge_sources: Arc::new(super::knowledge_source::KnowledgeSourceRuntime::for_test(
                 store_dir,

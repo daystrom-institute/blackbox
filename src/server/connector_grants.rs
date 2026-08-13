@@ -196,7 +196,6 @@ impl ConnectorGrantRuntime {
     /// the bearer. Returns the operator-declared `producer_id`, which is what
     /// the onboarding composite matches grants against; the token never
     /// leaves this method.
-    #[allow(dead_code)] // Consumed by the file-source route layer.
     pub(crate) fn authenticate(&self, bearer: &str) -> Option<&str> {
         if !self.enabled {
             return None;
@@ -210,29 +209,25 @@ impl ConnectorGrantRuntime {
         matched
     }
 
-    // The read surface below is the phase-1 seam. It is now backed by a table
-    // that retains live bearers (see the type's doc comment for the phase-0
-    // note this resolves), and it keeps the documented-seam idiom until the
-    // file-source route layer lands its callers.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
+    // The read surface below is consumed by the file-source route layer: the
+    // authentication middleware gates on `enabled`, `catalog_onboard` matches
+    // against `grants`, and every publication handler routes through
+    // `is_pending_onboard` plus `project_for`.
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The grant table the onboarding composite validates against.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn grants(&self) -> &[ConnectorGrantExpectation] {
         &self.grants
     }
 
     /// True when the scope is operator-configured but has no catalog project
     /// yet. Only onboarding may admit such a scope.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn is_pending_onboard(&self, scope: &ConnectorScope) -> bool {
         self.pending_onboard.contains(scope)
     }
 
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn project_for(
         &self,
         connector_source_id: &ConnectorSourceId,
@@ -242,13 +237,34 @@ impl ConnectorGrantRuntime {
 
     /// Project ids a connector grant makes eligible for a PUBLICATION lane.
     ///
-    /// Always empty in Phase 0, and that is the contract, not an oversight:
-    /// the phase ends at "onboards, lists, and reports with no publication
-    /// yet". Callers ask this rather than inferring eligibility from the
-    /// presence of a grant, so Phase 1 has exactly one place to open.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 publication lane.
+    /// Phase 0 returned empty by contract; phase 1 opens it, and this is the
+    /// exactly-one place that opening happens. Eligibility is CATALOG
+    /// membership, not grant presence: a granted scope with no catalog project
+    /// is pending onboarding and is deliberately absent here, which is what
+    /// keeps a pending scope out of every publication lane while leaving it
+    /// acceptable to the onboard endpoint.
     pub(crate) fn publication_project_ids(&self) -> BTreeSet<String> {
-        BTreeSet::new()
+        self.scope_to_project
+            .values()
+            .map(|project_id| project_id.as_str().to_string())
+            .collect()
+    }
+
+    /// The granted scope owning a project id, for the publisher-status read.
+    ///
+    /// Inverts `scope_to_project` on demand rather than keeping a second map:
+    /// the table is one entry per operator-configured scope, so a linear scan
+    /// is free, and a second map is a second thing that can disagree.
+    pub(crate) fn scope_for_project(&self, project_id: &ProjectId) -> Option<&ConnectorScope> {
+        let source_id = self
+            .scope_to_project
+            .iter()
+            .find(|(_, owned)| *owned == project_id)
+            .map(|(source_id, _)| source_id)?;
+        self.grants
+            .iter()
+            .map(|grant| &grant.scope)
+            .find(|scope| scope.connector_source_id() == source_id)
     }
 
     /// Configured producer ids, derived from the grants rather than stored

@@ -170,6 +170,7 @@ pub(super) fn build_http_app(
             axum::routing::post(super::workspace_binding_mint::admin_workspace_binding_mint),
         )
         .merge(super::code_source::router(shared.clone()))
+        .merge(super::file_source::router(shared.clone()))
         .merge(super::git_source::router(shared.clone()))
         .merge(super::knowledge_source::router(shared.clone()))
         .with_state(shared)

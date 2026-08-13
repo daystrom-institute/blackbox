@@ -40,6 +40,19 @@ pub(crate) struct ProducerGrant {
     pub(crate) projects: BTreeMap<PublishedScope, String>,
 }
 
+/// What a file-source request proved about itself.
+///
+/// Only the producer id, deliberately. The code lane's [`ProducerGrant`]
+/// carries a resolved scope-to-project map because its handlers need the
+/// project for a published scope on every call; the connector lane resolves
+/// scope authorization against the live grant table instead, so that a scope
+/// promoted out of pending-onboarding mid-flight is visible immediately rather
+/// than frozen into whatever the request's first middleware hop captured.
+#[derive(Clone)]
+pub(crate) struct ConnectorGrant {
+    pub(crate) producer_id: String,
+}
+
 #[derive(Clone)]
 struct AuthEntry {
     token: ServiceToken,
@@ -653,6 +666,49 @@ pub(crate) async fn authenticate_knowledge_source_request(
     next: Next,
 ) -> Response {
     authenticate_request(state, request, next, ProducerAuthLane::Knowledge).await
+}
+
+/// Authenticate one `/internal/file-source/v1/*` request.
+///
+/// A SEPARATE middleware rather than a fourth `ProducerAuthLane` arm, because
+/// the connector family authenticates against a different table and inserts a
+/// different extension type. Folding it into `authenticate_request` would mean
+/// that function returning one of two grant types by lane, which is exactly the
+/// optionality the connector store refused to bleed through its own key.
+///
+/// Enablement is the connector family's own flag: a daemon may legitimately run
+/// connector grants with code collection switched off, and
+/// `ConnectorGrantRuntime::build` resolves connectors before the
+/// code-collection early return precisely so that stays true here.
+pub(crate) async fn authenticate_file_source_request(
+    State(state): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let connectors = state.code_sources.producer_auth().connectors().clone();
+    if !connectors.enabled() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_disabled",
+            "source connectors are disabled",
+        );
+    }
+    let candidate = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    // `authenticate` is constant time and checks EVERY configured producer
+    // even after a match, so the number of comparisons does not vary with
+    // which producer presented the bearer.
+    let Some(producer_id) = candidate.and_then(|value| connectors.authenticate(value)) else {
+        return error_response(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized");
+    };
+    let grant = ConnectorGrant {
+        producer_id: producer_id.to_string(),
+    };
+    request.extensions_mut().insert(grant);
+    next.run(request).await
 }
 
 #[derive(Clone, Copy)]
