@@ -75,6 +75,10 @@ pub(crate) struct KnowledgeSourceRuntime {
     /// so every minting path (managed worker spawn and the operator mint
     /// route) shares one registry instead of one per authority instance.
     workspace_binding_renewals: parking_lot::Mutex<BTreeMap<String, CancellationToken>>,
+    /// Bounded record of what the auto-advance policy last did per
+    /// project. It lives beside the publication candidates it reacts to,
+    /// so no new field has to be threaded through `SharedState`.
+    auto_advance: Arc<super::publisher_auto_advance::PublisherAutoAdvanceLedger>,
 }
 
 pub(crate) struct KnowledgeTransportCheckoutPolicy {
@@ -126,6 +130,9 @@ impl KnowledgeSourceRuntime {
             store,
             workspace_bindings: parking_lot::RwLock::new(Vec::new()),
             workspace_binding_renewals: parking_lot::Mutex::new(BTreeMap::new()),
+            auto_advance: Arc::new(
+                super::publisher_auto_advance::PublisherAutoAdvanceLedger::default(),
+            ),
         })
     }
 
@@ -138,7 +145,16 @@ impl KnowledgeSourceRuntime {
             ),
             workspace_bindings: parking_lot::RwLock::new(Vec::new()),
             workspace_binding_renewals: parking_lot::Mutex::new(BTreeMap::new()),
+            auto_advance: Arc::new(
+                super::publisher_auto_advance::PublisherAutoAdvanceLedger::default(),
+            ),
         }
+    }
+
+    pub(crate) fn auto_advance_ledger(
+        &self,
+    ) -> Arc<super::publisher_auto_advance::PublisherAutoAdvanceLedger> {
+        self.auto_advance.clone()
     }
 
     pub(crate) fn store(&self) -> Arc<KnowledgeSourceStore> {
@@ -1129,8 +1145,31 @@ async fn finalize_publication_upload(
 ) -> Result<(StatusCode, Json<FinalizeSourceUploadResponseV1>), HttpError> {
     let store = state.knowledge_sources.store();
     let authority = require_publication_upload_grant(&state, &store, &grant, &upload_id).await?;
-    let response =
-        blocking(move || store.finalize_publication_upload(&authority, &upload_id)).await?;
+    let project_id = authority.project_id.clone();
+    let response = {
+        let authority = authority.clone();
+        blocking(move || store.finalize_publication_upload(&authority, &upload_id)).await?
+    };
+    // The candidate is durable and Ready by the time finalize returns, so
+    // this is where a project whose OPERATOR granted auto-advance gets its
+    // one policy attempt. Default OFF: without a standing grant on the
+    // currently accepted pointer this reads one pointer and stops.
+    //
+    // The attempt runs before the response so a producer that polls status
+    // immediately cannot observe an unserved Ready candidate that the
+    // daemon was already about to accept. A refusal never fails the
+    // finalize: the upload succeeded either way, and the prior accepted
+    // generation keeps serving.
+    {
+        let state = state.clone();
+        let source_generation_id = response.source_generation_id.clone();
+        blocking(move || {
+            let server = super::BlackboxServer::new(state);
+            server.attempt_publisher_auto_advance(&project_id, &source_generation_id);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    }
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
