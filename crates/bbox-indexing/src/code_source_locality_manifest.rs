@@ -52,12 +52,33 @@
 //!
 //! Every interleaving therefore has a defined outcome, and none of them is a
 //! crash loop.
+//!
+//! # Three readers, two stores
+//!
+//! The relationship chain (`validate_relationship_chain`, link 5) is NOT a
+//! third store. It is a third READER that re-derives the same journal-versus-
+//! manifest comparison independently, alongside this module's boot evidence
+//! loop and the locality cutover's live re-verification. All three compare the
+//! same two durable owners, so a tear presents to all three, and a tolerance
+//! rule taught to only one of them just moves the crash loop downstream.
+//!
+//! That makes ORDER a correctness property of the boot sequence, not a
+//! detail. `reconcile_workspace_manifests_from_activations` runs in the
+//! pre-bind recovery BEFORE the chain validates, so the chain sees reconciled
+//! state rather than the tear. The chain itself keeps its strict contract for
+//! every other caller: it is a pure validator that neither repairs nor is
+//! relaxed for the shape the journal owns. Its only added tolerance is the
+//! shape nothing can repair yet, an activation still in flight, which it
+//! admits exactly as it already admits an absent entry and the cutback crash
+//! window, deferring to the startup reducer sweep.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use bbox_code_source::GenerationState;
-use bbox_code_source_store::ActivationRecordV2;
+use bbox_code_source_store::{
+    ActivationRecordV2, CodeSourceStore, MixedActivationRecord, MixedStoredGeneration,
+};
 use bbox_edge_sidecar::manifest::{ManifestIndex, WorkspaceIndexEntry};
 
 /// What the derived manifest entry looks like against the journal.
@@ -147,9 +168,16 @@ pub fn classify_workspace_manifest(
                 return Ok(WorkspaceManifestState::Disagrees);
             }
             // Only a well-formed predecessor collected entry is a recognized
-            // torn shape. An entry that is malformed, cross-project, or
-            // traversal bearing is drift, and drift still refuses.
-            if !predecessor_collected_entry_is_well_formed(entry, project_id) {
+            // torn shape. An entry that is malformed, cross-project,
+            // traversal bearing, or disagreeing on something the atomic
+            // manifest write publishes together is drift, and drift still
+            // refuses.
+            if !is_torn_activation_predecessor(
+                entry,
+                project_id,
+                &activation.selector,
+                &activation.generation_id,
+            ) {
                 return Ok(WorkspaceManifestState::Disagrees);
             }
             entry.code_source_generation.clone()
@@ -177,19 +205,40 @@ pub fn classify_workspace_manifest(
     })
 }
 
-/// A predecessor entry has to look like something the collected writer
-/// produced for THIS project before it can be treated as a torn write rather
-/// than drift. Mirrors the shape validation the relationship chain applies to
-/// its own crash-window admission.
-fn predecessor_collected_entry_is_well_formed(
+/// Does this entry look like the collected writer's own publication for THIS
+/// project, naming an EARLIER generation than the one the journal names?
+///
+/// That is the signature of an activation torn between its journal write and
+/// its manifest write, and it is the only present-entry shape either the
+/// classifier or the relationship chain may treat as a crash window rather
+/// than drift. The shape validation mirrors the rigor the chain already
+/// applies to its cutback crash-window admission: exact manifest path for this
+/// project, a collected selector, and a same-project confined snapshot path
+/// with no traversal.
+///
+/// Requiring the entry to name a DIFFERENT generation is what keeps this from
+/// laundering drift. The manifest write publishes all three collected fields
+/// in one atomic replacement, so an entry that agrees on the generation but
+/// disagrees on the selector or the snapshot cannot have come from a torn
+/// write, and stays a refusal.
+pub fn is_torn_activation_predecessor(
     entry: &WorkspaceIndexEntry,
     project_id: &str,
+    activation_selector: &str,
+    activation_generation: &str,
 ) -> bool {
+    if !activation_selector.starts_with("collected:") {
+        return false;
+    }
     let Some(selector) = entry.code_source_selector.as_deref() else {
         return false;
     };
-    if !selector.starts_with("collected:") || entry.code_source_generation.is_none() {
+    if !selector.starts_with("collected:") || selector == activation_selector {
         return false;
+    }
+    match entry.code_source_generation.as_deref() {
+        Some(generation) if generation != activation_generation => {}
+        _ => return false,
     }
     if entry.manifest != format!("workspace/{project_id}/manifest.json") {
         return false;
@@ -200,6 +249,48 @@ fn predecessor_collected_entry_is_well_formed(
     snapshot.starts_with(&format!("workspace/{project_id}/snapshots/"))
         && !snapshot.contains("..")
         && !snapshot.contains('\0')
+}
+
+/// Repair every workspace manifest entry a torn activation left behind the
+/// journal, and report how many were repaired.
+///
+/// This is the sweep the pre-bind recovery runs BEFORE it validates the
+/// relationship chain, so the chain validates reconciled state rather than the
+/// tear. It is deliberately permissive: any activation it cannot fully prove
+/// (a generation the store cannot produce, a legacy record, a
+/// `validate_against_generation` failure) is skipped rather than refused here,
+/// so the chain still emits its own precise refusal for that record instead of
+/// this sweep masking it with a different error.
+pub fn reconcile_workspace_manifests_from_activations(
+    store: &CodeSourceStore,
+    projects_path: &Path,
+) -> Result<usize> {
+    let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
+    let mut reconciled = 0;
+    for activation in store.activation_records_mixed()? {
+        let MixedActivationRecord::CurrentV2(activation) = activation else {
+            continue;
+        };
+        if activation.cutback.is_some() || activation.cutback_pending {
+            continue;
+        }
+        let Ok(generation) = store.find_generation_mixed(&activation.generation_id) else {
+            continue;
+        };
+        let MixedStoredGeneration::CurrentV2(generation) = generation else {
+            continue;
+        };
+        if activation.validate_against_generation(&generation).is_err() {
+            continue;
+        }
+        if matches!(
+            classify_workspace_manifest(&edges_dir, &activation, generation.state)?,
+            WorkspaceManifestState::Reconciled { .. }
+        ) {
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
 }
 
 /// Rewrite the derived entry from the activation record.

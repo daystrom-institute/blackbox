@@ -3675,6 +3675,31 @@ fn validate_relationship_chain(
                          (manifest entry is local:{project_id}, activation record is \
                          collected; reducer will converge by clearing the stale record)"
                     );
+                } else if generation.state() != bbox_code_source::GenerationState::Active
+                    && bbox_indexing::code_source_locality_manifest::is_torn_activation_predecessor(
+                        entry,
+                        project_id,
+                        activation.selector(),
+                        generation_id,
+                    )
+                {
+                    // Torn-activation admission: the entry is this project's
+                    // own collected publication for an EARLIER generation
+                    // while the journal names a generation whose state flip
+                    // has not landed. The activation never completed, so the
+                    // manifest is right and nothing may repair it yet; the
+                    // pre-bind reconciler deliberately leaves this shape
+                    // alone and the step-8 reducer sweep converges it. The
+                    // completed-but-torn counterpart never reaches here
+                    // because the reconciler repaired it before this ran.
+                    tracing::warn!(
+                        project = %project_id,
+                        journal_generation = %generation_id,
+                        manifest_generation = entry.code_source_generation.as_deref().unwrap_or_default(),
+                        "relationship chain link 5: activation in flight \
+                         (journal is ahead of the workspace manifest and the \
+                         generation is not yet active; reducer will converge it)"
+                    );
                 } else if entry_selector != Some(activation.selector()) {
                     bail!(
                         "error.code_source_relationship_chain: \
@@ -4102,8 +4127,32 @@ pub(crate) fn pre_bind_catalog_recovery(
         .context("pre-bind: catalog snapshot for startup recovery")?;
     let catalog = snapshot.catalog();
 
-    // Load the manifest index for workspace entries (link 5).
     let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
+
+    // Step 4b: repair any workspace manifest entry a torn activation left
+    // behind the activation journal, BEFORE the relationship chain reads it.
+    // The chain is a third reader of the same two durable owners, so a tear
+    // presents to it exactly as it does to the boot evidence loop, and the
+    // chain runs first. Reconciling ahead of it means the chain validates
+    // settled state instead of the tear, and it keeps its strict contract for
+    // every other caller rather than being relaxed for a shape that can be
+    // repaired. Deliberately permissive: an activation this cannot prove is
+    // skipped so the chain still emits its own precise refusal.
+    let reconciled_entries =
+        bbox_indexing::code_source_locality_manifest::reconcile_workspace_manifests_from_activations(
+            store,
+            projects_path,
+        )
+        .context("pre-bind: reconciling workspace manifest entries from the activation journal")?;
+    if reconciled_entries > 0 {
+        tracing::warn!(
+            reconciled = reconciled_entries,
+            "pre-bind: reconciled workspace manifest entries left behind by a torn activation"
+        );
+    }
+
+    // Load the manifest index for workspace entries (link 5), after the
+    // reconciliation above so the chain reads repaired state.
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
         .context("pre-bind: manifest index for relationship chain")?;
 
@@ -7824,8 +7873,7 @@ mod tests {
         fs::create_dir_all(catalog_projects_path.parent().unwrap()).unwrap();
         let scope = PublishedScope::try_new("repo_onboard", ".").unwrap();
         let other_scope = PublishedScope::try_new("repo_other", ".").unwrap();
-        let (state, _token) =
-            enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
+        let (state, _token) = enabled_catalog_onboard_state(&root, &catalog_projects_path, &scope);
         // A second producer whose grant covers a different scope.
         let other_secret = "e".repeat(64);
         let other_token = bro_rpc::ServiceToken::parse(other_secret.clone()).unwrap();
@@ -12848,6 +12896,208 @@ mod tests {
         assert!(
             err.contains("selector mismatch"),
             "error must be selector mismatch, got: {err}"
+        );
+    }
+
+    /// Rewrite a seeded generation's stored state, leaving every other field
+    /// byte-identical so link 2's `validate_against_generation` still passes.
+    fn p4f_set_generation_state(
+        root: &Path,
+        scope: &PublishedScope,
+        generation_id: &str,
+        state: GenerationState,
+    ) {
+        let generation = StoredGenerationV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            generation_id: generation_id.to_string(),
+            producer_id: "p4f-producer".to_string(),
+            ordinal: 1,
+            descriptor: empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+            published_scope: scope.clone(),
+            state,
+            diagnostic: None,
+            created_unix_secs: 1,
+            materialized_doc_count: Some(0),
+            entity_inventory_sha256: Some("e".repeat(64)),
+        };
+        let paths = CodeSourceStorePaths::new(root).unwrap();
+        let metadata_path = paths.generation_metadata(scope, generation_id).unwrap();
+        fs::write(
+            &metadata_path,
+            encode_stored_generation_v2_for_migration(&generation).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A workspace entry that is this project's own collected publication for
+    /// an EARLIER generation: what a crash between the activation journal
+    /// write and the derived manifest write leaves behind.
+    fn p4f_predecessor_entry(
+        project_id: &str,
+        predecessor_generation: &str,
+    ) -> bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+        bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+            manifest: format!("workspace/{project_id}/manifest.json"),
+            active_snapshot: Some(format!(
+                "workspace/{project_id}/snapshots/collected-{}",
+                "e".repeat(32)
+            )),
+            dirty_overlay: None,
+            repo_materialization: None,
+            code_source_selector: Some(
+                crate::index::project_files::collected_materialization_selector(
+                    project_id,
+                    predecessor_generation,
+                ),
+            ),
+            code_source_generation: Some(predecessor_generation.to_string()),
+            git_overlay: None,
+            git_overlay_managed: true,
+        }
+    }
+
+    /// Seed the second tear shape: the journal names a generation whose
+    /// activation is still in flight while the manifest still holds this
+    /// project's previous collected publication.
+    fn p4f_torn_chain_inputs(
+        root: &Path,
+        store: &CodeSourceStore,
+        project_id: &str,
+        scope: &PublishedScope,
+    ) -> (
+        String,
+        CatalogSnapshotV2,
+        bbox_edge_sidecar::manifest::ManifestIndex,
+    ) {
+        let generation_id = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"a".repeat(40)),
+        );
+        let predecessor = compute_generation_id(
+            "p4f-producer",
+            &empty_generation_descriptor(scope.clone(), &"b".repeat(40)),
+        );
+        assert_ne!(generation_id, predecessor);
+        p4f_seed_activation(
+            store,
+            &root.join("code-sources"),
+            project_id,
+            scope,
+            &generation_id,
+            None,
+            false,
+        );
+        let snapshot = p4f_catalog_snapshot(project_id, scope.clone(), vec![]);
+        let mut manifest = bbox_edge_sidecar::manifest::ManifestIndex::new();
+        manifest.workspaces.insert(
+            project_id.to_string(),
+            p4f_predecessor_entry(project_id, &predecessor),
+        );
+        (generation_id, snapshot, manifest)
+    }
+
+    /// The second refusal the production probe-kill hit. The journal is ahead
+    /// of the manifest and the generation's state flip never landed, so the
+    /// activation never completed: the manifest is correct, nothing may
+    /// repair it yet, and the chain admits it for the step-8 reducer sweep
+    /// instead of aborting open.
+    #[test]
+    fn chain_admits_a_torn_activation_still_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let scope = PublishedScope::try_new("torn-inflight", ".").unwrap();
+        let project_id = "p_0000000000000000000000000000tr1";
+
+        let (_generation_id, snapshot, manifest) =
+            p4f_torn_chain_inputs(&root, &store, project_id, &scope);
+
+        validate_relationship_chain(&store, &snapshot, &manifest)
+            .expect("an activation still in flight must not abort open");
+    }
+
+    /// The chain is NOT relaxed for the shape the journal provably owns. Once
+    /// the generation is Active the tear is a lost manifest write, and the
+    /// pre-bind reconciler repairs it BEFORE the chain runs; a caller that
+    /// validates without that repair still refuses.
+    #[test]
+    fn chain_refuses_a_torn_predecessor_once_the_generation_is_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let scope = PublishedScope::try_new("torn-active", ".").unwrap();
+        let project_id = "p_0000000000000000000000000000tr2";
+
+        let (generation_id, snapshot, manifest) =
+            p4f_torn_chain_inputs(&root, &store, project_id, &scope);
+        p4f_set_generation_state(
+            &root.join("code-sources"),
+            &scope,
+            &generation_id,
+            GenerationState::Active,
+        );
+
+        let error = validate_relationship_chain(&store, &snapshot, &manifest)
+            .expect_err("a repairable tear must not be admitted by the validator")
+            .to_string();
+        assert!(
+            error.contains("selector mismatch"),
+            "error must be selector mismatch, got: {error}"
+        );
+    }
+
+    /// Strictness preservation: the torn-activation admission is as narrow as
+    /// the cutback one. A collected predecessor entry whose manifest path
+    /// belongs to another project is drift, not a crash window.
+    #[test]
+    fn chain_refuses_a_cross_project_collected_predecessor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let runtime = CodeSourceRuntime::for_test_catalog(&root);
+        let store = runtime.store();
+        let scope = PublishedScope::try_new("torn-drift", ".").unwrap();
+        let project_id = "p_0000000000000000000000000000tr3";
+
+        let (_generation_id, snapshot, mut manifest) =
+            p4f_torn_chain_inputs(&root, &store, project_id, &scope);
+        manifest.workspaces.get_mut(project_id).unwrap().manifest =
+            "workspace/p_0000000000000000000000000000oth/manifest.json".to_string();
+
+        let error = validate_relationship_chain(&store, &snapshot, &manifest)
+            .expect_err("a cross-project entry is drift and must fail closed")
+            .to_string();
+        assert!(
+            error.contains("selector mismatch"),
+            "error must be selector mismatch, got: {error}"
+        );
+    }
+
+    /// The reconciliation sweep must run BEFORE the relationship chain reads
+    /// the manifest. The chain is a third reader of the same two durable
+    /// owners and refuses a tear the sweep can repair, so reconciling after it
+    /// would leave the crash loop exactly where it was.
+    #[test]
+    fn reconciliation_runs_before_chain_validation() {
+        let src = self_source();
+        let body = extract_fn_body_again(&src, "pre_bind_catalog_recovery");
+        let reconcile_pos = body
+            .find("reconcile_workspace_manifests_from_activations")
+            .expect("reconciliation must exist in pre_bind");
+        let chain_pos = body
+            .find("validate_relationship_chain")
+            .expect("chain validation must exist in pre_bind");
+        let manifest_load_pos = body
+            .find("manifest index for relationship chain")
+            .expect("the chain's manifest load must exist in pre_bind");
+        assert!(
+            reconcile_pos < chain_pos,
+            "reconciliation must run BEFORE chain validation"
+        );
+        assert!(
+            reconcile_pos < manifest_load_pos,
+            "the manifest the chain validates must be loaded AFTER reconciliation"
         );
     }
 
