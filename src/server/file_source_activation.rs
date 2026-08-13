@@ -225,6 +225,30 @@ fn retire_superseded_generation(
             // Dropping the token releases the writer lane's retirement hold.
             drop(retired);
         }
+        // A retryable refusal is a READINESS condition, not a failure: the
+        // writer defers retirement while a reindex pass holds the lane or
+        // while the vector store is still warming, which is the ordinary
+        // shape of an activation that lands just after boot. It is logged
+        // apart from a real failure so an operator reading the log is not
+        // sent hunting a fault that does not exist.
+        //
+        // Phase 1 has no redrive for the connector lane, so a deferred
+        // retirement is NOT retried: those documents stay in the index,
+        // unreachable through the active selector. The next activation
+        // supersedes a different predecessor, so it does not pick this one
+        // up. That is a known gap, and it is bounded (one stranded corpus per
+        // deferral) rather than silent.
+        Err(error) if super::code_source::selector_retirement_retryable(&error) => {
+            tracing::warn!(
+                project_id,
+                superseded_generation = %superseded,
+                error = %error,
+                "retirement of the superseded connector generation was \
+                 deferred by writer readiness and phase 1 does not redrive \
+                 it; its documents remain in the index and are not reachable \
+                 through the active selector"
+            )
+        }
         Err(error) => tracing::warn!(
             project_id,
             superseded_generation = %superseded,
@@ -1074,6 +1098,14 @@ mod tests {
             bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
         ));
         let (state, token) = onboarded_state(&root);
+        // Selector retirement deletes the superseded generation's vectors
+        // alongside its documents, so it REFUSES with a retryable
+        // "vector store is still warming up" while no global store is
+        // installed. A for_test daemon never warms one on its own, so without
+        // this the retirement defers forever and the assertion below can only
+        // ever time out. The code lane's own restart test installs the
+        // daemon's store the same way.
+        let _vectors = bbox_vectors::install_test_global(state.vector_store.clone());
 
         let first_documents = documents();
         let first = publish(&state, &token, &first_documents, 0).await;
