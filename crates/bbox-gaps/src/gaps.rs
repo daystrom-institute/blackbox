@@ -473,8 +473,9 @@ pub struct GapListParams {
     pub resolution: Option<String>,
     /// Restrict to one project's gaps. Accepts an absolute project path
     /// (e.g. `/home/user/repos/my-app`), a project_id, or a registered
-    /// project alias; an unresolvable value keeps literal substring-filter
-    /// semantics.
+    /// project alias, and matches rows by project identity; an unresolvable
+    /// value keeps literal substring-filter semantics and reports itself in
+    /// the response diagnostics.
     #[serde(default)]
     pub project: Option<String>,
     /// Provisional visibility policy: published, own, or all.
@@ -528,7 +529,8 @@ pub struct GapResolveParams {
     /// rewritten repo-owned gap file lands in that worktree (the session
     /// commits it; the branch carries it). The gap's durable project scope
     /// never changes. Absent → the file is rewritten where it lives today
-    /// (the base checkout). Ignored for global-scope gaps.
+    /// (the base checkout), and the owning project is resolved from the gap
+    /// id itself, which is globally unique. Ignored for global-scope gaps.
     #[serde(default)]
     pub project: Option<String>,
     /// Internal logical write-carrier id resolved by the MCP adapter from
@@ -568,7 +570,8 @@ pub struct GapUpdateParams {
     /// rewritten repo-owned gap file lands in that worktree (the session
     /// commits it; the branch carries it). The gap's durable project scope
     /// never changes. Absent → the file is rewritten where it lives today
-    /// (the base checkout). Ignored for global-scope gaps.
+    /// (the base checkout), and the owning project is resolved from the gap
+    /// id itself, which is globally unique. Ignored for global-scope gaps.
     #[serde(default)]
     pub project: Option<String>,
     /// Internal logical write-carrier id resolved by the MCP adapter from

@@ -243,6 +243,34 @@ impl BlackboxServer {
             .ok()
     }
 
+    /// Filter-class IDENTITY arm shared by the project-keyed store list
+    /// surfaces (gap-40ab1102). Resolves a caller's `project` filter value
+    /// through the same catalog order the transcript lane already uses
+    /// (`corpus_project_filter` in `src/tools/transcripts.rs`, gap-72fd5932):
+    /// project_id, operator alias, registered path.
+    ///
+    /// `Ok(project_id)` arms the store's dual-read id predicate, so a row
+    /// stamped with a project id matches whatever path key it carries. That
+    /// is load-bearing on a path-free daemon, where published rows carry a
+    /// `project_id` and NO path at all: without the id arm every filtered
+    /// query silently returned zero rows.
+    ///
+    /// `Err(diagnostic)` is a value that named no registered project. The
+    /// surface keeps its documented literal substring semantics and the
+    /// caller gets a line saying the value was unresolvable, instead of an
+    /// empty result that looks like an empty store.
+    pub(crate) fn project_filter_identity(&self, raw: &str) -> Result<String, String> {
+        match self
+            .resolve_project_filter(raw)
+            .and_then(|resolution| resolution.project_id().map(str::to_owned))
+        {
+            Some(project_id) => Ok(project_id),
+            None => Err(format!(
+                "project filter `{raw}` resolved to no registered project (tried project_id, operator alias, and registered path); only a literal substring match on a row's stored project path can return rows"
+            )),
+        }
+    }
+
     /// Tuple wrapper variant that also carries the resolved project id for
     /// dual-read stamping (phase-2 §8.1).
     pub(crate) fn resolve_project_write_scope_with_id(
@@ -622,6 +650,44 @@ mod tests {
         assert_eq!(
             counters.surfaces["test_surface"]["path_hash_fallback"].count,
             1
+        );
+    }
+
+    /// Filter-class identity arm (gap-40ab1102): id, alias, registered path,
+    /// worktree, and subdirectory all resolve to the base project id; a
+    /// selector that names no registered project reports the value it could
+    /// not resolve instead of silently narrowing to nothing.
+    #[test]
+    fn project_filter_identity_resolves_selectors_and_names_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().canonicalize().unwrap();
+        let fx = parity_fixture(&tmp);
+
+        for selector in [
+            fx.record.project_id.as_str(),
+            "parity-alias",
+            fx.base.to_str().unwrap(),
+            fx.worktree.to_str().unwrap(),
+            fx.subdir.to_str().unwrap(),
+        ] {
+            assert_eq!(
+                fx.server.project_filter_identity(selector),
+                Ok(fx.record.project_id.clone()),
+                "selector {selector}"
+            );
+        }
+
+        let diagnostic = fx
+            .server
+            .project_filter_identity("not-a-registered-selector")
+            .unwrap_err();
+        assert!(
+            diagnostic.contains("not-a-registered-selector"),
+            "the diagnostic must name the unresolvable value: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("resolved to no registered project"),
+            "{diagnostic}"
         );
     }
 

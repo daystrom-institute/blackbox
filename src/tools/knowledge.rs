@@ -191,18 +191,38 @@ fn log_tool_err(tool: &'static str, start: std::time::Instant, err: &anyhow::Err
 /// worktree (scoped to the worktree path) stay visible too. Non-path filters
 /// (substring matches like "transcript-search") and unregistered paths are
 /// left untouched.
-fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut KnowledgeListParams) {
+///
+/// Returns a diagnostic when the filter value named no registered project
+/// (gap-40ab1102): that query keeps its literal substring semantics, and the
+/// caller must be told so rather than reading an empty result as an empty
+/// store.
+fn rescope_project_filter(
+    server: &crate::server::BlackboxServer,
+    p: &mut KnowledgeListParams,
+) -> Option<String> {
     use bbox_corpus_core::project_selector::{ProjectResolution, ResolvedAttachment};
-    let Some(raw) = p.project.as_deref() else {
-        return;
-    };
+    let raw = p.project.clone()?;
+    // Identity arm (gap-40ab1102): a filter that resolves also arms the
+    // dual-read id predicate, so rows stamped with a project_id match
+    // whatever path key they carry. A catalog-published row carries no path
+    // at all, which is how a path-free daemon answered a filtered query with
+    // zero rows over entries that plainly held its project_id.
+    // A blank value is the documented unscoped escape hatch, not a failed
+    // resolution: it narrows nothing and reports nothing.
+    let mut diagnostic = None;
+    if p.project_id.is_none() && !raw.trim().is_empty() {
+        match server.project_filter_identity(&raw) {
+            Ok(project_id) => p.project_id = Some(project_id),
+            Err(text) => diagnostic = Some(text),
+        }
+    }
     // Filter-class engine resolution (phase-2 §9.2): a selector that
     // resolves rewrites to the durable store key (worktree/subdir/alias/id →
     // registered base); one that does not keeps its substring-filter
     // semantics untouched. A worktree checkout is recorded in
     // `project_alias` so entries written from inside it stay visible.
-    let Some(resolution) = server.resolve_project_filter(raw) else {
-        return;
+    let Some(resolution) = server.resolve_project_filter(&raw) else {
+        return diagnostic;
     };
     // Catalog-mode ledger arm (plan §8.2): path-only entries still keyed under
     // one of this project's historical paths stay visible after attachment
@@ -211,7 +231,7 @@ fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut Knowle
         p.project_ledger_paths = server.ledger_historical_paths(project_id);
     }
     let ProjectResolution::Attached(ctx) = resolution else {
-        return;
+        return diagnostic;
     };
     // The alias dir is where checkout-local rows land: the v1 checkout root,
     // or the catalog attachment's own project dir under the key-to-base rule.
@@ -226,6 +246,7 @@ fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut Knowle
         p.project_alias = Some(checkout_dir);
     }
     p.project = Some(ctx.store_key);
+    diagnostic
 }
 
 impl BlackboxServer {
@@ -1617,8 +1638,11 @@ impl BlackboxServer {
             }
 
             let mut p = p;
-            if p.project.is_some() {
-                rescope_project_filter(&server, &mut p);
+            let mut filter_diagnostics = Vec::new();
+            if p.project.is_some()
+                && let Some(diagnostic) = rescope_project_filter(&server, &mut p)
+            {
+                filter_diagnostics.push(diagnostic);
             }
 
             let mut view = server.session_knowledge_view(
@@ -1627,6 +1651,12 @@ impl BlackboxServer {
             )?;
             let mut combined = view.knowledge.list(&p)?;
             let returned_ids = returned_entry_ids(&combined);
+            // Response-scoped diagnostics (gap-40ab1102): the legacy-lane
+            // line belongs to the rows this caller actually got, and the
+            // filter-resolution lines lead so an empty result explains
+            // itself.
+            let returned_legacy_rows = view.returned_rows_include_legacy_lane(&returned_ids);
+            view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
             if let Some(diagnostics) = view.diagnostics_text() {
                 combined.push_str("\n\n");
                 combined.push_str(&diagnostics);
@@ -2152,14 +2182,18 @@ mod tests {
         let (base, _worktree) = init_repo_with_worktree(&tmp_root);
         let (server, _record) = server_with_registered(&tmp_root, &base);
 
-        // Substring filter (not an absolute path) is untouched.
+        // Substring filter (not an absolute path) is untouched, and the
+        // caller is told the value resolved to nothing (gap-40ab1102).
         let mut p = KnowledgeListParams {
             project: Some("transcript-search".into()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        let diagnostic = rescope_project_filter(&server, &mut p)
+            .expect("an unresolvable filter must report itself");
+        assert!(diagnostic.contains("transcript-search"), "{diagnostic}");
         assert_eq!(p.project.as_deref(), Some("transcript-search"));
         assert_eq!(p.project_alias, None);
+        assert_eq!(p.project_id, None);
 
         // An absolute path no registered project owns is untouched.
         let stranger = tmp_root.join("stranger");
@@ -2168,7 +2202,12 @@ mod tests {
             project: Some(stranger.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        let diagnostic = rescope_project_filter(&server, &mut p)
+            .expect("an unresolvable filter must report itself");
+        assert!(
+            diagnostic.contains(stranger.to_str().unwrap()),
+            "{diagnostic}"
+        );
         assert_eq!(p.project.as_deref(), Some(stranger.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
     }
@@ -2193,22 +2232,35 @@ mod tests {
             )
             .unwrap();
 
-        // A registered alias rewrites to the base canonical path.
+        // A registered alias rewrites to the base canonical path AND arms
+        // the id predicate, so rows carrying only a project_id match too
+        // (gap-40ab1102).
         let mut p = KnowledgeListParams {
             project: Some("blackbox".into()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        assert_eq!(rescope_project_filter(&server, &mut p), None);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
+        assert_eq!(p.project_id.as_deref(), Some(record.project_id.as_str()));
 
         // A project_id selector rewrites the same way.
         let mut p = KnowledgeListParams {
             project: Some(record.project_id.clone()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        assert_eq!(rescope_project_filter(&server, &mut p), None);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
+        assert_eq!(p.project_id.as_deref(), Some(record.project_id.as_str()));
+
+        // A caller-supplied id is respected rather than overwritten.
+        let mut p = KnowledgeListParams {
+            project: Some(record.project_id.clone()),
+            project_id: Some("caller-supplied".into()),
+            ..Default::default()
+        };
+        assert_eq!(rescope_project_filter(&server, &mut p), None);
+        assert_eq!(p.project_id.as_deref(), Some("caller-supplied"));
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
@@ -2419,5 +2471,209 @@ mod tests {
             .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
             .count();
         assert_eq!(remaining, 1, "failed admission must not write a new entry");
+    }
+
+    /// A project-scoped entry stamped with project identity and NO path key,
+    /// the shape every catalog-published row has.
+    fn stamped_entry(
+        id: &str,
+        content: &str,
+        project_id: &str,
+    ) -> crate::knowledge::KnowledgeEntry {
+        use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
+        crate::knowledge::KnowledgeEntry {
+            id: id.into(),
+            title: id.into(),
+            content: content.into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            project_id: Some(project_id.to_string()),
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    fn knowledge_rows(structured: &serde_json::Value) -> &Vec<serde_json::Value> {
+        structured["rows"].as_array().expect("rows array")
+    }
+
+    fn knowledge_diagnostics(structured: &serde_json::Value) -> Vec<String> {
+        structured["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .map(|line| line.as_str().expect("diagnostic string").to_string())
+            .collect()
+    }
+
+    /// gap-40ab1102 (1): a `project` filter must match rows by their stamped
+    /// project id. A row that carries a project_id and no path key (every
+    /// catalog-published row) was dropped by all three selectors before the
+    /// filter armed the id predicate, so a project with knowledge answered
+    /// every filtered query with nothing.
+    #[tokio::test]
+    async fn bbox_knowledge_project_filter_matches_stamped_rows_by_id_alias_and_path() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .sync_declared_aliases(
+                &record.project_id,
+                &["kb-filter-alias".to_string()].into_iter().collect(),
+            )
+            .unwrap();
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry(
+                "stamped-row",
+                "STAMPED_ROW_MARKER",
+                &record.project_id,
+            ))
+            .unwrap();
+
+        for selector in [
+            record.project_id.as_str(),
+            "kb-filter-alias",
+            base.to_str().unwrap(),
+        ] {
+            let result = server
+                .bbox_knowledge(Parameters(KnowledgeListParams {
+                    project: Some(selector.to_string()),
+                    ..Default::default()
+                }))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{selector}: {result:?}");
+            let structured = result
+                .structured_content
+                .expect("bbox_knowledge structured response");
+            let rows = knowledge_rows(&structured);
+            assert_eq!(rows.len(), 1, "selector {selector}: {structured}");
+            assert_eq!(rows[0]["entry"]["id"], "stamped-row", "{selector}");
+        }
+    }
+
+    /// gap-40ab1102 (1): a filter value that names no registered project
+    /// keeps literal substring semantics AND reports itself, so an empty
+    /// result cannot be read as an empty store.
+    #[tokio::test]
+    async fn bbox_knowledge_unresolvable_project_filter_reports_the_value() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry(
+                "stamped-row",
+                "STAMPED_ROW_MARKER",
+                &record.project_id,
+            ))
+            .unwrap();
+
+        let result = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                project: Some("no-such-project-selector".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let structured = result
+            .structured_content
+            .expect("bbox_knowledge structured response");
+        assert!(knowledge_rows(&structured).is_empty(), "{structured}");
+        let diagnostics = knowledge_diagnostics(&structured).join("\n");
+        assert!(
+            diagnostics.contains("no-such-project-selector"),
+            "the diagnostic must name the unresolvable value: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("resolved to no registered project"),
+            "{diagnostics}"
+        );
+    }
+
+    /// gap-40ab1102 (3): the legacy-lane diagnostic describes ROWS, so a
+    /// response that returned none of them must not carry it. Firing it on
+    /// every response, stamped or not, is what trains callers to ignore
+    /// diagnostics.
+    #[tokio::test]
+    async fn bbox_knowledge_legacy_diagnostic_only_rides_responses_with_legacy_rows() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry(
+                "stamped-row",
+                "STAMPED_ROW_MARKER",
+                &record.project_id,
+            ))
+            .unwrap();
+
+        let matching = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                query: Some("STAMPED_ROW_MARKER".into()),
+                ..Default::default()
+            }))
+            .await
+            .structured_content
+            .expect("bbox_knowledge structured response");
+        assert_eq!(knowledge_rows(&matching).len(), 1, "{matching}");
+        assert!(
+            knowledge_diagnostics(&matching)
+                .iter()
+                .any(|diagnostic| diagnostic.contains("legacy_compatibility")),
+            "a returned legacy row keeps the warning: {matching}"
+        );
+
+        let empty = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                query: Some("NO_SUCH_ENTRY_MARKER".into()),
+                ..Default::default()
+            }))
+            .await
+            .structured_content
+            .expect("bbox_knowledge structured response");
+        assert!(knowledge_rows(&empty).is_empty(), "{empty}");
+        assert!(
+            !knowledge_diagnostics(&empty)
+                .iter()
+                .any(|diagnostic| diagnostic.contains("legacy_compatibility")),
+            "a response with no legacy rows must not warn about them: {empty}"
+        );
     }
 }

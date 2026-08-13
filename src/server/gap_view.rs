@@ -28,8 +28,14 @@ use super::BlackboxServer;
 use super::knowledge_view::{
     CatalogOverlayAttachment, ERROR_OVERLAY_ACCEPTED_CONTENT_CHANGED,
     ERROR_OVERLAY_BASELINE_UNAVAILABLE, ERROR_OVERLAY_SNAPSHOT_STALE,
-    ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE, OverlayDegradation, basename,
+    ERROR_PROVISIONAL_OVERLAY_UNAVAILABLE, LEGACY_COMPATIBILITY_LANE, OverlayDegradation, basename,
 };
+
+/// The single diagnostic the legacy gap lane emits. Named for the same
+/// reason as its knowledge twin (gap-40ab1102): the line describes ROWS, so
+/// a response emits it only when the rows it returned include one.
+pub(crate) const LEGACY_COMPATIBILITY_GAP_DIAGNOSTIC: &str =
+    "legacy_compatibility gap rows have no provable built_from stamp";
 
 #[derive(Clone)]
 pub(crate) struct PublishedGapCacheEntry {
@@ -74,6 +80,39 @@ impl SessionGapView {
 
     pub(crate) fn append_built_from_table(&self, output: String, table: &BuiltFromTable) -> String {
         super::built_from::append_built_from_section(output, table)
+    }
+
+    /// Whether any of these returned gap ids came from the legacy lane.
+    pub(crate) fn returned_rows_include_legacy_lane<'a>(
+        &self,
+        returned_ids: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        returned_ids.into_iter().any(|id| {
+            self.gaps
+                .view_metadata(id)
+                .and_then(|metadata| metadata.compatibility_lane.as_deref())
+                == Some(LEGACY_COMPATIBILITY_LANE)
+        })
+    }
+
+    /// Shape this view's diagnostics for ONE response (gap-40ab1102), the
+    /// twin of [`super::knowledge_view::SessionKnowledgeView::finalize_response_diagnostics`]:
+    /// the legacy-compatibility line rides a response only when the rows
+    /// that response returned actually include a legacy-lane row, and
+    /// filter-resolution diagnostics lead because they explain an empty
+    /// result.
+    pub(crate) fn finalize_response_diagnostics(
+        &mut self,
+        returned_legacy_rows: bool,
+        filter_diagnostics: Vec<String>,
+    ) {
+        if !returned_legacy_rows {
+            self.diagnostics
+                .retain(|diagnostic| diagnostic.as_str() != LEGACY_COMPATIBILITY_GAP_DIAGNOSTIC);
+        }
+        let mut diagnostics = filter_diagnostics;
+        diagnostics.append(&mut self.diagnostics);
+        self.diagnostics = diagnostics;
     }
 }
 
@@ -477,8 +516,7 @@ impl BlackboxServer {
         }
 
         if has_legacy_compatibility_rows {
-            diagnostics
-                .push("legacy_compatibility gap rows have no provable built_from stamp".into());
+            diagnostics.push(LEGACY_COMPATIBILITY_GAP_DIAGNOSTIC.into());
         }
         built_from.retain_ids(
             metadata
@@ -1310,7 +1348,7 @@ fn provisional_gap_ref(checkout_id: &str, gap_id: &str) -> String {
 fn legacy_gap_metadata() -> GapViewMetadata {
     GapViewMetadata {
         built_from_ref: None,
-        compatibility_lane: Some("legacy_compatibility".into()),
+        compatibility_lane: Some(LEGACY_COMPATIBILITY_LANE.into()),
     }
 }
 
@@ -1319,7 +1357,7 @@ fn overlay_gap_metadata(built_from_ref: Option<&str>) -> GapViewMetadata {
         built_from_ref: built_from_ref.map(str::to_owned),
         compatibility_lane: built_from_ref
             .is_none()
-            .then(|| "legacy_compatibility".into()),
+            .then(|| LEGACY_COMPATIBILITY_LANE.into()),
     }
 }
 
