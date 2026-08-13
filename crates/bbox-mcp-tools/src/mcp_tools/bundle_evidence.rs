@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::mcp_tools::find_paths::{render_node, render_path};
-use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache};
+use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection};
+use bbox_chunker::{EdgeConfidence, EdgeProvenance};
 use bbox_corpus_core::entity_ref::EntityRef;
-use bbox_edge_index::edge_index::EdgeIndex;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_providers::entity_loader;
 use bbox_providers::providers::ProviderContext;
 
@@ -82,13 +83,16 @@ pub fn bundle_evidence(
     let omitted_path_ids = p.path_ids.len().saturating_sub(PATH_CAP);
     for path_id in p.path_ids.iter().take(PATH_CAP) {
         match cache.get(PROCESS_SESSION_KEY, path_id) {
-            Some(path) => paths.push(path),
+            Some(mut path) => {
+                refresh_path_evidence(ctx, &mut path);
+                paths.push(path);
+            }
             None => stale_path_ids.push(path_id.clone()),
         }
     }
 
     let refs = entities.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>();
-    let mut intra_bundle_edges = intra_bundle_edges(edge_index, &refs);
+    let mut intra_bundle_edges = intra_bundle_edges(ctx, edge_index, &refs);
     let intra_bundle_edges_truncated = intra_bundle_edges.len() > INTRA_BUNDLE_EDGE_CAP;
     intra_bundle_edges.truncate(INTRA_BUNDLE_EDGE_CAP);
     let mut intra_bundle_convergences = intra_bundle_convergences(edge_index, &refs);
@@ -213,9 +217,57 @@ fn truncate_property(value: &str, max_chars: usize) -> String {
     out
 }
 
-fn intra_bundle_edges(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_json::Value> {
+/// Re-scores every evidence step in a cached path.
+///
+/// A path is cached from an earlier `bbox_find_paths` call, so its endpoint
+/// statuses are as old as that call. Freshness is a live property: a connector
+/// reprojection between the traversal and the bundle must show up here, or the
+/// bundle would assert a currency it no longer has.
+fn refresh_path_evidence(ctx: &ProviderContext<'_>, path: &mut CachedPath) {
+    for step in &mut path.steps {
+        if !step
+            .metadata
+            .contains_key(bbox_project_graph::EVIDENCE_META_BINDING_ID)
+        {
+            continue;
+        }
+        let (source, target) = match step.direction {
+            PathDirection::Out => (step.from.clone(), step.to.clone()),
+            PathDirection::In => (step.to.clone(), step.from.clone()),
+        };
+        let mut edge = Edge {
+            source,
+            kind: step.edge_kind.clone(),
+            target,
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: step.metadata.clone(),
+            project_id: step
+                .metadata
+                .get(bbox_project_graph::EVIDENCE_META_PROJECT_ID)
+                .cloned(),
+        };
+        crate::mcp_tools::inspect::refine_evidence_edge(ctx, &mut edge);
+        step.metadata = edge.metadata;
+    }
+}
+
+/// Edges that run between two entities already in the bundle.
+///
+/// Evidence bindings are enumerated alongside the corpus edge index because
+/// they do not live in it: a binding is tenant-asserted state on the
+/// repo-owned lane, not a projected corpus fact. Each edge carries its
+/// `evidence.*` provenance so a bundle answers who asserted the relation,
+/// under which observation or mapping, and whether it is still current, which
+/// is the whole reason to bundle it rather than restate it.
+fn intra_bundle_edges(
+    ctx: &ProviderContext<'_>,
+    edge_index: &EdgeIndex,
+    refs: &[EntityRef],
+) -> Vec<serde_json::Value> {
     let set = refs.iter().collect::<HashSet<_>>();
     let mut edges = Vec::new();
+    let mut seen = HashSet::new();
     for source in refs {
         for edge in edge_index.forward_edges(source) {
             if set.contains(&edge.target) {
@@ -225,6 +277,30 @@ fn intra_bundle_edges(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_j
                     "target": edge.target.to_string(),
                 }));
             }
+        }
+        for mut edge in ctx.evidence_edges(source) {
+            crate::mcp_tools::inspect::refine_evidence_edge(ctx, &mut edge);
+            if !set.contains(&edge.target) || !set.contains(&edge.source) {
+                continue;
+            }
+            // Both endpoints are bundled, so the binding is enumerated from
+            // each end; emit it once.
+            let binding_id = edge
+                .metadata
+                .get(bbox_project_graph::EVIDENCE_META_BINDING_ID)
+                .cloned()
+                .unwrap_or_else(|| format!("{}|{}|{}", edge.source, edge.kind, edge.target));
+            if !seen.insert(binding_id) {
+                continue;
+            }
+            edges.push(json!({
+                "source": edge.source.to_string(),
+                "kind": edge.kind,
+                "target": edge.target.to_string(),
+                "provenance": edge.provenance,
+                "confidence": edge.confidence,
+                "properties": edge.metadata,
+            }));
         }
     }
     edges

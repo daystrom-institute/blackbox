@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,15 @@ pub struct PathStep {
     pub edge_kind: String,
     pub to: EntityRef,
     pub direction: PathDirection,
+    /// Per-step edge labels, currently the `evidence.*` family: which binding
+    /// produced this hop, who asserted it, and the freshness of each endpoint.
+    ///
+    /// This rides `PathStep` rather than a parallel structure because
+    /// `PathStep` is serialized verbatim by both `bbox_find_paths` and
+    /// `bbox_bundle_evidence`, so one field covers both surfaces and they
+    /// cannot drift.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +116,7 @@ mod tests {
             edge_kind: "SUPERSEDES".into(),
             to: EntityRef::parse(&format!("knowledge:to{n}")).unwrap(),
             direction: PathDirection::Out,
+            metadata: BTreeMap::new(),
         }
     }
 

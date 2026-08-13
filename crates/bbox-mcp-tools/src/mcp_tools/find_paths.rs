@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use anyhow::Result;
 use rmcp::schemars;
@@ -8,7 +8,8 @@ use serde_json::json;
 use crate::mcp_tools::inspect::compact_label;
 use crate::path_cache::{CachedPath, PROCESS_SESSION_KEY, PathCache, PathDirection, PathStep};
 use bbox_corpus_core::entity_ref::{EntityRef, EntityType};
-use bbox_edge_index::edge_index::EdgeIndex;
+use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_project_graph::EvidenceEndpointStatus;
 use bbox_providers::providers::ProviderContext;
 
 const RENDERED_TEXT_CAP_BYTES: usize = 30 * 1024;
@@ -224,7 +225,12 @@ fn bfs(
         if entry.steps.len() >= max_depth {
             continue;
         }
-        for (edge_kind, direction, next) in expansions(ctx, edge_index, &entry.current, edge_filter)
+        for Expansion {
+            edge_kind,
+            direction,
+            next,
+            metadata,
+        } in expansions(ctx, edge_index, &entry.current, edge_filter)
         {
             if entry.visited.contains(&next) {
                 continue;
@@ -235,6 +241,7 @@ fn bfs(
                 edge_kind,
                 to: next.clone(),
                 direction,
+                metadata,
             });
             if to.is_some_and(|target| target == &next)
                 || to_type.is_some_and(|filter| filter.matches(&next))
@@ -256,27 +263,52 @@ fn bfs(
     found
 }
 
+/// One admissible next hop, plus whatever per-edge labels produced it.
+struct Expansion {
+    edge_kind: String,
+    direction: PathDirection,
+    next: EntityRef,
+    metadata: BTreeMap<String, String>,
+}
+
 fn expansions(
     ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
     current: &EntityRef,
     edge_filter: Option<&HashSet<String>>,
-) -> Vec<(String, PathDirection, EntityRef)> {
+) -> Vec<Expansion> {
     let mut out = Vec::new();
+    let mut push = |edge: Edge, direction: PathDirection| {
+        if edge_filter.is_some_and(|allowed| !allowed.contains(&edge.kind)) {
+            return;
+        }
+        // Traversal never crosses an unauthorized endpoint. Inspection still
+        // shows the edge for diagnosis, but a path that walked through a
+        // foreign scope would be an answer the caller is not entitled to.
+        if !evidence_step_is_traversable(&edge, direction) {
+            return;
+        }
+        let next = match direction {
+            PathDirection::Out => edge.target,
+            PathDirection::In => edge.source,
+        };
+        out.push(Expansion {
+            edge_kind: edge.kind,
+            direction,
+            next,
+            metadata: edge.metadata,
+        });
+    };
     if matches!(
         current.entity_type(),
         EntityType::ProjectGraphVertex | EntityType::ProvisionalProjectGraphVertex
     ) {
         if let Ok(entity) = bbox_providers::entity_loader::load(ctx, current) {
             for edge in entity.neighborhood.forward {
-                if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-                    out.push((edge.kind, PathDirection::Out, edge.target));
-                }
+                push(edge, PathDirection::Out);
             }
             for edge in entity.neighborhood.reverse {
-                if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-                    out.push((edge.kind, PathDirection::In, edge.source));
-                }
+                push(edge, PathDirection::In);
             }
         }
         return out;
@@ -287,16 +319,39 @@ fn expansions(
     // edge. Forward only: the reverse enumeration isn't a pure function of
     // the session ref, so it isn't synthesized here.
     for edge in edge_index.forward_edges_with_synthesis(current) {
-        if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-            out.push((edge.kind.clone(), PathDirection::Out, edge.target.clone()));
-        }
+        push(edge, PathDirection::Out);
     }
     for edge in edge_index.reverse_edges(current) {
-        if edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)) {
-            out.push((edge.kind.clone(), PathDirection::In, edge.source.clone()));
-        }
+        push(edge.clone(), PathDirection::In);
+    }
+    // A non-graph entity can still be an evidence endpoint: a project file or
+    // knowledge entry that a binding points at is reachable from the graph
+    // side, so it has to be reachable back the other way for the reverse
+    // traversal to preserve provenance.
+    for edge in ctx.evidence_edges(current) {
+        let direction = if &edge.source == current {
+            PathDirection::Out
+        } else {
+            PathDirection::In
+        };
+        push(edge, direction);
     }
     out
+}
+
+/// Whether traversal may cross this edge into the endpoint it leads to.
+///
+/// Non-evidence edges are always traversable. An evidence edge is refused
+/// only when the endpoint being STEPPED INTO is unauthorized; an unauthorized
+/// endpoint behind us is already where we came from.
+fn evidence_step_is_traversable(edge: &Edge, direction: PathDirection) -> bool {
+    let key = match direction {
+        PathDirection::Out => bbox_project_graph::EVIDENCE_META_TARGET_STATUS,
+        PathDirection::In => bbox_project_graph::EVIDENCE_META_SOURCE_STATUS,
+    };
+    edge.metadata
+        .get(key)
+        .is_none_or(|status| status != EvidenceEndpointStatus::Unauthorized.as_str())
 }
 
 fn parse_edge_filter(raw: Option<&EdgeTypesParam>) -> Option<HashSet<String>> {
@@ -359,13 +414,27 @@ pub fn render_path(ctx: &ProviderContext<'_>, path: &CachedPath) -> String {
         .map(|step| {
             let from = render_node(ctx, &step.from);
             let to = render_node(ctx, &step.to);
+            let freshness = rendered_evidence_freshness(&step.metadata);
             match step.direction {
-                PathDirection::Out => format!("{from} --{}--> {to}", step.edge_kind),
-                PathDirection::In => format!("{from} <--{}-- {to}", step.edge_kind),
+                PathDirection::Out => {
+                    format!("{from} --{}{freshness}--> {to}", step.edge_kind)
+                }
+                PathDirection::In => {
+                    format!("{from} <--{}{freshness}-- {to}", step.edge_kind)
+                }
             }
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+/// Renders an evidence step's freshness inline so a reader sees a stale or
+/// missing endpoint in the path text, not only in the structured metadata.
+fn rendered_evidence_freshness(metadata: &BTreeMap<String, String>) -> String {
+    metadata
+        .get(bbox_project_graph::EVIDENCE_META_FRESHNESS)
+        .map(|status| format!(" [{status}]"))
+        .unwrap_or_default()
 }
 
 pub fn render_node(ctx: &ProviderContext<'_>, r: &EntityRef) -> String {
@@ -406,6 +475,86 @@ mod tests {
     use super::*;
     use bbox_chunker::{EdgeConfidence, EdgeProvenance};
     use bbox_edge_index::edge_index::Edge;
+
+    fn evidence_edge(
+        source: &EntityRef,
+        target: &EntityRef,
+        status_key: &str,
+        status: &str,
+    ) -> Edge {
+        Edge {
+            source: source.clone(),
+            kind: "record:CORRESPONDS_TO".into(),
+            target: target.clone(),
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::from([
+                (
+                    bbox_project_graph::EVIDENCE_META_BINDING_ID.to_string(),
+                    "binding-1".to_string(),
+                ),
+                (status_key.to_string(), status.to_string()),
+            ]),
+            project_id: None,
+        }
+    }
+
+    /// Contract: path traversal never crosses an unauthorized endpoint, while
+    /// every other non-current status stays traversable and merely labeled.
+    ///
+    /// This exercises the guard directly rather than through a document,
+    /// because a binding document cannot currently express a foreign-scope
+    /// endpoint: project-scoped endpoints are materialized with the lane's own
+    /// project id, and the literal-ref form refuses project-scoped types. The
+    /// guard is the fail-closed backstop for anything that ever does produce
+    /// one, so it is tested where it can actually be reached.
+    #[test]
+    fn traversal_refuses_only_the_unauthorized_endpoint_it_would_step_into() {
+        let from = EntityRef::parse("knowledge:a").unwrap();
+        let to = EntityRef::parse("knowledge:b").unwrap();
+
+        let unauthorized_target = evidence_edge(
+            &from,
+            &to,
+            bbox_project_graph::EVIDENCE_META_TARGET_STATUS,
+            "unauthorized",
+        );
+        assert!(!evidence_step_is_traversable(
+            &unauthorized_target,
+            PathDirection::Out
+        ));
+        // Walking the other way, the unauthorized endpoint is behind us.
+        assert!(evidence_step_is_traversable(
+            &unauthorized_target,
+            PathDirection::In
+        ));
+
+        for status in ["current", "stale", "missing", "unresolved"] {
+            let edge = evidence_edge(
+                &from,
+                &to,
+                bbox_project_graph::EVIDENCE_META_TARGET_STATUS,
+                status,
+            );
+            assert!(
+                evidence_step_is_traversable(&edge, PathDirection::Out),
+                "{status} endpoints must stay traversable and labeled"
+            );
+        }
+
+        // A plain corpus edge carries no evidence metadata and is unaffected.
+        let plain = Edge {
+            source: from,
+            kind: "SUPERSEDES".into(),
+            target: to,
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        };
+        assert!(evidence_step_is_traversable(&plain, PathDirection::Out));
+        assert!(evidence_step_is_traversable(&plain, PathDirection::In));
+    }
 
     #[test]
     fn bfs_finds_direction_preserving_path() {
