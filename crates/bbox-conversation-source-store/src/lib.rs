@@ -136,6 +136,14 @@ impl JournalEntryV1 {
         }
     }
 
+    fn channel_id(&self) -> &str {
+        match self {
+            Self::Message(record) => &record.channel_id,
+            Self::Revision(record) => &record.channel_id,
+            Self::Tombstone(record) => &record.channel_id,
+        }
+    }
+
     fn observed_at(&self) -> &str {
         match self {
             Self::Message(record) => &record.observed_at,
@@ -205,6 +213,16 @@ struct ChannelFold {
     /// is what makes the journal's replay total: the same bytes fold to the
     /// same state no matter which order the two lanes landed them in.
     pending: BTreeMap<String, Vec<JournalEntryV1>>,
+    /// The channel every entry in this journal names, recovered from the first
+    /// entry of ANY kind.
+    ///
+    /// Taken from the raw entry rather than from a landed message on purpose:
+    /// a channel whose journal holds only held revisions has no landed message
+    /// to read an id off, and recovering from `messages` would make exactly
+    /// that channel invisible to `cursors` and `status` -- the one channel an
+    /// operator most needs to see, because it holds deletions for bodies the
+    /// corpus has never seen.
+    channel_id: Option<String>,
     revisions_applied: u64,
     last_observed_at: Option<String>,
     /// Byte offset of the end of the last COMPLETE, parseable line.
@@ -350,12 +368,13 @@ impl ConversationSourceStore {
                 ids.insert(observation.channel_id);
                 continue;
             }
-            // No roster: recover the id from the first journal entry, so a
-            // channel that landed records before it was ever rostered is not
-            // invisible to cursors and status.
+            // No roster: recover the id from the first journal entry of any
+            // kind, so neither a channel that landed records before it was
+            // rostered nor one holding only unapplied revisions is invisible
+            // to cursors and status.
             let fold = fold_journal(&path.join("journal.ndjson"))?;
-            if let Some(landed) = fold.messages.values().next() {
-                ids.insert(landed.record.channel_id.clone());
+            if let Some(channel_id) = fold.channel_id {
+                ids.insert(channel_id);
             }
         }
         Ok(ids.into_iter().collect())
@@ -415,12 +434,23 @@ impl ConversationSourceStore {
         })
     }
 
-    /// Land edits and tombstones against records this corpus already holds.
+    /// Land edits and tombstones against records this corpus holds, or will.
     ///
     /// Storage only. The reconciliation that DECIDES a message was edited or
     /// deleted is producer-side window diffing (design 5.4) and applying a
     /// revision to the projected document is S4; this makes the observation
     /// durable, ordered, and idempotent, and nothing more.
+    ///
+    /// **The counting contract.** `accepted + duplicates` equals the number of
+    /// revisions sent, and `accepted` splits into `applied` (superseded a
+    /// landed message in place) and `held` (journaled, waiting on a message
+    /// this corpus has not landed yet). Held is DURABLE and REPORTED, never
+    /// silent: it rides this receipt, the returned cursor's
+    /// `held_revisions`, and the status read, so the S4 reconciliation lane
+    /// watches the backlog rather than inferring it. The two never-landed and
+    /// landed-and-superseded cases stay distinguishable because a producer
+    /// that cannot tell them apart cannot tell a healthy mid-history start
+    /// from a backfill that has stalled.
     pub fn land_revisions(
         &self,
         scope: &ConnectorScope,
@@ -437,7 +467,8 @@ impl ConversationSourceStore {
 
         let mut appended = Vec::new();
         let mut duplicates = 0_u64;
-        let mut unknown_messages = 0_u64;
+        let mut applied = 0_u64;
+        let mut held = 0_u64;
         for revision in &request.revisions {
             let Some(key) = message_ts_order_key(revision.message_ts()) else {
                 bail!("invalid message timestamp survived revisions validation");
@@ -448,7 +479,11 @@ impl ConversationSourceStore {
             };
             match fold.messages.get(&key) {
                 Some(landed) if landed.key.revision >= revision.revision() => duplicates += 1,
-                Some(_) => appended.push(entry()),
+                // Supersedes a message the corpus already holds.
+                Some(_) => {
+                    applied += 1;
+                    appended.push(entry());
+                }
                 None => {
                     // Reported, not refused, and STORED rather than dropped.
                     // Refusing would make a producer that legitimately observed
@@ -458,15 +493,21 @@ impl ConversationSourceStore {
                     // the request succeeded. The fold holds an unmatched
                     // revision and applies it when its message lands, so
                     // arrival order does not decide whether a redaction sticks.
-                    let held = fold
+                    //
+                    // Held is counted SEPARATELY from applied rather than
+                    // folded into it. Both are equally durable, so both are
+                    // accepted; but only one of them has taken effect, and a
+                    // producer that cannot see the difference cannot tell a
+                    // healthy mid-history start from a stalled backfill.
+                    let already_held = fold
                         .pending
                         .get(&key)
                         .and_then(|entries| entries.iter().map(|entry| entry.revision()).max())
                         .unwrap_or(0);
-                    if held >= revision.revision() {
+                    if already_held >= revision.revision() {
                         duplicates += 1;
                     } else {
-                        unknown_messages += 1;
+                        held += 1;
                         appended.push(entry());
                     }
                 }
@@ -474,12 +515,18 @@ impl ConversationSourceStore {
         }
 
         let accepted = appended.len() as u64;
+        debug_assert_eq!(
+            accepted,
+            applied + held,
+            "every journaled revision is either applied or held"
+        );
         let cursor = self.commit(&journal, &fold, appended, &request.channel_id)?;
         Ok(ConversationRevisionsReceiptV1 {
             channel_id: request.channel_id.clone(),
             accepted,
+            applied,
+            held,
             duplicates,
-            unknown_messages,
             cursor,
         })
     }
@@ -606,6 +653,7 @@ impl ConversationSourceStore {
                 landed_records: cursor.landed_records,
                 revisions: cursor.revisions,
                 tombstones: cursor.tombstones,
+                held_revisions: cursor.held_revisions,
                 inflight_thread_parents: cursor.inflight_thread_parents.len() as u64,
                 lag_seconds: cursor
                     .history_watermark
@@ -735,6 +783,9 @@ fn apply(fold: &mut ChannelFold, entry: JournalEntryV1) {
         return;
     };
     fold.last_observed_at = Some(entry.observed_at().to_string());
+    if fold.channel_id.is_none() {
+        fold.channel_id = Some(entry.channel_id().to_string());
+    }
     match entry {
         JournalEntryV1::Message(record) => {
             let revision = record.revision;
@@ -874,6 +925,15 @@ fn derive_cursor(channel_id: &str, fold: &ChannelFold) -> ChannelCursorV1 {
             .values()
             .filter(|landed| landed.tombstoned)
             .count() as u64,
+        // Derived from the fold like everything else here, so a held revision
+        // cannot be reported by a receipt and then quietly vanish from the
+        // channel's standing state. It drops to zero on its own the moment the
+        // messages it was waiting for land.
+        held_revisions: fold
+            .pending
+            .values()
+            .map(|entries| entries.len() as u64)
+            .sum(),
         last_batch_at: fold.last_observed_at.clone(),
     }
 }
@@ -1117,14 +1177,17 @@ mod tests {
     fn a_replayed_batch_does_not_double_land() {
         let dir = tempfile::tempdir().unwrap();
         let store = bound_store(&dir);
-        let batch = batch(vec![
+        // Named `first` rather than `batch`: a local binding called `batch`
+        // shadows the helper of the same name for the rest of the test, and
+        // the overlapping resweep below needs to call it again.
+        let first = batch(vec![
             record("1755000000.000100", "first"),
             record("1755000001.000200", "second"),
         ]);
-        store.land_batch(&scope(), &batch).unwrap();
+        store.land_batch(&scope(), &first).unwrap();
         let bytes_after_first = file_len(&journal_path(&store)).unwrap();
 
-        let replay = store.land_batch(&scope(), &batch).unwrap();
+        let replay = store.land_batch(&scope(), &first).unwrap();
         assert_eq!(replay.accepted, 0, "a replay lands nothing");
         assert_eq!(replay.duplicates, 2, "and says so, so a resume is visible");
         assert_eq!(replay.cursor.landed_records, 2);
@@ -1377,20 +1440,125 @@ mod tests {
                 &revisions(vec![tombstone_for("1700000000.000001")]),
             )
             .unwrap();
-        assert_eq!(receipt.unknown_messages, 1);
-        assert_eq!(receipt.accepted, 0);
+        // Durable, so `accepted`; not yet in effect, so `held` rather than
+        // `applied`. Those are different facts and the receipt keeps them
+        // apart.
+        assert_eq!(receipt.accepted, 1, "a held revision is still durable");
+        assert_eq!(receipt.held, 1);
+        assert_eq!(receipt.applied, 0, "nothing was superseded: no message yet");
+        assert_eq!(receipt.duplicates, 0);
         assert_eq!(receipt.cursor.landed_records, 0);
 
+        // Held is not silent: it stands on the channel's own cursor, not just
+        // in the receipt of the request that created it.
+        assert_eq!(receipt.cursor.held_revisions, 1);
+        assert_eq!(
+            store
+                .cursor(&scope(), WORKSPACE, CHANNEL)
+                .unwrap()
+                .held_revisions,
+            1,
+            "a later reader sees the backlog too"
+        );
+
         // Reported is not the same as discarded: it was journaled, so a replay
-        // recognizes it rather than counting it unknown a second time.
+        // recognizes it rather than counting it held a second time.
         let replay = store
             .land_revisions(
                 &scope(),
                 &revisions(vec![tombstone_for("1700000000.000001")]),
             )
             .unwrap();
-        assert_eq!(replay.unknown_messages, 0);
+        assert_eq!(replay.accepted, 0);
+        assert_eq!(replay.held, 0);
         assert_eq!(replay.duplicates, 1);
+        assert_eq!(
+            replay.cursor.held_revisions, 1,
+            "the standing backlog is unchanged by a redundant replay"
+        );
+    }
+
+    #[test]
+    fn a_revisions_receipt_partitions_the_request_it_answers() {
+        // The contract the counts have to satisfy: accepted + duplicates is
+        // everything sent, and accepted itself is applied + held. A receipt
+        // whose numbers do not add up is worse than none, because a producer
+        // cannot tell a dropped revision from a miscounted one.
+        let dir = tempfile::tempdir().unwrap();
+        let store = bound_store(&dir);
+        let landed = "1755000000.000100";
+        store
+            .land_batch(&scope(), &batch(vec![record(landed, "here")]))
+            .unwrap();
+        // Pre-hold one revision so the request below also contains a duplicate.
+        store
+            .land_revisions(
+                &scope(),
+                &revisions(vec![tombstone_for("1700000000.000001")]),
+            )
+            .unwrap();
+
+        let sent = vec![
+            // applies: its message is landed
+            tombstone_for(landed),
+            // duplicate: already held at this revision
+            tombstone_for("1700000000.000001"),
+            // held: a third message nobody has landed
+            tombstone_for("1700000000.000002"),
+        ];
+        let count = sent.len() as u64;
+        let receipt = store.land_revisions(&scope(), &revisions(sent)).unwrap();
+
+        assert_eq!(receipt.applied, 1);
+        assert_eq!(receipt.held, 1);
+        assert_eq!(receipt.duplicates, 1);
+        assert_eq!(
+            receipt.accepted,
+            receipt.applied + receipt.held,
+            "accepted is exactly what was journaled"
+        );
+        assert_eq!(
+            receipt.accepted + receipt.duplicates,
+            count,
+            "every revision sent is accounted for exactly once"
+        );
+        assert_eq!(
+            receipt.cursor.held_revisions, 2,
+            "both never-landed revisions stand on the cursor"
+        );
+        assert_eq!(receipt.cursor.tombstones, 1, "and one took effect");
+    }
+
+    #[test]
+    fn status_exposes_the_held_backlog_for_the_reconciliation_lane() {
+        // S4 has to be able to watch this number rather than infer it: a
+        // standing nonzero held count means the corpus holds deletions for
+        // bodies it has never seen.
+        let dir = tempfile::tempdir().unwrap();
+        let store = bound_store(&dir);
+        let ts = "1755000000.000100";
+        store
+            .land_revisions(&scope(), &revisions(vec![tombstone_for(ts)]))
+            .unwrap();
+
+        let status = store.status(&scope(), 1_755_000_060).unwrap();
+        assert_eq!(
+            status.len(),
+            1,
+            "a channel with only held revisions is visible"
+        );
+        assert_eq!(status[0].held_revisions, 1);
+        assert_eq!(status[0].landed_records, 0);
+        assert_eq!(status[0].tombstones, 0, "held is not yet a tombstone");
+
+        // The gap closes when the message arrives, and the status number is
+        // what shows it closing.
+        store
+            .land_batch(&scope(), &batch(vec![record(ts, "late body")]))
+            .unwrap();
+        let status = store.status(&scope(), 1_755_000_060).unwrap();
+        assert_eq!(status[0].held_revisions, 0, "the backlog drained");
+        assert_eq!(status[0].tombstones, 1, "and became a real tombstone");
     }
 
     #[test]
@@ -1402,10 +1570,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = bound_store(&dir);
         let ts = "1755000000.000100";
-        let held = store
+        let deletion = store
             .land_revisions(&scope(), &revisions(vec![tombstone_for(ts)]))
             .unwrap();
-        assert_eq!(held.unknown_messages, 1);
+        assert_eq!(deletion.held, 1);
+        assert_eq!(deletion.applied, 0);
+        assert_eq!(deletion.cursor.held_revisions, 1);
 
         // The message arrives afterwards, from the slower lane.
         let receipt = store
@@ -1418,6 +1588,10 @@ mod tests {
         assert_eq!(
             receipt.cursor.tombstones, 1,
             "the held tombstone applies the moment its message lands"
+        );
+        assert_eq!(
+            receipt.cursor.held_revisions, 0,
+            "and stops being held, so the backlog is a real gauge and not a tally"
         );
 
         let landed = store.landed_messages(&scope(), WORKSPACE, CHANNEL).unwrap();

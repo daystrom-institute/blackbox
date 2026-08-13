@@ -864,20 +864,43 @@ pub struct ConversationBatchReceiptV1 {
     pub cursor: ChannelCursorV1,
 }
 
+/// What one revisions request did.
+///
+/// The counts partition the request exactly: `accepted + duplicates` equals the
+/// number of revisions sent, and `accepted` itself splits into `applied` and
+/// `held`. Both invariants are asserted by the store's tests, because a receipt
+/// whose numbers do not add up is worse than no receipt: a producer would have
+/// no way to tell a silently dropped revision from one it miscounted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationRevisionsReceiptV1 {
     pub channel_id: String,
-    pub accepted: u64,
-    pub duplicates: u64,
-    /// Revisions naming a message this corpus has not landed YET.
+    /// Durably journaled by this request. Equals `applied + held`.
     ///
-    /// Reported rather than refused: an observer whose visibility began after a
-    /// message was posted can legitimately see its deletion first, and refusing
-    /// would make the producer retry forever. They are still STORED, and the
-    /// store applies them if the message arrives later, so an out-of-order
-    /// deletion is held rather than lost. This count is the honest coverage
-    /// signal for how often that happens.
-    pub unknown_messages: u64,
+    /// "Accepted" means DURABLE, not "took effect". A held revision is every
+    /// bit as durable as an applied one, and the producer's only real question
+    /// is whether it needs to send the revision again. It does not.
+    pub accepted: u64,
+    /// Of `accepted`: superseded a landed message in place.
+    pub applied: u64,
+    /// Of `accepted`: journaled and waiting on a message this corpus has not
+    /// landed YET.
+    ///
+    /// This is the never-landed case, deliberately distinguishable from
+    /// `applied`. An observer whose visibility began mid-history can
+    /// legitimately see a deletion before it ever sees the message, and a
+    /// backfill lane running behind steady state makes that ordinary rather
+    /// than exotic. Refusing would make the producer retry forever;
+    /// accepting-and-discarding would lose the deletion the moment the slower
+    /// lane delivered the message. So it is journaled, held, applied when its
+    /// message lands, and REPORTED here the whole time: held is not silent.
+    ///
+    /// The running total per channel rides
+    /// [`ChannelCursorV1::held_revisions`] and the status read, so the S4
+    /// reconciliation lane can watch the backlog rather than infer it.
+    pub held: u64,
+    /// Revisions the corpus already holds at an equal or higher revision,
+    /// whether that revision is applied or still held. Nothing was journaled.
+    pub duplicates: u64,
     pub cursor: ChannelCursorV1,
 }
 
@@ -920,8 +943,18 @@ pub struct ChannelCursorV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inflight_thread_parents: Vec<String>,
     pub landed_records: u64,
+    /// Revisions that superseded a landed message in place.
     pub revisions: u64,
     pub tombstones: u64,
+    /// Revisions and tombstones journaled for messages this channel has not
+    /// landed yet, still waiting to apply.
+    ///
+    /// A standing nonzero value is a real signal, not noise: it means the
+    /// corpus holds deletions for bodies it has never seen, so either backfill
+    /// is behind or the observer's visibility began mid-history. S4's
+    /// reconciliation lane reads it to know whether the gap is closing.
+    #[serde(default)]
+    pub held_revisions: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_batch_at: Option<String>,
 }
@@ -950,6 +983,10 @@ pub struct ChannelStatusV1 {
     pub landed_records: u64,
     pub revisions: u64,
     pub tombstones: u64,
+    /// See [`ChannelCursorV1::held_revisions`]. Surfaced on status because a
+    /// held deletion is a coverage fact an operator has to be able to see.
+    #[serde(default)]
+    pub held_revisions: u64,
     pub inflight_thread_parents: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_watermark: Option<String>,
