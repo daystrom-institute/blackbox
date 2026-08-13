@@ -323,6 +323,7 @@ impl ProducerAuthRuntime {
     }
 
     /// The connector grant table, for onboarding and read surfaces.
+    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn connectors(&self) -> &Arc<ConnectorGrantRuntime> {
         &self.connectors
     }
