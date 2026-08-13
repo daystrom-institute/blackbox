@@ -15,6 +15,11 @@ pub const MAX_SOURCE_LANE_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_GRAPHS_PER_LANE: u64 = 1_024;
 pub const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_GRAPH_ROWS_PER_FILE: u64 = 1_000_000;
+/// The only filename the evidence lane admits. Held here rather than imported
+/// from the graph kernel so this crate stays a dependency-clean wire and
+/// validation leaf; `bbox_project_graph::EVIDENCE_BINDINGS_FILENAME` is the
+/// same string and a contract test pins them together.
+pub const EVIDENCE_BINDINGS_FILENAME: &str = "bindings.json";
 pub const MAX_ANCESTRY_NODES: u64 = 2_000_000;
 pub const MAX_ANCESTRY_EDGES: u64 = 8_000_000;
 pub const MAX_ANCESTRY_PAGE_NODES: u64 = 2_000;
@@ -147,6 +152,8 @@ pub enum ContractError {
     IncompleteGraphSource,
     #[error("graph source exceeds an enforced graph limit")]
     GraphLimitExceeded,
+    #[error("evidence source path is not exactly the single bindings document")]
+    InvalidEvidenceSourcePath,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +185,11 @@ pub enum SourceLaneV1 {
     Knowledge,
     Gaps,
     Graphs,
+    /// Tenant-owned cross-entity evidence bindings
+    /// (`.bbox/evidence/bindings.json`). A single-document lane: it carries at
+    /// most one file, because one complete valid document replaces one
+    /// project's accepted binding set.
+    Evidence,
 }
 
 impl SourceLaneV1 {
@@ -186,15 +198,45 @@ impl SourceLaneV1 {
             Self::Knowledge => "knowledge",
             Self::Gaps => "gaps",
             Self::Graphs => "graphs",
+            Self::Evidence => "evidence",
         }
     }
 
+    /// Domain separator for this lane's manifest digest. Tags are permanent:
+    /// changing one silently invalidates every stored manifest commitment.
     fn tag(self) -> u8 {
         match self {
             Self::Knowledge => 1,
             Self::Gaps => 2,
             Self::Graphs => 3,
+            Self::Evidence => 4,
         }
+    }
+}
+
+/// Which lanes a stored generation identity or working-pair commitment was
+/// minted over.
+///
+/// Every rung is the exact preimage some shipped binary used, so this ladder
+/// is APPEND-ONLY: a new lane adds a rung at the top and never edits one
+/// below. Editing a lower rung orphans every resource that binary wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneVintage {
+    /// Before the graphs lane: knowledge and gaps only.
+    PreGraphs,
+    /// Before the evidence lane: knowledge, gaps, graphs.
+    PreEvidence,
+    /// Current: knowledge, gaps, graphs, evidence.
+    Current,
+}
+
+impl LaneVintage {
+    fn includes_graphs(self) -> bool {
+        matches!(self, Self::PreEvidence | Self::Current)
+    }
+
+    fn includes_evidence(self) -> bool {
+        matches!(self, Self::Current)
     }
 }
 
@@ -215,6 +257,15 @@ pub struct SourceManifestDescriptorV1 {
 }
 
 impl Default for SourceManifestDescriptorV1 {
+    /// The canonical absent lane, shared by every lane.
+    ///
+    /// The digest below is graphs-tagged for historical reasons: this impl
+    /// landed with the graphs lane. Do NOT re-derive it per lane. This exact
+    /// value is what a lane absent from a stored record decodes to, so it is
+    /// durable on disk and `is_absent_lane` compares against it. Because the
+    /// manifest hash is domain-separated by lane tag, it does not equal any
+    /// other lane's own empty-manifest digest, which is why
+    /// `validate_source_manifest` admits it explicitly for an empty lane.
     fn default() -> Self {
         Self {
             manifest_sha256: source_manifest_sha256(SourceLaneV1::Graphs, &[]),
@@ -279,6 +330,10 @@ pub struct PublicationCandidateDescriptorV1 {
     pub gaps: SourceManifestDescriptorV1,
     #[serde(default)]
     pub graphs: SourceManifestDescriptorV1,
+    /// Absent in every candidate written before the evidence lane existed;
+    /// `default` decodes those to the canonical empty lane.
+    #[serde(default)]
+    pub evidence: SourceManifestDescriptorV1,
 }
 
 impl PublicationCandidateDescriptorV1 {
@@ -290,11 +345,13 @@ impl PublicationCandidateDescriptorV1 {
         self.knowledge.validate_header(limits)?;
         self.gaps.validate_header(limits)?;
         self.graphs.validate_header(limits)?;
+        self.evidence.validate_header(limits)?;
         validate_total_bytes(
             [
                 self.knowledge.logical_bytes,
                 self.gaps.logical_bytes,
                 self.graphs.logical_bytes,
+                self.evidence.logical_bytes,
             ],
             limits.max_generation_bytes,
         )
@@ -351,10 +408,16 @@ pub struct ProvisionalWorkspaceDescriptorV1 {
     pub baseline_gaps: SourceManifestDescriptorV1,
     #[serde(default)]
     pub baseline_graphs: SourceManifestDescriptorV1,
+    /// Absent in every workspace captured before the evidence lane existed.
+    #[serde(default)]
+    pub baseline_evidence: SourceManifestDescriptorV1,
     pub working_knowledge: SourceManifestDescriptorV1,
     pub working_gaps: SourceManifestDescriptorV1,
     #[serde(default)]
     pub working_graphs: SourceManifestDescriptorV1,
+    /// Absent in every workspace captured before the evidence lane existed.
+    #[serde(default)]
+    pub working_evidence: SourceManifestDescriptorV1,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -525,10 +588,14 @@ pub struct PublicationCandidateStatusV1 {
     pub gap_manifest_sha256: String,
     #[serde(default)]
     pub graph_manifest_sha256: String,
+    #[serde(default)]
+    pub evidence_manifest_sha256: String,
     pub knowledge_files: u64,
     pub gap_files: u64,
     #[serde(default)]
     pub graph_files: u64,
+    #[serde(default)]
+    pub evidence_files: u64,
     pub logical_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
@@ -548,10 +615,14 @@ pub struct ProvisionalWorkspaceStatusV1 {
     pub baseline_gap_manifest_sha256: String,
     #[serde(default)]
     pub baseline_graph_manifest_sha256: String,
+    #[serde(default)]
+    pub baseline_evidence_manifest_sha256: String,
     pub working_knowledge_manifest_sha256: String,
     pub working_gap_manifest_sha256: String,
     #[serde(default)]
     pub working_graph_manifest_sha256: String,
+    #[serde(default)]
+    pub working_evidence_manifest_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_expires_unix_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,23 +642,24 @@ impl ProvisionalWorkspaceDescriptorV1 {
         self.baseline_knowledge.validate_header(limits)?;
         self.baseline_gaps.validate_header(limits)?;
         self.baseline_graphs.validate_header(limits)?;
+        self.baseline_evidence.validate_header(limits)?;
         self.working_knowledge.validate_header(limits)?;
         self.working_gaps.validate_header(limits)?;
         self.working_graphs.validate_header(limits)?;
-        let working_pair = working_pair_sha256(
-            &self.working_knowledge,
-            &self.working_gaps,
-            &self.working_graphs,
-        );
-        // A workspace captured before the graphs lane existed committed to a
-        // working pair over the knowledge and gap descriptors only. Such a
-        // descriptor decodes with an absent working graph lane, so the
-        // pre-graphs commitment stays admissible for exactly that shape and
-        // for nothing else.
-        if self.capture.first_working_pair_sha256 != working_pair
-            && !(self.working_graphs.is_absent_lane()
-                && self.capture.first_working_pair_sha256
-                    == legacy_working_pair_sha256(&self.working_knowledge, &self.working_gaps))
+        self.working_evidence.validate_header(limits)?;
+        // A workspace commits to a working pair over the lanes its own binary
+        // knew about, so admission walks the vintage ladder rather than a
+        // single legacy special case. Each older rung is admissible only for
+        // the exact absent-lane shape a binary of that vintage could have
+        // produced: a capture carrying real evidence content has no
+        // pre-evidence vintage, and one carrying graph content has no
+        // pre-graphs vintage.
+        if !self
+            .admissible_working_pair_vintages()
+            .into_iter()
+            .any(|vintage| {
+                self.capture.first_working_pair_sha256 == self.working_pair_for_vintage(vintage)
+            })
         {
             return Err(ContractError::InvalidInput);
         }
@@ -596,11 +668,36 @@ impl ProvisionalWorkspaceDescriptorV1 {
                 self.baseline_knowledge.logical_bytes,
                 self.baseline_gaps.logical_bytes,
                 self.baseline_graphs.logical_bytes,
+                self.baseline_evidence.logical_bytes,
                 self.working_knowledge.logical_bytes,
                 self.working_gaps.logical_bytes,
                 self.working_graphs.logical_bytes,
+                self.working_evidence.logical_bytes,
             ],
             limits.max_generation_bytes,
+        )
+    }
+
+    /// The vintages this descriptor's shape could legitimately have been
+    /// minted by, newest first.
+    fn admissible_working_pair_vintages(&self) -> Vec<LaneVintage> {
+        let mut vintages = vec![LaneVintage::Current];
+        if self.working_evidence.is_absent_lane() {
+            vintages.push(LaneVintage::PreEvidence);
+            if self.working_graphs.is_absent_lane() {
+                vintages.push(LaneVintage::PreGraphs);
+            }
+        }
+        vintages
+    }
+
+    fn working_pair_for_vintage(&self, vintage: LaneVintage) -> String {
+        working_pair_for_vintage(
+            &self.working_knowledge,
+            &self.working_gaps,
+            &self.working_graphs,
+            &self.working_evidence,
+            vintage,
         )
     }
 }
@@ -623,17 +720,35 @@ pub fn source_file_blob_sha256(bytes: &[u8]) -> String {
     sha256(bytes)
 }
 
+/// The stable-capture commitment over every working lane.
+///
+/// Evidence participates because `.bbox/evidence/bindings.json` is
+/// checkout-plane state an author can edit mid-capture; leaving it out would
+/// let an evidence-only edit slip through the stability re-read undetected.
 pub fn working_pair_sha256(
     knowledge: &SourceManifestDescriptorV1,
     gaps: &SourceManifestDescriptorV1,
     graphs: &SourceManifestDescriptorV1,
+    evidence: &SourceManifestDescriptorV1,
 ) -> String {
-    let mut encoded = Vec::new();
-    push_field(&mut encoded, b"bbox-knowledge-working-pair-v1");
-    hash_manifest_descriptor(&mut encoded, knowledge);
-    hash_manifest_descriptor(&mut encoded, gaps);
-    hash_manifest_descriptor(&mut encoded, graphs);
-    sha256(&encoded)
+    working_pair_for_vintage(knowledge, gaps, graphs, evidence, LaneVintage::Current)
+}
+
+/// The working-pair commitment exactly as it was computed before the evidence
+/// lane existed: knowledge, gaps, and graphs. Never mint with this; it exists
+/// so stored pre-evidence captures stay readable.
+pub fn pre_evidence_working_pair_sha256(
+    knowledge: &SourceManifestDescriptorV1,
+    gaps: &SourceManifestDescriptorV1,
+    graphs: &SourceManifestDescriptorV1,
+) -> String {
+    working_pair_for_vintage(
+        knowledge,
+        gaps,
+        graphs,
+        &SourceManifestDescriptorV1::default(),
+        LaneVintage::PreEvidence,
+    )
 }
 
 /// The working-pair commitment exactly as it was computed before the graphs
@@ -643,10 +758,34 @@ pub fn legacy_working_pair_sha256(
     knowledge: &SourceManifestDescriptorV1,
     gaps: &SourceManifestDescriptorV1,
 ) -> String {
+    working_pair_for_vintage(
+        knowledge,
+        gaps,
+        &SourceManifestDescriptorV1::default(),
+        &SourceManifestDescriptorV1::default(),
+        LaneVintage::PreGraphs,
+    )
+}
+
+/// One preimage builder for every rung of the ladder. Older vintages simply
+/// stop hashing earlier, which is exactly what their binaries did.
+fn working_pair_for_vintage(
+    knowledge: &SourceManifestDescriptorV1,
+    gaps: &SourceManifestDescriptorV1,
+    graphs: &SourceManifestDescriptorV1,
+    evidence: &SourceManifestDescriptorV1,
+    vintage: LaneVintage,
+) -> String {
     let mut encoded = Vec::new();
     push_field(&mut encoded, b"bbox-knowledge-working-pair-v1");
     hash_manifest_descriptor(&mut encoded, knowledge);
     hash_manifest_descriptor(&mut encoded, gaps);
+    if vintage.includes_graphs() {
+        hash_manifest_descriptor(&mut encoded, graphs);
+    }
+    if vintage.includes_evidence() {
+        hash_manifest_descriptor(&mut encoded, evidence);
+    }
     sha256(&encoded)
 }
 
@@ -752,10 +891,33 @@ pub fn validate_source_manifest(
     if logical_bytes != descriptor.logical_bytes {
         return Err(ContractError::ManifestCountMismatch);
     }
-    if source_manifest_sha256(lane, entries) != descriptor.manifest_sha256 {
+    if source_manifest_sha256(lane, entries) != descriptor.manifest_sha256
+        && !absent_lane_commitment(descriptor, entries)
+    {
         return Err(ContractError::ManifestCommitmentMismatch);
     }
     Ok(())
+}
+
+/// Whether this descriptor is the canonical absent lane rather than this
+/// lane's own empty commitment.
+///
+/// `SourceManifestDescriptorV1::default()` carries ONE digest for every lane,
+/// and that digest is now durable in stored state: it is exactly what a lane
+/// absent from a stored record decodes to. It is not the same value as this
+/// lane's own empty-manifest digest, because the manifest hash is
+/// domain-separated by lane tag. The graphs lane never noticed, because
+/// `Default` happens to carry the graphs tag; every lane added after it would
+/// otherwise refuse every pre-lane record on disk.
+///
+/// The exemption is deliberately narrow: it applies only when the lane is
+/// ACTUALLY empty, so a descriptor claiming content can never pass validation
+/// on another lane's commitment.
+fn absent_lane_commitment(
+    descriptor: &SourceManifestDescriptorV1,
+    entries: &[SourceFileManifestEntryV1],
+) -> bool {
+    entries.is_empty() && descriptor.is_absent_lane()
 }
 
 pub fn validate_publication_candidate(
@@ -763,6 +925,7 @@ pub fn validate_publication_candidate(
     knowledge: &[SourceFileManifestEntryV1],
     gaps: &[SourceFileManifestEntryV1],
     graphs: &[SourceFileManifestEntryV1],
+    evidence: &[SourceFileManifestEntryV1],
     limits: KnowledgeSourceLimits,
 ) -> Result<(), ContractError> {
     descriptor.validate_header(limits)?;
@@ -787,7 +950,15 @@ pub fn validate_publication_candidate(
         graphs,
         limits,
     )?;
-    validate_graph_source_manifest(&descriptor.scope, graphs, limits)
+    validate_source_manifest(
+        &descriptor.scope,
+        SourceLaneV1::Evidence,
+        &descriptor.evidence,
+        evidence,
+        limits,
+    )?;
+    validate_graph_source_manifest(&descriptor.scope, graphs, limits)?;
+    validate_evidence_source_manifest(evidence)
 }
 
 pub fn ancestry_sha256(format: GitObjectFormatV1, nodes: &[AncestryCommitV1]) -> String {
@@ -899,9 +1070,11 @@ pub fn validate_provisional_workspace(
     baseline_knowledge: &[SourceFileManifestEntryV1],
     baseline_gaps: &[SourceFileManifestEntryV1],
     baseline_graphs: &[SourceFileManifestEntryV1],
+    baseline_evidence: &[SourceFileManifestEntryV1],
     working_knowledge: &[SourceFileManifestEntryV1],
     working_gaps: &[SourceFileManifestEntryV1],
     working_graphs: &[SourceFileManifestEntryV1],
+    working_evidence: &[SourceFileManifestEntryV1],
     limits: KnowledgeSourceLimits,
 ) -> Result<(), ContractError> {
     descriptor.validate_header(limits)?;
@@ -927,6 +1100,11 @@ pub fn validate_provisional_workspace(
             baseline_graphs,
         ),
         (
+            SourceLaneV1::Evidence,
+            &descriptor.baseline_evidence,
+            baseline_evidence,
+        ),
+        (
             SourceLaneV1::Knowledge,
             &descriptor.working_knowledge,
             working_knowledge,
@@ -937,11 +1115,18 @@ pub fn validate_provisional_workspace(
             &descriptor.working_graphs,
             working_graphs,
         ),
+        (
+            SourceLaneV1::Evidence,
+            &descriptor.working_evidence,
+            working_evidence,
+        ),
     ] {
         validate_source_manifest(&descriptor.scope, lane, manifest, entries, limits)?;
     }
     validate_graph_source_manifest(&descriptor.scope, baseline_graphs, limits)?;
     validate_graph_source_manifest(&descriptor.scope, working_graphs, limits)?;
+    validate_evidence_source_manifest(baseline_evidence)?;
+    validate_evidence_source_manifest(working_evidence)?;
     Ok(())
 }
 
@@ -951,31 +1136,40 @@ pub fn publication_candidate_generation_id(
 ) -> Result<String, ContractError> {
     validate_producer_id(producer_id)?;
     descriptor.validate_header(KnowledgeSourceLimits::default())?;
-    let mut encoded = Vec::new();
-    push_field(
-        &mut encoded,
-        b"bbox-knowledge-publication-source-generation-v1",
-    );
-    push_field(&mut encoded, producer_id.as_bytes());
-    hash_scope(&mut encoded, &descriptor.scope);
-    push_field(&mut encoded, descriptor.full_ref.as_bytes());
-    push_field(&mut encoded, descriptor.publisher_commit.as_bytes());
-    encoded.push(descriptor.object_format.tag());
-    hash_manifest_descriptor(&mut encoded, &descriptor.knowledge);
-    hash_manifest_descriptor(&mut encoded, &descriptor.gaps);
-    hash_manifest_descriptor(&mut encoded, &descriptor.graphs);
-    Ok(format!("kps_{}", sha256(&encoded)))
+    Ok(publication_generation_id_for(
+        producer_id,
+        descriptor,
+        LaneVintage::Current,
+    ))
 }
 
 /// The publication generation identity exactly as it was minted before the
-/// graphs lane existed: the graph descriptor contributed nothing to the hash.
+/// evidence lane existed: the evidence descriptor contributed nothing.
 ///
-/// This is a re-derivation of an identity already durable on disk, so it does
-/// not re-validate the header; callers validate the descriptor first and use
-/// this only to recognize stored state. Never mint with it.
+/// A re-derivation of an identity already durable on disk, so it does not
+/// re-validate the header; callers validate the descriptor first and use this
+/// only to recognize stored state. Never mint with it.
+pub fn pre_evidence_publication_candidate_generation_id(
+    producer_id: &str,
+    descriptor: &PublicationCandidateDescriptorV1,
+) -> String {
+    publication_generation_id_for(producer_id, descriptor, LaneVintage::PreEvidence)
+}
+
+/// The publication generation identity exactly as it was minted before the
+/// graphs lane existed: neither the graph nor the evidence descriptor
+/// contributed. Same re-derivation contract as the pre-evidence variant.
 pub fn legacy_publication_candidate_generation_id(
     producer_id: &str,
     descriptor: &PublicationCandidateDescriptorV1,
+) -> String {
+    publication_generation_id_for(producer_id, descriptor, LaneVintage::PreGraphs)
+}
+
+fn publication_generation_id_for(
+    producer_id: &str,
+    descriptor: &PublicationCandidateDescriptorV1,
+    vintage: LaneVintage,
 ) -> String {
     let mut encoded = Vec::new();
     push_field(
@@ -989,15 +1183,21 @@ pub fn legacy_publication_candidate_generation_id(
     encoded.push(descriptor.object_format.tag());
     hash_manifest_descriptor(&mut encoded, &descriptor.knowledge);
     hash_manifest_descriptor(&mut encoded, &descriptor.gaps);
+    if vintage.includes_graphs() {
+        hash_manifest_descriptor(&mut encoded, &descriptor.graphs);
+    }
+    if vintage.includes_evidence() {
+        hash_manifest_descriptor(&mut encoded, &descriptor.evidence);
+    }
     format!("kps_{}", sha256(&encoded))
 }
 
 /// Whether `stored_id` is an identity this descriptor can legitimately carry.
 ///
-/// The current identity always matches. A resource whose graph lane is absent
-/// may additionally carry the pre-graphs identity, because that is what the
-/// binary that wrote it minted. A resource that carries graph content has no
-/// pre-graphs vintage and is held to the current identity alone.
+/// The current identity always matches. Older rungs are admissible only for
+/// the exact absent-lane shape a binary of that vintage could have produced:
+/// a candidate carrying evidence content has no pre-evidence vintage, and one
+/// carrying graph content has no pre-graphs vintage.
 pub fn publication_generation_id_matches(
     producer_id: &str,
     descriptor: &PublicationCandidateDescriptorV1,
@@ -1006,8 +1206,25 @@ pub fn publication_generation_id_matches(
     if publication_candidate_generation_id(producer_id, descriptor)? == stored_id {
         return Ok(true);
     }
-    Ok(descriptor.graphs.is_absent_lane()
-        && legacy_publication_candidate_generation_id(producer_id, descriptor) == stored_id)
+    Ok(admissible_publication_vintages(descriptor)
+        .into_iter()
+        .any(|vintage| {
+            publication_generation_id_for(producer_id, descriptor, vintage) == stored_id
+        }))
+}
+
+/// Older vintages this candidate's lane shape could have been minted by.
+fn admissible_publication_vintages(
+    descriptor: &PublicationCandidateDescriptorV1,
+) -> Vec<LaneVintage> {
+    let mut vintages = Vec::new();
+    if descriptor.evidence.is_absent_lane() {
+        vintages.push(LaneVintage::PreEvidence);
+        if descriptor.graphs.is_absent_lane() {
+            vintages.push(LaneVintage::PreGraphs);
+        }
+    }
+    vintages
 }
 
 pub fn validate_publication_generation_id(value: &str) -> Result<(), ContractError> {
@@ -1018,44 +1235,32 @@ pub fn provisional_workspace_generation_id(
     descriptor: &ProvisionalWorkspaceDescriptorV1,
 ) -> Result<String, ContractError> {
     descriptor.validate_header(KnowledgeSourceLimits::default())?;
-    let mut encoded = Vec::new();
-    push_field(
-        &mut encoded,
-        b"bbox-knowledge-provisional-source-generation-v1",
-    );
-    hash_scope(&mut encoded, &descriptor.scope);
-    push_field(&mut encoded, descriptor.workspace_id.as_str().as_bytes());
-    encoded.extend_from_slice(&descriptor.sequence.to_be_bytes());
-    push_field(&mut encoded, descriptor.accepted_generation.as_bytes());
-    push_field(&mut encoded, descriptor.accepted_commit.as_bytes());
-    push_field(&mut encoded, descriptor.checkout_head.as_bytes());
-    push_field(&mut encoded, descriptor.merge_base.as_bytes());
-    encoded.push(descriptor.object_format.tag());
-    hash_ancestry_descriptor(&mut encoded, &descriptor.ancestry);
-    encoded.push(u8::from(descriptor.capture.transaction_pending_before));
-    encoded.push(u8::from(descriptor.capture.transaction_pending_after));
-    push_field(
-        &mut encoded,
-        descriptor.capture.first_working_pair_sha256.as_bytes(),
-    );
-    push_field(
-        &mut encoded,
-        descriptor.capture.second_working_pair_sha256.as_bytes(),
-    );
-    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_knowledge);
-    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_gaps);
-    hash_manifest_descriptor(&mut encoded, &descriptor.baseline_graphs);
-    hash_manifest_descriptor(&mut encoded, &descriptor.working_knowledge);
-    hash_manifest_descriptor(&mut encoded, &descriptor.working_gaps);
-    hash_manifest_descriptor(&mut encoded, &descriptor.working_graphs);
-    Ok(format!("kws_{}", sha256(&encoded)))
+    Ok(provisional_generation_id_for(
+        descriptor,
+        LaneVintage::Current,
+    ))
 }
 
 /// The provisional generation identity exactly as it was minted before the
-/// graphs lane existed. Same contract as the publication variant: a
-/// re-derivation for recognizing stored state, never a minting path.
+/// evidence lane existed. A re-derivation for recognizing stored state, never
+/// a minting path.
+pub fn pre_evidence_provisional_workspace_generation_id(
+    descriptor: &ProvisionalWorkspaceDescriptorV1,
+) -> String {
+    provisional_generation_id_for(descriptor, LaneVintage::PreEvidence)
+}
+
+/// The provisional generation identity exactly as it was minted before the
+/// graphs lane existed. Same contract as the pre-evidence variant.
 pub fn legacy_provisional_workspace_generation_id(
     descriptor: &ProvisionalWorkspaceDescriptorV1,
+) -> String {
+    provisional_generation_id_for(descriptor, LaneVintage::PreGraphs)
+}
+
+fn provisional_generation_id_for(
+    descriptor: &ProvisionalWorkspaceDescriptorV1,
+    vintage: LaneVintage,
 ) -> String {
     let mut encoded = Vec::new();
     push_field(
@@ -1081,16 +1286,32 @@ pub fn legacy_provisional_workspace_generation_id(
         &mut encoded,
         descriptor.capture.second_working_pair_sha256.as_bytes(),
     );
+    // Baseline lanes hash first, then working lanes, each in lane order. Older
+    // vintages omit the lanes they never had, which preserves the exact
+    // interleaving their binaries produced.
     hash_manifest_descriptor(&mut encoded, &descriptor.baseline_knowledge);
     hash_manifest_descriptor(&mut encoded, &descriptor.baseline_gaps);
+    if vintage.includes_graphs() {
+        hash_manifest_descriptor(&mut encoded, &descriptor.baseline_graphs);
+    }
+    if vintage.includes_evidence() {
+        hash_manifest_descriptor(&mut encoded, &descriptor.baseline_evidence);
+    }
     hash_manifest_descriptor(&mut encoded, &descriptor.working_knowledge);
     hash_manifest_descriptor(&mut encoded, &descriptor.working_gaps);
+    if vintage.includes_graphs() {
+        hash_manifest_descriptor(&mut encoded, &descriptor.working_graphs);
+    }
+    if vintage.includes_evidence() {
+        hash_manifest_descriptor(&mut encoded, &descriptor.working_evidence);
+    }
     format!("kws_{}", sha256(&encoded))
 }
 
 /// Whether `stored_id` is an identity this workspace descriptor can carry.
-/// The pre-graphs identity is admissible only when both graph lanes are
-/// absent, which is the only shape a pre-graphs capture can present.
+///
+/// An older rung is admissible only when BOTH that vintage's lanes are absent,
+/// which is the only shape a capture of that vintage can present.
 pub fn provisional_generation_id_matches(
     descriptor: &ProvisionalWorkspaceDescriptorV1,
     stored_id: &str,
@@ -1098,9 +1319,24 @@ pub fn provisional_generation_id_matches(
     if provisional_workspace_generation_id(descriptor)? == stored_id {
         return Ok(true);
     }
-    Ok(descriptor.baseline_graphs.is_absent_lane()
-        && descriptor.working_graphs.is_absent_lane()
-        && legacy_provisional_workspace_generation_id(descriptor) == stored_id)
+    Ok(admissible_provisional_vintages(descriptor)
+        .into_iter()
+        .any(|vintage| provisional_generation_id_for(descriptor, vintage) == stored_id))
+}
+
+fn admissible_provisional_vintages(
+    descriptor: &ProvisionalWorkspaceDescriptorV1,
+) -> Vec<LaneVintage> {
+    let mut vintages = Vec::new();
+    if descriptor.baseline_evidence.is_absent_lane() && descriptor.working_evidence.is_absent_lane()
+    {
+        vintages.push(LaneVintage::PreEvidence);
+        if descriptor.baseline_graphs.is_absent_lane() && descriptor.working_graphs.is_absent_lane()
+        {
+            vintages.push(LaneVintage::PreGraphs);
+        }
+    }
+    vintages
 }
 
 pub fn validate_provisional_generation_id(value: &str) -> Result<(), ContractError> {
@@ -1257,6 +1493,16 @@ fn validate_source_filename(
         }
         return Ok(());
     }
+    if lane == SourceLaneV1::Evidence {
+        // The evidence lane is a single flat document, not a tree. Admitting
+        // only this exact name is what makes "one complete valid document
+        // replaces the accepted set" a transport-level guarantee rather than
+        // a convention the reader has to re-derive.
+        if filename != EVIDENCE_BINDINGS_FILENAME {
+            return Err(ContractError::InvalidEvidenceSourcePath);
+        }
+        return Ok(());
+    }
     let Some(record_id) = filename.strip_suffix(".json") else {
         return Err(ContractError::InvalidSourceFilename);
     };
@@ -1315,6 +1561,18 @@ fn validate_graph_source_manifest(
         .any(|(_, files)| !required.is_subset(files) || !files.is_subset(&allowed))
     {
         return Err(ContractError::IncompleteGraphSource);
+    }
+    Ok(())
+}
+
+/// The evidence lane admits at most one file. `validate_source_filename`
+/// already pins the name; this pins the count, so a manifest can never smuggle
+/// a second accepted binding set past the replacement rule.
+fn validate_evidence_source_manifest(
+    entries: &[SourceFileManifestEntryV1],
+) -> Result<(), ContractError> {
+    if entries.len() > 1 {
+        return Err(ContractError::InvalidEvidenceSourcePath);
     }
     Ok(())
 }
@@ -1549,8 +1807,16 @@ mod tests {
             knowledge: manifest(SourceLaneV1::Knowledge, &knowledge),
             gaps: manifest(SourceLaneV1::Gaps, &gaps),
             graphs: SourceManifestDescriptorV1::default(),
+            evidence: SourceManifestDescriptorV1::default(),
         };
         (descriptor, knowledge, gaps)
+    }
+
+    fn evidence_entries() -> Vec<SourceFileManifestEntryV1> {
+        vec![entry(
+            ".bbox/evidence/bindings.json",
+            br#"{"version":1,"bindings":[]}"#,
+        )]
     }
 
     fn ancestry(format: GitObjectFormatV1) -> (AncestryDescriptorV1, Vec<AncestryCommitV1>) {
@@ -1601,7 +1867,13 @@ mod tests {
         let working_knowledge = manifest(SourceLaneV1::Knowledge, &knowledge);
         let working_gaps = manifest(SourceLaneV1::Gaps, &gaps);
         let empty_graphs = SourceManifestDescriptorV1::default();
-        let working_pair = working_pair_sha256(&working_knowledge, &working_gaps, &empty_graphs);
+        let empty_evidence = SourceManifestDescriptorV1::default();
+        let working_pair = working_pair_sha256(
+            &working_knowledge,
+            &working_gaps,
+            &empty_graphs,
+            &empty_evidence,
+        );
         let descriptor = ProvisionalWorkspaceDescriptorV1 {
             schema_version: SCHEMA_VERSION,
             scope: scope(),
@@ -1622,13 +1894,20 @@ mod tests {
             baseline_knowledge,
             baseline_gaps,
             baseline_graphs: empty_graphs.clone(),
+            baseline_evidence: empty_evidence.clone(),
             working_knowledge,
             working_gaps,
             working_graphs: empty_graphs,
+            working_evidence: empty_evidence,
         };
         (descriptor, nodes, knowledge, gaps)
     }
 
+    /// The manifest digest is lane-local and does not move when a lane is
+    /// added, so it stays a hard golden. The generation identity DOES move,
+    /// so its golden lives on the ladder rung that minted it: the literal
+    /// below is the value this crate asserted for these exact fixtures while
+    /// graphs was the newest lane, and it is now the pre-evidence rung.
     #[test]
     fn publication_manifest_and_generation_have_golden_commitments() {
         let (descriptor, knowledge, gaps) = publication();
@@ -1636,6 +1915,7 @@ mod tests {
             &descriptor,
             &knowledge,
             &gaps,
+            &[],
             &[],
             KnowledgeSourceLimits::default(),
         )
@@ -1645,9 +1925,34 @@ mod tests {
             "bc51a2b293789c1a7a94ad7315de7fbe26119a1a99d8c8be4fb2b54f86c5bc3d"
         );
         assert_eq!(
-            publication_candidate_generation_id("producer-a", &descriptor).unwrap(),
+            pre_evidence_publication_candidate_generation_id("producer-a", &descriptor),
             "kps_262e2277635441315066c6b9cb60a6243a14833da7f6c7729b518acecd5f6e71"
         );
+        assert_eq!(
+            legacy_publication_candidate_generation_id("producer-a", &descriptor),
+            "kps_ed7b6e9e7378e05714065e1bac8f6ac8c12e47d2b758c5eb6a41edfd62a5df56"
+        );
+        // The current rung hashes one more descriptor, so it must differ from
+        // both older rungs while all three stay admissible for this shape.
+        let current = publication_candidate_generation_id("producer-a", &descriptor).unwrap();
+        assert_ne!(
+            current,
+            pre_evidence_publication_candidate_generation_id("producer-a", &descriptor)
+        );
+        assert_ne!(
+            current,
+            legacy_publication_candidate_generation_id("producer-a", &descriptor)
+        );
+        for stored in [
+            current,
+            pre_evidence_publication_candidate_generation_id("producer-a", &descriptor),
+            legacy_publication_candidate_generation_id("producer-a", &descriptor),
+        ] {
+            assert!(
+                publication_generation_id_matches("producer-a", &descriptor, &stored).unwrap(),
+                "an empty-lane candidate must admit every vintage that could have minted it"
+            );
+        }
     }
 
     #[test]
@@ -1739,6 +2044,11 @@ mod tests {
         ));
     }
 
+    /// Same split as the publication golden. The ancestry digest is lane-free
+    /// and stays a hard golden. The generation identity hashes the working
+    /// pair, which the evidence lane widened, so reproducing the pre-evidence
+    /// identity means restoring the pre-evidence capture commitment first -
+    /// exactly what a stored pre-evidence workspace carries on disk.
     #[test]
     fn provisional_source_and_generation_have_golden_commitments() {
         let (descriptor, nodes, knowledge, gaps) = provisional();
@@ -1748,8 +2058,10 @@ mod tests {
             &knowledge,
             &gaps,
             &[],
+            &[],
             &knowledge,
             &gaps,
+            &[],
             &[],
             KnowledgeSourceLimits::default(),
         )
@@ -1758,10 +2070,210 @@ mod tests {
             descriptor.ancestry.ancestry_sha256,
             "ed5a0a409a0be0e8ffd40e95bd6bea7ef83c5732fd0b5f403098ed3eddb8e408"
         );
+
+        let mut pre_evidence = descriptor.clone();
+        let pair = pre_evidence_working_pair_sha256(
+            &pre_evidence.working_knowledge,
+            &pre_evidence.working_gaps,
+            &pre_evidence.working_graphs,
+        );
+        pre_evidence.capture.first_working_pair_sha256 = pair.clone();
+        pre_evidence.capture.second_working_pair_sha256 = pair;
         assert_eq!(
-            provisional_workspace_generation_id(&descriptor).unwrap(),
+            pre_evidence_provisional_workspace_generation_id(&pre_evidence),
             "kws_1c65ac3aec908e12d6b741901abb05a23a9026cd303887cbdff0d6c759a99672"
         );
+        // A stored pre-evidence workspace opens: its capture commitment and
+        // its identity are both admissible while the evidence lane is absent.
+        pre_evidence
+            .validate_header(KnowledgeSourceLimits::default())
+            .unwrap();
+        assert!(
+            provisional_generation_id_matches(
+                &pre_evidence,
+                &pre_evidence_provisional_workspace_generation_id(&pre_evidence)
+            )
+            .unwrap()
+        );
+    }
+
+    /// The pre-evidence rung is admissible only for the shape a pre-evidence
+    /// binary could have written. A workspace that actually carries evidence
+    /// content has no pre-evidence vintage and is held to the current rung.
+    #[test]
+    fn pre_evidence_identity_is_admissible_only_without_evidence_content() {
+        let (mut descriptor, ..) = provisional();
+        let pre_evidence = pre_evidence_provisional_workspace_generation_id(&descriptor);
+        let current = provisional_workspace_generation_id(&descriptor).unwrap();
+        assert_ne!(pre_evidence, current);
+        assert!(provisional_generation_id_matches(&descriptor, &pre_evidence).unwrap());
+        assert!(provisional_generation_id_matches(&descriptor, &current).unwrap());
+
+        descriptor.working_evidence = manifest(SourceLaneV1::Evidence, &evidence_entries());
+        let pair = working_pair_sha256(
+            &descriptor.working_knowledge,
+            &descriptor.working_gaps,
+            &descriptor.working_graphs,
+            &descriptor.working_evidence,
+        );
+        descriptor.capture.first_working_pair_sha256 = pair.clone();
+        descriptor.capture.second_working_pair_sha256 = pair;
+        descriptor
+            .validate_header(KnowledgeSourceLimits::default())
+            .unwrap();
+        assert!(!provisional_generation_id_matches(&descriptor, &pre_evidence).unwrap());
+        assert!(
+            provisional_generation_id_matches(
+                &descriptor,
+                &provisional_workspace_generation_id(&descriptor).unwrap(),
+            )
+            .unwrap()
+        );
+    }
+
+    /// A capture that carries evidence content cannot present a pre-evidence
+    /// working-pair commitment. This is the stability guarantee: an
+    /// evidence-only edit during capture has to move the pair.
+    #[test]
+    fn a_pre_evidence_working_pair_stops_being_admissible_with_evidence_content() {
+        let (mut descriptor, ..) = provisional();
+        let pre_evidence_pair = pre_evidence_working_pair_sha256(
+            &descriptor.working_knowledge,
+            &descriptor.working_gaps,
+            &descriptor.working_graphs,
+        );
+        descriptor.capture.first_working_pair_sha256 = pre_evidence_pair.clone();
+        descriptor.capture.second_working_pair_sha256 = pre_evidence_pair;
+        descriptor
+            .validate_header(KnowledgeSourceLimits::default())
+            .unwrap();
+
+        descriptor.working_evidence = manifest(SourceLaneV1::Evidence, &evidence_entries());
+        assert!(matches!(
+            descriptor.validate_header(KnowledgeSourceLimits::default()),
+            Err(ContractError::InvalidInput)
+        ));
+    }
+
+    /// The evidence lane is one document at one exact path. Anything else is
+    /// refused, so the replacement rule cannot be smuggled past.
+    #[test]
+    fn evidence_lane_admits_only_the_single_bindings_document() {
+        let entries = evidence_entries();
+        validate_source_manifest(
+            &scope(),
+            SourceLaneV1::Evidence,
+            &manifest(SourceLaneV1::Evidence, &entries),
+            &entries,
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+        validate_evidence_source_manifest(&entries).unwrap();
+
+        for path in [
+            ".bbox/evidence/other.json",
+            ".bbox/evidence/nested/bindings.json",
+            ".bbox/evidence/bindings.jsonl",
+            ".bbox/evidence/../bindings.json",
+        ] {
+            let invalid = vec![entry(path, b"{}")];
+            assert!(
+                matches!(
+                    validate_source_manifest(
+                        &scope(),
+                        SourceLaneV1::Evidence,
+                        &manifest(SourceLaneV1::Evidence, &invalid),
+                        &invalid,
+                        KnowledgeSourceLimits::default(),
+                    ),
+                    Err(ContractError::InvalidEvidenceSourcePath
+                        | ContractError::InvalidSourceFilename)
+                ),
+                "{path} must not be admissible on the evidence lane"
+            );
+        }
+
+        let mut two = evidence_entries();
+        two.push(entry(".bbox/evidence/bindings.json", b"{}"));
+        assert!(matches!(
+            validate_evidence_source_manifest(&two),
+            Err(ContractError::InvalidEvidenceSourcePath)
+        ));
+    }
+
+    /// A lane absent from stored state decodes to the shared canonical empty
+    /// descriptor, whose digest is graphs-tagged rather than this lane's own.
+    /// That shape has to validate, or every pre-evidence record on disk
+    /// becomes unreadable; a lane claiming content must not.
+    #[test]
+    fn the_canonical_absent_lane_validates_on_any_lane() {
+        let absent = SourceManifestDescriptorV1::default();
+        for lane in [
+            SourceLaneV1::Knowledge,
+            SourceLaneV1::Gaps,
+            SourceLaneV1::Graphs,
+            SourceLaneV1::Evidence,
+        ] {
+            validate_source_manifest(
+                &scope(),
+                lane,
+                &absent,
+                &[],
+                KnowledgeSourceLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("absent {lane:?} lane must validate: {error:?}"));
+        }
+
+        // A live capture of an empty lane commits to that lane's OWN empty
+        // digest, which is a different value and is not the absent lane.
+        let live_empty = manifest(SourceLaneV1::Evidence, &[]);
+        assert_ne!(live_empty.manifest_sha256, absent.manifest_sha256);
+        assert!(!live_empty.is_absent_lane());
+        validate_source_manifest(
+            &scope(),
+            SourceLaneV1::Evidence,
+            &live_empty,
+            &[],
+            KnowledgeSourceLimits::default(),
+        )
+        .unwrap();
+
+        // The exemption never covers a lane that claims content.
+        let entries = evidence_entries();
+        assert!(matches!(
+            validate_source_manifest(
+                &scope(),
+                SourceLaneV1::Evidence,
+                &absent,
+                &entries,
+                KnowledgeSourceLimits::default(),
+            ),
+            Err(ContractError::ManifestCountMismatch)
+        ));
+    }
+
+    /// The evidence lane's manifest digest is domain-separated from every
+    /// other lane, so the same entry list cannot be replayed across lanes.
+    #[test]
+    fn the_evidence_lane_tag_separates_its_manifest_digest() {
+        let entries = evidence_entries();
+        let evidence = source_manifest_sha256(SourceLaneV1::Evidence, &entries);
+        for other in [
+            SourceLaneV1::Knowledge,
+            SourceLaneV1::Gaps,
+            SourceLaneV1::Graphs,
+        ] {
+            assert_ne!(evidence, source_manifest_sha256(other, &entries));
+        }
+    }
+
+    /// The lane filename this crate admits and the one the graph kernel writes
+    /// have to be the same string. The crates cannot share a constant without
+    /// making this wire leaf depend on the kernel, so the coupling is pinned
+    /// here instead.
+    #[test]
+    fn the_evidence_lane_filename_is_the_documented_one() {
+        assert_eq!(EVIDENCE_BINDINGS_FILENAME, "bindings.json");
     }
 
     /// Both goldens below are the values the pre-graphs-lane binary minted for
@@ -1798,9 +2310,18 @@ mod tests {
             )
             .unwrap()
         );
-        descriptor.working_graphs = manifest(SourceLaneV1::Graphs, &graph_entries("records"));
+        // Content on EITHER newer lane retires the pre-graphs vintage: no
+        // binary of that era could have written either one.
+        let mut with_graphs = descriptor.clone();
+        with_graphs.working_graphs = manifest(SourceLaneV1::Graphs, &graph_entries("records"));
         assert!(matches!(
-            descriptor.validate_header(KnowledgeSourceLimits::default()),
+            with_graphs.validate_header(KnowledgeSourceLimits::default()),
+            Err(ContractError::InvalidInput)
+        ));
+        let mut with_evidence = descriptor;
+        with_evidence.working_evidence = manifest(SourceLaneV1::Evidence, &evidence_entries());
+        assert!(matches!(
+            with_evidence.validate_header(KnowledgeSourceLimits::default()),
             Err(ContractError::InvalidInput)
         ));
     }
@@ -1813,6 +2334,12 @@ mod tests {
         assert_ne!(legacy, current);
         assert!(publication_generation_id_matches("producer-a", &descriptor, &legacy).unwrap());
         assert!(publication_generation_id_matches("producer-a", &descriptor, &current).unwrap());
+
+        // Evidence content alone retires the pre-graphs rung too, because the
+        // ladder guard requires every newer lane to be absent.
+        let mut with_evidence = descriptor.clone();
+        with_evidence.evidence = manifest(SourceLaneV1::Evidence, &evidence_entries());
+        assert!(!publication_generation_id_matches("producer-a", &with_evidence, &legacy).unwrap());
 
         let graphs = graph_entries("records");
         descriptor.graphs = manifest(SourceLaneV1::Graphs, &graphs);
@@ -2157,6 +2684,7 @@ mod tests {
             &changed.working_knowledge,
             &changed.working_gaps,
             &changed.working_graphs,
+            &changed.working_evidence,
         );
         changed.capture.first_working_pair_sha256 = changed_pair.clone();
         changed.capture.second_working_pair_sha256 = changed_pair;

@@ -1587,6 +1587,17 @@ fn capture_publication_parity(
                         source_bytes: file.source_bytes.clone(),
                     })
                     .collect(),
+                evidence: candidate
+                    .evidence
+                    .iter()
+                    .map(|file| PublishSourceFile {
+                        repository_relative_filename: file
+                            .manifest
+                            .repository_relative_filename
+                            .clone(),
+                        source_bytes: file.source_bytes.clone(),
+                    })
+                    .collect(),
             },
         )
         .map_err(|cause| error("error.knowledge_transport_cutover_parity", cause))?;

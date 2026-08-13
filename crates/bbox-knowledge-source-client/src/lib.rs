@@ -311,6 +311,12 @@ impl WorkspaceCaptureClient {
                 captured.descriptor.baseline_graphs.page_count,
             ),
             (
+                SnapshotClassV1::Baseline,
+                SourceLaneV1::Evidence,
+                captured.baseline_evidence.as_slice(),
+                captured.descriptor.baseline_evidence.page_count,
+            ),
+            (
                 SnapshotClassV1::Working,
                 SourceLaneV1::Knowledge,
                 captured.working_knowledge.as_slice(),
@@ -327,6 +333,12 @@ impl WorkspaceCaptureClient {
                 SourceLaneV1::Graphs,
                 captured.working_graphs.as_slice(),
                 captured.descriptor.working_graphs.page_count,
+            ),
+            (
+                SnapshotClassV1::Working,
+                SourceLaneV1::Evidence,
+                captured.working_evidence.as_slice(),
+                captured.descriptor.working_evidence.page_count,
             ),
         ] {
             let pages = pack_manifest_pages(
@@ -501,9 +513,11 @@ struct CapturedWorkspace {
     baseline_knowledge: Vec<SourceFileManifestEntryV1>,
     baseline_gaps: Vec<SourceFileManifestEntryV1>,
     baseline_graphs: Vec<SourceFileManifestEntryV1>,
+    baseline_evidence: Vec<SourceFileManifestEntryV1>,
     working_knowledge: Vec<SourceFileManifestEntryV1>,
     working_gaps: Vec<SourceFileManifestEntryV1>,
     working_graphs: Vec<SourceFileManifestEntryV1>,
+    working_evidence: Vec<SourceFileManifestEntryV1>,
     blobs: BTreeMap<String, Vec<u8>>,
 }
 
@@ -591,6 +605,13 @@ fn capture_workspace(
         limits,
         &mut blobs,
     )?;
+    let baseline_evidence = capture_committed_lane(
+        &baseline_commit,
+        &context.scope,
+        SourceLaneV1::Evidence,
+        limits,
+        &mut blobs,
+    )?;
     let working_knowledge = capture_working_lane(
         project_root,
         &context.scope,
@@ -612,20 +633,36 @@ fn capture_workspace(
         limits,
         &mut blobs,
     )?;
+    // `.bbox/evidence/bindings.json` is one flat JSON document, so the generic
+    // branch of `capture_working_lane` reads it exactly as it reads a knowledge
+    // or gap record. The single-document rule is a transport-level guarantee
+    // the contract enforces, not something this walk re-derives.
+    let working_evidence = capture_working_lane(
+        project_root,
+        &context.scope,
+        SourceLaneV1::Evidence,
+        limits,
+        &mut blobs,
+    )?;
     let baseline_knowledge_descriptor =
         manifest_descriptor(SourceLaneV1::Knowledge, &baseline_knowledge, limits)?;
     let baseline_gaps_descriptor = manifest_descriptor(SourceLaneV1::Gaps, &baseline_gaps, limits)?;
     let baseline_graphs_descriptor =
         manifest_descriptor(SourceLaneV1::Graphs, &baseline_graphs, limits)?;
+    let baseline_evidence_descriptor =
+        manifest_descriptor(SourceLaneV1::Evidence, &baseline_evidence, limits)?;
     let working_knowledge_descriptor =
         manifest_descriptor(SourceLaneV1::Knowledge, &working_knowledge, limits)?;
     let working_gaps_descriptor = manifest_descriptor(SourceLaneV1::Gaps, &working_gaps, limits)?;
     let working_graphs_descriptor =
         manifest_descriptor(SourceLaneV1::Graphs, &working_graphs, limits)?;
+    let working_evidence_descriptor =
+        manifest_descriptor(SourceLaneV1::Evidence, &working_evidence, limits)?;
     let first_pair = working_pair_sha256(
         &working_knowledge_descriptor,
         &working_gaps_descriptor,
         &working_graphs_descriptor,
+        &working_evidence_descriptor,
     );
 
     let mut second_blobs = BTreeMap::new();
@@ -650,15 +687,24 @@ fn capture_workspace(
         limits,
         &mut second_blobs,
     )?;
+    let second_evidence = capture_working_lane(
+        project_root,
+        &context.scope,
+        SourceLaneV1::Evidence,
+        limits,
+        &mut second_blobs,
+    )?;
     let second_pair = working_pair_sha256(
         &manifest_descriptor(SourceLaneV1::Knowledge, &second_knowledge, limits)?,
         &manifest_descriptor(SourceLaneV1::Gaps, &second_gaps, limits)?,
         &manifest_descriptor(SourceLaneV1::Graphs, &second_graphs, limits)?,
+        &manifest_descriptor(SourceLaneV1::Evidence, &second_evidence, limits)?,
     );
     if first_pair != second_pair
         || working_knowledge != second_knowledge
         || working_gaps != second_gaps
         || working_graphs != second_graphs
+        || working_evidence != second_evidence
     {
         bail!("knowledge-source working files moved during stable capture");
     }
@@ -697,9 +743,11 @@ fn capture_workspace(
         baseline_knowledge: baseline_knowledge_descriptor,
         baseline_gaps: baseline_gaps_descriptor,
         baseline_graphs: baseline_graphs_descriptor,
+        baseline_evidence: baseline_evidence_descriptor,
         working_knowledge: working_knowledge_descriptor,
         working_gaps: working_gaps_descriptor,
         working_graphs: working_graphs_descriptor,
+        working_evidence: working_evidence_descriptor,
     };
     validate_provisional_workspace(
         &descriptor,
@@ -707,9 +755,11 @@ fn capture_workspace(
         &baseline_knowledge,
         &baseline_gaps,
         &baseline_graphs,
+        &baseline_evidence,
         &working_knowledge,
         &working_gaps,
         &working_graphs,
+        &working_evidence,
         limits,
     )?;
     Ok(CapturedWorkspace {
@@ -718,9 +768,11 @@ fn capture_workspace(
         baseline_knowledge,
         baseline_gaps,
         baseline_graphs,
+        baseline_evidence,
         working_knowledge,
         working_gaps,
         working_graphs,
+        working_evidence,
         blobs,
     })
 }
@@ -1039,9 +1091,11 @@ fn current_matches(
             == descriptor.baseline_knowledge.manifest_sha256
         && current.baseline_gap_manifest_sha256 == descriptor.baseline_gaps.manifest_sha256
         && current.baseline_graph_manifest_sha256 == descriptor.baseline_graphs.manifest_sha256
+        && current.baseline_evidence_manifest_sha256 == descriptor.baseline_evidence.manifest_sha256
         && current.working_knowledge_manifest_sha256 == descriptor.working_knowledge.manifest_sha256
         && current.working_gap_manifest_sha256 == descriptor.working_gaps.manifest_sha256
         && current.working_graph_manifest_sha256 == descriptor.working_graphs.manifest_sha256
+        && current.working_evidence_manifest_sha256 == descriptor.working_evidence.manifest_sha256
 }
 
 fn lane_repository_directory(scope: &PublishedScope, lane: SourceLaneV1) -> String {
@@ -1057,6 +1111,7 @@ fn lane_name(lane: SourceLaneV1) -> &'static str {
         SourceLaneV1::Knowledge => "knowledge",
         SourceLaneV1::Gaps => "gaps",
         SourceLaneV1::Graphs => "graphs",
+        SourceLaneV1::Evidence => "evidence",
     }
 }
 
@@ -1218,6 +1273,122 @@ mod tests {
         .err()
         .expect("pending transaction must fail closed");
         assert!(format!("{error:#}").contains("transaction is pending"));
+    }
+
+    const EVIDENCE_BINDINGS: &[u8] = br#"{"schema_version":1,"bindings":[]}"#;
+
+    fn write_working_evidence(root: &Path) {
+        fs::create_dir_all(root.join(".bbox/evidence")).unwrap();
+        fs::write(
+            root.join(".bbox")
+                .join("evidence")
+                .join(bbox_knowledge_source::EVIDENCE_BINDINGS_FILENAME),
+            EVIDENCE_BINDINGS,
+        )
+        .unwrap();
+    }
+
+    fn capture_context(accepted_commit: String) -> ProvisionalCaptureContextV1 {
+        ProvisionalCaptureContextV1 {
+            scope: PublishedScope::try_new("capture-test", ".").unwrap(),
+            accepted_generation: "a".repeat(64),
+            accepted_commit,
+            lease_ttl_secs: 60,
+        }
+    }
+
+    /// The status a daemon would report for exactly this capture. Anything the
+    /// reuse check consults has to come from the descriptor, or a lane that
+    /// moved would read as unchanged.
+    fn status_for(descriptor: &ProvisionalWorkspaceDescriptorV1) -> ProvisionalWorkspaceStatusV1 {
+        ProvisionalWorkspaceStatusV1 {
+            source_generation_id: "f".repeat(64),
+            state: SourceGenerationStateV1::Ready,
+            workspace_id: descriptor.workspace_id.clone(),
+            sequence: descriptor.sequence,
+            accepted_generation: descriptor.accepted_generation.clone(),
+            checkout_head: descriptor.checkout_head.clone(),
+            observed_at_unix_secs: 1,
+            baseline_knowledge_manifest_sha256: descriptor
+                .baseline_knowledge
+                .manifest_sha256
+                .clone(),
+            baseline_gap_manifest_sha256: descriptor.baseline_gaps.manifest_sha256.clone(),
+            baseline_graph_manifest_sha256: descriptor.baseline_graphs.manifest_sha256.clone(),
+            baseline_evidence_manifest_sha256: descriptor.baseline_evidence.manifest_sha256.clone(),
+            working_knowledge_manifest_sha256: descriptor.working_knowledge.manifest_sha256.clone(),
+            working_gap_manifest_sha256: descriptor.working_gaps.manifest_sha256.clone(),
+            working_graph_manifest_sha256: descriptor.working_graphs.manifest_sha256.clone(),
+            working_evidence_manifest_sha256: descriptor.working_evidence.manifest_sha256.clone(),
+            lease_expires_unix_secs: Some(61),
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn evidence_capture_reads_the_single_bindings_document() {
+        let (_directory, root, workspace_id, accepted) = managed_repository();
+        write_working_evidence(&root);
+
+        let captured =
+            capture_workspace(&root, &root, workspace_id, capture_context(accepted), 1).unwrap();
+
+        assert_eq!(captured.working_evidence.len(), 1);
+        assert_eq!(
+            captured.working_evidence[0].repository_relative_filename,
+            ".bbox/evidence/bindings.json"
+        );
+        assert_eq!(captured.descriptor.working_evidence.file_count, 1);
+        assert_eq!(captured.descriptor.working_evidence.page_count, 1);
+        assert!(
+            captured
+                .blobs
+                .contains_key(&captured.working_evidence[0].content_sha256)
+        );
+        // The document is uncommitted, so the accepted baseline carries no
+        // evidence at all. The descriptor still commits to the empty EVIDENCE
+        // lane rather than the canonical absent-lane digest, because a live
+        // capture always knows the lane exists.
+        assert!(captured.baseline_evidence.is_empty());
+        assert_eq!(captured.descriptor.baseline_evidence.file_count, 0);
+        assert_eq!(
+            captured.descriptor.baseline_evidence.manifest_sha256,
+            source_manifest_sha256(SourceLaneV1::Evidence, &[])
+        );
+    }
+
+    #[test]
+    fn evidence_only_edits_move_the_working_pair() {
+        let (_directory, root, workspace_id, accepted) = managed_repository();
+        let context = capture_context(accepted);
+        let before = capture_workspace(&root, &root, workspace_id.clone(), context.clone(), 1)
+            .expect("a workspace with no evidence document still captures");
+        let current = status_for(&before.descriptor);
+        assert!(current_matches(&current, &before.descriptor));
+
+        write_working_evidence(&root);
+        let after = capture_workspace(&root, &root, workspace_id, context, 2).unwrap();
+
+        // Only the evidence lane moved.
+        assert_eq!(
+            before.descriptor.working_knowledge.manifest_sha256,
+            after.descriptor.working_knowledge.manifest_sha256
+        );
+        assert_eq!(
+            before.descriptor.working_gaps.manifest_sha256,
+            after.descriptor.working_gaps.manifest_sha256
+        );
+        assert_ne!(
+            before.descriptor.working_evidence.manifest_sha256,
+            after.descriptor.working_evidence.manifest_sha256
+        );
+        assert_ne!(
+            before.descriptor.capture.first_working_pair_sha256,
+            after.descriptor.capture.first_working_pair_sha256
+        );
+        // Without the evidence comparison this reads as unchanged and the
+        // capture is never uploaded.
+        assert!(!current_matches(&current, &after.descriptor));
     }
 
     fn write_working_graph(root: &Path, graph_id: &str) -> PathBuf {
@@ -1542,9 +1713,11 @@ mod tests {
             baseline_knowledge_manifest_sha256: descriptor.baseline_knowledge.manifest_sha256,
             baseline_gap_manifest_sha256: descriptor.baseline_gaps.manifest_sha256,
             baseline_graph_manifest_sha256: descriptor.baseline_graphs.manifest_sha256,
+            baseline_evidence_manifest_sha256: descriptor.baseline_evidence.manifest_sha256,
             working_knowledge_manifest_sha256: descriptor.working_knowledge.manifest_sha256,
             working_gap_manifest_sha256: descriptor.working_gaps.manifest_sha256,
             working_graph_manifest_sha256: descriptor.working_graphs.manifest_sha256,
+            working_evidence_manifest_sha256: descriptor.working_evidence.manifest_sha256,
             lease_expires_unix_secs: Some(61),
             diagnostic: None,
         });

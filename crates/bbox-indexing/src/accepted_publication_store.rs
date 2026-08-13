@@ -474,6 +474,16 @@ pub struct AcceptedGraphSourceV1 {
     pub source_bytes: Vec<u8>,
 }
 
+/// One accepted `.bbox/evidence` source file. Same shape as the graph source,
+/// kept as its own type so the two lanes cannot be crossed by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedEvidenceSourceV1 {
+    pub source_content_sha256: PublicationSha256,
+    pub encoded_bytes: u64,
+    pub source_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedPublicationHashesV1 {
@@ -483,6 +493,10 @@ pub struct AcceptedPublicationHashesV1 {
     pub normalized_gaps_sha256: PublicationSha256,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_sources_sha256: Option<PublicationSha256>,
+    /// `None` for an empty evidence lane, which is what every generation
+    /// written before the lane existed recomputes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_sources_sha256: Option<PublicationSha256>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,6 +508,8 @@ pub struct AcceptedPublicationCountsV1 {
     pub gap_entries: u64,
     #[serde(default)]
     pub graph_files: u64,
+    #[serde(default)]
+    pub evidence_files: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +532,10 @@ pub(crate) struct AcceptedPublicationGenerationV1 {
     pub(crate) normalized_gaps: BTreeMap<PublicationRecordId, AcceptedGapEntryV1>,
     #[serde(default, deserialize_with = "deserialize_unique_btree_map")]
     pub(crate) graph_sources: BTreeMap<NormalizedRepoRelativeFilename, AcceptedGraphSourceV1>,
+    /// Absent in every generation written before the evidence lane; `default`
+    /// decodes those to the empty map so the record recomputes to itself.
+    #[serde(default, deserialize_with = "deserialize_unique_btree_map")]
+    pub(crate) evidence_sources: BTreeMap<NormalizedRepoRelativeFilename, AcceptedEvidenceSourceV1>,
     pub(crate) hashes: AcceptedPublicationHashesV1,
     pub(crate) counts: AcceptedPublicationCountsV1,
     pub(crate) total_encoded_bytes: u64,
@@ -608,6 +628,7 @@ pub(crate) struct AcceptedPublicationBuildInputV1 {
     pub(crate) knowledge: Vec<AcceptedKnowledgeSourceV1>,
     pub(crate) gaps: Vec<AcceptedGapSourceV1>,
     pub(crate) graphs: Vec<AcceptedGraphSourceV1Input>,
+    pub(crate) evidence: Vec<AcceptedEvidenceSourceV1Input>,
     /// The auto-advance grant this pointer will carry. The runtime resolves
     /// it from the installed pointer plus the caller's explicit operator
     /// update before it gets here; the builder only writes what it is told.
@@ -617,6 +638,12 @@ pub(crate) struct AcceptedPublicationBuildInputV1 {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptedGraphSourceV1Input {
+    pub(crate) repository_relative_filename: String,
+    pub(crate) source_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AcceptedEvidenceSourceV1Input {
     pub(crate) repository_relative_filename: String,
     pub(crate) source_bytes: Vec<u8>,
 }
@@ -727,6 +754,7 @@ pub(crate) struct AcceptedPublicationLimits {
     pub(crate) max_knowledge_source_bytes: u64,
     pub(crate) max_gap_source_bytes: u64,
     pub(crate) max_graph_source_bytes: u64,
+    pub(crate) max_evidence_source_bytes: u64,
     pub(crate) max_generation_bytes: usize,
     pub(crate) max_pointer_bytes: usize,
 }
@@ -740,6 +768,7 @@ impl Default for AcceptedPublicationLimits {
             max_knowledge_source_bytes: MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
             max_gap_source_bytes: MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
             max_graph_source_bytes: MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
+            max_evidence_source_bytes: MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE,
             max_generation_bytes: MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES,
             max_pointer_bytes: MAX_ACCEPTED_PUBLICATION_POINTER_BYTES,
         }
@@ -760,6 +789,8 @@ impl AcceptedPublicationLimits {
             && self.max_gap_source_bytes <= MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE
             && self.max_graph_source_bytes > 0
             && self.max_graph_source_bytes <= MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE
+            && self.max_evidence_source_bytes > 0
+            && self.max_evidence_source_bytes <= MAX_ACCEPTED_PUBLICATION_SOURCE_BYTES_PER_LANE
             && self.max_generation_bytes > 0
             && self.max_generation_bytes <= MAX_ACCEPTED_PUBLICATION_GENERATION_BYTES
             && self.max_pointer_bytes > 0
@@ -1448,9 +1479,89 @@ pub(crate) fn prepare_accepted_publication_v1(
         }
     }
 
+    let evidence_prefix = if input.scope.bbox_root_relpath() == "." {
+        format!("{}/", bbox_project_graph::EVIDENCE_LANE_ROOT)
+    } else {
+        format!(
+            "{}/{}/",
+            input.scope.bbox_root_relpath(),
+            bbox_project_graph::EVIDENCE_LANE_ROOT
+        )
+    };
+    let mut evidence_sources = BTreeMap::new();
+    let mut evidence_source_bytes = 0_u64;
+    for source in input.evidence {
+        let encoded_bytes = u64::try_from(source.source_bytes.len())
+            .map_err(|_| byte_limit("accepted evidence source file"))?;
+        if encoded_bytes == 0 || encoded_bytes > limits.max_source_file_bytes {
+            return Err(byte_limit("accepted evidence source file"));
+        }
+        evidence_source_bytes = evidence_source_bytes
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| byte_limit("accepted evidence source lane"))?;
+        if evidence_source_bytes > limits.max_evidence_source_bytes {
+            return Err(byte_limit("accepted evidence source lane"));
+        }
+        let supplied =
+            NormalizedRepoRelativeFilename::parse(source.repository_relative_filename.clone())?;
+        let relative = source
+            .repository_relative_filename
+            .strip_prefix(&evidence_prefix)
+            .ok_or_else(|| {
+                invalid_generation("accepted evidence filename is outside evidence scope")
+            })?;
+        if relative != bbox_project_graph::EVIDENCE_BINDINGS_FILENAME {
+            return Err(invalid_generation(
+                "accepted evidence lane admits only the bindings document",
+            ));
+        }
+        // The accepted set is validated BEFORE install, so an invalid document
+        // never displaces the prior accepted bindings: the whole publication
+        // is refused rather than landing a half-readable lane.
+        let load = bbox_project_graph::parse_evidence_document(
+            input.project_id.as_str(),
+            &source.source_bytes,
+            bbox_project_graph::EvidenceParseLimits::default(),
+        );
+        if !load.valid() {
+            let diagnostic = load
+                .errors
+                .iter()
+                .map(|error| {
+                    format!(
+                        "{}:{}:{}",
+                        error.code,
+                        error.binding_id.clone().unwrap_or_default(),
+                        error.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(invalid_generation(format!(
+                "accepted evidence bindings failed validation: {diagnostic}"
+            )));
+        }
+        if evidence_sources
+            .insert(
+                supplied,
+                AcceptedEvidenceSourceV1 {
+                    source_content_sha256: PublicationSha256::digest(&source.source_bytes),
+                    encoded_bytes,
+                    source_bytes: source.source_bytes,
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid_generation(
+                "accepted evidence publication contains a duplicate source file",
+            ));
+        }
+    }
+
     let total_encoded_bytes = knowledge_source_bytes
         .checked_add(gap_source_bytes)
         .and_then(|bytes| bytes.checked_add(graph_source_bytes))
+        .and_then(|bytes| bytes.checked_add(evidence_source_bytes))
         .ok_or_else(|| byte_limit("accepted publication source total"))?;
     let hashes = AcceptedPublicationHashesV1 {
         knowledge_file_manifest_sha256: canonical_json_hash(
@@ -1471,6 +1582,14 @@ pub(crate) fn prepare_accepted_publication_v1(
                 "accepted graph sources",
             )?)
         },
+        evidence_sources_sha256: if evidence_sources.is_empty() {
+            None
+        } else {
+            Some(canonical_json_hash(
+                &evidence_sources,
+                "accepted evidence sources",
+            )?)
+        },
     };
     let counts = AcceptedPublicationCountsV1 {
         knowledge_files: usize_to_u64(knowledge_file_manifest.len(), "accepted knowledge file")?,
@@ -1478,6 +1597,7 @@ pub(crate) fn prepare_accepted_publication_v1(
         gap_files: usize_to_u64(gap_file_manifest.len(), "accepted gap file")?,
         gap_entries: usize_to_u64(normalized_gaps.len(), "accepted gap entry")?,
         graph_files: usize_to_u64(graph_sources.len(), "accepted graph file")?,
+        evidence_files: usize_to_u64(evidence_sources.len(), "accepted evidence file")?,
     };
     let generation = AcceptedPublicationGenerationV1 {
         version: ACCEPTED_PUBLICATION_VERSION,
@@ -1490,6 +1610,7 @@ pub(crate) fn prepare_accepted_publication_v1(
         normalized_knowledge,
         normalized_gaps,
         graph_sources,
+        evidence_sources,
         hashes,
         counts,
         total_encoded_bytes,
@@ -1765,9 +1886,16 @@ fn validate_generation_v1(
         &generation.graph_sources,
         limits,
     )?;
+    let evidence_source_bytes = validate_accepted_evidence_sources(
+        &generation.project_id,
+        &generation.scope,
+        &generation.evidence_sources,
+        limits,
+    )?;
     let expected_total = knowledge_source_bytes
         .checked_add(gap_source_bytes)
         .and_then(|bytes| bytes.checked_add(graph_source_bytes))
+        .and_then(|bytes| bytes.checked_add(evidence_source_bytes))
         .ok_or_else(|| byte_limit("accepted publication source total"))?;
     if generation.total_encoded_bytes != expected_total {
         return Err(invalid_generation(
@@ -1786,6 +1914,7 @@ fn validate_generation_v1(
         gap_files: usize_to_u64(generation.gap_file_manifest.len(), "accepted gap file")?,
         gap_entries: usize_to_u64(generation.normalized_gaps.len(), "accepted gap entry")?,
         graph_files: usize_to_u64(generation.graph_sources.len(), "accepted graph file")?,
+        evidence_files: usize_to_u64(generation.evidence_sources.len(), "accepted evidence file")?,
     };
     if generation.counts != expected_counts {
         return Err(invalid_generation(
@@ -1817,6 +1946,14 @@ fn validate_generation_v1(
                 "accepted graph sources",
             )?)
         },
+        evidence_sources_sha256: if generation.evidence_sources.is_empty() {
+            None
+        } else {
+            Some(canonical_json_hash(
+                &generation.evidence_sources,
+                "accepted evidence sources",
+            )?)
+        },
     };
     if generation.hashes != expected_hashes {
         return Err(invalid_generation(
@@ -1824,6 +1961,75 @@ fn validate_generation_v1(
         ));
     }
     Ok(())
+}
+
+/// Re-validate the accepted evidence lane on read.
+///
+/// The lane is one document at one exact path, and its bytes must still parse
+/// and validate as a complete binding document. A generation written before
+/// the lane existed carries an empty map, which validates trivially and
+/// contributes zero bytes, so its stored total and hashes recompute to
+/// themselves.
+fn validate_accepted_evidence_sources(
+    project_id: &ProjectId,
+    scope: &PublishedScope,
+    sources: &BTreeMap<NormalizedRepoRelativeFilename, AcceptedEvidenceSourceV1>,
+    limits: &AcceptedPublicationLimits,
+) -> AcceptedPublicationStoreResult<u64> {
+    let evidence_prefix = if scope.bbox_root_relpath() == "." {
+        format!("{}/", bbox_project_graph::EVIDENCE_LANE_ROOT)
+    } else {
+        format!(
+            "{}/{}/",
+            scope.bbox_root_relpath(),
+            bbox_project_graph::EVIDENCE_LANE_ROOT
+        )
+    };
+    if sources.len() > 1 {
+        return Err(invalid_generation(
+            "accepted evidence lane admits only the bindings document",
+        ));
+    }
+    let mut total = 0_u64;
+    for (filename, source) in sources {
+        if source.encoded_bytes == 0
+            || source.encoded_bytes > limits.max_source_file_bytes
+            || source.encoded_bytes != source.source_bytes.len() as u64
+            || source.source_content_sha256 != PublicationSha256::digest(&source.source_bytes)
+        {
+            return Err(invalid_generation(
+                "accepted evidence source bytes disagree with their manifest",
+            ));
+        }
+        total = total
+            .checked_add(source.encoded_bytes)
+            .ok_or_else(|| byte_limit("accepted evidence source lane"))?;
+        if total > limits.max_evidence_source_bytes {
+            return Err(byte_limit("accepted evidence source lane"));
+        }
+        let relative = filename
+            .as_str()
+            .strip_prefix(&evidence_prefix)
+            .ok_or_else(|| {
+                invalid_generation("accepted evidence filename is outside evidence scope")
+            })?;
+        if relative != bbox_project_graph::EVIDENCE_BINDINGS_FILENAME {
+            return Err(invalid_generation(
+                "accepted evidence lane admits only the bindings document",
+            ));
+        }
+        let load = bbox_project_graph::parse_evidence_document(
+            project_id.as_str(),
+            &source.source_bytes,
+            bbox_project_graph::EvidenceParseLimits::default(),
+        );
+        if !load.valid() {
+            return Err(invalid_generation(
+                "accepted evidence bindings failed validation",
+            ));
+        }
+    }
+    Ok(total)
 }
 
 fn validate_accepted_graph_sources(
@@ -2837,6 +3043,7 @@ pub(crate) mod fixtures {
                 source_bytes: serde_json::to_vec(&gap_note("gap-1234abcd")).unwrap(),
             }],
             graphs: Vec::new(),
+            evidence: Vec::new(),
             // The shared fixture stays grant-free. A test that wants the
             // auto-advance policy installs the grant explicitly, so no
             // fixture consumer silently inherits one.
@@ -3011,6 +3218,7 @@ mod tests {
             )],
             gaps: vec![gap_source("gap-1234abcd", ".bbox/gaps/gap-1234abcd.json")],
             graphs: Vec::new(),
+            evidence: Vec::new(),
             auto_advance: None,
             prior_pointer: None,
         }
@@ -3084,6 +3292,151 @@ mod tests {
         assert_eq!(legacy.counts.graph_files, 0);
         assert!(legacy.hashes.graph_sources_sha256.is_none());
         validate_generation_v1(&legacy, &AcceptedPublicationLimits::default()).unwrap();
+    }
+
+    fn evidence_document_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "bindings": [{
+                "binding_id": "record-to-source",
+                "source": {
+                    "kind": "graph_vertex",
+                    "graph_id": "governance-record",
+                    "vertex_id": "record/case@1"
+                },
+                "kind": "record:CORRESPONDS_TO",
+                "target": {
+                    "kind": "project_file",
+                    "rel_path_hash": "pathhash",
+                    "chunk_hash": "chunkhash"
+                },
+                "assertion_authority": "project",
+                "mapping_version": "mapping-v1",
+                "asserted_at": "2026-01-01T00:00:00Z"
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn evidence_sources() -> Vec<AcceptedEvidenceSourceV1Input> {
+        vec![AcceptedEvidenceSourceV1Input {
+            repository_relative_filename: ".bbox/evidence/bindings.json".to_string(),
+            source_bytes: evidence_document_bytes(),
+        }]
+    }
+
+    /// Same vintage argument the graph lane made, one rung later. Every
+    /// evidence commitment is absent-equivalent: the aggregate hash is None
+    /// for an empty lane and the count is zero, so a generation written
+    /// before the lane recomputes to itself and still validates.
+    #[test]
+    fn generation_written_before_the_evidence_lane_still_validates() {
+        let prepared =
+            prepare_accepted_publication_v1(build_input(), &AcceptedPublicationLimits::default())
+                .unwrap();
+        let encoded = serde_json::to_value(&prepared.generation).unwrap();
+        let mut record = encoded.as_object().unwrap().clone();
+        assert!(record.remove("evidence_sources").is_some());
+        record
+            .get_mut("counts")
+            .and_then(|counts| counts.as_object_mut())
+            .map(|counts| counts.remove("evidence_files"))
+            .unwrap()
+            .unwrap();
+        record
+            .get_mut("hashes")
+            .and_then(|hashes| hashes.as_object_mut())
+            .map(|hashes| hashes.remove("evidence_sources_sha256"));
+
+        let legacy: AcceptedPublicationGenerationV1 =
+            serde_json::from_value(serde_json::Value::Object(record)).unwrap();
+        assert_eq!(legacy.counts.evidence_files, 0);
+        assert!(legacy.hashes.evidence_sources_sha256.is_none());
+        assert!(legacy.evidence_sources.is_empty());
+        validate_generation_v1(&legacy, &AcceptedPublicationLimits::default()).unwrap();
+    }
+
+    /// A record written before BOTH lanes still opens. The two tolerances are
+    /// independent, so the oldest vintage on disk has to be exercised as its
+    /// own case rather than inferred from the one-lane-back case.
+    #[test]
+    fn generation_written_before_both_lanes_still_validates() {
+        let prepared =
+            prepare_accepted_publication_v1(build_input(), &AcceptedPublicationLimits::default())
+                .unwrap();
+        let encoded = serde_json::to_value(&prepared.generation).unwrap();
+        let mut record = encoded.as_object().unwrap().clone();
+        record.remove("graph_sources");
+        record.remove("evidence_sources");
+        if let Some(counts) = record
+            .get_mut("counts")
+            .and_then(|value| value.as_object_mut())
+        {
+            counts.remove("graph_files");
+            counts.remove("evidence_files");
+        }
+        if let Some(hashes) = record
+            .get_mut("hashes")
+            .and_then(|value| value.as_object_mut())
+        {
+            hashes.remove("graph_sources_sha256");
+            hashes.remove("evidence_sources_sha256");
+        }
+
+        let legacy: AcceptedPublicationGenerationV1 =
+            serde_json::from_value(serde_json::Value::Object(record)).unwrap();
+        assert_eq!(legacy.counts.graph_files, 0);
+        assert_eq!(legacy.counts.evidence_files, 0);
+        validate_generation_v1(&legacy, &AcceptedPublicationLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn candidate_builder_accepts_the_evidence_bindings_document() {
+        let mut input = build_input();
+        input.graphs = governance_graph_sources();
+        input.evidence = evidence_sources();
+        let prepared =
+            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
+        assert_eq!(prepared.generation.counts.evidence_files, 1);
+        assert_eq!(prepared.generation.evidence_sources.len(), 1);
+        assert!(prepared.generation.hashes.evidence_sources_sha256.is_some());
+        validate_generation_v1(&prepared.generation, &AcceptedPublicationLimits::default())
+            .unwrap();
+    }
+
+    /// An invalid candidate document is refused at prepare time, so it never
+    /// displaces a prior accepted binding set: the whole publication fails
+    /// rather than landing a half-readable lane.
+    #[test]
+    fn candidate_builder_refuses_an_invalid_evidence_document() {
+        let mut input = build_input();
+        input.evidence = vec![AcceptedEvidenceSourceV1Input {
+            repository_relative_filename: ".bbox/evidence/bindings.json".to_string(),
+            source_bytes: br#"{"version":1,"bindings":[{"binding_id":""}]}"#.to_vec(),
+        }];
+        assert!(
+            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_builder_refuses_an_evidence_file_outside_the_lane() {
+        for filename in [
+            ".bbox/evidence/other.json",
+            ".bbox/evidence/nested/bindings.json",
+            ".bbox/graphs/bindings.json",
+        ] {
+            let mut input = build_input();
+            input.evidence = vec![AcceptedEvidenceSourceV1Input {
+                repository_relative_filename: filename.to_string(),
+                source_bytes: evidence_document_bytes(),
+            }];
+            assert!(
+                prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default())
+                    .is_err(),
+                "{filename} must not be accepted on the evidence lane"
+            );
+        }
     }
 
     #[test]

@@ -154,6 +154,17 @@ pub(crate) fn publish_from_ready_candidate(
                     source_bytes: file.source_bytes.clone(),
                 })
                 .collect(),
+            evidence: candidate
+                .evidence
+                .iter()
+                .map(|file| PublishSourceFile {
+                    repository_relative_filename: file
+                        .manifest
+                        .repository_relative_filename
+                        .clone(),
+                    source_bytes: file.source_bytes.clone(),
+                })
+                .collect(),
         },
         revalidate_source: Box::new(move || {
             let candidate = revalidate_pin.candidate();

@@ -40,6 +40,9 @@ tempfile = "3"
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-edge-index = { path = "../bbox-edge-index" }
 bbox-indexing = { path = "../bbox-indexing" }
+# For the evidence edge metadata keys and endpoint-status vocabulary the read
+# surfaces label steps and edges with.
+bbox-project-graph = { path = "../bbox-project-graph" }
 bbox-providers = { path = "../bbox-providers" }
 bbox-embed = { path = "../bbox-embed" }
 bbox-provenance = { path = "../bbox-provenance" }

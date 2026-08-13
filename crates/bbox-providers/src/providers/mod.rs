@@ -146,6 +146,23 @@ pub struct ProviderContext<'a> {
 
 pub trait ProjectGraphEntityResolver: Send + Sync {
     fn resolve_entity(&self, r: &EntityRef, provisional: Option<&str>) -> Result<EntityView>;
+
+    /// Tenant-owned evidence bindings touching `r`, in both directions.
+    ///
+    /// Distinct from `resolve_entity` because an evidence binding can name an
+    /// endpoint this resolver does not own: a project file or a knowledge
+    /// entry is a legal endpoint, and the edge has to surface on THAT entity's
+    /// neighborhood too, not only on the graph vertex at the other end.
+    /// Returning edges here is how a non-graph entity gets them without every
+    /// provider learning about evidence.
+    ///
+    /// Each edge carries the `evidence.*` metadata family, with any endpoint
+    /// the resolver could not observe left as `unresolved` for the read plane
+    /// to refine.
+    fn evidence_edges(&self, r: &EntityRef, provisional: Option<&str>) -> Vec<Edge> {
+        let _ = (r, provisional);
+        Vec::new()
+    }
 }
 
 impl<'a> ProviderContext<'a> {
@@ -247,6 +264,15 @@ impl<'a> ProviderContext<'a> {
 
     pub fn provisional_mode(&self) -> Option<&'a str> {
         self.provisional
+    }
+
+    /// Evidence bindings touching `r`. Empty when no project-graph resolver is
+    /// bound, which is the correct reading for a context that cannot see the
+    /// project graph at all.
+    pub fn evidence_edges(&self, r: &EntityRef) -> Vec<Edge> {
+        self.project_graph_resolver
+            .map(|resolver| resolver.evidence_edges(r, self.provisional))
+            .unwrap_or_default()
     }
 
     pub fn indexed_entity_properties(

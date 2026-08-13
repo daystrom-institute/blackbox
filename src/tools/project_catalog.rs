@@ -1790,6 +1790,7 @@ fn publisher_publish_probe(
                 })
                 .collect(),
             graphs: Vec::new(),
+            evidence: Vec::new(),
         },
         revalidate_checkout,
         revalidate_ref: Box::new(move || {
@@ -3224,6 +3225,12 @@ mod tests {
                     .sum(),
                 page_count: 1,
             },
+            evidence: SourceManifestDescriptorV1 {
+                manifest_sha256: source_manifest_sha256(SourceLaneV1::Evidence, &[]),
+                file_count: 0,
+                logical_bytes: 0,
+                page_count: 0,
+            },
         };
         let authority = PublicationAuthorityV1 {
             producer_id: "producer-a".into(),
@@ -3474,6 +3481,12 @@ mod tests {
                 },
                 graphs: SourceManifestDescriptorV1 {
                     manifest_sha256: source_manifest_sha256(SourceLaneV1::Graphs, &[]),
+                    file_count: 0,
+                    logical_bytes: 0,
+                    page_count: 0,
+                },
+                evidence: SourceManifestDescriptorV1 {
+                    manifest_sha256: source_manifest_sha256(SourceLaneV1::Evidence, &[]),
                     file_count: 0,
                     logical_bytes: 0,
                     page_count: 0,
@@ -3941,6 +3954,7 @@ mod tests {
                     }],
                     gaps: Vec::new(),
                     graphs: Vec::new(),
+                    evidence: Vec::new(),
                 },
             )
             .unwrap();

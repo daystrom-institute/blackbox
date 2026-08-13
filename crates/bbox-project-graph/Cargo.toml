@@ -4,6 +4,10 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+# Evidence bindings name canonical EntityRef endpoints, so the kernel needs the
+# foundation identity types. bbox-corpus-core depends on no blackbox internals,
+# so this stays a leaf-to-leaf edge with no cycle.
+bbox-corpus-core = { path = "../bbox-corpus-core" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

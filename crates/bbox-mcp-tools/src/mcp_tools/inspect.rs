@@ -7,6 +7,7 @@ use serde_json::json;
 
 use bbox_corpus_core::entity_ref::EntityRef;
 use bbox_edge_index::edge_index::{Edge, EdgeIndex};
+use bbox_project_graph::EvidenceEndpointStatus;
 use bbox_providers::entity_loader;
 use bbox_providers::providers::{self, EntityView, Neighborhood, NextHop, ProviderContext};
 
@@ -67,6 +68,10 @@ struct RenderedEdge {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_label: Option<String>,
     direction: String,
+    /// Per-edge labels, currently the `evidence.*` family. Absent on ordinary
+    /// corpus edges, so the payload does not grow for the common case.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,15 +158,35 @@ pub fn inspect_entity(
         Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
     };
     let canonical_ref = EntityRef::parse(&entity.ref_string).unwrap_or_else(|_| r.clone());
-    let full_neighborhood = if matches!(
+    let mut full_neighborhood = if matches!(
         r.entity_type(),
         bbox_corpus_core::entity_ref::EntityType::ProjectGraphVertex
             | bbox_corpus_core::entity_ref::EntityType::ProvisionalProjectGraphVertex
     ) {
+        // The graph resolver already attached this vertex's evidence edges.
         entity.neighborhood.clone()
     } else {
-        full_neighborhood(edge_index, r)
+        // A project file or knowledge entry is a legal evidence endpoint, so
+        // its neighborhood has to carry the bindings that point at it. Without
+        // this the edge would exist only on the graph side and the reverse
+        // traversal would lose it.
+        let mut neighborhood = full_neighborhood(edge_index, r);
+        for edge in ctx.evidence_edges(r) {
+            if &edge.source == r {
+                neighborhood.forward.push(edge);
+            } else {
+                neighborhood.reverse.push(edge);
+            }
+        }
+        neighborhood
     };
+    for edge in full_neighborhood
+        .forward
+        .iter_mut()
+        .chain(full_neighborhood.reverse.iter_mut())
+    {
+        refine_evidence_edge(ctx, edge);
+    }
     entity.neighborhood = filtered_neighborhood(
         &full_neighborhood,
         direction,
@@ -246,6 +271,92 @@ fn parse_edge_filter(raw: Option<&str>) -> Option<HashSet<String>> {
     )
 }
 
+/// Second-pass endpoint scoring for an evidence edge.
+///
+/// The graph layer can observe graph vertices, because it holds the view
+/// catalog, and marks everything else `unresolved`. Here the provider registry
+/// is in hand, so an `unresolved` endpoint can be settled by trying to load
+/// it: loadable is `current`, not loadable is `missing` (or `stale` when the
+/// binding recorded a generation to be stale against). Endpoints the graph
+/// layer already scored are left alone, and a non-evidence edge is untouched.
+pub fn refine_evidence_edge(ctx: &ProviderContext<'_>, edge: &mut Edge) {
+    if !edge
+        .metadata
+        .contains_key(bbox_project_graph::EVIDENCE_META_BINDING_ID)
+    {
+        return;
+    }
+    let source = refined_endpoint_status(
+        ctx,
+        &edge.source,
+        edge.metadata
+            .get(bbox_project_graph::EVIDENCE_META_SOURCE_STATUS),
+        edge.metadata
+            .contains_key(bbox_project_graph::EVIDENCE_META_SOURCE_GENERATION),
+    );
+    let target = refined_endpoint_status(
+        ctx,
+        &edge.target,
+        edge.metadata
+            .get(bbox_project_graph::EVIDENCE_META_TARGET_STATUS),
+        edge.metadata
+            .contains_key(bbox_project_graph::EVIDENCE_META_TARGET_GENERATION),
+    );
+    edge.metadata.insert(
+        bbox_project_graph::EVIDENCE_META_SOURCE_STATUS.to_string(),
+        source.as_str().to_string(),
+    );
+    edge.metadata.insert(
+        bbox_project_graph::EVIDENCE_META_TARGET_STATUS.to_string(),
+        target.as_str().to_string(),
+    );
+    edge.metadata.insert(
+        bbox_project_graph::EVIDENCE_META_FRESHNESS.to_string(),
+        bbox_project_graph::aggregate_endpoint_status(source, target)
+            .as_str()
+            .to_string(),
+    );
+}
+
+fn refined_endpoint_status(
+    ctx: &ProviderContext<'_>,
+    entity: &EntityRef,
+    recorded: Option<&String>,
+    has_expected_generation: bool,
+) -> EvidenceEndpointStatus {
+    let recorded = recorded.map(String::as_str);
+    if recorded != Some(EvidenceEndpointStatus::Unresolved.as_str()) {
+        return match recorded {
+            Some(value) if value == EvidenceEndpointStatus::Current.as_str() => {
+                EvidenceEndpointStatus::Current
+            }
+            Some(value) if value == EvidenceEndpointStatus::Stale.as_str() => {
+                EvidenceEndpointStatus::Stale
+            }
+            Some(value) if value == EvidenceEndpointStatus::Missing.as_str() => {
+                EvidenceEndpointStatus::Missing
+            }
+            Some(value) if value == EvidenceEndpointStatus::Unauthorized.as_str() => {
+                EvidenceEndpointStatus::Unauthorized
+            }
+            _ => EvidenceEndpointStatus::Unresolved,
+        };
+    }
+    let observation = match entity_loader::load(ctx, entity) {
+        // A loadable non-graph endpoint carries no generation to compare, so
+        // presence alone makes it current.
+        Ok(_) => bbox_project_graph::EvidenceEndpointObservation::Present { generation: None },
+        Err(_) => bbox_project_graph::EvidenceEndpointObservation::Absent,
+    };
+    // The exact recorded generation does not matter here, only whether the
+    // binding recorded one: that is what separates a stale endpoint (we know
+    // it used to be there) from a merely missing one.
+    bbox_project_graph::resolve_endpoint_status(
+        observation,
+        has_expected_generation.then_some(0_u64),
+    )
+}
+
 fn full_neighborhood(edge_index: &EdgeIndex, r: &EntityRef) -> Neighborhood {
     Neighborhood {
         // forward_edges_with_synthesis fills in the transcript -> session
@@ -309,6 +420,7 @@ fn render_edges(ctx: &ProviderContext<'_>, edges: &[Edge], direction: &str) -> V
             target: edge.target.to_string(),
             target_label: compact_label(ctx, &edge.target, None),
             direction: direction.to_string(),
+            properties: edge.metadata.clone(),
         })
         .collect()
 }
@@ -394,15 +506,17 @@ fn render_text(input: InspectText<'_>) -> String {
     } else {
         for edge in forward {
             text.push_str(&format!(
-                "  -->[{}] {}\n",
+                "  -->[{}{}] {}\n",
                 edge.kind,
+                rendered_edge_freshness(edge),
                 labeled_ref(&edge.target, edge.target_label.as_deref())
             ));
         }
         for edge in reverse {
             text.push_str(&format!(
-                "  <--[{}] {}\n",
+                "  <--[{}{}] {}\n",
                 edge.kind,
+                rendered_edge_freshness(edge),
                 labeled_ref(&edge.source, edge.source_label.as_deref())
             ));
         }
@@ -427,6 +541,16 @@ fn render_text(input: InspectText<'_>) -> String {
         }
     }
     text
+}
+
+/// Shows an evidence edge's freshness inline. A non-current binding stays
+/// visible for diagnosis rather than being hidden, so the reader can see that
+/// the assertion exists and that one of its endpoints has moved.
+fn rendered_edge_freshness(edge: &RenderedEdge) -> String {
+    edge.properties
+        .get(bbox_project_graph::EVIDENCE_META_FRESHNESS)
+        .map(|status| format!(" {status}"))
+        .unwrap_or_default()
 }
 
 fn labeled_ref(entity_ref: &str, label: Option<&str>) -> String {

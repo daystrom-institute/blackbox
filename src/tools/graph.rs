@@ -1707,9 +1707,423 @@ mod tests {
                         graph,
                     ),
                 )]),
+                evidence: bbox_project_graph::EvidenceBindingSet::default(),
             },
         );
         project.project_id
+    }
+
+    /// Builds one small synthetic graph from inline bytes. The evidence exit
+    /// gate needs TWO graphs in one project, and the governance fixture is a
+    /// single graph, so the second plane is authored here rather than
+    /// duplicating a fixture tree on disk.
+    fn synthetic_graph(
+        project_id: &str,
+        graph_id: &str,
+        namespace: &str,
+        vertex_type: &str,
+        vertex_id: &str,
+    ) -> bbox_project_graph::GraphGeneration {
+        let schema = serde_json::to_vec(&json!({
+            "version": 1,
+            "namespace": namespace,
+            "vertex_types": { vertex_type: {"properties": {"name": "string"}} },
+            "edge_types": []
+        }))
+        .unwrap();
+        let vertices = serde_json::to_vec(&json!({
+            "id": vertex_id,
+            "type": vertex_type,
+            "label": vertex_id,
+            "properties": {"name": vertex_id}
+        }))
+        .unwrap();
+        let loaded = bbox_project_graph::load_graph_documents(
+            project_id,
+            graph_id,
+            bbox_project_graph::GraphDocumentBytes {
+                descriptor: None,
+                schema: &schema,
+                vertices: &vertices,
+                edges: b"",
+            },
+            bbox_project_graph::GraphParseLimits::default(),
+            std::path::PathBuf::new(),
+        );
+        assert!(loaded.report.valid, "{:?}", loaded.report.errors);
+        loaded.generation.unwrap()
+    }
+
+    fn graph_entry(
+        graph: bbox_project_graph::GraphGeneration,
+    ) -> bbox_indexing::project_graph_view::ProjectGraphViewEntry {
+        let content_hash = graph.fingerprint.clone();
+        let graph_id = graph.key.graph_id.clone();
+        bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
+            graph_id,
+            bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                accepted_generation: "generation-one".into(),
+                accepted_commit: "a".repeat(40),
+                source_generation: None,
+                workspace_id: None,
+                content_hash,
+            },
+            graph,
+        )
+    }
+
+    /// Installs the exit-gate shape: a tenant record graph, a separate source
+    /// graph in the SAME project, and a binding set joining a record vertex to
+    /// a source vertex and that source vertex to a published project file.
+    ///
+    /// Two project-authored graphs stand in for the record/source split. The
+    /// connector-managed source graph belongs to the sibling milestone, and
+    /// the cross-plane variant becomes a follow-up test once both branches
+    /// fold; the binding layer cannot tell the difference, because it
+    /// addresses both planes by canonical vertex ref.
+    fn install_evidence_fixture(
+        server: &BlackboxServer,
+        root: &std::path::Path,
+    ) -> (String, String) {
+        let project = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(root)
+            .unwrap();
+        let project_id =
+            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone())
+                .unwrap();
+        let records = synthetic_graph(
+            project_id.as_str(),
+            "records",
+            "record",
+            "record:Filing",
+            "filing-1",
+        );
+        let source = synthetic_graph(
+            project_id.as_str(),
+            "source",
+            "dataset",
+            "dataset:Asset",
+            "asset-1",
+        );
+        let document = serde_json::to_vec(&json!({
+            "version": 1,
+            "bindings": [
+                {
+                    "binding_id": "record-to-source",
+                    "source": {
+                        "kind": "graph_vertex",
+                        "graph_id": "records",
+                        "vertex_id": "filing-1"
+                    },
+                    "kind": "record:CORRESPONDS_TO",
+                    "target": {
+                        "kind": "graph_vertex",
+                        "graph_id": "source",
+                        "vertex_id": "asset-1"
+                    },
+                    "assertion_authority": "project",
+                    "mapping_version": "mapping-v1",
+                    "asserted_at": "2026-01-01T00:00:00Z",
+                    "source_generation": 1,
+                    "target_generation": 1
+                },
+                {
+                    "binding_id": "source-to-file",
+                    "source": {
+                        "kind": "graph_vertex",
+                        "graph_id": "source",
+                        "vertex_id": "asset-1"
+                    },
+                    "kind": "dataset:EVIDENCED_BY",
+                    "target": {
+                        "kind": "project_file",
+                        "rel_path_hash": "pathhash",
+                        "chunk_hash": "chunkhash",
+                        "occurrence_idx": 0
+                    },
+                    "assertion_authority": "connector",
+                    "observation_id": "observation-file-1",
+                    "asserted_at": "2026-01-01T00:00:00Z",
+                    "source_generation": 1
+                }
+            ]
+        }))
+        .unwrap();
+        let evidence = bbox_project_graph::parse_evidence_document(
+            project_id.as_str(),
+            &document,
+            bbox_project_graph::EvidenceParseLimits::default(),
+        )
+        .bindings
+        .expect("fixture binding document is valid");
+        let scope = PublishedScope::try_new("repo-evidence", ".").unwrap();
+        server.state.project_graph_views.write().install_published(
+            bbox_indexing::project_graph_view::PublishedProjectGraphView {
+                project_id,
+                scope,
+                graphs: std::collections::BTreeMap::from([
+                    ("records".to_string(), graph_entry(records)),
+                    ("source".to_string(), graph_entry(source)),
+                ]),
+                evidence,
+            },
+        );
+        let file_ref = format!("project_file:{}:pathhash:chunkhash:0", project.project_id);
+        (project.project_id, file_ref)
+    }
+
+    async fn inspect_published(server: &BlackboxServer, entity_ref: &str) -> serde_json::Value {
+        let result = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: entity_ref.to_string(),
+                provisional: Some("published".into()),
+                edge_types: None,
+                direction: Some("both".into()),
+                per_type_limit: Some(10),
+                property_mode: Some("full".into()),
+            }))
+            .await;
+        serde_json::from_str(&extract_text(&result)).unwrap()
+    }
+
+    /// THE EXIT GATE for milestone 3: a tenant record vertex traverses through
+    /// a source vertex to a published project file, and the reverse traversal
+    /// preserves provenance.
+    #[tokio::test]
+    async fn a_record_vertex_traverses_through_a_source_vertex_to_a_project_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let (project_id, file_ref) = install_evidence_fixture(&server, &root);
+        let record_ref = format!("project_graph_vertex:{project_id}:records:filing-1");
+
+        let forward = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: record_ref.clone(),
+                provisional: Some("published".into()),
+                to: Some(file_ref.clone()),
+                to_type: None,
+                edge_types: None,
+                max_depth: Some(3),
+                limit: Some(5),
+            }))
+            .await;
+        let forward_text = extract_text(&forward);
+        let forward: serde_json::Value = serde_json::from_str(&forward_text).unwrap();
+        let paths = forward["paths"].as_array().expect("paths array");
+        assert!(
+            !paths.is_empty(),
+            "record vertex must reach the project file: {forward_text}"
+        );
+        let steps = paths[0]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "{forward_text}");
+        // Hop one crosses from the record graph into a DIFFERENT graph of the
+        // same project, which is what the cross-graph namespace split needed.
+        assert_eq!(steps[0]["edge_kind"], "record:CORRESPONDS_TO");
+        assert_eq!(
+            steps[0]["metadata"]["evidence.binding_id"],
+            "record-to-source"
+        );
+        assert_eq!(
+            steps[0]["metadata"]["evidence.mapping_version"],
+            "mapping-v1"
+        );
+        assert!(
+            steps[0]["to"].as_str().unwrap().contains(":source:asset-1"),
+            "{forward_text}"
+        );
+        // Hop two leaves the graph plane entirely for a project file ref.
+        assert_eq!(steps[1]["edge_kind"], "dataset:EVIDENCED_BY");
+        assert_eq!(
+            steps[1]["metadata"]["evidence.observation_id"],
+            "observation-file-1"
+        );
+        assert_eq!(steps[1]["to"], file_ref);
+
+        // The reverse traversal preserves provenance: same bindings, same
+        // authority and observation labels, walked from the file back.
+        let reverse = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: file_ref.clone(),
+                provisional: Some("published".into()),
+                to: Some(record_ref),
+                to_type: None,
+                edge_types: None,
+                max_depth: Some(3),
+                limit: Some(5),
+            }))
+            .await;
+        let reverse_text = extract_text(&reverse);
+        let reverse: serde_json::Value = serde_json::from_str(&reverse_text).unwrap();
+        let paths = reverse["paths"].as_array().expect("paths array");
+        assert!(
+            !paths.is_empty(),
+            "the project file must reach back to the record vertex: {reverse_text}"
+        );
+        let steps = paths[0]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "{reverse_text}");
+        assert_eq!(steps[0]["direction"], "in");
+        assert_eq!(
+            steps[0]["metadata"]["evidence.observation_id"], "observation-file-1",
+            "reverse traversal must carry the same observation provenance"
+        );
+        assert_eq!(
+            steps[0]["metadata"]["evidence.assertion_authority"],
+            "connector"
+        );
+        assert_eq!(steps[1]["direction"], "in");
+        assert_eq!(
+            steps[1]["metadata"]["evidence.assertion_authority"],
+            "project"
+        );
+        assert_eq!(
+            steps[1]["metadata"]["evidence.mapping_version"],
+            "mapping-v1"
+        );
+    }
+
+    /// Evidence is an edge family on BOTH endpoints of a binding, so the same
+    /// assertion is discoverable from either vertex.
+    #[tokio::test]
+    async fn inspect_surfaces_evidence_edges_on_both_endpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let (project_id, _) = install_evidence_fixture(&server, &root);
+
+        let record = inspect_published(
+            &server,
+            &format!("project_graph_vertex:{project_id}:records:filing-1"),
+        )
+        .await;
+        let out = record["edges"]["out"].as_array().unwrap();
+        let binding = out
+            .iter()
+            .find(|edge| edge["kind"] == "record:CORRESPONDS_TO")
+            .unwrap_or_else(|| panic!("record vertex carries its evidence edge: {record}"));
+        assert_eq!(binding["properties"]["evidence.freshness"], "current");
+        assert_eq!(
+            binding["properties"]["evidence.assertion_authority"],
+            "project"
+        );
+
+        let source = inspect_published(
+            &server,
+            &format!("project_graph_vertex:{project_id}:source:asset-1"),
+        )
+        .await;
+        let incoming = source["edges"]["in"].as_array().unwrap();
+        assert!(
+            incoming
+                .iter()
+                .any(|edge| edge["kind"] == "record:CORRESPONDS_TO"),
+            "the same binding must appear on the target endpoint: {source}"
+        );
+        let outgoing = source["edges"]["out"].as_array().unwrap();
+        assert!(
+            outgoing
+                .iter()
+                .any(|edge| edge["kind"] == "dataset:EVIDENCED_BY"),
+            "the source vertex must carry its outgoing file binding: {source}"
+        );
+    }
+
+    /// Contract: connector reprojection changes freshness status but cannot
+    /// delete a tenant-owned binding. Advancing the source graph to a
+    /// generation the binding never saw leaves the edge in place and marked
+    /// stale rather than dropping it.
+    #[tokio::test]
+    async fn reprojection_marks_a_binding_stale_without_deleting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let (project_id, _) = install_evidence_fixture(&server, &root);
+
+        // Reproject the source graph: same vertex, later generation.
+        {
+            let mut views = server.state.project_graph_views.write();
+            let parsed =
+                bbox_corpus_core::project_catalog::ProjectId::parse(project_id.clone()).unwrap();
+            let mut view = views.published_view(&parsed).unwrap().clone();
+            let mut reprojected =
+                synthetic_graph(&project_id, "source", "dataset", "dataset:Asset", "asset-1");
+            reprojected.descriptor.generation = 2;
+            view.graphs
+                .insert("source".to_string(), graph_entry(reprojected));
+            views.install_published(view);
+        }
+
+        let inspected = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: format!("project_graph_vertex:{project_id}:records:filing-1"),
+                provisional: Some("published".into()),
+                edge_types: None,
+                direction: Some("both".into()),
+                per_type_limit: Some(10),
+                property_mode: Some("full".into()),
+            }))
+            .await;
+        let text = extract_text(&inspected);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let binding = value["edges"]["out"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|edge| edge["kind"] == "record:CORRESPONDS_TO")
+            .unwrap_or_else(|| panic!("the binding survives reprojection: {text}"));
+        assert_eq!(
+            binding["properties"]["evidence.target_status"], "stale",
+            "reprojection must move freshness: {text}"
+        );
+        assert_eq!(binding["properties"]["evidence.freshness"], "stale");
+    }
+
+    /// Contract: bindings and their provenance appear in bundles.
+    #[tokio::test]
+    async fn bundles_carry_evidence_bindings_and_their_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let (project_id, _) = install_evidence_fixture(&server, &root);
+
+        let bundled = server
+            .bbox_bundle_evidence(Parameters(BundleEvidenceParams {
+                question: "what does this filing correspond to?".into(),
+                entity_refs: vec![
+                    format!("project_graph_vertex:{project_id}:records:filing-1"),
+                    format!("project_graph_vertex:{project_id}:source:asset-1"),
+                ],
+                path_ids: Vec::new(),
+                provisional: Some("published".into()),
+                property_mode: Some("summary".into()),
+            }))
+            .await;
+        let text = extract_text(&bundled);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let edges = value["intra_bundle_edges"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bundle must carry the binding: {text}"));
+        let binding = edges
+            .iter()
+            .find(|edge| edge["kind"] == "record:CORRESPONDS_TO")
+            .unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(
+            binding["properties"]["evidence.binding_id"],
+            "record-to-source"
+        );
+        assert_eq!(
+            binding["properties"]["evidence.assertion_authority"],
+            "project"
+        );
+        assert_eq!(
+            binding["properties"]["evidence.mapping_version"],
+            "mapping-v1"
+        );
     }
 
     #[tokio::test]
@@ -1825,6 +2239,7 @@ mod tests {
                             ),
                         ),
                     )]),
+                    evidence: None,
                 },
             );
 
@@ -1942,6 +2357,7 @@ mod tests {
                             ),
                         ),
                     )]),
+                    evidence: None,
                 },
             );
 
