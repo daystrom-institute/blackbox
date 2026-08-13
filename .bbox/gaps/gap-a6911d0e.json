@@ -1,0 +1,23 @@
+{
+  "id": "gap-a6911d0e",
+  "title": "Opt-in auto-advance of accepted publication for checkout-owner producer lanes",
+  "gap_kind": "tooling",
+  "domain": "project-catalog-publisher",
+  "wanted_capability": "A per-project, operator-enabled policy (e.g. `publisher.auto_advance = true` in committed project config or catalog metadata) under which a Ready candidate from the project's bound checkout-owner producer advances the accepted publication automatically once it passes acceptance validation, stamping the audit trail with the policy as the reason. Scope guard: applies only to producer-bound projects whose candidate derives from the operator's own committed state on the published ref; the git commit is the operator's acceptance act, so requiring a second manual CAS'd bbox_project_publisher_advance per commit leaves committed graph/knowledge state silently unserved (observed live: a committed graph generation waited indefinitely; the collector logged durable terminal success while accepted_state stayed on the prior commit until a manual advance). Manual advance remains for establish, rollback, scope changes, and non-linear moves. This deliberately narrows, not contradicts, the knowledge-source transport non-goal \"No automatic knowledge acceptance by a producer or model\" (design/daemon-runtime/knowledge-source-transport-impl.md section 10): the policy is operator-granted per project ahead of time, not producer discretion.",
+  "missing_primitive": "validation-gated auto-advance policy on the accepted-publication pointer for producer-bound projects",
+  "fallback_used": "Manual bbox_project_publisher_advance with CAS tokens (expected_generation_id, expected_pointer_sha256, expected_catalog_epoch) read from bbox_project_publisher_status after each collector upload.",
+  "evidence": [
+    "thread-a2062843",
+    "design/daemon-runtime/knowledge-source-transport-impl.md (section 10 non-goals)",
+    "gap-e41499a9 (same exercise)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-catalog-publisher/auto-advance-producer-candidates",
+  "notes": "Surfaced driving the graph-authoring exemplar end to end against prod: commit -> collector publish (durable terminal success) -> nothing serves until an out-of-band advance. The publish-loop mental model documented for graph authoring (\"acceptance validates at the merge gate; views serve the new generation immediately on accept\") only holds today if an orchestrator remembers the advance step. Acceptance validation already refuses broken candidates and keeps the prior generation, so the safety property the manual gate provides is redundant for the linear same-producer fast path.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-a2062843",
+  "created_at": "2026-08-13T03:37:12Z",
+  "updated_at": "2026-08-13T03:37:12Z"
+}
