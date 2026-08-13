@@ -30,6 +30,7 @@ members = [
     "crates/bbox-vectors",
     "crates/bbox-corpus-core",
     "crates/bbox-project-graph",
+    "crates/bbox-source-graph",
     "crates/bbox-code-source",
     "crates/bbox-code-source-store",
     "crates/bbox-code-collector",
