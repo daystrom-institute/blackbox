@@ -1,5 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde_json::{Value, json};
@@ -9,7 +10,29 @@ const DEFAULT_INTERVAL_SECS: u64 = 60;
 const INTERVAL_ENV: &str = "BLACKBOX_RUNTIME_METRICS_INTERVAL_SECS";
 const LOG_TARGET: &str = "blackbox::runtime";
 
+/// Scheduler-latency probe (design/daemon-runtime/healthz-ingest-starvation.md
+/// §6). One second between probes: the health probe that starved in the
+/// 2026-08-13 ingest incident had a 5s timeout, so the instrument has to
+/// resolve well inside it. The 60s metrics interval above cannot.
+const DEFAULT_PROBE_INTERVAL_MILLIS: u64 = 1_000;
+const PROBE_INTERVAL_ENV: &str = "BLACKBOX_SCHED_PROBE_INTERVAL_MILLIS";
+/// A ready task waiting longer than this to be polled means cheap HTTP
+/// handlers are already degraded, well before an external probe times out.
+const DEFAULT_PROBE_BUDGET_MILLIS: u64 = 250;
+const PROBE_BUDGET_ENV: &str = "BLACKBOX_SCHED_PROBE_BUDGET_MILLIS";
+/// Ceiling on how long one probe waits before recording the sample as
+/// at-least-this-long. Generous relative to the budget on purpose: an
+/// over-budget sample IS the finding, so truncating it early would discard
+/// the number worth having.
+const PROBE_CEILING: Duration = Duration::from_secs(30);
+const PROBE_LOG_TARGET: &str = "blackbox::runtime::sched_probe";
+
 static LATEST_SNAPSHOT: OnceLock<Arc<RwLock<Option<Value>>>> = OnceLock::new();
+
+static PROBE_LAST_MICROS: AtomicU64 = AtomicU64::new(0);
+static PROBE_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+static PROBE_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROBE_OVER_BUDGET_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn spawn_runtime_metrics_sampler() {
     let interval_secs = runtime_metrics_interval_secs();
@@ -42,6 +65,121 @@ pub(crate) fn spawn_runtime_metrics_sampler() {
 
 pub(crate) fn latest_runtime_metrics_snapshot() -> Option<Value> {
     snapshot_slot().read().clone()
+}
+
+/// Measure how long the serving runtime takes to poll a task that is ready
+/// the instant it is spawned.
+///
+/// This is the `/healthz` question minus the socket. `health_probe`
+/// (src/server/mcp.rs) holds no lock, reads no state, and is `Ready` on its
+/// first poll, so when it stops answering the cause is the runtime not
+/// polling it, not anything on its path. Nothing else in the daemon measures
+/// that; the 2026-08-13 ingest incident was unresolvable afterwards partly
+/// because of it (design/daemon-runtime/healthz-ingest-starvation.md §5.2).
+///
+/// It runs on a dedicated OS thread, and that placement is the whole point.
+/// [`spawn_runtime_metrics_sampler`] is a `tokio::spawn` on the runtime it
+/// reports on, so runtime starvation delays the sampler by exactly the
+/// amount it exists to record: it goes blind in the only window that
+/// matters. This probe keeps its timekeeping (`std::thread::sleep`) and its
+/// wait (`std::sync::mpsc`) off the runtime entirely, and reaches in only
+/// through `Handle::spawn`. It shares no lock and no queue with ingest.
+pub(crate) fn spawn_scheduler_latency_probe(handle: tokio::runtime::Handle) {
+    let interval = scheduler_probe_interval();
+    if interval.is_zero() {
+        tracing::info!(
+            target: PROBE_LOG_TARGET,
+            env = PROBE_INTERVAL_ENV,
+            "scheduler latency probe disabled"
+        );
+        return;
+    }
+    let budget = scheduler_probe_budget();
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("blackbox-sched-probe".into())
+        .spawn(move || scheduler_latency_probe_loop(&handle, interval, budget))
+    {
+        tracing::warn!(
+            target: PROBE_LOG_TARGET,
+            %error,
+            "scheduler latency probe thread not started"
+        );
+    }
+}
+
+fn scheduler_latency_probe_loop(
+    handle: &tokio::runtime::Handle,
+    interval: Duration,
+    budget: Duration,
+) {
+    loop {
+        std::thread::sleep(interval);
+        // `None` means the runtime dropped the task instead of running it,
+        // i.e. it is shutting down. Stop probing rather than spin.
+        let Some(latency) = probe_scheduler_latency_once(handle, PROBE_CEILING) else {
+            return;
+        };
+        record_scheduler_latency(latency, budget);
+    }
+}
+
+/// One round trip: spawn an always-ready task and time how long it takes to
+/// run. Returns `None` when the runtime refuses the work (shutdown).
+fn probe_scheduler_latency_once(
+    handle: &tokio::runtime::Handle,
+    ceiling: Duration,
+) -> Option<Duration> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let started = Instant::now();
+    handle.spawn(async move {
+        // Ready on first poll: everything measured is scheduling delay.
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(ceiling) {
+        Ok(()) => Some(started.elapsed()),
+        // The task never ran within the ceiling. The sample is a floor, not
+        // an exact figure, and a floor of 30s is finding enough.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(started.elapsed()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+fn record_scheduler_latency(latency: Duration, budget: Duration) {
+    let micros = duration_micros(latency);
+    PROBE_LAST_MICROS.store(micros, Ordering::Relaxed);
+    PROBE_MAX_MICROS.fetch_max(micros, Ordering::Relaxed);
+    PROBE_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    if latency > budget {
+        // Logged per sample, not per interval. The averaged 60s snapshot is
+        // what made the original incident unreadable; an operator needs the
+        // spike at the moment it happens.
+        let over_budget_count = PROBE_OVER_BUDGET_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            target: PROBE_LOG_TARGET,
+            latency_micros = micros,
+            budget_micros = duration_micros(budget),
+            over_budget_count,
+            "serving runtime did not poll a ready task within budget; cheap \
+             HTTP handlers such as /healthz are stalled for the same reason"
+        );
+    }
+}
+
+/// Live probe counters. Read straight from the atomics rather than from the
+/// sampler's published snapshot, so this stays truthful even when the
+/// sampler is itself starved.
+pub(crate) fn scheduler_latency_snapshot() -> Value {
+    json!({
+        "source": "sched-probe",
+        "budget_micros": duration_micros(scheduler_probe_budget()),
+        "interval_millis": scheduler_probe_interval().as_millis() as u64,
+        "last_micros": PROBE_LAST_MICROS.load(Ordering::Relaxed),
+        "max_micros": PROBE_MAX_MICROS.load(Ordering::Relaxed),
+        "sample_count": PROBE_SAMPLE_COUNT.load(Ordering::Relaxed),
+        "over_budget_count": PROBE_OVER_BUDGET_COUNT.load(Ordering::Relaxed),
+    })
 }
 
 fn publish_runtime_metrics_snapshot(metrics: &RuntimeMetrics, interval_secs: u64) {
@@ -221,6 +359,27 @@ fn runtime_metrics_interval_secs() -> u64 {
         .unwrap_or(DEFAULT_INTERVAL_SECS)
 }
 
+fn scheduler_probe_interval() -> Duration {
+    Duration::from_millis(millis_from_env(
+        PROBE_INTERVAL_ENV,
+        DEFAULT_PROBE_INTERVAL_MILLIS,
+    ))
+}
+
+fn scheduler_probe_budget() -> Duration {
+    Duration::from_millis(millis_from_env(
+        PROBE_BUDGET_ENV,
+        DEFAULT_PROBE_BUDGET_MILLIS,
+    ))
+}
+
+fn millis_from_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -294,6 +453,154 @@ mod tests {
             snapshot["unstable"]["scheduler"]["io_driver_ready_count"],
             47
         );
+    }
+
+    /// The probe surface is stable-tokio only. Every field that discriminates
+    /// the 2026-08-13 ingest starvation candidates used to sit behind
+    /// `#[cfg(tokio_unstable)]`, which no build in this repo enables, so it
+    /// was absent from the shipped binary exactly when it was needed
+    /// (design/daemon-runtime/healthz-ingest-starvation.md §5.2).
+    #[test]
+    fn scheduler_latency_snapshot_exposes_probe_counters_on_stable_tokio() {
+        let snapshot = scheduler_latency_snapshot();
+
+        let object = snapshot
+            .as_object()
+            .expect("probe snapshot must be an object");
+        for key in [
+            "source",
+            "budget_micros",
+            "interval_millis",
+            "last_micros",
+            "max_micros",
+            "sample_count",
+            "over_budget_count",
+        ] {
+            assert!(object.contains_key(key), "missing probe key `{key}`");
+        }
+        assert_eq!(snapshot["source"], "sched-probe");
+    }
+
+    #[test]
+    fn scheduler_probe_measures_an_idle_runtime_as_prompt() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("probe test runtime");
+
+        let latency = probe_scheduler_latency_once(runtime.handle(), Duration::from_secs(5))
+            .expect("an idle runtime must answer the probe");
+
+        assert!(
+            latency < Duration::from_secs(1),
+            "idle runtime probe took {latency:?}"
+        );
+    }
+
+    /// The laboratory version of the incident: the task is ready, and nothing
+    /// polls it because the only worker is parked in blocking code. This is
+    /// what the probe exists to catch, so if this assertion ever stops
+    /// holding the instrument is worthless.
+    #[test]
+    fn scheduler_probe_detects_a_runtime_whose_worker_is_blocked() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("probe test runtime");
+        let handle = runtime.handle().clone();
+
+        handle.spawn(async {
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        // Let the blocking task claim the single worker before probing;
+        // otherwise the probe can win the race and measure nothing.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let latency = probe_scheduler_latency_once(&handle, Duration::from_secs(5))
+            .expect("a live runtime must answer the probe eventually");
+
+        assert!(
+            latency >= Duration::from_millis(100),
+            "probe must observe the stall, saw {latency:?}"
+        );
+    }
+
+    /// A probe thread that cannot tell "shutting down" from "stalled" would
+    /// spin against a dead runtime for the life of the process.
+    #[test]
+    fn scheduler_probe_reports_none_once_the_runtime_is_gone() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("probe test runtime");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_timeout(Duration::from_secs(1));
+
+        assert!(
+            probe_scheduler_latency_once(&handle, Duration::from_millis(200)).is_none(),
+            "a shut-down runtime must end the probe loop, not stall it"
+        );
+    }
+
+    /// One test owns the probe statics so the delta assertions cannot race a
+    /// sibling test in a shared-process run.
+    #[test]
+    fn over_budget_samples_are_counted_rather_than_averaged_away() {
+        let budget = Duration::from_millis(250);
+        let samples_before = PROBE_SAMPLE_COUNT.load(Ordering::Relaxed);
+        let over_before = PROBE_OVER_BUDGET_COUNT.load(Ordering::Relaxed);
+
+        record_scheduler_latency(Duration::from_millis(900), budget);
+
+        assert_eq!(PROBE_LAST_MICROS.load(Ordering::Relaxed), 900_000);
+        assert!(PROBE_MAX_MICROS.load(Ordering::Relaxed) >= 900_000);
+        assert!(PROBE_SAMPLE_COUNT.load(Ordering::Relaxed) > samples_before);
+        assert_eq!(
+            PROBE_OVER_BUDGET_COUNT.load(Ordering::Relaxed),
+            over_before + 1,
+            "a sample past budget must be counted"
+        );
+
+        let over_after_spike = PROBE_OVER_BUDGET_COUNT.load(Ordering::Relaxed);
+        record_scheduler_latency(Duration::from_millis(1), budget);
+
+        assert_eq!(
+            PROBE_OVER_BUDGET_COUNT.load(Ordering::Relaxed),
+            over_after_spike,
+            "a healthy sample must not be counted as over budget"
+        );
+        // The peak survives a later healthy sample; `max` is the incident
+        // evidence and must not be reset by recovery.
+        assert!(PROBE_MAX_MICROS.load(Ordering::Relaxed) >= 900_000);
+    }
+
+    #[test]
+    fn probe_tuning_falls_back_to_defaults_on_unset_or_unparseable_env() {
+        let mut env = crate::util::TestEnvGuard::new();
+
+        env.remove(PROBE_INTERVAL_ENV);
+        assert_eq!(
+            millis_from_env(PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MILLIS),
+            DEFAULT_PROBE_INTERVAL_MILLIS
+        );
+
+        env.set(PROBE_INTERVAL_ENV, "not-a-number");
+        assert_eq!(
+            millis_from_env(PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MILLIS),
+            DEFAULT_PROBE_INTERVAL_MILLIS
+        );
+
+        // Zero is a deliberate value, not a parse failure: it disables the
+        // probe in spawn_scheduler_latency_probe.
+        env.set(PROBE_INTERVAL_ENV, "0");
+        assert_eq!(
+            millis_from_env(PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MILLIS),
+            0
+        );
+        assert!(scheduler_probe_interval().is_zero());
     }
 
     fn sample_metrics() -> RuntimeMetrics {

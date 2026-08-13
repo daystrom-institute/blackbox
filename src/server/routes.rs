@@ -1392,6 +1392,12 @@ pub(crate) async fn admin_runtime_metrics() -> impl axum::response::IntoResponse
     axum::Json(json!({
         "status": "ok",
         "snapshot": super::runtime_metrics::latest_runtime_metrics_snapshot(),
+        // Separate top-level key, not folded into `snapshot`: the snapshot is
+        // republished by a task on the serving runtime every 60s and goes
+        // stale precisely when the runtime stalls, whereas these counters are
+        // maintained off-runtime and are always current. Their disagreement is
+        // itself a signal (healthz-ingest-starvation.md §5.2).
+        "scheduler_latency": super::runtime_metrics::scheduler_latency_snapshot(),
     }))
     .into_response()
 }
