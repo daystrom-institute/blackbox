@@ -207,8 +207,10 @@ fn rescope_project_filter(
     // whatever path key they carry. A catalog-published row carries no path
     // at all, which is how a path-free daemon answered a filtered query with
     // zero rows over entries that plainly held its project_id.
+    // A blank value is the documented unscoped escape hatch, not a failed
+    // resolution: it narrows nothing and reports nothing.
     let mut diagnostic = None;
-    if p.project_id.is_none() {
+    if p.project_id.is_none() && !raw.trim().is_empty() {
         match server.project_filter_identity(&raw) {
             Ok(project_id) => p.project_id = Some(project_id),
             Err(text) => diagnostic = Some(text),

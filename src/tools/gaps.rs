@@ -686,7 +686,9 @@ impl BlackboxServer {
                 // without this arm every filtered query returned zero rows
                 // over a store that plainly held them. An unresolvable
                 // value keeps the literal substring lane and says so.
-                if p.project_id.is_none() {
+                // A blank value narrows nothing and reports nothing: it is
+                // the documented unscoped escape hatch, not a miss.
+                if p.project_id.is_none() && !raw.trim().is_empty() {
                     match self.project_filter_identity(raw) {
                         Ok(project_id) => p.project_id = Some(project_id),
                         Err(diagnostic) => filter_diagnostics.push(diagnostic),
