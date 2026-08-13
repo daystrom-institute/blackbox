@@ -923,14 +923,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_status",
         category: ToolCategory::Orchestration,
         summary: "Non-blocking progress check on a task; call before declaring a timeout dead or cancelling.",
-        when_to_use: "Peek at a running task without blocking. Use after a timeout, before `bro_cancel`, and before replacing allegedly stuck work. Prefer `bro_wait` with a timeout when you actually need the result.",
+        when_to_use: "Peek at a running task without blocking. Use after a timeout, before `bro_cancel`, and before replacing allegedly stuck work. Prefer `bro_wait` with a timeout when you actually need the result. The `context` block reports context-window pressure for live tasks too (unlike `usage`/`costUsd`/`numTurns`, which appear only once terminal): `last_turn_input_tokens` is the most recent prompt's cache-inclusive size, the real measure of window occupancy; `context_window`, `utilization`, and `approaching_ceiling` are present only when the model's window is known, so an unrecognized model reports occupancy with nulls rather than a guessed fraction. `approaching_ceiling: true` means rotate to a fresh session before the provider rejects a prompt outright; `ceiling_ratio` is the threshold that judged it (default 0.8, `BBOX_CONTEXT_CEILING_RATIO`).",
         example: None,
     },
     ToolDoc {
         name: "bro_dashboard",
         category: ToolCategory::Orchestration,
         summary: "List recent tasks / sessions for lookup only; do not take over another operator's bro from the dashboard.",
-        when_to_use: "Look up a taskId or sessionId when you don't already have it. Filter by provider, status, team. Treat dashboard rows as shared state, not ownership grants: prefer taskId/sessionId handles returned by your own dispatch, and do not resume/cancel/prune/dissolve work created by another external session unless the user explicitly asks.",
+        when_to_use: "Look up a taskId or sessionId when you don't already have it. Filter by provider, status, team. Treat dashboard rows as shared state, not ownership grants: prefer taskId/sessionId handles returned by your own dispatch, and do not resume/cancel/prune/dissolve work created by another external session unless the user explicitly asks. Rows carry the same `context` block `bro_status` returns when a task has reported a turn, so a fleet-wide scan shows which long-lived sessions are approaching their context ceiling; a row with no measurement omits the block rather than reporting a zero.",
         example: None,
     },
     ToolDoc {

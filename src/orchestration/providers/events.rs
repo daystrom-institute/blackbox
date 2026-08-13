@@ -4,6 +4,7 @@ use serde_json::Value;
 use super::Provider;
 
 /// Mutable state that event parsing updates on a Task.
+#[derive(Debug, Default)]
 pub struct EventSink {
     pub last_assistant_message: Option<String>,
     pub usage: Option<Usage>,
@@ -11,6 +12,21 @@ pub struct EventSink {
     pub num_turns: Option<u64>,
     pub session_id: Option<String>,
     pub interrupted: bool,
+    /// Cache-inclusive input tokens of the most recent model turn: how much of
+    /// the context window the prompt just processed occupied.
+    ///
+    /// Deliberately NOT derived from [`Self::usage`]. That field carries
+    /// session totals whose accumulation convention varies by provider
+    /// (cumulative-per-session for some, final-result for others), which makes
+    /// it a measure of work done rather than of window occupancy. A session can
+    /// burn tens of millions of cumulative input tokens and never approach the
+    /// ceiling as long as each individual prompt stays small.
+    pub last_turn_input_tokens: Option<u64>,
+    /// The model's context window as reported by the producer, when it knows
+    /// it. Never inferred daemon-side: the model-keyed table lives in the
+    /// harness, which the daemon does not link, and a locally-guessed window
+    /// would drift from the one actually driving compaction.
+    pub context_window: Option<u64>,
 }
 
 /// Normalized per-task token usage.
@@ -156,6 +172,20 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         if matches!(subtype, Some("hook_started") | Some("hook_response")) {
             return;
         }
+        // Context-window pressure, emitted by the harness after every model
+        // step. Authoritative for both fields: the producer owns the
+        // model-keyed window table, so an absent `context_window` here means
+        // the producer genuinely does not know this model's window and the
+        // consumer must report occupancy without a utilization fraction.
+        if subtype == Some("context_pressure") {
+            let context = &evt["context"];
+            if let Some(tokens) = context["last_turn_input_tokens"].as_u64() {
+                sink.last_turn_input_tokens = Some(tokens);
+            }
+            if let Some(window) = context["context_window"].as_u64() {
+                sink.context_window = Some(window);
+            }
+        }
     }
     if let Some(session_id) = evt["session_id"]
         .as_str()
@@ -186,6 +216,25 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         }
     }
     if evt["type"].as_str() == Some("assistant") {
+        // Per-step usage is the prompt the model just processed, so its
+        // cache-inclusive input total is this step's window occupancy. Read as
+        // a fallback for producers that emit step usage but no dedicated
+        // pressure event.
+        //
+        // When both land they agree, because both read the same step's usage,
+        // so the arrival order does not matter for occupancy. It matters for
+        // nothing else either: only the pressure event ever carries the
+        // window, and this branch never touches that field, so a later
+        // assistant message cannot erase a window already captured.
+        if let Some(usage) = evt["message"]["usage"].as_object() {
+            let field = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let occupancy = field("input_tokens")
+                .saturating_add(field("cache_read_input_tokens"))
+                .saturating_add(field("cache_creation_input_tokens"));
+            if occupancy > 0 {
+                sink.last_turn_input_tokens = Some(occupancy);
+            }
+        }
         let streaming_captured = sink
             .last_assistant_message
             .as_deref()
