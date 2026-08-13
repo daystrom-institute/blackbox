@@ -749,6 +749,141 @@ mod tests {
             .collect()
     }
 
+    /// A daemon where the scope is GRANTED but not yet cataloged, which is
+    /// the only state the onboard route admits and every publication route
+    /// refuses.
+    fn pending_state(root: &std::path::Path) -> (Arc<SharedState>, String) {
+        let catalog_root = root.join("catalog");
+        std::fs::create_dir_all(&catalog_root).unwrap();
+        let catalog_projects_path = catalog_root.join("projects.json");
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            &catalog_projects_path,
+        )
+        .unwrap();
+        let state = Arc::new(SharedState::for_test_catalog(root, &catalog_projects_path));
+        let token_secret = "a".repeat(64);
+        let token_path = token_file(root, &token_secret);
+        let config = crate::config::SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![crate::config::ConnectorProducerConfig {
+                producer_id: PRODUCER.into(),
+                token_file: token_path,
+                scopes: vec![crate::config::ConnectorScopeGrant {
+                    connector_source_id: ConnectorSourceId::parse(SOURCE_ID).unwrap(),
+                    connector_kind: ConnectorKind::parse("fixture").unwrap(),
+                    remote_authority: "fixture.invalid".to_string(),
+                }],
+            }],
+        };
+        let store = state.project_authority.catalog_store().unwrap().clone();
+        let pinned = store.snapshot().unwrap();
+        let connectors = ConnectorGrantRuntime::build(&config, Some(pinned.catalog())).unwrap();
+        assert!(
+            connectors.is_pending_onboard(&scope()),
+            "a granted scope with no catalog project is pending onboarding"
+        );
+        state.code_sources.install_auth_for_test(Arc::new(
+            ProducerAuthRuntime::for_test_connectors(Arc::new(connectors)),
+        ));
+        (state, token_secret)
+    }
+
+    #[tokio::test]
+    async fn onboarding_mints_the_connector_project_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (state, token) = pending_state(&root);
+        let app = crate::server::file_source::router(state.clone()).with_state(state.clone());
+
+        // A pending scope opens NO publication lane. This is the refusal that
+        // makes "add the scope to the daemon config first" possible without
+        // opening a lane for a project that does not exist.
+        let entries: Vec<FileManifestEntryV1> = documents()
+            .iter()
+            .map(|document| document.entry())
+            .collect();
+        let begin = BeginFileUploadRequestV1 {
+            descriptor: descriptor(&entries, 0),
+            telemetry: PublicationTelemetryV1::default(),
+            degradation: None,
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/uploads",
+                &token,
+                Body::from(serde_json::to_vec(&begin).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "publishing under a pending scope is a conflict, deliberately \
+             distinct from a forbidden one: they are different fixes"
+        );
+
+        let onboard = bbox_file_source::FileCatalogOnboardRequestV1 {
+            schema_version: bbox_file_source::CATALOG_ONBOARD_SCHEMA_VERSION,
+            scope: scope(),
+            probed_connector_kind: "fixture".into(),
+            probed_remote_authority: "fixture.invalid".into(),
+            probed_remote_root_id: Some("root-1".into()),
+            probed_remote_display_name: Some("Ops shared folder".into()),
+            display_name: "Ops shared folder".into(),
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&onboard).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let receipt: bbox_file_source::FileCatalogOnboardResponseV1 = json_body(response).await;
+        assert!(receipt.created_project, "the first onboard mints it");
+
+        // The catalog now owns the scope-to-project mapping, which is the
+        // only authority the activation lane ever consults.
+        let store = state.project_authority.catalog_store().unwrap().clone();
+        let pinned = store.snapshot().unwrap();
+        let project = pinned
+            .catalog()
+            .projects
+            .values()
+            .find(|project| matches!(&project.scope, ProjectScope::Connector(owned) if owned == &scope()))
+            .expect("onboarding records a connector-scoped project");
+        assert_eq!(project.project_id.as_str(), receipt.project_id);
+
+        // Find-or-create: a producer driving onboard before every cycle is
+        // safe to retry rather than duplicating the project.
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/catalog/onboard",
+                &token,
+                Body::from(serde_json::to_vec(&onboard).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let replayed: bbox_file_source::FileCatalogOnboardResponseV1 = json_body(response).await;
+        assert_eq!(replayed.project_id, receipt.project_id);
+        assert!(
+            !replayed.created_project,
+            "only the call that MINTED the project reports creating it"
+        );
+        assert_eq!(
+            store.snapshot().unwrap().catalog().projects.len(),
+            1,
+            "a retried onboard is not a second project"
+        );
+    }
+
     #[tokio::test]
     async fn a_connector_generation_publishes_activates_and_becomes_searchable() {
         let directory = tempfile::tempdir().unwrap();
