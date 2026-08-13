@@ -271,6 +271,38 @@ struct Expansion {
     metadata: BTreeMap<String, String>,
 }
 
+/// Records one candidate hop, applying the edge-kind allowlist and the
+/// unauthorized-endpoint refusal.
+///
+/// A free function rather than a closure over `out`, so the mutable borrow
+/// ends at each call instead of spanning the whole enumeration.
+fn push_expansion(
+    out: &mut Vec<Expansion>,
+    edge: Edge,
+    direction: PathDirection,
+    edge_filter: Option<&HashSet<String>>,
+) {
+    if edge_filter.is_some_and(|allowed| !allowed.contains(&edge.kind)) {
+        return;
+    }
+    // Traversal never crosses an unauthorized endpoint. Inspection still shows
+    // the edge for diagnosis, but a path that walked through a foreign scope
+    // would be an answer the caller is not entitled to.
+    if !evidence_step_is_traversable(&edge, direction) {
+        return;
+    }
+    let next = match direction {
+        PathDirection::Out => edge.target,
+        PathDirection::In => edge.source,
+    };
+    out.push(Expansion {
+        edge_kind: edge.kind,
+        direction,
+        next,
+        metadata: edge.metadata,
+    });
+}
+
 fn expansions(
     ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
@@ -278,37 +310,16 @@ fn expansions(
     edge_filter: Option<&HashSet<String>>,
 ) -> Vec<Expansion> {
     let mut out = Vec::new();
-    let mut push = |edge: Edge, direction: PathDirection| {
-        if edge_filter.is_some_and(|allowed| !allowed.contains(&edge.kind)) {
-            return;
-        }
-        // Traversal never crosses an unauthorized endpoint. Inspection still
-        // shows the edge for diagnosis, but a path that walked through a
-        // foreign scope would be an answer the caller is not entitled to.
-        if !evidence_step_is_traversable(&edge, direction) {
-            return;
-        }
-        let next = match direction {
-            PathDirection::Out => edge.target,
-            PathDirection::In => edge.source,
-        };
-        out.push(Expansion {
-            edge_kind: edge.kind,
-            direction,
-            next,
-            metadata: edge.metadata,
-        });
-    };
     if matches!(
         current.entity_type(),
         EntityType::ProjectGraphVertex | EntityType::ProvisionalProjectGraphVertex
     ) {
         if let Ok(entity) = bbox_providers::entity_loader::load(ctx, current) {
             for edge in entity.neighborhood.forward {
-                push(edge, PathDirection::Out);
+                push_expansion(&mut out, edge, PathDirection::Out, edge_filter);
             }
             for edge in entity.neighborhood.reverse {
-                push(edge, PathDirection::In);
+                push_expansion(&mut out, edge, PathDirection::In, edge_filter);
             }
         }
         return out;
@@ -319,10 +330,10 @@ fn expansions(
     // edge. Forward only: the reverse enumeration isn't a pure function of
     // the session ref, so it isn't synthesized here.
     for edge in edge_index.forward_edges_with_synthesis(current) {
-        push(edge, PathDirection::Out);
+        push_expansion(&mut out, edge, PathDirection::Out, edge_filter);
     }
     for edge in edge_index.reverse_edges(current) {
-        push(edge.clone(), PathDirection::In);
+        push_expansion(&mut out, Edge::clone(edge), PathDirection::In, edge_filter);
     }
     // A non-graph entity can still be an evidence endpoint: a project file or
     // knowledge entry that a binding points at is reachable from the graph
@@ -334,7 +345,7 @@ fn expansions(
         } else {
             PathDirection::In
         };
-        push(edge, direction);
+        push_expansion(&mut out, edge, direction, edge_filter);
     }
     out
 }
