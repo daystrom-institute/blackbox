@@ -415,6 +415,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-conversation-source"
+version = "0.0.1"
+dependencies = [
+ "bbox-corpus-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bbox-conversation-source-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-conversation-source",
+ "bbox-corpus-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-corpus-core"
 version = "0.0.1"
 dependencies = [
@@ -1178,6 +1203,8 @@ dependencies = [
  "bbox-code-source",
  "bbox-code-source-store",
  "bbox-config",
+ "bbox-conversation-source",
+ "bbox-conversation-source-store",
  "bbox-corpus-core",
  "bbox-corpus-index",
  "bbox-edge-index",
