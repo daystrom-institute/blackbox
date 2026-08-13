@@ -37,6 +37,8 @@ members = [
     "crates/bbox-file-source",
     "crates/bbox-file-source-store",
     "crates/bbox-file-collector",
+    "crates/bbox-conversation-source",
+    "crates/bbox-conversation-source-store",
     "crates/bbox-git-source",
     "crates/bbox-git-source-store",
     "crates/bbox-knowledge-source",
@@ -116,6 +118,8 @@ bbox-code-source = { path = "crates/bbox-code-source" }
 bbox-code-source-store = { path = "crates/bbox-code-source-store" }
 bbox-file-source = { path = "crates/bbox-file-source" }
 bbox-file-source-store = { path = "crates/bbox-file-source-store" }
+bbox-conversation-source = { path = "crates/bbox-conversation-source" }
+bbox-conversation-source-store = { path = "crates/bbox-conversation-source-store" }
 bbox-git-source = { path = "crates/bbox-git-source" }
 bbox-git-source-store = { path = "crates/bbox-git-source-store" }
 bbox-knowledge-source = { path = "crates/bbox-knowledge-source" }

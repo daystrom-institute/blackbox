@@ -1,0 +1,25 @@
+[package]
+name = "bbox-conversation-source"
+version = "0.0.1"
+edition = "2024"
+
+# Dependency-clean leaf wire crate for connector-sourced CONVERSATIONS, the
+# append-only sibling of `bbox-file-source`. It is linked by BOTH the daemon
+# and the producer satellite (`bbox-slack-collector`, not yet written), so it
+# may only ever depend on other leaves. Adding a chunker, index, store,
+# vector, transcript, or model dependency here would smuggle that dependency
+# into the satellite and break its acceptance ceiling, the same ceiling
+# scripts/acceptance-file-collector-deps.sh enforces for the file lane.
+#
+# It deliberately does NOT depend on `bbox-file-source`: the two lanes share
+# `ConnectorScope` (from `bbox-corpus-core`) and nothing else. See the
+# comparison in src/lib.rs.
+[dependencies]
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

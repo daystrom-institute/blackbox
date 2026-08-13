@@ -1,0 +1,20 @@
+[package]
+name = "bbox-conversation-source-store"
+version = "0.0.1"
+edition = "2024"
+
+# Daemon-side durable landing store for connector-sourced conversations. It is
+# corpus infrastructure, NOT satellite code: the conversation producer must
+# never depend on it, exactly as `bbox-file-collector` must never depend on
+# `bbox-file-source-store`. Any future acceptance script over the conversation
+# satellite's resolved dependency graph names this crate in its forbidden list.
+[dependencies]
+anyhow = "1"
+bbox-conversation-source = { path = "../bbox-conversation-source" }
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
