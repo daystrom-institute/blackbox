@@ -3332,6 +3332,21 @@ mod tests {
                     },
                 )
                 .unwrap();
+            // NOT an idle query. `missing_publication_blobs` is the only
+            // caller of the store's manifest-completion step, so it is what
+            // seals the manifest and moves the upload from
+            // ReceivingManifest to MissingBlobs. Skipping it leaves every
+            // later call refusing with InvalidState, which is why the real
+            // route order puts GET .../missing between the manifest pages
+            // and the first blob PUT.
+            let missing = store
+                .missing_publication_blobs(&authority, &upload.upload_id, None)
+                .unwrap();
+            assert_eq!(
+                missing.hashes,
+                vec![manifest_entry.content_sha256.clone()],
+                "the sealed manifest names exactly the blob this candidate is about to upload"
+            );
             store
                 .install_publication_blob(
                     &authority,
