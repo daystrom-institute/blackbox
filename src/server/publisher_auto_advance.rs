@@ -37,6 +37,9 @@ use super::producer_auth::ProducerAuthRuntime;
 /// generated policy reason is bounded at the point it is built.
 const MAX_AUDIT_REASON_BYTES: usize = 1024;
 
+/// The stable refusal every candidate-selection failure carries.
+const CANDIDATE_REQUIRED: &str = "error.accepted_publication_candidate_required";
+
 /// Most recent policy attempts retained per daemon lifetime. The ledger is
 /// an observability surface, not a queue: it must never be the reason the
 /// daemon grows without bound.
@@ -68,40 +71,44 @@ pub(crate) fn publish_from_ready_candidate(
     expected_catalog_epoch: u64,
     dry_run: bool,
     auto_advance: AutoAdvanceGrantUpdate,
-) -> anyhow::Result<PublishReceipt> {
+) -> Result<PublishReceipt, PublishError> {
+    // `PublishError` and not `anyhow` on purpose: it carries the refusing
+    // layer's own code AND `may_have_swapped`, which the operator tool uses
+    // to decide whether to reconverge after a failure. Flattening it here
+    // would silently drop that signal from one of the two callers.
     project_catalog_admin::preflight_candidate_publish_authority(
         store,
         expected_catalog_epoch,
         project_id,
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    )?;
     let pinned = Arc::new(
         knowledge_sources
             .pin_ready_publication_candidate(source_generation_id)
-            .map_err(|error| {
-                anyhow::anyhow!("error.accepted_publication_candidate_required: {error}")
-            })?,
+            .map_err(|error| PublishError::refusal(CANDIDATE_REQUIRED, format!("{error}")))?,
     );
     let candidate = pinned.candidate();
     if candidate.project_id != project_id.as_str() {
-        anyhow::bail!(
-            "error.accepted_publication_candidate_required: candidate belongs to another project"
-        );
+        return Err(PublishError::refusal(
+            CANDIDATE_REQUIRED,
+            "candidate belongs to another project",
+        ));
     }
     let granted_project = producer_auth
         .project_transport_grant_for_id(&candidate.producer_id, &candidate.descriptor.scope)
         .map_err(|error| {
-            anyhow::anyhow!(
-                "error.accepted_publication_candidate_required: current producer grant rejected \
-                 the candidate ({})",
-                error.code()
+            PublishError::refusal(
+                CANDIDATE_REQUIRED,
+                format!(
+                    "current producer grant rejected the candidate ({})",
+                    error.code()
+                ),
             )
         })?;
     if granted_project != project_id {
-        anyhow::bail!(
-            "error.accepted_publication_candidate_required: current producer grant resolves the \
-             candidate to another project"
-        );
+        return Err(PublishError::refusal(
+            CANDIDATE_REQUIRED,
+            "current producer grant resolves the candidate to another project",
+        ));
     }
     let expected_generation = candidate.source_generation_id.clone();
     let expected_sha256 = candidate.source_generation_sha256.clone();
@@ -175,7 +182,6 @@ pub(crate) fn publish_from_ready_candidate(
         },
         probe,
     )
-    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// Why a policy attempt did not move the pointer, or that it did.
@@ -221,6 +227,15 @@ pub(crate) enum AutoAdvanceOutcome {
 impl AutoAdvanceOutcome {
     pub(crate) fn accepted(&self) -> bool {
         matches!(self, Self::Accepted { .. })
+    }
+
+    /// A refusal from the acceptance path keeps the refusing layer's own
+    /// code verbatim, exactly as the operator tool reports it.
+    fn from_publish_error(error: &PublishError) -> Self {
+        Self::Refused {
+            code: error.code().to_string(),
+            detail: bounded_detail(error.detail().to_string()),
+        }
     }
 
     fn refused(error: &anyhow::Error) -> Self {
@@ -550,7 +565,10 @@ impl super::BlackboxServer {
                     generation_id: receipt.generation_id().to_string(),
                 },
             ),
-            Err(error) => (accepted_producer, AutoAdvanceOutcome::refused(&error)),
+            Err(error) => (
+                accepted_producer,
+                AutoAdvanceOutcome::from_publish_error(&error),
+            ),
         }
     }
 }

@@ -28,7 +28,7 @@ use bbox_corpus_core::project_catalog::{
 use bbox_corpus_core::project_selector::{ProjectResolveError, ProjectSelectorRequest};
 use bbox_indexing::accepted_publication_runtime::{
     AcceptedPublicationScopeAgreement, AcceptedPublicationSourceBinding, AcceptedPublicationState,
-    PublishError, PublishSourceFile, PublishSources, PublisherPublishMode,
+    AutoAdvanceGrantUpdate, PublishError, PublishSourceFile, PublishSources, PublisherPublishMode,
 };
 use bbox_indexing::checkout_access::{
     CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest, CheckoutAccessSourceLane,
@@ -150,6 +150,15 @@ pub(crate) struct ProjectPublisherAdvanceParams {
     /// replace.
     #[serde(default)]
     pub expected_pointer_sha256: Option<String>,
+    /// Operator authority over this project's standing auto-advance grant.
+    /// Omit to leave the grant exactly as it is (the default). `true`
+    /// installs it on the pointer this call writes, which is the audited
+    /// operator act that lets later Ready candidates from the SAME bound
+    /// producer, scope, and ref be accepted without a further operator
+    /// call. `false` revokes it. Agents pass this through from operator
+    /// input and never default or infer it.
+    #[serde(default)]
+    pub auto_advance: Option<bool>,
     #[serde(default)]
     pub dry_run: bool,
     pub expected_catalog_epoch: u64,
@@ -1030,7 +1039,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_advance",
-        description = "Establish or advance one published project's accepted publication. mode=establish creates the first pointer; mode=advance requires the generation and pointer tokens from bbox_project_publisher_status. Select exactly one source: attachment_id with full_ref reads a capable attached checkout, while source_generation_id consumes a Ready remote publication candidate and derives its producer, scope, ref, commit, and both source lanes from pinned immutable evidence. Candidate mode refuses caller-supplied full_ref. Both paths validate knowledge and gaps into one immutable generation and swap only after rechecking catalog authority and source freshness. Publishing uses the catalog's current scope, which clears a scope-migration bridge. dry_run validates and writes nothing. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Establish or advance one published project's accepted publication. mode=establish creates the first pointer; mode=advance requires the generation and pointer tokens from bbox_project_publisher_status. Select exactly one source: attachment_id with full_ref reads a capable attached checkout, while source_generation_id consumes a Ready remote publication candidate and derives its producer, scope, ref, commit, and both source lanes from pinned immutable evidence. Candidate mode refuses caller-supplied full_ref. Both paths validate knowledge and gaps into one immutable generation and swap only after rechecking catalog authority and source freshness. Publishing uses the catalog's current scope, which clears a scope-migration bridge. dry_run validates and writes nothing. Requires expected_catalog_epoch and a bounded audit_reason. auto_advance is operator authority over this project's standing auto-advance grant: omit it to leave the grant unchanged, pass true to install it on the pointer this call writes, or false to revoke it. A granted project accepts later Ready candidates from the same bound producer, catalog scope, and published ref through this same validation and compare-and-swap discipline, with audit_reason policy:auto_advance; establish, rollback, scope changes, and every other non-linear move stay manual. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_advance(
         &self,
@@ -1069,6 +1078,17 @@ impl BlackboxServer {
             Self::run_blocking("bbox_project_publisher_advance", move || {
                 let audit_reason = bounded_audit_reason(&p.audit_reason)?;
                 let mode = publish_mode_from_params(&p)?;
+                // The grant this call installs, revokes, or leaves alone.
+                // It is bound to the operator's own audit reason, so the
+                // pointer records WHICH operator act authorized every
+                // later policy acceptance.
+                let auto_advance_update = match p.auto_advance {
+                    None => AutoAdvanceGrantUpdate::Inherit,
+                    Some(enabled) => AutoAdvanceGrantUpdate::Set {
+                        enabled,
+                        reason: audit_reason.clone(),
+                    },
+                };
                 let receipt = match (&p.attachment_id, &p.source_generation_id) {
                 (Some(attachment_id), None) => {
                     if knowledge_transport_governed {
@@ -1123,6 +1143,7 @@ impl BlackboxServer {
                             full_ref: full_ref.to_string(),
                             expected_epoch: p.expected_catalog_epoch,
                             dry_run: p.dry_run,
+                            auto_advance: auto_advance_update.clone(),
                         },
                         probe,
                     )
@@ -1134,110 +1155,21 @@ impl BlackboxServer {
                              derives full_ref from immutable source evidence"
                         );
                     }
-                    project_catalog_admin::preflight_candidate_publish_authority(
-                        &store,
-                        p.expected_catalog_epoch,
-                        &committed,
-                    )
-                    .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    let pinned = Arc::new(
-                        knowledge_sources
-                            .pin_ready_publication_candidate(source_generation_id)
-                            .map_err(|error| anyhow::anyhow!(
-                                "error.accepted_publication_candidate_required: {error}"
-                            ))?,
-                    );
-                    let candidate = pinned.candidate();
-                    if candidate.project_id != committed.as_str() {
-                        anyhow::bail!(
-                            "error.accepted_publication_candidate_required: candidate belongs to \
-                             another project"
-                        );
-                    }
-                    let granted_project = producer_auth
-                        .project_transport_grant_for_id(
-                            &candidate.producer_id,
-                            &candidate.descriptor.scope,
-                        )
-                        .map_err(|error| anyhow::anyhow!(
-                            "error.accepted_publication_candidate_required: current producer grant rejected the candidate ({})",
-                            error.code()
-                        ))?;
-                    if granted_project != &committed {
-                        anyhow::bail!(
-                            "error.accepted_publication_candidate_required: current producer grant resolves the candidate to another project"
-                        );
-                    }
-                    let expected_generation = candidate.source_generation_id.clone();
-                    let expected_sha256 = candidate.source_generation_sha256.clone();
-                    let revalidate_pin = Arc::clone(&pinned);
-                    let probe = project_catalog_admin::PublisherCandidatePublishProbe {
-                        producer_id: candidate.producer_id.clone(),
-                        source_generation_id: expected_generation.clone(),
-                        source_generation_sha256: expected_sha256.clone(),
-                        scope: candidate.descriptor.scope.clone(),
-                        full_ref: candidate.descriptor.full_ref.clone(),
-                        accepted_commit: candidate.descriptor.publisher_commit.clone(),
-                        sources: PublishSources {
-                            knowledge: candidate
-                                .knowledge
-                                .iter()
-                                .map(|file| PublishSourceFile {
-                                    repository_relative_filename: file
-                                        .manifest
-                                        .repository_relative_filename
-                                        .clone(),
-                                    source_bytes: file.source_bytes.clone(),
-                                })
-                                .collect(),
-                            gaps: candidate
-                                .gaps
-                                .iter()
-                                .map(|file| PublishSourceFile {
-                                    repository_relative_filename: file
-                                        .manifest
-                                        .repository_relative_filename
-                                        .clone(),
-                                    source_bytes: file.source_bytes.clone(),
-                                })
-                                .collect(),
-                            graphs: candidate
-                                .graphs
-                                .iter()
-                                .map(|file| PublishSourceFile {
-                                    repository_relative_filename: file
-                                        .manifest
-                                        .repository_relative_filename
-                                        .clone(),
-                                    source_bytes: file.source_bytes.clone(),
-                                })
-                                .collect(),
-                        },
-                        revalidate_source: Box::new(move || {
-                            let candidate = revalidate_pin.candidate();
-                            if candidate.source_generation_id == expected_generation
-                                && candidate.source_generation_sha256 == expected_sha256
-                            {
-                                Ok(())
-                            } else {
-                                Err(PublishError::refusal(
-                                    "error.accepted_publication_candidate_stale",
-                                    "the pinned publication candidate changed before commit",
-                                ))
-                            }
-                        }),
-                    };
-                    project_catalog_admin::publish_accepted_publication_candidate(
+                    // The SAME entry point the auto-advance policy calls.
+                    // Keeping one candidate-acceptance path is what makes
+                    // "policy acceptance validates identically to an
+                    // operator acceptance" structural.
+                    crate::server::publisher_auto_advance::publish_from_ready_candidate(
                         &store,
                         runtime.as_ref(),
-                        &project_catalog_admin::PublisherCandidatePublishRequest {
-                            mode: mode.clone(),
-                            project_id: committed.clone(),
-                            source_generation_id: source_generation_id.clone(),
-                            expected_epoch: p.expected_catalog_epoch,
-                            dry_run: p.dry_run,
-                        },
-                        probe,
+                        producer_auth.as_ref(),
+                        knowledge_sources.as_ref(),
+                        &committed,
+                        source_generation_id,
+                        mode.clone(),
+                        p.expected_catalog_epoch,
+                        p.dry_run,
+                        auto_advance_update.clone(),
                     )
                 }
                 _ => anyhow::bail!(
@@ -1276,6 +1208,11 @@ impl BlackboxServer {
                     "previous_pointer_sha256": receipt.previous_pointer_sha256(),
                     "audit_reason": audit_reason,
                     "epoch": p.expected_catalog_epoch,
+                    "auto_advance_grant": match &auto_advance_update {
+                        AutoAdvanceGrantUpdate::Inherit => "inherited",
+                        AutoAdvanceGrantUpdate::Set { enabled: true, .. } => "granted",
+                        AutoAdvanceGrantUpdate::Set { enabled: false, .. } => "revoked",
+                    },
                 }))?)
             })
             .await;
@@ -1321,7 +1258,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports current, prior-fallback, missing, or corrupt state; accepted scope, ref, commit, generation identity, pointer SHA-256, and the typed source binding. Attachment bindings name an attachment; producer bindings name the producer plus source generation id and evidence hash. It also reports scope agreement and advance availability. A `health` object adds the bounded runtime projection: binding status, source kind, recorded attachment capabilities, overlay outcomes, and watcher state. Generation id and pointer SHA-256 are the compare-and-swap tokens bbox_project_publisher_advance requires. The call is observational, takes no checkout lease, and is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports current, prior-fallback, missing, or corrupt state; accepted scope, ref, commit, generation identity, pointer SHA-256, and the typed source binding. Attachment bindings name an attachment; producer bindings name the producer plus source generation id and evidence hash. It also reports scope agreement and advance availability. A `health` object adds the bounded runtime projection: binding status, source kind, recorded attachment capabilities, overlay outcomes, and watcher state. An `auto_advance` object reports the standing operator grant (enabled, the audit reason that installed it, and whether the accepted binding is producer-bound and therefore eligible) plus the last policy attempt and why it did or did not move the pointer. Generation id and pointer SHA-256 are the compare-and-swap tokens bbox_project_publisher_advance requires. The call is observational, takes no checkout lease, and is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -1371,6 +1308,27 @@ impl BlackboxServer {
             // caller that reads them. P5-G ADDS the runtime health view
             // beside them (plan section 8, P5-G mechanic 4).
             let runtime_health = server.state.project_runtime_status(project_id.as_str());
+            // Auto-advance state is REPORTED, never inferred by the caller:
+            // the standing grant is a pointer fact and the last attempt is
+            // the only place a policy refusal is visible without a log
+            // dive. A Ready candidate that is not serving must be able to
+            // say why (design/daemon-runtime/publisher-auto-advance.md).
+            let auto_advance_grant = runtime
+                .auto_advance_grant(&project_id)
+                .ok()
+                .flatten()
+                .map(|grant| {
+                    json!({
+                        "enabled": grant.enabled,
+                        "granted_reason": grant.granted_reason,
+                        "eligible_binding": grant.source.kind() == "producer",
+                    })
+                });
+            let auto_advance_last_attempt = server
+                .state
+                .knowledge_sources
+                .auto_advance_ledger()
+                .last_attempt(project_id.as_str());
             Ok(serde_json::to_string_pretty(&json!({
                 "project_id": project_id.as_str(),
                 "accepted_state": accepted_state_label(status.state()),
@@ -1390,6 +1348,10 @@ impl BlackboxServer {
                 "pointer_sha256": status.binding_stamp().map(|stamp| stamp.pointer_sha256()),
                 "diagnostic": status.failure().map(|failure| failure.code()),
                 "epoch": state.epoch(),
+                "auto_advance": {
+                    "grant": auto_advance_grant,
+                    "last_attempt": auto_advance_last_attempt,
+                },
                 "health": runtime_health,
             }))?)
         })
