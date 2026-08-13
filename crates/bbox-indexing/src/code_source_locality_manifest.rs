@@ -261,3 +261,265 @@ fn reconcile_workspace_manifest_entry(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_corpus_core::project_catalog::ProjectId;
+
+    const PROJECT: &str = "p_00000000000000000000000000000001";
+
+    fn project_id() -> ProjectId {
+        ProjectId::parse(PROJECT).unwrap()
+    }
+
+    /// The journal record for the generation the daemon believes is current.
+    fn activation(generation_id: &str) -> ActivationRecordV2 {
+        ActivationRecordV2 {
+            version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+            project_id: project_id(),
+            published_scope: PublishedScope::try_new("fixture-repo", ".").unwrap(),
+            generation_id: generation_id.to_string(),
+            selector: format!("collected:{PROJECT}:{generation_id}"),
+            snapshot_id: format!("collected-{generation_id}"),
+            document_count: 0,
+            entity_inventory_sha256: "b".repeat(64),
+            current_chunk_targets: BTreeMap::new(),
+            activated_unix_secs: 1,
+            cutback_pending: false,
+            cutback: None,
+            diagnostic: None,
+        }
+    }
+
+    /// The derived entry the collected writer would have published for
+    /// `activation`.
+    fn entry_for(activation: &ActivationRecordV2) -> WorkspaceIndexEntry {
+        WorkspaceIndexEntry {
+            manifest: format!("workspace/{PROJECT}/manifest.json"),
+            active_snapshot: Some(bbox_edge_sidecar::snapshot::active_snapshot_rel(
+                PROJECT,
+                &activation.snapshot_id,
+            )),
+            dirty_overlay: None,
+            repo_materialization: None,
+            code_source_selector: Some(activation.selector.clone()),
+            code_source_generation: Some(activation.generation_id.clone()),
+            git_overlay: None,
+            git_overlay_managed: true,
+        }
+    }
+
+    fn write_entry(edges_dir: &Path, entry: Option<WorkspaceIndexEntry>) {
+        let mut index = ManifestIndex::load_or_new(edges_dir).unwrap();
+        match entry {
+            Some(entry) => index.upsert_workspace(PROJECT, entry),
+            None => {
+                index.workspaces.remove(PROJECT);
+            }
+        }
+        index.write_atomic(edges_dir).unwrap();
+    }
+
+    fn loaded_entry(edges_dir: &Path) -> Option<WorkspaceIndexEntry> {
+        ManifestIndex::load_or_new(edges_dir)
+            .unwrap()
+            .workspaces
+            .get(PROJECT)
+            .cloned()
+    }
+
+    fn edges_root(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        directory.path().canonicalize().unwrap().join("edges")
+    }
+
+    #[test]
+    fn an_agreeing_entry_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = edges_root(&directory);
+        let current = activation(&"a".repeat(64));
+        write_entry(&edges_dir, Some(entry_for(&current)));
+
+        let state =
+            classify_workspace_manifest(&edges_dir, &current, GenerationState::Active).unwrap();
+
+        assert_eq!(state, WorkspaceManifestState::Agreed);
+        assert_eq!(loaded_entry(&edges_dir), Some(entry_for(&current)));
+    }
+
+    /// The exact production shape: the journal names the generation whose
+    /// state flip already landed, and the derived entry still names its
+    /// predecessor because the crash swallowed the manifest write.
+    #[test]
+    fn a_stale_entry_behind_an_active_generation_is_reconciled() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = edges_root(&directory);
+        let predecessor = activation(&"a".repeat(64));
+        let current = activation(&"c".repeat(64));
+        let mut stale = entry_for(&predecessor);
+        stale.repo_materialization = Some("materialized/repo".into());
+        write_entry(&edges_dir, Some(stale));
+
+        let state =
+            classify_workspace_manifest(&edges_dir, &current, GenerationState::Active).unwrap();
+
+        assert_eq!(
+            state,
+            WorkspaceManifestState::Reconciled {
+                previous_generation: Some(predecessor.generation_id.clone()),
+            }
+        );
+        let entry = loaded_entry(&edges_dir).expect("reconciled entry");
+        assert_eq!(
+            entry.code_source_generation.as_deref(),
+            Some(current.generation_id.as_str())
+        );
+        assert_eq!(
+            entry.code_source_selector.as_deref(),
+            Some(current.selector.as_str())
+        );
+        assert_eq!(
+            entry.active_snapshot,
+            Some(bbox_edge_sidecar::snapshot::active_snapshot_rel(
+                PROJECT,
+                &current.snapshot_id
+            ))
+        );
+        // Carried over exactly as the production writer does.
+        assert_eq!(
+            entry.repo_materialization.as_deref(),
+            Some("materialized/repo")
+        );
+        // An overlay is bound to one code generation and must not survive.
+        assert!(entry.git_overlay.is_none());
+        assert!(entry.git_overlay_managed);
+    }
+
+    /// The second production variant: the project never carried a collected
+    /// entry, so the crash left no entry at all.
+    #[test]
+    fn an_absent_entry_behind_an_active_generation_is_reconciled() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = edges_root(&directory);
+        let current = activation(&"c".repeat(64));
+        write_entry(&edges_dir, None);
+
+        let state =
+            classify_workspace_manifest(&edges_dir, &current, GenerationState::Active).unwrap();
+
+        assert_eq!(
+            state,
+            WorkspaceManifestState::Reconciled {
+                previous_generation: None
+            }
+        );
+        assert_eq!(loaded_entry(&edges_dir), Some(entry_for(&current)));
+    }
+
+    /// The state flip is written after the manifest write, so a non-Active
+    /// generation whose entry names the predecessor is an activation that
+    /// never finished. The manifest is right and must not be rewritten.
+    #[test]
+    fn a_stale_entry_behind_an_unsettled_generation_is_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = edges_root(&directory);
+        let predecessor = activation(&"a".repeat(64));
+        let current = activation(&"c".repeat(64));
+        write_entry(&edges_dir, Some(entry_for(&predecessor)));
+
+        for state in [GenerationState::StagingIndex, GenerationState::Ready] {
+            let classified = classify_workspace_manifest(&edges_dir, &current, state).unwrap();
+            assert_eq!(
+                classified,
+                WorkspaceManifestState::ActivationInFlight {
+                    journal_generation: current.generation_id.clone(),
+                }
+            );
+            assert_eq!(loaded_entry(&edges_dir), Some(entry_for(&predecessor)));
+        }
+    }
+
+    /// `cutback_to_local` writes the two stores in the inverse order, so its
+    /// crash window is resolved in the manifest's favour elsewhere. Rewriting
+    /// it here would re-point the project at the collected generation it was
+    /// deliberately cut back from.
+    #[test]
+    fn the_cutback_crash_window_is_not_reconciled() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = edges_root(&directory);
+        let current = activation(&"c".repeat(64));
+        let local = WorkspaceIndexEntry {
+            manifest: format!("workspace/{PROJECT}/manifest.json"),
+            active_snapshot: Some(format!("workspace/{PROJECT}/snapshots/head-local")),
+            dirty_overlay: None,
+            repo_materialization: None,
+            code_source_selector: Some(bbox_code_source::local_selector(PROJECT)),
+            code_source_generation: Some("local".into()),
+            git_overlay: None,
+            git_overlay_managed: true,
+        };
+        write_entry(&edges_dir, Some(local.clone()));
+
+        let state =
+            classify_workspace_manifest(&edges_dir, &current, GenerationState::Active).unwrap();
+
+        assert_eq!(state, WorkspaceManifestState::Disagrees);
+        assert_eq!(loaded_entry(&edges_dir), Some(local));
+    }
+
+    /// Only a well-formed predecessor entry is a recognized torn write.
+    /// Anything else is drift, and drift still refuses.
+    #[test]
+    fn a_malformed_predecessor_entry_still_disagrees() {
+        let current = activation(&"c".repeat(64));
+        let predecessor = activation(&"a".repeat(64));
+
+        let cross_project = {
+            let mut entry = entry_for(&predecessor);
+            entry.manifest = "workspace/p_00000000000000000000000000000009/manifest.json".into();
+            entry
+        };
+        let traversal = {
+            let mut entry = entry_for(&predecessor);
+            entry.active_snapshot = Some(format!("workspace/{PROJECT}/snapshots/../../escape"));
+            entry
+        };
+        let no_snapshot = {
+            let mut entry = entry_for(&predecessor);
+            entry.active_snapshot = None;
+            entry
+        };
+
+        for malformed in [cross_project, traversal, no_snapshot] {
+            let directory = tempfile::tempdir().unwrap();
+            let edges_dir = edges_root(&directory);
+            write_entry(&edges_dir, Some(malformed.clone()));
+
+            let state =
+                classify_workspace_manifest(&edges_dir, &current, GenerationState::Active).unwrap();
+
+            assert_eq!(state, WorkspaceManifestState::Disagrees);
+            assert_eq!(loaded_entry(&edges_dir), Some(malformed));
+        }
+    }
+
+    /// A local activation record is not this module's to repair.
+    #[test]
+    fn a_local_activation_is_out_of_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let edges_dir = edges_root(&directory);
+        let mut local = activation(&"c".repeat(64));
+        local.selector = bbox_code_source::local_selector(PROJECT);
+        write_entry(&edges_dir, None);
+
+        let state =
+            classify_workspace_manifest(&edges_dir, &local, GenerationState::Active).unwrap();
+
+        assert_eq!(state, WorkspaceManifestState::Disagrees);
+        assert_eq!(loaded_entry(&edges_dir), None);
+    }
+}

@@ -1212,6 +1212,272 @@ mod tests {
         );
     }
 
+    /// Rewrite the project's workspace manifest entry so it names `generation`
+    /// again: the exact shape a crash between the activation journal write and
+    /// the derived manifest write leaves behind.
+    fn tear_manifest_back_to(
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        project_id: &ProjectId,
+        generation: &CodeSourceLocalityGenerationEvidenceV1,
+    ) {
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(layout.projects_path());
+        let mut index =
+            bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
+        index.upsert_workspace(
+            project_id.as_str(),
+            bbox_edge_sidecar::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(bbox_edge_sidecar::snapshot::active_snapshot_rel(
+                    project_id.as_str(),
+                    &generation.snapshot_id,
+                )),
+                dirty_overlay: None,
+                repo_materialization: None,
+                code_source_selector: Some(generation.selector.clone()),
+                code_source_generation: Some(generation.generation_id.clone()),
+                git_overlay: None,
+                git_overlay_managed: true,
+            },
+        );
+        index.write_atomic(&edges_dir).unwrap();
+    }
+
+    /// The other production variant: the crash left no workspace entry at all.
+    fn remove_manifest_entry(
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        project_id: &ProjectId,
+    ) {
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(layout.projects_path());
+        let mut index =
+            bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir).unwrap();
+        index.workspaces.remove(project_id.as_str());
+        index.write_atomic(&edges_dir).unwrap();
+    }
+
+    fn manifest_generation(
+        layout: &ProjectCatalogMigrationResolvedLayoutV1,
+        project_id: &ProjectId,
+    ) -> Option<String> {
+        let edges_dir =
+            bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(layout.projects_path());
+        bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)
+            .unwrap()
+            .workspaces
+            .get(project_id.as_str())
+            .and_then(|entry| entry.code_source_generation.clone())
+    }
+
+    /// Drive the fixture to the state the production incident left behind: a
+    /// governed, cut-over project whose journal names an Active successor
+    /// generation while the workspace manifest still names its predecessor.
+    /// Returns the layout, config, project, and the successor generation id.
+    fn torn_after_cutover(
+        root: &Path,
+    ) -> (
+        Config,
+        ProjectCatalogMigrationResolvedLayoutV1,
+        ProjectId,
+        String,
+    ) {
+        let (config, layout, project_id, scope) = current_v2_fixture(root);
+        let report_path = root.join("code-source-locality-report.json");
+        ProjectCatalogCodeSourceLocalityCutoverFacadeV1::preflight(
+            CodeSourceLocalityCutoverPreflightRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path: report_path.clone(),
+                project_ids: vec![project_id.clone()],
+                min_quiet_secs: MIN_CODE_SOURCE_LOCALITY_QUIET_SECS,
+                generated_at: "2026-08-09T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let mut report: CodeSourceLocalityCutoverReportV1 =
+            read_json_required(&report_path).unwrap();
+        report.generated_at_unix_secs =
+            now_unix_secs().saturating_sub(MIN_CODE_SOURCE_LOCALITY_QUIET_SECS);
+        write_json(&report_path, &report).unwrap();
+        ProjectCatalogCodeSourceLocalityCutoverFacadeV1::apply(
+            CodeSourceLocalityCutoverApplyRequestV1 {
+                layout: layout.clone(),
+                config: config.clone(),
+                report_path,
+                applied_at: "2026-08-09T00:05:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let predecessor = report.rows[0].generation.clone();
+        let successor = activate_successor_generation(&config, &layout, &project_id, &scope);
+        assert_ne!(successor, predecessor.generation_id);
+        // The kill: the journal already names the successor, the derived
+        // manifest write is rolled back to the predecessor.
+        tear_manifest_back_to(&layout, &project_id, &predecessor);
+        assert_eq!(
+            manifest_generation(&layout, &project_id).as_deref(),
+            Some(predecessor.generation_id.as_str())
+        );
+        (config, layout, project_id, successor)
+    }
+
+    /// The production incident. Before this fix, `verify_live` refused with
+    /// "active collected generation disagrees with the workspace manifest" and
+    /// the daemon crash-looped on every restart.
+    #[test]
+    fn verify_reconciles_a_manifest_torn_behind_an_active_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, successor) = torn_after_cutover(&root);
+
+        let verified = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 {
+                layout: layout.clone(),
+                config,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(verified.status, "verified");
+        // The derived manifest now serves the journal's generation.
+        assert_eq!(
+            manifest_generation(&layout, &project_id).as_deref(),
+            Some(successor.as_str())
+        );
+    }
+
+    /// The second production variant: the crash left no workspace entry.
+    #[test]
+    fn verify_reconciles_an_absent_manifest_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, successor) = torn_after_cutover(&root);
+        remove_manifest_entry(&layout, &project_id);
+        assert_eq!(manifest_generation(&layout, &project_id), None);
+
+        let verified = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 {
+                layout: layout.clone(),
+                config,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(verified.status, "verified");
+        assert_eq!(
+            manifest_generation(&layout, &project_id).as_deref(),
+            Some(successor.as_str())
+        );
+    }
+
+    /// The startup evidence loop is the other refusal site, and it must serve
+    /// the journal's generation once the derived entry is repaired.
+    #[test]
+    fn startup_evidence_serves_the_journal_after_a_torn_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, successor) = torn_after_cutover(&root);
+        let store = open_code_store(&config).unwrap();
+
+        let observations = open_observations(&store).unwrap();
+        observations
+            .record_verified_activations(
+                &store,
+                layout.projects_path(),
+                CodeSourceLocalityEvidenceKindV1::FullRebuild,
+            )
+            .unwrap();
+
+        let recorded = observations
+            .snapshot()
+            .observations
+            .into_iter()
+            .find(|observation| {
+                observation.project_id == project_id
+                    && observation.evidence_kind == CodeSourceLocalityEvidenceKindV1::FullRebuild
+            })
+            .expect("full rebuild evidence for the torn project");
+        assert_eq!(recorded.generation_id, successor);
+        assert_eq!(
+            manifest_generation(&layout, &project_id).as_deref(),
+            Some(successor.as_str())
+        );
+    }
+
+    /// A generation that is still staging has no completed-activation proof,
+    /// so its disagreeing manifest is an activation in flight rather than a
+    /// lost write. Boot passes over the project and leaves the manifest
+    /// exactly where it is; the startup reducer sweep converges the record.
+    #[test]
+    fn verify_defers_an_activation_still_in_flight_without_touching_the_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, successor) = torn_after_cutover(&root);
+        let predecessor = manifest_generation(&layout, &project_id).expect("predecessor entry");
+        let scope = PublishedScope::try_new("fixture-repo", ".").unwrap();
+        open_code_store(&config)
+            .unwrap()
+            .mark_generation_state_mixed(&scope, &successor, GenerationState::StagingIndex, None)
+            .unwrap();
+
+        let verified = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 {
+                layout: layout.clone(),
+                config,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(verified.status, "verified");
+        assert_eq!(
+            manifest_generation(&layout, &project_id).as_deref(),
+            Some(predecessor.as_str()),
+            "an unfinished activation must not rewrite the manifest"
+        );
+    }
+
+    /// Strictness preservation: reconciliation trusts the journal only because
+    /// the caller has already proven the activation against a generation the
+    /// store can produce. An activation naming a generation that does not
+    /// exist still refuses.
+    #[test]
+    fn verify_still_refuses_an_activation_the_store_cannot_produce() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, _successor) = torn_after_cutover(&root);
+        let scope = PublishedScope::try_new("fixture-repo", ".").unwrap();
+        let absent_generation = "f".repeat(64);
+        open_code_store(&config)
+            .unwrap()
+            .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
+                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
+                project_id: project_id.clone(),
+                published_scope: scope,
+                generation_id: absent_generation.clone(),
+                selector: format!("collected:{project_id}:{absent_generation}"),
+                snapshot_id: format!("collected-{absent_generation}"),
+                document_count: 0,
+                entity_inventory_sha256: "e".repeat(64),
+                current_chunk_targets: BTreeMap::new(),
+                activated_unix_secs: 3,
+                cutback_pending: false,
+                cutback: None,
+                diagnostic: None,
+            })
+            .unwrap();
+
+        let error = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
+            CodeSourceLocalityCutoverVerifyRequestV1 { layout, config },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("generation not found"),
+            "unexpected verification error: {error:#}"
+        );
+    }
+
     #[test]
     fn verify_tolerates_a_crash_wedged_completed_staging() {
         let directory = tempfile::tempdir().unwrap();
