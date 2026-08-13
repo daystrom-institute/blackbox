@@ -27,8 +27,12 @@ const JOURNAL_VERSION: u32 = 1;
 /// the invariant STRUCTURAL rather than checked: there is no representable
 /// value with a hash and a skip reason, or a published row with no size, so
 /// no validator has to be remembered and no sentinel can drift.
+// No `deny_unknown_fields`: this enum is FLATTENED into `JournalEntry`, so its
+// deserializer is handed the residual key set rather than a self-contained
+// map. Denying unknown fields there would make it reject its own container's
+// siblings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum JournalState {
     Published { content_hash: String, size: u64 },
     Skipped { reason: String },

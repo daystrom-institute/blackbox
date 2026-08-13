@@ -119,7 +119,7 @@ pub fn assign_logical_paths(
             };
             let key = bbox_file_source::collision_key(&resolved);
             if let Some(owner) = taken.get(&key)
-                && owner != *remote_id
+                && owner.as_str() != *remote_id
             {
                 // Two distinct remote ids whose SUFFIXED paths collide. The
                 // suffix is a sha256 prefix over the remote id, so this is a
