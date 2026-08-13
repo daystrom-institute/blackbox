@@ -342,10 +342,56 @@ impl BlackboxServer {
             .and_then(|pending| pending.mutation.content_json.clone())
     }
 
+    /// The covered project that owns an id-addressed gap mutation, for a
+    /// caller that supplied no project context (gap-40ab1102).
+    ///
+    /// Gap ids are globally unique, so the authority for "which project owns
+    /// gap-x" is the same served view the unfiltered `bbox_gaps` list reads.
+    /// Find the row, take its durable project identity, and keep the
+    /// checkout-owner lane only when that project is actually covered.
+    fn covered_scope_for_gap_id(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<(String, bbox_corpus_core::identity::PublishedScope)>> {
+        // A bridge daemon has no checkout-owner transport at all, so it pays
+        // nothing for this lane: no view build on the common local path.
+        if self.state.project_authority.catalog_store().is_none() {
+            return Ok(None);
+        }
+        let view = self.session_gap_view(None, None)?;
+        let Some(project_id) = view
+            .gaps
+            .all()
+            .iter()
+            .find(|gap| Self::gap_id_matches(&gap.id, id))
+            .and_then(|gap| gap.project_id.clone())
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .covered_scope_for_project_id(&project_id)
+            .map(|scope| (project_id, scope)))
+    }
+
+    /// The covered project targeted by one gap mutation: the caller's
+    /// selector when it supplied one, otherwise the gap id's own owner.
+    fn covered_mutation_target(
+        &self,
+        raw: Option<&str>,
+        id: &str,
+    ) -> anyhow::Result<Option<(String, bbox_corpus_core::identity::PublishedScope)>> {
+        match raw {
+            Some(raw) => Ok(self.covered_project_scope(raw)),
+            None => self.covered_scope_for_gap_id(id),
+        }
+    }
+
     /// Load one gap for a covered-project mutation: published view first,
-    /// then the pending-delivery overlay.
-    fn served_gap(&self, raw: &str, id: &str) -> anyhow::Result<crate::gaps::GapNote> {
-        let view = self.session_gap_view(Some(raw), None)?;
+    /// then the pending-delivery overlay. `raw` narrows the view when the
+    /// caller supplied a selector; without one the whole served view is the
+    /// lookup surface, exactly as the unfiltered list is.
+    fn served_gap(&self, raw: Option<&str>, id: &str) -> anyhow::Result<crate::gaps::GapNote> {
+        let view = self.session_gap_view(raw, None)?;
         if let Some(gap) = view
             .gaps
             .all()
@@ -368,14 +414,53 @@ impl BlackboxServer {
         anyhow::bail!("Gap not found: {id} (expected `gap-<8hex>`)")
     }
 
+    /// Store-identity breadcrumb for an id-addressed mutation miss
+    /// (gap-40ab1102, following gap-518d7215's thread-lookup precedent).
+    ///
+    /// A gap the served view carries but the daemon-local store cannot
+    /// rewrite is a missing WRITE precondition, not a missing gap. Name the
+    /// project that owns the row and what would make the mutation
+    /// targetable, so a caller stops reading the miss as "this gap does not
+    /// exist". Anything else keeps the store's own error verbatim.
+    fn explain_gap_mutation_miss(
+        &self,
+        tool: &'static str,
+        id: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if !error.to_string().contains("Gap not found") {
+            return error;
+        }
+        let Ok(view) = self.session_gap_view(None, None) else {
+            return error;
+        };
+        let Some(owner) = view
+            .gaps
+            .all()
+            .iter()
+            .find(|gap| Self::gap_id_matches(&gap.id, id))
+            .map(|gap| {
+                gap.project_id
+                    .clone()
+                    .or_else(|| gap.project.clone())
+                    .unwrap_or_else(|| "an unidentified project".to_string())
+            })
+        else {
+            return error;
+        };
+        anyhow::anyhow!(
+            "{tool}: gap {id} IS served by this daemon under project {owner}, but the daemon-local gap store holds no record it can rewrite. This is missing write authority, not a missing gap: run the mutation from a session with checkout authority for {owner}, or pass project={owner} (its project id, registered path, or alias) so the rewrite targets that project's checkout. Underlying store error: {error:#}"
+        )
+    }
+
     /// Covered-project gap update: patch the served record exactly like
     /// GapStore::update_locked and enqueue the rewritten file.
     fn enqueue_gap_update_via_checkout_owner(
         &self,
         p: &GapUpdateParams,
-        raw: &str,
+        raw: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let Some((project_id, scope)) = self.covered_project_scope(raw) else {
+        let Some((project_id, scope)) = self.covered_mutation_target(raw, &p.id)? else {
             return Ok(None);
         };
         let mut gap = self.served_gap(raw, &p.id)?;
@@ -467,9 +552,9 @@ impl BlackboxServer {
     fn enqueue_gap_resolve_via_checkout_owner(
         &self,
         p: &GapResolveParams,
-        raw: &str,
+        raw: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let Some((project_id, scope)) = self.covered_project_scope(raw) else {
+        let Some((project_id, scope)) = self.covered_mutation_target(raw, &p.id)? else {
             return Ok(None);
         };
         let resolution = p.resolution.as_str();
@@ -680,7 +765,8 @@ impl BlackboxServer {
             };
             if !p.json.unwrap_or(false) {
                 if !view.diagnostics.is_empty() {
-                    rendered.push_str("\n\nGap read diagnostics:\n- ");
+                    // Header wording is frozen by the bridge parity capture.
+                    rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
                     rendered.push_str(&view.diagnostics.join("\n- "));
                 }
                 rendered = view.append_built_from_table(rendered, &built_from);
@@ -717,17 +803,32 @@ impl BlackboxServer {
                         .map(|checkout| checkout.checkout_project_dir.clone())
                 });
             server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
+            // The checkout-owner lane runs whether or not the caller named a
+            // project (gap-40ab1102): gap ids are globally unique, so an
+            // id-only call resolves its owner from the same served view the
+            // unfiltered list reads instead of failing as "Gap not found".
+            if let Some(text) =
+                server.enqueue_gap_resolve_via_checkout_owner(&p, raw_project.as_deref())?
+            {
+                return Ok(text);
+            }
             if let Some(raw) = raw_project {
-                if let Some(text) = server.enqueue_gap_resolve_via_checkout_owner(&p, &raw)? {
-                    return Ok(text);
-                }
                 let (project, _resolved_project_id, write_dir, resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
                 checkout = resolved_checkout;
             }
-            let result = server.state.gaps.write().resolve(&p)?;
+            // Bind the store outcome first so the write guard is released
+            // before the miss breadcrumb reads the served view (which takes
+            // the same lock).
+            let outcome = server.state.gaps.write().resolve(&p);
+            let result = match outcome {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(server.explain_gap_mutation_miss("bbox_gap_resolve", &p.id, error));
+                }
+            };
             if let Some(checkout) = checkout.as_ref() {
                 server.refresh_dark_gap_overlay(checkout);
             }
@@ -761,17 +862,27 @@ impl BlackboxServer {
                         .map(|checkout| checkout.checkout_project_dir.clone())
                 });
             server.guard_unscoped_gap_mutation(&p.id, raw_project.is_some())?;
+            // Same id-only resolution as bbox_gap_resolve (gap-40ab1102).
+            if let Some(text) =
+                server.enqueue_gap_update_via_checkout_owner(&p, raw_project.as_deref())?
+            {
+                return Ok(text);
+            }
             if let Some(raw) = raw_project {
-                if let Some(text) = server.enqueue_gap_update_via_checkout_owner(&p, &raw)? {
-                    return Ok(text);
-                }
                 let (project, _resolved_project_id, write_dir, resolved_checkout) =
                     server.resolve_gap_project(&raw)?;
                 p.project = Some(project);
                 p.write_dir = write_dir;
                 checkout = resolved_checkout;
             }
-            let result = server.state.gaps.write().update(&p)?;
+            // Guard released before the breadcrumb reads the served view.
+            let outcome = server.state.gaps.write().update(&p);
+            let result = match outcome {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(server.explain_gap_mutation_miss("bbox_gap_update", &p.id, error));
+                }
+            };
             if let Some(checkout) = checkout.as_ref() {
                 server.refresh_dark_gap_overlay(checkout);
             }
@@ -839,6 +950,222 @@ mod tests {
                 .to_string()
                 .contains("only global gaps")
         );
+    }
+
+    /// A registered git base whose committed `.bbox/gaps/` publishes one gap
+    /// row stamped with the resolver's project id, plus a declared operator
+    /// alias. This is the published read plane the filter must match by
+    /// identity: the catalog lane that surfaced gap-40ab1102 live serves the
+    /// same row shape with NO path key at all.
+    fn published_gap_fixture(root: &Path) -> (BlackboxServer, crate::projects::ProjectRecord) {
+        let repo = init_repo(&root.join("repo"));
+
+        let state = Arc::new(SharedState::for_test(root));
+        let record = {
+            let registry = state.project_authority.bridge_registry().unwrap();
+            let mut registry = registry.write();
+            let record = registry.register_path(&repo).unwrap();
+            registry
+                .sync_declared_aliases(
+                    &record.project_id,
+                    &["gap-filter-alias".to_string()].into_iter().collect(),
+                )
+                .unwrap();
+            registry.resolve(&record.project_id).unwrap().unwrap()
+        };
+
+        std::fs::create_dir_all(repo.join(".bbox/gaps")).unwrap();
+        std::fs::write(
+            repo.join(".bbox/gaps/gap-40ab1102.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "id": "gap-40ab1102",
+                "title": "STAMPED_ROW_MARKER",
+                "gap_kind": "mcp_surface",
+                "domain": "knowledge-gaps-read-plane",
+                "wanted_capability": "match a project filter by stamped identity",
+                "dedupe_key": "mcp_surface/knowledge-gaps-read-plane/stamped-row",
+                "project_id": record.project_id,
+                "created_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        run_git(&repo, &["add", ".bbox"]);
+        run_git(&repo, &["commit", "-m", "publish gap"]);
+
+        (BlackboxServer::new(state), record)
+    }
+
+    fn gaps_structured(server: &BlackboxServer, selector: &str) -> serde_json::Value {
+        let result = server.bbox_gaps(Parameters(GapListParams {
+            project: Some(selector.to_string()),
+            provisional: Some("published".into()),
+            json: Some(true),
+            ..Default::default()
+        }));
+        assert_ne!(result.is_error, Some(true), "bbox_gaps failed: {result:?}");
+        result
+            .structured_content
+            .expect("bbox_gaps structured response")
+    }
+
+    fn diagnostics_of(structured: &serde_json::Value) -> Vec<String> {
+        structured["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .map(|line| line.as_str().expect("diagnostic string").to_string())
+            .collect()
+    }
+
+    /// gap-40ab1102 (1): a `project` filter matches rows by their stamped
+    /// project id, whatever path key the row carries, for the project id,
+    /// a declared operator alias, and the registered path alike.
+    #[test]
+    fn bbox_gaps_project_filter_matches_stamped_rows_by_id_alias_and_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (server, record) = published_gap_fixture(&root);
+        let repo = record.canonical_path.clone();
+
+        for selector in [
+            record.project_id.as_str(),
+            "gap-filter-alias",
+            repo.as_str(),
+        ] {
+            let structured = gaps_structured(&server, selector);
+            let rows = structured["rows"].as_array().expect("rows array");
+            assert_eq!(rows.len(), 1, "selector {selector}: {structured}");
+            assert_eq!(rows[0]["id"], "gap-40ab1102", "selector {selector}");
+            assert!(
+                rows[0]["built_from_ref"].is_string(),
+                "selector {selector}: the matched row must keep its stamp: {structured}"
+            );
+            // A fully stamped result set carries no legacy-lane diagnostic.
+            for diagnostic in diagnostics_of(&structured) {
+                assert!(
+                    !diagnostic.contains("legacy_compatibility"),
+                    "selector {selector}: {diagnostic}"
+                );
+            }
+        }
+    }
+
+    /// gap-40ab1102 (1): a filter value that names no registered project
+    /// keeps literal substring semantics AND says so, so an empty result
+    /// cannot be read as an empty store.
+    #[test]
+    fn bbox_gaps_unresolvable_project_filter_reports_the_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (server, _record) = published_gap_fixture(&root);
+
+        let structured = gaps_structured(&server, "no-such-project-selector");
+        assert!(
+            structured["rows"].as_array().expect("rows").is_empty(),
+            "{structured}"
+        );
+        let diagnostics = diagnostics_of(&structured).join("\n");
+        assert!(
+            diagnostics.contains("no-such-project-selector"),
+            "the diagnostic must name the unresolvable value: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("resolved to no registered project"),
+            "{diagnostics}"
+        );
+    }
+
+    /// gap-40ab1102 (3): the legacy-lane diagnostic describes ROWS, so it
+    /// rides a response only when that response returned a legacy row. A
+    /// global gap sitting in the view must not stamp the warning onto a
+    /// query that returned nothing (or nothing legacy).
+    #[tokio::test]
+    async fn bbox_gaps_legacy_diagnostic_only_rides_responses_with_legacy_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+
+        let mut p = gap_params(String::new());
+        p.scope = Some("global".into());
+        p.project = None;
+        p.title = "GLOBAL_LEGACY_MARKER".into();
+        let filed = server.bbox_gap(Parameters(p)).await;
+        assert_ne!(filed.is_error, Some(true), "bbox_gap failed: {filed:?}");
+
+        let matching = server.bbox_gaps(Parameters(GapListParams {
+            query: Some("GLOBAL_LEGACY_MARKER".into()),
+            json: Some(true),
+            ..Default::default()
+        }));
+        let matching = matching
+            .structured_content
+            .expect("bbox_gaps structured response");
+        assert_eq!(
+            matching["rows"].as_array().expect("rows").len(),
+            1,
+            "{matching}"
+        );
+        assert!(
+            diagnostics_of(&matching)
+                .iter()
+                .any(|diagnostic| diagnostic.contains("legacy_compatibility")),
+            "a returned legacy row keeps the warning: {matching}"
+        );
+
+        let empty = server.bbox_gaps(Parameters(GapListParams {
+            query: Some("NO_SUCH_GAP_MARKER".into()),
+            json: Some(true),
+            ..Default::default()
+        }));
+        let empty = empty
+            .structured_content
+            .expect("bbox_gaps structured response");
+        assert!(
+            empty["rows"].as_array().expect("rows").is_empty(),
+            "{empty}"
+        );
+        assert!(
+            !diagnostics_of(&empty)
+                .iter()
+                .any(|diagnostic| diagnostic.contains("legacy_compatibility")),
+            "a response with no legacy rows must not warn about them: {empty}"
+        );
+    }
+
+    /// gap-40ab1102 (2): a gap the daemon SERVES but cannot rewrite locally
+    /// is a missing write precondition, not a missing gap. The error names
+    /// the owning project and what would make the mutation targetable
+    /// (gap-518d7215's store-identity breadcrumb precedent).
+    #[tokio::test]
+    async fn bbox_gap_resolve_miss_names_the_write_precondition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (server, record) = published_gap_fixture(&root);
+
+        // The row is plainly listable under its project.
+        let listed = gaps_structured(&server, &record.project_id);
+        assert_eq!(
+            listed["rows"].as_array().expect("rows").len(),
+            1,
+            "{listed}"
+        );
+
+        let resolved = server
+            .bbox_gap_resolve(Parameters(GapResolveParams {
+                id: "gap-40ab1102".into(),
+                resolution: "addressed".into(),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(resolved.is_error, Some(true), "{resolved:?}");
+        let body = format!("{:?}", resolved.content);
+        assert!(
+            body.contains("IS served by this daemon"),
+            "the miss must not present as a missing gap: {body}"
+        );
+        assert!(body.contains(&record.project_id), "{body}");
+        assert!(body.contains("missing write authority"), "{body}");
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {

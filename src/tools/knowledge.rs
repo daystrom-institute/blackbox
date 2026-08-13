@@ -2470,4 +2470,208 @@ mod tests {
             .count();
         assert_eq!(remaining, 1, "failed admission must not write a new entry");
     }
+
+    /// A project-scoped entry stamped with project identity and NO path key,
+    /// the shape every catalog-published row has.
+    fn stamped_entry(
+        id: &str,
+        content: &str,
+        project_id: &str,
+    ) -> crate::knowledge::KnowledgeEntry {
+        use bbox_knowledge::knowledge::{Approval, Category, Priority, Scope, Status};
+        crate::knowledge::KnowledgeEntry {
+            id: id.into(),
+            title: id.into(),
+            content: content.into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            project_id: Some(project_id.to_string()),
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: false,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        }
+    }
+
+    fn knowledge_rows(structured: &serde_json::Value) -> &Vec<serde_json::Value> {
+        structured["rows"].as_array().expect("rows array")
+    }
+
+    fn knowledge_diagnostics(structured: &serde_json::Value) -> Vec<String> {
+        structured["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .map(|line| line.as_str().expect("diagnostic string").to_string())
+            .collect()
+    }
+
+    /// gap-40ab1102 (1): a `project` filter must match rows by their stamped
+    /// project id. A row that carries a project_id and no path key (every
+    /// catalog-published row) was dropped by all three selectors before the
+    /// filter armed the id predicate, so a project with knowledge answered
+    /// every filtered query with nothing.
+    #[tokio::test]
+    async fn bbox_knowledge_project_filter_matches_stamped_rows_by_id_alias_and_path() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .sync_declared_aliases(
+                &record.project_id,
+                &["kb-filter-alias".to_string()].into_iter().collect(),
+            )
+            .unwrap();
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry(
+                "stamped-row",
+                "STAMPED_ROW_MARKER",
+                &record.project_id,
+            ))
+            .unwrap();
+
+        for selector in [
+            record.project_id.as_str(),
+            "kb-filter-alias",
+            base.to_str().unwrap(),
+        ] {
+            let result = server
+                .bbox_knowledge(Parameters(KnowledgeListParams {
+                    project: Some(selector.to_string()),
+                    ..Default::default()
+                }))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{selector}: {result:?}");
+            let structured = result
+                .structured_content
+                .expect("bbox_knowledge structured response");
+            let rows = knowledge_rows(&structured);
+            assert_eq!(rows.len(), 1, "selector {selector}: {structured}");
+            assert_eq!(rows[0]["entry"]["id"], "stamped-row", "{selector}");
+        }
+    }
+
+    /// gap-40ab1102 (1): a filter value that names no registered project
+    /// keeps literal substring semantics AND reports itself, so an empty
+    /// result cannot be read as an empty store.
+    #[tokio::test]
+    async fn bbox_knowledge_unresolvable_project_filter_reports_the_value() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry(
+                "stamped-row",
+                "STAMPED_ROW_MARKER",
+                &record.project_id,
+            ))
+            .unwrap();
+
+        let result = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                project: Some("no-such-project-selector".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let structured = result
+            .structured_content
+            .expect("bbox_knowledge structured response");
+        assert!(knowledge_rows(&structured).is_empty(), "{structured}");
+        let diagnostics = knowledge_diagnostics(&structured).join("\n");
+        assert!(
+            diagnostics.contains("no-such-project-selector"),
+            "the diagnostic must name the unresolvable value: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("resolved to no registered project"),
+            "{diagnostics}"
+        );
+    }
+
+    /// gap-40ab1102 (3): the legacy-lane diagnostic describes ROWS, so a
+    /// response that returned none of them must not carry it. Firing it on
+    /// every response, stamped or not, is what trains callers to ignore
+    /// diagnostics.
+    #[tokio::test]
+    async fn bbox_knowledge_legacy_diagnostic_only_rides_responses_with_legacy_rows() {
+        init_system_memory();
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let (base, _worktree) = init_repo_with_worktree(&tmp_root);
+        let (server, record) = server_with_registered(&tmp_root, &base);
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(stamped_entry(
+                "stamped-row",
+                "STAMPED_ROW_MARKER",
+                &record.project_id,
+            ))
+            .unwrap();
+
+        let matching = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                query: Some("STAMPED_ROW_MARKER".into()),
+                ..Default::default()
+            }))
+            .await
+            .structured_content
+            .expect("bbox_knowledge structured response");
+        assert_eq!(knowledge_rows(&matching).len(), 1, "{matching}");
+        assert!(
+            knowledge_diagnostics(&matching)
+                .iter()
+                .any(|diagnostic| diagnostic.contains("legacy_compatibility")),
+            "a returned legacy row keeps the warning: {matching}"
+        );
+
+        let empty = server
+            .bbox_knowledge(Parameters(KnowledgeListParams {
+                query: Some("NO_SUCH_ENTRY_MARKER".into()),
+                ..Default::default()
+            }))
+            .await
+            .structured_content
+            .expect("bbox_knowledge structured response");
+        assert!(knowledge_rows(&empty).is_empty(), "{empty}");
+        assert!(
+            !knowledge_diagnostics(&empty)
+                .iter()
+                .any(|diagnostic| diagnostic.contains("legacy_compatibility")),
+            "a response with no legacy rows must not warn about them: {empty}"
+        );
+    }
 }
