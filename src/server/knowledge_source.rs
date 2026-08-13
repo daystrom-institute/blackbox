@@ -935,7 +935,11 @@ async fn provisional_capture_context(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<WorkspaceBindingGrant>,
 ) -> Result<Json<ProvisionalCaptureContextV1>, HttpError> {
-    Ok(Json(current_provisional_capture_context(&state, &grant)?))
+    // Off the worker: this reads through the accepted-publication on-disk
+    // lock. See `blocking_http`.
+    Ok(Json(
+        blocking_http(move || current_provisional_capture_context(&state, &grant)).await?,
+    ))
 }
 
 fn current_provisional_capture_context(
@@ -1211,7 +1215,15 @@ async fn begin_provisional_upload(
     Extension(grant): Extension<WorkspaceBindingGrant>,
     Json(request): Json<BeginProvisionalUploadRequestV1>,
 ) -> Result<(StatusCode, Json<BeginSourceUploadResponseV1>), HttpError> {
-    require_current_provisional_descriptor(&state, &grant, &request.descriptor)?;
+    {
+        // Off the worker: accepted-publication on-disk lock. See
+        // `blocking_http`.
+        let state = state.clone();
+        let grant = grant.clone();
+        let descriptor = request.descriptor.clone();
+        blocking_http(move || require_current_provisional_descriptor(&state, &grant, &descriptor))
+            .await?;
+    }
     let authority = provisional_authority(&grant);
     let store = state.knowledge_sources.store();
     let response =
@@ -1304,7 +1316,14 @@ async fn finalize_provisional_upload(
         let upload_id = upload_id.clone();
         blocking(move || store.provisional_upload_descriptor(&authority, &upload_id)).await?
     };
-    require_current_provisional_descriptor(&state, &grant, &descriptor)?;
+    {
+        // Off the worker: accepted-publication on-disk lock. See
+        // `blocking_http`.
+        let state = state.clone();
+        let grant = grant.clone();
+        blocking_http(move || require_current_provisional_descriptor(&state, &grant, &descriptor))
+            .await?;
+    }
     let response = {
         let authority = authority.clone();
         blocking(move || {
@@ -1356,7 +1375,14 @@ async fn renew_provisional_generation(
         let generation = generation.clone();
         blocking(move || store.provisional_generation_descriptor(&authority, &generation)).await?
     };
-    if let Err(error) = require_current_provisional_descriptor(&state, &grant, &descriptor) {
+    // Off the worker: accepted-publication on-disk lock. See `blocking_http`.
+    let currency = {
+        let state = state.clone();
+        let grant = grant.clone();
+        blocking_http(move || require_current_provisional_descriptor(&state, &grant, &descriptor))
+            .await
+    };
+    if let Err(error) = currency {
         let store = store.clone();
         let authority = authority.clone();
         let stale_generation = generation.clone();
@@ -1586,6 +1612,30 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|_| HttpError::storage("knowledge-source blocking task failed"))?
         .map_err(HttpError::from_store)
+}
+
+/// Blocking-pool twin of [`blocking`] for operations that already yield an
+/// `HttpError` and so cannot go through `HttpError::from_store`.
+///
+/// This exists for one reason worth stating at the call sites that use it.
+/// The accepted-publication read path takes an ON-DISK exclusive lock, and
+/// `acquire_store_lock_nofollow_with_timeout` (bbox-corpus-core
+/// `json_store.rs`) waits for it by spin-sleeping on `std::thread::sleep`
+/// for up to `ACCEPTED_PUBLICATION_LOCK_TIMEOUT` (15s). Called from an
+/// `async fn` body that is not a blocking-pool closure, one contended read
+/// parks a tokio WORKER for those 15 seconds. Worker count defaults to one
+/// per core, so a handful of concurrent provisional requests during a
+/// publication window park every worker at once, and the runtime then polls
+/// nothing at all: not the MCP transport, not the axum accept loop, and not
+/// `/healthz`, whose handler holds no lock and is ready on its first poll.
+/// That is the 2026-08-13 ingest starvation
+/// (design/daemon-runtime/healthz-ingest-starvation.md).
+async fn blocking_http<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, HttpError> + Send + 'static,
+) -> Result<T, HttpError> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| HttpError::storage("knowledge-source blocking task failed"))?
 }
 
 fn reap_upload_body_tempfiles(store_root: &std::path::Path) -> Result<u64> {
@@ -2850,5 +2900,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stale_finalize.status(), StatusCode::CONFLICT);
+    }
+
+    /// The 2026-08-13 ingest starvation, reduced to its smallest form.
+    ///
+    /// The provisional handlers read accepted publications through an
+    /// on-disk exclusive lock whose waiter spin-sleeps on
+    /// `std::thread::sleep` for up to 15s
+    /// (`acquire_store_lock_nofollow_with_timeout`). Run inline in an
+    /// `async fn` body, that parks a tokio WORKER. One worker per core means
+    /// a few concurrent requests park the entire runtime, after which
+    /// nothing is polled: not the MCP transport, not the accept loop, and
+    /// not `/healthz`, whose handler holds no lock and is ready on its first
+    /// poll.
+    ///
+    /// This runs on a deliberately single-worker runtime so that a
+    /// regression (moving the wait back onto the worker) cannot pass: with
+    /// one worker parked there is no second worker to rescue the spawned
+    /// task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_http_keeps_a_parked_operation_off_the_only_worker() {
+        let parked = tokio::spawn(blocking_http(move || {
+            // Stand-in for the lock waiter's spin-sleep.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Ok::<_, HttpError>(())
+        }));
+
+        // A trivial spawned task needs the worker to poll it. If the parked
+        // operation were sitting on that worker, this could not finish until
+        // the sleep above did.
+        let polled = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tokio::spawn(async { 7_u8 }),
+        )
+        .await
+        .expect("the runtime must keep polling ready tasks while the operation is parked")
+        .expect("the probe task must not panic");
+        assert_eq!(polled, 7);
+
+        parked
+            .await
+            .expect("the parked task must not panic")
+            .expect("the parked operation must succeed");
+    }
+
+    /// `blocking` maps its error through `HttpError::from_store`, which would
+    /// flatten an already-shaped status. The provisional currency checks
+    /// answer 409 `knowledge_source_accepted_generation_stale`, and clients
+    /// branch on exactly that, so the relocation must not disturb it.
+    #[tokio::test]
+    async fn blocking_http_preserves_the_operation_status_and_code() {
+        let error = blocking_http(move || {
+            Err::<(), _>(HttpError::new(
+                StatusCode::CONFLICT,
+                "knowledge_source_accepted_generation_stale",
+                "workspace scope no longer matches accepted publication",
+            ))
+        })
+        .await
+        .expect_err("the operation error must surface");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(
+            error.body.code,
+            "knowledge_source_accepted_generation_stale"
+        );
     }
 }

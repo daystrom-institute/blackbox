@@ -111,20 +111,24 @@ impl CompactionPolicy {
         }
     }
 
-    /// Resolve `(context_window, compact_at)` for a model, each field walking
-    /// the exact → longest-glob → default chain independently.
-    fn resolve(&self, model: &str) -> (u64, f64) {
-        let exact = self.entries.get(model);
-        // Longest matching glob prefix wins (e.g. "deepseek-r*" beats "deepseek-*").
-        let glob = self
-            .entries
+    /// The entry whose glob key matches `model`, longest prefix winning
+    /// (e.g. `deepseek-r*` beats `deepseek-*`).
+    fn glob_entry(&self, model: &str) -> Option<&Entry> {
+        self.entries
             .iter()
             .filter(|(k, _)| {
                 k.strip_suffix('*')
                     .is_some_and(|prefix| model.starts_with(prefix))
             })
             .max_by_key(|(k, _)| k.len())
-            .map(|(_, v)| v);
+            .map(|(_, v)| v)
+    }
+
+    /// Resolve `(context_window, compact_at)` for a model, each field walking
+    /// the exact → longest-glob → default chain independently.
+    fn resolve(&self, model: &str) -> (u64, f64) {
+        let exact = self.entries.get(model);
+        let glob = self.glob_entry(model);
         let default = self.entries.get("default");
 
         let field = |f: &dyn Fn(&Entry) -> Option<f64>| -> Option<f64> {
@@ -150,6 +154,29 @@ impl CompactionPolicy {
             return None;
         }
         Some((window as f64 * ratio) as u64)
+    }
+
+    /// The model's context window, when the table actually KNOWS it.
+    ///
+    /// Deliberately narrower than the window [`Self::resolve`] hands to
+    /// compaction: this walks exact → longest-glob only, never the generic
+    /// `default` entry. Compaction has to pick some number for an
+    /// unrecognized model and the default is the right choice there, but
+    /// context-pressure telemetry must not publish a guessed denominator: a
+    /// 200K default applied to a 1M-class model reports 90% utilization on a
+    /// session occupying 18% of its window, and an orchestrator acting on
+    /// that rotates healthy sessions for no reason.
+    ///
+    /// Independent of `enabled`, because the window is a property of the
+    /// model, not of the compaction feature: a session with compaction
+    /// switched off still reports honest pressure. `None` when the model is
+    /// unknown to the table or its entry zeroes the window.
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.entries
+            .get(model)
+            .and_then(|e| e.context_window)
+            .or_else(|| self.glob_entry(model).and_then(|e| e.context_window))
+            .filter(|w| *w > 0)
     }
 
     /// Bundle the per-pass tuning knobs for `Transport::compact`.
@@ -357,5 +384,98 @@ mod tests {
         // Regression guard: the inline summary budget must not regress to the
         // old hardcoded 2048 that squeezed long threads.
         const { assert!(DEFAULT_SUMMARY_MAX_TOKENS > 2048) };
+    }
+
+    // ---------------------------------------------------------------------
+    // context_window: the telemetry denominator (thread-682cd0ea item 2)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn context_window_resolves_from_an_exact_entry() {
+        let p = policy(&[
+            ("default", Some(200_000), Some(0.75)),
+            ("deepseek-reasoner", Some(128_000), None),
+        ]);
+        assert_eq!(p.context_window("deepseek-reasoner"), Some(128_000));
+    }
+
+    #[test]
+    fn context_window_resolves_from_the_longest_matching_glob() {
+        let p = policy(&[
+            ("default", Some(200_000), Some(0.75)),
+            ("deepseek-*", Some(128_000), None),
+            ("deepseek-v4*", Some(1_000_000), None),
+        ]);
+        assert_eq!(p.context_window("deepseek-v4-plus"), Some(1_000_000));
+        assert_eq!(p.context_window("deepseek-chat"), Some(128_000));
+    }
+
+    #[test]
+    fn context_window_is_none_for_a_model_the_table_does_not_know() {
+        // The `default` entry exists and compaction WILL use it, but telemetry
+        // must not present it as this model's window: publishing 200_000 for
+        // an unrecognized 1M-class model manufactures a false ceiling alarm.
+        let p = policy(&[
+            ("default", Some(200_000), Some(0.75)),
+            ("glm-*", Some(200_000), None),
+        ]);
+        assert_eq!(p.resolve("some-unlisted-model").0, 200_000);
+        assert_eq!(
+            p.context_window("some-unlisted-model"),
+            None,
+            "an unknown model must report no window, not the default"
+        );
+    }
+
+    #[test]
+    fn context_window_treats_a_zeroed_entry_as_unknown() {
+        let p = policy(&[
+            ("default", Some(200_000), Some(0.75)),
+            ("mute-*", Some(0), None),
+        ]);
+        assert_eq!(p.context_window("mute-1"), None);
+    }
+
+    #[test]
+    fn context_window_is_reported_even_when_compaction_is_disabled() {
+        // The window is a property of the model, not of the compaction
+        // feature. A session running with BRO_HARNESS_COMPACTION=0 still needs
+        // honest pressure telemetry — arguably more, since nothing will save
+        // it from the ceiling automatically.
+        let mut p = policy(&[
+            ("default", Some(200_000), Some(0.75)),
+            ("glm-*", Some(200_000), None),
+        ]);
+        p.enabled = false;
+        assert_eq!(p.threshold("glm-4.6"), None);
+        assert_eq!(p.context_window("glm-4.6"), Some(200_000));
+    }
+
+    #[test]
+    fn shipped_table_knows_every_dispatch_model_family() {
+        // Each family in the shipped table must yield a window, otherwise the
+        // telemetry silently degrades to "unknown" for a lane we actually
+        // dispatch to.
+        let p = CompactionPolicy {
+            entries: default_entries(),
+            keep_tail: DEFAULT_KEEP_TAIL,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            tool_render_cap: DEFAULT_TOOL_RENDER_CAP,
+            enabled: true,
+        };
+        for (model, expected) in [
+            ("glm-4.6", 200_000),
+            ("deepseek-chat", 128_000),
+            ("deepseek-v4-plus", 1_000_000),
+            ("MiniMax-M2", 1_000_000),
+            ("kimi-k2-turbo", 256_000),
+            ("gpt-5-codex", 400_000),
+        ] {
+            assert_eq!(
+                p.context_window(model),
+                Some(expected),
+                "{model} must resolve a known context window"
+            );
+        }
     }
 }

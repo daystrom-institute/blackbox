@@ -216,6 +216,15 @@ impl BlackboxServer {
                 if s.interrupted {
                     entry["interrupted"] = Value::Bool(true);
                 }
+                // Same block bro_status returns. The dashboard is the surface
+                // an orchestrator scans across a whole fleet, so it is where a
+                // session approaching its context ceiling most needs to be
+                // visible before it hard-fails.
+                if let Some(pressure) = s.context
+                    && let Ok(value) = serde_json::to_value(pressure)
+                {
+                    entry["context"] = value;
+                }
                 // Sort key: legacy used `started_at`. Fall back to
                 // `last_event_at` when `started_at` is somehow
                 // missing (older summaries before the wave-7c DTO
@@ -1524,6 +1533,7 @@ mod tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             }
         }
 
@@ -1556,6 +1566,7 @@ mod tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             }
         }
 
@@ -1751,6 +1762,57 @@ mod tests {
             assert_eq!(tasks[0]["status"], "cancelled");
             assert_eq!(tasks[0]["interrupted"], true);
             assert_eq!(tasks[0]["hasResult"], true);
+        }
+
+        #[test]
+        fn dashboard_row_carries_context_pressure_when_present() {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            let t = 1_700_000_000_000_u64;
+
+            let mut pressured = live_summary("pressured", Provider::Glm, t);
+            pressured.context = Some(bro_protocol::ContextPressure::derive(
+                190_000,
+                Some(200_000),
+                0.8,
+            ));
+            server
+                .state
+                .roster_view
+                .upsert("pressured".to_string(), pressured);
+            // A second row with no measurement must stay silent rather than
+            // report a zero that reads as an empty window.
+            server.state.roster_view.upsert(
+                "quiet".to_string(),
+                live_summary("quiet", Provider::Glm, t - 1000),
+            );
+
+            let dash = server.bro_dashboard(Parameters(DashboardParams {
+                limit: Some(20),
+                provider: None,
+                status: None,
+                team: None,
+            }));
+            assert_ne!(dash.is_error, Some(true));
+            let body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+            let by_id: std::collections::HashMap<_, _> = body["tasks"]
+                .as_array()
+                .expect("tasks must be array")
+                .iter()
+                .map(|t| (t["taskId"].as_str().unwrap().to_string(), t.clone()))
+                .collect();
+
+            let row = by_id.get("pressured").expect("pressured row present");
+            assert_eq!(row["context"]["last_turn_input_tokens"], 190_000);
+            assert_eq!(row["context"]["context_window"], 200_000);
+            assert_eq!(row["context"]["utilization"], 0.95);
+            assert_eq!(row["context"]["approaching_ceiling"], true);
+
+            let quiet = by_id.get("quiet").expect("quiet row present");
+            assert!(
+                quiet.get("context").is_none(),
+                "a row with no measurement must omit the block entirely: {quiet}"
+            );
         }
 
         #[test]

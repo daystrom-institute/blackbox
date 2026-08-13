@@ -687,6 +687,14 @@ pub struct TaskInner {
     pub usage: Option<Usage>,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
+    /// Cache-inclusive input tokens of the session's most recent model turn:
+    /// how much of the context window the last prompt occupied. Distinct from
+    /// [`Self::usage`], which accumulates session totals and therefore measures
+    /// work done rather than window occupancy.
+    pub last_turn_input_tokens: Option<u64>,
+    /// The model's context window, as reported by the producer that owns the
+    /// model-keyed table. `None` for a model that table does not recognize.
+    pub context_window: Option<u64>,
     pub stderr: String,
     pub status: TaskStatus,
     pub started_at: u64,
@@ -1079,6 +1087,8 @@ mod roster_view_tests {
                 usage: None,
                 cost_usd: Some(0.42),
                 num_turns: Some(7),
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status,
                 started_at: 1_700_000_000_000,
@@ -1141,6 +1151,7 @@ mod roster_view_tests {
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
+            context: None,
         };
         view.upsert("t1".into(), summary.clone());
         let snap = view.snapshot();
@@ -1176,6 +1187,7 @@ mod roster_view_tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             },
         );
         assert_eq!(view.snapshot().len(), 1);
@@ -1299,6 +1311,7 @@ mod roster_view_tests {
                 interrupted: false,
                 error_teaser: None,
                 transcript_path: None,
+                context: None,
             },
         );
         let mut store = TaskStore::new();
@@ -1425,6 +1438,9 @@ pub fn roster_summary_from_task(task: &Task) -> bro_protocol::RosterSummaryV1 {
             .as_ref()
             .filter(|_| !inner.session_id.is_empty() && inner.session_id != "pending")
             .map(|location| location.path.to_string_lossy().into_owned()),
+        // Same signal bro_status carries, projected onto the roster plane so
+        // the dashboard can render it without re-locking per-task state.
+        context: context_pressure_for_inner(&inner),
     }
 }
 
@@ -1567,6 +1583,8 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
             usage: None,
             cost_usd: None,
             num_turns: Some(3),
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: String::new(),
             status,
             started_at: now_ms(),
@@ -1719,6 +1737,13 @@ struct PersistedTask {
     usage: Option<Usage>,
     cost_usd: Option<f64>,
     num_turns: Option<u64>,
+    /// See [`TaskInner::last_turn_input_tokens`]. Defaulted on read so tasks
+    /// persisted before context telemetry existed still load.
+    #[serde(default)]
+    last_turn_input_tokens: Option<u64>,
+    /// See [`TaskInner::context_window`].
+    #[serde(default)]
+    context_window: Option<u64>,
     stderr: String,
     status: TaskStatus,
     started_at: u64,
@@ -1828,6 +1853,8 @@ impl TaskStore {
                     usage: inner.usage.clone(),
                     cost_usd: inner.cost_usd,
                     num_turns: inner.num_turns,
+                    last_turn_input_tokens: inner.last_turn_input_tokens,
+                    context_window: inner.context_window,
                     stderr: inner.stderr.chars().take(2000).collect(),
                     status: inner.status,
                     started_at: inner.started_at,
@@ -1920,6 +1947,8 @@ impl TaskStore {
                     usage: rec.usage,
                     cost_usd: rec.cost_usd,
                     num_turns: rec.num_turns,
+                    last_turn_input_tokens: rec.last_turn_input_tokens,
+                    context_window: rec.context_window,
                     stderr: rec.stderr,
                     status: rec.status,
                     started_at: rec.started_at,
@@ -2657,6 +2686,8 @@ fn failed_duplicate_task(
             usage: None,
             cost_usd: None,
             num_turns: None,
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: message,
             status: TaskStatus::Failed,
             started_at: now_ms(),
@@ -2736,6 +2767,8 @@ pub fn spawn_in_process_task(
             usage: None,
             cost_usd: None,
             num_turns: None,
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: String::new(),
             status: TaskStatus::Running,
             started_at: now_ms(),
@@ -3488,6 +3521,8 @@ async fn spawn_harness_child_task(
             usage: None,
             cost_usd: None,
             num_turns: None,
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: String::new(),
             status: TaskStatus::Running,
             started_at: now_ms(),
@@ -4241,6 +4276,11 @@ fn ingest_harness_event(
                     None
                 },
                 interrupted: false,
+                // Seeded from prior state so a partial update (an event that
+                // carries no pressure block) merges rather than clears, the
+                // same contract the usage/cost/turns fields above follow.
+                last_turn_input_tokens: inner.last_turn_input_tokens,
+                context_window: inner.context_window,
             };
             provider.parse_event(&evt, &mut sink);
             apply_cwd_updates_from_event(&mut inner, &evt);
@@ -4670,6 +4710,12 @@ fn apply_sink_updates(inner: &mut TaskInner, sink: EventSink) {
     if sink.num_turns.is_some() {
         inner.num_turns = sink.num_turns;
     }
+    if sink.last_turn_input_tokens.is_some() {
+        inner.last_turn_input_tokens = sink.last_turn_input_tokens;
+    }
+    if sink.context_window.is_some() {
+        inner.context_window = sink.context_window;
+    }
     if sink.interrupted {
         inner.interrupted = true;
     } else if inner.status == TaskStatus::Running {
@@ -4794,6 +4840,22 @@ pub fn task_result_json(task: &Task) -> Value {
     task_result_json_from_inner(&inner)
 }
 
+/// Derive the context-window pressure block for a task.
+///
+/// `None` until some turn has reported occupancy: a task with no measurement
+/// yet must report nothing rather than a zero that reads as "plenty of room".
+pub(crate) fn context_pressure_for_inner(
+    inner: &TaskInner,
+) -> Option<bro_protocol::ContextPressure> {
+    inner.last_turn_input_tokens.map(|tokens| {
+        bro_protocol::ContextPressure::derive(
+            tokens,
+            inner.context_window,
+            supervision::context_ceiling_ratio(),
+        )
+    })
+}
+
 fn task_result_json_from_inner(inner: &TaskInner) -> Value {
     let mut obj = serde_json::json!({
         "taskId": inner.id,
@@ -4861,6 +4923,16 @@ fn task_result_json_from_inner(inner: &TaskInner) -> Value {
                 "transcriptLocated": inner.transcript_location.is_some(),
             });
         }
+    }
+    // Context-window pressure is deliberately NOT behind the terminal-status
+    // gate the usage/cost/turns block sits behind. A finished task's window
+    // occupancy is a curiosity; a RUNNING task's is the entire point, because
+    // it is the only state in which an orchestrator can still act on it by
+    // rotating to a fresh session.
+    if let Some(pressure) = context_pressure_for_inner(inner)
+        && let Ok(value) = serde_json::to_value(pressure)
+    {
+        obj["context"] = value;
     }
     if let Some(ref label) = inner.bro_label {
         obj["broLabel"] = Value::String(label.clone());
@@ -6736,6 +6808,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: stderr.into(),
                 status,
                 started_at: now_ms(),
@@ -7168,6 +7242,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -7206,6 +7282,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -7261,6 +7339,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -7315,6 +7395,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -7549,6 +7631,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -8393,6 +8477,8 @@ mod tests {
                 }),
                 cost_usd: Some(0.05),
                 num_turns: Some(3),
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Completed,
                 started_at: 1000,
@@ -8448,6 +8534,136 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Context-ceiling telemetry in the status projection
+    // -----------------------------------------------------------------
+
+    /// A task carrying a measured turn occupancy and, optionally, a window.
+    fn task_with_context(
+        status: TaskStatus,
+        last_turn_input_tokens: Option<u64>,
+        context_window: Option<u64>,
+    ) -> Task {
+        let task = task_with(status, "", vec![]);
+        {
+            let mut inner = task.inner.lock();
+            inner.last_turn_input_tokens = last_turn_input_tokens;
+            inner.context_window = context_window;
+        }
+        task
+    }
+
+    #[test]
+    fn context_block_is_absent_without_a_measurement() {
+        let task = task_with_context(TaskStatus::Running, None, Some(200_000));
+        let json = task_result_json(&task);
+        assert!(
+            json.get("context").is_none(),
+            "a task with no reported turn must report no pressure, not a zero \
+             that reads as plenty of room: {json}"
+        );
+    }
+
+    #[test]
+    fn context_block_is_reported_while_the_task_is_still_running() {
+        // The whole point of the signal: usage/costUsd/numTurns are gated to
+        // terminal status, but a RUNNING task is the only one an orchestrator
+        // can still rescue by rotating the session.
+        let task = task_with_context(TaskStatus::Running, Some(50_000), Some(200_000));
+        task.inner.lock().usage = Some(Usage {
+            input_tokens: 1_000,
+            output_tokens: 20,
+            ..Default::default()
+        });
+        let json = task_result_json(&task);
+        let context = &json["context"];
+        assert!(
+            context.is_object(),
+            "running task must carry context pressure: {json}"
+        );
+        assert_eq!(context["last_turn_input_tokens"], 50_000);
+        assert_eq!(context["context_window"], 200_000);
+        assert_eq!(context["utilization"], 0.25);
+        assert_eq!(context["approaching_ceiling"], false);
+        assert!(
+            json.get("usage").is_none(),
+            "the terminal-only usage gate must stay closed for a running task, \
+             which is exactly why context needs its own ungated path: {json}"
+        );
+    }
+
+    #[test]
+    fn context_block_omits_utilization_when_the_window_is_unknown() {
+        let task = task_with_context(TaskStatus::Running, Some(180_000), None);
+        let json = task_result_json(&task);
+        let context = &json["context"];
+        assert_eq!(context["last_turn_input_tokens"], 180_000);
+        assert!(
+            context["context_window"].is_null(),
+            "an unknown window must surface as null, never as a guess: {json}"
+        );
+        assert!(
+            context["utilization"].is_null(),
+            "utilization must be absent without a denominator: {json}"
+        );
+        assert_eq!(
+            context["approaching_ceiling"], false,
+            "an unmeasurable session must never be flagged"
+        );
+    }
+
+    #[test]
+    fn context_block_flags_a_session_at_its_ceiling() {
+        // Occupancy equal to the window flags under any admissible ratio, so
+        // this assertion holds whatever threshold the host is configured with.
+        let task = task_with_context(TaskStatus::Running, Some(200_000), Some(200_000));
+        let json = task_result_json(&task);
+        assert_eq!(json["context"]["utilization"], 1.0);
+        assert_eq!(json["context"]["approaching_ceiling"], true);
+        assert_eq!(
+            json["context"]["ceiling_ratio"],
+            serde_json::json!(supervision::context_ceiling_ratio()),
+            "the block must publish the threshold it was judged against"
+        );
+    }
+
+    #[test]
+    fn context_block_survives_into_terminal_status() {
+        let task = task_with_context(TaskStatus::Completed, Some(160_000), Some(200_000));
+        let json = task_result_json(&task);
+        assert_eq!(json["context"]["last_turn_input_tokens"], 160_000);
+    }
+
+    #[test]
+    fn roster_summary_carries_the_same_context_block() {
+        // bro_dashboard renders from the roster projection, not from
+        // task_result_json, so the two must agree or a fleet-wide scan
+        // silently loses the signal that a per-task check would show.
+        let task = Arc::new(task_with_context(
+            TaskStatus::Running,
+            Some(160_000),
+            Some(200_000),
+        ));
+        let summary = roster_summary_from_task(&task);
+        let pressure = summary.context.expect("roster summary must carry context");
+        assert_eq!(pressure.last_turn_input_tokens, 160_000);
+        assert_eq!(pressure.context_window, Some(200_000));
+        assert_eq!(pressure.utilization, Some(0.8));
+
+        let status = task_result_json(&task);
+        assert_eq!(
+            serde_json::to_value(pressure).unwrap(),
+            status["context"],
+            "roster and status projections must publish identical blocks"
+        );
+    }
+
+    #[test]
+    fn roster_summary_context_absent_without_a_measurement() {
+        let task = Arc::new(task_with_context(TaskStatus::Running, None, None));
+        assert!(roster_summary_from_task(&task).context.is_none());
+    }
+
     #[test]
     fn task_status_json_omits_redundant_snapshot() {
         // Plain completed task: Unknown origin, no worktree, not workflow-owned,
@@ -8493,6 +8709,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: "something went wrong".into(),
                 status: TaskStatus::Failed,
                 started_at: 1000,
@@ -8549,6 +8767,8 @@ mod tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Completed,
                 started_at: 1000,
@@ -8605,6 +8825,8 @@ mod tests {
             }),
             cost_usd: Some(0.01),
             num_turns: Some(1),
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: String::new(),
             status: TaskStatus::Running,
             started_at: 1000,
@@ -8663,6 +8885,8 @@ mod tests {
             usage: None,
             cost_usd: None,
             num_turns: None,
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: String::new(),
             status: TaskStatus::Running,
             started_at: 1000,
@@ -8698,6 +8922,7 @@ mod tests {
             num_turns: Some(2),
             session_id: Some("s1".into()),
             interrupted: false,
+            ..Default::default()
         };
 
         apply_sink_updates(&mut inner, sink);
@@ -8734,6 +8959,8 @@ mod tests {
             usage: None,
             cost_usd: None,
             num_turns: None,
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: String::new(),
             status: TaskStatus::Running,
             started_at: 1000,
@@ -8792,6 +9019,8 @@ mod tests {
             usage: None,
             cost_usd: None,
             num_turns: None,
+            last_turn_input_tokens: None,
+            context_window: None,
             stderr: String::new(),
             status: TaskStatus::Running,
             started_at: 1000,
@@ -8898,6 +9127,8 @@ mod async_tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Completed,
                 started_at: now_ms(),
@@ -8942,6 +9173,8 @@ mod async_tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -8992,6 +9225,8 @@ mod async_tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Completed,
                 started_at: now_ms(),
@@ -9038,6 +9273,8 @@ mod async_tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -9096,6 +9333,8 @@ mod async_tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),
@@ -9147,6 +9386,8 @@ mod async_tests {
                 usage: None,
                 cost_usd: None,
                 num_turns: None,
+                last_turn_input_tokens: None,
+                context_window: None,
                 stderr: String::new(),
                 status: TaskStatus::Running,
                 started_at: now_ms(),

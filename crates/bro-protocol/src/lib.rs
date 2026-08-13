@@ -187,6 +187,90 @@ pub struct RosterSummaryV1 {
     /// task; readers treat absence as an empty transcript. Additive+optional.
     #[serde(default)]
     pub transcript_path: Option<String>,
+    /// Context-window pressure for the session backing this task. Additive and
+    /// optional: absent until the harness has reported at least one turn's
+    /// input-token count. See [`ContextPressure`].
+    #[serde(default)]
+    pub context: Option<ContextPressure>,
+}
+
+/// Per-session context-window pressure.
+///
+/// A long-lived session dies when the prompt it sends crosses the model's
+/// context window, and that failure is terminal rather than degraded: the
+/// provider rejects the request outright ("context window exceeded ... compact
+/// the conversation and retry"). Orchestrators need to see the wall coming
+/// while the session still answers, so they can rotate to a fresh one.
+///
+/// The measure of occupancy is the input-token count of the MOST RECENT turn,
+/// cache-inclusive: that is literally how many tokens the model had to hold to
+/// answer. Cumulative session totals (the `usage` block, the supervision token
+/// counters) measure work done, not window occupancy. A multi-phase arc can
+/// burn tens of millions of cumulative input tokens and never approach the
+/// ceiling, as long as each individual prompt stays small.
+///
+/// `context_window` is nullable on purpose. The harness resolves it from its
+/// model-keyed table and publishes only a window it actually knows for that
+/// model or model family; an unrecognized model yields `None`, and then
+/// `utilization` is `None` and `approaching_ceiling` is `false`. Absent beats
+/// guessed: a stale 200K denominator applied to a 1M-class model would raise a
+/// false ceiling alarm on every long session.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ContextPressure {
+    /// Cache-inclusive input tokens of the most recent model turn.
+    pub last_turn_input_tokens: u64,
+    /// The model's context window in tokens, when known.
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    /// `last_turn_input_tokens / context_window`, rounded to four decimal
+    /// places. `None` whenever the window is unknown.
+    #[serde(default)]
+    pub utilization: Option<f64>,
+    /// True once `utilization` reaches `ceiling_ratio`. Always false when the
+    /// window is unknown, because there is no fraction to compare.
+    #[serde(default)]
+    pub approaching_ceiling: bool,
+    /// The utilization fraction that flips `approaching_ceiling`.
+    pub ceiling_ratio: f64,
+}
+
+impl ContextPressure {
+    /// Fraction of the window at which a session is called "approaching the
+    /// ceiling". Deliberately below the harness compaction trigger: the point
+    /// is to give an orchestrator room to rotate, not to describe an
+    /// already-lost session.
+    pub const DEFAULT_CEILING_RATIO: f64 = 0.8;
+
+    /// Derive the pressure signal from a turn's input-token count and the
+    /// model's window.
+    ///
+    /// A zero window is treated as unknown (a policy entry can zero out a
+    /// window to disable the signal). A non-finite or non-positive
+    /// `ceiling_ratio` falls back to [`Self::DEFAULT_CEILING_RATIO`] rather
+    /// than producing a nonsense comparison.
+    pub fn derive(
+        last_turn_input_tokens: u64,
+        context_window: Option<u64>,
+        ceiling_ratio: f64,
+    ) -> Self {
+        let ceiling_ratio = if ceiling_ratio.is_finite() && ceiling_ratio > 0.0 {
+            ceiling_ratio
+        } else {
+            Self::DEFAULT_CEILING_RATIO
+        };
+        let context_window = context_window.filter(|w| *w > 0);
+        let utilization = context_window.map(|w| {
+            let raw = last_turn_input_tokens as f64 / w as f64;
+            (raw * 10_000.0).round() / 10_000.0
+        });
+        Self {
+            last_turn_input_tokens,
+            context_window,
+            utilization,
+            approaching_ceiling: utilization.is_some_and(|u| u >= ceiling_ratio),
+            ceiling_ratio,
+        }
+    }
 }
 
 /// Structured form of a `bro_report` payload, projected into the
@@ -304,6 +388,7 @@ mod tests {
             interrupted: false,
             error_teaser: None,
             transcript_path: None,
+            context: None,
         };
         let value = serde_json::to_value(&summary).unwrap();
         let obj = value.as_object().expect("summary must serialize as object");
@@ -440,5 +525,123 @@ mod tests {
         let round: RosterSnapshotV1 = serde_json::from_value(value).unwrap();
         assert_eq!(round.daemon_version.as_deref(), Some("0.0.1"));
         assert_eq!(round.daemon_build_id.as_deref(), Some("1700000000"));
+    }
+
+    // ---------------------------------------------------------------------
+    // ContextPressure
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn context_pressure_unknown_window_leaves_utilization_absent() {
+        let p = ContextPressure::derive(180_000, None, ContextPressure::DEFAULT_CEILING_RATIO);
+        assert_eq!(p.last_turn_input_tokens, 180_000);
+        assert_eq!(p.context_window, None);
+        assert_eq!(
+            p.utilization, None,
+            "an unknown window must not produce a guessed utilization"
+        );
+        assert!(
+            !p.approaching_ceiling,
+            "an unknown window must never flag the ceiling"
+        );
+    }
+
+    #[test]
+    fn context_pressure_zero_window_is_treated_as_unknown() {
+        let p = ContextPressure::derive(180_000, Some(0), ContextPressure::DEFAULT_CEILING_RATIO);
+        assert_eq!(p.context_window, None);
+        assert_eq!(p.utilization, None);
+        assert!(!p.approaching_ceiling);
+    }
+
+    #[test]
+    fn context_pressure_computes_utilization_from_known_window() {
+        let p = ContextPressure::derive(50_000, Some(200_000), 0.8);
+        assert_eq!(p.context_window, Some(200_000));
+        assert_eq!(p.utilization, Some(0.25));
+        assert!(!p.approaching_ceiling);
+    }
+
+    #[test]
+    fn context_pressure_flags_at_and_above_the_threshold() {
+        let at = ContextPressure::derive(160_000, Some(200_000), 0.8);
+        assert_eq!(at.utilization, Some(0.8));
+        assert!(
+            at.approaching_ceiling,
+            "utilization exactly at the ratio must flag"
+        );
+
+        let above = ContextPressure::derive(190_000, Some(200_000), 0.8);
+        assert_eq!(above.utilization, Some(0.95));
+        assert!(above.approaching_ceiling);
+    }
+
+    #[test]
+    fn context_pressure_does_not_flag_just_below_the_threshold() {
+        let p = ContextPressure::derive(159_000, Some(200_000), 0.8);
+        assert_eq!(p.utilization, Some(0.795));
+        assert!(!p.approaching_ceiling);
+    }
+
+    #[test]
+    fn context_pressure_honors_a_custom_threshold() {
+        // Same occupancy, two policies: a stricter operator threshold flags
+        // where the default would not.
+        let lenient = ContextPressure::derive(120_000, Some(200_000), 0.8);
+        assert!(!lenient.approaching_ceiling);
+        let strict = ContextPressure::derive(120_000, Some(200_000), 0.5);
+        assert!(strict.approaching_ceiling);
+        assert_eq!(strict.ceiling_ratio, 0.5);
+    }
+
+    #[test]
+    fn context_pressure_rejects_nonsense_threshold() {
+        for bad in [f64::NAN, 0.0, -1.0, f64::INFINITY] {
+            let p = ContextPressure::derive(160_000, Some(200_000), bad);
+            assert_eq!(
+                p.ceiling_ratio,
+                ContextPressure::DEFAULT_CEILING_RATIO,
+                "a non-finite or non-positive ratio must fall back to the default"
+            );
+            assert!(p.approaching_ceiling);
+        }
+    }
+
+    #[test]
+    fn context_pressure_round_trips_through_json() {
+        let p = ContextPressure::derive(160_000, Some(200_000), 0.8);
+        let value = serde_json::to_value(p).unwrap();
+        let obj = value.as_object().unwrap();
+        for key in [
+            "last_turn_input_tokens",
+            "context_window",
+            "utilization",
+            "approaching_ceiling",
+            "ceiling_ratio",
+        ] {
+            assert!(obj.contains_key(key), "ContextPressure must carry `{key}`");
+        }
+        let round: ContextPressure = serde_json::from_value(value).unwrap();
+        assert_eq!(round, p);
+    }
+
+    #[test]
+    fn roster_summary_context_defaults_to_absent_on_older_payloads() {
+        // A summary serialized before the field existed must still decode.
+        let value = serde_json::json!({
+            "task_id": "task-1",
+            "status": "running",
+            "provider": "glm",
+            "cost": null,
+            "turns": null,
+            "cwd": null,
+            "label": null,
+            "session_id": null,
+            "last_message_snippet": null,
+            "model": null,
+            "last_event_at": null,
+        });
+        let summary: RosterSummaryV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(summary.context, None);
     }
 }

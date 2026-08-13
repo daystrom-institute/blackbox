@@ -652,6 +652,12 @@ struct Session {
     max_turns: u64,
     compaction: crate::compaction::CompactionPolicy,
     compact_threshold: Option<u64>,
+    /// The active model's context window, when the compaction table knows it.
+    /// Published on the per-step `context_pressure` event so consumers get the
+    /// utilization denominator from the table's owner instead of duplicating
+    /// it. `None` for a model the table does not recognize; consumers then
+    /// report occupancy with no utilization rather than guessing.
+    context_window: Option<u64>,
     /// Tool-result spill threshold in bytes (0 ⇒ disabled) and the dump dir.
     tool_result_cap: usize,
     dump_dir: std::path::PathBuf,
@@ -1020,6 +1026,7 @@ impl Session {
         );
         let compaction = crate::compaction::CompactionPolicy::from_env();
         let compact_threshold = compaction.threshold(&base_opts.model);
+        let context_window = compaction.context_window(&base_opts.model);
         let tool_result_cap = crate::bound::cap_bytes();
         let dump_dir = crate::bound::dump_dir();
 
@@ -1057,6 +1064,7 @@ impl Session {
             max_turns,
             compaction,
             compact_threshold,
+            context_window,
             tool_result_cap,
             dump_dir,
             strategy,
@@ -1106,6 +1114,9 @@ impl Session {
         {
             self.base_opts.model = m.to_string();
             self.compact_threshold = self.compaction.threshold(m);
+            // The window is a property of the model, so a mid-session model
+            // swap moves the telemetry denominator too.
+            self.context_window = self.compaction.context_window(m);
             tracing::info!(model = m, "set_model");
         }
         // set_max_thinking_tokens / others are accepted (acked) but not yet
@@ -1341,6 +1352,15 @@ impl Session {
             self.turns += 1;
             self.total_usage.add(&out.usage);
             self.last_prompt_tokens = out.usage.total_input_tokens();
+            // Publish window occupancy every step. The terminal `result` event
+            // reports it too late to be actionable: an orchestrator needs to
+            // rotate the session BEFORE the provider rejects a prompt for
+            // exceeding the window, and by `result` the session is over.
+            self.emitter.context_pressure(
+                self.last_prompt_tokens,
+                self.context_window,
+                self.compact_threshold,
+            );
             // The just-sent input is now reflected in last_prompt_tokens; clear
             // the appended-tail estimate so it only counts items added afterward.
             self.pending_input_estimate = 0;
@@ -2810,6 +2830,7 @@ mod tests {
             max_turns: 50,
             compaction: crate::compaction::CompactionPolicy::from_env(),
             compact_threshold: None,
+            context_window: None,
             tool_result_cap: 0,
             dump_dir: std::env::temp_dir(),
             store: SessionStore::open(Some(&id), None).unwrap(),

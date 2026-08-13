@@ -22,6 +22,7 @@ all of that work.
 ## Documents
 
 - [Concurrency model: planes, invariants, and the path off the bolt-on era](concurrency-model.md)
+- [Health-probe starvation during code-source ingest](healthz-ingest-starvation.md)
 - [Locality-first decomposition: the checkout plane and the corpus plane](locality-first-decomposition.md)
 - [Checkout-plane provenance export implementation plan](checkout-provenance-export-impl.md)
 - [Distributed code-source collector implementation plan](distributed-code-source-collector-impl.md)
