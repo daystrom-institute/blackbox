@@ -115,3 +115,40 @@ The [Code Source Collector](code-source-collector.md) can publish current files
 from the machine that owns a checkout while the corpus daemon remains the only
 index and graph authority. This overlap mode still requires one matching local
 project registration on the corpus host for project identity and Git history.
+
+## Publishing Project Graphs
+
+A registered project's `.bbox/graphs/<graph_id>/` tree only becomes a
+queryable graph after an explicit acceptance step. The collector uploading a
+Ready candidate does not, by itself, advance what `bbox_project_graph_list`
+and `bbox_project_graph_describe` serve under published visibility:
+
+```text
+bbox_project_publisher_status(project_id="p_...")
+bbox_project_publisher_advance(
+  project_id="p_...",
+  source_generation_id="...",
+  mode="establish",
+  expected_generation_id="...",
+  expected_pointer_sha256="...",
+  expected_catalog_epoch=7,
+  audit_reason="publish reviewed graph"
+)
+```
+
+`bbox_project_publisher_status` is read-only and reports the compare-and-swap
+tokens (`generation_id`, `pointer_sha256`) that `bbox_project_publisher_advance`
+requires as `expected_generation_id`/`expected_pointer_sha256`, alongside
+`expected_catalog_epoch` from the project catalog. Until the advance call
+succeeds, published-visibility graph reads keep serving the prior accepted
+generation (or nothing, on a first publish) even though the candidate is
+sitting Ready. `examples/graph-live-exercise.sh` runs this exact sequence
+end to end (`step_publish` uploads the candidate, `step_accept` advances it).
+
+A successful advance triggers a full rebuild of the complete graph view.
+Graph queries, including `bbox_project_graph_list`, `bbox_project_graph_describe`,
+`bbox_inspect_entity`, and `bbox_find_paths`, can answer
+`error.edge_index_warming` for the few minutes the rebuild takes on a large
+index. That is the daemon holding queries to a complete old view or a
+complete new view rather than ever answering a half-built one; it is not a
+failure. Retry the call rather than treating it as one.
