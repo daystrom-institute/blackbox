@@ -954,6 +954,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-slack-collector"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bbox-conversation-source",
+ "bbox-corpus-core",
+ "chrono",
+ "clap",
+ "globset",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bbox-source-graph"
 version = "0.0.1"
 dependencies = [
