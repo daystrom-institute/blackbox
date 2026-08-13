@@ -690,3 +690,245 @@ impl IntoResponse for HttpError {
         (self.status, Json(self.body)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bbox_corpus_core::project_catalog::{
+        CatalogSnapshotV2, ConnectorKind, ConnectorSourceId, CorpusProject, ProjectId, ProjectScope,
+    };
+    use std::collections::BTreeSet;
+    use std::io::Write as _;
+    use std::path::Path as StdPath;
+
+    const SOURCE_A: &str = "csrc_5f2c1d9a4b6e470e";
+    const SOURCE_B: &str = "csrc_00000000deadbeef";
+
+    fn token_file(root: &StdPath, name: &str, value: &str) -> std::path::PathBuf {
+        let path = root.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(value.as_bytes()).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    fn grant(connector_source_id: &str) -> crate::config::ConnectorScopeGrant {
+        crate::config::ConnectorScopeGrant {
+            connector_source_id: ConnectorSourceId::parse(connector_source_id).unwrap(),
+            connector_kind: ConnectorKind::parse("fixture").unwrap(),
+            remote_authority: "tenant.example".to_string(),
+        }
+    }
+
+    fn scope(connector_source_id: &str) -> ConnectorScope {
+        ConnectorScope::try_new(connector_source_id, "fixture").unwrap()
+    }
+
+    /// A catalog holding a project for `connector_source_id`, so the grant
+    /// table resolves it instead of parking it in `pending_onboard`.
+    fn catalog_with(connector_source_id: &str) -> CatalogSnapshotV2 {
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let project_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+        catalog.projects.insert(
+            project_id.clone(),
+            CorpusProject {
+                project_id,
+                scope: ProjectScope::Connector(scope(connector_source_id)),
+                operator_aliases: BTreeSet::new(),
+                nominated_aliases: BTreeSet::new(),
+                display_name: "Ops shared folder".into(),
+                created_at: "2026-08-13T00:00:00Z".into(),
+                registered_at_compat: None,
+                repo_history: None,
+                languages: BTreeSet::new(),
+            },
+        );
+        catalog.sync_version();
+        catalog.validate().unwrap();
+        catalog
+    }
+
+    /// A grant table where `producer-a` holds SOURCE_A and `producer-b` holds
+    /// SOURCE_B, with only `cataloged` resolved to a catalog project.
+    fn table(root: &StdPath, cataloged: &str) -> ConnectorGrantRuntime {
+        let config = crate::config::SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![
+                crate::config::ConnectorProducerConfig {
+                    producer_id: "producer-a".into(),
+                    token_file: token_file(root, "token-a", &"a".repeat(64)),
+                    scopes: vec![grant(SOURCE_A)],
+                },
+                crate::config::ConnectorProducerConfig {
+                    producer_id: "producer-b".into(),
+                    token_file: token_file(root, "token-b", &"b".repeat(64)),
+                    scopes: vec![grant(SOURCE_B)],
+                },
+            ],
+        };
+        ConnectorGrantRuntime::build(&config, Some(&catalog_with(cataloged))).unwrap()
+    }
+
+    fn caller(producer_id: &str) -> ConnectorGrant {
+        ConnectorGrant {
+            producer_id: producer_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_publication_scope_is_authorized_only_for_the_producer_that_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let table = table(&root, SOURCE_A);
+
+        require_publication_scope(&table, &caller("producer-a"), &scope(SOURCE_A))
+            .expect("the granting producer publishes its own scope");
+
+        // The scope is real and cataloged; the CALLER is wrong. This is the
+        // check that stops one producer publishing into another's project.
+        let error = require_publication_scope(&table, &caller("producer-b"), &scope(SOURCE_A))
+            .expect_err("a scope granted to another producer is forbidden");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "scope_forbidden");
+
+        let error = require_publication_scope(&table, &caller("producer-a"), &scope(SOURCE_B))
+            .expect_err("a scope this producer was never granted is forbidden");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_pending_onboarding_scope_is_refused_by_every_publication_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // SOURCE_B is granted but absent from the catalog, so the grant table
+        // parks it in pending_onboard.
+        let table = table(&root, SOURCE_A);
+        assert!(table.is_pending_onboard(&scope(SOURCE_B)));
+
+        let error = require_publication_scope(&table, &caller("producer-b"), &scope(SOURCE_B))
+            .expect_err("a pending scope opens no publication lane");
+        // Distinct from scope_forbidden ON PURPOSE: "you never granted this"
+        // and "you granted it but never onboarded it" are different fixes,
+        // and collapsing them sends an operator to edit the wrong file.
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.code, "scope_pending_onboarding");
+
+        // The same scope IS eligible for onboarding, which is the whole point
+        // of the admission: the onboard route checks grant membership only.
+        assert!(
+            table.grants().iter().any(|expectation| {
+                expectation.producer_id == "producer-b" && expectation.scope == scope(SOURCE_B)
+            }),
+            "onboarding still sees the grant"
+        );
+        assert_eq!(
+            table.publication_project_ids().len(),
+            1,
+            "the cataloged scope opens a lane and the pending one contributes none"
+        );
+    }
+
+    #[test]
+    fn a_disabled_connector_family_authorizes_nothing() {
+        let table = ConnectorGrantRuntime::disabled();
+        assert!(!table.enabled());
+        let error = require_publication_scope(&table, &caller("producer-a"), &scope(SOURCE_A))
+            .expect_err("a disabled family holds no grants");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn missing_blob_paging_is_a_strict_scan_from_the_cursor() {
+        let hashes: Vec<String> = ["11", "22", "33", "44"]
+            .iter()
+            .map(|prefix| prefix.repeat(32))
+            .collect();
+        let page = page_of("gen-1".into(), hashes.clone(), None);
+        assert_eq!(page.generation_id, "gen-1");
+        assert_eq!(page.hashes, hashes);
+        assert_eq!(page.next_cursor, None, "a short page ends the scan");
+
+        // Strictly greater than the cursor: the cursor itself is the last
+        // hash the producer already received and must not repeat.
+        let page = page_of("gen-1".into(), hashes.clone(), Some(&hashes[1]));
+        assert_eq!(page.hashes, vec![hashes[2].clone(), hashes[3].clone()]);
+
+        // The set SHRINKS as blobs land. A numeric offset would skip entries
+        // here; a value cursor does not, which is the whole reason for it.
+        let remaining = vec![hashes[1].clone(), hashes[3].clone()];
+        let page = page_of("gen-1".into(), remaining, Some(&hashes[0]));
+        assert_eq!(page.hashes, vec![hashes[1].clone(), hashes[3].clone()]);
+    }
+
+    #[test]
+    fn a_full_missing_page_carries_a_cursor_and_a_short_one_does_not() {
+        let many: Vec<String> = (0..MISSING_BLOBS_PAGE + 5)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        let page = page_of("gen-1".into(), many.clone(), None);
+        assert_eq!(page.hashes.len(), MISSING_BLOBS_PAGE);
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some(many[MISSING_BLOBS_PAGE - 1].as_str()),
+            "the cursor is the last hash actually delivered"
+        );
+
+        let tail = page_of("gen-1".into(), many, page.next_cursor.as_deref());
+        assert_eq!(tail.hashes.len(), 5);
+        assert_eq!(tail.next_cursor, None);
+    }
+
+    #[test]
+    fn contract_violations_map_onto_the_three_actionable_buckets() {
+        let skew = HttpError::from_contract(FileSourceError::ConnectorPolicyMismatch {
+            received: "old".into(),
+            expected: bbox_file_source::CONNECTOR_POLICY_VERSION,
+        });
+        assert_eq!(skew.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(skew.body.code, "unsupported_contract");
+
+        let limit = HttpError::from_contract(FileSourceError::TooManyFiles {
+            actual: 10,
+            limit: 5,
+        });
+        assert_eq!(limit.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(limit.body.code, "limit_exceeded");
+
+        let shape = HttpError::from_contract(FileSourceError::ManifestDigestMismatch);
+        assert_eq!(shape.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(shape.body.code, "invalid_file_source_input");
+    }
+
+    #[test]
+    fn an_io_failure_is_unavailable_and_a_store_refusal_is_the_producers_fault() {
+        let io = HttpError::from_store(anyhow::Error::new(std::io::Error::other("disk gone")));
+        assert_eq!(io.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(io.body.code, "storage_unavailable");
+
+        let refusal =
+            HttpError::from_store(anyhow!("upload fsu-x exists with a different descriptor"));
+        assert_eq!(refusal.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refusal.body.code, "invalid_upload_state");
+
+        // An UNRECOGNIZED internal failure degrades to unavailable, not to a
+        // 4xx. Telling a producer to change a request that was fine is the
+        // worse error, so the default direction is retry.
+        let unknown = HttpError::from_store(anyhow!("something nobody classified"));
+        assert_eq!(unknown.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn the_wire_error_body_is_bounded() {
+        let error = HttpError::new(StatusCode::BAD_REQUEST, "code", "x".repeat(4096));
+        assert_eq!(
+            error.body.message.chars().count(),
+            512,
+            "an unbounded echo of store context is how a wire error becomes a leak"
+        );
+    }
+}
