@@ -1643,22 +1643,16 @@ mod tests {
         wire["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    fn install_governance_graph(server: &BlackboxServer, root: &std::path::Path) -> String {
-        let project = server
-            .state
-            .project_authority
-            .bridge_registry()
-            .unwrap()
-            .write()
-            .register_path(root)
-            .unwrap();
-        let project_id =
-            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone())
-                .unwrap();
-        let graph_id = "governance-record";
+    /// Parses the governance-record fixture into a graph generation. Callable
+    /// more than once per test so a provisional overlay can carry its own
+    /// (identical) generation alongside the published one.
+    fn load_governance_generation(
+        project_id: &str,
+        root: &std::path::Path,
+    ) -> bbox_project_graph::GraphGeneration {
         let loaded = bbox_project_graph::load_graph_documents(
-            project_id.as_str(),
-            graph_id,
+            project_id,
+            "governance-record",
             bbox_project_graph::GraphDocumentBytes {
                 descriptor: Some(include_bytes!(
                     "../../crates/bbox-project-graph/tests/fixtures/governance-record/graph.json"
@@ -1677,7 +1671,23 @@ mod tests {
             root.to_path_buf(),
         );
         assert!(loaded.report.valid, "{:?}", loaded.report.errors);
-        let graph = loaded.generation.unwrap();
+        loaded.generation.unwrap()
+    }
+
+    fn install_governance_graph(server: &BlackboxServer, root: &std::path::Path) -> String {
+        let project = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(root)
+            .unwrap();
+        let project_id =
+            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone())
+                .unwrap();
+        let graph_id = "governance-record";
+        let graph = load_governance_generation(project_id.as_str(), root);
         let scope = PublishedScope::try_new("repo-governance", ".").unwrap();
         server.state.project_graph_views.write().install_published(
             bbox_indexing::project_graph_view::PublishedProjectGraphView {
@@ -1763,6 +1773,125 @@ mod tests {
             }))
             .await;
         assert!(extract_text(&paths).contains("\"paths\""));
+    }
+
+    /// gap-e41499a9: under own visibility an authored graph materializes as
+    /// `provisional_project_graph_vertex` overlay refs, so a caller filtering
+    /// on the logical type used to walk the whole neighborhood and match
+    /// nothing. The logical type must be enough; the overlay type name stays
+    /// available for callers that want the overlay form exclusively.
+    #[tokio::test]
+    async fn find_paths_to_type_admits_overlay_vertices_under_own_visibility() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_governance_graph(&server, &root);
+        let scope = PublishedScope::try_new("repo-governance", ".").unwrap();
+        let workspace_id = bro_core::WorkspaceId::parse("a".repeat(32)).unwrap();
+        server.set_session_checkout_for_test(
+            project_id.clone(),
+            scope.clone(),
+            workspace_id.to_string(),
+            root.clone(),
+        );
+        let graph = load_governance_generation(&project_id, &root);
+        let content_hash = graph.fingerprint.clone();
+        server
+            .state
+            .project_graph_views
+            .write()
+            .install_provisional(
+                bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
+                    project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
+                        project_id.clone(),
+                    )
+                    .unwrap(),
+                    scope,
+                    workspace_id: workspace_id.clone(),
+                    source_generation_id: "working-one".into(),
+                    graphs: std::collections::BTreeMap::from([(
+                        "governance-record".into(),
+                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
+                            bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
+                                "governance-record".into(),
+                                bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                                    accepted_generation: "generation-one".into(),
+                                    accepted_commit: "a".repeat(40),
+                                    source_generation: Some("working-one".into()),
+                                    workspace_id: Some(workspace_id),
+                                    content_hash,
+                                },
+                                graph,
+                            ),
+                        ),
+                    )]),
+                },
+            );
+
+        let vertex_ref =
+            format!("project_graph_vertex:{project_id}:governance-record:record/case@1");
+        let logical = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: vertex_ref.clone(),
+                provisional: Some("own".into()),
+                to: None,
+                to_type: Some("project_graph_vertex".into()),
+                edge_types: None,
+                max_depth: Some(2),
+                limit: Some(5),
+            }))
+            .await;
+        let logical_text = extract_text(&logical);
+        assert!(!logical_text.contains("No paths found"), "{logical_text}");
+        assert!(
+            logical_text.contains("provisional_project_graph_vertex:"),
+            "{logical_text}"
+        );
+
+        // The overlay type name keeps working for callers that already know it.
+        let explicit = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: vertex_ref,
+                provisional: Some("own".into()),
+                to: None,
+                to_type: Some("provisional_project_graph_vertex".into()),
+                edge_types: None,
+                max_depth: Some(2),
+                limit: Some(5),
+            }))
+            .await;
+        let explicit_text = extract_text(&explicit);
+        assert!(!explicit_text.contains("No paths found"), "{explicit_text}");
+        assert!(
+            explicit_text.contains("provisional_project_graph_vertex:"),
+            "{explicit_text}"
+        );
+    }
+
+    /// gap-e41499a9: a targetless call is a malformed call, not an empty
+    /// neighborhood, and must say so at the tool boundary.
+    #[tokio::test]
+    async fn find_paths_without_a_target_refuses_at_the_tool_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_governance_graph(&server, &root);
+
+        let refused = server
+            .bbox_find_paths(Parameters(FindPathsParams {
+                from: format!("project_graph_vertex:{project_id}:governance-record:record/case@1"),
+                provisional: Some("published".into()),
+                to: None,
+                to_type: None,
+                edge_types: None,
+                max_depth: Some(2),
+                limit: Some(5),
+            }))
+            .await;
+        let refused_text = extract_text(&refused);
+        assert!(refused_text.contains("error.bad_input"), "{refused_text}");
+        assert!(refused_text.contains("suggested_fix"), "{refused_text}");
+        assert!(!refused_text.contains("No paths found"), "{refused_text}");
     }
 
     #[tokio::test]
