@@ -1117,14 +1117,14 @@ mod tests {
     fn a_replayed_batch_does_not_double_land() {
         let dir = tempfile::tempdir().unwrap();
         let store = bound_store(&dir);
-        let batch = batch(vec![
+        let first_batch = batch(vec![
             record("1755000000.000100", "first"),
             record("1755000001.000200", "second"),
         ]);
-        store.land_batch(&scope(), &batch).unwrap();
+        store.land_batch(&scope(), &first_batch).unwrap();
         let bytes_after_first = file_len(&journal_path(&store)).unwrap();
 
-        let replay = store.land_batch(&scope(), &batch).unwrap();
+        let replay = store.land_batch(&scope(), &first_batch).unwrap();
         assert_eq!(replay.accepted, 0, "a replay lands nothing");
         assert_eq!(replay.duplicates, 2, "and says so, so a resume is visible");
         assert_eq!(replay.cursor.landed_records, 2);
