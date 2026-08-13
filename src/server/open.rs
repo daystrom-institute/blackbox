@@ -1049,6 +1049,14 @@ pub(super) fn open_shared_state(
     });
     shared.install_code_read_view_commit_hook();
 
+    // Reconcile every granted connector scope against the derived manifest.
+    // The activation record, the manifest, and the state flip are three
+    // writes across two stores that share no transaction, so a crash between
+    // any pair leaves an observable tear; the store's classifier is total
+    // over those shapes and this is the one call that consumes it. Runs after
+    // the read view exists because a forward republish swaps it.
+    super::file_source_activation::recover_connector_activations(&shared);
+
     // Start the single-writer task-store persist actor (control-plane starvation
     // fix). Hot paths now signal `request_persist` instead of doing a blocking
     // `task_store.read().persist(dir)` on a tokio worker. Production only — tests

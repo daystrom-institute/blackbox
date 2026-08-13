@@ -453,11 +453,14 @@ async fn finalize_upload(
     // code lane offers and the reason `FileGenerationStateV1::Superseded`
     // counts as terminal SUCCESS.
     //
-    // The generation therefore rests at `Ready` when this route layer is the
-    // only thing mounted. Wiring the activation lane onto this seam is the
-    // next commit; until it lands, a finalized generation is durable, correct,
-    // and simply not yet searchable.
-    let _ = &generation;
+    // A generation that is already `Active` (a redelivered finalize) enqueues
+    // an activation that returns immediately, so the retry is free rather
+    // than a second staging pass.
+    super::file_source_activation::enqueue_activation(
+        &state,
+        generation.scope.clone(),
+        generation_id.clone(),
+    );
     Ok(Json(FinalizeFileUploadResponseV1 {
         status_url: format!("/internal/file-source/v1/generations/{generation_id}/status"),
         generation_id,
