@@ -21,29 +21,38 @@ use bbox_indexing::project_catalog_admin::{ConnectorGrantExpectation, find_conne
 use bro_rpc::ServiceToken;
 use sha2::{Digest, Sha256};
 
+/// One authenticated producer: its operator-declared id and its live bearer.
+struct ConnectorProducerToken {
+    producer_id: String,
+    token: ServiceToken,
+}
+
 /// Immutable grant table, rebuilt whenever the producer snapshot is rebuilt.
 ///
-/// **This type retains no credential material, deliberately.** Each producer's
-/// token is loaded during [`ConnectorGrantRuntime::build`] so an unreadable,
-/// world-readable, symlinked, hardlinked, or malformed token file refuses
-/// startup, and it is digested there to prove no two producers share a token
-/// value. Then it is dropped. Phase 0 mounts no endpoint, so there is nothing
-/// to authenticate and no reason to hold a secret in memory for a phase that
-/// cannot use it.
+/// **This type now RETAINS credential material, and that is the phase-1
+/// resolution of the note phase 0 left here.** Phase 0 loaded each producer's
+/// token during [`ConnectorGrantRuntime::build`] purely to validate it (the
+/// owner, mode, symlink, hardlink, and shape checks) and to digest it, then
+/// dropped it: with no endpoint mounted there was nothing to authenticate and
+/// holding a secret would have been custody without purpose. Phase 1 mounts
+/// `/internal/file-source/v1/*`, so the table is now the thing that answers
+/// "which producer is this bearer?" and the tokens have to live here.
 ///
-/// That is why `Debug` is derived here and NOT on the sibling
-/// `ProducerAuthRuntime`: that runtime holds live `ServiceToken`s because it
-/// authenticates real requests, so it stays un-`Debug`-able and leans on
-/// `ServiceToken`'s own redacted `Debug` as a second line. Everything
-/// reachable from this struct is operator-declared config (producer ids,
-/// connector scopes, remote authorities) plus catalog project ids, none of it
-/// secret. If phase 1 reintroduces token retention here, it must revisit this
-/// derive; `the_grant_table_holds_no_credential_material` fails loudly if a
-/// token value ever becomes reachable through it.
-#[derive(Debug)]
+/// The consequence is that `Debug` can no longer be DERIVED. It is written by
+/// hand below and renders producer ids, connector scopes, remote authorities,
+/// and catalog project ids -- all operator-declared config -- while the
+/// tokens are reduced to a count. That follows the `bro_rpc::ServiceToken`
+/// precedent, whose own `Debug` prints `REDACTED`: this is the second line of
+/// that defense, not a replacement for it.
+///
+/// `the_grant_table_holds_no_credential_material` still passes verbatim and is
+/// now doing real work rather than asserting a vacuous property: it renders a
+/// table that genuinely holds a secret and proves the secret is unreachable.
 pub(crate) struct ConnectorGrantRuntime {
     enabled: bool,
     grants: Vec<ConnectorGrantExpectation>,
+    /// Live bearers, one per configured producer.
+    producers: Vec<ConnectorProducerToken>,
     /// Granted scopes that already have a catalog project.
     scope_to_project: BTreeMap<ConnectorSourceId, ProjectId>,
     /// Granted scopes with no catalog project yet. Only onboarding may
@@ -51,11 +60,28 @@ pub(crate) struct ConnectorGrantRuntime {
     pending_onboard: BTreeSet<ConnectorScope>,
 }
 
+impl std::fmt::Debug for ConnectorGrantRuntime {
+    /// Hand-written so a bearer can never reach a panic message, a tracing
+    /// field, or a test log through this type. Only the token COUNT is
+    /// rendered; everything else here is operator-declared config.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorGrantRuntime")
+            .field("enabled", &self.enabled)
+            .field("grants", &self.grants)
+            .field("producer_tokens", &self.producers.len())
+            .field("scope_to_project", &self.scope_to_project)
+            .field("pending_onboard", &self.pending_onboard)
+            .finish()
+    }
+}
+
 impl ConnectorGrantRuntime {
     pub(crate) fn disabled() -> Self {
         Self {
             enabled: false,
             grants: Vec::new(),
+            producers: Vec::new(),
             scope_to_project: BTreeMap::new(),
             pending_onboard: BTreeSet::new(),
         }
@@ -81,6 +107,7 @@ impl ConnectorGrantRuntime {
         }
 
         let mut grants = Vec::new();
+        let mut producer_tokens = Vec::new();
         let mut scope_to_project = BTreeMap::new();
         let mut pending_onboard = BTreeSet::new();
         let mut producer_ids = BTreeSet::new();
@@ -91,25 +118,26 @@ impl ConnectorGrantRuntime {
             if !producer_ids.insert(producer.producer_id.clone()) {
                 bail!("duplicate source-connector producer id");
             }
-            // Load to VALIDATE, not to retain. `ServiceToken::load` performs
+            // Load to VALIDATE and to RETAIN. `ServiceToken::load` performs
             // the owner, mode, symlink, hardlink, and shape checks, so a
             // misconfigured token file refuses startup here rather than on a
             // first publication attempt. The digest proves no two producers
-            // share a token value. Both uses end inside this loop and the
-            // token is dropped: phase 0 has no endpoint to authenticate, so
-            // holding the secret would be custody without purpose.
-            let token_digest = {
-                let token = ServiceToken::load(&producer.token_file).map_err(|error| {
-                    anyhow::anyhow!(
-                        "loading source-connector token for {}: {error}",
-                        producer.producer_id
-                    )
-                })?;
-                Sha256::digest(token.expose_secret().as_bytes())
-            };
+            // share a token value; the token itself is kept because phase 1
+            // mounts an endpoint this table has to authenticate.
+            let token = ServiceToken::load(&producer.token_file).map_err(|error| {
+                anyhow::anyhow!(
+                    "loading source-connector token for {}: {error}",
+                    producer.producer_id
+                )
+            })?;
+            let token_digest = Sha256::digest(token.expose_secret().as_bytes());
             if !token_digests.insert(token_digest.to_vec()) {
                 bail!("source-connector token values must be unique");
             }
+            producer_tokens.push(ConnectorProducerToken {
+                producer_id: producer.producer_id.clone(),
+                token,
+            });
             if producer.scopes.is_empty() {
                 bail!("enabled source-connector producer has no scopes");
             }
@@ -154,35 +182,52 @@ impl ConnectorGrantRuntime {
         Ok(Self {
             enabled: true,
             grants,
+            producers: producer_tokens,
             scope_to_project,
             pending_onboard,
         })
     }
 
-    // The read surface below is the phase-1 seam. Phase 0 deliberately mounts
-    // no endpoint, so these have no non-test caller yet; they are defined and
-    // tested now so `/internal/file-source/v1/catalog/onboard` inherits a
-    // validated grant table rather than growing its own. Marked with the
-    // repo's documented-seam idiom rather than deleted-and-rewritten later.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
+    /// Resolve a presented bearer to the producer it authenticates.
+    ///
+    /// Comparison runs through `ServiceToken::verify`, which is constant
+    /// time, and EVERY configured producer is checked even after a match so
+    /// the number of comparisons does not vary with which producer presented
+    /// the bearer. Returns the operator-declared `producer_id`, which is what
+    /// the onboarding composite matches grants against; the token never
+    /// leaves this method.
+    pub(crate) fn authenticate(&self, bearer: &str) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+        let mut matched: Option<&str> = None;
+        for producer in &self.producers {
+            if producer.token.verify(bearer) {
+                matched = Some(producer.producer_id.as_str());
+            }
+        }
+        matched
+    }
+
+    // The read surface below is consumed by the file-source route layer: the
+    // authentication middleware gates on `enabled`, `catalog_onboard` matches
+    // against `grants`, and every publication handler routes through
+    // `is_pending_onboard` plus `project_for`.
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The grant table the onboarding composite validates against.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn grants(&self) -> &[ConnectorGrantExpectation] {
         &self.grants
     }
 
     /// True when the scope is operator-configured but has no catalog project
     /// yet. Only onboarding may admit such a scope.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn is_pending_onboard(&self, scope: &ConnectorScope) -> bool {
         self.pending_onboard.contains(scope)
     }
 
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn project_for(
         &self,
         connector_source_id: &ConnectorSourceId,
@@ -192,13 +237,34 @@ impl ConnectorGrantRuntime {
 
     /// Project ids a connector grant makes eligible for a PUBLICATION lane.
     ///
-    /// Always empty in Phase 0, and that is the contract, not an oversight:
-    /// the phase ends at "onboards, lists, and reports with no publication
-    /// yet". Callers ask this rather than inferring eligibility from the
-    /// presence of a grant, so Phase 1 has exactly one place to open.
-    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 publication lane.
+    /// Phase 0 returned empty by contract; phase 1 opens it, and this is the
+    /// exactly-one place that opening happens. Eligibility is CATALOG
+    /// membership, not grant presence: a granted scope with no catalog project
+    /// is pending onboarding and is deliberately absent here, which is what
+    /// keeps a pending scope out of every publication lane while leaving it
+    /// acceptable to the onboard endpoint.
     pub(crate) fn publication_project_ids(&self) -> BTreeSet<String> {
-        BTreeSet::new()
+        self.scope_to_project
+            .values()
+            .map(|project_id| project_id.as_str().to_string())
+            .collect()
+    }
+
+    /// The granted scope owning a project id, for the publisher-status read.
+    ///
+    /// Inverts `scope_to_project` on demand rather than keeping a second map:
+    /// the table is one entry per operator-configured scope, so a linear scan
+    /// is free, and a second map is a second thing that can disagree.
+    pub(crate) fn scope_for_project(&self, project_id: &ProjectId) -> Option<&ConnectorScope> {
+        let source_id = self
+            .scope_to_project
+            .iter()
+            .find(|(_, owned)| *owned == project_id)
+            .map(|(source_id, _)| source_id)?;
+        self.grants
+            .iter()
+            .map(|grant| &grant.scope)
+            .find(|scope| scope.connector_source_id() == source_id)
     }
 
     /// Configured producer ids, derived from the grants rather than stored
@@ -391,11 +457,10 @@ mod tests {
         let catalog = CatalogSnapshotV2::empty(1).unwrap();
         let runtime = ConnectorGrantRuntime::build(&config, Some(&catalog)).unwrap();
 
-        // The token was loaded (and therefore validated) during build, but
-        // nothing about it survives into the table. This guards the `Debug`
-        // derive: if phase 1 reintroduces token retention, this fails and
-        // forces the redaction question to be answered again rather than
-        // leaking a bearer into a panic message or a test log.
+        // Phase 1 RETAINS this token, so the assertion below is no longer
+        // vacuous: it renders a table that genuinely holds the secret and
+        // proves the secret is unreachable through it. That is what the
+        // hand-written `Debug` buys, and why the derive had to go.
         let rendered = format!("{runtime:?}");
         assert!(
             !rendered.contains(&secret),
@@ -405,6 +470,53 @@ mod tests {
             rendered.contains("producer-a") && rendered.contains(SOURCE_A),
             "the rendering must still carry the operator-declared grant facts: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_retained_bearer_resolves_to_exactly_its_own_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let secret_a = "a".repeat(64);
+        let secret_b = "b".repeat(64);
+        let config = config_with(
+            vec![
+                ConnectorProducerConfig {
+                    producer_id: "producer-a".into(),
+                    token_file: token_file(&root, "token-a", &secret_a),
+                    scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+                },
+                ConnectorProducerConfig {
+                    producer_id: "producer-b".into(),
+                    token_file: token_file(&root, "token-b", &secret_b),
+                    scopes: vec![grant("csrc_00000000deadbeef", "gdrive", "tenant.example")],
+                },
+            ],
+            true,
+        );
+        let catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let runtime = ConnectorGrantRuntime::build(&config, Some(&catalog)).unwrap();
+
+        assert_eq!(runtime.authenticate(&secret_a), Some("producer-a"));
+        assert_eq!(runtime.authenticate(&secret_b), Some("producer-b"));
+        assert_eq!(
+            runtime.authenticate(&"c".repeat(64)),
+            None,
+            "an unknown bearer authenticates as nobody"
+        );
+        assert_eq!(runtime.authenticate(""), None);
+        assert_eq!(
+            runtime.authenticate(&secret_a[..63]),
+            None,
+            "a truncated bearer is not a prefix match"
+        );
+    }
+
+    #[test]
+    fn a_disabled_family_authenticates_nobody() {
+        // Retaining tokens must not create a lane that answers while the
+        // family is switched off.
+        let runtime = ConnectorGrantRuntime::build(&config_with(Vec::new(), false), None).unwrap();
+        assert_eq!(runtime.authenticate(&"a".repeat(64)), None);
     }
 
     #[test]

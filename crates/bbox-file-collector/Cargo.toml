@@ -1,0 +1,62 @@
+[package]
+name = "bbox-file-collector"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+name = "bbox_file_collector"
+path = "src/lib.rs"
+
+# The satellite binary. It runs on a PRODUCER host: it holds the vendor
+# credential, observes, applies policy, exports, and publishes. The library
+# half stays independently testable (connector trait, policy engine, journal,
+# logical-path assignment, fixture connector, and the publication cycle, which
+# is written against a sink trait so its decisions are testable without a
+# socket).
+[[bin]]
+name = "bbox-file-collector"
+path = "src/main.rs"
+
+# THE DEPENDENCY CEILING IS THIS CRATE'S MOST VALUABLE PROPERTY.
+#
+# `bbox-file-collector` is the connector satellite: it runs on a producer host,
+# holds the vendor credentials, observes a remote store, applies policy,
+# exports provider-native documents, and publishes a manifest plus blobs. It is
+# a DUMB PRODUCER. Chunking, Tantivy, embeddings, vectors, edges, activation,
+# and every other corpus behavior live on the corpus host, and exactly one
+# chunker version exists in the system so satellite deploys can never skew
+# against the index.
+#
+# Forbidden here, mechanically enforced by
+# `scripts/acceptance-file-collector-deps.sh` (acceptance criteria section 19):
+# `blackbox`, any `*-source-store`, `bbox-corpus-index`, `bbox-indexing`,
+# `bbox-chunker`, `bbox-embed`, `bbox-vectors`, `bbox-edge-*`, `tantivy`,
+# `bro-harness`, `bro-code-mode`, V8, and every model-provider SDK.
+#
+# Vendor SDKs (phase 2 onward) are permitted and are precisely why this is a
+# separate binary from `bbox-code-collector` rather than a mode on it: fusing
+# them would either contaminate that crate's acceptance test or grow
+# per-connector exceptions until it meant nothing.
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bbox-code-source = { path = "../bbox-code-source" }
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-file-source = { path = "../bbox-file-source" }
+bro-rpc = { path = "../bro-rpc" }
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+globset = "0.4"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"

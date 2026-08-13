@@ -277,6 +277,113 @@ fn connector_observations_json(
     }
 }
 
+/// The file-source publication state of one connector-scoped project.
+///
+/// Phase 0 reported `publication_lanes: []` because no lane existed. Phase 1
+/// mounts one, so this renders what that lane actually knows: the active
+/// generation and its ordinal, per-state generation counts, the freshness
+/// facts (file count, logical bytes, the display-only remote watermark), the
+/// producer's own publication telemetry, and any cursor degradation.
+///
+/// Three things are deliberately absent.
+///
+/// No credential material, and none is reachable: every field here comes from
+/// the durable generation record, whose wire types carry opaque tokens the
+/// leaf contract already bounded and scheme-restricted. `remote_url` is not
+/// projected at all, because it is per-entry manifest data rather than
+/// publication status and rendering a manifest through a status call would
+/// make an unbounded response out of a bounded one.
+///
+/// No freshness AUTHORITY. `remote_watermark` is rendered beside a name that
+/// says what it is; the manifest digest is the fingerprint and the generation
+/// id already carries it.
+///
+/// No error when the store has never heard of this scope. A connector project
+/// that onboarded and has not yet published reports an absent active
+/// generation and empty counts, which is the honest reading of "onboarded, no
+/// publication yet" and is exactly the phase-0 state this replaces.
+fn connector_publication_json(
+    store: &bbox_file_source_store::FileSourceStore,
+    scope: &bbox_corpus_core::project_catalog::ConnectorScope,
+) -> serde_json::Value {
+    let generations = match store.generations(scope) {
+        Ok(generations) => generations,
+        // A read failure is REPORTED, not swallowed and not fatal: publisher
+        // status is an observational call and a connector lane that cannot be
+        // read must not take down the whole status response for a project.
+        Err(error) => {
+            return json!({
+                "readable": false,
+                "diagnostic": error.to_string().chars().take(256).collect::<String>(),
+            });
+        }
+    };
+    let active_record = store.active_generation(scope).ok().flatten();
+    let mut states: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for generation in &generations {
+        let label = serde_json::to_value(generation.state)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        *states.entry(label).or_insert(0) += 1;
+    }
+    let active = active_record.as_ref().and_then(|record| {
+        let generation = generations
+            .iter()
+            .find(|generation| generation.generation_id == record.generation_id)?;
+        Some(json!({
+            "generation_id": generation.generation_id,
+            "ordinal": generation.ordinal,
+            "producer_id": generation.producer_id,
+            "selector": record.selector,
+            "installed_at": record.installed_at,
+            "document_count": record.document_count,
+            "superseded_generation_id": record.superseded_generation_id,
+            "file_count": generation.descriptor.file_count,
+            "logical_bytes": generation.descriptor.logical_bytes,
+            "cursor_epoch": generation.descriptor.cursor_epoch,
+            // Named for what it is on the wire: display and diagnostic only.
+            // The manifest digest is the fingerprint.
+            "remote_watermark_display_only": generation.descriptor.remote_watermark,
+            "manifest_sha256": generation.descriptor.manifest_sha256,
+            "telemetry": {
+                "entries_enumerated": generation.telemetry.entries_enumerated,
+                "blobs_fetched": generation.telemetry.blobs_fetched,
+                "documents_exported": generation.telemetry.documents_exported,
+                "skipped": generation.telemetry.skipped,
+                "total_skipped": generation.telemetry.total_skipped(),
+            },
+        }))
+    });
+    // Cursor degradation is surfaced from the LATEST generation carrying one
+    // rather than only from the active one: a degradation reported by a
+    // generation that has not activated yet is still the operator's signal,
+    // and hiding it until activation is the "silently absorbed" failure the
+    // design forbids by name.
+    let degradation = generations
+        .iter()
+        .rev()
+        .find_map(|generation| generation.degradation.as_ref())
+        .map(|degradation| {
+            json!({
+                "checkpoint_name": degradation.checkpoint_name,
+                "cause": degradation.cause,
+                "cursor_epoch": degradation.cursor_epoch,
+                "observed_at": degradation.observed_at,
+                "entries_enumerated": degradation.entries_enumerated,
+                "blobs_refetched": degradation.blobs_refetched,
+                "documents_reexported": degradation.documents_reexported,
+            })
+        });
+    json!({
+        "readable": true,
+        "active": active,
+        "generation_count": generations.len(),
+        "generation_states": states,
+        "last_cursor_degradation": degradation,
+    })
+}
+
 /// Daemon-observed checkout facts. Probing is filesystem work and runs only
 /// inside the blocking phase.
 struct CheckoutProbe {
@@ -1295,7 +1402,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports current, prior-fallback, missing, or corrupt state; accepted scope, ref, commit, generation identity, pointer SHA-256, and the typed source binding. Attachment bindings name an attachment; producer bindings name the producer plus source generation id and evidence hash. It also reports scope agreement and advance availability. A `health` object adds the bounded runtime projection: binding status, source kind, recorded attachment capabilities, overlay outcomes, and watcher state. An `auto_advance` object reports the standing operator grant (enabled, the audit reason that installed it, and whether the accepted binding is producer-bound and therefore eligible) plus the last policy attempt and why it did or did not move the pointer. Generation id and pointer SHA-256 are the compare-and-swap tokens bbox_project_publisher_advance requires. The response also echoes the project's catalog `scope`, and for a connector source adds a `connector` object naming the connector_source_id, the connector kind, the producer's observed vendor coordinates, and an empty publication_lanes list: a connector source onboards, lists, and reports before any publication lane exists, so it claims none. The call is observational, takes no checkout lease, and is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports current, prior-fallback, missing, or corrupt state; accepted scope, ref, commit, generation identity, pointer SHA-256, and the typed source binding. Attachment bindings name an attachment; producer bindings name the producer plus source generation id and evidence hash. It also reports scope agreement and advance availability. A `health` object adds the bounded runtime projection: binding status, source kind, recorded attachment capabilities, overlay outcomes, and watcher state. An `auto_advance` object reports the standing operator grant (enabled, the audit reason that installed it, and whether the accepted binding is producer-bound and therefore eligible) plus the last policy attempt and why it did or did not move the pointer. Generation id and pointer SHA-256 are the compare-and-swap tokens bbox_project_publisher_advance requires. The response also echoes the project's catalog `scope`, and for a connector source adds a `connector` object naming the connector_source_id, the connector kind, the producer's observed vendor coordinates, the publication_lanes it claims, and a `file_source` object carrying that lane's state: the active generation with its ordinal, producer, collected selector, document and file counts, logical bytes, cursor epoch, manifest digest, and the producer's publication telemetry (entries enumerated, blobs fetched, documents exported, per-reason skip counters); the per-state generation counts; and the last reported cursor degradation with its cause and cost. `remote_watermark_display_only` is named for what it is and is never freshness authority. A connector project that has onboarded without publishing reports an absent active generation rather than an error, and an unreadable lane reports readable=false with a diagnostic instead of failing the whole call. No credential material appears anywhere in this response. The call is observational, takes no checkout lease, and is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -1369,17 +1476,21 @@ impl BlackboxServer {
                 .knowledge_sources
                 .auto_advance_ledger()
                 .last_attempt(project_id.as_str());
-            // A connector project reports its family honestly and claims no
-            // publication lane: Phase 0 of the connector program onboards,
-            // lists, and reports, and publishes nothing. `publication_lanes`
-            // is empty rather than absent so a reader sees the claim was
-            // made, not that the field was forgotten.
+            // A connector project reports its family and, since phase 1
+            // mounted the lane, its actual file-source publication state.
+            // `publication_lanes` names the lanes that exist rather than
+            // staying empty: a reader can now tell "this project publishes
+            // through file-source" from "this project claims no lane at all",
+            // which is the distinction phase 0 could not express.
             let connector = project.scope.connector().map(|scope| {
+                let file_source =
+                    connector_publication_json(server.state.file_sources.store().as_ref(), scope);
                 json!({
                     "connector_source_id": scope.connector_source_id().as_str(),
                     "connector_kind": scope.connector_kind().as_str(),
                     "observations": connector_observations_json(state.catalog(), project),
-                    "publication_lanes": Vec::<String>::new(),
+                    "publication_lanes": vec!["file_source"],
+                    "file_source": file_source,
                 })
             });
             Ok(serde_json::to_string_pretty(&json!({

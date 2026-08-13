@@ -120,6 +120,30 @@ pub enum IndexWriteOp {
         release: mpsc::Receiver<()>,
         hold_state: Arc<AtomicU8>,
     },
+    /// Stage one CONNECTOR generation from the file-source blob store.
+    ///
+    /// The file-lane sibling of [`IndexWriteOp::StageCollectedGeneration`],
+    /// and a NARROWING of it: the collected lane already opens no Git, and
+    /// this one additionally has no commit, no dirty fingerprint, and no
+    /// repository-relative root for edge targets. It carries the file lane's
+    /// own wire types end to end rather than adapting them into
+    /// `bbox_code_source::ManifestEntry`, whose validation applies source-tree
+    /// walker policy that a document store must not be subject to.
+    ///
+    /// The ack/release/hold_state triple is IDENTICAL to the collected lane's
+    /// on purpose: the release token holds the staged generation open across
+    /// the two-store activation, and without that window the activation's
+    /// write ordering has nothing to order against.
+    StageConnectorGeneration {
+        identity: Box<CodeProjectIdentity>,
+        descriptor: Box<bbox_file_source::FileGenerationDescriptorV1>,
+        generation_id: String,
+        entries: Vec<bbox_file_source::FileManifestEntryV1>,
+        store: std::sync::Arc<bbox_file_source_store::FileSourceStore>,
+        ack: mpsc::SyncSender<Result<super::project_files::CollectedIndexResult>>,
+        release: mpsc::Receiver<()>,
+        hold_state: Arc<AtomicU8>,
+    },
     /// Stage one local generation by walking the leased checkout.
     ///
     /// `scope` is the authorized producer scope the caller acted on. For a
@@ -1287,6 +1311,51 @@ impl IndexWriterActor {
         })
     }
 
+    /// Stage one connector generation and hold the writer lane open for its
+    /// activation.
+    ///
+    /// Same contract as [`Self::stage_collected_generation`]: the returned
+    /// [`StagedIndexGeneration`] IS the release token. The actor parks on the
+    /// release channel until it is dropped, so the caller may run the whole
+    /// two-store activation (stage record, install record, derived manifest,
+    /// state flip) knowing the staged documents cannot be reclaimed
+    /// underneath it. Call `begin_publication()` before the first durable
+    /// activation write to convert the bounded staging hold into an unbounded
+    /// publication hold; a caller that skips it can have the actor time out
+    /// mid-activation.
+    pub fn stage_connector_generation(
+        &self,
+        identity: CodeProjectIdentity,
+        descriptor: bbox_file_source::FileGenerationDescriptorV1,
+        generation_id: String,
+        entries: Vec<bbox_file_source::FileManifestEntryV1>,
+        store: std::sync::Arc<bbox_file_source_store::FileSourceStore>,
+    ) -> Result<StagedIndexGeneration> {
+        let (ack, ack_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let hold_state = Arc::new(AtomicU8::new(STAGE_HOLD_HELD));
+        self.tx
+            .send(IndexWriteOp::StageConnectorGeneration {
+                identity: Box::new(identity),
+                descriptor: Box::new(descriptor),
+                generation_id,
+                entries,
+                store,
+                ack,
+                release: release_rx,
+                hold_state: hold_state.clone(),
+            })
+            .map_err(|_| anyhow!("index writer actor unavailable"))?;
+        let result = ack_rx
+            .recv()
+            .map_err(|_| anyhow!("index writer actor dropped the connector-stage ack"))??;
+        Ok(StagedIndexGeneration {
+            result,
+            release: Some(release),
+            hold_state,
+        })
+    }
+
     pub fn stage_local_generation(
         &self,
         identity: CodeProjectIdentity,
@@ -1492,6 +1561,35 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                     );
                 }
             }
+            IndexWriteOp::StageConnectorGeneration {
+                identity,
+                descriptor,
+                generation_id,
+                entries,
+                store,
+                ack,
+                release,
+                hold_state,
+            } => {
+                let result = run_connector_stage(
+                    &ctx,
+                    &identity,
+                    &descriptor,
+                    &generation_id,
+                    &entries,
+                    &store,
+                );
+                let should_hold = result.is_ok();
+                let _ = ack.send(result);
+                if should_hold {
+                    await_generation_stage_release(
+                        release,
+                        "connector generation",
+                        &hold_state,
+                        STAGED_GENERATION_HOLD_TIMEOUT,
+                    );
+                }
+            }
             IndexWriteOp::StageLocalGeneration {
                 identity,
                 scope,
@@ -1591,6 +1689,10 @@ fn run_actor(rx: mpsc::Receiver<IndexWriteOp>, ctx: ActorCtx) {
                             break;
                         }
                         Ok(stage @ IndexWriteOp::StageCollectedGeneration { .. }) => {
+                            deferred = Some(stage);
+                            break;
+                        }
+                        Ok(stage @ IndexWriteOp::StageConnectorGeneration { .. }) => {
                             deferred = Some(stage);
                             break;
                         }
@@ -1739,7 +1841,7 @@ fn run_collected_stage(
         &edges_dir,
         &mut publication,
         |entry| {
-            let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+            let mut file = store.verified_blob_file(entry.content_sha256, entry.size)?;
             let mut bytes = Vec::with_capacity(entry.size as usize);
             std::io::Read::read_to_end(&mut file, &mut bytes)?;
             Ok(bytes)
@@ -1748,6 +1850,77 @@ fn run_collected_stage(
     // No checkout lease contributed to this bundle, so there is no
     // publication guard to hold: the broker's guard exists to pin checkout
     // lifecycle across publish, and this transaction touched no checkout.
+    let (publication_result, commit_payload) =
+        commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
+    publication_result.finalize_publications()?;
+    bbox_edge_sidecar::snapshot::prune_receipt_closeouts_after_commit(
+        &edges_dir,
+        (!commit_payload.is_empty()).then_some(commit_payload.as_str()),
+    )?;
+    post_commit(ctx);
+    Ok(result)
+}
+
+/// Stage a connector generation. A NARROWING of [`run_collected_stage`].
+///
+/// The collected lane already opens no Git; this one additionally has no
+/// commit to record, no dirty fingerprint, and no repository-relative root to
+/// key current-file edge targets under. What survives unchanged is everything
+/// that makes the result an ordinary collected source: the same chunkers, the
+/// same edge sidecar staging, the same `collected:` selector, and the same
+/// commit-and-publish sequence.
+///
+/// The legacy-local refusal still runs, and for the same reason it runs on the
+/// collected lane: it is a statement about which identities may own a
+/// generation at all. A connector project's identity carries
+/// `ProjectScope::Connector`, so it passes; a catalog `LegacyLocal` project
+/// would be refused before any writer exists.
+fn run_connector_stage(
+    ctx: &ActorCtx,
+    identity: &CodeProjectIdentity,
+    descriptor: &bbox_file_source::FileGenerationDescriptorV1,
+    generation_id: &str,
+    entries: &[bbox_file_source::FileManifestEntryV1],
+    store: &bbox_file_source_store::FileSourceStore,
+) -> Result<super::project_files::CollectedIndexResult> {
+    refuse_collected_staging_for_legacy_local(identity)?;
+    // The route layer already enforced the real cardinality and byte caps
+    // against the operator's configured limits. Re-validating here with the
+    // ceilings lifted re-proves the parts that are about THIS manifest --
+    // ordering, uniqueness, per-entry shape, and the descriptor digest --
+    // which is exactly what the collected lane re-proves at the same seam.
+    descriptor
+        .validate_manifest(entries, u64::MAX, u64::MAX)
+        .map_err(|error| anyhow!("connector manifest rejected at staging: {error}"))?;
+    let compat = compat_record(ctx, identity.project_id.as_str());
+    let edges_dir =
+        bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(&ctx.config.projects_path);
+    let staging: Vec<super::project_files::SourceStagingEntry<'_>> = entries
+        .iter()
+        .map(|entry| super::project_files::SourceStagingEntry {
+            relative_path: &entry.logical_path,
+            content_sha256: &entry.content_sha256,
+            size: entry.size,
+        })
+        .collect();
+    let mut writer = create_writer(&ctx.index, WRITER_HEAP_REINDEX)?;
+    writer.set_merge_policy(Box::new(conservative_log_merge_policy()));
+    let mut publication = super::project_files::ProjectIndexPublicationBundle::default();
+    let result = super::project_files::stage_connector_file_generation(
+        identity,
+        super::project_files::ProjectFileCompatFields {
+            repo_id: compat.as_ref().and_then(|record| record.repo_id.as_deref()),
+        },
+        generation_id,
+        &staging,
+        ctx.fields,
+        &mut writer,
+        &edges_dir,
+        &mut publication,
+        |entry| store.verified_blob(entry.content_sha256, entry.size),
+    )?;
+    // No checkout lease contributed to this bundle and no connector source can
+    // ever produce one, so there is no publication guard to hold.
     let (publication_result, commit_payload) =
         commit_snapshot_publications(&ctx.index, &mut writer, &edges_dir, publication.publish()?)?;
     publication_result.finalize_publications()?;
@@ -2351,6 +2524,11 @@ fn run_pass(
                             IndexWriterRetryableError::ReindexPassInProgress,
                         )));
                     }
+                    IndexWriteOp::StageConnectorGeneration { ack, .. } => {
+                        let _ = ack.send(Err(anyhow::Error::new(
+                            IndexWriterRetryableError::ReindexPassInProgress,
+                        )));
+                    }
                     IndexWriteOp::StageLocalGeneration { ack, .. } => {
                         let _ = ack.send(Err(anyhow::Error::new(
                             IndexWriterRetryableError::ReindexPassInProgress,
@@ -2489,6 +2667,7 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
         ),
         IndexWriteOp::ReindexPass { .. }
         | IndexWriteOp::StageCollectedGeneration { .. }
+        | IndexWriteOp::StageConnectorGeneration { .. }
         | IndexWriteOp::StageLocalGeneration { .. }
         | IndexWriteOp::StageGitCurrentOverlay { .. }
         | IndexWriteOp::StageConsolidatedHistory { .. }

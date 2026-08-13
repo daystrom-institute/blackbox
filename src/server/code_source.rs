@@ -2715,7 +2715,7 @@ fn schedule_cutback(
 /// is the activation half of the F1 fix. Bridge mode projects the version-1
 /// record, which is the only authority that exists there, so the
 /// "registered project disappeared" failure survives on that arm alone.
-fn resolve_code_project_identity(
+pub(super) fn resolve_code_project_identity(
     state: &Arc<SharedState>,
     project_id: &str,
     during: &str,

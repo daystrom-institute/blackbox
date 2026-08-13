@@ -40,6 +40,70 @@ pub struct ProjectFileCompatFields<'a> {
     pub repo_id: Option<&'a str>,
 }
 
+/// One entry as the staging loop sees it, independent of which lane produced
+/// it.
+///
+/// This exists because the file lane's manifest entry is NOT a
+/// [`bbox_code_source::ManifestEntry`] and must never be adapted into one:
+/// that type's `validate` applies the source-tree walker policy
+/// (`is_skipped_component`), which drops dotfiles and folders named `target`
+/// or `node_modules`. Those are ordinary documents in a remote store, so the
+/// file lane validates against its own contract and hands the staging loop
+/// this neutral view instead. The loop below needs exactly three facts about
+/// an entry, and both lanes can honestly supply them.
+///
+/// Borrowed rather than owned: both lanes already hold their entries for the
+/// whole call, and the loop reads every field twice (symbol pass, document
+/// pass).
+#[derive(Debug, Clone, Copy)]
+pub struct SourceStagingEntry<'a> {
+    /// Scope-relative, slash-separated. `relative_path` on the code lane,
+    /// `logical_path` on the file lane; the same thing to every consumer
+    /// downstream of this struct.
+    pub relative_path: &'a str,
+    pub content_sha256: &'a str,
+    pub size: u64,
+}
+
+impl<'a> SourceStagingEntry<'a> {
+    pub fn from_code_manifest(entry: &'a bbox_code_source::ManifestEntry) -> Self {
+        Self {
+            relative_path: &entry.relative_path,
+            content_sha256: &entry.content_sha256,
+            size: entry.size,
+        }
+    }
+}
+
+/// The per-lane facts the staging loop cannot derive from an entry.
+///
+/// Every field here is a place the code lane and the file lane genuinely
+/// disagree, which is why they are parameters rather than a shared descriptor:
+/// a connector source has no commit, no worktree to be dirty, and no
+/// repository-relative root to key Git edge targets under.
+#[derive(Debug, Clone, Copy)]
+struct GenerationStagingFacts<'a> {
+    /// The `code_source_generation` document field. The generation id for a
+    /// collected or connector generation, the literal `"local"` for the local
+    /// lane.
+    generation: &'a str,
+    /// `commit_sha` on every emitted document. `None` for a connector source:
+    /// there is no commit, and `remote_watermark` is display-only and
+    /// explicitly not authority, so it must not be laundered into a field
+    /// that means "the commit these bytes came from".
+    commit_sha: Option<&'a str>,
+    /// The scope's repository-relative root, used to key Git current-file
+    /// targets. `None` skips that derivation entirely, which is the connector
+    /// lane: there is no repository for an overlay to be about.
+    git_scope_relpath: Option<&'a str>,
+    /// Carried onto [`CollectedIndexResult`] for the caller's activation
+    /// record. Empty on the connector lane, where the manifest digest is the
+    /// fingerprint and a remote store is always dirty.
+    head_commit: &'a str,
+    dirty_fingerprint: &'a str,
+    worktree_dirty: bool,
+}
+
 /// Caller-supplied checkout roots for one project indexing operation.
 ///
 /// The daemon indexing layer obtains these roots from validated leases and
@@ -1477,7 +1541,7 @@ fn index_active_collected_project(
             edges_dir,
             &mut stats.publication,
             |entry| {
-                let mut file = store.verified_blob_file(&entry.content_sha256, entry.size)?;
+                let mut file = store.verified_blob_file(entry.content_sha256, entry.size)?;
                 let mut bytes = Vec::with_capacity(entry.size as usize);
                 file.read_to_end(&mut bytes)?;
                 Ok(bytes)
@@ -1684,17 +1748,89 @@ where
     let project_id = identity.project_id.as_str();
     let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, generation_id);
     let selector = collected_materialization_selector(project_id, generation_id);
+    let staging: Vec<SourceStagingEntry<'_>> = entries
+        .iter()
+        .map(SourceStagingEntry::from_code_manifest)
+        .collect();
     stage_project_file_generation(
         identity,
         ProjectFileCompatFields {
             repo_id: compat.repo_id,
         },
-        descriptor,
-        generation_id,
+        GenerationStagingFacts {
+            generation: generation_id,
+            commit_sha: Some(&descriptor.head_commit),
+            git_scope_relpath: Some(descriptor.scope.bbox_root_relpath()),
+            head_commit: &descriptor.head_commit,
+            dirty_fingerprint: &descriptor.dirty_fingerprint,
+            worktree_dirty: false,
+        },
+        &staging,
+        &selector,
+        &snapshot_id,
+        f,
+        writer,
+        edges_dir,
+        publication,
+        open_bytes,
+    )
+}
+
+/// Stage one CONNECTOR generation from immutable, already-verified blobs.
+///
+/// The file-lane sibling of [`stage_collected_project_generation`], and
+/// deliberately a parallel entry point rather than an adapter into it. The
+/// code lane's [`bbox_code_source::GenerationDescriptor`] carries a
+/// non-optional `PublishedScope`, a `head_commit`, and a `dirty_fingerprint`,
+/// and its manifest entry applies source-tree walker policy. A connector
+/// source has none of those: no repository, no commit, no worktree, and a
+/// document legitimately named `.plan.md` or filed under a folder called
+/// `target`. Mapping one onto the other would either fabricate a published
+/// scope or silently drop real documents.
+///
+/// What IS shared is everything downstream of byte acquisition: the same
+/// chunkers, the same symbol table, the same edge sidecar, the same
+/// `collected:` selector family, and the same documents. A connector source
+/// is an ordinary collected source to every reader, which is the whole point.
+///
+/// `open_bytes` must return the exact bytes the manifest entry names; the
+/// loop re-verifies size and digest before chunking, so a manifest that
+/// points at the wrong (still valid) blob fails here rather than indexing.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_connector_file_generation<F>(
+    identity: &CodeProjectIdentity,
+    compat: ProjectFileCompatFields<'_>,
+    generation_id: &str,
+    entries: &[SourceStagingEntry<'_>],
+    f: FieldHandles,
+    writer: &mut IndexWriter,
+    edges_dir: &Path,
+    publication: &mut ProjectIndexPublicationBundle,
+    open_bytes: F,
+) -> Result<CollectedIndexResult>
+where
+    F: FnMut(&SourceStagingEntry<'_>) -> Result<Vec<u8>>,
+{
+    let project_id = identity.project_id.as_str();
+    let snapshot_id = bbox_edge_sidecar::snapshot::collected_snapshot_id(project_id, generation_id);
+    let selector = collected_materialization_selector(project_id, generation_id);
+    stage_project_file_generation(
+        identity,
+        compat,
+        GenerationStagingFacts {
+            generation: generation_id,
+            // No commit exists. `remote_watermark` is display-only by
+            // contract and must not be laundered into `commit_sha`.
+            commit_sha: None,
+            // No repository, so no current-file Git overlay targets.
+            git_scope_relpath: None,
+            head_commit: "",
+            dirty_fingerprint: "",
+            worktree_dirty: false,
+        },
         entries,
         &selector,
         &snapshot_id,
-        false,
         f,
         writer,
         edges_dir,
@@ -1786,21 +1922,30 @@ pub fn stage_local_project_generation(
         // local lane.
         bbox_edge_sidecar::snapshot::clean_snapshot_id(scope.repo_id(), project_id, &head_commit)
     };
+    let staging: Vec<SourceStagingEntry<'_>> = entries
+        .iter()
+        .map(SourceStagingEntry::from_code_manifest)
+        .collect();
     stage_project_file_generation(
         identity,
         compat,
-        &descriptor,
-        "local",
-        &entries,
+        GenerationStagingFacts {
+            generation: "local",
+            commit_sha: Some(&descriptor.head_commit),
+            git_scope_relpath: Some(descriptor.scope.bbox_root_relpath()),
+            head_commit: &descriptor.head_commit,
+            dirty_fingerprint: &descriptor.dirty_fingerprint,
+            worktree_dirty,
+        },
+        &staging,
         &selector,
         &snapshot_id,
-        worktree_dirty,
         f,
         writer,
         edges_dir,
         publication,
         |entry| {
-            read_regular_file_confined(&root, Path::new(&entry.relative_path))
+            read_regular_file_confined(&root, Path::new(entry.relative_path))
                 .with_context(|| format!("re-reading local source {}", entry.relative_path))
         },
     )
@@ -1810,12 +1955,10 @@ pub fn stage_local_project_generation(
 fn stage_project_file_generation<F>(
     identity: &CodeProjectIdentity,
     compat: ProjectFileCompatFields<'_>,
-    descriptor: &bbox_code_source::GenerationDescriptor,
-    generation_id: &str,
-    entries: &[bbox_code_source::ManifestEntry],
+    facts: GenerationStagingFacts<'_>,
+    entries: &[SourceStagingEntry<'_>],
     selector: &str,
     snapshot_id: &str,
-    worktree_dirty: bool,
     f: FieldHandles,
     writer: &mut IndexWriter,
     edges_dir: &Path,
@@ -1823,7 +1966,7 @@ fn stage_project_file_generation<F>(
     mut open_bytes: F,
 ) -> Result<CollectedIndexResult>
 where
-    F: FnMut(&bbox_code_source::ManifestEntry) -> Result<Vec<u8>>,
+    F: FnMut(&SourceStagingEntry<'_>) -> Result<Vec<u8>>,
 {
     const MAX_STAGED_SYMBOLS: usize = 2_000_000;
     const MAX_STAGED_CHUNK_TARGETS: usize = 2_000_000;
@@ -1835,8 +1978,8 @@ where
     // first alias else the project id. No checkout root participates.
     let project_display = identity.display_name.as_str();
     let registry = chunker::default_registry();
-    let mut chunk_entry = |entry: &bbox_code_source::ManifestEntry| {
-        let relative_path = Path::new(&entry.relative_path);
+    let mut chunk_entry = |entry: &SourceStagingEntry<'_>| {
+        let relative_path = Path::new(entry.relative_path);
         let bytes = open_bytes(entry)
             .with_context(|| format!("opening collected source {}", entry.relative_path))?;
         if bytes.len() as u64 != entry.size || full_hash(&bytes) != entry.content_sha256 {
@@ -1906,11 +2049,18 @@ where
             &mut stats,
             Some(snapshot_id),
         ));
-        current_chunk_targets.extend(git_targets_for_scope(
-            descriptor.scope.bbox_root_relpath(),
-            &chunks,
-            Some(snapshot_id),
-        ));
+        // A connector source has no repository, so there is no
+        // repository-relative root to key current-file targets under and no
+        // post-activation Git overlay that would ever consume them. Skipping
+        // the derivation is the honest shape; deriving them against a
+        // fabricated root would populate a map whose keys name nothing.
+        if let Some(git_scope_relpath) = facts.git_scope_relpath {
+            current_chunk_targets.extend(git_targets_for_scope(
+                git_scope_relpath,
+                &chunks,
+                Some(snapshot_id),
+            ));
+        }
         if current_chunk_targets.len() > MAX_STAGED_CHUNK_TARGETS {
             anyhow::bail!("collected source chunk targets exceed the staging safety limit");
         }
@@ -1928,7 +2078,7 @@ where
             .collect::<Vec<_>>();
         edge_writer.append(&sidecar_edges)?;
 
-        let entry_key = bbox_code_source::source_entry_key(&selector, &entry.relative_path);
+        let entry_key = bbox_code_source::source_entry_key(selector, entry.relative_path);
         for chunk in chunks {
             let entity_id =
                 super::embed_hook::project_file_entity_id_for_snapshot(&chunk, Some(snapshot_id));
@@ -1940,12 +2090,12 @@ where
                 &chunk,
                 project_id,
                 compat.repo_id,
-                &entry.relative_path,
+                entry.relative_path,
                 project_display,
-                Some(&descriptor.head_commit),
+                facts.commit_sha,
                 Some(snapshot_id),
-                &selector,
-                generation_id,
+                selector,
+                facts.generation,
                 &entry_key,
                 f,
             );
@@ -1976,9 +2126,9 @@ where
         document_count: entity_ids.len() as u64,
         entity_inventory_sha256: hex::encode(inventory.finalize()),
         current_chunk_targets,
-        head_commit: descriptor.head_commit.clone(),
-        dirty_fingerprint: descriptor.dirty_fingerprint.clone(),
-        worktree_dirty,
+        head_commit: facts.head_commit.to_string(),
+        dirty_fingerprint: facts.dirty_fingerprint.to_string(),
+        worktree_dirty: facts.worktree_dirty,
         _snapshot_staging_guard: snapshot_staging_guard,
     })
 }

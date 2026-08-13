@@ -10,6 +10,8 @@ pub(crate) mod checkout_access;
 pub(crate) mod code_source;
 pub(crate) mod connector_grants;
 pub mod dispatch;
+pub(crate) mod file_source;
+pub(crate) mod file_source_activation;
 mod gap_view;
 pub(crate) mod git_source;
 pub mod handler;

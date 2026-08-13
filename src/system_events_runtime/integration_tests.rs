@@ -168,6 +168,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         code_sources: Arc::new(crate::server::code_source::CodeSourceRuntime::for_test(
             tmp.path(),
         )),
+        file_sources: Arc::new(crate::server::file_source::FileSourceRuntime::for_test(
+            tmp.path(),
+        )),
         git_sources: Arc::new(crate::server::git_source::GitSourceRuntime::for_test(
             tmp.path(),
         )),

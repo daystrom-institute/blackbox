@@ -1,0 +1,21 @@
+[package]
+name = "bbox-file-source-store"
+version = "0.0.1"
+edition = "2024"
+
+# Daemon-side durable store for connector-sourced generations. It is corpus
+# infrastructure, NOT satellite code: `bbox-file-collector` must never depend
+# on it, and scripts/acceptance-file-collector-deps.sh names this crate in its
+# forbidden list.
+[dependencies]
+anyhow = "1"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-file-source = { path = "../bbox-file-source" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

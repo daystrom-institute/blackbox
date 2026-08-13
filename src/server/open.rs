@@ -741,6 +741,11 @@ pub(super) fn open_shared_state(
         checkout_access.clone(),
         code_source_locality_cutover.clone(),
     )?);
+    // Opened beside the code lane and unconditionally: the store is a
+    // directory tree with no producer state, so opening it when no connector
+    // is configured costs two `mkdir -p` calls and keeps `SharedState`
+    // non-optional for every reader.
+    let file_sources = Arc::new(super::file_source::FileSourceRuntime::open(&cfg)?);
     if let Some(catalog_store) = catalog_store.as_ref() {
         code_source_locality_cutover.verify_live(
             catalog_store,
@@ -974,6 +979,7 @@ pub(super) fn open_shared_state(
         code_read_view: RwLock::new(Arc::new(code_read_view)),
         edge_index_ready: std::sync::atomic::AtomicBool::new(cfg.index.edge_index_boot_rebuild),
         code_sources,
+        file_sources,
         git_sources,
         knowledge_sources,
         git_transport_cutover,
@@ -1042,6 +1048,14 @@ pub(super) fn open_shared_state(
         )),
     });
     shared.install_code_read_view_commit_hook();
+
+    // Reconcile every granted connector scope against the derived manifest.
+    // The activation record, the manifest, and the state flip are three
+    // writes across two stores that share no transaction, so a crash between
+    // any pair leaves an observable tear; the store's classifier is total
+    // over those shapes and this is the one call that consumes it. Runs after
+    // the read view exists because a forward republish swaps it.
+    super::file_source_activation::recover_connector_activations(&shared);
 
     // Start the single-writer task-store persist actor (control-plane starvation
     // fix). Hot paths now signal `request_persist` instead of doing a blocking

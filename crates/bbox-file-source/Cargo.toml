@@ -1,0 +1,21 @@
+[package]
+name = "bbox-file-source"
+version = "0.0.1"
+edition = "2024"
+
+# Dependency-clean leaf wire crate for connector-sourced files, the sibling of
+# `bbox-code-source`. It is linked by BOTH the daemon and the producer
+# satellite, so it may only ever depend on other leaves. Adding a chunker,
+# index, store, vector, or model dependency here would smuggle that dependency
+# into `bbox-file-collector` and break the satellite's acceptance ceiling
+# (scripts/acceptance-file-collector-deps.sh).
+[dependencies]
+bbox-code-source = { path = "../bbox-code-source" }
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
