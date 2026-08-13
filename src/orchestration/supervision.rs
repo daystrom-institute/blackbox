@@ -701,7 +701,6 @@ pub(crate) fn context_ceiling_ratio() -> f64 {
     *RATIO.get_or_init(|| {
         let default = default_context_ceiling_ratio();
         // Env read happens once per process, off any hot path.
-        #[allow(clippy::disallowed_methods)]
         let raw = std::env::var("BBOX_CONTEXT_CEILING_RATIO").ok();
         match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => default,
