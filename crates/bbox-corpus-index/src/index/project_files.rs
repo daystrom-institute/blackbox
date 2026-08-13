@@ -1728,6 +1728,14 @@ pub fn build_project_file_doc(
 /// [`CodeProjectIdentity`] instead of a path-bearing `ProjectRecord`. At the
 /// P3-E cut the documents carry `project` = the identity's display name and
 /// `file_path`/`relative_path` = the manifest's normalized relative path.
+///
+/// `entries` stays a code-lane manifest because that is what this lane's
+/// callers hold, but `open_bytes` receives the neutral
+/// [`SourceStagingEntry`] the shared staging loop passes it, NOT a
+/// [`bbox_code_source::ManifestEntry`]. The two carry the same three facts
+/// here; the difference is that the view's `content_sha256` is a `&str`
+/// rather than a `String`, so a closure body wants `entry.content_sha256`
+/// and not `&entry.content_sha256`.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_collected_project_generation<F>(
     identity: &CodeProjectIdentity,
@@ -1742,7 +1750,7 @@ pub fn stage_collected_project_generation<F>(
     open_bytes: F,
 ) -> Result<CollectedIndexResult>
 where
-    F: FnMut(&bbox_code_source::ManifestEntry) -> Result<Vec<u8>>,
+    F: FnMut(&SourceStagingEntry<'_>) -> Result<Vec<u8>>,
 {
     descriptor.validate_manifest(entries, u64::MAX, u64::MAX)?;
     let project_id = identity.project_id.as_str();
