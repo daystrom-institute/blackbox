@@ -1,0 +1,23 @@
+{
+  "id": "gap-f48dd98d",
+  "title": "Commit-to-published latency is poll-bound; the watch plane exists but nothing registers it for publication",
+  "gap_kind": "tooling",
+  "domain": "knowledge-transport-latency",
+  "wanted_capability": "Event-driven publication for checkout-owner lanes: a commit to a published ref should reach the accepted publication in seconds, not a collector poll interval. Today the loop is poll-shaped end to end: the collector wakes on interval_secs (was 900, now 120 on this host), uploads a candidate, the auto-advance grant accepts it, and the edge-index warms. Meanwhile bbox_project_publisher_status already reports watcher_running: true with the base attachment listed under capable_but_unregistered and artifact_watching among its capabilities, so the daemon-side watch plane exists and nothing registers checkout attachments for commit-triggered publication. Wanted: (1) the collector (or the attachment watcher) subscribes to ref updates on registered checkouts (post-commit hook, fs event on .git refs, or daemon-pushed nudge) and runs the publish for exactly the affected project immediately; (2) the acceptance-to-served tail shrinks: the post-acceptance complete-graph-view rebuild currently defers on large sidecar graphs (edge-index watcher \"deferred a store-only nudge\" at 1.4M edges) or answers error.edge_index_warming for minutes, so incremental application of a single accepted generation's delta is the companion piece. Poll stays as the reconciliation backstop, events become the fast path.",
+  "missing_primitive": "ref-update-triggered publish on checkout attachments (watcher registration) plus incremental post-acceptance view application",
+  "fallback_used": "Dropped this host's collector interval_secs from 900 to 120 (cycles are ~200ms no-ops when current, so faster polling is nearly free); auto-advance grants remove the manual acceptance wait; own-visibility workspace captures already give sub-second iteration for the authoring checkout.",
+  "evidence": [
+    "thread-a2062843",
+    "bbox_project_publisher_status watcher block (capable_but_unregistered)",
+    "gap-a6911d0e (acceptance half of the same latency story, addressed)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/knowledge-transport-latency/event-driven-checkout-publication",
+  "notes": "Surfaced by the operator during the graph exemplar closeout: a 20-30 minute commit-to-useful wall clock reads as broken to an iterating user even though every stage is individually healthy. The latency budget worth designing to: commit to candidate in under 5s (event), acceptance instant (grant, shipped), serving under 30s (incremental view application).",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-a2062843",
+  "created_at": "2026-08-13T16:51:56Z",
+  "updated_at": "2026-08-13T16:51:56Z"
+}

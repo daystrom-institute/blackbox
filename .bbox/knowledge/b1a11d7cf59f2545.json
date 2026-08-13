@@ -1,0 +1,21 @@
+{
+  "id": "b1a11d7cf59f2545",
+  "title": "Graph index eligibility is conservative and schema-directed: by default ...",
+  "content": "Graph index eligibility is conservative and schema-directed: by default only vertex labels are word-indexed; graph schemas declare per-property annotations for text indexing and embedding participation, and embeddings are strictly per-kind opt-in under per-graph policy. No property is embedded or text-indexed implicitly.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "project_id": "89bd722f",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Prevents accidentally indexing credential-shaped or personal-data property values, matches the settled meaning-bearing-vs-mechanical split (embeddings for claim/decision-like kinds, word index for mechanical kinds), and deciding the annotation surface now lets schema authors annotate as they write instead of migrating at unified-retrieval time (M9). Operator ratified 2026-08-13.",
+  "source": "user",
+  "created_at": "2026-08-13T17:50:53Z",
+  "updated_at": "2026-08-13T17:50:53Z",
+  "recall_count": 0
+}
