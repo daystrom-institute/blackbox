@@ -21,20 +21,28 @@ use bbox_indexing::project_catalog_admin::{ConnectorGrantExpectation, find_conne
 use bro_rpc::ServiceToken;
 use sha2::{Digest, Sha256};
 
-/// One authenticated connector producer. Phase 0 mounts no wire endpoint, so
-/// nothing verifies a bearer yet; the token is loaded at build time anyway so
-/// an unreadable or unsafe token file refuses startup rather than surfacing
-/// on the first publication attempt.
-struct ConnectorAuthEntry {
-    #[allow(dead_code)] // Consumed by the Phase 1 wire endpoint.
-    token: ServiceToken,
-    producer_id: String,
-}
-
 /// Immutable grant table, rebuilt whenever the producer snapshot is rebuilt.
+///
+/// **This type retains no credential material, deliberately.** Each producer's
+/// token is loaded during [`ConnectorGrantRuntime::build`] so an unreadable,
+/// world-readable, symlinked, hardlinked, or malformed token file refuses
+/// startup, and it is digested there to prove no two producers share a token
+/// value. Then it is dropped. Phase 0 mounts no endpoint, so there is nothing
+/// to authenticate and no reason to hold a secret in memory for a phase that
+/// cannot use it.
+///
+/// That is why `Debug` is derived here and NOT on the sibling
+/// `ProducerAuthRuntime`: that runtime holds live `ServiceToken`s because it
+/// authenticates real requests, so it stays un-`Debug`-able and leans on
+/// `ServiceToken`'s own redacted `Debug` as a second line. Everything
+/// reachable from this struct is operator-declared config (producer ids,
+/// connector scopes, remote authorities) plus catalog project ids, none of it
+/// secret. If phase 1 reintroduces token retention here, it must revisit this
+/// derive; `the_grant_table_holds_no_credential_material` fails loudly if a
+/// token value ever becomes reachable through it.
+#[derive(Debug)]
 pub(crate) struct ConnectorGrantRuntime {
     enabled: bool,
-    entries: Vec<ConnectorAuthEntry>,
     grants: Vec<ConnectorGrantExpectation>,
     /// Granted scopes that already have a catalog project.
     scope_to_project: BTreeMap<ConnectorSourceId, ProjectId>,
@@ -47,7 +55,6 @@ impl ConnectorGrantRuntime {
     pub(crate) fn disabled() -> Self {
         Self {
             enabled: false,
-            entries: Vec::new(),
             grants: Vec::new(),
             scope_to_project: BTreeMap::new(),
             pending_onboard: BTreeSet::new(),
@@ -73,7 +80,6 @@ impl ConnectorGrantRuntime {
             bail!("enabled source connectors require at least one producer");
         }
 
-        let mut entries = Vec::new();
         let mut grants = Vec::new();
         let mut scope_to_project = BTreeMap::new();
         let mut pending_onboard = BTreeSet::new();
@@ -85,13 +91,22 @@ impl ConnectorGrantRuntime {
             if !producer_ids.insert(producer.producer_id.clone()) {
                 bail!("duplicate source-connector producer id");
             }
-            let token = ServiceToken::load(&producer.token_file).map_err(|error| {
-                anyhow::anyhow!(
-                    "loading source-connector token for {}: {error}",
-                    producer.producer_id
-                )
-            })?;
-            let token_digest = Sha256::digest(token.expose_secret().as_bytes());
+            // Load to VALIDATE, not to retain. `ServiceToken::load` performs
+            // the owner, mode, symlink, hardlink, and shape checks, so a
+            // misconfigured token file refuses startup here rather than on a
+            // first publication attempt. The digest proves no two producers
+            // share a token value. Both uses end inside this loop and the
+            // token is dropped: phase 0 has no endpoint to authenticate, so
+            // holding the secret would be custody without purpose.
+            let token_digest = {
+                let token = ServiceToken::load(&producer.token_file).map_err(|error| {
+                    anyhow::anyhow!(
+                        "loading source-connector token for {}: {error}",
+                        producer.producer_id
+                    )
+                })?;
+                Sha256::digest(token.expose_secret().as_bytes())
+            };
             if !token_digests.insert(token_digest.to_vec()) {
                 bail!("source-connector token values must be unique");
             }
@@ -134,36 +149,40 @@ impl ConnectorGrantRuntime {
                     remote_authority: grant.remote_authority.clone(),
                 });
             }
-            entries.push(ConnectorAuthEntry {
-                token,
-                producer_id: producer.producer_id.clone(),
-            });
         }
 
         Ok(Self {
             enabled: true,
-            entries,
             grants,
             scope_to_project,
             pending_onboard,
         })
     }
 
+    // The read surface below is the phase-1 seam. Phase 0 deliberately mounts
+    // no endpoint, so these have no non-test caller yet; they are defined and
+    // tested now so `/internal/file-source/v1/catalog/onboard` inherits a
+    // validated grant table rather than growing its own. Marked with the
+    // repo's documented-seam idiom rather than deleted-and-rewritten later.
+    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The grant table the onboarding composite validates against.
+    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn grants(&self) -> &[ConnectorGrantExpectation] {
         &self.grants
     }
 
     /// True when the scope is operator-configured but has no catalog project
     /// yet. Only onboarding may admit such a scope.
+    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn is_pending_onboard(&self, scope: &ConnectorScope) -> bool {
         self.pending_onboard.contains(scope)
     }
 
+    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 onboard endpoint.
     pub(crate) fn project_for(
         &self,
         connector_source_id: &ConnectorSourceId,
@@ -177,15 +196,19 @@ impl ConnectorGrantRuntime {
     /// the phase ends at "onboards, lists, and reports with no publication
     /// yet". Callers ask this rather than inferring eligibility from the
     /// presence of a grant, so Phase 1 has exactly one place to open.
+    #[allow(dead_code)] // Phase-0 seam consumed by the phase-1 publication lane.
     pub(crate) fn publication_project_ids(&self) -> BTreeSet<String> {
         BTreeSet::new()
     }
 
+    /// Configured producer ids, derived from the grants rather than stored
+    /// beside them: a producer with no scopes never builds, so the grant list
+    /// already names every producer and a second copy could only disagree.
     #[cfg(test)]
-    pub(crate) fn producer_ids(&self) -> Vec<&str> {
-        self.entries
+    pub(crate) fn producer_ids(&self) -> BTreeSet<&str> {
+        self.grants
             .iter()
-            .map(|entry| entry.producer_id.as_str())
+            .map(|grant| grant.producer_id.as_str())
             .collect()
     }
 
@@ -285,7 +308,7 @@ mod tests {
             "a pending scope is excluded from every publication lane"
         );
         assert_eq!(runtime.grants().len(), 1, "onboarding still sees the grant");
-        assert_eq!(runtime.producer_ids(), vec!["producer-a"]);
+        assert_eq!(runtime.producer_ids(), BTreeSet::from(["producer-a"]));
     }
 
     #[test]
@@ -350,6 +373,66 @@ mod tests {
         );
         let error = ConnectorGrantRuntime::build(&config, None).unwrap_err();
         assert!(error.to_string().contains("catalog project authority"));
+    }
+
+    #[test]
+    fn the_grant_table_holds_no_credential_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let secret = "b".repeat(64);
+        let config = config_with(
+            vec![ConnectorProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: token_file(&root, "token-a", &secret),
+                scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+            }],
+            true,
+        );
+        let catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let runtime = ConnectorGrantRuntime::build(&config, Some(&catalog)).unwrap();
+
+        // The token was loaded (and therefore validated) during build, but
+        // nothing about it survives into the table. This guards the `Debug`
+        // derive: if phase 1 reintroduces token retention, this fails and
+        // forces the redaction question to be answered again rather than
+        // leaking a bearer into a panic message or a test log.
+        let rendered = format!("{runtime:?}");
+        assert!(
+            !rendered.contains(&secret),
+            "a token value must never be reachable through the grant table"
+        );
+        assert!(
+            rendered.contains("producer-a") && rendered.contains(SOURCE_A),
+            "the rendering must still carry the operator-declared grant facts: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_token_file_still_refuses_startup() {
+        // Retaining nothing must not weaken the fail-closed load: the token
+        // is read at build time precisely so a bad file refuses here.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = token_file(&root, "token-a", &"a".repeat(64));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let config = config_with(
+            vec![ConnectorProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: path,
+                scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+            }],
+            true,
+        );
+        let catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let error = ConnectorGrantRuntime::build(&config, Some(&catalog)).unwrap_err();
+        assert!(
+            error.to_string().contains("producer-a"),
+            "the refusal must name the producer whose token file is unsafe: {error}"
+        );
     }
 
     #[test]
