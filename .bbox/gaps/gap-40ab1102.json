@@ -15,9 +15,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/knowledge-gaps-read-plane/project-filter-and-id-resolve-context",
   "notes": "Both prior gaps in this family were fixed by routing filter values through the shared resolver (project_id, alias, path) and by making lookup errors carry store identity; this is the same medicine on the knowledge/gaps surfaces. Note the constant \"legacy_compatibility rows have no provable built_from stamp\" diagnostic fires on every call including fully-stamped result sets, which trains callers to ignore diagnostics; it should fire only when legacy rows are actually present in the result.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-13T15:59:58Z",
-  "updated_at": "2026-08-13T15:59:58Z"
+  "updated_at": "2026-08-13T18:35:03Z",
+  "resolved_at": "2026-08-13T18:35:03Z",
+  "resolution_note": "Shipped on beta/blackbox-v2 (662d7312, branch fix/knowledge-gaps-project-filter, cluster verify green): the knowledge/gaps list adapters now arm the project_id predicate via the shared catalog resolver (project_id, alias, path; unresolvable values keep substring semantics and report themselves in diagnostics); bbox_gap_resolve/bbox_gap_update resolve a bare globally unique gap id against the served view with an honest precondition error naming the owning project on a genuine miss; the legacy_compatibility diagnostic rides only responses actually containing legacy-lane rows. Root cause: the adapters never set project_id, so catalog-published rows (project_id set, path None) could never match any filter shape."
 }

@@ -15,7 +15,10 @@
   "dedupe_key": "ontology/connectors/non-git-scope-minting",
   "suggested_owner": "blackbox",
   "notes": "Phase 0 of the remote-source connector design blocks on this; every network connector profile (file-tree, conversation, API-dataset) inherits it.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-08-11T00:00:00Z",
-  "updated_at": "2026-08-11T00:00:00Z"
+  "updated_at": "2026-08-13T18:34:59Z",
+  "resolved_at": "2026-08-13T18:34:59Z",
+  "resolution_note": "Phase 0 shipped on beta/blackbox-v2 (662d7312, branch feat/connector-scope-phase0, cluster verify green): ProjectScope::Connector(ConnectorScope { connector_source_id, connector_kind }) with uniqueness and grant lookup keyed on connector_source_id alone; provider coordinates as snapshot-level observations; content-derived catalog versioning (v2 until a connector scope exists, then v3) with the downgrade proven at both layers (typed unsupported_version from the startup probe, strict-deser refusal on direct row decode); [source_connectors] producer grant family with fail-closed token validation and no credential retention; grant-validated find-or-create onboarding composite; pending-onboarding admission excluded from every publication lane; honest rendering on catalog list/get and publisher status. Gate met: onboards/lists/reports with no publication, tampered and non-granted scopes refused, downgrade proven. Phase 1 (satellite substrate + fixture connector + wire endpoint) is the first caller of the onboarding composite."
 }
