@@ -522,6 +522,35 @@ Accepted implementation contract (carried from the salvage implementation):
 - connector reprojection or deletion changes freshness status but cannot
   delete tenant-owned bindings.
 
+One deviation from that contract was taken deliberately during implementation
+and is now the settled shape. Runtime endpoints are canonical `EntityRef`s
+with generic edge kinds, exactly as specified. The COMMITTED authoring form
+stops one step short of canonical for project-scoped endpoints: a canonical
+`project_file` or `project_graph_vertex` ref embeds a `project_id`, and
+`project_id` is assigned by whichever host registered the checkout, so baking
+one into a committed repo file makes that file wrong on every other host that
+clones it. A project-scoped endpoint therefore names only what the repo owns
+(graph id, vertex id, path and chunk hashes) and the loader materializes the
+canonical ref with the project id supplied by the lane the document arrived
+on. Endpoints that carry no project scope are authored as canonical ref
+strings directly, through a literal-ref form that refuses project-scoped types
+for this reason. Campaign invariant 1 is unaffected: no connector-specific
+entity variant is introduced, and the endpoint types are the existing
+canonical ones.
+
+Two further notes on the implemented shape:
+
+- the evidence lane rides the same repo-owned state transport as
+  `.bbox/knowledge` and `.bbox/graphs`, but carries no `built_from` stamp of
+  its own. Graph-shaped lanes are identified by generation identity rather
+  than by `BuiltFromStamp`, and the stamp variant set is frozen by an
+  acceptance scan; evidence follows the graph precedent;
+- adding a lane moves the working-pair capture commitment and both generation
+  identities, so the single pre-graphs legacy special case became an explicit
+  append-only vintage ladder. Each rung is the exact preimage some shipped
+  binary used, and an older rung stays admissible only for the absent-lane
+  shape a binary of that vintage could have produced.
+
 ## 10. Milestone 4: graph-aware connector runtime
 
 Generalize the connector shape into composable profiles on the producer/corpus
