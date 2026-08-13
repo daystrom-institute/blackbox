@@ -1108,9 +1108,10 @@ fn code_sources_section(state: &crate::server::state::SharedState) -> SectionRep
                                     bbox_corpus_core::project_catalog::ProjectScope::Published(
                                         scope,
                                     ) => Some(scope.clone()),
-                                    bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => {
-                                        None
-                                    }
+                                    bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal
+                                    | bbox_corpus_core::project_catalog::ProjectScope::Connector(
+                                        _,
+                                    ) => None,
                                 })
                                 .ok_or_else(|| {
                                     bbox_indexing::checkout_access::CheckoutAccessError::new(

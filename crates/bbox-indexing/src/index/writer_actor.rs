@@ -813,6 +813,12 @@ fn acquire_leases_for_record(
             (None, Some(scope), None)
         }
         Ok(crate::checkout_access::CheckoutRecordedProjectScope::LegacyLocal) => (None, None, None),
+        // A connector-scoped project has no checkout on any host, so there
+        // is no publisher config to read and nothing to deny: the durable
+        // row is already the whole answer. Reached only if a connector
+        // project ever acquires a path-bearing v1 record, which it cannot
+        // today (it has no attachment).
+        Ok(crate::checkout_access::CheckoutRecordedProjectScope::Connector) => (None, None, None),
         Ok(crate::checkout_access::CheckoutRecordedProjectScope::Unavailable) => {
             let publisher_config = broker.acquire(access_request(
                 &project.project_id,

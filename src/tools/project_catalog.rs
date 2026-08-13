@@ -241,6 +241,39 @@ fn scope_json(scope: &ProjectScope) -> serde_json::Value {
             "bbox_root_relpath": scope.bbox_root_relpath(),
         }),
         ProjectScope::LegacyLocal => json!({ "kind": "legacy_local" }),
+        // Identity only. Vendor coordinates never render here; they render
+        // beside the scope as observations so a reader cannot mistake one
+        // for the other.
+        ProjectScope::Connector(scope) => json!({
+            "kind": "connector",
+            "connector_source_id": scope.connector_source_id().as_str(),
+            "connector_kind": scope.connector_kind().as_str(),
+        }),
+    }
+}
+
+/// Observed vendor coordinates for a connector project, or `null`.
+///
+/// Rendered under an explicit `connector_observations` key, never merged
+/// into the scope object: these are the producer's claims about where the
+/// source lives, refreshed on every onboarding report, and the daemon
+/// verifies none of them.
+fn connector_observations_json(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    project: &bbox_corpus_core::project_catalog::CorpusProject,
+) -> serde_json::Value {
+    if project.scope.connector().is_none() {
+        return serde_json::Value::Null;
+    }
+    match catalog.connector_observations.get(&project.project_id) {
+        Some(observed) => json!({
+            "observed_at": observed.observed_at,
+            "producer_id": observed.producer_id,
+            "remote_authority": observed.remote_authority,
+            "remote_root_id": observed.remote_root_id,
+            "remote_display_name": observed.remote_display_name,
+        }),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -474,7 +507,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_catalog_list",
-        description = "List every project in the durable catalog, including remote-only projects with no attachment on this host. Path-free rows: project_id, display_name, scope (published repo_id + bbox_root_relpath, or legacy_local), operator and nominated aliases, and the count of active attachments. Returns the catalog epoch to pass as expected_catalog_epoch on a following administration call. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "List every project in the durable catalog, including remote-only projects with no attachment on this host. Path-free rows: project_id, display_name, scope (published repo_id + bbox_root_relpath, legacy_local, or connector connector_source_id + connector_kind), connector_observations (a connector producer's observed vendor coordinates, null for every other scope family; observations are replaceable claims, never identity), operator and nominated aliases, and the count of active attachments. Returns the catalog epoch to pass as expected_catalog_epoch on a following administration call. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_catalog_list(
         &self,
@@ -505,6 +538,8 @@ impl BlackboxServer {
                         "project_id": project.project_id.as_str(),
                         "display_name": project.display_name,
                         "scope": scope_json(&project.scope),
+                        "connector_observations":
+                            connector_observations_json(state.catalog(), project),
                         "operator_aliases": project.operator_aliases,
                         "nominated_aliases": project.nominated_aliases,
                         "active_attachments": active,
@@ -521,7 +556,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_catalog_get",
-        description = "Read one catalog project: its id, display name, scope, aliases, pending alias nominations, and repo-history reference, plus a separate host_local_attachments section carrying this host's attachment rows (attachment_id, status, kind, checkout dir, relpath). The catalog section stays path-free; attachment paths are host-local operator data. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project: its id, display name, scope, connector_observations, aliases, pending alias nominations, and repo-history reference, plus a separate host_local_attachments section carrying this host's attachment rows (attachment_id, status, kind, checkout dir, relpath). The catalog section stays path-free; attachment paths are host-local operator data. A connector-scoped project has no attachment and no repo history, and its vendor coordinates render only as connector_observations: they are what a producer reported, refreshed on every onboarding, and never the project's identity. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_catalog_get(
         &self,
@@ -568,6 +603,8 @@ impl BlackboxServer {
                     "project_id": project.project_id.as_str(),
                     "display_name": project.display_name,
                     "scope": scope_json(&project.scope),
+                    "connector_observations":
+                        connector_observations_json(state.catalog(), project),
                     "operator_aliases": project.operator_aliases,
                     "nominated_aliases": project.nominated_aliases,
                     "repo_history": project.repo_history.as_ref().map(|id| id.as_str()),
@@ -1258,7 +1295,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports current, prior-fallback, missing, or corrupt state; accepted scope, ref, commit, generation identity, pointer SHA-256, and the typed source binding. Attachment bindings name an attachment; producer bindings name the producer plus source generation id and evidence hash. It also reports scope agreement and advance availability. A `health` object adds the bounded runtime projection: binding status, source kind, recorded attachment capabilities, overlay outcomes, and watcher state. An `auto_advance` object reports the standing operator grant (enabled, the audit reason that installed it, and whether the accepted binding is producer-bound and therefore eligible) plus the last policy attempt and why it did or did not move the pointer. Generation id and pointer SHA-256 are the compare-and-swap tokens bbox_project_publisher_advance requires. The call is observational, takes no checkout lease, and is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports current, prior-fallback, missing, or corrupt state; accepted scope, ref, commit, generation identity, pointer SHA-256, and the typed source binding. Attachment bindings name an attachment; producer bindings name the producer plus source generation id and evidence hash. It also reports scope agreement and advance availability. A `health` object adds the bounded runtime projection: binding status, source kind, recorded attachment capabilities, overlay outcomes, and watcher state. An `auto_advance` object reports the standing operator grant (enabled, the audit reason that installed it, and whether the accepted binding is producer-bound and therefore eligible) plus the last policy attempt and why it did or did not move the pointer. Generation id and pointer SHA-256 are the compare-and-swap tokens bbox_project_publisher_advance requires. The response also echoes the project's catalog `scope`, and for a connector source adds a `connector` object naming the connector_source_id, the connector kind, the producer's observed vendor coordinates, and an empty publication_lanes list: a connector source onboards, lists, and reports before any publication lane exists, so it claims none. The call is observational, takes no checkout lease, and is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -1281,7 +1318,10 @@ impl BlackboxServer {
             };
             let catalog_scope = match &project.scope {
                 bbox_corpus_core::project_catalog::ProjectScope::Published(scope) => Some(scope),
-                bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => None,
+                // A connector project has no published scope to agree or
+                // disagree with, exactly like a legacy-local one.
+                bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal
+                | bbox_corpus_core::project_catalog::ProjectScope::Connector(_) => None,
             };
             let status = runtime
                 .status(&project_id, catalog_scope)
@@ -1329,8 +1369,23 @@ impl BlackboxServer {
                 .knowledge_sources
                 .auto_advance_ledger()
                 .last_attempt(project_id.as_str());
+            // A connector project reports its family honestly and claims no
+            // publication lane: Phase 0 of the connector program onboards,
+            // lists, and reports, and publishes nothing. `publication_lanes`
+            // is empty rather than absent so a reader sees the claim was
+            // made, not that the field was forgotten.
+            let connector = project.scope.connector().map(|scope| {
+                json!({
+                    "connector_source_id": scope.connector_source_id().as_str(),
+                    "connector_kind": scope.connector_kind().as_str(),
+                    "observations": connector_observations_json(state.catalog(), project),
+                    "publication_lanes": Vec::<String>::new(),
+                })
+            });
             Ok(serde_json::to_string_pretty(&json!({
                 "project_id": project_id.as_str(),
+                "scope": scope_json(&project.scope),
+                "connector": connector,
                 "accepted_state": accepted_state_label(status.state()),
                 "published_available": status.published_available(),
                 "advance_available": status.advance_available(),
@@ -1934,6 +1989,10 @@ impl BlackboxServer {
                     "the moved directory carries no checkout identity marker; detach the \
                      old attachment and re-attach the new path explicitly"
                 }
+                ProjectScope::Connector(_) => {
+                    "this project is connector-scoped and owns no local checkout, so there \
+                     is nothing to relocate"
+                }
             };
             anyhow::bail!("error.project_catalog_admin_checkout_identity_missing: {instruction}");
         };
@@ -2336,6 +2395,114 @@ mod tests {
             );
             assert_eq!(text, expected, "refusal text must be the shared one");
         }
+    }
+
+    #[test]
+    fn connector_scope_renders_as_its_own_family() {
+        use bbox_corpus_core::project_catalog::ConnectorScope;
+
+        let rendered = scope_json(&ProjectScope::Connector(
+            ConnectorScope::try_new("csrc_5f2c1d9a4b6e470e", "gdrive").unwrap(),
+        ));
+        assert_eq!(
+            rendered,
+            json!({
+                "kind": "connector",
+                "connector_source_id": "csrc_5f2c1d9a4b6e470e",
+                "connector_kind": "gdrive",
+            }),
+            "the scope object carries identity only, never a vendor coordinate"
+        );
+        assert_eq!(
+            scope_json(&ProjectScope::LegacyLocal),
+            json!({ "kind": "legacy_local" }),
+            "the other families render exactly as before"
+        );
+        assert_eq!(
+            scope_json(&ProjectScope::Published(
+                PublishedScope::try_new("repo-a", ".").unwrap()
+            )),
+            json!({
+                "kind": "published",
+                "repo_id": "repo-a",
+                "bbox_root_relpath": ".",
+            })
+        );
+    }
+
+    #[test]
+    fn connector_observations_render_beside_the_scope_not_inside_it() {
+        use bbox_corpus_core::project_catalog::{
+            CatalogSnapshotV2, ConnectorObservationsV1, ConnectorScope, CorpusProject,
+        };
+        use std::collections::BTreeSet;
+
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let connector_id = ProjectId::parse("p_000000000000000000000000000000a1").unwrap();
+        let published_id = ProjectId::parse("p_000000000000000000000000000000b1").unwrap();
+        let project = |project_id: &ProjectId, scope: ProjectScope| CorpusProject {
+            project_id: project_id.clone(),
+            scope,
+            operator_aliases: BTreeSet::new(),
+            nominated_aliases: BTreeSet::new(),
+            display_name: "Example".into(),
+            created_at: "2026-08-13T00:00:00Z".into(),
+            registered_at_compat: None,
+            repo_history: None,
+            languages: BTreeSet::new(),
+        };
+        let connector_project = project(
+            &connector_id,
+            ProjectScope::Connector(
+                ConnectorScope::try_new("csrc_5f2c1d9a4b6e470e", "gdrive").unwrap(),
+            ),
+        );
+        let published_project = project(
+            &published_id,
+            ProjectScope::Published(PublishedScope::try_new("repo-a", ".").unwrap()),
+        );
+        catalog
+            .projects
+            .insert(connector_id.clone(), connector_project.clone());
+        catalog
+            .projects
+            .insert(published_id.clone(), published_project.clone());
+        catalog.connector_observations.insert(
+            connector_id.clone(),
+            ConnectorObservationsV1 {
+                observed_at: "2026-08-13T00:00:00Z".into(),
+                producer_id: Some("producer-a".into()),
+                remote_authority: Some("tenant.example".into()),
+                remote_root_id: Some("0ABcDeFgHiJkLmN".into()),
+                remote_display_name: Some("Ops shared folder".into()),
+            },
+        );
+        catalog.sync_version();
+        catalog.validate().unwrap();
+
+        assert_eq!(
+            connector_observations_json(&catalog, &connector_project),
+            json!({
+                "observed_at": "2026-08-13T00:00:00Z",
+                "producer_id": "producer-a",
+                "remote_authority": "tenant.example",
+                "remote_root_id": "0ABcDeFgHiJkLmN",
+                "remote_display_name": "Ops shared folder",
+            })
+        );
+        assert_eq!(
+            connector_observations_json(&catalog, &published_project),
+            serde_json::Value::Null,
+            "only a connector project can carry connector observations"
+        );
+
+        // A connector project onboarded but never reported on renders null
+        // observations rather than an invented coordinate.
+        catalog.connector_observations.remove(&connector_id);
+        assert_eq!(
+            connector_observations_json(&catalog, &connector_project),
+            serde_json::Value::Null
+        );
     }
 
     #[test]

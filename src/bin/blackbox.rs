@@ -3187,6 +3187,11 @@ fn scope_json(scope: &ProjectScope) -> serde_json::Value {
             "repo_id": scope.repo_id(),
             "bbox_root_relpath": scope.bbox_root_relpath(),
         }),
+        ProjectScope::Connector(scope) => serde_json::json!({
+            "kind": "connector",
+            "connector_source_id": scope.connector_source_id().as_str(),
+            "connector_kind": scope.connector_kind().as_str(),
+        }),
     }
 }
 
@@ -4873,7 +4878,7 @@ fn current_scope_hashes(
         .get(project_id)
         .and_then(|project| match &project.scope {
             ProjectScope::Published(scope) => Some(bbox_code_source::scope_hash(scope)),
-            ProjectScope::LegacyLocal => None,
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         })
         .into_iter()
         .collect()
@@ -4916,7 +4921,7 @@ fn capture_retirement_evidence(
         .collect::<Vec<_>>();
     let current_scope = match &project.scope {
         ProjectScope::Published(scope) => Some(scope),
-        ProjectScope::LegacyLocal => None,
+        ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
     };
 
     let code_sources = config.paths.state_dir.join("code-sources");

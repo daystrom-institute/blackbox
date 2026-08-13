@@ -2474,7 +2474,7 @@ impl SharedState {
         let project = snapshot.catalog().projects.get(&parsed)?;
         let catalog_scope = match &project.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         };
 
         let accepted_status = self

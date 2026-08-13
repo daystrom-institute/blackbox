@@ -1846,7 +1846,10 @@ fn gc_blobs_for_mode(
             bbox_corpus_core::project_catalog::ProjectScope::Published(scope) => {
                 Some(scope.clone())
             }
-            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => None,
+            // Neither holds collected code-source blobs under a published
+            // scope, so neither contributes a GC root here.
+            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal
+            | bbox_corpus_core::project_catalog::ProjectScope::Connector(_) => None,
         })
         .collect::<std::collections::BTreeSet<_>>();
     // Section 9.5 GC root: every non-null code_bridge_generation in
@@ -4450,7 +4453,8 @@ fn is_bridge_open(
             bbox_corpus_core::project_catalog::ProjectScope::Published(pub_scope) => {
                 pub_scope == scope
             }
-            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal => false,
+            bbox_corpus_core::project_catalog::ProjectScope::LegacyLocal
+            | bbox_corpus_core::project_catalog::ProjectScope::Connector(_) => false,
         },
         None => false,
     }
@@ -4581,7 +4585,9 @@ fn try_automatic_bridge_clear(state: &Arc<SharedState>, project_id: &str) -> Res
     };
     let bridge_is_stale = match &record.new_scope {
         ProjectScope::Published(new_scope) => new_scope == current_scope,
-        ProjectScope::LegacyLocal => false,
+        // A scope migration never targets either family from a published
+        // project; treat both as "not the current scope".
+        ProjectScope::LegacyLocal | ProjectScope::Connector(_) => false,
     };
     if !bridge_is_stale {
         return Ok(false);
@@ -11268,6 +11274,7 @@ mod tests {
             repo_histories: BTreeMap::new(),
             ambiguous_namespaces: BTreeMap::new(),
             scope_migrations,
+            connector_observations: BTreeMap::new(),
         }
     }
 

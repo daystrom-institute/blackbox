@@ -171,7 +171,7 @@ impl CatalogBaseTargets {
                 .get(&attachment.project_id)
                 .and_then(|project| match &project.scope {
                     ProjectScope::Published(scope) => Some(scope.clone()),
-                    ProjectScope::LegacyLocal => None,
+                    ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
                 });
             // A second active base makes the target ambiguous, and the
             // compatibility projection already omits such a project. Drop

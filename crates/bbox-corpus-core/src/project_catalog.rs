@@ -18,6 +18,15 @@ use crate::identity::PublishedScope;
 use crate::language::Language;
 
 pub const CATALOG_VERSION_V2: u32 = 2;
+/// Catalog wire version that carries the connector scope family.
+///
+/// The version is DERIVED from content, never chosen: a catalog holding no
+/// connector scope keeps writing [`CATALOG_VERSION_V2`] bytes, so a daemon
+/// predating this family still opens it. See
+/// [`CatalogSnapshotV2::required_version`].
+pub const CATALOG_VERSION_V3: u32 = 3;
+/// Highest catalog wire version this build can open.
+pub const CATALOG_VERSION_MAX: u32 = CATALOG_VERSION_V3;
 pub const ATTACHMENT_VERSION_V1: u32 = 1;
 pub const LEGACY_PROJECT_STORE_VERSION_V1: u32 = 1;
 pub const MAX_PROJECT_CATALOG_BYTES: usize = 8 * 1024 * 1024;
@@ -31,6 +40,10 @@ const MAX_TIMESTAMP_BYTES: usize = 128;
 const MAX_AUDIT_SOURCE_BYTES: usize = 256;
 const MAX_AUDIT_REASON_BYTES: usize = 1024;
 const MAX_PATH_BYTES: usize = 4096;
+const MIN_CONNECTOR_SOURCE_ID_BYTES: usize = 8;
+const MAX_CONNECTOR_SOURCE_ID_BYTES: usize = 128;
+const MAX_CONNECTOR_KIND_BYTES: usize = 64;
+const MAX_CONNECTOR_OBSERVATION_BYTES: usize = 256;
 const MINT_RETRIES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +138,79 @@ fn validate_commit_namespace(value: &str) -> Result<(), ProjectCatalogError> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return Err(invalid_id("commit_namespace"));
+    }
+    Ok(())
+}
+
+/// Shape rule for the operator-minted `connector_source_id`.
+///
+/// The id is IDENTITY for a connector-scoped project and the daemon can
+/// never recompute it from anything: it is minted once by the operator and
+/// written into both sides of the two-sided config (the daemon's producer
+/// grant and the satellite's source config). The daemon therefore validates
+/// shape only, and the shape exists to kill whole classes of transcription
+/// and confusion error rather than to prove anything about the remote store:
+///
+/// - **opaque**: no structure is parsed out of it and none is implied. It is
+///   not a path, a URL, a repo id, or a vendor coordinate;
+/// - **length-bounded**: 8 to 128 bytes. The floor refuses ids too short to
+///   survive a transcription slip between two config files; the ceiling
+///   bounds the durable record;
+/// - **non-path-shaped**: ASCII lowercase alphanumerics plus `_`, `-`, and
+///   `.`, which excludes `/`, `\`, `:`, whitespace, and control bytes. It
+///   must start and end with an alphanumeric (so `.`, `..`, and dotfile
+///   shapes are refused) and may not contain `..` anywhere;
+/// - **lowercase**: two ids differing only by case would be two distinct
+///   durable scopes that no human review would separate, so case is not a
+///   distinguishing dimension at all.
+///
+/// Nothing here mandates a mint algorithm. A UUID, a random token, or a
+/// readable slug all pass; the recommended form is a short prefix plus a
+/// UUID (`csrc_5f2c…`), which keeps a connector scope legible in logs.
+fn validate_connector_source_id(value: &str) -> Result<(), ProjectCatalogError> {
+    let bytes = value.as_bytes();
+    if bytes.len() < MIN_CONNECTOR_SOURCE_ID_BYTES || bytes.len() > MAX_CONNECTOR_SOURCE_ID_BYTES {
+        return Err(invalid_id("connector_source_id"));
+    }
+    if !bytes
+        .iter()
+        .all(|byte| is_connector_id_byte(*byte) || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(invalid_id("connector_source_id"));
+    }
+    if !is_connector_id_byte(bytes[0]) || !is_connector_id_byte(bytes[bytes.len() - 1]) {
+        return Err(invalid_id("connector_source_id"));
+    }
+    if value.contains("..") {
+        return Err(invalid_id("connector_source_id"));
+    }
+    Ok(())
+}
+
+fn is_connector_id_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit()
+}
+
+/// Shape rule for `connector_kind`, the operator's declared connector family
+/// (`gdrive`, `graph`, `webdav`, `s3`, ...).
+///
+/// It is deliberately an opaque validated token and NOT a closed enum: the
+/// connector program's first invariant is that Blackbox core grows no
+/// vendor-specific variants, so the corpus never learns the catalog of
+/// vendors. Lowercase letters and digits plus `_`, leading letter, bounded.
+fn validate_connector_kind(value: &str) -> Result<(), ProjectCatalogError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_CONNECTOR_KIND_BYTES {
+        return Err(invalid_id("connector_kind"));
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return Err(invalid_id("connector_kind"));
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return Err(invalid_id("connector_kind"));
     }
     Ok(())
 }
@@ -228,6 +314,8 @@ parsed_string_type!(LegacyPathBindingId, |value: &str| {
 parsed_string_type!(ProjectCatalogTransactionId, |value: &str| {
     validate_minted_id(value, "pct_", "project_catalog_transaction_id")
 });
+parsed_string_type!(ConnectorSourceId, validate_connector_source_id);
+parsed_string_type!(ConnectorKind, validate_connector_kind);
 parsed_string_type!(RepoHistoryGenerationId, |value: &str| {
     validate_content_addressed_id(value, "rhg_", "repo_history_generation_id")
 });
@@ -315,20 +403,194 @@ fn is_local_commit_namespace(namespace: &CommitNamespace) -> bool {
 pub enum ProjectScope {
     Published(PublishedScope),
     LegacyLocal,
+    /// A remote source with no git repository and no committed config: a
+    /// document store folder, a workspace, an API tenant.
+    ///
+    /// Identity is the operator's declaration, not a vendor fact. See
+    /// [`ConnectorScope`].
+    Connector(ConnectorScope),
 }
 
 impl ProjectScope {
     fn validate(&self) -> Result<(), ProjectCatalogError> {
-        if let Self::Published(scope) = self {
-            scope.validate().map_err(|error| {
+        match self {
+            Self::Published(scope) => scope.validate().map_err(|error| {
                 ProjectCatalogError::new(
                     "error.project_catalog_invalid_scope",
                     format!("invalid published scope {}", error.field()),
                 )
-            })?;
+            })?,
+            Self::LegacyLocal => {}
+            Self::Connector(scope) => scope.validate()?,
         }
         Ok(())
     }
+
+    /// Stable wire label for this scope family, shared by every read surface
+    /// so `kind` reads identically from the catalog, the CLI, and the tools.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Published(_) => "published",
+            Self::LegacyLocal => "legacy_local",
+            Self::Connector(_) => "connector",
+        }
+    }
+
+    /// The published scope, or `None` for every family that has none. A
+    /// connector scope is never a published scope: it names no repository,
+    /// no commit, and no checkout.
+    pub fn published(&self) -> Option<&PublishedScope> {
+        match self {
+            Self::Published(scope) => Some(scope),
+            Self::LegacyLocal | Self::Connector(_) => None,
+        }
+    }
+
+    pub fn connector(&self) -> Option<&ConnectorScope> {
+        match self {
+            Self::Connector(scope) => Some(scope),
+            Self::Published(_) | Self::LegacyLocal => None,
+        }
+    }
+}
+
+/// Durable identity for a connector source.
+///
+/// Resolved by operator decision (2026-08-12): identity is a grant-time,
+/// operator-minted, opaque `connector_source_id` written into both sides of
+/// the two-sided config. Provider coordinates (folder ids, drive ids,
+/// workspace ids, tenant ids) are NOT identity and never enter this type;
+/// they travel as replaceable observations
+/// ([`ConnectorObservationsV1`]) exactly as absolute paths travel as
+/// attachment observations for a git source.
+///
+/// Why not vendor coordinates: "stable" is per-vendor and softer than a
+/// commit hash (folder moves survive, tenant migrations and account
+/// transfers do not), WebDAV and S3 have no id concept at all, and the
+/// daemon can independently recompute none of it. The accepted cost is that
+/// two operators onboarding the same folder mint two scopes with no
+/// mechanical convergence; that is what `LegacyLocal` already pays and is
+/// closable later by an operator-declared alias, which is additive.
+///
+/// `connector_kind` rides along as the operator's grant-time declaration of
+/// which connector family serves the source. It is durable because every
+/// read surface must report the family honestly and Phase 0 has no other
+/// durable home for it, but it is NOT part of identity: catalog uniqueness
+/// and every grant lookup key on `connector_source_id` alone, so one id can
+/// never name two projects even under a mistyped kind.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorScope {
+    connector_source_id: ConnectorSourceId,
+    connector_kind: ConnectorKind,
+}
+
+impl ConnectorScope {
+    pub fn new(connector_source_id: ConnectorSourceId, connector_kind: ConnectorKind) -> Self {
+        Self {
+            connector_source_id,
+            connector_kind,
+        }
+    }
+
+    /// Parse and validate both halves from operator-supplied strings.
+    pub fn try_new(
+        connector_source_id: impl Into<String>,
+        connector_kind: impl Into<String>,
+    ) -> Result<Self, ProjectCatalogError> {
+        Ok(Self {
+            connector_source_id: ConnectorSourceId::parse(connector_source_id)?,
+            connector_kind: ConnectorKind::parse(connector_kind)?,
+        })
+    }
+
+    pub fn connector_source_id(&self) -> &ConnectorSourceId {
+        &self.connector_source_id
+    }
+
+    pub fn connector_kind(&self) -> &ConnectorKind {
+        &self.connector_kind
+    }
+
+    pub fn validate(&self) -> Result<(), ProjectCatalogError> {
+        validate_connector_source_id(self.connector_source_id.as_str())?;
+        validate_connector_kind(self.connector_kind.as_str())?;
+        Ok(())
+    }
+}
+
+impl fmt::Display for ConnectorScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.connector_kind, self.connector_source_id)
+    }
+}
+
+/// Vendor coordinates a producer OBSERVED for a connector-scoped project.
+///
+/// Every field here is an observation: replaceable on the next onboarding
+/// report, never compared for identity, never a lookup key, and never a
+/// reason to accept or refuse anything. The daemon cannot recompute any of
+/// it and does not pretend to verify it. Recording it is what lets an
+/// operator see which folder or tenant a durable scope is pointed at without
+/// letting a vendor coordinate become the scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorObservationsV1 {
+    /// When the producer reported these coordinates.
+    pub observed_at: String,
+    /// The producer that reported them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_id: Option<String>,
+    /// Vendor tenant or account the source was observed under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_authority: Option<String>,
+    /// The store's own id for the scope root (a folder file id, a drive plus
+    /// item id, a bucket plus prefix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_root_id: Option<String>,
+    /// Human-facing name the vendor shows for the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_display_name: Option<String>,
+}
+
+impl ConnectorObservationsV1 {
+    pub fn validate(&self) -> Result<(), ProjectCatalogError> {
+        validate_timestamp(&self.observed_at, "connector observation observed_at")?;
+        for (value, field) in [
+            (&self.producer_id, "connector observation producer_id"),
+            (
+                &self.remote_authority,
+                "connector observation remote_authority",
+            ),
+            (&self.remote_root_id, "connector observation remote_root_id"),
+            (
+                &self.remote_display_name,
+                "connector observation remote_display_name",
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_observation_text(value, field)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Observations are operator-visible vendor text, so they are bounded and
+/// control-free, and nothing else. They are never parsed.
+fn validate_observation_text(value: &str, field: &'static str) -> Result<(), ProjectCatalogError> {
+    if value.is_empty()
+        || value.len() > MAX_CONNECTOR_OBSERVATION_BYTES
+        || value.chars().any(|ch| ch.is_control())
+    {
+        return Err(ProjectCatalogError::new(
+            "error.project_catalog_invalid_connector_observation",
+            format!("invalid {field}"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -497,6 +759,13 @@ pub struct CatalogSnapshotV2 {
     pub repo_histories: BTreeMap<RepoHistoryId, RepoHistoryRecord>,
     pub ambiguous_namespaces: BTreeMap<CommitNamespace, AmbiguousNamespaceRecord>,
     pub scope_migrations: BTreeMap<ScopeMigrationId, ScopeMigrationRecord>,
+    /// Observed vendor coordinates for connector-scoped projects, keyed by
+    /// project id. Absent from the bytes entirely when empty, which is what
+    /// keeps a connector-free catalog byte-identical to a pre-connector
+    /// write. An entry for a project that is not connector-scoped is
+    /// refused: only a connector project can carry connector observations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connector_observations: BTreeMap<ProjectId, ConnectorObservationsV1>,
 }
 
 impl CatalogSnapshotV2 {
@@ -509,6 +778,7 @@ impl CatalogSnapshotV2 {
             repo_histories: BTreeMap::new(),
             ambiguous_namespaces: BTreeMap::new(),
             scope_migrations: BTreeMap::new(),
+            connector_observations: BTreeMap::new(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -516,6 +786,38 @@ impl CatalogSnapshotV2 {
 
     pub fn validate(&self) -> Result<(), ProjectCatalogError> {
         validate_catalog(self)
+    }
+
+    /// The lowest catalog wire version that can represent this content.
+    ///
+    /// This is the whole downgrade story. The version field is DERIVED, not
+    /// chosen: a catalog holding no connector scope reports
+    /// [`CATALOG_VERSION_V2`] and is written as v2 bytes, so a daemon
+    /// predating the connector family opens it unchanged. The moment one
+    /// connector scope exists the catalog reports [`CATALOG_VERSION_V3`],
+    /// and an older daemon then FAILS CLOSED on it with
+    /// `error.project_catalog_unsupported_version` rather than silently
+    /// dropping projects it cannot represent. Losing a connector project to
+    /// a downgrade would orphan its content and free its scope for reuse;
+    /// refusing to open is the only honest outcome, and it is named here so
+    /// nobody rediscovers it during an incident.
+    pub fn required_version(&self) -> u32 {
+        if self
+            .projects
+            .values()
+            .any(|project| matches!(project.scope, ProjectScope::Connector(_)))
+        {
+            CATALOG_VERSION_V3
+        } else {
+            CATALOG_VERSION_V2
+        }
+    }
+
+    /// Set `version` to exactly what the content requires. The durable store
+    /// calls this on the write path; a transaction closure never chooses the
+    /// version itself.
+    pub fn sync_version(&mut self) {
+        self.version = self.required_version();
     }
 }
 
@@ -838,10 +1140,22 @@ fn collection_limit(kind: &'static str) -> ProjectCatalogError {
 }
 
 fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogError> {
-    if snapshot.version != CATALOG_VERSION_V2 {
+    // The version is a function of content, checked in both directions: an
+    // unknown version cannot be opened, and a version too LOW for what the
+    // bytes carry is refused rather than laundered into a valid-looking
+    // catalog. A v2-declared file holding connector scopes is exactly what a
+    // hand-edit or a partial downgrade produces, and accepting it would mean
+    // writing v2 bytes an older daemon then reads as a truncated catalog.
+    if !(CATALOG_VERSION_V2..=CATALOG_VERSION_MAX).contains(&snapshot.version) {
         return Err(ProjectCatalogError::new(
             "error.project_catalog_unsupported_version",
             "catalog version is unsupported",
+        ));
+    }
+    if snapshot.version < snapshot.required_version() {
+        return Err(ProjectCatalogError::new(
+            "error.project_catalog_unsupported_version",
+            "catalog version is lower than its content requires",
         ));
     }
     if snapshot.epoch == 0 {
@@ -862,6 +1176,7 @@ fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogEr
     }
 
     let mut published_scopes = BTreeSet::new();
+    let mut connector_source_ids = BTreeSet::new();
     let mut accepted_aliases = BTreeMap::<&str, &ProjectId>::new();
     let project_ids = snapshot
         .projects
@@ -898,6 +1213,18 @@ fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogEr
                 format!("project {} has a duplicate published scope", key),
             ));
         }
+        // Connector uniqueness keys on the minted id ALONE, never on the
+        // (id, kind) pair: one operator-minted id names exactly one durable
+        // project, so a mistyped kind can never mint a second project under
+        // an id that is already owned.
+        if let ProjectScope::Connector(scope) = &project.scope
+            && !connector_source_ids.insert(scope.connector_source_id())
+        {
+            return Err(ProjectCatalogError::new(
+                "error.project_catalog_duplicate_scope",
+                format!("project {} has a duplicate connector_source_id", key),
+            ));
+        }
         for alias in &project.operator_aliases {
             validate_alias(alias)?;
             if project_ids.contains(alias.as_str()) {
@@ -924,6 +1251,30 @@ fn validate_catalog(snapshot: &CatalogSnapshotV2) -> Result<(), ProjectCatalogEr
                 format!("project {} references a missing repo history", key),
             ));
         }
+    }
+
+    // Observations are strictly subordinate to a connector-scoped project:
+    // they name one, they never outlive one, and they never appear beside a
+    // published or legacy-local project. That last rule is what keeps a
+    // catalog with no connector scopes byte-identical to a pre-connector
+    // write, which is the downgrade proof.
+    if snapshot.connector_observations.len() > MAX_PROJECT_CATALOG_ENTRIES {
+        return Err(collection_limit("connector observations"));
+    }
+    for (project_id, observations) in &snapshot.connector_observations {
+        let Some(project) = snapshot.projects.get(project_id) else {
+            return Err(ProjectCatalogError::new(
+                "error.project_catalog_dangling_connector_observation",
+                format!("connector observations name missing project {project_id}"),
+            ));
+        };
+        if !matches!(project.scope, ProjectScope::Connector(_)) {
+            return Err(ProjectCatalogError::new(
+                "error.project_catalog_invalid_connector_observation",
+                format!("project {project_id} is not connector-scoped"),
+            ));
+        }
+        observations.validate()?;
     }
 
     let mut recorded_authorities = BTreeSet::new();
@@ -1995,7 +2346,7 @@ mod tests {
     }
 
     fn catalog_with(project: CorpusProject) -> CatalogSnapshotV2 {
-        CatalogSnapshotV2 {
+        let mut snapshot = CatalogSnapshotV2 {
             version: CATALOG_VERSION_V2,
             epoch: 1,
             origin: CatalogOriginV2::FreshV2 {},
@@ -2003,7 +2354,16 @@ mod tests {
             repo_histories: BTreeMap::new(),
             ambiguous_namespaces: BTreeMap::new(),
             scope_migrations: BTreeMap::new(),
-        }
+            connector_observations: BTreeMap::new(),
+        };
+        // Fixtures derive the version exactly as the store does, so a
+        // connector fixture is a v3 catalog without every caller saying so.
+        snapshot.sync_version();
+        snapshot
+    }
+
+    fn connector_scope(id: &str) -> ConnectorScope {
+        ConnectorScope::try_new(id, "gdrive").unwrap()
     }
 
     fn attachment(
@@ -3982,5 +4342,383 @@ mod tests {
                 "the refusal must name the remediation: {error}"
             );
         }
+    }
+
+    // ── Connector scope family (Phase 0) ────────────────────────────────
+
+    #[test]
+    fn connector_source_id_shape_accepts_opaque_bounded_ids() {
+        for accepted in [
+            "csrc_5f2c1d9a4b6e470e",
+            "drive-ops-2026",
+            "a1b2c3d4",
+            "team.ops.drive-01",
+            &"x".repeat(MAX_CONNECTOR_SOURCE_ID_BYTES),
+        ] {
+            ConnectorSourceId::parse(accepted)
+                .unwrap_or_else(|error| panic!("{accepted:?} must parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn connector_source_id_shape_refuses_path_case_and_length_hazards() {
+        for refused in [
+            // too short to survive a transcription slip between the two
+            // sides of the operator's config
+            "short7",
+            "",
+            // over the durable bound
+            &"x".repeat(MAX_CONNECTOR_SOURCE_ID_BYTES + 1),
+            // path-shaped
+            "drive/ops-2026",
+            "drive\\ops-2026",
+            "../drive-ops",
+            ".drive-ops",
+            "drive-ops.",
+            "drive..ops",
+            ".",
+            "..",
+            "/absolute/path",
+            "c:\\drive\\ops",
+            // authority-shaped
+            "tenant@example.com",
+            "https://drive.example",
+            // case and whitespace confusion
+            "Drive-Ops-2026",
+            "drive ops 2026",
+            "drive\tops",
+            "drive\nops",
+        ] {
+            let error =
+                ConnectorSourceId::parse(refused).expect_err(&format!("{refused:?} is refused"));
+            assert_eq!(error.code(), "error.project_catalog_invalid_id");
+        }
+    }
+
+    #[test]
+    fn connector_kind_is_an_opaque_token_not_a_closed_vendor_enum() {
+        for accepted in ["gdrive", "graph", "webdav", "s3", "slack", "local_mirror"] {
+            ConnectorKind::parse(accepted).unwrap();
+        }
+        for refused in [
+            "", "GDrive", "g drive", "g-drive", "3s", "_gdrive", "drive/x",
+        ] {
+            let error =
+                ConnectorKind::parse(refused).expect_err(&format!("{refused:?} is refused"));
+            assert_eq!(error.code(), "error.project_catalog_invalid_id");
+        }
+    }
+
+    #[test]
+    fn connector_scope_round_trips_through_the_tagged_envelope() {
+        let scope = ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e"));
+        let encoded = serde_json::to_value(&scope).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "kind": "connector",
+                "scope": {
+                    "connector_source_id": "csrc_5f2c1d9a4b6e470e",
+                    "connector_kind": "gdrive",
+                },
+            }),
+            "the connector envelope is part of the durable wire contract"
+        );
+        let decoded: ProjectScope = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, scope);
+        assert_eq!(scope.kind_label(), "connector");
+        assert!(
+            scope.published().is_none(),
+            "a connector scope names no repository"
+        );
+        assert_eq!(
+            scope.connector().unwrap().connector_kind().as_str(),
+            "gdrive"
+        );
+    }
+
+    #[test]
+    fn connector_scope_envelope_refuses_unknown_fields_and_vendor_coordinates() {
+        // A provider coordinate smuggled into the durable scope is refused:
+        // coordinates are observations, never identity.
+        for injected in [
+            serde_json::json!({
+                "kind": "connector",
+                "scope": {
+                    "connector_source_id": "csrc_5f2c1d9a4b6e470e",
+                    "connector_kind": "gdrive",
+                    "remote_root_id": "0ABcDeFgHiJkLmN",
+                },
+            }),
+            serde_json::json!({
+                "kind": "connector",
+                "scope": {
+                    "connector_source_id": "csrc_5f2c1d9a4b6e470e",
+                    "connector_kind": "gdrive",
+                    "remote_authority": "tenant.example",
+                },
+            }),
+        ] {
+            serde_json::from_value::<ProjectScope>(injected)
+                .expect_err("the connector scope envelope is strict");
+        }
+        serde_json::from_value::<ProjectScope>(serde_json::json!({
+            "kind": "connector",
+            "scope": { "connector_source_id": "../x", "connector_kind": "gdrive" },
+        }))
+        .expect_err("a path-shaped connector_source_id is refused at the wire");
+    }
+
+    #[test]
+    fn duplicate_connector_source_id_refuses_even_under_a_different_kind() {
+        let mut catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        let second = project(
+            "p_2222",
+            ProjectScope::Connector(
+                ConnectorScope::try_new("csrc_5f2c1d9a4b6e470e", "graph").unwrap(),
+            ),
+        );
+        catalog.projects.insert(second.project_id.clone(), second);
+        let error = catalog.validate().unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_duplicate_scope");
+    }
+
+    #[test]
+    fn distinct_connector_source_ids_coexist() {
+        let mut catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        let second = project(
+            "p_2222",
+            ProjectScope::Connector(connector_scope("csrc_00000000deadbeef")),
+        );
+        catalog.projects.insert(second.project_id.clone(), second);
+        catalog.validate().unwrap();
+    }
+
+    #[test]
+    fn catalog_version_is_derived_from_content() {
+        let published = catalog_with(project(
+            "p_1111",
+            ProjectScope::Published(scope("repo-a", ".")),
+        ));
+        assert_eq!(
+            published.required_version(),
+            CATALOG_VERSION_V2,
+            "a catalog with no connector scope still writes v2 bytes"
+        );
+        assert_eq!(published.version, CATALOG_VERSION_V2);
+
+        let connector = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        assert_eq!(connector.required_version(), CATALOG_VERSION_V3);
+        assert_eq!(connector.version, CATALOG_VERSION_V3);
+    }
+
+    #[test]
+    fn a_catalog_understating_its_version_is_refused() {
+        let mut catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        catalog.version = CATALOG_VERSION_V2;
+        let error = catalog.validate().unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_unsupported_version");
+
+        catalog.version = CATALOG_VERSION_MAX + 1;
+        let error = catalog.validate().unwrap_err();
+        assert_eq!(error.code(), "error.project_catalog_unsupported_version");
+    }
+
+    #[test]
+    fn connector_catalog_survives_an_encode_decode_reopen() {
+        let mut catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        catalog.connector_observations.insert(
+            id("p_1111"),
+            ConnectorObservationsV1 {
+                observed_at: "2026-08-13T00:00:00Z".into(),
+                producer_id: Some("producer-a".into()),
+                remote_authority: Some("tenant.example".into()),
+                remote_root_id: Some("0ABcDeFgHiJkLmN".into()),
+                remote_display_name: Some("Ops shared folder".into()),
+            },
+        );
+        let raw = encode_catalog_snapshot(&catalog).unwrap();
+        let reopened = decode_catalog_snapshot(&raw).unwrap();
+        assert_eq!(reopened, catalog, "a connector catalog reopens unchanged");
+        assert_eq!(reopened.version, CATALOG_VERSION_V3);
+        let observed = &reopened.connector_observations[&id("p_1111")];
+        assert_eq!(observed.remote_root_id.as_deref(), Some("0ABcDeFgHiJkLmN"));
+    }
+
+    #[test]
+    fn connector_observations_are_subordinate_to_a_connector_project() {
+        // Dangling: names no project at all.
+        let mut catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        catalog
+            .connector_observations
+            .insert(id("p_9999"), bare_observations());
+        assert_eq!(
+            catalog.validate().unwrap_err().code(),
+            "error.project_catalog_dangling_connector_observation"
+        );
+
+        // Attached to a project that is not connector-scoped.
+        let mut catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Published(scope("repo-a", ".")),
+        ));
+        catalog
+            .connector_observations
+            .insert(id("p_1111"), bare_observations());
+        assert_eq!(
+            catalog.validate().unwrap_err().code(),
+            "error.project_catalog_invalid_connector_observation"
+        );
+    }
+
+    #[test]
+    fn connector_observation_text_is_bounded_and_control_free() {
+        let mut catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        for injected in [
+            "x".repeat(MAX_CONNECTOR_OBSERVATION_BYTES + 1),
+            "a\u{0}b".to_string(),
+            String::new(),
+        ] {
+            let mut observations = bare_observations();
+            observations.remote_authority = Some(injected.clone());
+            catalog
+                .connector_observations
+                .insert(id("p_1111"), observations);
+            assert_eq!(
+                catalog.validate().unwrap_err().code(),
+                "error.project_catalog_invalid_connector_observation",
+                "unexpected acceptance for {injected:?}"
+            );
+        }
+    }
+
+    fn bare_observations() -> ConnectorObservationsV1 {
+        ConnectorObservationsV1 {
+            observed_at: "2026-08-13T00:00:00Z".into(),
+            producer_id: None,
+            remote_authority: None,
+            remote_root_id: None,
+            remote_display_name: None,
+        }
+    }
+
+    // ── The downgrade story ─────────────────────────────────────────────
+    //
+    // These mirror types ARE the pre-connector reader, reproduced field for
+    // field: the strict two-variant scope enum, the strict project envelope,
+    // and the snapshot envelope whose version gate accepted only 2. Decoding
+    // this build's own bytes through them is the proof, and it is the only
+    // way to exercise an old reader without shipping an old binary into the
+    // test.
+
+    #[derive(Debug, Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "scope",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    #[allow(dead_code)]
+    enum PreConnectorProjectScope {
+        Published(PublishedScope),
+        LegacyLocal,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct PreConnectorCorpusProject {
+        project_id: ProjectId,
+        scope: PreConnectorProjectScope,
+        operator_aliases: BTreeSet<String>,
+        nominated_aliases: BTreeSet<String>,
+        display_name: String,
+        created_at: String,
+        #[serde(default)]
+        registered_at_compat: Option<String>,
+        #[serde(default)]
+        repo_history: Option<RepoHistoryId>,
+        languages: BTreeSet<Language>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct PreConnectorCatalogSnapshot {
+        version: u32,
+        epoch: u64,
+        origin: CatalogOriginV2,
+        projects: BTreeMap<ProjectId, PreConnectorCorpusProject>,
+        repo_histories: BTreeMap<RepoHistoryId, RepoHistoryRecord>,
+        ambiguous_namespaces: BTreeMap<CommitNamespace, AmbiguousNamespaceRecord>,
+        scope_migrations: BTreeMap<ScopeMigrationId, ScopeMigrationRecord>,
+    }
+
+    fn decode_as_pre_connector_reader(raw: &[u8]) -> Result<PreConnectorCatalogSnapshot, String> {
+        let snapshot: PreConnectorCatalogSnapshot =
+            serde_json::from_slice(raw).map_err(|error| error.to_string())?;
+        if snapshot.version != CATALOG_VERSION_V2 {
+            return Err("error.project_catalog_unsupported_version".to_string());
+        }
+        Ok(snapshot)
+    }
+
+    #[test]
+    fn downgrade_opens_a_connector_free_catalog_written_by_this_build() {
+        let catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Published(scope("repo-a", ".")),
+        ));
+        let raw = encode_catalog_snapshot(&catalog).unwrap();
+        assert!(
+            !String::from_utf8(raw.clone())
+                .unwrap()
+                .contains("connector_observations"),
+            "an empty observation map must not reach the bytes at all, or every \
+             pre-connector reader breaks on a catalog that has no connectors"
+        );
+        let reopened = decode_as_pre_connector_reader(&raw)
+            .expect("a connector-free catalog written here opens under v2 expectations");
+        assert_eq!(reopened.version, CATALOG_VERSION_V2);
+        assert_eq!(reopened.projects.len(), 1);
+    }
+
+    #[test]
+    fn downgrade_fails_closed_on_a_catalog_that_holds_connector_scopes() {
+        let catalog = catalog_with(project(
+            "p_1111",
+            ProjectScope::Connector(connector_scope("csrc_5f2c1d9a4b6e470e")),
+        ));
+        let raw = encode_catalog_snapshot(&catalog).unwrap();
+        // Fail-closed, named explicitly: the old reader refuses the WHOLE
+        // catalog rather than opening it minus the projects it cannot
+        // represent. Silently dropping them would orphan their content and
+        // free a durable scope for reuse; refusing is the only honest
+        // outcome, and the remedy is to roll forward, never to hand-edit
+        // the version field.
+        let error = decode_as_pre_connector_reader(&raw)
+            .expect_err("a v3 catalog must refuse to open under v2 expectations");
+        assert_eq!(error, "error.project_catalog_unsupported_version");
     }
 }

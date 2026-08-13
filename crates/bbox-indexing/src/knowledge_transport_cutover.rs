@@ -1866,7 +1866,9 @@ fn recheck_report(
         .iter()
         .filter_map(|(project_id, project)| match &project.scope {
             ProjectScope::Published(scope) => Some((project_id, scope)),
-            ProjectScope::LegacyLocal => None,
+            // Knowledge transport is a published-scope lane; a connector
+            // project has no committed .bbox tree to carry.
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         })
         .collect::<BTreeMap<_, _>>();
     let report_projects = report

@@ -3294,7 +3294,7 @@ fn published_scope_of(project: &CorpusProject) -> Option<(String, String)> {
             scope.repo_id().to_string(),
             scope.bbox_root_relpath().to_string(),
         )),
-        ProjectScope::LegacyLocal => None,
+        ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
     }
 }
 

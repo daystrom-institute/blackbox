@@ -2899,6 +2899,10 @@ fn build_base_post_images(
         repo_histories,
         ambiguous_namespaces,
         scope_migrations: BTreeMap::new(),
+        // A version-1 store has no connector sources to migrate: the family
+        // is onboarded, never inherited. This catalog therefore stays a
+        // version-2 write.
+        connector_observations: BTreeMap::new(),
     };
 
     let checkout_actions = identities

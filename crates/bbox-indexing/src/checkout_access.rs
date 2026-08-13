@@ -289,6 +289,11 @@ pub enum CheckoutRecordedProjectScope {
     Unavailable,
     LegacyLocal,
     Published(PublishedScope),
+    /// A connector-scoped catalog project. Distinct from `Unavailable`: the
+    /// durable row exists and is complete, and there is no checkout to
+    /// discover a scope from, ever. A caller must not fall back to
+    /// config-tree discovery for it the way it does for a bridge authority.
+    Connector,
 }
 
 /// Process-lifetime policy above attachment resolution. It is evaluated

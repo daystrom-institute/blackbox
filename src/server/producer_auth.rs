@@ -32,6 +32,7 @@ use bro_rpc::ServiceToken;
 use sha2::{Digest, Sha256};
 
 use super::SharedState;
+use super::connector_grants::ConnectorGrantRuntime;
 
 #[derive(Clone)]
 pub(crate) struct ProducerGrant {
@@ -91,6 +92,12 @@ pub(crate) struct ProducerAuthRuntime {
     producer_to_scopes: BTreeMap<String, BTreeSet<PublishedScope>>,
     project_to_repo_history: BTreeMap<ProjectId, RepoHistoryId>,
     repo_grants: BTreeMap<RepoHistoryId, RepoTransportGrantState>,
+    /// Connector producer grants. A SEPARATE family riding the same
+    /// rebuild: it is enabled independently of code collection, its scopes
+    /// are never published scopes, and it appears in no publication view
+    /// here (`assignments`, `assignment_map`, `assigned_project_ids` stay
+    /// published-scope-only by construction).
+    connectors: Arc<ConnectorGrantRuntime>,
     #[cfg(test)]
     catalog_mode: bool,
 }
@@ -112,6 +119,25 @@ impl ProducerAuthRuntime {
         catalog_store: Option<&Arc<bbox_indexing::project_catalog_store::ProjectCatalogStore>>,
         checkout_access: &CheckoutAccessBroker,
     ) -> Result<Self> {
+        // Connector grants are their own family: enabled independently of
+        // code collection, so they are resolved BEFORE the code-collection
+        // gates and survive the disabled early return below. A daemon may
+        // legitimately run connector grants with code collection off.
+        let connector_catalog = match catalog_store {
+            Some(store) => Some(
+                store
+                    .snapshot()
+                    .map_err(|error| anyhow::anyhow!("catalog snapshot unavailable: {error}"))?
+                    .catalog()
+                    .clone(),
+            ),
+            None => None,
+        };
+        let connectors = Arc::new(ConnectorGrantRuntime::build(
+            &config.source_connectors,
+            connector_catalog.as_deref(),
+        )?);
+
         if config.code_collection.git_transport_enabled && !config.code_collection.enabled {
             bail!("Git transport requires code collection to be enabled");
         }
@@ -127,7 +153,8 @@ impl ProducerAuthRuntime {
             bail!("Git transport limits must be nonzero");
         }
         if !config.code_collection.enabled {
-            return Ok(Self::disabled());
+            // Code collection off does not mean connector grants off.
+            return Ok(Self::disabled_with(connectors));
         }
         if config.code_collection.producers.is_empty() {
             bail!("enabled code collection requires at least one producer");
@@ -267,12 +294,17 @@ impl ProducerAuthRuntime {
             producer_to_scopes,
             project_to_repo_history,
             repo_grants,
+            connectors,
             #[cfg(test)]
             catalog_mode: matches!(resolution, GrantScopeResolution::Catalog { .. }),
         })
     }
 
     pub(crate) fn disabled() -> Self {
+        Self::disabled_with(Arc::new(ConnectorGrantRuntime::disabled()))
+    }
+
+    fn disabled_with(connectors: Arc<ConnectorGrantRuntime>) -> Self {
         Self {
             enabled: false,
             git_transport_enabled: false,
@@ -284,9 +316,15 @@ impl ProducerAuthRuntime {
             producer_to_scopes: BTreeMap::new(),
             project_to_repo_history: BTreeMap::new(),
             repo_grants: BTreeMap::new(),
+            connectors,
             #[cfg(test)]
             catalog_mode: false,
         }
+    }
+
+    /// The connector grant table, for onboarding and read surfaces.
+    pub(crate) fn connectors(&self) -> &Arc<ConnectorGrantRuntime> {
+        &self.connectors
     }
 
     #[cfg(test)]
@@ -308,6 +346,7 @@ impl ProducerAuthRuntime {
             producer_to_scopes: BTreeMap::new(),
             project_to_repo_history: BTreeMap::new(),
             repo_grants: BTreeMap::new(),
+            connectors: Arc::new(ConnectorGrantRuntime::disabled()),
             catalog_mode: false,
         }
     }
@@ -351,6 +390,7 @@ impl ProducerAuthRuntime {
             producer_to_scopes,
             project_to_repo_history: projection.project_to_repo_history,
             repo_grants: projection.grants,
+            connectors: Arc::new(ConnectorGrantRuntime::disabled()),
             catalog_mode: true,
         }
     }
@@ -561,7 +601,10 @@ pub(crate) fn resolve_catalog_project(
         .iter()
         .filter(|(_, project)| match &project.scope {
             ProjectScope::Published(published) => published == scope,
-            ProjectScope::LegacyLocal => false,
+            // A published grant never resolves to either: one has no
+            // committed authority, the other is a remote source whose
+            // identity is not a published scope at all.
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => false,
         })
         .map(|(project_id, _)| project_id)
         .collect();
@@ -812,5 +855,78 @@ mod tests {
             BTreeMap::from([(scope, "producer-a".into())]),
             "transport commitments consume producer ids"
         );
+    }
+
+    #[test]
+    fn a_connector_project_never_enters_a_published_publication_view() {
+        use bbox_corpus_core::project_catalog::ConnectorScope;
+
+        let published_scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let mut catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let history_id = RepoHistoryId::parse("rh_00000000000000000000000000000001").unwrap();
+        catalog.repo_histories.insert(
+            history_id.clone(),
+            RepoHistoryRecord {
+                repo_history_id: history_id.clone(),
+                membership_generation: 0,
+                authority: RepoHistoryAuthority::Recorded(
+                    RecordedRepoAuthority::parse("repo-a").unwrap(),
+                ),
+                primary_namespace: CommitNamespace::parse("repo-a").unwrap(),
+                compatibility_namespaces: BTreeSet::new(),
+                materialization: RepoHistoryMaterialization::NotBuilt,
+            },
+        );
+        let published = project(
+            "p_00000000000000000000000000000001",
+            ProjectScope::Published(published_scope.clone()),
+            &history_id,
+        );
+        catalog
+            .projects
+            .insert(published.project_id.clone(), published);
+        let mut connector = project(
+            "p_00000000000000000000000000000002",
+            ProjectScope::Connector(
+                ConnectorScope::try_new("csrc_5f2c1d9a4b6e470e", "gdrive").unwrap(),
+            ),
+            &history_id,
+        );
+        connector.repo_history = None;
+        catalog
+            .projects
+            .insert(connector.project_id.clone(), connector);
+        catalog.sync_version();
+        catalog.validate().unwrap();
+
+        // The published grant still resolves to exactly its own project.
+        let resolved = resolve_catalog_project(&catalog, &published_scope).unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            "p_00000000000000000000000000000001",
+            "a connector project must not be reachable through a published grant"
+        );
+
+        // And no published-scope publication view can name the connector
+        // project, because those views are keyed by PublishedScope.
+        let auth = ProducerAuthRuntime::for_test_catalog(
+            vec![(
+                ServiceToken::parse("a".repeat(64)).unwrap(),
+                ProducerGrant {
+                    producer_id: "producer-a".into(),
+                    projects: BTreeMap::from([(
+                        published_scope,
+                        "p_00000000000000000000000000000001".to_string(),
+                    )]),
+                },
+            )],
+            &catalog,
+        );
+        assert_eq!(
+            auth.assigned_project_ids(),
+            BTreeSet::from(["p_00000000000000000000000000000001".to_string()]),
+            "publication lanes see published projects only"
+        );
+        assert!(auth.connectors().publication_project_ids().is_empty());
     }
 }

@@ -12,6 +12,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 
+use bbox_corpus_core::project_catalog::{ConnectorKind, ConnectorScope, ConnectorSourceId};
 use bbox_util::util;
 
 const MAX_COMMITTED_PROJECT_CONFIG_BYTES: usize = 1024 * 1024;
@@ -114,6 +115,8 @@ struct RawConfig {
     pub index: RawIndexConfig,
     #[serde(default)]
     pub code_collection: RawCodeCollectionConfig,
+    #[serde(default)]
+    pub source_connectors: RawSourceConnectorsConfig,
     pub provenance: RawProvenanceConfig,
     pub providers: RawProviderConfig,
     pub lsp: RawLspConfig,
@@ -164,6 +167,17 @@ struct RawCodeCollectionConfig {
     pub cutback_max_attempts: u32,
     #[serde(default)]
     pub producers: Vec<CodeCollectionProducerConfig>,
+}
+
+/// Raw `[source_connectors]` block. Strict like its code-collection
+/// sibling: a misspelled key is a refusal, not a silently ignored grant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSourceConnectorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub producers: Vec<ConnectorProducerConfig>,
 }
 
 impl Default for RawCodeCollectionConfig {
@@ -661,6 +675,140 @@ pub struct CodeCollectionProducerConfig {
     pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
 }
 
+/// Operator grants for connector producers (remote-source connectors,
+/// design/connectors/remote-source-connectors.md section 9).
+///
+/// This mirrors `[[code_collection.producers]]`: a producer id, a
+/// file-sourced bearer token, and an allowlist of durable scopes the
+/// producer may speak for. It differs in what a scope IS. A code producer's
+/// scope is a published scope the daemon can independently recompute from a
+/// committed config; a connector producer's scope is an operator-minted
+/// `connector_source_id` that nothing can recompute, so the grant also
+/// carries the operator's EXPECTATION of what that source should turn out to
+/// be (its connector kind and its remote authority). Onboarding checks a
+/// producer's probed facts against that expectation; it is the only
+/// mechanical check available, and it is deliberately not presented as
+/// verification of the remote store.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SourceConnectorsConfig {
+    pub enabled: bool,
+    pub producers: Vec<ConnectorProducerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorProducerConfig {
+    pub producer_id: String,
+    pub token_file: PathBuf,
+    #[serde(default)]
+    pub scopes: Vec<ConnectorScopeGrant>,
+}
+
+/// One granted connector scope plus the operator's declared expectation for
+/// it. The durable half is `connector_source_id` (identity) and
+/// `connector_kind`; `remote_authority` is an expectation only and never
+/// reaches the catalog scope, because a vendor tenant or account is a
+/// coordinate, not identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorScopeGrant {
+    pub connector_source_id: ConnectorSourceId,
+    pub connector_kind: ConnectorKind,
+    /// The vendor tenant or account this source is expected to live under.
+    pub remote_authority: String,
+}
+
+impl ConnectorScopeGrant {
+    /// The durable catalog scope this grant covers.
+    pub fn scope(&self) -> ConnectorScope {
+        ConnectorScope::new(
+            self.connector_source_id.clone(),
+            self.connector_kind.clone(),
+        )
+    }
+}
+
+/// Longest accepted `remote_authority`. It is operator text describing a
+/// vendor tenant, never parsed and never a lookup key, so it is bounded and
+/// control-free and nothing more.
+const MAX_REMOTE_AUTHORITY_BYTES: usize = 256;
+
+/// Validate the connector grant family: producer shape, token uniqueness of
+/// intent, and the one rule that actually protects the catalog, which is
+/// that a `connector_source_id` may be granted to exactly one producer.
+fn validate_source_connectors(config: &SourceConnectorsConfig) -> Result<()> {
+    if !config.enabled {
+        // A disabled family still refuses malformed grants rather than
+        // hiding them until the day it is switched on.
+        if config.producers.is_empty() {
+            return Ok(());
+        }
+    } else if config.producers.is_empty() {
+        anyhow::bail!("enabled source_connectors requires at least one producer");
+    }
+
+    let mut producer_ids = std::collections::BTreeSet::new();
+    let mut granted_sources = std::collections::BTreeMap::<String, String>::new();
+    for producer in &config.producers {
+        if producer.producer_id.is_empty()
+            || producer.producer_id.len() > 128
+            || producer.producer_id.trim() != producer.producer_id
+            || !producer
+                .producer_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            anyhow::bail!(
+                "source_connectors producer_id must be a bounded alphanumeric token: {:?}",
+                producer.producer_id
+            );
+        }
+        if !producer_ids.insert(producer.producer_id.clone()) {
+            anyhow::bail!("duplicate source_connectors producer id");
+        }
+        if producer.token_file.as_os_str().is_empty() {
+            anyhow::bail!(
+                "source_connectors producer {} has no token_file",
+                producer.producer_id
+            );
+        }
+        if config.enabled && producer.scopes.is_empty() {
+            anyhow::bail!(
+                "enabled source_connectors producer {} has no scopes",
+                producer.producer_id
+            );
+        }
+        for grant in &producer.scopes {
+            if grant.remote_authority.is_empty()
+                || grant.remote_authority.len() > MAX_REMOTE_AUTHORITY_BYTES
+                || grant.remote_authority.trim() != grant.remote_authority
+                || grant.remote_authority.chars().any(char::is_control)
+            {
+                anyhow::bail!(
+                    "source_connectors remote_authority must be bounded, trimmed, and \
+                     control-free for {}",
+                    grant.connector_source_id
+                );
+            }
+            // Two producers granted one connector_source_id would race to
+            // onboard one durable project and then both claim authority over
+            // it. Refuse the config instead of resolving it at runtime.
+            if let Some(owner) = granted_sources.insert(
+                grant.connector_source_id.as_str().to_string(),
+                producer.producer_id.clone(),
+            ) {
+                anyhow::bail!(
+                    "connector_source_id {} is granted to both {} and {}",
+                    grant.connector_source_id,
+                    owner,
+                    producer.producer_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Provenance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceConfig {
@@ -701,6 +849,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub index: IndexConfig,
     pub code_collection: CodeCollectionConfig,
+    pub source_connectors: SourceConnectorsConfig,
     pub provenance: ProvenanceConfig,
     pub providers: ProviderConfig,
     pub lsp: LspConfig,
@@ -739,6 +888,7 @@ impl Config {
                 edge_index_boot_rebuild: default_index_edge_index_boot_rebuild(),
             },
             code_collection: RawCodeCollectionConfig::default(),
+            source_connectors: RawSourceConnectorsConfig::default(),
             provenance: RawProvenanceConfig {
                 git_notes_namespace: default_provenance_git_notes_namespace(),
             },
@@ -1055,6 +1205,21 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let source_connectors = SourceConnectorsConfig {
+        enabled: raw.source_connectors.enabled,
+        producers: raw
+            .source_connectors
+            .producers
+            .iter()
+            .cloned()
+            .map(|mut producer| {
+                producer.token_file = expand_tilde(&producer.token_file.to_string_lossy(), &home)?;
+                Ok(producer)
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
+    validate_source_connectors(&source_connectors)?;
+
     validate_cutback_retry_config(
         raw.code_collection.cutback_retry_base_secs,
         raw.code_collection.cutback_retry_max_secs,
@@ -1119,6 +1284,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             cutback_max_attempts: raw.code_collection.cutback_max_attempts,
             producers: code_collection_producers,
         },
+        source_connectors,
         provenance: ProvenanceConfig {
             git_notes_namespace: raw.provenance.git_notes_namespace,
         },
@@ -3050,6 +3216,219 @@ state_dir = "~"
                 .extract::<CodeCollectionProducerConfig>()
                 .is_err()
         );
+    }
+
+    fn connector_grant(
+        connector_source_id: &str,
+        connector_kind: &str,
+        remote_authority: &str,
+    ) -> ConnectorScopeGrant {
+        ConnectorScopeGrant {
+            connector_source_id: ConnectorSourceId::parse(connector_source_id).unwrap(),
+            connector_kind: ConnectorKind::parse(connector_kind).unwrap(),
+            remote_authority: remote_authority.to_string(),
+        }
+    }
+
+    fn connector_producer(
+        producer_id: &str,
+        scopes: Vec<ConnectorScopeGrant>,
+    ) -> SourceConnectorsConfig {
+        SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![ConnectorProducerConfig {
+                producer_id: producer_id.to_string(),
+                token_file: PathBuf::from("/tmp/connector-token"),
+                scopes,
+            }],
+        }
+    }
+
+    #[test]
+    fn source_connectors_parse_a_grant_family() {
+        let raw: RawSourceConnectorsConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+enabled = true
+
+[[producers]]
+producer_id = "producer-a"
+token_file = "/tmp/connector-token"
+
+[[producers.scopes]]
+connector_source_id = "csrc_5f2c1d9a4b6e470e"
+connector_kind = "gdrive"
+remote_authority = "tenant.example"
+"#,
+            ))
+            .extract()
+            .expect("a well-formed connector grant parses");
+        assert!(raw.enabled);
+        let grant = &raw.producers[0].scopes[0];
+        assert_eq!(grant.connector_source_id.as_str(), "csrc_5f2c1d9a4b6e470e");
+        assert_eq!(grant.connector_kind.as_str(), "gdrive");
+        assert_eq!(grant.remote_authority, "tenant.example");
+        assert_eq!(
+            grant.scope().connector_source_id().as_str(),
+            "csrc_5f2c1d9a4b6e470e",
+            "the grant projects to the durable catalog scope"
+        );
+    }
+
+    #[test]
+    fn source_connectors_reject_unknown_fields_and_malformed_ids() {
+        assert!(
+            Figment::new()
+                .merge(Toml::string("enabled = true\nenabeld = false\n"))
+                .extract::<RawSourceConnectorsConfig>()
+                .is_err()
+        );
+        assert!(
+            Figment::new()
+                .merge(Toml::string(
+                    "producer_id = \"host-a\"\ntoken_file = \"/tmp/t\"\nunknown = true\n"
+                ))
+                .extract::<ConnectorProducerConfig>()
+                .is_err()
+        );
+        // A path-shaped connector_source_id never becomes a grant: the
+        // durable id type validates at deserialization.
+        assert!(
+            Figment::new()
+                .merge(Toml::string(
+                    "connector_source_id = \"../drive-ops\"\nconnector_kind = \"gdrive\"\n\
+                     remote_authority = \"tenant.example\"\n"
+                ))
+                .extract::<ConnectorScopeGrant>()
+                .is_err()
+        );
+        // A provider coordinate is not a grant field.
+        assert!(
+            Figment::new()
+                .merge(Toml::string(
+                    "connector_source_id = \"csrc_5f2c1d9a4b6e470e\"\n\
+                     connector_kind = \"gdrive\"\nremote_authority = \"tenant.example\"\n\
+                     remote_root_id = \"0ABcDeFgHiJkLmN\"\n"
+                ))
+                .extract::<ConnectorScopeGrant>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn source_connectors_validation_refuses_conflicting_grants() {
+        validate_source_connectors(&connector_producer(
+            "producer-a",
+            vec![connector_grant(
+                "csrc_5f2c1d9a4b6e470e",
+                "gdrive",
+                "tenant.example",
+            )],
+        ))
+        .expect("one producer granting one source is the ordinary case");
+
+        // One connector_source_id granted twice would race two producers to
+        // onboard one durable project.
+        let mut duplicated = connector_producer(
+            "producer-a",
+            vec![connector_grant(
+                "csrc_5f2c1d9a4b6e470e",
+                "gdrive",
+                "tenant.example",
+            )],
+        );
+        duplicated.producers.push(ConnectorProducerConfig {
+            producer_id: "producer-b".into(),
+            token_file: PathBuf::from("/tmp/other-token"),
+            scopes: vec![connector_grant(
+                "csrc_5f2c1d9a4b6e470e",
+                "graph",
+                "other.example",
+            )],
+        });
+        let error = validate_source_connectors(&duplicated).unwrap_err();
+        assert!(
+            error.to_string().contains("granted to both"),
+            "the refusal must name the conflict: {error}"
+        );
+
+        let mut duplicate_producer = connector_producer(
+            "producer-a",
+            vec![connector_grant(
+                "csrc_5f2c1d9a4b6e470e",
+                "gdrive",
+                "tenant.example",
+            )],
+        );
+        duplicate_producer.producers.push(ConnectorProducerConfig {
+            producer_id: "producer-a".into(),
+            token_file: PathBuf::from("/tmp/other-token"),
+            scopes: vec![connector_grant(
+                "csrc_00000000deadbeef",
+                "graph",
+                "other.example",
+            )],
+        });
+        assert!(validate_source_connectors(&duplicate_producer).is_err());
+    }
+
+    #[test]
+    fn source_connectors_validation_refuses_empty_and_malformed_shapes() {
+        let enabled_without_producers = SourceConnectorsConfig {
+            enabled: true,
+            producers: Vec::new(),
+        };
+        assert!(validate_source_connectors(&enabled_without_producers).is_err());
+
+        let scopeless = connector_producer("producer-a", Vec::new());
+        assert!(validate_source_connectors(&scopeless).is_err());
+
+        for authority in [
+            "",
+            "  tenant.example",
+            &"x".repeat(257),
+            "tenant\u{0}example",
+        ] {
+            let config = connector_producer(
+                "producer-a",
+                vec![ConnectorScopeGrant {
+                    connector_source_id: ConnectorSourceId::parse("csrc_5f2c1d9a4b6e470e").unwrap(),
+                    connector_kind: ConnectorKind::parse("gdrive").unwrap(),
+                    remote_authority: authority.to_string(),
+                }],
+            );
+            assert!(
+                validate_source_connectors(&config).is_err(),
+                "remote_authority {authority:?} must be refused"
+            );
+        }
+
+        let mut bad_producer_id = connector_producer(
+            "producer a",
+            vec![connector_grant(
+                "csrc_5f2c1d9a4b6e470e",
+                "gdrive",
+                "tenant.example",
+            )],
+        );
+        assert!(validate_source_connectors(&bad_producer_id).is_err());
+        bad_producer_id.producers[0].producer_id = "producer-a".into();
+        bad_producer_id.producers[0].token_file = PathBuf::new();
+        assert!(validate_source_connectors(&bad_producer_id).is_err());
+    }
+
+    #[test]
+    fn source_connectors_default_to_disabled_and_empty() {
+        // Read the DEFAULTS, never the host's real config file: a daemon with
+        // connector grants configured must not turn this assertion red.
+        let raw = RawSourceConnectorsConfig::default();
+        assert!(!raw.enabled);
+        assert!(raw.producers.is_empty());
+        validate_source_connectors(&SourceConnectorsConfig {
+            enabled: raw.enabled,
+            producers: raw.producers,
+        })
+        .expect("the disabled default is a valid config");
     }
 
     #[test]
