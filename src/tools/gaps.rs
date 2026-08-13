@@ -406,7 +406,11 @@ impl BlackboxServer {
                 .as_object_mut()
                 .expect("object envelope")
                 .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
-            let checked = crate::gaps::GapNote::from_envelope(&envelope, gap.id.clone(), gap.created_at.clone())?;
+            let checked = crate::gaps::GapNote::from_envelope(
+                &envelope,
+                gap.id.clone(),
+                gap.created_at.clone(),
+            )?;
             gap.impact = checked.impact;
         }
         if let Some(value) = &p.blocking_level {
@@ -422,7 +426,11 @@ impl BlackboxServer {
                 .as_object_mut()
                 .expect("object envelope")
                 .insert("dedupe_key".to_string(), gap.dedupe_key.clone().into());
-            let checked = crate::gaps::GapNote::from_envelope(&envelope, gap.id.clone(), gap.created_at.clone())?;
+            let checked = crate::gaps::GapNote::from_envelope(
+                &envelope,
+                gap.id.clone(),
+                gap.created_at.clone(),
+            )?;
             gap.blocking_level = checked.blocking_level;
         }
         if let Some(value) = &p.missing_primitive {
@@ -508,7 +516,9 @@ impl BlackboxServer {
                 &other,
                 &format!("bbox_gap_resolve supersession link (project_id={project_id})"),
             )?;
-            text.push_str(&format!("; supersessor {other_id} relinked ({other_delivery})"));
+            text.push_str(&format!(
+                "; supersessor {other_id} relinked ({other_delivery})"
+            ));
         }
         Ok(Some(text))
     }

@@ -395,8 +395,7 @@ impl BlackboxServer {
         {
             return Ok(entry.clone());
         }
-        if let Some(content) =
-            self.pending_mutation_content(&format!(".bbox/knowledge/{id}.json"))
+        if let Some(content) = self.pending_mutation_content(&format!(".bbox/knowledge/{id}.json"))
             && let Ok(entry) = serde_json::from_str::<crate::knowledge::KnowledgeEntry>(&content)
         {
             return Ok(entry);
@@ -511,8 +510,7 @@ impl BlackboxServer {
         p: &LearnParams,
         id: &str,
     ) -> anyhow::Result<Option<(String, String)>> {
-        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)?
-        else {
+        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
             return Ok(None);
         };
         self.patch_entry_from_learn(&mut entry, p)?;
@@ -538,8 +536,7 @@ impl BlackboxServer {
         action: &str,
         id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)?
-        else {
+        let Some((mut entry, project_id, scope)) = self.covered_knowledge_entry_scope(id)? else {
             return Ok(None);
         };
         entry.updated_at = bbox_util::util::now_iso();
@@ -733,7 +730,11 @@ impl BlackboxServer {
             std::process::id().hash(&mut h);
             std::thread::current().id().hash(&mut h);
             let id = format!("{:016x}", h.finish());
-            let taken_by_view = view.knowledge.all_entries().iter().any(|entry| entry.id == id);
+            let taken_by_view = view
+                .knowledge
+                .all_entries()
+                .iter()
+                .any(|entry| entry.id == id);
             let taken_by_pending = self
                 .state
                 .checkout_mutations
@@ -816,7 +817,9 @@ impl BlackboxServer {
             anyhow::bail!("'content' is required");
         }
         if p.rationale.trim().is_empty() {
-            anyhow::bail!("'rationale' is required — a decision without justification is just a command");
+            anyhow::bail!(
+                "'rationale' is required — a decision without justification is just a command"
+            );
         }
         let priority = Self::checkout_lane_priority(p.priority.as_deref())?;
         let now = bbox_util::util::now_iso();
@@ -869,10 +872,7 @@ impl BlackboxServer {
                 "write",
                 &format!("bbox_decide supersession (project_id={project_id})"),
             )?;
-            message.push_str(&format!(
-                "; superseded {} ({old_delivery})",
-                old.id
-            ));
+            message.push_str(&format!("; superseded {} ({old_delivery})", old.id));
         }
         Ok(message)
     }

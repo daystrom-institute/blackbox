@@ -493,7 +493,6 @@ pub struct CheckoutMutationAckResponseV1 {
     pub status: String,
 }
 
-
 pub fn validate_scope(scope: &PublishedScope) -> Result<(), ContractError> {
     if scope.repo_id().trim().is_empty()
         || scope.repo_id().trim() != scope.repo_id()

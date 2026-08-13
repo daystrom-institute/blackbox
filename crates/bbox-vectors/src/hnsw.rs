@@ -186,8 +186,7 @@ impl HnswIndex {
         }
         let ef = self.options.ef_search.max(16);
         for ordinal in orphans {
-            let candidates =
-                self.search_layer(self.vectors.get(ordinal), &[entry_point], ef, 0);
+            let candidates = self.search_layer(self.vectors.get(ordinal), &[entry_point], ef, 0);
             if let Some((nearest, _)) = candidates.first()
                 && *nearest != ordinal
             {
@@ -963,10 +962,7 @@ mod tests {
                 let ordinal = index.active_ordinal_by_id[&id];
                 let hits = index.search(index.vectors.get(ordinal), 10);
                 sampled += 1;
-                if hits
-                    .iter()
-                    .any(|hit| hit.id.starts_with(&format!("c{c}-")))
-                {
+                if hits.iter().any(|hit| hit.id.starts_with(&format!("c{c}-"))) {
                     found += 1;
                 }
             }

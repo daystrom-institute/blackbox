@@ -83,7 +83,9 @@ impl CheckoutMutations {
     /// caller; an id that already exists is a no-op so retried enqueues
     /// stay idempotent.
     pub fn enqueue(&mut self, mutation: CheckoutMutationV1) -> Result<bool> {
-        mutation.validate().map_err(|error| anyhow::anyhow!("{error}"))?;
+        mutation
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         if self
             .store
             .mutations
@@ -107,7 +109,10 @@ impl CheckoutMutations {
     /// first, capped per poll. The deferred count covers both the cap and
     /// pending mutations outside the grant, so operators can see a grant
     /// that does not cover an enqueued scope.
-    pub fn poll(&self, granted_scopes: &BTreeSet<PublishedScope>) -> (Vec<CheckoutMutationV1>, u64) {
+    pub fn poll(
+        &self,
+        granted_scopes: &BTreeSet<PublishedScope>,
+    ) -> (Vec<CheckoutMutationV1>, u64) {
         let mut covered = Vec::new();
         let mut deferred = 0u64;
         for pending in &self.store.mutations {
@@ -188,14 +193,10 @@ impl CheckoutMutations {
     /// overlay this on the published view so chained writes inside one
     /// collector cycle see each other.
     pub fn pending_for_path(&self, relative_path: &str) -> Option<&PendingCheckoutMutation> {
-        self.store
-            .mutations
-            .iter()
-            .rev()
-            .find(|pending| {
-                pending.status == CheckoutMutationStatus::Pending
-                    && pending.mutation.relative_path == relative_path
-            })
+        self.store.mutations.iter().rev().find(|pending| {
+            pending.status == CheckoutMutationStatus::Pending
+                && pending.mutation.relative_path == relative_path
+        })
     }
 
     /// Every pending write's (relative_path, content_json) pair.
@@ -331,12 +332,24 @@ mod tests {
         assert_eq!(deferred, 0);
         assert!(
             !store
-                .ack("cm-0000000000000001", "applied", None, None, "2026-08-12T00:02:00Z")
+                .ack(
+                    "cm-0000000000000001",
+                    "applied",
+                    None,
+                    None,
+                    "2026-08-12T00:02:00Z"
+                )
                 .unwrap()
         );
         assert!(
             !store
-                .ack("cm-ffffffffffffffff", "applied", None, None, "2026-08-12T00:02:00Z")
+                .ack(
+                    "cm-ffffffffffffffff",
+                    "applied",
+                    None,
+                    None,
+                    "2026-08-12T00:02:00Z"
+                )
                 .unwrap()
         );
     }
@@ -360,10 +373,7 @@ mod tests {
         );
         assert_eq!(store.pending_count(), 0);
         assert_eq!(store.failed().len(), 1);
-        assert_eq!(
-            store.failed()[0].last_error.as_deref(),
-            Some("disk full")
-        );
+        assert_eq!(store.failed()[0].last_error.as_deref(), Some("disk full"));
     }
 
     #[test]

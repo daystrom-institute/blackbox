@@ -416,9 +416,7 @@ fn apply_checkout_mutation(
             match fs::remove_file(&target) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).context(format!("deleting {}", target.display()))
-                }
+                Err(error) => return Err(error).context(format!("deleting {}", target.display())),
             }
             tracing::info!(
                 mutation_id = %mutation.mutation_id,
