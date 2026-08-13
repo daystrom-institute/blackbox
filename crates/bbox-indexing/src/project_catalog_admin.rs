@@ -17,7 +17,7 @@
 use bbox_corpus_core::identity::PublishedScope;
 use bbox_corpus_core::project_catalog::{
     AttachmentCapabilities, AttachmentId, AttachmentKind, AttachmentStatus, CheckoutAttachment,
-    ProjectId, ProjectScope,
+    ConnectorObservationsV1, ConnectorScope, ProjectId, ProjectScope,
 };
 
 use crate::accepted_publication_runtime::{
@@ -1314,6 +1314,9 @@ pub fn bind_publisher_attachment(
 pub enum CatalogAddKind {
     Published(PublishedScope),
     LegacyLocal,
+    /// A connector source. Reached from the grant-validated onboarding
+    /// composite, never from producer traffic and never from a reload.
+    Connector(ConnectorScope),
 }
 
 pub fn catalog_add(
@@ -1367,6 +1370,20 @@ fn insert_new_project(
         return Err(admin_error(
             "error.project_catalog_admin_scope_owned",
             "the scope is already owned by a catalog project",
+        ));
+    }
+    // Ownership for a connector source is keyed on the minted id ALONE, so a
+    // second project can never appear under an id an operator already
+    // granted, whatever kind was typed beside it.
+    if let CatalogAddKind::Connector(scope) = kind
+        && catalog.projects.values().any(|p| {
+            matches!(&p.scope, ProjectScope::Connector(s)
+                if s.connector_source_id() == scope.connector_source_id())
+        })
+    {
+        return Err(admin_error(
+            "error.project_catalog_admin_scope_owned",
+            "the connector_source_id is already owned by a catalog project",
         ));
     }
     for alias in aliases {
@@ -1433,6 +1450,10 @@ fn insert_new_project(
             };
             (ProjectScope::Published(scope.clone()), Some(history_id))
         }
+        // No repo history: a connector source has no commits, no namespace,
+        // and nothing for history materialization to build. `repo_history`
+        // is already optional on the record, so this needs no placeholder.
+        CatalogAddKind::Connector(scope) => (ProjectScope::Connector(scope.clone()), None),
     };
     catalog.projects.insert(
         project_id.clone(),
@@ -1449,6 +1470,289 @@ fn insert_new_project(
         },
     );
     Ok(project_id)
+}
+
+// ── Connector onboarding (remote-source connectors, section 9) ──────────
+
+/// One operator grant entry, projected out of daemon config: which producer
+/// may speak for which connector scope, and what the operator expects that
+/// source to be.
+///
+/// The grant is the whole of the daemon's authority here. It cannot verify
+/// that the presented coordinates describe the folder or tenant the operator
+/// meant; it can only check that the scope was granted, that the grant is
+/// unique, and that the producer's probed facts agree with the operator's
+/// declared expectation. That residual producer trust is the same class the
+/// code-source lane already accepts for the canonical path string, and it is
+/// named here rather than papered over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorGrantExpectation {
+    pub producer_id: String,
+    /// The granted durable scope: minted id plus the operator's declared
+    /// connector kind.
+    pub scope: ConnectorScope,
+    /// The vendor tenant or account the operator expects to see.
+    pub remote_authority: String,
+}
+
+/// An onboarding request: the durable scope the producer presents, plus the
+/// facts it probed from the remote store.
+///
+/// Phase 0 has no wire endpoint; this is the shape the endpoint will carry
+/// and the shape the composite validates today.
+#[derive(Debug, Clone)]
+pub struct ConnectorOnboardRequest {
+    /// The authenticated producer presenting the request.
+    pub producer_id: String,
+    /// The durable scope, as written into both sides of the operator config.
+    pub scope: ConnectorScope,
+    /// The connector kind the producer actually ran.
+    pub probed_connector_kind: String,
+    /// The vendor tenant or account the producer actually reached.
+    pub probed_remote_authority: String,
+    /// The store's own id for the scope root, if the connector has one.
+    pub probed_remote_root_id: Option<String>,
+    /// The vendor's display name for the root, if any.
+    pub probed_remote_display_name: Option<String>,
+    pub display_name: String,
+    pub observed_at: String,
+}
+
+/// Receipt for one onboarding call (section 9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorOnboardReceipt {
+    pub project_id: ProjectId,
+    /// True only when THIS call minted the project. A re-onboard of an
+    /// already-cataloged scope is `false` and writes nothing.
+    pub created: bool,
+    pub catalog_epoch: u64,
+}
+
+/// Parse operator or wire strings into a durable connector scope.
+///
+/// Separate from [`ConnectorScope::try_new`] so the refusal carries an admin
+/// error code: a malformed `connector_source_id` is an onboarding refusal,
+/// not an internal parse failure.
+pub fn parse_connector_scope(
+    connector_source_id: &str,
+    connector_kind: &str,
+) -> AdminResult<ConnectorScope> {
+    ConnectorScope::try_new(connector_source_id, connector_kind).map_err(|error| {
+        admin_error(
+            "error.project_catalog_connector_scope_malformed",
+            format!("connector scope is malformed: {error}"),
+        )
+    })
+}
+
+/// Check one onboarding request against the operator's grants and return the
+/// grant that covers it.
+///
+/// Refusals, in the order a tampered request meets them:
+/// 1. no grant names this `connector_source_id` at all;
+/// 2. the grant belongs to a different producer;
+/// 3. the presented scope's kind disagrees with the granted kind;
+/// 4. the producer's probed kind disagrees with the granted kind;
+/// 5. the producer's probed remote authority disagrees with the expectation.
+///
+/// Grants are matched on `connector_source_id` ALONE and the kind is then
+/// checked, so a mistyped kind produces a named mismatch rather than a
+/// confusing "not granted".
+pub fn validate_connector_onboard_request<'a>(
+    grants: &'a [ConnectorGrantExpectation],
+    request: &ConnectorOnboardRequest,
+) -> AdminResult<&'a ConnectorGrantExpectation> {
+    let matching: Vec<&ConnectorGrantExpectation> = grants
+        .iter()
+        .filter(|grant| grant.scope.connector_source_id() == request.scope.connector_source_id())
+        .collect();
+    let [grant] = matching.as_slice() else {
+        if matching.is_empty() {
+            return Err(admin_error(
+                "error.project_catalog_connector_scope_forbidden",
+                format!(
+                    "connector scope {} is not covered by any producer grant",
+                    request.scope.connector_source_id()
+                ),
+            ));
+        }
+        return Err(admin_error(
+            "error.project_catalog_connector_scope_forbidden",
+            format!(
+                "connector scope {} is granted more than once",
+                request.scope.connector_source_id()
+            ),
+        ));
+    };
+    if grant.producer_id != request.producer_id {
+        return Err(admin_error(
+            "error.project_catalog_connector_scope_forbidden",
+            format!(
+                "connector scope {} is granted to a different producer",
+                request.scope.connector_source_id()
+            ),
+        ));
+    }
+    if grant.scope.connector_kind() != request.scope.connector_kind() {
+        return Err(admin_error(
+            "error.project_catalog_connector_kind_mismatch",
+            format!(
+                "presented connector kind {} does not match the granted kind {}",
+                request.scope.connector_kind(),
+                grant.scope.connector_kind()
+            ),
+        ));
+    }
+    if grant.scope.connector_kind().as_str() != request.probed_connector_kind {
+        return Err(admin_error(
+            "error.project_catalog_connector_kind_mismatch",
+            format!(
+                "probed connector kind {} does not match the granted kind {}",
+                request.probed_connector_kind,
+                grant.scope.connector_kind()
+            ),
+        ));
+    }
+    if grant.remote_authority != request.probed_remote_authority {
+        return Err(admin_error(
+            "error.project_catalog_connector_authority_mismatch",
+            "probed remote authority does not match the grant's expectation",
+        ));
+    }
+    Ok(grant)
+}
+
+/// The connector onboarding composite (section 9): find or create the
+/// catalog project for a granted connector scope, and record the producer's
+/// observed coordinates.
+///
+/// Find-or-create, so a producer that drives it before every cycle is safe
+/// to retry: an already-cataloged scope returns the same project id with
+/// `created: false`. Observations ARE refreshed on a re-onboard, because
+/// they are observations; identity is not touched.
+pub fn connector_onboard(
+    store: &ProjectCatalogStore,
+    expected_epoch: u64,
+    grants: &[ConnectorGrantExpectation],
+    request: &ConnectorOnboardRequest,
+) -> AdminResult<ConnectorOnboardReceipt> {
+    validate_connector_onboard_request(grants, request)?;
+    request.scope.validate().map_err(|error| {
+        admin_error(
+            "error.project_catalog_connector_scope_malformed",
+            format!("connector scope is malformed: {error}"),
+        )
+    })?;
+
+    let state = store.snapshot()?;
+    let existing = find_connector_project(state.catalog(), &request.scope)?;
+    let observations = ConnectorObservationsV1 {
+        observed_at: request.observed_at.clone(),
+        producer_id: Some(request.producer_id.clone()),
+        remote_authority: Some(request.probed_remote_authority.clone()),
+        remote_root_id: request.probed_remote_root_id.clone(),
+        remote_display_name: request.probed_remote_display_name.clone(),
+    };
+
+    if let Some(project_id) = existing {
+        // Idempotent re-onboard. Nothing about identity moves; only the
+        // observed coordinates are refreshed, and only when they actually
+        // changed, so a steady-state producer cycle commits nothing.
+        let unchanged = state.epoch() == expected_epoch
+            && state
+                .catalog()
+                .connector_observations
+                .get(&project_id)
+                .is_some_and(|current| current == &observations);
+        // The no-op path is taken only against the epoch the caller pinned;
+        // anything else falls through to the transaction, whose
+        // compare-and-swap refuses staleness.
+        if unchanged {
+            return Ok(ConnectorOnboardReceipt {
+                project_id,
+                created: false,
+                catalog_epoch: state.epoch(),
+            });
+        }
+        let target = project_id.clone();
+        let commit = store.transact(expected_epoch, move |catalog, _attachments| {
+            catalog
+                .connector_observations
+                .insert(target.clone(), observations.clone());
+            Ok(())
+        })?;
+        return Ok(ConnectorOnboardReceipt {
+            project_id,
+            created: false,
+            catalog_epoch: commit.epoch,
+        });
+    }
+
+    let kind = CatalogAddKind::Connector(request.scope.clone());
+    let display_name = request.display_name.clone();
+    let created_at = request.observed_at.clone();
+    let minted = std::sync::Mutex::new(None::<ProjectId>);
+    let commit = store.transact(expected_epoch, |catalog, _attachments| {
+        let project_id = insert_new_project(catalog, &kind, &display_name, &[], &created_at)?;
+        catalog
+            .connector_observations
+            .insert(project_id.clone(), observations.clone());
+        *minted.lock().unwrap() = Some(project_id);
+        Ok(())
+    })?;
+    let project_id = minted
+        .into_inner()
+        .unwrap()
+        .expect("committed transaction minted an id");
+    Ok(ConnectorOnboardReceipt {
+        project_id,
+        created: true,
+        catalog_epoch: commit.epoch,
+    })
+}
+
+/// Resolve the catalog project owning a connector scope.
+///
+/// Lookup keys on `connector_source_id` alone and then checks the kind, so a
+/// grant whose kind was mistyped reports a kind mismatch instead of looking
+/// like an unknown scope and minting a second project under an owned id.
+pub fn find_connector_project(
+    catalog: &bbox_corpus_core::project_catalog::CatalogSnapshotV2,
+    scope: &ConnectorScope,
+) -> AdminResult<Option<ProjectId>> {
+    let matching: Vec<(&ProjectId, &ConnectorScope)> = catalog
+        .projects
+        .iter()
+        .filter_map(|(project_id, project)| match &project.scope {
+            ProjectScope::Connector(owned)
+                if owned.connector_source_id() == scope.connector_source_id() =>
+            {
+                Some((project_id, owned))
+            }
+            _ => None,
+        })
+        .collect();
+    let [(project_id, owned)] = matching.as_slice() else {
+        if matching.is_empty() {
+            return Ok(None);
+        }
+        return Err(admin_error(
+            "error.project_catalog_admin_scope_owned",
+            "connector_source_id resolves to more than one catalog project",
+        ));
+    };
+    if owned.connector_kind() != scope.connector_kind() {
+        return Err(admin_error(
+            "error.project_catalog_connector_kind_mismatch",
+            format!(
+                "connector_source_id {} is cataloged under kind {}, not {}",
+                scope.connector_source_id(),
+                owned.connector_kind(),
+                scope.connector_kind()
+            ),
+        ));
+    }
+    Ok(Some((*project_id).clone()))
 }
 
 /// Outcome of the register compatibility composite (plan §9.1).
@@ -4750,6 +5054,296 @@ mod tests {
 
     fn current_epoch(store: &ProjectCatalogStore) -> u64 {
         store.snapshot().unwrap().epoch()
+    }
+
+    // ── Connector onboarding (Phase 0) ──────────────────────────────────
+
+    const CONNECTOR_SOURCE: &str = "csrc_5f2c1d9a4b6e470e";
+
+    fn empty_store(root: &Path) -> Arc<ProjectCatalogStore> {
+        Arc::new(ProjectCatalogStore::initialize_empty(root.join("projects.json")).unwrap())
+    }
+
+    fn connector_grant() -> ConnectorGrantExpectation {
+        ConnectorGrantExpectation {
+            producer_id: "producer-a".into(),
+            scope: ConnectorScope::try_new(CONNECTOR_SOURCE, "gdrive").unwrap(),
+            remote_authority: "tenant.example".into(),
+        }
+    }
+
+    fn onboard_request() -> ConnectorOnboardRequest {
+        ConnectorOnboardRequest {
+            producer_id: "producer-a".into(),
+            scope: ConnectorScope::try_new(CONNECTOR_SOURCE, "gdrive").unwrap(),
+            probed_connector_kind: "gdrive".into(),
+            probed_remote_authority: "tenant.example".into(),
+            probed_remote_root_id: Some("0ABcDeFgHiJkLmN".into()),
+            probed_remote_display_name: Some("Ops shared folder".into()),
+            display_name: "Ops shared folder".into(),
+            observed_at: "2026-08-13T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn granted_connector_scope_onboards_and_re_onboards_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = empty_store(&root);
+        let grants = vec![connector_grant()];
+
+        let receipt = connector_onboard(&store, current_epoch(&store), &grants, &onboard_request())
+            .expect("a granted connector scope onboards");
+        assert!(receipt.created, "the first onboard mints the project");
+
+        let state = store.snapshot().unwrap();
+        let project = state.catalog().projects.get(&receipt.project_id).unwrap();
+        let scope = project.scope.connector().expect("a connector scope");
+        assert_eq!(scope.connector_source_id().as_str(), CONNECTOR_SOURCE);
+        assert_eq!(scope.connector_kind().as_str(), "gdrive");
+        assert!(
+            project.repo_history.is_none(),
+            "a connector source has no repository history"
+        );
+        assert_eq!(
+            state.catalog().version,
+            bbox_corpus_core::project_catalog::CATALOG_VERSION_V3,
+            "a catalog holding a connector scope is written at version 3"
+        );
+        let observed = state
+            .catalog()
+            .connector_observations
+            .get(&receipt.project_id)
+            .expect("coordinates are recorded as observations");
+        assert_eq!(observed.remote_root_id.as_deref(), Some("0ABcDeFgHiJkLmN"));
+        assert_eq!(observed.remote_authority.as_deref(), Some("tenant.example"));
+
+        // Re-onboarding is find-or-create: same project, nothing created,
+        // and an unchanged report writes nothing at all.
+        let epoch_before = current_epoch(&store);
+        let again = connector_onboard(&store, epoch_before, &grants, &onboard_request())
+            .expect("re-onboarding is safe to retry");
+        assert_eq!(again.project_id, receipt.project_id);
+        assert!(!again.created);
+        assert_eq!(
+            current_epoch(&store),
+            epoch_before,
+            "an unchanged re-onboard commits nothing"
+        );
+        assert_eq!(state.catalog().projects.len(), 1);
+    }
+
+    #[test]
+    fn re_onboarding_refreshes_observations_without_touching_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = empty_store(&root);
+        let grants = vec![connector_grant()];
+        let first =
+            connector_onboard(&store, current_epoch(&store), &grants, &onboard_request()).unwrap();
+
+        let mut moved = onboard_request();
+        moved.probed_remote_root_id = Some("0ABmovedFolderId".into());
+        moved.probed_remote_display_name = Some("Ops shared folder (moved)".into());
+        moved.observed_at = "2026-08-14T00:00:00Z".into();
+        let second = connector_onboard(&store, current_epoch(&store), &grants, &moved).unwrap();
+
+        assert_eq!(
+            second.project_id, first.project_id,
+            "a moved folder is the same durable source: coordinates are not identity"
+        );
+        assert!(!second.created);
+        let state = store.snapshot().unwrap();
+        let observed = &state.catalog().connector_observations[&first.project_id];
+        assert_eq!(observed.remote_root_id.as_deref(), Some("0ABmovedFolderId"));
+    }
+
+    #[test]
+    fn a_non_granted_connector_scope_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = empty_store(&root);
+
+        // No grants at all.
+        let error =
+            connector_onboard(&store, current_epoch(&store), &[], &onboard_request()).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_scope_forbidden"
+        );
+
+        // A grant for a DIFFERENT source: onboarding cannot widen a grant.
+        let grants = vec![ConnectorGrantExpectation {
+            producer_id: "producer-a".into(),
+            scope: ConnectorScope::try_new("csrc_00000000deadbeef", "gdrive").unwrap(),
+            remote_authority: "tenant.example".into(),
+        }];
+        let error = connector_onboard(&store, current_epoch(&store), &grants, &onboard_request())
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_scope_forbidden"
+        );
+
+        // The right scope presented by the wrong producer.
+        let mut impostor = onboard_request();
+        impostor.producer_id = "producer-b".into();
+        let error = connector_onboard(
+            &store,
+            current_epoch(&store),
+            &[connector_grant()],
+            &impostor,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_scope_forbidden"
+        );
+
+        assert!(
+            store.snapshot().unwrap().catalog().projects.is_empty(),
+            "no refusal may mint a project"
+        );
+    }
+
+    #[test]
+    fn a_connector_kind_mismatch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = empty_store(&root);
+        let grants = vec![connector_grant()];
+
+        // The presented durable scope disagrees with the granted kind.
+        let mut presented = onboard_request();
+        presented.scope = ConnectorScope::try_new(CONNECTOR_SOURCE, "graph").unwrap();
+        presented.probed_connector_kind = "graph".into();
+        let error =
+            connector_onboard(&store, current_epoch(&store), &grants, &presented).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_kind_mismatch"
+        );
+
+        // The producer probed a different kind than the operator granted.
+        let mut probed = onboard_request();
+        probed.probed_connector_kind = "webdav".into();
+        let error = connector_onboard(&store, current_epoch(&store), &grants, &probed).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_kind_mismatch"
+        );
+
+        assert!(store.snapshot().unwrap().catalog().projects.is_empty());
+    }
+
+    #[test]
+    fn a_remote_authority_mismatch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = empty_store(&root);
+        let mut request = onboard_request();
+        request.probed_remote_authority = "attacker.example".into();
+        let error = connector_onboard(
+            &store,
+            current_epoch(&store),
+            &[connector_grant()],
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_authority_mismatch"
+        );
+        assert!(store.snapshot().unwrap().catalog().projects.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_connector_source_id_never_becomes_a_scope() {
+        for malformed in [
+            "../drive-ops",
+            "drive/ops",
+            "short7",
+            "Drive-Ops-2026",
+            "drive ops",
+            ".",
+        ] {
+            let error = parse_connector_scope(malformed, "gdrive")
+                .expect_err(&format!("{malformed:?} must be refused"));
+            assert_eq!(
+                error.code(),
+                "error.project_catalog_connector_scope_malformed"
+            );
+        }
+        // The kind is validated on the same path.
+        let error = parse_connector_scope(CONNECTOR_SOURCE, "GDrive").unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_scope_malformed"
+        );
+        parse_connector_scope(CONNECTOR_SOURCE, "gdrive").expect("a well-formed scope parses");
+    }
+
+    #[test]
+    fn one_connector_source_id_can_never_own_two_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = empty_store(&root);
+        connector_onboard(
+            &store,
+            current_epoch(&store),
+            &[connector_grant()],
+            &onboard_request(),
+        )
+        .unwrap();
+
+        // A second grant naming the same id under a different kind resolves
+        // to a NAMED kind mismatch, never to a second project.
+        let conflicting_grant = ConnectorGrantExpectation {
+            producer_id: "producer-a".into(),
+            scope: ConnectorScope::try_new(CONNECTOR_SOURCE, "graph").unwrap(),
+            remote_authority: "tenant.example".into(),
+        };
+        let mut request = onboard_request();
+        request.scope = ConnectorScope::try_new(CONNECTOR_SOURCE, "graph").unwrap();
+        request.probed_connector_kind = "graph".into();
+        let error = connector_onboard(
+            &store,
+            current_epoch(&store),
+            &[conflicting_grant],
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_connector_kind_mismatch"
+        );
+        assert_eq!(store.snapshot().unwrap().catalog().projects.len(), 1);
+    }
+
+    #[test]
+    fn a_connector_project_accepts_no_checkout_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = empty_store(&root);
+        let receipt = connector_onboard(
+            &store,
+            current_epoch(&store),
+            &[connector_grant()],
+            &onboard_request(),
+        )
+        .unwrap();
+
+        let error = attach_checkout(
+            &store,
+            current_epoch(&store),
+            &receipt.project_id,
+            &probe(&root),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "error.project_catalog_admin_connector_not_attachable"
+        );
     }
 
     #[test]
