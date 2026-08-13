@@ -1097,7 +1097,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_find_paths",
-        description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent."
+        description = "Find direction-preserving graph paths from one EntityRef to another ref or entity type. Use after bbox_inspect_entity when a claim depends on a multi-hop chain; filter edge_types aggressively, keep max_depth small (default 3, max 5), and reuse returned path IDs with bbox_bundle_evidence. edge_types accepts a comma-separated string (e.g. 'CALLS,CALLED_BY') OR a JSON array of strings. Both shapes are equivalent. A target is required: a call with neither to nor to_type is refused with error.bad_input rather than answered as an empty result. Over project graphs under own or all visibility, to_type='project_graph_vertex' also matches provisional overlay vertices, so the logical type is enough; pass to_type='provisional_project_graph_vertex' only to target the overlay form exactly."
     )]
     pub(crate) async fn bbox_find_paths(
         &self,
