@@ -16,10 +16,12 @@ use crate::project_record::ProjectRecord;
 /// catalog, or the version-1 bridge's path-bearing `ProjectRecord`.
 ///
 /// This is the plan's "typed `BridgeLegacy` marker" realized as identity
-/// provenance rather than a third `ProjectScope` variant: `ProjectScope`
-/// stays exactly `Published | LegacyLocal` (adding a bridge-only arm there
+/// provenance rather than a `ProjectScope` variant: a bridge-only arm there
 /// would leak into catalog serialization, since `ProjectScope` is also the
-/// wire type for `CorpusProject.scope`). Collected staging's typed
+/// wire type for `CorpusProject.scope`. (`ProjectScope` did later grow a
+/// third arm, `Connector`, but that one is durable catalog identity for a
+/// remote source and carries its own wire version; it is not a runtime
+/// provenance marker, and this reasoning is unchanged by it.) Collected staging's typed
 /// `LegacyLocal` refusal (Phase 3 plan section 6 item 1) reads `origin`
 /// together with `scope`, refusing if and only if
 /// `origin == Catalog && scope == LegacyLocal`: a catalog `LegacyLocal`
