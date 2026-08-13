@@ -2995,6 +2995,37 @@ mod tests {
         .collect()
     }
 
+    /// The accepted store gained graph fields in the same change that broke
+    /// the knowledge-source store on pre-graphs state. It survives that
+    /// vintage because every graph commitment is absent-equivalent: the
+    /// aggregate hash is None for an empty graph lane and the count is zero,
+    /// so a record written without the fields recomputes to itself.
+    #[test]
+    fn generation_written_before_the_graph_lane_still_validates() {
+        let prepared =
+            prepare_accepted_publication_v1(build_input(), &AcceptedPublicationLimits::default())
+                .unwrap();
+        let encoded = serde_json::to_value(&prepared.generation).unwrap();
+        let mut record = encoded.as_object().unwrap().clone();
+        assert!(record.remove("graph_sources").is_some());
+        record
+            .get_mut("counts")
+            .and_then(|counts| counts.as_object_mut())
+            .map(|counts| counts.remove("graph_files"))
+            .unwrap()
+            .unwrap();
+        record
+            .get_mut("hashes")
+            .and_then(|hashes| hashes.as_object_mut())
+            .map(|hashes| hashes.remove("graph_sources_sha256"));
+
+        let legacy: AcceptedPublicationGenerationV1 =
+            serde_json::from_value(serde_json::Value::Object(record)).unwrap();
+        assert_eq!(legacy.counts.graph_files, 0);
+        assert!(legacy.hashes.graph_sources_sha256.is_none());
+        validate_generation_v1(&legacy, &AcceptedPublicationLimits::default()).unwrap();
+    }
+
     #[test]
     fn candidate_builder_accepts_the_governance_record_graph_fixture() {
         let mut input = build_input();
