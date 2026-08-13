@@ -23,14 +23,23 @@ date: 2026-08-11
 
 # Graph-native connector campaign
 
-Status: proposed, re-grounded 2026-08-11 on the post-locality architecture.
-The reflective graph kernel, connector source projections, and cross-entity
-evidence bindings named by milestones M1-M3 were implemented once on the
-diverged salvage branch `campaign/reflective-graph-r2-projection`
-(pre-locality base); that code is donor material for reimplementation on the
-current tree, not landed capability. Nothing in this program exists on
-`beta/blackbox-v2` today beyond the reflective graph design doc itself.
-Reverify contract names against code before building.
+Status: partial, re-grounded 2026-08-11 on the post-locality architecture;
+status refreshed 2026-08-13. **M1 is LANDED**: the reflective graph kernel
+shipped on `beta/blackbox-v2` on 2026-08-12 (`crates/bbox-project-graph`,
+descriptors, schema-as-data validation, atomic generations, the
+`project_graph_vertex` ref family, `bbox_project_graph_list/describe/
+validate`, provisional visibility through workspace-binding capture) and is
+proven live by `examples/graph-live-exercise.sh` plus a real external
+authoring exercise against production (a private project authored a domain
+graph end to end; findings on thread-a2062843). The non-git scope identity
+question (section 8 of `remote-source-connectors.md`) was RESOLVED by
+operator decision on 2026-08-12: grant-time operator-minted
+`connector_source_id` with provider coordinates as observations (knowledge
+4b7b8ab0); `gap-0c7ec76c` tracks the catalog implementation. Connector
+source projections and cross-entity evidence bindings (M2-M3) remain
+salvage donor material on `campaign/reflective-graph-r2-projection`
+(pre-locality base), to be ported against current contracts, never merged
+wholesale. Reverify contract names against code before building.
 
 ## 0. Outcome
 
