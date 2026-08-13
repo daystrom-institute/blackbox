@@ -1,0 +1,412 @@
+//! The publication cycle end to end: a real Slack client against a fixture
+//! workspace, and a model of the corpus landing store.
+//!
+//! One test per gate clause from design section 9 (S1 plus the S3 thread
+//! machinery this deployment cannot defer), because thread completeness and
+//! edit/delete reconciliation are the two places an ingestion lane most easily
+//! looks correct while being wrong.
+
+mod support;
+
+use std::path::PathBuf;
+
+use bbox_slack_collector::{Journal, SatelliteConfig, SlackClient, run_publication_cycle};
+use support::{
+    FakeChannel, FakeMessage, FakeSlack, FakeSlackState, ModelSink, RefusingSink, fast_rate_policy,
+    one_app_scopes, pinned_now, test_config, ts_before,
+};
+
+const CHANNEL: &str = "C0FIXTURE01";
+const OTHER_CHANNEL: &str = "C0FIXTURE02";
+
+struct Harness {
+    slack: FakeSlack,
+    client: SlackClient,
+    sink: ModelSink,
+    config: SatelliteConfig,
+    journal_path: PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+impl Harness {
+    async fn start(state: FakeSlackState) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        // Canonicalized before anything derives a path from it: on macOS the
+        // raw tempdir is /var/... while everything downstream sees /private/var.
+        let root = directory.path().canonicalize().unwrap();
+        let journal_path = root.join("journal.json");
+        let slack = FakeSlack::start(state).await;
+        let client = SlackClient::new(
+            slack.base_url.as_str(),
+            "xoxb-fixture-token",
+            fast_rate_policy(),
+        )
+        .unwrap();
+        let config = test_config(&slack.base_url, journal_path.clone(), &["engineering"]);
+        Self {
+            slack,
+            client,
+            sink: ModelSink::new(),
+            config,
+            journal_path,
+            _directory: directory,
+        }
+    }
+
+    async fn cycle(&self, offset_secs: i64) -> bbox_slack_collector::CycleOutcome {
+        run_publication_cycle(
+            &self.client,
+            &self.sink,
+            &self.config,
+            &self.journal_path,
+            pinned_now(offset_secs),
+        )
+        .await
+        .unwrap()
+    }
+}
+
+fn workspace(messages: Vec<FakeMessage>) -> FakeSlackState {
+    FakeSlackState {
+        granted_scopes: one_app_scopes(),
+        channels: vec![FakeChannel::public(CHANNEL, "engineering")],
+        history: [(CHANNEL.to_string(), messages)].into_iter().collect(),
+        page_size: 50,
+        ..FakeSlackState::default()
+    }
+}
+
+fn three_messages() -> Vec<FakeMessage> {
+    vec![
+        FakeMessage::new(&ts_before(600, 1), "U0HUMAN", "first"),
+        FakeMessage::new(&ts_before(300, 2), "U0OTHER", "second"),
+        FakeMessage::new(&ts_before(120, 3), "U0HUMAN", "third"),
+    ]
+}
+
+#[tokio::test]
+async fn a_steady_state_sweep_lands_every_new_message_exactly_once() {
+    let harness = Harness::start(workspace(three_messages())).await;
+
+    let first = harness.cycle(0).await;
+    assert_eq!(first.channels_enrolled, 1);
+    assert_eq!(first.messages_landed, 3);
+    assert_eq!(first.duplicates, 0);
+    assert_eq!(first.windows_deferred, 0);
+
+    // A second cycle over the same workspace re-reads nothing it already
+    // landed. Exactly once means exactly once ACROSS cycles, which is the half
+    // a single-run assertion misses.
+    let second = harness.cycle(60).await;
+    assert_eq!(second.messages_landed, 0);
+    assert_eq!(second.duplicates, 0);
+
+    let mut landed = harness.sink.timestamps(CHANNEL);
+    landed.sort();
+    assert_eq!(
+        landed,
+        vec![ts_before(600, 1), ts_before(300, 2), ts_before(120, 3)]
+    );
+    assert_eq!(
+        harness
+            .sink
+            .record(CHANNEL, &ts_before(300, 2))
+            .unwrap()
+            .text,
+        "second"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_channel_produces_no_batch_at_all() {
+    let harness = Harness::start(workspace(three_messages())).await;
+    harness.cycle(0).await;
+    let batches_after_first = harness.sink.batches();
+    assert_eq!(batches_after_first, 1);
+
+    harness.cycle(60).await;
+
+    // Not "an empty batch", not "a batch the server deduplicates": NO batch.
+    // An idle workspace must not turn "no news" into write traffic.
+    assert_eq!(harness.sink.batches(), batches_after_first);
+}
+
+#[tokio::test]
+async fn a_thread_whose_replies_were_never_broadcast_is_fully_indexed() {
+    // The gate that decides whether this connector is honest. Unbroadcast
+    // replies never appear in conversations.history, so a history-only
+    // collector silently loses most thread bodies while looking healthy.
+    let parent_ts = ts_before(600, 1);
+    let reply_one = ts_before(400, 5);
+    let reply_two = ts_before(100, 9);
+    let mut state = workspace(vec![
+        FakeMessage::new(&parent_ts, "U0HUMAN", "thread starter").parent(2, &reply_two),
+        FakeMessage::new(&ts_before(300, 2), "U0OTHER", "unrelated"),
+    ]);
+    state.replies.insert(
+        (CHANNEL.to_string(), parent_ts.clone()),
+        vec![
+            FakeMessage::new(&reply_one, "U0OTHER", "reply one").reply_to(&parent_ts),
+            FakeMessage::new(&reply_two, "U0HUMAN", "reply two").reply_to(&parent_ts),
+        ],
+    );
+    let harness = Harness::start(state).await;
+
+    let outcome = harness.cycle(0).await;
+
+    assert_eq!(outcome.threads_swept, 1);
+    assert_eq!(outcome.thread_replies_landed, 2);
+    // Four records: two channel-visible messages plus two replies that no
+    // history sweep would ever have returned.
+    assert_eq!(harness.sink.timestamps(CHANNEL).len(), 4);
+    let landed_reply = harness.sink.record(CHANNEL, &reply_two).unwrap();
+    assert_eq!(landed_reply.text, "reply two");
+    assert_eq!(
+        landed_reply.thread_parent_ts.as_deref(),
+        Some(parent_ts.as_str())
+    );
+    // The parent is landed once, by the history sweep. The replies sweep
+    // returns it on every page and must filter it.
+    assert_eq!(
+        harness.sink.record(CHANNEL, &parent_ts).unwrap().text,
+        "thread starter"
+    );
+
+    // An idle thread costs nothing on the next cycle: the advertised
+    // latest_reply has not moved, so the cheap test skips it.
+    let before = harness.slack.request_count("conversations.replies");
+    harness.cycle(60).await;
+    assert_eq!(
+        harness.slack.request_count("conversations.replies"),
+        before,
+        "an idle thread must not be resswept while nothing has changed"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_produces_a_revision_and_a_delete_produces_a_tombstone() {
+    let mut harness = Harness::start(workspace(three_messages())).await;
+    // Reconcile every cycle so the gate does not depend on cadence arithmetic.
+    harness.config.reconciliation.every_cycles = 1;
+
+    harness.cycle(0).await;
+    assert_eq!(harness.sink.timestamps(CHANNEL).len(), 3);
+
+    // The workspace changes underneath the corpus: one message is edited in
+    // place (same ts, moved edit stamp) and one is deleted (simply absent).
+    // Both are invisible to a forward-only cursor.
+    harness.slack.with(|state| {
+        let messages = state.history.get_mut(CHANNEL).unwrap();
+        messages.retain(|message| message.ts != ts_before(120, 3));
+        for message in messages.iter_mut() {
+            if message.ts == ts_before(300, 2) {
+                *message = message
+                    .clone()
+                    .edited(&ts_before(30, 0), "second, corrected");
+            }
+        }
+    });
+
+    let outcome = harness.cycle(60).await;
+
+    assert!(outcome.reconciled);
+    assert_eq!(outcome.revisions_emitted, 1);
+    assert_eq!(outcome.tombstones_emitted, 1);
+
+    // The edit superseded IN PLACE: same identity, higher revision, new text.
+    let edited = harness.sink.record(CHANNEL, &ts_before(300, 2)).unwrap();
+    assert_eq!(edited.text, "second, corrected");
+    assert_eq!(edited.revision, 1);
+    assert!(!edited.tombstoned);
+
+    // The deletion MARKED the record rather than erasing it, so the corpus can
+    // still tell a redaction from a message it never saw.
+    let deleted = harness.sink.record(CHANNEL, &ts_before(120, 3)).unwrap();
+    assert!(deleted.tombstoned);
+    assert_eq!(deleted.revision, 1);
+
+    // And a third cycle with nothing further changed emits neither again.
+    let quiet = harness.cycle(120).await;
+    assert_eq!(quiet.revisions_emitted, 0);
+    assert_eq!(quiet.tombstones_emitted, 0);
+}
+
+#[tokio::test]
+async fn a_satellite_restart_without_its_journal_resumes_from_the_server_cursor() {
+    let harness = Harness::start(workspace(three_messages())).await;
+    harness.cycle(0).await;
+    assert_eq!(harness.sink.timestamps(CHANNEL).len(), 3);
+
+    // Producer working state is losable BY DESIGN. Delete it entirely and add a
+    // message: the corpus cursor alone must produce a clean resume, with no
+    // gap and no re-landing of what it already holds.
+    std::fs::remove_file(&harness.journal_path).unwrap();
+    assert_eq!(Journal::load(&harness.journal_path), Journal::default());
+    harness.slack.with(|state| {
+        state
+            .history
+            .get_mut(CHANNEL)
+            .unwrap()
+            .push(FakeMessage::new(
+                &ts_before(-30, 4),
+                "U0HUMAN",
+                "after the restart",
+            ));
+    });
+
+    let outcome = harness.cycle(60).await;
+
+    assert_eq!(outcome.messages_landed, 1);
+    assert_eq!(
+        outcome.duplicates, 0,
+        "the server watermark is the resume point, so nothing already landed is re-sent"
+    );
+    assert_eq!(harness.sink.timestamps(CHANNEL).len(), 4);
+    assert_eq!(
+        harness
+            .sink
+            .record(CHANNEL, &ts_before(-30, 4))
+            .unwrap()
+            .text,
+        "after the restart"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_read_scope_refuses_before_any_durable_write() {
+    let mut state = workspace(three_messages());
+    // The interactive bot's grant, minus the one read this collector needs.
+    // Under the one-app posture this is the only scope failure it can refuse,
+    // and refusing matters: without the scope every sweep comes back empty and
+    // the deployment presents as a healthy satellite over an empty corpus.
+    state.granted_scopes = vec!["channels:read".to_string(), "chat:write".to_string()];
+    let slack = FakeSlack::start(state).await;
+    let client = SlackClient::new(
+        slack.base_url.as_str(),
+        "xoxb-fixture-token",
+        fast_rate_policy(),
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let journal_path = root.join("journal.json");
+    let config = test_config(&slack.base_url, journal_path.clone(), &["engineering"]);
+
+    // The sink refuses every verb, so a cycle that reached the corpus at all
+    // would fail with a different message than the one asserted here.
+    let error = run_publication_cycle(
+        &client,
+        &RefusingSink,
+        &config,
+        &journal_path,
+        pinned_now(0),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("channels:history"), "{error}");
+    assert!(error.contains("missing required read scope"), "{error}");
+    assert!(!journal_path.exists(), "nothing durable may be written");
+}
+
+#[tokio::test]
+async fn a_credential_that_reached_another_workspace_is_refused() {
+    let mut harness = Harness::start(workspace(three_messages())).await;
+    harness.config.expected_workspace_id = Some("T0SOMEWHEREELSE".to_string());
+
+    let error = run_publication_cycle(
+        &harness.client,
+        &RefusingSink,
+        &harness.config,
+        &harness.journal_path,
+        pinned_now(0),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("T0SOMEWHEREELSE"), "{error}");
+}
+
+#[tokio::test]
+async fn a_channel_outside_the_allowlist_is_never_swept() {
+    let mut state = workspace(three_messages());
+    state
+        .channels
+        .push(FakeChannel::public(OTHER_CHANNEL, "random"));
+    state.history.insert(
+        OTHER_CHANNEL.to_string(),
+        vec![FakeMessage::new(
+            &ts_before(200, 7),
+            "U0HUMAN",
+            "off limits",
+        )],
+    );
+    let harness = Harness::start(state).await;
+
+    let outcome = harness.cycle(0).await;
+
+    assert_eq!(outcome.channels_enrolled, 1);
+    assert_eq!(
+        outcome.channels_skipped.get("not_included").copied(),
+        Some(1)
+    );
+    assert!(harness.sink.timestamps(OTHER_CHANNEL).is_empty());
+    // Not enrolled means not READ. Policy reaches the request, not just the
+    // landing decision, so the stronger claim is available: the fixture was
+    // never even asked about that channel.
+    assert_eq!(harness.slack.channel_read_count(OTHER_CHANNEL), 0);
+    assert!(harness.slack.channel_read_count(CHANNEL) > 0);
+}
+
+#[tokio::test]
+async fn a_window_that_did_not_finish_enumerating_is_deferred_rather_than_landed() {
+    // The cursor-integrity gate. History pages newest-first, so a
+    // budget-truncated window holds the newest messages rather than a
+    // contiguous run from the watermark. Landing it would advance the cursor
+    // past the older two forever.
+    let mut state = workspace(three_messages());
+    state.page_size = 1;
+    let mut harness = Harness::start(state).await;
+    harness.config.sweep.max_pages_per_window = 1;
+
+    let deferred = harness.cycle(0).await;
+
+    assert_eq!(deferred.windows_deferred, 1);
+    assert_eq!(deferred.messages_landed, 0);
+    assert_eq!(
+        harness.sink.batches(),
+        0,
+        "a partial window must not be published at all"
+    );
+
+    // Nothing was lost: with room to finish, the same range lands whole.
+    harness.config.sweep.max_pages_per_window = 10;
+    let complete = harness.cycle(60).await;
+    assert_eq!(complete.windows_deferred, 0);
+    assert_eq!(complete.messages_landed, 3);
+    assert_eq!(harness.sink.timestamps(CHANNEL).len(), 3);
+}
+
+#[tokio::test]
+async fn structural_channel_noise_is_counted_rather_than_indexed() {
+    let mut messages = three_messages();
+    messages.push(
+        FakeMessage::new(&ts_before(90, 8), "U0HUMAN", "has joined the channel")
+            .subtype("channel_join"),
+    );
+    let harness = Harness::start(workspace(messages)).await;
+
+    let outcome = harness.cycle(0).await;
+
+    assert_eq!(outcome.messages_landed, 3);
+    assert_eq!(
+        outcome
+            .normalization_skips
+            .get("subtype_channel_join")
+            .copied(),
+        Some(1)
+    );
+    assert!(harness.sink.record(CHANNEL, &ts_before(90, 8)).is_none());
+}

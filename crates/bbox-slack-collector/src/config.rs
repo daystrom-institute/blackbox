@@ -118,6 +118,16 @@ pub struct SweepPolicy {
     /// Pages one thread may consume.
     #[serde(default = "default_max_pages_per_thread")]
     pub max_pages_per_thread: u32,
+    /// Cycles after which a quiet thread is resswept anyway.
+    ///
+    /// The cheap latest-reply test (design 5.3) only works while the parent is
+    /// still inside a channel window the sweep re-reads: once it ages out,
+    /// nothing advertises a new unbroadcast reply to anyone, and a
+    /// latest-reply-only policy would never look again. So an idle thread costs
+    /// nothing for this many cycles and then costs exactly one call. Set it
+    /// higher to spend less rate budget and detect late thread activity slower.
+    #[serde(default = "default_thread_rotation_cycles")]
+    pub thread_rotation_cycles: u32,
     /// Pages the channel roster may consume.
     #[serde(default = "default_max_roster_pages")]
     pub max_roster_pages: u32,
@@ -147,6 +157,10 @@ fn default_max_pages_per_thread() -> u32 {
     5
 }
 
+fn default_thread_rotation_cycles() -> u32 {
+    10
+}
+
 fn default_max_roster_pages() -> u32 {
     10
 }
@@ -160,6 +174,7 @@ impl Default for SweepPolicy {
             max_pages_per_window: default_max_pages_per_window(),
             thread_parents_per_cycle: default_thread_parents_per_cycle(),
             max_pages_per_thread: default_max_pages_per_thread(),
+            thread_rotation_cycles: default_thread_rotation_cycles(),
             max_roster_pages: default_max_roster_pages(),
         }
     }

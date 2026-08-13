@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn a_vendor_retry_after_is_honored_within_the_ceiling() {
         let policy = RatePolicy::default();
-        assert_eq!(policy.backoff(Some(Duration::from_secs(7)), 0), Duration::from_secs(7));
+        assert_eq!(
+            policy.backoff(Some(Duration::from_secs(7)), 0),
+            Duration::from_secs(7)
+        );
         assert_eq!(
             policy.backoff(Some(Duration::from_secs(3_600)), 0),
             Duration::from_secs(policy.max_backoff_secs)

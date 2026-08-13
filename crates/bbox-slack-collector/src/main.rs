@@ -99,9 +99,14 @@ async fn main() -> Result<()> {
             );
         }
         Command::Run => {
-            let outcome =
-                run_publication_cycle(&slack, &sink, &config, &config.journal_path, chrono::Utc::now())
-                    .await?;
+            let outcome = run_publication_cycle(
+                &slack,
+                &sink,
+                &config,
+                &config.journal_path,
+                chrono::Utc::now(),
+            )
+            .await?;
             report(&outcome, &slack);
         }
         Command::Watch { interval_secs } => {

@@ -249,7 +249,13 @@ impl SlackIdentity {
 /// a false negative would understate what the shared credential can do.
 fn is_write_scope(scope: &str) -> bool {
     const WRITE_MARKERS: &[&str] = &[
-        ":write", "chat:", "files:write", "views:", "commands", "im:write", "reactions:write",
+        ":write",
+        "chat:",
+        "files:write",
+        "views:",
+        "commands",
+        "im:write",
+        "reactions:write",
     ];
     WRITE_MARKERS.iter().any(|marker| scope.contains(marker))
 }

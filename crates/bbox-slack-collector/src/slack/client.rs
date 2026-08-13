@@ -63,7 +63,10 @@ pub const DEFAULT_PAGE_LIMIT: u32 = 200;
 /// NEWEST part of its window, not a contiguous run from the watermark, so
 /// landing it would advance the cursor over a hole. [`crate::cycle`] refuses to
 /// land an incomplete window for exactly that reason.
-#[derive(Debug, Clone, Default, PartialEq)]
+// No `PartialEq`: the vendor response shapes it carries are deliberately
+// permissive (they gain fields on Slack's schedule) and comparing two sweeps
+// structurally is not a thing any caller should want to do.
+#[derive(Debug, Clone, Default)]
 pub struct Sweep {
     pub messages: Vec<RawMessage>,
     pub complete: bool,
@@ -161,7 +164,11 @@ impl SlackClient {
     /// is validated the same way the corpus URL is: a non-loopback plain-HTTP
     /// base would put a bot token on the wire in clear text, so it is refused
     /// here rather than trusted to be a test.
-    pub fn new(base_url: impl Into<String>, token: impl Into<String>, policy: RatePolicy) -> Result<Self> {
+    pub fn new(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        policy: RatePolicy,
+    ) -> Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         crate::config::require_safe_transport(&base_url, "slack_api_base_url")?;
         let token = token.into();
@@ -352,10 +359,12 @@ impl SlackClient {
 #[async_trait]
 impl SlackRead for SlackClient {
     async fn auth_test(&self) -> Result<SlackIdentity> {
-        let (response, scopes) = self.send::<AuthTestResponse>(SlackReadMethod::AuthTest, &[]).await?;
-        let workspace_id = response
-            .team_id
-            .ok_or_else(|| anyhow!("auth.test returned no team_id; refusing to guess an identity"))?;
+        let (response, scopes) = self
+            .send::<AuthTestResponse>(SlackReadMethod::AuthTest, &[])
+            .await?;
+        let workspace_id = response.team_id.ok_or_else(|| {
+            anyhow!("auth.test returned no team_id; refusing to guess an identity")
+        })?;
         Ok(SlackIdentity {
             workspace_id,
             workspace_domain: response.url.map(|url| {
@@ -442,11 +451,7 @@ impl SlackRead for SlackClient {
                     // `has_more` without a cursor is a vendor state we cannot
                     // page out of; treating it as done would be a silent hole,
                     // so it is surfaced as an incomplete sweep.
-                    cursor.or(if has_more {
-                        Some(String::new())
-                    } else {
-                        None
-                    })
+                    cursor.or(if has_more { Some(String::new()) } else { None })
                 },
             )
             .await?;
@@ -481,11 +486,7 @@ impl SlackRead for SlackClient {
                     let has_more = page.has_more;
                     let cursor = page.response_metadata.cursor().map(str::to_string);
                     messages.extend(page.messages);
-                    cursor.or(if has_more {
-                        Some(String::new())
-                    } else {
-                        None
-                    })
+                    cursor.or(if has_more { Some(String::new()) } else { None })
                 },
             )
             .await?;
@@ -536,15 +537,24 @@ mod tests {
 
     #[test]
     fn a_non_loopback_plain_http_slack_base_is_refused() {
-        let error = SlackClient::new("http://slack.example.com/api", "xoxb-fixture", RatePolicy::default())
-            .unwrap_err()
-            .to_string();
+        let error = SlackClient::new(
+            "http://slack.example.com/api",
+            "xoxb-fixture",
+            RatePolicy::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("slack_api_base_url"), "{error}");
     }
 
     #[test]
     fn a_loopback_plain_http_base_is_allowed_for_fixtures() {
-        SlackClient::new("http://127.0.0.1:8080/api", "xoxb-fixture", RatePolicy::default()).unwrap();
+        SlackClient::new(
+            "http://127.0.0.1:8080/api",
+            "xoxb-fixture",
+            RatePolicy::default(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -557,8 +567,12 @@ mod tests {
 
     #[test]
     fn the_debug_rendering_never_carries_the_token() {
-        let client =
-            SlackClient::new(DEFAULT_API_BASE_URL, "xoxb-super-secret", RatePolicy::default()).unwrap();
+        let client = SlackClient::new(
+            DEFAULT_API_BASE_URL,
+            "xoxb-super-secret",
+            RatePolicy::default(),
+        )
+        .unwrap();
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("xoxb-super-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
@@ -566,7 +580,8 @@ mod tests {
 
     #[test]
     fn every_composed_url_comes_from_the_allowlist() {
-        let client = SlackClient::new(DEFAULT_API_BASE_URL, "xoxb-fixture", RatePolicy::default()).unwrap();
+        let client =
+            SlackClient::new(DEFAULT_API_BASE_URL, "xoxb-fixture", RatePolicy::default()).unwrap();
         for method in SlackReadMethod::ALL {
             let url = client.url(*method).unwrap();
             assert_eq!(

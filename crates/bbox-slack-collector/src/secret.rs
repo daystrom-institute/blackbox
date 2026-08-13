@@ -70,9 +70,9 @@ impl SecretRef {
     /// steps later that reads like a revoked grant.
     pub fn validate(&self, field: &str) -> Result<()> {
         match (&self.token_file, &self.token_secret_ref) {
-            (Some(_), Some(_)) => bail!(
-                "{field}: set exactly one of token_file or token_secret_ref, not both"
-            ),
+            (Some(_), Some(_)) => {
+                bail!("{field}: set exactly one of token_file or token_secret_ref, not both")
+            }
             (None, None) => bail!("{field}: set token_file or token_secret_ref"),
             (Some(path), None) => {
                 if path.as_os_str().is_empty() {
@@ -130,7 +130,10 @@ pub fn read_token_file(path: &Path, field: &str) -> Result<String> {
         );
     }
     if !metadata.is_file() {
-        bail!("{field}: token file {} is not a regular file", path.display());
+        bail!(
+            "{field}: token file {} is not a regular file",
+            path.display()
+        );
     }
     #[cfg(unix)]
     {
@@ -196,13 +199,24 @@ mod tests {
     #[test]
     fn exactly_one_reference_form_is_required() {
         let neither = SecretRef::default();
-        assert!(neither.validate("slack").unwrap_err().to_string().contains("set token_file"));
+        assert!(
+            neither
+                .validate("slack")
+                .unwrap_err()
+                .to_string()
+                .contains("set token_file")
+        );
 
         let both = SecretRef {
             token_file: Some(PathBuf::from("/run/secrets/slack")),
             token_secret_ref: Some("op://vault/item/field".into()),
         };
-        assert!(both.validate("slack").unwrap_err().to_string().contains("not both"));
+        assert!(
+            both.validate("slack")
+                .unwrap_err()
+                .to_string()
+                .contains("not both")
+        );
     }
 
     #[test]

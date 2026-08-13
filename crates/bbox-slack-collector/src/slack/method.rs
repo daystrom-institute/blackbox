@@ -87,7 +87,10 @@ impl SlackReadMethod {
     /// roster probes through on the same conservative budget rather than a
     /// separate one.
     pub const fn is_paging_read(self) -> bool {
-        matches!(self, Self::ConversationsHistory | Self::ConversationsReplies)
+        matches!(
+            self,
+            Self::ConversationsHistory | Self::ConversationsReplies
+        )
     }
 
     /// Resolve a method NAME, refusing anything outside the allowlist.

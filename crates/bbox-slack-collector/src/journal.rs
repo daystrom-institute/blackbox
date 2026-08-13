@@ -231,7 +231,12 @@ impl ChannelJournal {
     /// already applied one would refuse as a duplicate. This matters most right
     /// after a journal loss, which is exactly when baselines are reseeded from
     /// messages with edit history.
-    pub fn observe_landed(&mut self, message_ts: &str, edited_ts: Option<&str>, thread_reply: bool) {
+    pub fn observe_landed(
+        &mut self,
+        message_ts: &str,
+        edited_ts: Option<&str>,
+        thread_reply: bool,
+    ) {
         let entry = self
             .baseline
             .entry(message_ts.to_string())

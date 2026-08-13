@@ -65,7 +65,9 @@ impl ConversationSourceClient {
                 // bearer.
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .map_err(|error| anyhow!("building the conversation-source HTTP client: {error}"))?,
+                .map_err(|error| {
+                    anyhow!("building the conversation-source HTTP client: {error}")
+                })?,
         })
     }
 
@@ -79,7 +81,10 @@ impl ConversationSourceClient {
                 "connector_source_id",
                 scope.connector_source_id().as_str().to_string(),
             ),
-            ("connector_kind", scope.connector_kind().as_str().to_string()),
+            (
+                "connector_kind",
+                scope.connector_kind().as_str().to_string(),
+            ),
         ]
     }
 }

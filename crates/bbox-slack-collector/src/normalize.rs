@@ -177,10 +177,7 @@ pub fn normalize(
         thread_parent_ts,
         subtype,
         text,
-        edited_ts: message
-            .edited
-            .as_ref()
-            .and_then(|edited| edited.ts.clone()),
+        edited_ts: message.edited.as_ref().and_then(|edited| edited.ts.clone()),
         reactions,
         attachments,
         observed_at: observed_at.to_string(),

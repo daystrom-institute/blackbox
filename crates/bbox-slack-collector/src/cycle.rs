@@ -79,8 +79,10 @@ pub trait ConversationSink: Send + Sync {
         &self,
         request: &ConversationCatalogOnboardRequestV1,
     ) -> Result<ConversationCatalogOnboardResponseV1>;
-    async fn post_channels(&self, request: &ChannelRosterRequestV1)
-    -> Result<ChannelRosterReceiptV1>;
+    async fn post_channels(
+        &self,
+        request: &ChannelRosterRequestV1,
+    ) -> Result<ChannelRosterReceiptV1>;
     async fn cursors(&self, scope: &ConnectorScope) -> Result<ConversationCursorsResponseV1>;
     async fn post_batch(&self, batch: &ConversationBatchV1) -> Result<ConversationBatchReceiptV1>;
     async fn post_revisions(
@@ -237,8 +239,8 @@ pub async fn run_publication_cycle(
     };
 
     // -- enrollment ----------------------------------------------------------
-    let policy = CompiledChannelPolicy::compile(&config.channels)
-        .context("compiling the channel policy")?;
+    let policy =
+        CompiledChannelPolicy::compile(&config.channels).context("compiling the channel policy")?;
     let roster = slack
         .list_channels(&ChannelListRequest {
             include_private: policy.include_private(),
@@ -550,7 +552,11 @@ async fn sweep_steady_state(
         // Marks advance only now, after the corpus acknowledged the batch.
         let channel = journal.channel_mut(context.channel_id);
         for landed in &posted.landed {
-            channel.observe_landed(&landed.message_ts, landed.edited_ts.as_deref(), landed.is_reply);
+            channel.observe_landed(
+                &landed.message_ts,
+                landed.edited_ts.as_deref(),
+                landed.is_reply,
+            );
             result.landed_ts.insert(landed.message_ts.clone());
         }
         channel.advance_swept_through(&end_ts);
@@ -584,21 +590,30 @@ async fn sweep_threads(
     }
 
     let cycle = journal.cycles;
-    let channel_journal = journal.channel(context.channel_id).cloned().unwrap_or_default();
+    let channel_journal = journal
+        .channel(context.channel_id)
+        .cloned()
+        .unwrap_or_default();
     // Priority: threads with a real signal first (unknown, or an advertised
     // reply newer than what was swept), then the ROTATION by staleness. The
     // rotation is what keeps an old thread's unbroadcast reply from being
     // invisible forever, since nothing advertises it once the parent leaves the
     // sweep window.
+    let rotation = u64::from(config.sweep.thread_rotation_cycles.max(1));
     let mut ordered: Vec<(u8, u64, String, Option<String>)> = candidates
         .into_iter()
-        .map(|(parent_ts, latest_reply)| {
+        .filter_map(|(parent_ts, latest_reply)| {
             let signaled = channel_journal.thread_needs_sweep(&parent_ts, latest_reply.as_deref());
             let last_swept = channel_journal
                 .thread(&parent_ts)
                 .map(|mark| mark.last_swept_cycle)
                 .unwrap_or(0);
-            (u8::from(!signaled), last_swept, parent_ts, latest_reply)
+            // An idle thread costs NOTHING until the rotation comes around,
+            // which is the cheap test design 5.3 asks for. The rotation is what
+            // keeps "cheap" from becoming "never": once a parent ages out of
+            // the sweep window nothing advertises its new replies at all.
+            let due = cycle.saturating_sub(last_swept) >= rotation;
+            (signaled || due).then_some((u8::from(!signaled), last_swept, parent_ts, latest_reply))
         })
         .collect();
     ordered.sort_by(|left, right| {
@@ -991,10 +1006,8 @@ async fn post_records(
         ordered.into_values().collect();
 
     for chunk in ordered.chunks(MAX_BATCH_RECORDS) {
-        let batch_records: Vec<ConversationMessageRecordV1> = chunk
-            .iter()
-            .map(|(record, _, _)| record.clone())
-            .collect();
+        let batch_records: Vec<ConversationMessageRecordV1> =
+            chunk.iter().map(|(record, _, _)| record.clone()).collect();
         let batch = ConversationBatchV1 {
             schema_version: SCHEMA_VERSION,
             conversation_policy_version: CONVERSATION_POLICY_VERSION.to_string(),
@@ -1008,7 +1021,10 @@ async fn post_records(
         batch
             .validate()
             .map_err(|error| anyhow!("refusing to publish an invalid batch: {error}"))?;
-        let receipt = sink.post_batch(&batch).await.context("publishing a batch")?;
+        let receipt = sink
+            .post_batch(&batch)
+            .await
+            .context("publishing a batch")?;
         outcome.accepted += receipt.accepted;
         outcome.duplicates += receipt.duplicates;
         for (record, edited_ts, is_reply) in chunk {
