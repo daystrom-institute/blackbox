@@ -1437,35 +1437,44 @@ mod tests {
         );
     }
 
+    /// Destroy a generation's producibility while leaving intact the
+    /// activation record that names it. `find_generation_mixed` locates a
+    /// generation by `scopes/*/generations/<id>/metadata.json`, so removing
+    /// the generation directory makes the store unable to answer for it, the
+    /// same as one that never existed.
+    fn remove_generation_from_store(config: &Config, generation_id: &str) {
+        let scopes = config
+            .paths
+            .state_dir
+            .join("code-sources")
+            .join("scopes")
+            .canonicalize()
+            .unwrap();
+        let mut removed = false;
+        for scope_entry in std::fs::read_dir(&scopes).unwrap() {
+            let generation = scope_entry
+                .unwrap()
+                .path()
+                .join("generations")
+                .join(generation_id);
+            if generation.is_dir() {
+                std::fs::remove_dir_all(&generation).unwrap();
+                removed = true;
+            }
+        }
+        assert!(removed, "expected to remove generation {generation_id}");
+    }
+
     /// Strictness preservation: reconciliation trusts the journal only because
     /// the caller has already proven the activation against a generation the
-    /// store can produce. An activation naming a generation that does not
-    /// exist still refuses.
+    /// store can produce. A real, valid activation whose generation the store
+    /// can no longer produce still refuses, and never reaches the classifier.
     #[test]
     fn verify_still_refuses_an_activation_the_store_cannot_produce() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let (config, layout, project_id, _successor) = torn_after_cutover(&root);
-        let scope = PublishedScope::try_new("fixture-repo", ".").unwrap();
-        let absent_generation = "f".repeat(64);
-        open_code_store(&config)
-            .unwrap()
-            .save_activation_v2(&bbox_code_source_store::ActivationRecordV2 {
-                version: bbox_code_source_store::MIGRATION_STORE_VERSION,
-                project_id: project_id.clone(),
-                published_scope: scope,
-                generation_id: absent_generation.clone(),
-                selector: format!("collected:{project_id}:{absent_generation}"),
-                snapshot_id: format!("collected-{absent_generation}"),
-                document_count: 0,
-                entity_inventory_sha256: "e".repeat(64),
-                current_chunk_targets: BTreeMap::new(),
-                activated_unix_secs: 3,
-                cutback_pending: false,
-                cutback: None,
-                diagnostic: None,
-            })
-            .unwrap();
+        let (config, layout, _project_id, successor) = torn_after_cutover(&root);
+        remove_generation_from_store(&config, &successor);
 
         let error = ProjectCatalogCodeSourceLocalityCutoverFacadeV1::verify(
             CodeSourceLocalityCutoverVerifyRequestV1 { layout, config },
