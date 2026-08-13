@@ -1891,6 +1891,18 @@ mod tests {
         serde_json::from_str(&extract_text(&result)).unwrap()
     }
 
+    /// The JSON a serialized `EntityRef` takes on a path step.
+    ///
+    /// `EntityRef` is an internally tagged enum, so it rides the wire as an
+    /// OBJECT keyed by `type`, not as its rendered `type:segments` string.
+    /// `steps[n]["to"]` is therefore never a JSON string, and comparing it
+    /// against a rendered ref silently compares an object to a string rather
+    /// than failing loudly at the point of the mistake. Build the expected
+    /// value from the ref itself so the assertion tracks the real wire shape.
+    fn step_ref(rendered: &str) -> serde_json::Value {
+        serde_json::to_value(entity_ref::EntityRef::parse(rendered).unwrap()).unwrap()
+    }
+
     /// THE EXIT GATE for milestone 3: a tenant record vertex traverses through
     /// a source vertex to a published project file, and the reverse traversal
     /// preserves provenance.
@@ -1933,8 +1945,9 @@ mod tests {
             steps[0]["metadata"]["evidence.mapping_version"],
             "mapping-v1"
         );
-        assert!(
-            steps[0]["to"].as_str().unwrap().contains(":source:asset-1"),
+        assert_eq!(
+            steps[0]["to"],
+            step_ref(&format!("project_graph_vertex:{project_id}:source:asset-1")),
             "{forward_text}"
         );
         // Hop two leaves the graph plane entirely for a project file ref.
@@ -1943,7 +1956,7 @@ mod tests {
             steps[1]["metadata"]["evidence.observation_id"],
             "observation-file-1"
         );
-        assert_eq!(steps[1]["to"], file_ref);
+        assert_eq!(steps[1]["to"], step_ref(&file_ref), "{forward_text}");
 
         // The reverse traversal preserves provenance: same bindings, same
         // authority and observation labels, walked from the file back.
@@ -1967,7 +1980,16 @@ mod tests {
         );
         let steps = paths[0]["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 2, "{reverse_text}");
+        // Walking back: file -> source vertex -> record vertex. A step records
+        // `from`/`to` in walk order and labels the edge direction separately,
+        // so both hops are `in` while the refs advance toward the record.
         assert_eq!(steps[0]["direction"], "in");
+        assert_eq!(steps[0]["from"], step_ref(&file_ref), "{reverse_text}");
+        assert_eq!(
+            steps[0]["to"],
+            step_ref(&format!("project_graph_vertex:{project_id}:source:asset-1")),
+            "{reverse_text}"
+        );
         assert_eq!(
             steps[0]["metadata"]["evidence.observation_id"], "observation-file-1",
             "reverse traversal must carry the same observation provenance"
@@ -1977,6 +1999,13 @@ mod tests {
             "connector"
         );
         assert_eq!(steps[1]["direction"], "in");
+        assert_eq!(
+            steps[1]["to"],
+            step_ref(&format!(
+                "project_graph_vertex:{project_id}:records:filing-1"
+            )),
+            "{reverse_text}"
+        );
         assert_eq!(
             steps[1]["metadata"]["evidence.assertion_authority"],
             "project"
