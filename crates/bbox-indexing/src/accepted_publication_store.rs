@@ -2837,6 +2837,10 @@ pub(crate) mod fixtures {
                 source_bytes: serde_json::to_vec(&gap_note("gap-1234abcd")).unwrap(),
             }],
             graphs: Vec::new(),
+            // The shared fixture stays grant-free. A test that wants the
+            // auto-advance policy installs the grant explicitly, so no
+            // fixture consumer silently inherits one.
+            auto_advance: None,
             prior_pointer,
         };
         prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap()
@@ -3314,9 +3318,13 @@ mod tests {
         .unwrap();
         let grant = decoded
             .auto_advance
+            .as_ref()
             .expect("the grant survives a round trip");
         assert!(grant.enabled);
         assert_eq!(grant.granted_reason, "operator grant for the producer lane");
+        // Re-encoding the WHOLE decoded pointer is the point: the grant has
+        // to survive the round trip in place, not merely be readable, so
+        // `decoded` must still be intact here.
         assert_eq!(
             encode_pointer_v1(&decoded, &AcceptedPublicationLimits::default()).unwrap(),
             prepared.pointer_bytes
