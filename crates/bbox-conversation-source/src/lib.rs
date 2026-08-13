@@ -615,18 +615,27 @@ impl ConversationRevisionV1 {
 
 /// What class of conversation this is, so policy can gate on it.
 ///
-/// Design section 6 makes private channels and DMs a separate operator flag per
-/// class, default off. Carrying the class on the wire is what lets the corpus
-/// host enforce that independently of the producer host's config, rather than
-/// trusting a producer to have filtered correctly.
+/// Design section 6 makes each conversation class a separate operator flag,
+/// default off for the sensitive ones. Carrying the class on the wire is what
+/// lets the corpus host enforce that independently of the producer host's
+/// config, rather than trusting a producer to have filtered correctly.
+///
+/// **Channels only, by operator ruling (2026-08-13).** The deployed posture
+/// observes channels from the bot's own membership; no direct or group-direct
+/// message ever enters this corpus, so no variant names one. That is not a
+/// gap to be filled in later out of tidiness: because the enum is closed and
+/// every ingest payload is `deny_unknown_fields`, a producer that somehow
+/// presented a DM roster entry gets a PARSE REFUSAL rather than an ingest, and
+/// the class it would need cannot be conjured by a config typo. A dormant
+/// `DirectMessage` variant would trade that fail-closed property for nothing,
+/// since design section 5 gates DMs behind operator-gated S5 anyway. Adding
+/// one later is additive and requires the deliberate act of adding it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelClassV1 {
     #[default]
     Public,
     Private,
-    DirectMessage,
-    GroupDirectMessage,
 }
 
 /// One channel as the producer observed it.
@@ -860,10 +869,14 @@ pub struct ConversationRevisionsReceiptV1 {
     pub channel_id: String,
     pub accepted: u64,
     pub duplicates: u64,
-    /// Revisions naming a message this corpus never landed. Reported rather
-    /// than refused: an observer whose visibility began after a message was
-    /// posted can legitimately see its deletion, and refusing would make the
-    /// producer retry forever.
+    /// Revisions naming a message this corpus has not landed YET.
+    ///
+    /// Reported rather than refused: an observer whose visibility began after a
+    /// message was posted can legitimately see its deletion first, and refusing
+    /// would make the producer retry forever. They are still STORED, and the
+    /// store applies them if the message arrives later, so an out-of-order
+    /// deletion is held rather than lost. This count is the honest coverage
+    /// signal for how often that happens.
     pub unknown_messages: u64,
     pub cursor: ChannelCursorV1,
 }
@@ -891,9 +904,19 @@ pub struct ChannelCursorV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_observed: Option<String>,
     /// Thread parents whose replies are still owed. Corresponds to
-    /// `TranscriptCursor::MessageIdSet`; see the crate doc. Bounded by
-    /// [`MAX_INFLIGHT_THREAD_PARENTS`], truncated oldest-first so the set stays
-    /// answerable on a pathological channel.
+    /// `TranscriptCursor::MessageIdSet`; see the crate doc.
+    ///
+    /// FIRST CLASS, not an S3 afterthought. Threaded replies are a primary
+    /// communication surface in the deployed workspace and they do not appear
+    /// in a channel history sweep unless they were also broadcast, so a
+    /// history-only connector silently loses most thread bodies (design 5.3).
+    /// The record carries `thread_parent_ts` and the cursor carries this set
+    /// from the FIRST wire version precisely so S3 adds sweep POLICY rather
+    /// than a shape change that would need a re-ingest to backfill.
+    ///
+    /// Bounded by [`MAX_INFLIGHT_THREAD_PARENTS`]: on a pathological channel
+    /// the newest parents are kept and the oldest are dropped, because an old
+    /// thread is the one least likely to still be taking replies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inflight_thread_parents: Vec<String>,
     pub landed_records: u64,

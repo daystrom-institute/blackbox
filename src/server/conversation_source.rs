@@ -531,15 +531,25 @@ impl HttpError {
 /// String matching is not a taxonomy and this is a compromise, named as one,
 /// exactly as the file lane names its own. The default is the SAFE direction
 /// (503, retry) so a miss here degrades to a retry rather than to a producer
-/// permanently convinced its input was bad. A journal-corruption refusal
-/// deliberately does NOT match: the producer can do nothing about it and must
-/// not be told to change its request.
+/// permanently convinced its input was bad. Two refusals deliberately do NOT
+/// match, because the producer can do nothing about either and must not be
+/// told to change its request: a corrupt journal, and a corrupt workspace
+/// binding file.
+///
+/// Each marker is a WHOLE store sentence rather than a keyword. A bare
+/// `"workspace"` looked equivalent and was not: the binding lives in
+/// `workspace.json`, so a truncated or hand-edited binding produces the
+/// decode context `"decoding .../workspace.json"`, which carries a
+/// `serde_json::Error` rather than an `io::Error` and therefore reaches this
+/// function. The keyword matched it and reported server-side corruption to
+/// the producer as its own fault.
 fn is_producer_correctable(rendered: &str) -> bool {
-    const MARKERS: [&str; 4] = [
+    const MARKERS: [&str; 5] = [
         "invalid batch",
         "invalid revisions request",
-        "workspace",
-        "onboard it before landing records",
+        "batch workspace does not match",
+        "has no workspace binding",
+        "already bound to a different workspace",
     ];
     MARKERS.iter().any(|marker| rendered.contains(marker))
 }
@@ -797,6 +807,18 @@ mod tests {
              torn append"
         ));
         assert_eq!(corrupt.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // The near miss that a keyword marker got wrong: a corrupt workspace
+        // BINDING renders a decode context naming workspace.json, and it is
+        // server-side damage, not a request the producer can fix.
+        let corrupt_binding = HttpError::from_store(anyhow!(
+            "decoding /state/conversation-sources/scopes/abc/workspace.json"
+        ));
+        assert_eq!(
+            corrupt_binding.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a corrupt binding file is not the producer's fault"
+        );
 
         let unknown = HttpError::from_store(anyhow!("something nobody classified"));
         assert_eq!(unknown.status, StatusCode::SERVICE_UNAVAILABLE);

@@ -128,6 +128,14 @@ impl JournalEntryV1 {
         }
     }
 
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Message(record) => record.revision,
+            Self::Revision(record) => record.revision,
+            Self::Tombstone(record) => record.revision,
+        }
+    }
+
     fn observed_at(&self) -> &str {
         match self {
             Self::Message(record) => &record.observed_at,
@@ -187,6 +195,16 @@ struct ChannelFold {
     /// per-line copy could only ever disagree with it. Callers stamp it from
     /// the binding on the way out.
     messages: BTreeMap<String, LandedMessageV1>,
+    /// Revisions and tombstones whose message has not been folded YET, keyed
+    /// on the same order key and applied the moment it is.
+    ///
+    /// Arrival order must not decide whether a redaction sticks. A producer
+    /// whose visibility began mid-history can legitimately observe a deletion
+    /// before it ever observes the message, and a backfill lane running behind
+    /// steady state makes that ordinary rather than exotic. Holding the entry
+    /// is what makes the journal's replay total: the same bytes fold to the
+    /// same state no matter which order the two lanes landed them in.
+    pending: BTreeMap<String, Vec<JournalEntryV1>>,
     revisions_applied: u64,
     last_observed_at: Option<String>,
     /// Byte offset of the end of the last COMPLETE, parseable line.
@@ -363,7 +381,11 @@ impl ConversationSourceStore {
     ) -> Result<ConversationBatchReceiptV1> {
         batch
             .validate()
-            .map_err(|error| anyhow::anyhow!("invalid batch: {error}"))?;
+            // Context, not interpolation: the route layer downcasts to the
+            // typed leaf error to pick a status code, and `anyhow!("{error}")`
+            // would flatten it into a string that can only ever render as a
+            // generic 422.
+            .map_err(|error| anyhow::Error::new(error).context("invalid batch"))?;
         let workspace_id = self.require_workspace(scope, &batch.workspace_id)?;
         let dir = self.channel_dir(scope, &workspace_id, &batch.channel_id);
         let journal = dir.join("journal.ndjson");
@@ -406,7 +428,8 @@ impl ConversationSourceStore {
     ) -> Result<ConversationRevisionsReceiptV1> {
         request
             .validate()
-            .map_err(|error| anyhow::anyhow!("invalid revisions request: {error}"))?;
+            // See `land_batch`: context preserves the downcast.
+            .map_err(|error| anyhow::Error::new(error).context("invalid revisions request"))?;
         let workspace_id = self.require_workspace(scope, &request.workspace_id)?;
         let dir = self.channel_dir(scope, &workspace_id, &request.channel_id);
         let journal = dir.join("journal.ndjson");
@@ -419,17 +442,34 @@ impl ConversationSourceStore {
             let Some(key) = message_ts_order_key(revision.message_ts()) else {
                 bail!("invalid message timestamp survived revisions validation");
             };
+            let entry = || match revision.clone() {
+                ConversationRevisionV1::Edit(record) => JournalEntryV1::Revision(record),
+                ConversationRevisionV1::Tombstone(record) => JournalEntryV1::Tombstone(record),
+            };
             match fold.messages.get(&key) {
-                None => {
-                    // Reported, not refused. Refusing would make a producer
-                    // that legitimately observed only a deletion retry forever.
-                    unknown_messages += 1;
-                }
                 Some(landed) if landed.key.revision >= revision.revision() => duplicates += 1,
-                Some(_) => appended.push(match revision.clone() {
-                    ConversationRevisionV1::Edit(record) => JournalEntryV1::Revision(record),
-                    ConversationRevisionV1::Tombstone(record) => JournalEntryV1::Tombstone(record),
-                }),
+                Some(_) => appended.push(entry()),
+                None => {
+                    // Reported, not refused, and STORED rather than dropped.
+                    // Refusing would make a producer that legitimately observed
+                    // only a deletion retry forever; accepting-and-discarding
+                    // would lose that deletion permanently the moment the
+                    // message itself arrived, with the producer already told
+                    // the request succeeded. The fold holds an unmatched
+                    // revision and applies it when its message lands, so
+                    // arrival order does not decide whether a redaction sticks.
+                    let held = fold
+                        .pending
+                        .get(&key)
+                        .and_then(|entries| entries.iter().map(|entry| entry.revision()).max())
+                        .unwrap_or(0);
+                    if held >= revision.revision() {
+                        duplicates += 1;
+                    } else {
+                        unknown_messages += 1;
+                        appended.push(entry());
+                    }
+                }
             }
         }
 
@@ -716,11 +756,31 @@ fn apply(fold: &mut ChannelFold, entry: JournalEntryV1) {
                         tombstoned: false,
                         tombstoned_at: None,
                     };
-                    fold.messages.insert(key, landed);
+                    fold.messages.insert(key.clone(), landed);
+                    // Drain anything that was waiting on this message. Held
+                    // entries were journaled in arrival order, so replaying
+                    // them in that order reproduces exactly the state a
+                    // well-ordered stream would have produced.
+                    if let Some(held) = fold.pending.remove(&key) {
+                        for entry in held {
+                            apply_revision(fold, &key, entry);
+                        }
+                    }
                 }
             }
         }
-        JournalEntryV1::Revision(revision) => match fold.messages.get_mut(&key) {
+        other => apply_revision(fold, &key, other),
+    }
+}
+
+/// Apply one revision or tombstone, holding it when its message is absent.
+///
+/// Split from [`apply`] because it is called twice: once when the entry is read
+/// from the journal, and once more when the message it was waiting for finally
+/// lands.
+fn apply_revision(fold: &mut ChannelFold, key: &str, entry: JournalEntryV1) {
+    match entry {
+        JournalEntryV1::Revision(revision) => match fold.messages.get_mut(key) {
             Some(landed) if revision.revision > landed.key.revision => {
                 landed.key.revision = revision.revision;
                 landed.record.revision = revision.revision;
@@ -732,17 +792,29 @@ fn apply(fold: &mut ChannelFold, entry: JournalEntryV1) {
                 }
                 fold.revisions_applied += 1;
             }
-            _ => {}
+            Some(_) => {}
+            None => fold
+                .pending
+                .entry(key.to_string())
+                .or_default()
+                .push(JournalEntryV1::Revision(revision)),
         },
-        JournalEntryV1::Tombstone(tombstone) => match fold.messages.get_mut(&key) {
+        JournalEntryV1::Tombstone(tombstone) => match fold.messages.get_mut(key) {
             Some(landed) if tombstone.revision > landed.key.revision => {
                 landed.key.revision = tombstone.revision;
                 landed.record.revision = tombstone.revision;
                 landed.tombstoned = true;
                 landed.tombstoned_at = Some(tombstone.observed_at);
             }
-            _ => {}
+            Some(_) => {}
+            None => fold
+                .pending
+                .entry(key.to_string())
+                .or_default()
+                .push(JournalEntryV1::Tombstone(tombstone)),
         },
+        // A message reaches `apply` directly and never routes through here.
+        JournalEntryV1::Message(_) => {}
     }
 }
 
@@ -776,9 +848,9 @@ fn derive_cursor(channel_id: &str, fold: &ChannelFold) -> ChannelCursorV1 {
             parents.insert(key, parent.clone());
         }
     }
-    // Truncated NEWEST-first when a pathological channel exceeds the bound: an
-    // old thread is the one least likely to still be taking replies, so the
-    // dropped end is the cheap one.
+    // When a pathological channel exceeds the bound, KEEP the newest and drop
+    // the oldest: an old thread is the one least likely to still be taking
+    // replies, so the dropped end is the cheap one.
     let mut inflight: Vec<String> = parents.into_values().collect();
     if inflight.len() > MAX_INFLIGHT_THREAD_PARENTS {
         inflight = inflight.split_off(inflight.len() - MAX_INFLIGHT_THREAD_PARENTS);
@@ -1277,6 +1349,15 @@ mod tests {
         assert_eq!(file_len(&journal_path(&store)).unwrap(), bytes);
     }
 
+    fn tombstone_for(ts: &str) -> ConversationRevisionV1 {
+        ConversationRevisionV1::Tombstone(ConversationTombstoneRecordV1 {
+            channel_id: CHANNEL.into(),
+            message_ts: ts.into(),
+            revision: 1,
+            observed_at: "2026-08-13T00:01:00Z".into(),
+        })
+    }
+
     #[test]
     fn a_revision_for_a_message_this_corpus_never_landed_is_reported_not_refused() {
         // An observer whose visibility began after a message was posted can
@@ -1287,19 +1368,71 @@ mod tests {
         let receipt = store
             .land_revisions(
                 &scope(),
-                &revisions(vec![ConversationRevisionV1::Tombstone(
-                    ConversationTombstoneRecordV1 {
-                        channel_id: CHANNEL.into(),
-                        message_ts: "1700000000.000001".into(),
-                        revision: 1,
-                        observed_at: "2026-08-13T00:01:00Z".into(),
-                    },
-                )]),
+                &revisions(vec![tombstone_for("1700000000.000001")]),
             )
             .unwrap();
         assert_eq!(receipt.unknown_messages, 1);
         assert_eq!(receipt.accepted, 0);
         assert_eq!(receipt.cursor.landed_records, 0);
+
+        // Reported is not the same as discarded: it was journaled, so a replay
+        // recognizes it rather than counting it unknown a second time.
+        let replay = store
+            .land_revisions(
+                &scope(),
+                &revisions(vec![tombstone_for("1700000000.000001")]),
+            )
+            .unwrap();
+        assert_eq!(replay.unknown_messages, 0);
+        assert_eq!(replay.duplicates, 1);
+    }
+
+    #[test]
+    fn a_deletion_observed_before_its_message_still_sticks_when_the_message_lands() {
+        // Arrival order must not decide whether a redaction holds. A backfill
+        // lane running behind steady state makes this ordinary, not exotic:
+        // reconciliation can see a message vanish before backfill has reached
+        // the message itself.
+        let dir = tempfile::tempdir().unwrap();
+        let store = bound_store(&dir);
+        let ts = "1755000000.000100";
+        let held = store
+            .land_revisions(&scope(), &revisions(vec![tombstone_for(ts)]))
+            .unwrap();
+        assert_eq!(held.unknown_messages, 1);
+
+        // The message arrives afterwards, from the slower lane.
+        let receipt = store
+            .land_batch(
+                &scope(),
+                &batch(vec![record(ts, "deleted before we saw it")]),
+            )
+            .unwrap();
+        assert_eq!(receipt.accepted, 1);
+        assert_eq!(
+            receipt.cursor.tombstones, 1,
+            "the held tombstone applies the moment its message lands"
+        );
+
+        let landed = store.landed_messages(&scope(), WORKSPACE, CHANNEL).unwrap();
+        assert_eq!(landed.len(), 1);
+        assert!(
+            landed[0].tombstoned,
+            "an out-of-order deletion is held, not lost"
+        );
+        assert_eq!(landed[0].key.revision, 1);
+
+        // And it survives a reopen, because the hold lives in the journal
+        // rather than in memory. Opened directly rather than through the
+        // helper, which the local binding above shadows.
+        let root = dir.path().canonicalize().unwrap();
+        let reopened = ConversationSourceStore::open(root.join("conversation-sources")).unwrap();
+        assert!(
+            reopened
+                .landed_messages(&scope(), WORKSPACE, CHANNEL)
+                .unwrap()[0]
+                .tombstoned
+        );
     }
 
     // -- cursors, threads, status -----------------------------------------
