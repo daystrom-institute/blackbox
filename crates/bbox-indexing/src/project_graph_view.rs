@@ -981,6 +981,7 @@ mod tests {
                 "records".into(),
                 valid_entry("records", "published", false),
             )]),
+            evidence: EvidenceBindingSet::default(),
         });
 
         let colliding =
@@ -1012,6 +1013,7 @@ mod tests {
                 "records".into(),
                 valid_entry("records", "published", false),
             )]),
+            evidence: EvidenceBindingSet::default(),
         });
         assert!(catalog.list_connector(&project_id).is_empty());
         assert!(matches!(
