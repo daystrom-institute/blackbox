@@ -20,6 +20,7 @@ use crate::checkout_access::{
     CheckoutAccessHealth, CheckoutAccessKind, CheckoutAccessObservations,
     CheckoutAccessTargetCounter,
 };
+use crate::code_source_locality_manifest::WorkspaceManifestState;
 use crate::code_source_locality_observations::{
     CodeSourceLocalityEvidenceKindV1, CodeSourceLocalityObservationSnapshotV1,
     CodeSourceLocalityObservationV1, CodeSourceLocalityObservationsV1,
@@ -191,7 +192,24 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
             if assigned_producer(config, &row.scope)? != row.producer_id {
                 bail!("governed code-source producer assignment changed");
             }
-            let current = current_generation_evidence(store, projects_path, &row.project_id)?;
+            // Boot-time verification tolerates an activation still in flight:
+            // the manifest is correctly serving the predecessor generation and
+            // the startup reducer sweep converges the journal record. Refusing
+            // here would crash-loop the daemon before the reducer that fixes
+            // it ever runs. Everything else about the governed row (catalog
+            // scope and producer assignment, checked above) is still enforced.
+            let current = match current_generation_outcome(store, projects_path, &row.project_id)? {
+                CurrentGenerationV1::Evidence(evidence) => evidence,
+                CurrentGenerationV1::ActivationInFlight { journal_generation } => {
+                    tracing::warn!(
+                        project_id = %row.project_id,
+                        journal_generation = %journal_generation,
+                        "governed code-source project has an activation in flight; deferring \
+                         generation verification to the startup reducer sweep"
+                    );
+                    continue;
+                }
+            };
             if current.project_id != row.project_id
                 || current.scope != row.scope
                 || current.producer_id != row.producer_id
@@ -435,11 +453,39 @@ impl ProjectCatalogCodeSourceLocalityCutoverFacadeV1 {
     }
 }
 
+/// What the journal and the derived manifest jointly say about a project's
+/// current collected generation.
+enum CurrentGenerationV1 {
+    /// A settled generation, with the evidence the cutover ceremony compares.
+    Evidence(CodeSourceLocalityGenerationEvidenceV1),
+    /// An activation torn between its journal write and its manifest write:
+    /// the manifest still correctly serves the predecessor and the startup
+    /// reducer sweep converges the record.
+    ActivationInFlight { journal_generation: String },
+}
+
+/// The strict form: every caller that must see a settled generation. The
+/// offline ceremony (preflight and apply) refuses an unsettled activation
+/// rather than measuring against state that is still converging.
 fn current_generation_evidence(
     store: &CodeSourceStore,
     projects_path: &Path,
     project_id: &ProjectId,
 ) -> Result<CodeSourceLocalityGenerationEvidenceV1> {
+    match current_generation_outcome(store, projects_path, project_id)? {
+        CurrentGenerationV1::Evidence(evidence) => Ok(evidence),
+        CurrentGenerationV1::ActivationInFlight { journal_generation } => bail!(
+            "code-source locality cutover requires a settled activation: generation \
+             {journal_generation} for {project_id} is still in flight"
+        ),
+    }
+}
+
+fn current_generation_outcome(
+    store: &CodeSourceStore,
+    projects_path: &Path,
+    project_id: &ProjectId,
+) -> Result<CurrentGenerationV1> {
     let activation = store
         .load_activation_mixed(project_id.as_str())?
         .context("code-source locality cutover requires an activation record")?;
@@ -455,41 +501,53 @@ fn current_generation_evidence(
     };
     activation.validate_against_generation(&generation)?;
     let edges_dir = bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
-    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir)?;
-    let entry = manifest
-        .workspaces
-        .get(project_id.as_str())
-        .context("active collected generation is absent from the workspace manifest")?;
-    let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
-        project_id.as_str(),
-        &activation.snapshot_id,
-    );
-    if entry.code_source_selector.as_deref() != Some(activation.selector.as_str())
-        || entry.code_source_generation.as_deref() != Some(activation.generation_id.as_str())
-        || entry.active_snapshot.as_deref() != Some(expected_snapshot.as_str())
-    {
-        bail!("active collected generation disagrees with the workspace manifest");
+    // The journal and the derived workspace manifest are written in that
+    // order with no shared transaction, so a crash between them is
+    // observable. `classify_workspace_manifest` names the shape and repairs
+    // only the one the journal provably owns; the module's header documents
+    // the outcome for every interleaving.
+    match crate::code_source_locality_manifest::classify_workspace_manifest(
+        &edges_dir,
+        &activation,
+        generation.state,
+    )? {
+        WorkspaceManifestState::Agreed | WorkspaceManifestState::Reconciled { .. } => {}
+        WorkspaceManifestState::ActivationInFlight { journal_generation } => {
+            // The manifest is right and the journal record is an activation
+            // that never finished. Boot callers pass over the project and let
+            // the startup reducer sweep converge it; the offline ceremony
+            // refuses, because it must not be run against unsettled state.
+            return Ok(CurrentGenerationV1::ActivationInFlight { journal_generation });
+        }
+        WorkspaceManifestState::Disagrees => {
+            bail!("active collected generation disagrees with the workspace manifest");
+        }
     }
     // A staging-index state with the workspace manifest and the activation
     // journal in full agreement is a completed activation whose final state
     // flip was lost to a crash; the reconciler flips it to Active right
     // after startup. The agreement checks above are what distinguish that
-    // from a genuinely incomplete staging, which still fails closed.
+    // from a genuinely incomplete staging, which still fails closed: a
+    // staging generation whose manifest DISAGREES classifies as
+    // `ActivationInFlight` above and never reaches this point, so tolerance
+    // here still rests on agreement alone.
     if generation.state != GenerationState::Active
         && generation.state != GenerationState::StagingIndex
     {
         bail!("code-source locality cutover requires an active generation");
     }
-    Ok(CodeSourceLocalityGenerationEvidenceV1 {
-        project_id: activation.project_id,
-        scope: activation.published_scope,
-        producer_id: generation.producer_id,
-        generation_id: activation.generation_id,
-        selector: activation.selector,
-        snapshot_id: activation.snapshot_id,
-        document_count: activation.document_count,
-        entity_inventory_sha256: activation.entity_inventory_sha256,
-    })
+    Ok(CurrentGenerationV1::Evidence(
+        CodeSourceLocalityGenerationEvidenceV1 {
+            project_id: activation.project_id,
+            scope: activation.published_scope,
+            producer_id: generation.producer_id,
+            generation_id: activation.generation_id,
+            selector: activation.selector,
+            snapshot_id: activation.snapshot_id,
+            document_count: activation.document_count,
+            entity_inventory_sha256: activation.entity_inventory_sha256,
+        },
+    ))
 }
 
 fn required_observation(

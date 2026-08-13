@@ -15,6 +15,8 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::code_source_locality_manifest::WorkspaceManifestState;
+
 const OBSERVATION_VERSION: u32 = 1;
 const MAX_OBSERVATIONS: usize = 65_536;
 const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
@@ -97,9 +99,8 @@ impl CodeSourceLocalityObservationsV1 {
         projects_path: &Path,
         evidence_kind: CodeSourceLocalityEvidenceKindV1,
     ) -> Result<u64> {
-        let manifest_path =
+        let edges_dir =
             bbox_edge_sidecar::edge_sidecar::edges_dir_from_projects_path(projects_path);
-        let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&manifest_path)?;
         let mut current = Vec::new();
         for activation in store.activation_records_mixed()? {
             let MixedActivationRecord::CurrentV2(activation) = activation else {
@@ -116,20 +117,25 @@ impl CodeSourceLocalityObservationsV1 {
             if generation.state != GenerationState::Active {
                 continue;
             }
-            let expected_snapshot = bbox_edge_sidecar::snapshot::active_snapshot_rel(
-                activation.project_id.as_str(),
-                &activation.snapshot_id,
-            );
-            let entry = manifest
-                .workspaces
-                .get(activation.project_id.as_str())
-                .context("active collected generation is absent from the workspace manifest")?;
-            if entry.code_source_selector.as_deref() != Some(activation.selector.as_str())
-                || entry.code_source_generation.as_deref()
-                    != Some(activation.generation_id.as_str())
-                || entry.active_snapshot.as_deref() != Some(expected_snapshot.as_str())
-            {
-                bail!("active collected generation disagrees with the workspace manifest");
+            // The generation is Active and validates against its activation
+            // record. Because the state flip is written after the manifest
+            // write, that is proof the activation completed and a disagreeing
+            // derived entry is a lost write, not an in-flight activation, so
+            // it is repaired from the journal instead of refusing to open.
+            // Unrecognized shapes, including the cutback crash window, still
+            // refuse. `ActivationInFlight` cannot arise here because that
+            // classification requires a non-Active generation; it is folded
+            // into the refusal arm so the match stays total.
+            match crate::code_source_locality_manifest::classify_workspace_manifest(
+                &edges_dir,
+                &activation,
+                generation.state,
+            )? {
+                WorkspaceManifestState::Agreed | WorkspaceManifestState::Reconciled { .. } => {}
+                WorkspaceManifestState::ActivationInFlight { .. }
+                | WorkspaceManifestState::Disagrees => {
+                    bail!("active collected generation disagrees with the workspace manifest");
+                }
             }
             current.push(CodeSourceLocalityObservationV1 {
                 project_id: activation.project_id,
