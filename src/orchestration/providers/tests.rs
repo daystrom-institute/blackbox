@@ -381,10 +381,21 @@ fn assistant_step_usage_supplies_occupancy_without_a_pressure_event() {
 }
 
 #[test]
-fn pressure_event_wins_over_the_assistant_step_fallback() {
-    // The dedicated event arrives after the assistant message for the same
-    // step and is authoritative, because it also carries the window.
+fn an_assistant_step_never_erases_a_captured_window() {
+    // The harness emits the pressure event first and the assistant message
+    // second for the same step, both reading the same usage. Occupancy is
+    // therefore identical from either source, but only the pressure event
+    // carries the window: the assistant branch must leave that field alone, or
+    // every step would knock the utilization denominator back out.
     let mut sink = empty_sink();
+    Provider::Glm.parse_event(
+        &serde_json::json!({
+            "type": "system",
+            "subtype": "context_pressure",
+            "context": { "last_turn_input_tokens": 100, "context_window": 200_000 }
+        }),
+        &mut sink,
+    );
     Provider::Glm.parse_event(
         &serde_json::json!({
             "type": "assistant",
@@ -396,16 +407,11 @@ fn pressure_event_wins_over_the_assistant_step_fallback() {
         &mut sink,
     );
     assert_eq!(sink.last_turn_input_tokens, Some(100));
-    Provider::Glm.parse_event(
-        &serde_json::json!({
-            "type": "system",
-            "subtype": "context_pressure",
-            "context": { "last_turn_input_tokens": 100, "context_window": 200_000 }
-        }),
-        &mut sink,
+    assert_eq!(
+        sink.context_window,
+        Some(200_000),
+        "the assistant fallback must not clear a window the pressure event set"
     );
-    assert_eq!(sink.last_turn_input_tokens, Some(100));
-    assert_eq!(sink.context_window, Some(200_000));
 }
 
 #[test]

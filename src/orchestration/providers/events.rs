@@ -219,9 +219,13 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         // Per-step usage is the prompt the model just processed, so its
         // cache-inclusive input total is this step's window occupancy. Read as
         // a fallback for producers that emit step usage but no dedicated
-        // pressure event; the dedicated event, when present, arrives after the
-        // assistant message for the same step and overwrites this with the
-        // same number plus the window.
+        // pressure event.
+        //
+        // When both land they agree, because both read the same step's usage,
+        // so the arrival order does not matter for occupancy. It matters for
+        // nothing else either: only the pressure event ever carries the
+        // window, and this branch never touches that field, so a later
+        // assistant message cannot erase a window already captured.
         if let Some(usage) = evt["message"]["usage"].as_object() {
             let field = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
             let occupancy = field("input_tokens")
