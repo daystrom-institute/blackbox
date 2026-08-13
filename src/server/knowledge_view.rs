@@ -52,6 +52,17 @@ pub(crate) struct CatalogPublishedKnowledgeCacheEntry {
     pub(crate) snapshot: PublishedKnowledgeSnapshot,
 }
 
+/// Compatibility-lane tag carried by view rows served without a provable
+/// `built_from` stamp (legacy loaded state, unstamped checkout overlays).
+pub(crate) const LEGACY_COMPATIBILITY_LANE: &str = "legacy_compatibility";
+
+/// The single diagnostic the legacy knowledge lane emits. Named so a
+/// response can decide whether its OWN rows warrant it (gap-40ab1102): the
+/// line describes rows, and firing it on a fully-stamped result set trains
+/// callers to ignore diagnostics.
+pub(crate) const LEGACY_COMPATIBILITY_KNOWLEDGE_DIAGNOSTIC: &str =
+    "legacy_compatibility knowledge rows have no provable built_from stamp";
+
 #[derive(Debug, Clone)]
 pub(crate) struct KnowledgeViewItem {
     pub(crate) entity_ref: String,
@@ -240,6 +251,43 @@ impl SessionKnowledgeView {
         response
     }
 
+    /// Shape this view's diagnostics for ONE response (gap-40ab1102).
+    ///
+    /// Two rules. The legacy-compatibility line describes ROWS, so it rides
+    /// a response only when the rows that response returned actually include
+    /// a legacy-lane row; a view-wide legacy row the caller never saw (a
+    /// global entry, another project's leftovers) must not fire it, because
+    /// a diagnostic that fires on every fully-stamped result set trains
+    /// callers to ignore diagnostics. Filter-resolution diagnostics lead the
+    /// list, because they are what explains an empty result.
+    pub(crate) fn finalize_response_diagnostics(
+        &mut self,
+        returned_legacy_rows: bool,
+        filter_diagnostics: Vec<String>,
+    ) {
+        if !returned_legacy_rows {
+            self.diagnostics.retain(|diagnostic| {
+                diagnostic.as_str() != LEGACY_COMPATIBILITY_KNOWLEDGE_DIAGNOSTIC
+            });
+        }
+        let mut diagnostics = filter_diagnostics;
+        diagnostics.append(&mut self.diagnostics);
+        self.diagnostics = diagnostics;
+    }
+
+    /// Whether any of these returned rows came from the legacy lane.
+    pub(crate) fn returned_rows_include_legacy_lane(&self, returned_ids: &[String]) -> bool {
+        returned_ids.iter().any(|id| {
+            self.knowledge
+                .view_metadata(id)
+                .and_then(|metadata| metadata.compatibility_lane.as_deref())
+                == Some(LEGACY_COMPATIBILITY_LANE)
+        })
+    }
+
+    /// The rendered diagnostics block. The header wording is frozen by the
+    /// bridge parity capture (`tests/fixtures/bridge-parity`), so filter and
+    /// overlay diagnostics share it rather than growing a second section.
     pub(crate) fn diagnostics_text(&self) -> Option<String> {
         (!self.diagnostics.is_empty()).then(|| {
             format!(
@@ -379,7 +427,7 @@ impl BlackboxServer {
                 None,
                 None,
                 None,
-                Some("legacy_compatibility"),
+                Some(LEGACY_COMPATIBILITY_LANE),
             );
             has_legacy_compatibility_rows = true;
         }
@@ -435,7 +483,7 @@ impl BlackboxServer {
                             None,
                             None,
                             None,
-                            Some("legacy_compatibility"),
+                            Some(LEGACY_COMPATIBILITY_LANE),
                         );
                         has_legacy_compatibility_rows = true;
                     }
@@ -596,9 +644,7 @@ impl BlackboxServer {
         }
 
         if has_legacy_compatibility_rows {
-            diagnostics.push(
-                "legacy_compatibility knowledge rows have no provable built_from stamp".into(),
-            );
+            diagnostics.push(LEGACY_COMPATIBILITY_KNOWLEDGE_DIAGNOSTIC.into());
         }
 
         let items = items.into_values().collect::<Vec<_>>();
@@ -2235,7 +2281,7 @@ fn insert_overlay_item(
                 built_from_ref: built_from_ref.map(str::to_owned),
                 compatibility_lane: built_from_ref
                     .is_none()
-                    .then(|| "legacy_compatibility".to_string()),
+                    .then(|| LEGACY_COMPATIBILITY_LANE.to_string()),
             },
             entity_ref,
             entry,

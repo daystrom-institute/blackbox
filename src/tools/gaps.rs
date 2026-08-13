@@ -586,21 +586,51 @@ impl BlackboxServer {
         Self::run_with_structured("bbox_gaps", || {
             let mut p = p;
             let requested_project = p.project.clone();
-            let view =
+            let mut view =
                 self.session_gap_view(requested_project.as_deref(), p.provisional.as_deref())?;
+            let mut filter_diagnostics = Vec::new();
             if let Some(raw) = requested_project.as_deref() {
                 // Catalog-mode ledger arm (plan §8.2): path-only gaps still
                 // keyed under one of this project's historical paths stay
                 // visible after relocation. Empty in bridge mode.
                 p.project_ledger_paths = self.filter_ledger_paths(raw);
+                // Identity arm (gap-40ab1102): a filter that resolves also
+                // arms the dual-read id predicate, so rows stamped with a
+                // project_id match whatever path key they carry. A
+                // published row on a path-free daemon carries none, and
+                // without this arm every filtered query returned zero rows
+                // over a store that plainly held them. An unresolvable
+                // value keeps the literal substring lane and says so.
+                if p.project_id.is_none() {
+                    match self.project_filter_identity(raw) {
+                        Ok(project_id) => p.project_id = Some(project_id),
+                        Err(diagnostic) => filter_diagnostics.push(diagnostic),
+                    }
+                }
                 if let Some(base) = self.rescope_project_filter_value(raw) {
                     p.project = Some(base);
                 }
+            } else if let Some(raw_id) = p.project_id.clone() {
+                // A caller-supplied id is a selector, not an assertion: it
+                // resolves through the engine to the canonical id (and the
+                // ledger arm), and an unknown id simply matches nothing.
+                if let Some(resolved) = self
+                    .resolve_project_filter(&raw_id)
+                    .and_then(|resolution| resolution.project_id().map(str::to_owned))
+                {
+                    p.project_ledger_paths = self.ledger_historical_paths(&resolved);
+                    p.project_id = Some(resolved);
+                }
             }
             let mut used_stamp_refs = Vec::<String>::new();
-            let rows = view
-                .gaps
-                .query(&p)
+            let selected = view.gaps.query(&p);
+            // Response-scoped diagnostics (gap-40ab1102): the legacy-lane
+            // line belongs to the rows this caller actually got, and the
+            // filter-resolution lines lead so an empty result explains
+            // itself.
+            let returned_legacy_rows =
+                view.returned_rows_include_legacy_lane(selected.iter().map(|gap| gap.id.as_str()));
+            let rows = selected
                 .into_iter()
                 .map(|gap| {
                     let metadata = view.gaps.view_metadata(&gap.id);
@@ -628,6 +658,7 @@ impl BlackboxServer {
                     Ok::<_, anyhow::Error>(row)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
             let built_from = view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
             let mut structured = serde_json::json!({
                 "rows": rows,
@@ -649,7 +680,7 @@ impl BlackboxServer {
             };
             if !p.json.unwrap_or(false) {
                 if !view.diagnostics.is_empty() {
-                    rendered.push_str("\n\nProvisional gap diagnostics:\n- ");
+                    rendered.push_str("\n\nGap read diagnostics:\n- ");
                     rendered.push_str(&view.diagnostics.join("\n- "));
                 }
                 rendered = view.append_built_from_table(rendered, &built_from);

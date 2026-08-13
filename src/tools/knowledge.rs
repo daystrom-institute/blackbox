@@ -191,18 +191,36 @@ fn log_tool_err(tool: &'static str, start: std::time::Instant, err: &anyhow::Err
 /// worktree (scoped to the worktree path) stay visible too. Non-path filters
 /// (substring matches like "transcript-search") and unregistered paths are
 /// left untouched.
-fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut KnowledgeListParams) {
+///
+/// Returns a diagnostic when the filter value named no registered project
+/// (gap-40ab1102): that query keeps its literal substring semantics, and the
+/// caller must be told so rather than reading an empty result as an empty
+/// store.
+fn rescope_project_filter(
+    server: &crate::server::BlackboxServer,
+    p: &mut KnowledgeListParams,
+) -> Option<String> {
     use bbox_corpus_core::project_selector::{ProjectResolution, ResolvedAttachment};
-    let Some(raw) = p.project.as_deref() else {
-        return;
-    };
+    let raw = p.project.clone()?;
+    // Identity arm (gap-40ab1102): a filter that resolves also arms the
+    // dual-read id predicate, so rows stamped with a project_id match
+    // whatever path key they carry. A catalog-published row carries no path
+    // at all, which is how a path-free daemon answered a filtered query with
+    // zero rows over entries that plainly held its project_id.
+    let mut diagnostic = None;
+    if p.project_id.is_none() {
+        match server.project_filter_identity(&raw) {
+            Ok(project_id) => p.project_id = Some(project_id),
+            Err(text) => diagnostic = Some(text),
+        }
+    }
     // Filter-class engine resolution (phase-2 §9.2): a selector that
     // resolves rewrites to the durable store key (worktree/subdir/alias/id →
     // registered base); one that does not keeps its substring-filter
     // semantics untouched. A worktree checkout is recorded in
     // `project_alias` so entries written from inside it stay visible.
-    let Some(resolution) = server.resolve_project_filter(raw) else {
-        return;
+    let Some(resolution) = server.resolve_project_filter(&raw) else {
+        return diagnostic;
     };
     // Catalog-mode ledger arm (plan §8.2): path-only entries still keyed under
     // one of this project's historical paths stay visible after attachment
@@ -211,7 +229,7 @@ fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut Knowle
         p.project_ledger_paths = server.ledger_historical_paths(project_id);
     }
     let ProjectResolution::Attached(ctx) = resolution else {
-        return;
+        return diagnostic;
     };
     // The alias dir is where checkout-local rows land: the v1 checkout root,
     // or the catalog attachment's own project dir under the key-to-base rule.
@@ -226,6 +244,7 @@ fn rescope_project_filter(server: &crate::server::BlackboxServer, p: &mut Knowle
         p.project_alias = Some(checkout_dir);
     }
     p.project = Some(ctx.store_key);
+    diagnostic
 }
 
 impl BlackboxServer {
@@ -1617,8 +1636,11 @@ impl BlackboxServer {
             }
 
             let mut p = p;
-            if p.project.is_some() {
-                rescope_project_filter(&server, &mut p);
+            let mut filter_diagnostics = Vec::new();
+            if p.project.is_some()
+                && let Some(diagnostic) = rescope_project_filter(&server, &mut p)
+            {
+                filter_diagnostics.push(diagnostic);
             }
 
             let mut view = server.session_knowledge_view(
@@ -1627,6 +1649,12 @@ impl BlackboxServer {
             )?;
             let mut combined = view.knowledge.list(&p)?;
             let returned_ids = returned_entry_ids(&combined);
+            // Response-scoped diagnostics (gap-40ab1102): the legacy-lane
+            // line belongs to the rows this caller actually got, and the
+            // filter-resolution lines lead so an empty result explains
+            // itself.
+            let returned_legacy_rows = view.returned_rows_include_legacy_lane(&returned_ids);
+            view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
             if let Some(diagnostics) = view.diagnostics_text() {
                 combined.push_str("\n\n");
                 combined.push_str(&diagnostics);
@@ -2152,14 +2180,18 @@ mod tests {
         let (base, _worktree) = init_repo_with_worktree(&tmp_root);
         let (server, _record) = server_with_registered(&tmp_root, &base);
 
-        // Substring filter (not an absolute path) is untouched.
+        // Substring filter (not an absolute path) is untouched, and the
+        // caller is told the value resolved to nothing (gap-40ab1102).
         let mut p = KnowledgeListParams {
             project: Some("transcript-search".into()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        let diagnostic = rescope_project_filter(&server, &mut p)
+            .expect("an unresolvable filter must report itself");
+        assert!(diagnostic.contains("transcript-search"), "{diagnostic}");
         assert_eq!(p.project.as_deref(), Some("transcript-search"));
         assert_eq!(p.project_alias, None);
+        assert_eq!(p.project_id, None);
 
         // An absolute path no registered project owns is untouched.
         let stranger = tmp_root.join("stranger");
@@ -2168,7 +2200,12 @@ mod tests {
             project: Some(stranger.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        let diagnostic = rescope_project_filter(&server, &mut p)
+            .expect("an unresolvable filter must report itself");
+        assert!(
+            diagnostic.contains(stranger.to_str().unwrap()),
+            "{diagnostic}"
+        );
         assert_eq!(p.project.as_deref(), Some(stranger.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
     }
@@ -2193,22 +2230,35 @@ mod tests {
             )
             .unwrap();
 
-        // A registered alias rewrites to the base canonical path.
+        // A registered alias rewrites to the base canonical path AND arms
+        // the id predicate, so rows carrying only a project_id match too
+        // (gap-40ab1102).
         let mut p = KnowledgeListParams {
             project: Some("blackbox".into()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        assert_eq!(rescope_project_filter(&server, &mut p), None);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
         assert_eq!(p.project_alias, None);
+        assert_eq!(p.project_id.as_deref(), Some(record.project_id.as_str()));
 
         // A project_id selector rewrites the same way.
         let mut p = KnowledgeListParams {
             project: Some(record.project_id.clone()),
             ..Default::default()
         };
-        rescope_project_filter(&server, &mut p);
+        assert_eq!(rescope_project_filter(&server, &mut p), None);
         assert_eq!(p.project.as_deref(), Some(base.to_str().unwrap()));
+        assert_eq!(p.project_id.as_deref(), Some(record.project_id.as_str()));
+
+        // A caller-supplied id is respected rather than overwritten.
+        let mut p = KnowledgeListParams {
+            project: Some(record.project_id.clone()),
+            project_id: Some("caller-supplied".into()),
+            ..Default::default()
+        };
+        assert_eq!(rescope_project_filter(&server, &mut p), None);
+        assert_eq!(p.project_id.as_deref(), Some("caller-supplied"));
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
