@@ -33,18 +33,30 @@
 //! - [`journal`] -- producer working state keyed on `remote_id`;
 //! - [`logical`] -- collision-safe logical-path assignment;
 //! - [`fixture`] -- the filesystem-backed fixture connector (no network, no
-//!   OAuth, no vendor code).
+//!   OAuth, no vendor code);
+//! - [`cycle`] -- one publication cycle (observe, decide, acquire, publish),
+//!   written against a sink trait so its decisions are testable without a
+//!   socket;
+//! - [`client`] -- the `/internal/file-source/v1/*` wire client;
+//! - [`config`] -- the operator-declared satellite configuration the binary
+//!   loads.
 
+pub mod client;
+pub mod config;
 pub mod connector;
+pub mod cycle;
 pub mod fixture;
 pub mod journal;
 pub mod logical;
 pub mod policy;
 
+pub use client::FileSourceClient;
+pub use config::SatelliteConfig;
 pub use connector::{
     ChangeBatch, CheckpointInvalidation, CheckpointSet, FetchOutcome, FetchedContent, Observation,
     RemoteEntry, RemoteEntryKind, RemoteInfo, RemoteSourceConnector,
 };
+pub use cycle::{CycleOutcome, PublicationSink, run_publication_cycle};
 pub use fixture::{FIXTURE_KIND, FixtureConnector};
 pub use journal::{Journal, JournalEntry, JournalState};
 pub use logical::{AssignmentInput, assign_logical_paths};

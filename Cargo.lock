@@ -537,6 +537,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbox-file-collector"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bbox-code-source",
+ "bbox-corpus-core",
+ "bbox-file-source",
+ "bro-rpc",
+ "chrono",
+ "clap",
+ "globset",
+ "hex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "bbox-file-source"
+version = "0.0.1"
+dependencies = [
+ "bbox-code-source",
+ "bbox-corpus-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bbox-file-source-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bbox-corpus-core",
+ "bbox-file-source",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "bbox-gaps"
 version = "0.0.1"
 dependencies = [
@@ -1113,6 +1167,9 @@ dependencies = [
  "bbox-edge-index",
  "bbox-edge-sidecar",
  "bbox-embed",
+ "bbox-file-collector",
+ "bbox-file-source",
+ "bbox-file-source-store",
  "bbox-gaps",
  "bbox-git-source",
  "bbox-git-source-store",

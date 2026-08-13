@@ -262,6 +262,12 @@ bbox-embed = { path = "crates/bbox-embed", features = ["test-support"] }
 # Same pattern for bbox-visual-store's install_test_global: visual-chunk
 # tests must pin the payload store to a tempdir, never the real state dir.
 bbox-visual-store = { path = "crates/bbox-visual-store", features = ["test-support"] }
+# The connector satellite, for its SYNTHETIC document fixtures (render_pdf,
+# render_png). Test scope only, and the direction is deliberate: the daemon
+# must never link the satellite, but proving the file lane end to end means
+# indexing bytes a real connector would actually publish rather than bytes a
+# test invented to be easy to chunk.
+bbox-file-collector = { path = "crates/bbox-file-collector" }
 # Same pattern for bbox-indexing's accepted-publication fixtures: catalog
 # published-view tests need installed accepted bytes, and only the owning
 # crate can build them through the real preparation path.

@@ -7,10 +7,15 @@ edition = "2024"
 name = "bbox_file_collector"
 path = "src/lib.rs"
 
-# The binary target lands with the publication cycle (the wire client plus the
-# lane loop). Until then this crate is the satellite SUBSTRATE as a library:
-# connector trait, policy engine, journal, logical-path assignment, and the
-# fixture connector, each independently testable.
+# The satellite binary. It runs on a PRODUCER host: it holds the vendor
+# credential, observes, applies policy, exports, and publishes. The library
+# half stays independently testable (connector trait, policy engine, journal,
+# logical-path assignment, fixture connector, and the publication cycle, which
+# is written against a sink trait so its decisions are testable without a
+# socket).
+[[bin]]
+name = "bbox-file-collector"
+path = "src/main.rs"
 
 # THE DEPENDENCY CEILING IS THIS CRATE'S MOST VALUABLE PROPERTY.
 #
@@ -39,6 +44,7 @@ bbox-code-source = { path = "../bbox-code-source" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 bbox-file-source = { path = "../bbox-file-source" }
 bro-rpc = { path = "../bro-rpc" }
+chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 globset = "0.4"
 hex = "0.4"
