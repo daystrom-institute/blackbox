@@ -3423,6 +3423,7 @@ fn prepare_publisher_generation(
             knowledge,
             gaps,
             graphs: Vec::new(),
+            evidence: Vec::new(),
             // A migrated G1 pointer carries no standing policy grant. The
             // operator grants auto-advance through a later explicit
             // advance, never as a side effect of migration.

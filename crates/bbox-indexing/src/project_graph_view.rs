@@ -326,47 +326,7 @@ impl ProjectGraphViewCatalog {
         self.connector
             .get(&(project_id.clone(), graph_id.to_string()))
     }
-}
 
-/// Build the read-plane view of one accepted connector generation.
-///
-/// The generation comes from the source projection store, which has already
-/// validated it, so this only refuses a generation that is not actually
-/// connector authored.
-pub fn build_connector_graph_view(
-    project_id: ProjectId,
-    generation: GraphGeneration,
-) -> Result<ConnectorProjectGraphView> {
-    if generation.descriptor.authority != bbox_project_graph::GraphAuthority::Connector {
-        bail!(
-            "error.graph_authority_conflict: graph `{}` is not connector authored",
-            generation.descriptor.graph_id
-        );
-    }
-    let Some(source_connector) = generation.descriptor.source_connector.clone() else {
-        bail!(
-            "error.graph_authority_conflict: connector graph `{}` names no source connector",
-            generation.descriptor.graph_id
-        );
-    };
-    let graph_id = generation.descriptor.graph_id.clone();
-    let identity = ProjectGraphGenerationIdentity {
-        accepted_generation: generation.descriptor.generation.to_string(),
-        // A connector projection has no publisher commit: it is accepted from
-        // observations, not from a checkout.
-        accepted_commit: String::new(),
-        source_generation: generation.descriptor.projection_version.clone(),
-        // Load bearing: a connector graph is never workspace scoped, which is
-        // what keeps the read plane from labelling it provisional.
-        workspace_id: None,
-        content_hash: generation.fingerprint.clone(),
-    };
-    Ok(ConnectorProjectGraphView {
-        project_id,
-        graph_id: graph_id.clone(),
-        source_connector,
-        entry: ProjectGraphViewEntry::valid(graph_id, identity, generation),
-    })
     /// The accepted binding set under published visibility.
     ///
     /// An unknown project and a project with no evidence lane both read as
@@ -421,6 +381,47 @@ pub fn build_connector_graph_view(
         }
         sets
     }
+}
+
+/// Build the read-plane view of one accepted connector generation.
+///
+/// The generation comes from the source projection store, which has already
+/// validated it, so this only refuses a generation that is not actually
+/// connector authored.
+pub fn build_connector_graph_view(
+    project_id: ProjectId,
+    generation: GraphGeneration,
+) -> Result<ConnectorProjectGraphView> {
+    if generation.descriptor.authority != bbox_project_graph::GraphAuthority::Connector {
+        bail!(
+            "error.graph_authority_conflict: graph `{}` is not connector authored",
+            generation.descriptor.graph_id
+        );
+    }
+    let Some(source_connector) = generation.descriptor.source_connector.clone() else {
+        bail!(
+            "error.graph_authority_conflict: connector graph `{}` names no source connector",
+            generation.descriptor.graph_id
+        );
+    };
+    let graph_id = generation.descriptor.graph_id.clone();
+    let identity = ProjectGraphGenerationIdentity {
+        accepted_generation: generation.descriptor.generation.to_string(),
+        // A connector projection has no publisher commit: it is accepted from
+        // observations, not from a checkout.
+        accepted_commit: String::new(),
+        source_generation: generation.descriptor.projection_version.clone(),
+        // Load bearing: a connector graph is never workspace scoped, which is
+        // what keeps the read plane from labelling it provisional.
+        workspace_id: None,
+        content_hash: generation.fingerprint.clone(),
+    };
+    Ok(ConnectorProjectGraphView {
+        project_id,
+        graph_id: graph_id.clone(),
+        source_connector,
+        entry: ProjectGraphViewEntry::valid(graph_id, identity, generation),
+    })
 }
 
 fn read_from_entry(entry: ProjectGraphViewEntry) -> ProjectGraphRead {
