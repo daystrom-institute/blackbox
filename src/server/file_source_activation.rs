@@ -374,3 +374,783 @@ fn recover_one_scope(
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
+
+#[cfg(test)]
+mod tests {
+    //! The phase-1 gate, end to end: publish through the route layer, activate
+    //! through the writer op, and prove the documents are reachable.
+    //!
+    //! The fixture bytes are the SYNTHETIC ones a real connector would
+    //! publish, rendered by `bbox-file-collector` rather than invented here.
+    //! That matters for the PDF and the image specifically: a test that
+    //! indexed a `.md` file named `report.pdf` would prove the plumbing and
+    //! nothing about whether the chunker registry claims what a document store
+    //! actually sends.
+
+    use std::collections::BTreeSet;
+    use std::io::Write as _;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use bbox_corpus_core::project_catalog::{
+        ConnectorKind, ConnectorScope, ConnectorSourceId, CorpusProject, ProjectId, ProjectScope,
+    };
+    use bbox_file_source::{
+        BeginFileUploadRequestV1, BeginFileUploadResponseV1, FileGenerationDescriptorV1,
+        FileGenerationStateV1, FileGenerationStatusV1, FileManifestEntryV1, FileManifestPageV1,
+        FinalizeFileUploadResponseV1, MissingFileBlobsPageV1, PublicationTelemetryV1,
+    };
+    use sha2::{Digest, Sha256};
+    use tantivy::TantivyDocument;
+    use tantivy::collector::{Count, TopDocs};
+    use tantivy::query::TermQuery;
+    use tantivy::schema::{Field, IndexRecordOption, Term};
+    use tower::ServiceExt as _;
+
+    use super::*;
+    use crate::server::connector_grants::ConnectorGrantRuntime;
+    use crate::server::producer_auth::ProducerAuthRuntime;
+    use crate::server::state::SharedState;
+
+    const SOURCE_ID: &str = "csrc_5f2c1d9a4b6e470e";
+    const PROJECT_ID: &str = "p_000000000000000000000000000000a1";
+    const PRODUCER: &str = "producer-a";
+
+    fn scope() -> ConnectorScope {
+        ConnectorScope::try_new(SOURCE_ID, "fixture").unwrap()
+    }
+
+    /// One published document, as the wire carries it.
+    struct Document {
+        logical_path: &'static str,
+        bytes: Vec<u8>,
+        remote_id: &'static str,
+    }
+
+    impl Document {
+        fn entry(&self) -> FileManifestEntryV1 {
+            FileManifestEntryV1 {
+                logical_path: self.logical_path.to_string(),
+                content_sha256: hex::encode(Sha256::digest(&self.bytes)),
+                size: self.bytes.len() as u64,
+                remote_id: self.remote_id.to_string(),
+                remote_version: "v1".to_string(),
+                remote_url: Some(format!("https://fixture.invalid/d/{}", self.remote_id)),
+            }
+        }
+    }
+
+    /// Strictly sorted by logical path, which the manifest contract requires.
+    fn documents() -> Vec<Document> {
+        vec![
+            Document {
+                logical_path: "images/diagram.png",
+                bytes: bbox_file_collector::fixture::render_png(),
+                remote_id: "remote-image",
+            },
+            Document {
+                logical_path: "notes/plan.md",
+                bytes: b"# Plan\n\nThe quarterly widget targets are unchanged.\n".to_vec(),
+                remote_id: "remote-plan",
+            },
+            Document {
+                logical_path: "notes/report.pdf",
+                bytes: bbox_file_collector::fixture::render_pdf(
+                    "Quarterly report: widget throughput exceeded the forecast.",
+                ),
+                remote_id: "remote-report",
+            },
+            // A folder named `target` and a dotted name are ORDINARY content
+            // in a document store. The code lane's walker policy would drop
+            // both, and their silent disappearance would be
+            // indistinguishable from a broken connector.
+            Document {
+                logical_path: "target/quarterly.md",
+                bytes: b"# Quarterly\n\nthis folder is not build output\n".to_vec(),
+                remote_id: "remote-target",
+            },
+        ]
+    }
+
+    fn descriptor(
+        entries: &[FileManifestEntryV1],
+        cursor_epoch: u64,
+    ) -> FileGenerationDescriptorV1 {
+        FileGenerationDescriptorV1 {
+            schema_version: bbox_file_source::SCHEMA_VERSION,
+            connector_policy_version: bbox_file_source::CONNECTOR_POLICY_VERSION.to_string(),
+            scope: scope(),
+            remote_watermark: "watermark-1".to_string(),
+            cursor_epoch,
+            manifest_sha256: bbox_file_source::manifest_sha256(entries),
+            file_count: entries.len() as u64,
+            logical_bytes: entries.iter().map(|entry| entry.size).sum(),
+        }
+    }
+
+    fn token_file(root: &std::path::Path, value: &str) -> std::path::PathBuf {
+        let path = root.join("producer.token");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(value.as_bytes()).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    /// A catalog-backed daemon whose only producer authority is a connector
+    /// grant on [`SOURCE_ID`], already onboarded to a catalog project.
+    fn onboarded_state(root: &std::path::Path) -> (Arc<SharedState>, String) {
+        let catalog_root = root.join("catalog");
+        std::fs::create_dir_all(&catalog_root).unwrap();
+        let catalog_projects_path = catalog_root.join("projects.json");
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            &catalog_projects_path,
+        )
+        .unwrap();
+        let state = Arc::new(SharedState::for_test_catalog(root, &catalog_projects_path));
+
+        // Onboarding, as the catalog records it: a project whose scope IS the
+        // connector scope. Nothing here fabricates a published scope or a
+        // repo id, which is the whole reason the connector lane exists.
+        let store = state.project_authority.catalog_store().unwrap().clone();
+        let project_id = ProjectId::parse(PROJECT_ID.to_string()).unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        store
+            .transact(epoch, |catalog, _attachments| {
+                catalog.projects.insert(
+                    project_id.clone(),
+                    CorpusProject {
+                        project_id: project_id.clone(),
+                        scope: ProjectScope::Connector(scope()),
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: "Ops shared folder".into(),
+                        created_at: "2026-08-13T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let token_secret = "a".repeat(64);
+        let token_path = token_file(root, &token_secret);
+        let config = crate::config::SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![crate::config::ConnectorProducerConfig {
+                producer_id: PRODUCER.into(),
+                token_file: token_path,
+                scopes: vec![crate::config::ConnectorScopeGrant {
+                    connector_source_id: ConnectorSourceId::parse(SOURCE_ID).unwrap(),
+                    connector_kind: ConnectorKind::parse("fixture").unwrap(),
+                    remote_authority: "fixture.invalid".to_string(),
+                }],
+            }],
+        };
+        let pinned = store.snapshot().unwrap();
+        let connectors = ConnectorGrantRuntime::build(&config, Some(pinned.catalog())).unwrap();
+        assert!(
+            !connectors.is_pending_onboard(&scope()),
+            "the fixture scope must be onboarded before any publication route admits it"
+        );
+        state.code_sources.install_auth_for_test(Arc::new(
+            ProducerAuthRuntime::for_test_connectors(Arc::new(connectors)),
+        ));
+        (state, token_secret)
+    }
+
+    fn request(method: &str, uri: &str, token: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(body)
+            .unwrap()
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(response: axum::response::Response) -> T {
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Drive one whole publication through the ROUTE LAYER: begin, manifest,
+    /// close, blobs, finalize. Returns the server-derived generation id.
+    async fn publish(
+        state: &Arc<SharedState>,
+        token: &str,
+        documents: &[Document],
+        cursor_epoch: u64,
+    ) -> String {
+        let app = crate::server::file_source::router(state.clone()).with_state(state.clone());
+        let entries: Vec<FileManifestEntryV1> =
+            documents.iter().map(|document| document.entry()).collect();
+        let begin = BeginFileUploadRequestV1 {
+            descriptor: descriptor(&entries, cursor_epoch),
+            telemetry: PublicationTelemetryV1::default(),
+            degradation: None,
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/uploads",
+                token,
+                Body::from(serde_json::to_vec(&begin).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let begun: BeginFileUploadResponseV1 = json_body(response).await;
+
+        let page = FileManifestPageV1 {
+            entries: entries.clone(),
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                &format!(
+                    "/internal/file-source/v1/uploads/{}/manifest/0",
+                    begun.upload_id
+                ),
+                token,
+                Body::from(serde_json::to_vec(&page).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/file-source/v1/uploads/{}/manifest/complete",
+                    begun.upload_id
+                ),
+                token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let owed: MissingFileBlobsPageV1 = json_body(response).await;
+
+        for hash in &owed.hashes {
+            let document = documents
+                .iter()
+                .find(|document| &document.entry().content_sha256 == hash)
+                .expect("the server may only ask for blobs the manifest names");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/internal/file-source/v1/uploads/{}/blobs/{hash}",
+                            begun.upload_id
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, document.bytes.len())
+                        .body(Body::from(document.bytes.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "blob {hash}");
+        }
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/file-source/v1/uploads/{}/finalize",
+                    begun.upload_id
+                ),
+                token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let finalized: FinalizeFileUploadResponseV1 = json_body(response).await;
+        finalized.generation_id
+    }
+
+    /// Poll the status ROUTE until the generation reaches a terminal state.
+    ///
+    /// Polling rather than awaiting a handle on purpose: this is the exact
+    /// contract a producer has. Finalize means the bytes are durable, and the
+    /// only way to learn the activation outcome is this route.
+    async fn await_terminal(
+        state: &Arc<SharedState>,
+        token: &str,
+        generation_id: &str,
+    ) -> FileGenerationStatusV1 {
+        for _ in 0..600 {
+            let app = crate::server::file_source::router(state.clone()).with_state(state.clone());
+            let response = app
+                .oneshot(request(
+                    "GET",
+                    &format!("/internal/file-source/v1/generations/{generation_id}/status"),
+                    token,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let status: FileGenerationStatusV1 = json_body(response).await;
+            if status.state.is_terminal_success() || status.state.is_terminal_failure() {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("generation {generation_id} never reached a terminal state");
+    }
+
+    fn first_text(doc: &TantivyDocument, field: Field) -> String {
+        doc.get_all(field)
+            .next()
+            .and_then(|value| match value {
+                tantivy::schema::OwnedValue::Str(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every document the index holds under one selector, as stored fields.
+    fn documents_under(state: &Arc<SharedState>, selector: &str) -> Vec<TantivyDocument> {
+        let index = state.idx.read();
+        let reader = index.index_handle().reader().unwrap();
+        reader.reload().unwrap();
+        let searcher = reader.searcher();
+        let fields = index.field_handles();
+        let query = TermQuery::new(
+            Term::from_field_text(fields.code_source_selector, selector),
+            IndexRecordOption::Basic,
+        );
+        let total = searcher.search(&query, &Count).unwrap();
+        searcher
+            .search(&query, &TopDocs::with_limit(total.max(1)))
+            .unwrap()
+            .into_iter()
+            .map(|(_, address)| searcher.doc(address).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_connector_generation_publishes_activates_and_becomes_searchable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        // The image chunker stores its payload in a PROCESS-GLOBAL visual
+        // store. Without this guard the test writes a payload into the
+        // developer's real state directory, and the OnceLock pins that path
+        // for every later test in the binary.
+        let _visual = bbox_visual_store::install_test_global(Arc::new(
+            bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
+        ));
+        let (state, token) = onboarded_state(&root);
+        let documents = documents();
+
+        let generation_id = publish(&state, &token, &documents, 0).await;
+        let status = await_terminal(&state, &token, &generation_id).await;
+        assert_eq!(
+            status.state,
+            FileGenerationStateV1::Active,
+            "diagnostic: {:?}",
+            status.diagnostic
+        );
+        assert_eq!(status.file_count, documents.len() as u64);
+
+        // The activation record names the catalog project, and the selector
+        // is an ordinary collected one: a connector source is a collected
+        // source to everything downstream of byte acquisition.
+        let record = state
+            .file_sources
+            .store()
+            .active_generation(&scope())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.generation_id, generation_id);
+        assert!(record.selector.starts_with("collected:"));
+        assert!(record.document_count > 0);
+
+        let selector = crate::index::project_files::collected_materialization_selector(
+            PROJECT_ID,
+            &generation_id,
+        );
+        let indexed = documents_under(&state, &selector);
+        assert_eq!(
+            indexed.len() as u64,
+            record.document_count,
+            "the activation record's count must be the index's count"
+        );
+
+        let fields = state.idx.read().field_handles();
+        let paths: BTreeSet<String> = indexed
+            .iter()
+            .map(|doc| first_text(doc, fields.relative_path))
+            .collect();
+        for document in &documents {
+            assert!(
+                paths.contains(document.logical_path),
+                "{} must be indexed; paths were {paths:?}",
+                document.logical_path
+            );
+        }
+        assert!(
+            paths.contains("target/quarterly.md"),
+            "a remote folder named `target` is ordinary content, not build \
+             output; dropping it would be indistinguishable from a broken \
+             connector"
+        );
+
+        for doc in &indexed {
+            assert_eq!(
+                first_text(doc, fields.source_kind),
+                bbox_code_source::SOURCE_KIND_COLLECTED,
+                "connector content is indexed as an ordinary collected source"
+            );
+            assert_eq!(first_text(doc, fields.project_id), PROJECT_ID);
+            assert_eq!(
+                first_text(doc, fields.commit_sha),
+                "",
+                "a connector source has no commit, and the display-only \
+                 remote watermark must never be laundered into one"
+            );
+        }
+
+        // The PDF is CHUNKED, not merely stored: its page text reached the
+        // content field. This is what the synthetic fixture buys over a
+        // renamed text file.
+        let pdf_text: String = indexed
+            .iter()
+            .filter(|doc| first_text(doc, fields.relative_path) == "notes/report.pdf")
+            .map(|doc| first_text(doc, fields.content))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            pdf_text.contains("widget throughput"),
+            "the PDF's page text must be searchable, got: {pdf_text}"
+        );
+
+        // The image is claimed by the visual lane rather than chunked as
+        // text, so its reachability is the image chunk existing under the
+        // selector at all.
+        let image_kinds: Vec<String> = indexed
+            .iter()
+            .filter(|doc| first_text(doc, fields.relative_path) == "images/diagram.png")
+            .map(|doc| first_text(doc, fields.chunk_kind))
+            .collect();
+        assert_eq!(
+            image_kinds,
+            vec!["image".to_string()],
+            "a standalone image is one visual chunk under the connector's \
+             selector"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_generation_supersedes_the_first_on_the_read_plane() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let _visual = bbox_visual_store::install_test_global(Arc::new(
+            bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
+        ));
+        let (state, token) = onboarded_state(&root);
+
+        let first_documents = documents();
+        let first = publish(&state, &token, &first_documents, 0).await;
+        assert_eq!(
+            await_terminal(&state, &token, &first).await.state,
+            FileGenerationStateV1::Active
+        );
+        let first_selector =
+            crate::index::project_files::collected_materialization_selector(PROJECT_ID, &first);
+
+        let mut second_documents = documents();
+        second_documents[1].bytes =
+            b"# Plan\n\nThe quarterly widget targets were revised upward.\n".to_vec();
+        let second = publish(&state, &token, &second_documents, 0).await;
+        assert_ne!(second, first, "changed bytes are a distinct generation");
+        assert_eq!(
+            await_terminal(&state, &token, &second).await.state,
+            FileGenerationStateV1::Active
+        );
+
+        let second_selector =
+            crate::index::project_files::collected_materialization_selector(PROJECT_ID, &second);
+        assert!(
+            !documents_under(&state, &second_selector).is_empty(),
+            "the new generation is populated"
+        );
+        assert!(
+            documents_under(&state, &first_selector).is_empty(),
+            "staging replaces the outgoing selector's documents rather than \
+             leaving two generations addressable at once"
+        );
+
+        // The predecessor is RETAINED, not pruned: it is where a tear between
+        // the activation record and the derived manifest recovers backward to.
+        let store = state.file_sources.store();
+        let record = store.active_generation(&scope()).unwrap().unwrap();
+        assert_eq!(record.generation_id, second);
+        assert_eq!(
+            record.superseded_generation_id.as_deref(),
+            Some(first.as_str())
+        );
+        assert!(store.load_generation(&scope(), &first).unwrap().is_some());
+        assert_eq!(
+            store
+                .load_generation(&scope(), &first)
+                .unwrap()
+                .unwrap()
+                .state,
+            FileGenerationStateV1::Superseded
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_publication_resumes_without_reuploading_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let _visual = bbox_visual_store::install_test_global(Arc::new(
+            bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
+        ));
+        let (state, token) = onboarded_state(&root);
+        let documents = documents();
+        let app = crate::server::file_source::router(state.clone()).with_state(state.clone());
+        let entries: Vec<FileManifestEntryV1> =
+            documents.iter().map(|document| document.entry()).collect();
+        let begin = BeginFileUploadRequestV1 {
+            descriptor: descriptor(&entries, 0),
+            telemetry: PublicationTelemetryV1::default(),
+            degradation: None,
+        };
+
+        // A first attempt gets as far as one blob, then the producer dies.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/uploads",
+                &token,
+                Body::from(serde_json::to_vec(&begin).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let begun: BeginFileUploadResponseV1 = json_body(response).await;
+        let page = FileManifestPageV1 {
+            entries: entries.clone(),
+        };
+        app.clone()
+            .oneshot(request(
+                "PUT",
+                &format!(
+                    "/internal/file-source/v1/uploads/{}/manifest/0",
+                    begun.upload_id
+                ),
+                &token,
+                Body::from(serde_json::to_vec(&page).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/file-source/v1/uploads/{}/manifest/complete",
+                    begun.upload_id
+                ),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let owed: MissingFileBlobsPageV1 = json_body(response).await;
+        assert_eq!(owed.hashes.len(), documents.len());
+        let landed = owed.hashes[0].clone();
+        let document = documents
+            .iter()
+            .find(|document| document.entry().content_sha256 == landed)
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/internal/file-source/v1/uploads/{}/blobs/{landed}",
+                        begun.upload_id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_LENGTH, document.bytes.len())
+                    .body(Body::from(document.bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Restart: the same descriptor derives the same upload, and the owed
+        // set is RECOMPUTED from the content-addressed store rather than
+        // replayed, so the blob that landed is not re-requested.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/uploads",
+                &token,
+                Body::from(serde_json::to_vec(&begin).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let resumed: BeginFileUploadResponseV1 = json_body(response).await;
+        assert_eq!(
+            resumed.upload_id, begun.upload_id,
+            "an exact replay resumes"
+        );
+        assert_eq!(
+            resumed.ordinal, begun.ordinal,
+            "and a replay does not advance the ordinal"
+        );
+        let response = app
+            .oneshot(request(
+                "GET",
+                &format!(
+                    "/internal/file-source/v1/uploads/{}/missing",
+                    begun.upload_id
+                ),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let still_owed: MissingFileBlobsPageV1 = json_body(response).await;
+        assert_eq!(still_owed.hashes.len(), documents.len() - 1);
+        assert!(
+            !still_owed.hashes.contains(&landed),
+            "a blob that landed before the restart is never re-requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_torn_activation_is_classified_and_reconciled_at_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let _visual = bbox_visual_store::install_test_global(Arc::new(
+            bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
+        ));
+        let (state, token) = onboarded_state(&root);
+        let documents = documents();
+        let generation_id = publish(&state, &token, &documents, 0).await;
+        assert_eq!(
+            await_terminal(&state, &token, &generation_id).await.state,
+            FileGenerationStateV1::Active
+        );
+
+        let store = state.file_sources.store();
+        // Model the crash between the derived manifest and the state flip:
+        // both sides name this generation, but the flip was lost.
+        store
+            .set_state(
+                &scope(),
+                &generation_id,
+                FileGenerationStateV1::StagingIndex,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .classify_tear(&scope(), Some(&generation_id))
+                .unwrap()
+                .unwrap(),
+            bbox_file_source_store::ActivationTear::RecoverForwardReplayStateFlip
+        );
+
+        recover_connector_activations(&state);
+        assert_eq!(
+            store
+                .load_generation(&scope(), &generation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            FileGenerationStateV1::Active,
+            "a lost flip replays forward; this store is the authority"
+        );
+        assert_eq!(
+            store
+                .classify_tear(&scope(), Some(&generation_id))
+                .unwrap()
+                .unwrap(),
+            bbox_file_source_store::ActivationTear::Converged
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_scope_publishes_nothing_and_an_unknown_producer_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (state, token) = onboarded_state(&root);
+        let app = crate::server::file_source::router(state.clone()).with_state(state.clone());
+        let entries: Vec<FileManifestEntryV1> = documents()
+            .iter()
+            .map(|document| document.entry())
+            .collect();
+        let begin = BeginFileUploadRequestV1 {
+            descriptor: descriptor(&entries, 0),
+            telemetry: PublicationTelemetryV1::default(),
+            degradation: None,
+        };
+
+        // No credential at all stops at the authorization boundary, before
+        // any body is parsed.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/file-source/v1/uploads")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // A wrong bearer is equally refused, and the real one still works.
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/uploads",
+                &"b".repeat(64),
+                Body::from(serde_json::to_vec(&begin).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request(
+                "POST",
+                "/internal/file-source/v1/uploads",
+                &token,
+                Body::from(serde_json::to_vec(&begin).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+}

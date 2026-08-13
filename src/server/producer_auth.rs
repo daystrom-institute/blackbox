@@ -341,6 +341,17 @@ impl ProducerAuthRuntime {
         &self.connectors
     }
 
+    /// A runtime whose ONLY authority is a connector grant table.
+    ///
+    /// The file-source middleware gates on `connectors.enabled()` alone, so
+    /// the code-source half stays disabled: a connector test that also
+    /// authorized published scopes would prove less, not more, because it
+    /// could not tell a connector grant from a code grant leaking through.
+    #[cfg(test)]
+    pub(crate) fn for_test_connectors(connectors: Arc<ConnectorGrantRuntime>) -> Self {
+        Self::disabled_with(connectors)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         enabled: bool,
