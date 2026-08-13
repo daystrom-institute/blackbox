@@ -186,7 +186,7 @@ impl BlackboxServer {
                 project_id: project_id.clone(),
                 catalog_scope: match &project.scope {
                     ProjectScope::Published(scope) => Some(scope.clone()),
-                    ProjectScope::LegacyLocal => None,
+                    ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
                 },
             })
             .collect())

@@ -67,7 +67,7 @@ fn open_accepted_publications(
         .map(|(project_id, project)| {
             let scope = match &project.scope {
                 ProjectScope::Published(scope) => Some(scope.clone()),
-                ProjectScope::LegacyLocal => None,
+                ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
             };
             (project_id.clone(), scope)
         })

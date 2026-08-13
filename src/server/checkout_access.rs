@@ -181,7 +181,7 @@ fn catalog_project_scope(project: &ResolvedProjectIdentity) -> Option<PublishedS
     match project {
         ResolvedProjectIdentity::Catalog { project } => match &project.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         },
         ResolvedProjectIdentity::V1Compat { .. } => None,
     }
@@ -210,7 +210,7 @@ fn unique_active_base_attachment(
         attachment_id: base.attachment_id.as_str().to_string(),
         expected_scope: match &project.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         },
     })
 }
@@ -406,7 +406,7 @@ impl DaemonArtifactWatchAccess {
         let parsed = ProjectId::parse(project_id).ok()?;
         match &state.catalog().projects.get(&parsed)?.scope {
             ProjectScope::Published(scope) => Some(scope.clone()),
-            ProjectScope::LegacyLocal => None,
+            ProjectScope::LegacyLocal | ProjectScope::Connector(_) => None,
         }
     }
 }
