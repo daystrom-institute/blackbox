@@ -1221,6 +1221,7 @@ mod harness {
                     full_ref: Some("refs/heads/main".into()),
                     expected_generation_id: None,
                     expected_pointer_sha256: None,
+                    auto_advance: None,
                     dry_run: false,
                     expected_catalog_epoch: 1,
                     audit_reason: "bridge parity".into(),
