@@ -9,7 +9,7 @@ use bbox_indexing::project_graph_view::{
     ProjectGraphRead, ProjectGraphValidity, ProjectGraphViewEntry,
 };
 use bbox_knowledge::overlay::ProvisionalMode;
-use bbox_project_graph::{GraphGeneration, ProjectGraphVertex, ValidationError};
+use bbox_project_graph::{GraphAuthority, GraphGeneration, ProjectGraphVertex, ValidationError};
 use bbox_providers::providers::{
     EntityView, Neighborhood, ProjectGraphEntityResolver, empty_neighborhood_view,
 };
@@ -77,7 +77,7 @@ impl BlackboxServer {
     ) -> Result<Vec<GraphSummary>> {
         let (project_id, mode, own) = self.graph_read_context(project, provisional)?;
         let views = self.state.project_graph_views.read();
-        let entries = match mode {
+        let mut entries = match mode {
             ProvisionalMode::Published => views.list_published(&project_id),
             ProvisionalMode::Own => views.list_own(
                 &project_id,
@@ -95,6 +95,11 @@ impl BlackboxServer {
                 entries
             }
         };
+        // Connector-managed source graphs are read-only projections accepted
+        // by the source projection store, not checkout state, so they are
+        // visible under every visibility policy rather than gated by a
+        // provisional opt-in.
+        entries.extend(views.list_connector(&project_id));
         Ok(entries.into_iter().map(summary).collect())
     }
 
@@ -180,10 +185,13 @@ impl BlackboxServer {
     ) -> Result<ResolvedGraphVertex> {
         let (project_id, mode, own) = self.graph_read_context(Some(project), provisional)?;
         let views = self.state.project_graph_views.read();
+        // A project can hold connector-managed graphs before it has ever
+        // published one, so the published scope is optional here. It is only
+        // needed to render a provisional compound ref, and a connector graph
+        // never has one.
         let scope_hash = views
             .published_view(&project_id)
-            .map(|view| bbox_code_source::scope_hash(&view.scope))
-            .ok_or_else(|| anyhow!("error.not_found: project has no accepted graph generation"))?;
+            .map(|view| bbox_code_source::scope_hash(&view.scope));
         let mut candidates = Vec::new();
         match mode {
             ProvisionalMode::Published => {
@@ -206,6 +214,13 @@ impl BlackboxServer {
                 }
             }
         }
+        if candidates.is_empty() {
+            push_read_candidate(&mut candidates, views.load_connector(&project_id, graph_id))?;
+        }
+        if candidates.is_empty() && scope_hash.is_none() {
+            bail!("error.not_found: project has no accepted graph generation");
+        }
+        let scope_hash = scope_hash.unwrap_or_default();
         let mut resolved = candidates
             .into_iter()
             .filter_map(|entry| resolve_vertex(&project_id, &scope_hash, entry, vertex_id))
@@ -300,6 +315,9 @@ impl BlackboxServer {
             }
         }
         if entries.is_empty() {
+            push_read_candidate(&mut entries, views.load_connector(&project_id, graph_id))?;
+        }
+        if entries.is_empty() {
             bail!(
                 "error.not_found: graph `{graph_id}` was not found in {} visibility",
                 mode_name(mode)
@@ -358,15 +376,7 @@ impl ProjectGraphEntityResolver for BlackboxServer {
                 "content_hash".into(),
                 resolved.generation.content_hash.clone(),
             ),
-            (
-                "source".into(),
-                if resolved.provisional {
-                    "provisional"
-                } else {
-                    "published"
-                }
-                .into(),
-            ),
+            ("source".into(), resolved_source_label(&resolved).into()),
             (
                 "properties".into(),
                 serde_json::to_string(&resolved.vertex.properties)?,
@@ -523,8 +533,22 @@ fn summary(entry: ProjectGraphViewEntry) -> GraphSummary {
     }
 }
 
+/// The read-plane authority label for one graph. Three values, one per
+/// authority plane: `published` for accepted project-authored facts,
+/// `provisional` for a checkout's own uncommitted graph, and `connector` for a
+/// connector-managed source projection, which no checkout lane can author.
 fn source_label(entry: &ProjectGraphViewEntry) -> &'static str {
-    if entry.generation.workspace_id.is_some() {
+    match entry.graph() {
+        Some(graph) if graph.descriptor.authority == GraphAuthority::Connector => "connector",
+        _ if entry.generation.workspace_id.is_some() => "provisional",
+        _ => "published",
+    }
+}
+
+fn resolved_source_label(resolved: &ResolvedGraphVertex) -> &'static str {
+    if resolved.graph.descriptor.authority == GraphAuthority::Connector {
+        "connector"
+    } else if resolved.provisional {
         "provisional"
     } else {
         "published"
@@ -536,5 +560,95 @@ fn mode_name(mode: ProvisionalMode) -> &'static str {
         ProvisionalMode::Published => "published",
         ProvisionalMode::Own => "own",
         ProvisionalMode::All => "all",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity;
+    use bbox_project_graph::{
+        DESCRIPTOR_VERSION, GraphDescriptor, GraphKey, GraphSchema, GraphScope, GraphSource,
+        RetentionPolicy, build_generation,
+    };
+
+    fn schema() -> GraphSchema {
+        serde_json::from_str(
+            r#"{"version":1,"namespace":"dataset","vertex_types":{"dataset:Asset":{"required":["remote_id"],"properties":{"remote_id":"string"}}},"edge_types":[]}"#,
+        )
+        .unwrap()
+    }
+
+    fn generation(authority: GraphAuthority, source: GraphSource) -> GraphGeneration {
+        let connector = authority == GraphAuthority::Connector;
+        build_generation(
+            GraphKey {
+                scope_id: "scope".into(),
+                graph_id: "source-assets".into(),
+                source,
+            },
+            GraphDescriptor {
+                descriptor_version: DESCRIPTOR_VERSION,
+                scope: GraphScope::Project,
+                graph_id: "source-assets".into(),
+                authority,
+                schema_id: "dataset:schema".into(),
+                schema_version: 1,
+                projection_version: connector.then(|| "dataset-v1".to_string()),
+                source_connector: connector.then(|| "synthetic-api".to_string()),
+                retention_policy: if connector {
+                    RetentionPolicy::ConnectorManaged
+                } else {
+                    RetentionPolicy::ProjectOwned
+                },
+                generation: 1,
+            },
+            schema(),
+            Vec::new(),
+            Vec::new(),
+            "d".repeat(64),
+            std::path::PathBuf::from("/store"),
+        )
+    }
+
+    fn identity(workspace: Option<&str>) -> ProjectGraphGenerationIdentity {
+        ProjectGraphGenerationIdentity {
+            accepted_generation: "1".into(),
+            accepted_commit: String::new(),
+            source_generation: None,
+            workspace_id: workspace.map(|id| WorkspaceId::parse(id.to_string()).unwrap()),
+            content_hash: "d".repeat(64),
+        }
+    }
+
+    /// The read plane names three authority planes, and connector is distinct
+    /// from both project-authored ones.
+    #[test]
+    fn the_source_label_names_three_distinct_authority_planes() {
+        let connector = ProjectGraphViewEntry::valid(
+            "source-assets".into(),
+            identity(None),
+            generation(GraphAuthority::Connector, GraphSource::ConnectorManaged),
+        );
+        assert_eq!(source_label(&connector), "connector");
+        assert_eq!(summary(connector.clone()).source, "connector");
+        assert!(
+            summary(connector).checkout_id.is_none(),
+            "a connector projection is never checkout scoped"
+        );
+
+        let published = ProjectGraphViewEntry::valid(
+            "records".into(),
+            identity(None),
+            generation(GraphAuthority::Project, GraphSource::Committed),
+        );
+        assert_eq!(source_label(&published), "published");
+
+        let provisional = ProjectGraphViewEntry::valid(
+            "records".into(),
+            identity(Some("0123456789abcdef0123456789abcdef")),
+            generation(GraphAuthority::Project, GraphSource::Committed),
+        );
+        assert_eq!(source_label(&provisional), "provisional");
     }
 }

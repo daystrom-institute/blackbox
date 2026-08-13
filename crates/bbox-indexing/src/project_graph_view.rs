@@ -95,6 +95,20 @@ pub struct ProvisionalProjectGraphOverlay {
     pub graphs: BTreeMap<String, ProjectGraphOverlayValue>,
 }
 
+/// A connector-managed source graph as the read plane sees it.
+///
+/// Read-only by construction: these generations are accepted by the source
+/// projection store (`bbox-source-graph`), never by a checkout lane, so the
+/// catalog offers no path that mutates one and the visibility policy does not
+/// gate them the way it gates provisional checkout state.
+#[derive(Debug, Clone)]
+pub struct ConnectorProjectGraphView {
+    pub project_id: ProjectId,
+    pub graph_id: String,
+    pub source_connector: String,
+    pub entry: ProjectGraphViewEntry,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProjectGraphRead {
     Missing,
@@ -107,6 +121,7 @@ pub enum ProjectGraphRead {
 pub struct ProjectGraphViewCatalog {
     published: BTreeMap<ProjectId, PublishedProjectGraphView>,
     provisional: BTreeMap<(ProjectId, WorkspaceId), ProvisionalProjectGraphOverlay>,
+    connector: BTreeMap<(ProjectId, String), ConnectorProjectGraphView>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +234,115 @@ impl ProjectGraphViewCatalog {
         self.provisional
             .get(&(project_id.clone(), workspace_id.clone()))
     }
+
+    /// Install one connector-managed source graph.
+    ///
+    /// Refused when the project already publishes a graph under that id: one
+    /// graph id in one project holds exactly one authority, and a connector
+    /// refresh must never replace or shadow project-authored facts. The
+    /// reverse ordering (a later publication introducing a colliding id)
+    /// cannot be refused here, so it is resolved at read time in favour of the
+    /// project-authored graph by [`Self::visible_connector`].
+    pub fn install_connector(&mut self, view: ConnectorProjectGraphView) -> Result<()> {
+        if self
+            .published
+            .get(&view.project_id)
+            .is_some_and(|published| published.graphs.contains_key(&view.graph_id))
+        {
+            bail!(
+                "error.graph_authority_conflict: graph `{}` is project authored; \
+                 a connector refresh cannot replace it",
+                view.graph_id
+            );
+        }
+        self.connector
+            .insert((view.project_id.clone(), view.graph_id.clone()), view);
+        Ok(())
+    }
+
+    pub fn remove_connector(&mut self, project_id: &ProjectId, graph_id: &str) {
+        self.connector
+            .remove(&(project_id.clone(), graph_id.to_string()));
+    }
+
+    /// Every connector-managed graph for a project that is not shadowed by a
+    /// project-authored graph of the same id.
+    pub fn list_connector(&self, project_id: &ProjectId) -> Vec<ProjectGraphViewEntry> {
+        self.connector
+            .iter()
+            .filter_map(|((candidate, graph_id), view)| {
+                (candidate == project_id && self.visible_connector(project_id, graph_id).is_some())
+                    .then(|| view.entry.clone())
+            })
+            .collect()
+    }
+
+    pub fn load_connector(&self, project_id: &ProjectId, graph_id: &str) -> ProjectGraphRead {
+        self.visible_connector(project_id, graph_id)
+            .map(|view| read_from_entry(view.entry.clone()))
+            .unwrap_or(ProjectGraphRead::Missing)
+    }
+
+    /// The connector view for a graph id, unless a project-authored graph
+    /// claims that id. Project authorship is the stronger authority, so a
+    /// collision hides the connector projection rather than the project's own
+    /// facts.
+    pub fn visible_connector(
+        &self,
+        project_id: &ProjectId,
+        graph_id: &str,
+    ) -> Option<&ConnectorProjectGraphView> {
+        if self
+            .published
+            .get(project_id)
+            .is_some_and(|published| published.graphs.contains_key(graph_id))
+        {
+            return None;
+        }
+        self.connector
+            .get(&(project_id.clone(), graph_id.to_string()))
+    }
+}
+
+/// Build the read-plane view of one accepted connector generation.
+///
+/// The generation comes from the source projection store, which has already
+/// validated it, so this only refuses a generation that is not actually
+/// connector authored.
+pub fn build_connector_graph_view(
+    project_id: ProjectId,
+    generation: GraphGeneration,
+) -> Result<ConnectorProjectGraphView> {
+    if generation.descriptor.authority != bbox_project_graph::GraphAuthority::Connector {
+        bail!(
+            "error.graph_authority_conflict: graph `{}` is not connector authored",
+            generation.descriptor.graph_id
+        );
+    }
+    let Some(source_connector) = generation.descriptor.source_connector.clone() else {
+        bail!(
+            "error.graph_authority_conflict: connector graph `{}` names no source connector",
+            generation.descriptor.graph_id
+        );
+    };
+    let graph_id = generation.descriptor.graph_id.clone();
+    let identity = ProjectGraphGenerationIdentity {
+        accepted_generation: generation.descriptor.generation.to_string(),
+        // A connector projection has no publisher commit: it is accepted from
+        // observations, not from a checkout.
+        accepted_commit: String::new(),
+        source_generation: generation.descriptor.projection_version.clone(),
+        // Load bearing: a connector graph is never workspace scoped, which is
+        // what keeps the read plane from labelling it provisional.
+        workspace_id: None,
+        content_hash: generation.fingerprint.clone(),
+    };
+    Ok(ConnectorProjectGraphView {
+        project_id,
+        graph_id: graph_id.clone(),
+        source_connector,
+        entry: ProjectGraphViewEntry::valid(graph_id, identity, generation),
+    })
 }
 
 fn read_from_entry(entry: ProjectGraphViewEntry) -> ProjectGraphRead {
@@ -644,6 +768,144 @@ mod tests {
             generation: identity("invalid", true),
             graph: None,
         }
+    }
+
+    fn connector_generation(graph_id: &str, generation: u64) -> GraphGeneration {
+        let schema: bbox_project_graph::GraphSchema = serde_json::from_str(
+            r#"{"version":1,"namespace":"dataset","vertex_types":{"dataset:Asset":{"required":["remote_id"],"properties":{"remote_id":"string"}}},"edge_types":[]}"#,
+        )
+        .unwrap();
+        bbox_project_graph::build_generation(
+            bbox_project_graph::GraphKey {
+                scope_id: "connector-source:synthetic-api:tenant".into(),
+                graph_id: graph_id.to_string(),
+                source: bbox_project_graph::GraphSource::ConnectorManaged,
+            },
+            bbox_project_graph::GraphDescriptor {
+                descriptor_version: bbox_project_graph::DESCRIPTOR_VERSION,
+                scope: bbox_project_graph::GraphScope::Project,
+                graph_id: graph_id.to_string(),
+                authority: bbox_project_graph::GraphAuthority::Connector,
+                schema_id: "dataset:schema".into(),
+                schema_version: 1,
+                projection_version: Some("dataset-v1".into()),
+                source_connector: Some("synthetic-api".into()),
+                retention_policy: bbox_project_graph::RetentionPolicy::ConnectorManaged,
+                generation,
+            },
+            schema,
+            Vec::new(),
+            Vec::new(),
+            "c".repeat(64),
+            std::path::PathBuf::from("/source-graphs"),
+        )
+    }
+
+    /// A connector projection is visible without any provisional opt-in, and
+    /// it carries connector identity rather than a workspace.
+    #[test]
+    fn connector_graphs_are_visible_without_a_checkout_opt_in() {
+        let project_id = project_id();
+        let mut catalog = ProjectGraphViewCatalog::default();
+        let view = build_connector_graph_view(
+            project_id.clone(),
+            connector_generation("source-assets", 3),
+        )
+        .unwrap();
+        assert_eq!(view.source_connector, "synthetic-api");
+        assert_eq!(view.entry.generation.accepted_generation, "3");
+        assert!(view.entry.generation.workspace_id.is_none());
+        catalog.install_connector(view).unwrap();
+
+        let listed = catalog.list_connector(&project_id);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].graph_id, "source-assets");
+        assert!(matches!(
+            catalog.load_connector(&project_id, "source-assets"),
+            ProjectGraphRead::Valid(_)
+        ));
+        assert!(matches!(
+            catalog.load_connector(&project_id, "missing"),
+            ProjectGraphRead::Missing
+        ));
+        // The project-authored lanes are untouched by a connector install.
+        assert!(catalog.list_published(&project_id).is_empty());
+    }
+
+    /// A connector refresh cannot replace a project-authored graph, and a
+    /// later publication of the same id shadows the connector projection
+    /// rather than the other way round.
+    #[test]
+    fn connector_graphs_never_replace_project_authored_graphs() {
+        let project_id = project_id();
+        let scope = PublishedScope::try_new("repo-family", ".").unwrap();
+        let mut catalog = ProjectGraphViewCatalog::default();
+        catalog.install_published(PublishedProjectGraphView {
+            project_id: project_id.clone(),
+            scope: scope.clone(),
+            graphs: BTreeMap::from([(
+                "records".into(),
+                valid_entry("records", "published", false),
+            )]),
+        });
+
+        let colliding =
+            build_connector_graph_view(project_id.clone(), connector_generation("records", 1))
+                .unwrap();
+        let error = catalog.install_connector(colliding).unwrap_err();
+        assert!(
+            error.to_string().contains("error.graph_authority_conflict"),
+            "{error}"
+        );
+        assert!(matches!(
+            catalog.load_published(&project_id, "records"),
+            ProjectGraphRead::Valid(_)
+        ));
+
+        // The reverse ordering: the connector graph lands first, then a
+        // publication claims the id. The project-authored graph wins.
+        let mut catalog = ProjectGraphViewCatalog::default();
+        catalog
+            .install_connector(
+                build_connector_graph_view(project_id.clone(), connector_generation("records", 1))
+                    .unwrap(),
+            )
+            .unwrap();
+        catalog.install_published(PublishedProjectGraphView {
+            project_id: project_id.clone(),
+            scope,
+            graphs: BTreeMap::from([(
+                "records".into(),
+                valid_entry("records", "published", false),
+            )]),
+        });
+        assert!(catalog.list_connector(&project_id).is_empty());
+        assert!(matches!(
+            catalog.load_connector(&project_id, "records"),
+            ProjectGraphRead::Missing
+        ));
+        assert!(catalog.visible_connector(&project_id, "records").is_none());
+    }
+
+    /// The read plane only accepts generations that really are connector
+    /// authored.
+    #[test]
+    fn a_project_authored_generation_cannot_become_a_connector_view() {
+        let mut generation = connector_generation("source-assets", 1);
+        generation.descriptor.authority = bbox_project_graph::GraphAuthority::Project;
+        let error = build_connector_graph_view(project_id(), generation).unwrap_err();
+        assert!(
+            error.to_string().contains("error.graph_authority_conflict"),
+            "{error}"
+        );
+
+        let mut generation = connector_generation("source-assets", 1);
+        generation.descriptor.source_connector = None;
+        let error = build_connector_graph_view(project_id(), generation).unwrap_err();
+        assert!(
+            error.to_string().contains("names no source connector"),
+            "{error}"
+        );
     }
 
     #[test]
