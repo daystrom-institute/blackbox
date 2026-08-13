@@ -1465,6 +1465,67 @@ mod tests {
         assert!(removed, "expected to remove generation {generation_id}");
     }
 
+    /// The pre-bind sweep is what runs ahead of the relationship chain, so it
+    /// has to repair the production shape on its own, without the cutover
+    /// runtime being involved at all.
+    #[test]
+    fn sweep_reconciles_a_manifest_torn_behind_an_active_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, successor) = torn_after_cutover(&root);
+        let store = open_code_store(&config).unwrap();
+
+        let reconciled =
+            crate::code_source_locality_manifest::reconcile_workspace_manifests_from_activations(
+                &store,
+                layout.projects_path(),
+            )
+            .unwrap();
+
+        assert_eq!(reconciled, 1);
+        assert_eq!(
+            manifest_generation(&layout, &project_id).as_deref(),
+            Some(successor.as_str())
+        );
+
+        // Idempotent: a second sweep finds nothing left to repair.
+        let again =
+            crate::code_source_locality_manifest::reconcile_workspace_manifests_from_activations(
+                &store,
+                layout.projects_path(),
+            )
+            .unwrap();
+        assert_eq!(again, 0);
+    }
+
+    /// The sweep deliberately leaves the in-flight shape alone; the
+    /// relationship chain admits it and the reducer converges it.
+    #[test]
+    fn sweep_leaves_an_activation_still_in_flight_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (config, layout, project_id, successor) = torn_after_cutover(&root);
+        let predecessor = manifest_generation(&layout, &project_id).expect("predecessor entry");
+        let store = open_code_store(&config).unwrap();
+        let scope = PublishedScope::try_new("fixture-repo", ".").unwrap();
+        store
+            .mark_generation_state_mixed(&scope, &successor, GenerationState::StagingIndex, None)
+            .unwrap();
+
+        let reconciled =
+            crate::code_source_locality_manifest::reconcile_workspace_manifests_from_activations(
+                &store,
+                layout.projects_path(),
+            )
+            .unwrap();
+
+        assert_eq!(reconciled, 0);
+        assert_eq!(
+            manifest_generation(&layout, &project_id).as_deref(),
+            Some(predecessor.as_str())
+        );
+    }
+
     /// Strictness preservation: reconciliation trusts the journal only because
     /// the caller has already proven the activation against a generation the
     /// store can produce. A real, valid activation whose generation the store
