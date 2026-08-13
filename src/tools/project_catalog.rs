@@ -3746,6 +3746,7 @@ mod tests {
                     full_ref: "refs/heads/main".into(),
                     accepted_commit: COMMIT_ONE.into(),
                     dry_run: false,
+                    auto_advance: AutoAdvanceGrantUpdate::Inherit,
                 },
                 PublishSources {
                     knowledge: vec![PublishSourceFile {

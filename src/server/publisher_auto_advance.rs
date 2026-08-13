@@ -225,6 +225,10 @@ pub(crate) enum AutoAdvanceOutcome {
 }
 
 impl AutoAdvanceOutcome {
+    /// Test-only. Production code matches the variant it cares about
+    /// directly; this exists so an assertion can say "it accepted" without
+    /// naming the generation id it does not know in advance.
+    #[cfg(test)]
     pub(crate) fn accepted(&self) -> bool {
         matches!(self, Self::Accepted { .. })
     }
