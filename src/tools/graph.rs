@@ -1877,6 +1877,20 @@ mod tests {
         (project.project_id, file_ref)
     }
 
+    async fn inspect_published(server: &BlackboxServer, entity_ref: &str) -> serde_json::Value {
+        let result = server
+            .bbox_inspect_entity(Parameters(InspectEntityParams {
+                entity_ref: entity_ref.to_string(),
+                provisional: Some("published".into()),
+                edge_types: None,
+                direction: Some("both".into()),
+                per_type_limit: Some(10),
+                property_mode: Some("full".into()),
+            }))
+            .await;
+        serde_json::from_str(&extract_text(&result)).unwrap()
+    }
+
     /// THE EXIT GATE for milestone 3: a tenant record vertex traverses through
     /// a source vertex to a published project file, and the reverse traversal
     /// preserves provenance.
@@ -1982,23 +1996,10 @@ mod tests {
         let server = test_server(&tmp);
         let (project_id, _) = install_evidence_fixture(&server, &root);
 
-        let inspect = async |entity_ref: String| {
-            let result = server
-                .bbox_inspect_entity(Parameters(InspectEntityParams {
-                    entity_ref,
-                    provisional: Some("published".into()),
-                    edge_types: None,
-                    direction: Some("both".into()),
-                    per_type_limit: Some(10),
-                    property_mode: Some("full".into()),
-                }))
-                .await;
-            serde_json::from_str::<serde_json::Value>(&extract_text(&result)).unwrap()
-        };
-
-        let record = inspect(format!(
-            "project_graph_vertex:{project_id}:records:filing-1"
-        ))
+        let record = inspect_published(
+            &server,
+            &format!("project_graph_vertex:{project_id}:records:filing-1"),
+        )
         .await;
         let out = record["edges"]["out"].as_array().unwrap();
         let binding = out
@@ -2011,7 +2012,11 @@ mod tests {
             "project"
         );
 
-        let source = inspect(format!("project_graph_vertex:{project_id}:source:asset-1")).await;
+        let source = inspect_published(
+            &server,
+            &format!("project_graph_vertex:{project_id}:source:asset-1"),
+        )
+        .await;
         let incoming = source["edges"]["in"].as_array().unwrap();
         assert!(
             incoming
