@@ -807,44 +807,47 @@ auth flow.
 
 ## 20. Open questions
 
-- **Durable scope minting for non-git sources** (section 8), the primary blocker.
-  Grant-time synthetic scope with provider coordinates as observations is the
-  leaning; it needs an owner decision, a catalog migration plan, and a stance on
-  cross-producer convergence. `gap-0c7ec76c`.
-- **Remote provenance on the wire.** Whether `remote_id`, `remote_version`, and a
-  renderable remote URL should reach the corpus as manifest-entry metadata so
-  evidence can cite the source document, or whether the logical path is identity
-  enough. Coupled to section 12's encoded-path display limit and to
-  `gap-616857f8`. A manifest-entry field is a wire version bump: cheap once,
-  expensive twice.
-- **Export churn from vendor renderer changes** (section 7). Whether a full
-  re-enumeration producing new hashes for unedited documents is accepted as a real
-  generation (current position), suppressed by trusting `remote_version` as
-  freshness authority (which rejects the content-hash principle), or detected and
-  reported as a distinct condition so renderer churn is distinguishable from real
-  edits.
-- **Source-scoped embedding policy.** Whether a source can override visual-route
-  participation ("index this drive but never send its pixels to a hosted
-  embedder") or whether the global opt-in suffices. Leaning toward a per-source
-  `visual_embed = false`: cheap, and it matches the export-posture principle.
+- **Durable scope minting for non-git sources** (section 8): DECIDED
+  2026-08-12 (operator). Grant-time operator-minted `connector_source_id`
+  with provider coordinates as observations; catalog implementation tracked
+  by `gap-0c7ec76c` (phase 0, in flight 2026-08-13).
+- **Remote provenance on the wire**: DECIDED 2026-08-13 (operator, decision
+  bb2cc144c47840b0). The connector wire carries `remote_id`,
+  `remote_version`, and a renderable remote URL as manifest-entry metadata
+  from its FIRST version, so evidence can cite the source document. The
+  cheap-once wire bump is taken while the wire is greenfield.
+- **Export churn from vendor renderer changes** (section 7). Backburner,
+  re-evaluate at phase 2 with real Drive traffic. Standing recommendation:
+  keep content-hash as the freshness authority AND detect-and-report the
+  churn (unchanged `remote_version` with changed exported bytes counts as
+  renderer-churn on publication status; the journal already records
+  `remote_version`, so detection is a comparison).
+- **Source-scoped embedding policy.** Backburner, decide at phase 2.
+  Standing recommendation: adopt the per-source `visual_embed = false`
+  override, default inheriting global; cheap, and it matches the
+  export-posture principle.
 - **Quota and backoff across sources.** Per-connector rate limiting is
-  connector-internal in v1; two sources sharing one vendor account will need a
-  shared per-account limiter on the producer. Precedent: the embed queue's
-  conservative byte heuristics.
-- **Visual-store garbage collection.** Remote deletion and source removal strand
-  derived visual payloads until refcount or mark-sweep GC lands: still true, still
-  deferred, now with a second consumer arguing for it.
+  connector-internal in v1; the named trigger for a shared per-account
+  limiter is the SECOND source configured against one vendor account.
+  Precedent: the embed queue's conservative byte heuristics.
+- **Visual-store garbage collection.** Deferred with a named deadline:
+  refcount GC lands before M7 (a durable overlay's continuous refresh is
+  what strands payloads at scale); earlier phases live with documented
+  stranding.
 - **Graph participation for connector-sourced documents.** Whether a document
   tree with no repository, commits, or symbols projects into the project graph the
   way code does or wants its own projection shape. Tracked with the
   reflective-graph program as `gap-5d57d2bb`.
-- **Long-tail extraction.** Remote corpora surface formats the registry does not
-  claim (email archives, legacy binary `.doc`/`.ppt`). Candidates are a
-  compiled-native Tika binding or a supervised Tika server sidecar, adopted behind
-  a new corpus-side chunker, never inside a connector. Demand-driven.
-- **Eventual satellite consolidation.** Whether `bbox-code-collector` and
-  `bbox-file-collector` merge once the producer-host story stabilizes.
-  Deliberately not now (section 5).
+- **Long-tail extraction.** Demand-driven as before. Standing
+  recommendation for when demand arrives: the supervised Tika server
+  sidecar over the compiled-native binding (process isolation and memory
+  behavior beat linkage convenience), behind a new corpus-side chunker,
+  never inside a connector.
+- **Eventual satellite consolidation.** Deliberately not now (section 5);
+  do not revisit before `gdrive` ships. Criteria at that point: whether the
+  shared wire client extracted cleanly as a crate, and whether operating
+  two producer satellites is a measured burden rather than an aesthetic
+  one.
 
 ## 21. Relationship
 

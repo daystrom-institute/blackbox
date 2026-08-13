@@ -814,18 +814,35 @@ Added by the 2026-08-11 re-grounding:
   plane through the modernized secrets-provider design rather than a
   hypothetical future seam.
 
-Still open:
+Decided 2026-08-13 (operator ratification of the standing recommendations;
+knowledge decisions referenced):
 
-- the exact retained-observation policy needed for offline reprojection;
-- whether source schemas ship with the connector binary, as versioned corpus
-  artifacts, or through a signed package registry;
-- the minimum Xero entity set needed before the Files action can avoid broad
-  reconciliation;
-- which graph properties are eligible for text or vector indexing by default;
-- whether tenant mapping assertions require human approval for every change or
-  only for ambiguous matches;
-- durable scope identity for non-git connector sources (owned by
-  `remote-source-connectors.md`, consumed here).
+- Retained-observation policy (98d9f430f62ad8ca): accepted observation
+  batches are retained content-addressed, defaulting to current plus prior
+  generation and everything younger than a retention window, per source
+  class and widenable by deployment policy; reprojection beyond the horizon
+  degrades honestly to re-observe.
+- Source schema shipping (7650b743fb23c265): versioned corpus artifacts
+  through the existing artifact catalog, not compiled into connector
+  binaries; signed distribution deferred to M10-era hardening.
+- Index eligibility (b1a11d7cf59f2545): conservative and schema-directed;
+  labels word-indexed by default, per-property annotations for text and
+  embedding participation, embeddings strictly per-kind opt-in under
+  per-graph policy. Schema authors annotate as they write.
+- Durable scope identity for non-git sources: resolved 2026-08-12
+  (operator-minted `connector_source_id`, coordinates as observations);
+  catalog implementation is `gap-0c7ec76c`, in flight.
+
+Still open (backburner, re-evaluate at decision time):
+
+- the minimum Xero entity set needed before the Files action can avoid
+  broad reconciliation: decide empirically from M5 fixtures; starting
+  hypothesis is the set the action's two lanes touch (contacts, invoices,
+  tracking categories and options, attachments, files, associations);
+- tenant mapping approval (decide at M8): standing recommendation is v1
+  requires operator approval for every mapping change (low volume,
+  authority-bearing), relaxing later to auto-accepted unambiguous
+  exact-key matches with audit once volume demands.
 
 ## 21. Relationship
 
