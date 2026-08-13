@@ -14,7 +14,10 @@
   "dedupe_key": "ontology/agentic-corpus/cross-entity-evidence-endpoints",
   "suggested_owner": "blackbox",
   "notes": "Re-filed 2026-08-11 for the modernized connector campaign; replaces a pre-locality gap reference that was never present in any surviving store.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-08-11T00:00:00Z",
-  "updated_at": "2026-08-11T00:00:00Z"
+  "updated_at": "2026-08-13T20:44:49Z",
+  "resolved_at": "2026-08-13T20:44:49Z",
+  "resolution_note": "M3 cross-graph and cross-entity evidence bindings shipped on beta/blackbox-v2 (c0d3345f, branch feat/evidence-bindings, folded with M2 source projections; cluster verify green, full workspace suite green with one unrelated flaky bro-slack contention test passing solo). Tenant-owned bindings in .bbox/evidence/bindings.json ride a new knowledge-source lane with an append-only vintage ladder (PreGraphs, PreEvidence, Current) keeping every prior on-disk shape openable; canonical EntityRef endpoints with no connector-specific variants; per-binding assertion authority, provenance, and optional endpoint generations; whole-document replacement with invalid candidates leaving the accepted set intact; five-state endpoint freshness resolved at traversal and bundle time (only unauthorized refuses traversal); bindings surface through inspect (edge family on both endpoints), find_paths (traversable with per-step evidence metadata), and bundle_evidence (intra-bundle edges with provenance). Exit gate proven: a record vertex traverses through a source vertex to a project file with provenance preserved in reverse, including the cross-graph same-project case the wampum kit/instance split was waiting on. The M3 agent also caught and fixed a latent absent-lane digest defect that would have refused every pre-evidence record on open."
 }
