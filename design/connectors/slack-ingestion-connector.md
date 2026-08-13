@@ -138,11 +138,40 @@ loop) was considered and rejected:
 - **Rate-limit isolation.** A multi-hour backfill and an interactive mention
   response should not draw on the same bucket.
 
-Recommended deployment is **two Slack apps**: the existing interactive app and
-a read-only observer app. Where an operator insists on one app, the fallback is
-two token files with distinct grants and the same startup assertion, which is
-supported but weaker because the workspace-level audit surface no longer
-separates the purposes. Both processes share the producer host and therefore
+**RULED (operator, 2026-08-13): the deployed posture is ONE app, the
+existing interactive bot.** The requirement is observation from the bot's own
+perspective: the bot's channel membership defines exactly what it indexes, so
+the bot can search its own history when directed by humans. A Slack app holds
+one bot token per install carrying all granted scopes, so a read-only
+credential for the same bot identity does not exist; credential-level
+enforcement is therefore unavailable, and write-safety moves to the collector's
+code path as a threefold contract: the collector has no write call sites, its
+Slack client is allowlisted to the read API families (conversations.history,
+conversations.replies, users.*, and cursor pagination) and refuses any other
+method by construction, and the dependency ceiling is enforced by acceptance
+script. The agents-never-post rule is untouched: it binds agents, and the
+collector is an observer that structurally cannot compose a write. The
+two-app split remains documented below as the posture for deployments that
+want credential-level enforcement and separable workspace audit; it is not
+the deployed shape here.
+
+Consequence of one app: the interactive bot and the collector share one rate
+budget, so the S3 workspace token bucket must span both processes, and until
+it exists the collector self-throttles conservatively and yields to
+interactive traffic. Steady-state observation remains watermark polling, not
+the bot's socket-mode event stream: events miss everything during downtime
+while polling self-heals; event-assisted freshness (the bridge nudging the
+collector) is a later optimization. The first consuming deployment resolves
+the bot token from the operator's secret vault via the op CLI at startup
+(a secret reference, never a literal in config), per the secrets-provider
+design.
+
+Original recommendation, retained for deployments without the
+bot-perspective requirement: **two Slack apps**, the existing interactive app
+and a read-only observer app. Where an operator insists on one app without
+the bot-perspective requirement, the fallback is two token files with
+distinct grants and the same startup assertion, which is supported but weaker
+because the workspace-level audit surface no longer separates the purposes. Both processes share the producer host and therefore
 share credential delivery, supervision, and the operator's secret plane
 ([`../operations/config-artifacts/secrets-provider.md`](../operations/config-artifacts/secrets-provider.md)).
 
