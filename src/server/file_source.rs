@@ -178,6 +178,20 @@ fn require_publication_scope(
             "connector scope is not authorized for this producer",
         ));
     }
+    // The lane check. A grant carries the ingest lane it opens, and a
+    // conversation grant reaching a file publication route is a producer
+    // pointed at the wrong endpoint family, not a permission the operator
+    // meant to give. Refused as forbidden, with its own code so the producer's
+    // logs name the actual mistake.
+    if connectors.profile_for(scope.connector_source_id())
+        != Some(crate::config::ConnectorProfile::File)
+    {
+        return Err(HttpError::new(
+            StatusCode::FORBIDDEN,
+            "scope_wrong_lane",
+            "connector scope is not granted on the file-source lane",
+        ));
+    }
     if connectors.is_pending_onboard(scope) {
         return Err(HttpError::new(
             StatusCode::CONFLICT,
@@ -725,6 +739,7 @@ mod tests {
             connector_source_id: ConnectorSourceId::parse(connector_source_id).unwrap(),
             connector_kind: ConnectorKind::parse("fixture").unwrap(),
             remote_authority: "tenant.example".to_string(),
+            profile: crate::config::ConnectorProfile::File,
         }
     }
 
@@ -833,6 +848,38 @@ mod tests {
             table.publication_project_ids().len(),
             1,
             "the cataloged scope opens a lane and the pending one contributes none"
+        );
+    }
+
+    #[test]
+    fn a_conversation_lane_grant_cannot_publish_a_file_manifest() {
+        // Both lanes authenticate through one producer table, so lane
+        // separation has to be an explicit check rather than a consequence of
+        // which endpoint the producer happened to call.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = crate::config::SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![crate::config::ConnectorProducerConfig {
+                producer_id: "producer-conversation".into(),
+                token_file: token_file(&root, "token-c", &"c".repeat(64)),
+                scopes: vec![crate::config::ConnectorScopeGrant {
+                    connector_source_id: ConnectorSourceId::parse(SOURCE_A).unwrap(),
+                    connector_kind: ConnectorKind::parse("fixture").unwrap(),
+                    remote_authority: "workspace.example".to_string(),
+                    profile: crate::config::ConnectorProfile::Conversation,
+                }],
+            }],
+        };
+        let table = ConnectorGrantRuntime::build(&config, Some(&catalog_with(SOURCE_A))).unwrap();
+
+        let error =
+            require_publication_scope(&table, &caller("producer-conversation"), &scope(SOURCE_A))
+                .expect_err("a conversation grant opens no file publication lane");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.code, "scope_wrong_lane",
+            "distinct from scope_forbidden: the grant is real, the endpoint is wrong"
         );
     }
 

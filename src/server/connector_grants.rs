@@ -58,6 +58,16 @@ pub(crate) struct ConnectorGrantRuntime {
     /// Granted scopes with no catalog project yet. Only onboarding may
     /// accept these.
     pending_onboard: BTreeSet<ConnectorScope>,
+    /// Which ingest lane each granted id opens.
+    ///
+    /// Keyed on `connector_source_id` alone, which is sound because the config
+    /// loader and [`ConnectorGrantRuntime::build`] both refuse a doubly-granted
+    /// id. It is a separate map rather than a field on
+    /// [`ConnectorGrantExpectation`] deliberately: that type is the shared
+    /// onboarding contract in `bbox-indexing`, the onboarding composite has no
+    /// business branching on a lane, and widening it would make every consumer
+    /// of that crate carry a field only two route layers read.
+    profiles: BTreeMap<ConnectorSourceId, crate::config::ConnectorProfile>,
 }
 
 impl std::fmt::Debug for ConnectorGrantRuntime {
@@ -72,6 +82,7 @@ impl std::fmt::Debug for ConnectorGrantRuntime {
             .field("producer_tokens", &self.producers.len())
             .field("scope_to_project", &self.scope_to_project)
             .field("pending_onboard", &self.pending_onboard)
+            .field("profiles", &self.profiles)
             .finish()
     }
 }
@@ -84,6 +95,7 @@ impl ConnectorGrantRuntime {
             producers: Vec::new(),
             scope_to_project: BTreeMap::new(),
             pending_onboard: BTreeSet::new(),
+            profiles: BTreeMap::new(),
         }
     }
 
@@ -110,6 +122,7 @@ impl ConnectorGrantRuntime {
         let mut producer_tokens = Vec::new();
         let mut scope_to_project = BTreeMap::new();
         let mut pending_onboard = BTreeSet::new();
+        let mut profiles = BTreeMap::new();
         let mut producer_ids = BTreeSet::new();
         let mut token_digests = BTreeSet::new();
         let mut granted_sources = BTreeSet::new();
@@ -150,6 +163,7 @@ impl ConnectorGrantRuntime {
                 if !granted_sources.insert(scope.connector_source_id().clone()) {
                     bail!("connector_source_id is granted more than once");
                 }
+                profiles.insert(scope.connector_source_id().clone(), grant.profile);
                 match find_connector_project(catalog, &scope) {
                     Ok(Some(project_id)) => {
                         scope_to_project.insert(scope.connector_source_id().clone(), project_id);
@@ -185,6 +199,7 @@ impl ConnectorGrantRuntime {
             producers: producer_tokens,
             scope_to_project,
             pending_onboard,
+            profiles,
         })
     }
 
@@ -233,6 +248,21 @@ impl ConnectorGrantRuntime {
         connector_source_id: &ConnectorSourceId,
     ) -> Option<&ProjectId> {
         self.scope_to_project.get(connector_source_id)
+    }
+
+    /// The ingest lane a granted scope opens.
+    ///
+    /// Returns `None` for a scope this table does not hold, so a caller cannot
+    /// mistake "not granted" for "granted on the default lane". Both route
+    /// layers check this BEFORE reaching their store: a conversation grant must
+    /// not be able to publish a file manifest, and a file grant must not be
+    /// able to land messages, even though both authenticate through the same
+    /// producer table.
+    pub(crate) fn profile_for(
+        &self,
+        connector_source_id: &ConnectorSourceId,
+    ) -> Option<crate::config::ConnectorProfile> {
+        self.profiles.get(connector_source_id).copied()
     }
 
     /// Project ids a connector grant makes eligible for a PUBLICATION lane.
@@ -319,10 +349,25 @@ mod tests {
     }
 
     fn grant(connector_source_id: &str, kind: &str, authority: &str) -> ConnectorScopeGrant {
+        grant_on(
+            connector_source_id,
+            kind,
+            authority,
+            crate::config::ConnectorProfile::File,
+        )
+    }
+
+    fn grant_on(
+        connector_source_id: &str,
+        kind: &str,
+        authority: &str,
+        profile: crate::config::ConnectorProfile,
+    ) -> ConnectorScopeGrant {
         ConnectorScopeGrant {
             connector_source_id: ConnectorSourceId::parse(connector_source_id).unwrap(),
             connector_kind: ConnectorKind::parse(kind).unwrap(),
             remote_authority: authority.to_string(),
+            profile,
         }
     }
 
@@ -450,6 +495,55 @@ mod tests {
             2,
             "both scopes remain visible to onboarding: eligibility is catalog \
              membership, not grant presence"
+        );
+    }
+
+    #[test]
+    fn a_grants_ingest_lane_travels_with_it_into_the_table() {
+        // Two producers, two lanes, one table. The lane is what keeps a
+        // conversation grant out of the file publication routes and a file
+        // grant out of the conversation ones, even though both authenticate
+        // through the same producer list.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = config_with(
+            vec![
+                ConnectorProducerConfig {
+                    producer_id: "producer-files".into(),
+                    token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                    scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+                },
+                ConnectorProducerConfig {
+                    producer_id: "producer-conversation".into(),
+                    token_file: token_file(&root, "token-b", &"b".repeat(64)),
+                    scopes: vec![grant_on(
+                        SOURCE_B,
+                        "slack",
+                        "workspace.example",
+                        crate::config::ConnectorProfile::Conversation,
+                    )],
+                },
+            ],
+            true,
+        );
+        let catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let runtime = ConnectorGrantRuntime::build(&config, Some(&catalog)).unwrap();
+
+        let files = ConnectorSourceId::parse(SOURCE_A).unwrap();
+        let conversation = ConnectorSourceId::parse(SOURCE_B).unwrap();
+        assert_eq!(
+            runtime.profile_for(&files),
+            Some(crate::config::ConnectorProfile::File)
+        );
+        assert_eq!(
+            runtime.profile_for(&conversation),
+            Some(crate::config::ConnectorProfile::Conversation)
+        );
+        // An ungranted id resolves to no lane at all, so a caller cannot
+        // mistake "not granted" for "granted on the default lane".
+        assert_eq!(
+            runtime.profile_for(&ConnectorSourceId::parse("csrc_1111111111111111").unwrap()),
+            None
         );
     }
 

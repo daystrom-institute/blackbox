@@ -716,6 +716,40 @@ pub struct ConnectorScopeGrant {
     pub connector_kind: ConnectorKind,
     /// The vendor tenant or account this source is expected to live under.
     pub remote_authority: String,
+    /// Which ingest lane this grant opens. Defaults to the file lane, so every
+    /// config written before the conversation lane existed keeps its exact
+    /// meaning.
+    #[serde(default)]
+    pub profile: ConnectorProfile,
+}
+
+/// Which ingest lane a connector grant opens.
+///
+/// **Why this is a discriminant on `[source_connectors]` rather than a second
+/// `[conversation_sources]` block.** The one rule that actually protects the
+/// catalog is that a `connector_source_id` may be granted to exactly one
+/// producer, and `validate_source_connectors` enforces it by walking a single
+/// table. A parallel config family would fork that invariant across two
+/// loaders, and the first thing an operator would do is grant one minted id in
+/// each: two producers, one durable project, both claiming authority over it.
+/// The scope family is unchanged from phase 0 ([`ConnectorScope`]); only the
+/// lane a grant addresses is new, and a lane is a property OF the grant.
+///
+/// `connector_kind` cannot carry this. It is the operator's declaration of
+/// which connector family serves the source (`gdrive`, `graph`, `slack`), it is
+/// durable catalog data, and it is deliberately open ended. A closed lane
+/// discriminant that a route layer switches on must not be inferred from an
+/// open-ended label.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorProfile {
+    /// `/internal/file-source/v1/*`: a manifest of named blobs, published as
+    /// whole-set generations.
+    #[default]
+    File,
+    /// `/internal/conversation-source/v1/*`: an append-only message stream with
+    /// server-owned per-channel cursors.
+    Conversation,
 }
 
 impl ConnectorScopeGrant {
@@ -3227,6 +3261,7 @@ state_dir = "~"
             connector_source_id: ConnectorSourceId::parse(connector_source_id).unwrap(),
             connector_kind: ConnectorKind::parse(connector_kind).unwrap(),
             remote_authority: remote_authority.to_string(),
+            profile: ConnectorProfile::File,
         }
     }
 
@@ -3272,6 +3307,58 @@ remote_authority = "tenant.example"
             grant.scope().connector_source_id().as_str(),
             "csrc_5f2c1d9a4b6e470e",
             "the grant projects to the durable catalog scope"
+        );
+        assert_eq!(
+            grant.profile,
+            ConnectorProfile::File,
+            "a grant written before the conversation lane existed keeps its meaning"
+        );
+    }
+
+    #[test]
+    fn a_connector_grant_declares_which_ingest_lane_it_opens() {
+        // The lane is a property of the GRANT, in the one table whose walk
+        // enforces that a minted id belongs to exactly one producer. A second
+        // config family would fork that invariant across two loaders.
+        let raw: RawSourceConnectorsConfig = Figment::new()
+            .merge(Toml::string(
+                r#"
+enabled = true
+
+[[producers]]
+producer_id = "producer-conversation"
+token_file = "/tmp/connector-token"
+
+[[producers.scopes]]
+connector_source_id = "csrc_5f2c1d9a4b6e470e"
+connector_kind = "slack"
+remote_authority = "workspace.example"
+profile = "conversation"
+"#,
+            ))
+            .extract()
+            .expect("a conversation grant parses");
+        assert_eq!(
+            raw.producers[0].scopes[0].profile,
+            ConnectorProfile::Conversation
+        );
+        // The durable catalog scope is UNCHANGED by the lane: phase 0's
+        // ConnectorScope is still exactly the scope family, and the profile
+        // never reaches the catalog.
+        let scope = raw.producers[0].scopes[0].scope();
+        assert_eq!(scope.connector_kind().as_str(), "slack");
+
+        // An unknown lane is a refusal, not a silent fallback to the file
+        // lane: a typo must never open a lane the operator did not name.
+        assert!(
+            Figment::new()
+                .merge(Toml::string(
+                    "connector_source_id = \"csrc_5f2c1d9a4b6e470e\"\n\
+                     connector_kind = \"slack\"\nremote_authority = \"workspace.example\"\n\
+                     profile = \"converstaion\"\n"
+                ))
+                .extract::<ConnectorScopeGrant>()
+                .is_err()
         );
     }
 

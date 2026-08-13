@@ -611,6 +611,7 @@ mod tests {
                     connector_source_id: ConnectorSourceId::parse(SOURCE_ID).unwrap(),
                     connector_kind: ConnectorKind::parse("fixture").unwrap(),
                     remote_authority: "fixture.invalid".to_string(),
+                    profile: crate::config::ConnectorProfile::File,
                 }],
             }],
         };
