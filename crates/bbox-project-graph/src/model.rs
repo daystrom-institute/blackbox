@@ -29,6 +29,10 @@ pub enum GraphScope {
 #[serde(rename_all = "snake_case")]
 pub enum GraphAuthority {
     Project,
+    /// A connector-managed projection of remote state. Connector authority is
+    /// only legal for graphs held in the dedicated source projection store;
+    /// it can never be authored through a checkout graph root.
+    Connector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -36,6 +40,7 @@ pub enum GraphAuthority {
 pub enum RetentionPolicy {
     ProjectOwned,
     LocalScratch,
+    ConnectorManaged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +67,120 @@ pub struct GraphSchema {
     pub namespace: String,
     pub vertex_types: BTreeMap<String, VertexTypeDefinition>,
     pub edge_types: Vec<EdgeTypeDefinition>,
+    /// Per-graph retrieval policy. Schema authors annotate individual
+    /// properties for text indexing and embedding participation; this policy
+    /// is the per-graph gate those annotations sit under. Structural only in
+    /// M2: nothing indexes or embeds from it yet.
+    #[serde(default)]
+    pub index_policy: GraphIndexPolicy,
+}
+
+/// Per-graph retrieval policy. Conservative by construction: with the default
+/// policy no property is embedded, whatever a property annotation asks for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GraphIndexPolicy {
+    /// Whether any property in this graph may participate in embeddings.
+    /// A property that opts into embedding while this is false is a schema
+    /// error, not a silent downgrade.
+    #[serde(default)]
+    pub embeddings_enabled: bool,
+}
+
+/// How a property participates in text retrieval. Vertex labels are word
+/// indexed by default; every property is `none` unless annotated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyIndexMode {
+    #[default]
+    None,
+    Word,
+    Text,
+}
+
+impl PropertyIndexMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "word" => Some(Self::Word),
+            "text" => Some(Self::Text),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Word => "word",
+            Self::Text => "text",
+        }
+    }
+}
+
+/// The retrieval annotations carried by one schema property term.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PropertyAnnotations {
+    pub index: PropertyIndexMode,
+    pub embed: bool,
+}
+
+/// The reserved keys of an annotated property term.
+pub const ANNOTATION_TYPE_KEY: &str = "type";
+pub const ANNOTATION_INDEX_KEY: &str = "index";
+pub const ANNOTATION_EMBED_KEY: &str = "embed";
+
+/// Whether a property term is an ANNOTATED term rather than a nested object
+/// term.
+///
+/// The discriminator is deliberately narrow so no existing schema changes
+/// meaning: an annotated term is an object whose keys are a subset of
+/// `{type, index, embed}`, that carries `type`, and that carries at least one
+/// of `index` / `embed`. A bare `{"type": "string"}` therefore keeps its
+/// existing meaning (an object with one field named `type`), and only an
+/// author who actually writes an annotation opts into the new form.
+pub fn is_annotated_property_term(term: &Value) -> bool {
+    let Some(fields) = term.as_object() else {
+        return false;
+    };
+    fields.contains_key(ANNOTATION_TYPE_KEY)
+        && (fields.contains_key(ANNOTATION_INDEX_KEY) || fields.contains_key(ANNOTATION_EMBED_KEY))
+        && fields.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                ANNOTATION_TYPE_KEY | ANNOTATION_INDEX_KEY | ANNOTATION_EMBED_KEY
+            )
+        })
+}
+
+/// The structural term inside a property term: the annotated `type` body when
+/// the term is annotated, the term itself otherwise. Value validation always
+/// runs against this, so annotating a property never changes what values it
+/// accepts.
+pub fn property_term_body(term: &Value) -> &Value {
+    if is_annotated_property_term(term) {
+        &term[ANNOTATION_TYPE_KEY]
+    } else {
+        term
+    }
+}
+
+/// The annotations a property term declares. Unannotated terms carry the
+/// conservative default (`index: none`, `embed: false`).
+pub fn property_annotations(term: &Value) -> PropertyAnnotations {
+    if !is_annotated_property_term(term) {
+        return PropertyAnnotations::default();
+    }
+    PropertyAnnotations {
+        index: term
+            .get(ANNOTATION_INDEX_KEY)
+            .and_then(Value::as_str)
+            .and_then(PropertyIndexMode::parse)
+            .unwrap_or_default(),
+        embed: term
+            .get(ANNOTATION_EMBED_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or_default(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -163,6 +282,11 @@ pub struct ProjectGraphEdge {
 pub enum GraphSource {
     Committed,
     LocalScratch,
+    /// Held by the dedicated source projection store, outside every checkout
+    /// graph root. Connector-managed graphs have no relative root by
+    /// construction, which is what keeps them unreachable from the checkout
+    /// authoring lane.
+    ConnectorManaged,
 }
 
 impl GraphSource {
@@ -170,14 +294,37 @@ impl GraphSource {
         match self {
             Self::Committed => RetentionPolicy::ProjectOwned,
             Self::LocalScratch => RetentionPolicy::LocalScratch,
+            Self::ConnectorManaged => RetentionPolicy::ConnectorManaged,
         }
     }
 
-    pub fn relative_root(self) -> &'static str {
+    /// The checkout-relative directory that holds this source's graphs, or
+    /// `None` for sources that are not file-backed by a checkout. Callers that
+    /// discover or locate graphs on disk must treat `None` as "no such graph
+    /// here" rather than defaulting to a project root.
+    pub fn relative_root(self) -> Option<&'static str> {
         match self {
-            Self::Committed => ".bbox/graphs",
-            Self::LocalScratch => ".bbox/local/graphs",
+            Self::Committed => Some(".bbox/graphs"),
+            Self::LocalScratch => Some(".bbox/local/graphs"),
+            Self::ConnectorManaged => None,
         }
+    }
+
+    /// The read-surface label for this source: `project` for checkout-authored
+    /// graphs, `provisional` for opt-in local scratch, and `connector` for
+    /// connector-managed source projections.
+    pub fn read_surface_label(self) -> &'static str {
+        match self {
+            Self::Committed => "project",
+            Self::LocalScratch => "provisional",
+            Self::ConnectorManaged => "connector",
+        }
+    }
+
+    /// Whether a graph from this source may be authored or mutated through a
+    /// checkout lane.
+    pub fn is_checkout_authored(self) -> bool {
+        matches!(self, Self::Committed | Self::LocalScratch)
     }
 }
 
@@ -258,7 +405,11 @@ pub fn meta_schema_floor() -> MetaSchemaFloor {
     }
 }
 
-pub(crate) fn project_generation(
+/// Reflect a validated descriptor, schema, and fact set into an accepted
+/// generation: the schema is projected in as meta vertices and edges on top of
+/// the authored facts. Shared by the checkout loader and the source projection
+/// store so both authority planes reflect identically.
+pub fn build_generation(
     key: GraphKey,
     descriptor: GraphDescriptor,
     schema: GraphSchema,
@@ -499,6 +650,25 @@ impl ProjectGraphCatalog {
         &mut self,
         candidate: GraphGeneration,
     ) -> Result<Arc<GraphGeneration>, CatalogPublishError> {
+        // One graph id in one scope has exactly one authority. A connector
+        // refresh must never be able to shadow or replace a project-authored
+        // graph, and a checkout must never be able to shadow a connector
+        // projection; both directions fail closed here.
+        if let Some(existing) = self.entries.keys().find(|key| {
+            key.scope_id == candidate.key.scope_id
+                && key.graph_id == candidate.key.graph_id
+                && key.source != candidate.key.source
+        }) {
+            return Err(CatalogPublishError {
+                code: "graph.ambiguous_source".into(),
+                message: format!(
+                    "graph `{}` already has an accepted generation from the {} source; \
+                     one graph id cannot hold two authorities",
+                    candidate.key.graph_id,
+                    existing.source.read_surface_label()
+                ),
+            });
+        }
         if let Some(current) = self.entries.get(&candidate.key) {
             if candidate.descriptor.generation < current.descriptor.generation {
                 return Err(CatalogPublishError {
@@ -539,17 +709,31 @@ impl ProjectGraphCatalog {
             graph_id: graph_id.to_string(),
             source: GraphSource::Committed,
         };
-        self.entries.get(&committed).cloned().or_else(|| {
-            include_local.then(|| {
+        self.entries
+            .get(&committed)
+            .cloned()
+            .or_else(|| {
+                // Connector-managed graphs are always visible: they are
+                // read-only, so they need no local opt-in.
                 self.entries
                     .get(&GraphKey {
                         scope_id: scope_id.to_string(),
                         graph_id: graph_id.to_string(),
-                        source: GraphSource::LocalScratch,
+                        source: GraphSource::ConnectorManaged,
                     })
                     .cloned()
-            })?
-        })
+            })
+            .or_else(|| {
+                include_local.then(|| {
+                    self.entries
+                        .get(&GraphKey {
+                            scope_id: scope_id.to_string(),
+                            graph_id: graph_id.to_string(),
+                            source: GraphSource::LocalScratch,
+                        })
+                        .cloned()
+                })?
+            })
     }
 
     pub fn remove(&mut self, key: &GraphKey) {
@@ -580,8 +764,22 @@ impl ProjectGraphCatalog {
     pub fn vertex_count(&self, include_local: bool) -> usize {
         self.entries
             .values()
-            .filter(|generation| include_local || generation.key.source == GraphSource::Committed)
+            .filter(|generation| {
+                include_local || generation.key.source != GraphSource::LocalScratch
+            })
             .map(|generation| generation.vertices.len())
             .sum()
+    }
+
+    /// Accepted generations, optionally including local scratch graphs.
+    /// Connector-managed generations are always included.
+    pub fn generations(&self, include_local: bool) -> Vec<Arc<GraphGeneration>> {
+        self.entries
+            .values()
+            .filter(|generation| {
+                include_local || generation.key.source != GraphSource::LocalScratch
+            })
+            .cloned()
+            .collect()
     }
 }

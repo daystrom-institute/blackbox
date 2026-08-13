@@ -4,8 +4,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    EdgeTypeDefinition, GraphDescriptor, GraphSchema, GraphSource, ProjectGraphEdge,
-    ProjectGraphVertex, RetentionPolicy, VertexTypeDefinition,
+    ANNOTATION_EMBED_KEY, ANNOTATION_INDEX_KEY, EdgeTypeDefinition, GraphAuthority,
+    GraphDescriptor, GraphSchema, GraphSource, ProjectGraphEdge, ProjectGraphVertex,
+    PropertyIndexMode, RetentionPolicy, VertexTypeDefinition, is_annotated_property_term,
+    property_term_body,
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -131,13 +133,65 @@ fn validate_descriptor(
             "generation must be positive",
         ));
     }
-    if descriptor.projection_version.is_some() || descriptor.source_connector.is_some() {
-        errors.push(ValidationError::new(
-            "descriptor.source_projection_deferred",
-            "graph.json",
-            None,
-            "projection_version and source_connector are unavailable for project-owned M1 graphs",
-        ));
+    // Authority and storage source are one decision, checked in both
+    // directions. A project-authored graph can never claim connector
+    // authority, and a connector projection can never be stored in a checkout
+    // graph root, so a connector refresh has no path to a project-authored
+    // graph and a checkout has no path to a connector projection.
+    match descriptor.authority {
+        GraphAuthority::Project => {
+            if source == GraphSource::ConnectorManaged {
+                errors.push(ValidationError::new(
+                    "descriptor.authority_source_mismatch",
+                    "graph.json",
+                    None,
+                    "project authority cannot use the connector-managed source projection store",
+                ));
+            }
+            if descriptor.projection_version.is_some() || descriptor.source_connector.is_some() {
+                errors.push(ValidationError::new(
+                    "descriptor.project_projection_fields",
+                    "graph.json",
+                    None,
+                    "project-authored graphs cannot declare projection_version or source_connector",
+                ));
+            }
+        }
+        GraphAuthority::Connector => {
+            if source != GraphSource::ConnectorManaged {
+                errors.push(ValidationError::new(
+                    "descriptor.authority_source_mismatch",
+                    "graph.json",
+                    None,
+                    "connector authority requires the connector-managed source projection store; \
+                     connector graphs are not authorable through a checkout",
+                ));
+            }
+            if descriptor
+                .projection_version
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                errors.push(ValidationError::new(
+                    "descriptor.missing_projection_version",
+                    "graph.json",
+                    None,
+                    "connector-managed graphs require a non-empty projection_version",
+                ));
+            }
+            if descriptor
+                .source_connector
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                errors.push(ValidationError::new(
+                    "descriptor.missing_source_connector",
+                    "graph.json",
+                    None,
+                    "connector-managed graphs require a non-empty source_connector",
+                ));
+            }
+        }
     }
     let expected_retention = source.retention_policy();
     if descriptor.retention_policy != expected_retention {
@@ -193,7 +247,12 @@ fn validate_schema(schema: &GraphSchema, errors: &mut Vec<ValidationError>) {
                 format!("duplicate vertex type `{type_name}`"),
             ));
         }
-        validate_property_definition(&format!("vertex type `{type_name}`"), definition, errors);
+        validate_property_definition(
+            &format!("vertex type `{type_name}`"),
+            definition,
+            &schema.index_policy,
+            errors,
+        );
     }
 
     let mut edge_type_names = HashSet::new();
@@ -257,7 +316,7 @@ fn validate_schema(schema: &GraphSchema, errors: &mut Vec<ValidationError>) {
                 }
             }
         }
-        validate_edge_property_definition(definition, errors);
+        validate_edge_property_definition(definition, &schema.index_policy, errors);
     }
 }
 
@@ -463,19 +522,28 @@ fn validate_type_name(
 fn validate_property_definition(
     owner: &str,
     definition: &VertexTypeDefinition,
+    policy: &crate::GraphIndexPolicy,
     errors: &mut Vec<ValidationError>,
 ) {
-    validate_definition_parts(owner, &definition.required, &definition.properties, errors);
+    validate_definition_parts(
+        owner,
+        &definition.required,
+        &definition.properties,
+        policy,
+        errors,
+    );
 }
 
 fn validate_edge_property_definition(
     definition: &EdgeTypeDefinition,
+    policy: &crate::GraphIndexPolicy,
     errors: &mut Vec<ValidationError>,
 ) {
     validate_definition_parts(
         &format!("edge type `{}`", definition.type_name),
         &definition.required,
         &definition.properties,
+        policy,
         errors,
     );
 }
@@ -484,6 +552,7 @@ fn validate_definition_parts(
     owner: &str,
     required: &[String],
     properties: &BTreeMap<String, Value>,
+    policy: &crate::GraphIndexPolicy,
     errors: &mut Vec<ValidationError>,
 ) {
     let mut seen = HashSet::new();
@@ -506,7 +575,56 @@ fn validate_definition_parts(
         }
     }
     for (name, term) in properties {
-        validate_property_term(owner, name, term, errors);
+        validate_property_term(owner, name, term, policy, errors);
+    }
+}
+
+/// Validate one property annotation and its per-graph gate. The annotation is
+/// structural in M2: it is accepted, checked, and preserved, but nothing reads
+/// it for indexing or embedding yet.
+fn validate_property_annotations(
+    owner: &str,
+    path: &str,
+    term: &Value,
+    policy: &crate::GraphIndexPolicy,
+    errors: &mut Vec<ValidationError>,
+) {
+    if let Some(index) = term.get(ANNOTATION_INDEX_KEY) {
+        let valid = index
+            .as_str()
+            .is_some_and(|value| PropertyIndexMode::parse(value).is_some());
+        if !valid {
+            errors.push(ValidationError::new(
+                "schema.invalid_index_annotation",
+                "schema.json",
+                None,
+                format!(
+                    "{owner} property `{path}` index annotation must be one of `none`, `word`, or `text`"
+                ),
+            ));
+        }
+    }
+    match term.get(ANNOTATION_EMBED_KEY) {
+        None => {}
+        Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            if !policy.embeddings_enabled {
+                errors.push(ValidationError::new(
+                    "schema.embedding_not_enabled",
+                    "schema.json",
+                    None,
+                    format!(
+                        "{owner} property `{path}` opts into embedding, but this graph's index_policy does not enable embeddings"
+                    ),
+                ));
+            }
+        }
+        Some(_) => errors.push(ValidationError::new(
+            "schema.invalid_embed_annotation",
+            "schema.json",
+            None,
+            format!("{owner} property `{path}` embed annotation must be a boolean"),
+        )),
     }
 }
 
@@ -514,8 +632,14 @@ fn validate_property_term(
     owner: &str,
     path: &str,
     term: &Value,
+    policy: &crate::GraphIndexPolicy,
     errors: &mut Vec<ValidationError>,
 ) {
+    if is_annotated_property_term(term) {
+        validate_property_annotations(owner, path, term, policy, errors);
+        validate_property_term(owner, path, property_term_body(term), policy, errors);
+        return;
+    }
     match term {
         Value::String(name) if matches!(name.as_str(), "string" | "number" | "boolean") => {}
         Value::Object(fields) if fields.len() == 1 && fields.contains_key("enum") => {
@@ -558,11 +682,11 @@ fn validate_property_term(
         }
         Value::Object(fields) if !fields.is_empty() => {
             for (name, nested) in fields {
-                validate_property_term(owner, &format!("{path}.{name}"), nested, errors);
+                validate_property_term(owner, &format!("{path}.{name}"), nested, policy, errors);
             }
         }
         Value::Array(items) if items.len() == 1 => {
-            validate_property_term(owner, &format!("{path}[]"), &items[0], errors);
+            validate_property_term(owner, &format!("{path}[]"), &items[0], policy, errors);
         }
         _ => errors.push(ValidationError::new(
             "schema.invalid_property_term",
@@ -617,6 +741,10 @@ fn validate_property_shape(
     line: usize,
     errors: &mut Vec<ValidationError>,
 ) {
+    // Annotations are retrieval metadata, not shape. Values are always checked
+    // against the annotated term's body, so annotating a property never
+    // changes which values it accepts.
+    let term = property_term_body(term);
     let matches = match term {
         Value::String(kind) => match kind.as_str() {
             "string" => value.is_string(),
@@ -768,6 +896,7 @@ mod tests {
                 },
             )]),
             edge_types: Vec::new(),
+            index_policy: crate::GraphIndexPolicy::default(),
         }
     }
 
@@ -858,6 +987,256 @@ mod tests {
             assert!(
                 errors.iter().any(|error| error.code == expected_code),
                 "{errors:?}"
+            );
+        }
+    }
+
+    fn connector_descriptor() -> GraphDescriptor {
+        GraphDescriptor {
+            authority: GraphAuthority::Connector,
+            projection_version: Some("dataset-v1".into()),
+            source_connector: Some("synthetic-api".into()),
+            retention_policy: RetentionPolicy::ConnectorManaged,
+            ..descriptor()
+        }
+    }
+
+    /// A connector-authored descriptor dropped into a checkout graph root is
+    /// refused. This is the checkout-lane half of the authority split: there is
+    /// no way to author a connector graph by committing files.
+    #[test]
+    fn connector_authority_is_refused_in_a_checkout_graph_root() {
+        for source in [GraphSource::Committed, GraphSource::LocalScratch] {
+            let errors =
+                validate_graph("repo", source, &connector_descriptor(), &schema(), &[], &[]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.code == "descriptor.authority_source_mismatch"),
+                "{source:?}: {errors:?}"
+            );
+        }
+    }
+
+    /// The mirror refusal: a connector refresh cannot install a
+    /// project-authored descriptor into the source projection store, so a
+    /// refresh has no path to project-authored facts.
+    #[test]
+    fn project_authority_is_refused_in_the_source_projection_store() {
+        let errors = validate_graph(
+            "repo",
+            GraphSource::ConnectorManaged,
+            &descriptor(),
+            &schema(),
+            &[],
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "descriptor.authority_source_mismatch"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn connector_descriptors_require_projection_version_and_source_connector() {
+        let mut descriptor = connector_descriptor();
+        descriptor.projection_version = Some("   ".into());
+        descriptor.source_connector = None;
+        let errors = validate_graph(
+            "repo",
+            GraphSource::ConnectorManaged,
+            &descriptor,
+            &schema(),
+            &[],
+            &[],
+        );
+        for expected in [
+            "descriptor.missing_projection_version",
+            "descriptor.missing_source_connector",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.code == expected),
+                "{expected} missing from {errors:?}"
+            );
+        }
+    }
+
+    /// A well-formed connector descriptor validates in its own store.
+    #[test]
+    fn connector_descriptors_validate_in_the_source_projection_store() {
+        let errors = validate_graph(
+            "repo",
+            GraphSource::ConnectorManaged,
+            &connector_descriptor(),
+            &schema(),
+            &[],
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// An annotated property term is accepted, its body still governs values,
+    /// and the annotation round trips structurally (M9 reads it; M2 only
+    /// preserves it).
+    #[test]
+    fn annotated_property_terms_validate_their_body_and_preserve_annotations() {
+        let mut schema = schema();
+        schema.index_policy.embeddings_enabled = true;
+        schema
+            .vertex_types
+            .get_mut("repo:Claim")
+            .unwrap()
+            .properties
+            .insert(
+                "summary".into(),
+                json!({"type": "string", "index": "text", "embed": true}),
+            );
+        let vertices = vec![(
+            1,
+            ProjectGraphVertex {
+                id: "claim-1".into(),
+                type_name: "repo:Claim".into(),
+                label: "claim".into(),
+                properties: BTreeMap::from([
+                    ("source".into(), json!({"path": "PROJECT.md", "tags": []})),
+                    ("summary".into(), json!("a summary")),
+                ]),
+            },
+        )];
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &vertices,
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let term = &schema.vertex_types["repo:Claim"].properties["summary"];
+        assert!(crate::is_annotated_property_term(term));
+        assert_eq!(crate::property_term_body(term), &json!("string"));
+        let annotations = crate::property_annotations(term);
+        assert_eq!(annotations.index, crate::PropertyIndexMode::Text);
+        assert!(annotations.embed);
+
+        // The annotated term still rejects a value of the wrong shape.
+        let mismatched = vec![(
+            2,
+            ProjectGraphVertex {
+                id: "claim-2".into(),
+                type_name: "repo:Claim".into(),
+                label: "claim".into(),
+                properties: BTreeMap::from([
+                    ("source".into(), json!({"path": "PROJECT.md", "tags": []})),
+                    ("summary".into(), json!(7)),
+                ]),
+            },
+        )];
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &mismatched,
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "property.shape_mismatch"),
+            "{errors:?}"
+        );
+    }
+
+    /// A bare `{"type": ...}` object keeps its pre-annotation meaning, so no
+    /// existing schema changes meaning when annotations land.
+    #[test]
+    fn a_bare_type_field_is_still_a_nested_object_term() {
+        let term = json!({"type": "string"});
+        assert!(!crate::is_annotated_property_term(&term));
+        assert_eq!(crate::property_term_body(&term), &term);
+        assert_eq!(
+            crate::property_annotations(&term),
+            crate::PropertyAnnotations::default()
+        );
+    }
+
+    /// Embedding is per-kind opt-in UNDER a per-graph policy. Opting a
+    /// property in without enabling the graph policy is an error, never a
+    /// silent downgrade.
+    #[test]
+    fn embedding_opt_in_requires_the_graph_index_policy() {
+        let mut schema = schema();
+        schema
+            .vertex_types
+            .get_mut("repo:Claim")
+            .unwrap()
+            .properties
+            .insert("summary".into(), json!({"type": "string", "embed": true}));
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "schema.embedding_not_enabled"),
+            "{errors:?}"
+        );
+
+        schema.index_policy.embeddings_enabled = true;
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn invalid_annotation_values_are_rejected() {
+        for (term, expected) in [
+            (
+                json!({"type": "string", "index": "everything"}),
+                "schema.invalid_index_annotation",
+            ),
+            (
+                json!({"type": "string", "index": 3}),
+                "schema.invalid_index_annotation",
+            ),
+            (
+                json!({"type": "string", "embed": "yes"}),
+                "schema.invalid_embed_annotation",
+            ),
+        ] {
+            let mut schema = schema();
+            schema
+                .vertex_types
+                .get_mut("repo:Claim")
+                .unwrap()
+                .properties
+                .insert("summary".into(), term);
+            let errors = validate_graph(
+                "repo",
+                GraphSource::Committed,
+                &descriptor(),
+                &schema,
+                &[],
+                &[],
+            );
+            assert!(
+                errors.iter().any(|error| error.code == expected),
+                "{expected} missing from {errors:?}"
             );
         }
     }

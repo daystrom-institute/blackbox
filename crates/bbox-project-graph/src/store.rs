@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     GraphDescriptor, GraphGeneration, GraphKey, GraphSchema, GraphSource, ProjectGraphEdge,
-    ProjectGraphVertex, ValidationError, project_generation, validate_graph, validate_graph_id,
+    ProjectGraphVertex, ValidationError, build_generation, validate_graph, validate_graph_id,
 };
 
 const GRAPH_FILE: &str = "graph.json";
@@ -99,9 +99,11 @@ pub fn locate_graph(
             message,
         ));
     }
-    let committed = graph_directory(project_root, GraphSource::Committed, graph_id);
-    let local = graph_directory(project_root, GraphSource::LocalScratch, graph_id);
-    if committed.is_dir() && include_local && local.is_dir() {
+    let committed = graph_directory(project_root, GraphSource::Committed, graph_id)
+        .filter(|directory| directory.is_dir());
+    let local = graph_directory(project_root, GraphSource::LocalScratch, graph_id)
+        .filter(|directory| directory.is_dir());
+    if committed.is_some() && include_local && local.is_some() {
         return Err(ValidationError::new(
             "graph.ambiguous_source",
             GRAPH_FILE,
@@ -109,25 +111,25 @@ pub fn locate_graph(
             format!("graph `{graph_id}` exists in both .bbox/graphs and .bbox/local/graphs"),
         ));
     }
-    if committed.is_dir() {
+    if let Some(directory) = committed {
         return Ok(GraphLocation {
             graph_id: graph_id.to_string(),
             source: GraphSource::Committed,
-            directory: committed,
+            directory,
         });
     }
-    if include_local && local.is_dir() {
+    if include_local && let Some(directory) = local.clone() {
         return Ok(GraphLocation {
             graph_id: graph_id.to_string(),
             source: GraphSource::LocalScratch,
-            directory: local,
+            directory,
         });
     }
     Err(ValidationError::new(
         "graph.not_found",
         GRAPH_FILE,
         None,
-        if local.is_dir() {
+        if local.is_some() {
             format!(
                 "graph `{graph_id}` exists only under .bbox/local/graphs; pass include_local=true to opt in"
             )
@@ -196,7 +198,7 @@ pub fn load_graph(scope_id: &str, project_root: &Path, location: &GraphLocation)
         Some(fingerprint.clone()),
     );
     let generation = if report.valid {
-        Some(project_generation(
+        Some(build_generation(
             GraphKey {
                 scope_id: scope_id.to_string(),
                 graph_id: location.graph_id.clone(),
@@ -274,7 +276,7 @@ pub fn load_graph_documents(
         Some(fingerprint.clone()),
     );
     let generation = if report.valid {
-        Some(project_generation(
+        Some(build_generation(
             GraphKey {
                 scope_id: scope_id.to_string(),
                 graph_id: graph_id.to_string(),
@@ -294,7 +296,12 @@ pub fn load_graph_documents(
 }
 
 fn discover_under(project_root: &Path, source: GraphSource) -> Vec<GraphLocation> {
-    let root = project_root.join(source.relative_root());
+    // A source with no checkout-relative root (connector-managed) is never
+    // discoverable on a checkout, however the caller asks.
+    let Some(relative_root) = source.relative_root() else {
+        return Vec::new();
+    };
+    let root = project_root.join(relative_root);
     let Ok(entries) = fs::read_dir(&root) else {
         return Vec::new();
     };
@@ -314,8 +321,10 @@ fn discover_under(project_root: &Path, source: GraphSource) -> Vec<GraphLocation
         .collect()
 }
 
-fn graph_directory(project_root: &Path, source: GraphSource, graph_id: &str) -> PathBuf {
-    project_root.join(source.relative_root()).join(graph_id)
+/// The checkout directory that would hold this graph, or `None` when the
+/// source is not file-backed by a checkout (connector-managed).
+fn graph_directory(project_root: &Path, source: GraphSource, graph_id: &str) -> Option<PathBuf> {
+    Some(project_root.join(source.relative_root()?).join(graph_id))
 }
 
 fn read_stable_documents(directory: &Path) -> Result<OwnedGraphDocuments, Vec<ValidationError>> {
@@ -665,6 +674,81 @@ mod tests {
         assert_eq!(descriptor.graph_id, "repo");
         assert_eq!(descriptor.schema_id, "repo:schema");
         assert_eq!(descriptor.generation, 1);
+    }
+
+    /// Connector-managed graphs have no checkout-relative root, so no amount
+    /// of asking discovers or locates one on a checkout. This is the storage
+    /// half of "connector graphs are not writable through a checkout lane".
+    #[test]
+    fn connector_managed_graphs_are_not_discoverable_on_a_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_graph(&root, "repo", 1, false);
+        assert!(GraphSource::ConnectorManaged.relative_root().is_none());
+        assert!(!GraphSource::ConnectorManaged.is_checkout_authored());
+        assert!(graph_directory(&root, GraphSource::ConnectorManaged, "repo").is_none());
+        assert!(discover_under(&root, GraphSource::ConnectorManaged).is_empty());
+        assert!(
+            discover_graphs(&root, true)
+                .iter()
+                .all(|location| location.source != GraphSource::ConnectorManaged)
+        );
+    }
+
+    /// One graph id in one scope holds exactly one authority. A connector
+    /// generation cannot shadow or replace a project-authored graph, and the
+    /// refusal is symmetric.
+    #[test]
+    fn a_connector_generation_cannot_shadow_a_project_authored_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_graph(&root, "repo", 1, false);
+        let location = locate_graph(&root, "repo", false).unwrap();
+        let project = load_graph("scope123", &root, &location).generation.unwrap();
+
+        let schema: GraphSchema = serde_json::from_str(
+            r#"{"version":1,"namespace":"dataset","vertex_types":{"dataset:Asset":{"required":["remote_id"],"properties":{"remote_id":"string"}}},"edge_types":[]}"#,
+        )
+        .unwrap();
+        let connector = crate::build_generation(
+            GraphKey {
+                scope_id: "scope123".into(),
+                graph_id: "repo".into(),
+                source: GraphSource::ConnectorManaged,
+            },
+            GraphDescriptor {
+                descriptor_version: crate::DESCRIPTOR_VERSION,
+                scope: crate::GraphScope::Project,
+                graph_id: "repo".into(),
+                authority: crate::GraphAuthority::Connector,
+                schema_id: "dataset:schema".into(),
+                schema_version: 1,
+                projection_version: Some("dataset-v1".into()),
+                source_connector: Some("synthetic-api".into()),
+                retention_policy: crate::RetentionPolicy::ConnectorManaged,
+                generation: 9,
+            },
+            schema,
+            Vec::new(),
+            Vec::new(),
+            "0".repeat(64),
+            root.clone(),
+        );
+
+        let mut catalog = ProjectGraphCatalog::default();
+        catalog.publish(project).unwrap();
+        let error = catalog.publish(connector).unwrap_err();
+        assert_eq!(error.code, "graph.ambiguous_source");
+        assert!(error.message.contains("project"), "{}", error.message);
+        assert_eq!(
+            catalog
+                .get("scope123", "repo", false)
+                .unwrap()
+                .descriptor
+                .authority,
+            crate::GraphAuthority::Project,
+            "the project-authored generation stays accepted"
+        );
     }
 
     #[test]
