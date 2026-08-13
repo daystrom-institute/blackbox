@@ -6151,7 +6151,7 @@ fn writer_pass_in_progress(error: &anyhow::Error) -> bool {
     })
 }
 
-fn selector_retirement_retryable(error: &anyhow::Error) -> bool {
+pub(super) fn selector_retirement_retryable(error: &anyhow::Error) -> bool {
     writer_pass_in_progress(error)
         || error.chain().any(|cause| {
             matches!(
