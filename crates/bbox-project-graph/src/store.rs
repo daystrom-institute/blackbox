@@ -623,6 +623,33 @@ mod tests {
     }
 
     #[test]
+    fn authored_counts_match_source_rows_and_stay_below_reflected_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_graph(&root, "repo", 1, false);
+        let location = locate_graph(&root, "repo", false).unwrap();
+        let loaded = load_graph("scope123", &root, &location);
+        assert!(loaded.report.valid, "{:?}", loaded.report.errors);
+
+        // write_graph() authors exactly 2 vertices (repo:Module,
+        // repo:Invariant) and 1 edge (repo:CONSTRAINED_BY) in
+        // vertices.jsonl / edges.jsonl.
+        assert_eq!(loaded.report.fact_vertex_count, 2);
+        assert_eq!(loaded.report.fact_edge_count, 1);
+
+        let generation = loaded.generation.unwrap();
+        assert_eq!(generation.authored_vertex_count, 2);
+        assert_eq!(generation.authored_edge_count, 1);
+
+        // The reflected graph also carries the fixed meta floor plus
+        // schema-as-data vertex/edge type definitions and meta:INSTANCE_OF
+        // edges, so the totals on GraphGeneration must exceed the authored
+        // counts.
+        assert!(generation.vertices.len() > generation.authored_vertex_count);
+        assert!(generation.edges.len() > generation.authored_edge_count);
+    }
+
+    #[test]
     fn graph_without_optional_descriptor_loads_from_the_filesystem() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();

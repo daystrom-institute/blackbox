@@ -197,6 +197,16 @@ pub struct GraphGeneration {
     pub edges: Vec<ProjectGraphEdge>,
     pub fingerprint: String,
     pub source_root: PathBuf,
+    /// Count of vertices read directly from vertices.jsonl, before the
+    /// schema-as-data meta vertices (vertex/edge type definitions and the
+    /// fixed meta floor) are projected in. This is the number an author
+    /// comparing against their source files expects to see.
+    pub authored_vertex_count: usize,
+    /// Count of edges read directly from edges.jsonl, before the
+    /// schema-as-data meta edges (`meta:INSTANCE_OF`, `meta:FROM_TYPE`,
+    /// `meta:TO_TYPE`) are projected in. This is the number an author
+    /// comparing against their source files expects to see.
+    pub authored_edge_count: usize,
 }
 
 impl GraphGeneration {
@@ -257,6 +267,8 @@ pub(crate) fn project_generation(
     fingerprint: String,
     source_root: PathBuf,
 ) -> GraphGeneration {
+    let authored_vertex_count = fact_vertices.len();
+    let authored_edge_count = fact_edges.len();
     let mut vertices = fixed_meta_vertices();
     for (type_name, definition) in &schema.vertex_types {
         vertices.insert(
@@ -355,6 +367,8 @@ pub(crate) fn project_generation(
         edges: all_edges,
         fingerprint,
         source_root,
+        authored_vertex_count,
+        authored_edge_count,
     }
 }
 

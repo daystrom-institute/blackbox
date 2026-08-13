@@ -286,15 +286,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_project_graph_list",
         category: ToolCategory::ProjectGraphs,
-        summary: "List visible project graphs.",
-        when_to_use: "Discover graph ids.",
+        summary: "List visible project graphs. Each entry reports two count families: vertex_count/edge_count are the REFLECTED graph (authored rows plus schema-as-data vertex/edge type definitions plus meta:INSTANCE_OF edges), while authored_vertex_count/authored_edge_count count only rows sourced from vertices.jsonl/edges.jsonl. Compare authored_* against your source files, not vertex_count/edge_count.",
+        when_to_use: "Discover graph ids. Use authored_vertex_count/authored_edge_count when checking a count against your jsonl source files; use vertex_count/edge_count when reasoning about the full materialized graph an agent will traverse.",
         example: None,
     },
     ToolDoc {
         name: "bbox_project_graph_describe",
         category: ToolCategory::ProjectGraphs,
-        summary: "Describe one visible project graph.",
-        when_to_use: "Read schema and generation identity.",
+        summary: "Describe one visible project graph. The summary carries both count families: vertex_count/edge_count are the REFLECTED graph (authored rows plus schema-as-data vertex/edge type definitions plus meta:INSTANCE_OF edges), while authored_vertex_count/authored_edge_count count only rows sourced from vertices.jsonl/edges.jsonl.",
+        when_to_use: "Read schema and generation identity. Use authored_vertex_count/authored_edge_count when checking a count against your jsonl source files; use vertex_count/edge_count when reasoning about the full materialized graph an agent will traverse.",
         example: None,
     },
     ToolDoc {
