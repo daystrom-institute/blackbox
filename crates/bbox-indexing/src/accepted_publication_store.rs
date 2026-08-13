@@ -548,6 +548,25 @@ pub(crate) struct AcceptedPublicationPriorPointerV1 {
     pub(crate) generation_hash: PublicationSha256,
 }
 
+/// The operator's standing grant for policy-driven acceptance, carried by
+/// the pointer that the operator installed (`publisher-auto-advance.md`).
+///
+/// It lives on the mutable pointer rather than in accepted CONTENT because
+/// the grant is an operator fact about a project, not a producer-attested
+/// fact about a commit. A producer supplies candidate bytes; it never
+/// supplies this. The field is additive and optional, so every pointer
+/// written before the feature decodes and re-encodes byte-identically and
+/// keeps its compare-and-swap digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptedPublicationAutoAdvanceV1 {
+    pub(crate) enabled: bool,
+    /// The `audit_reason` of the operator advance that installed this
+    /// grant, retained so `bbox_audit` history can name the human act that
+    /// authorized every later policy acceptance.
+    pub(crate) granted_reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcceptedPublicationPointerV1 {
@@ -562,6 +581,8 @@ pub(crate) struct AcceptedPublicationPointerV1 {
     pub(crate) accepted_scope: PublishedScope,
     pub(crate) accepted_generation: AcceptedPublicationGenerationId,
     pub(crate) generation_hash: PublicationSha256,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_advance: Option<AcceptedPublicationAutoAdvanceV1>,
     pub(crate) prior_pointer: Option<AcceptedPublicationPriorPointerV1>,
 }
 
@@ -587,6 +608,10 @@ pub(crate) struct AcceptedPublicationBuildInputV1 {
     pub(crate) knowledge: Vec<AcceptedKnowledgeSourceV1>,
     pub(crate) gaps: Vec<AcceptedGapSourceV1>,
     pub(crate) graphs: Vec<AcceptedGraphSourceV1Input>,
+    /// The auto-advance grant this pointer will carry. The runtime resolves
+    /// it from the installed pointer plus the caller's explicit operator
+    /// update before it gets here; the builder only writes what it is told.
+    pub(crate) auto_advance: Option<AcceptedPublicationAutoAdvanceV1>,
     pub(crate) prior_pointer: Option<AcceptedPublicationPriorPointerV1>,
 }
 
@@ -1529,6 +1554,7 @@ pub(crate) fn prepare_accepted_publication_v1(
         accepted_scope: input.scope,
         accepted_generation: generation_id.clone(),
         generation_hash: generation_hash.clone(),
+        auto_advance: input.auto_advance,
         prior_pointer: input.prior_pointer,
     };
     validate_pointer_v1(&pointer)?;
@@ -1928,10 +1954,39 @@ fn validate_prior_pointer_v1(
         .map_err(|error| invalid_pointer(error.to_string()))
 }
 
+/// Longest `granted_reason` a pointer may carry. It mirrors the catalog's
+/// own bounded audit reason, because the value IS one: the audit reason of
+/// the operator advance that installed the grant.
+pub(crate) const MAX_AUTO_ADVANCE_REASON_BYTES: usize = 1024;
+
+fn validate_auto_advance_v1(
+    policy: &AcceptedPublicationAutoAdvanceV1,
+) -> AcceptedPublicationStoreResult<()> {
+    if policy.granted_reason.trim().is_empty() {
+        return Err(invalid_pointer(
+            "an auto-advance grant must record the operator audit reason that installed it",
+        ));
+    }
+    if policy.granted_reason.len() > MAX_AUTO_ADVANCE_REASON_BYTES {
+        return Err(invalid_pointer(
+            "auto-advance granted_reason exceeds the bounded audit-reason length",
+        ));
+    }
+    if policy.granted_reason.chars().any(char::is_control) {
+        return Err(invalid_pointer(
+            "auto-advance granted_reason must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_pointer_v1(
     pointer: &AcceptedPublicationPointerV1,
 ) -> AcceptedPublicationStoreResult<()> {
     pointer_source_binding(pointer)?;
+    if let Some(policy) = &pointer.auto_advance {
+        validate_auto_advance_v1(policy)?;
+    }
     pointer
         .accepted_scope
         .validate()
@@ -2952,6 +3007,7 @@ mod tests {
             )],
             gaps: vec![gap_source("gap-1234abcd", ".bbox/gaps/gap-1234abcd.json")],
             graphs: Vec::new(),
+            auto_advance: None,
             prior_pointer: None,
         }
     }
@@ -3227,6 +3283,71 @@ mod tests {
             .unwrap(),
             prepared.pointer_bytes
         );
+    }
+
+    /// The grant is additive: a pointer without one serializes exactly the
+    /// bytes it serialized before the field existed, so every project that
+    /// never enables the policy keeps its compare-and-swap digest.
+    #[test]
+    fn a_pointer_without_an_auto_advance_grant_omits_the_field_entirely() {
+        let prepared = prepared();
+        let value = serde_json::to_value(&prepared.pointer).unwrap();
+        assert!(
+            value.get("auto_advance").is_none(),
+            "the absent grant must not appear in pointer bytes: {value}"
+        );
+    }
+
+    #[test]
+    fn an_auto_advance_grant_round_trips_through_pointer_bytes() {
+        let mut input = build_input();
+        input.auto_advance = Some(AcceptedPublicationAutoAdvanceV1 {
+            enabled: true,
+            granted_reason: "operator grant for the producer lane".to_string(),
+        });
+        let prepared =
+            prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default()).unwrap();
+        let decoded = decode_pointer_v1(
+            &prepared.pointer_bytes,
+            &AcceptedPublicationLimits::default(),
+        )
+        .unwrap();
+        let grant = decoded
+            .auto_advance
+            .expect("the grant survives a round trip");
+        assert!(grant.enabled);
+        assert_eq!(grant.granted_reason, "operator grant for the producer lane");
+        assert_eq!(
+            encode_pointer_v1(&decoded, &AcceptedPublicationLimits::default()).unwrap(),
+            prepared.pointer_bytes
+        );
+    }
+
+    /// The grant records WHY it exists. A blank reason would leave an
+    /// audited acceptance pointing at nothing, so it is refused at the
+    /// same layer that refuses every other malformed pointer field.
+    #[test]
+    fn an_auto_advance_grant_without_an_operator_reason_is_refused() {
+        let mut input = build_input();
+        input.auto_advance = Some(AcceptedPublicationAutoAdvanceV1 {
+            enabled: true,
+            granted_reason: "   ".to_string(),
+        });
+        let error = prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default())
+            .expect_err("a reasonless grant is not a valid pointer");
+        assert_eq!(error.code(), "error.accepted_publication_invalid_pointer");
+    }
+
+    #[test]
+    fn an_oversized_auto_advance_reason_is_refused() {
+        let mut input = build_input();
+        input.auto_advance = Some(AcceptedPublicationAutoAdvanceV1 {
+            enabled: true,
+            granted_reason: "r".repeat(MAX_AUTO_ADVANCE_REASON_BYTES + 1),
+        });
+        let error = prepare_accepted_publication_v1(input, &AcceptedPublicationLimits::default())
+            .expect_err("an unbounded reason is not a valid pointer");
+        assert_eq!(error.code(), "error.accepted_publication_invalid_pointer");
     }
 
     #[test]

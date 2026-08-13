@@ -24,10 +24,10 @@ use parking_lot::RwLock;
 
 use crate::accepted_publication_store::{
     AcceptedGapSourceV1, AcceptedGraphSourceV1Input, AcceptedKnowledgeSourceV1,
-    AcceptedPublicationBuildInputV1, AcceptedPublicationBuildSourceV1,
-    AcceptedPublicationFaultInjector, AcceptedPublicationGenerationId,
-    AcceptedPublicationGenerationV1, AcceptedPublicationLimits, AcceptedPublicationLockGuard,
-    AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
+    AcceptedPublicationAutoAdvanceV1, AcceptedPublicationBuildInputV1,
+    AcceptedPublicationBuildSourceV1, AcceptedPublicationFaultInjector,
+    AcceptedPublicationGenerationId, AcceptedPublicationGenerationV1, AcceptedPublicationLimits,
+    AcceptedPublicationLockGuard, AcceptedPublicationPointerV1, AcceptedPublicationPriorPointerV1,
     AcceptedPublicationSourceBindingV2, AcceptedPublicationStoreError,
     AcceptedPublicationStorePaths, FullPublisherRef, GitObjectId, PointerExpectationV1,
     PreparedAcceptedPublicationV1, VerifiedAcceptedPublicationSelectionV1,
@@ -700,6 +700,45 @@ pub struct PublishSources {
     pub graphs: Vec<PublishSourceFile>,
 }
 
+/// What a publish does to the project's standing auto-advance grant
+/// (`design/daemon-runtime/publisher-auto-advance.md`).
+///
+/// `Inherit` is the only value a policy-driven acceptance may use, and it
+/// is the default for every existing caller. `Set` is operator authority:
+/// it comes from an explicit parameter on the operator's own advance and
+/// is never inferred, so the candidate being accepted can never be the
+/// thing that authorizes its own acceptance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AutoAdvanceGrantUpdate {
+    /// Carry the installed pointer's grant forward unchanged. An establish
+    /// has no installed pointer, so it inherits no grant.
+    #[default]
+    Inherit,
+    /// Install (or, with `enabled: false`, revoke) the grant. `reason` is
+    /// the operator's bounded audit reason for this advance.
+    Set { enabled: bool, reason: String },
+}
+
+/// The project's standing auto-advance grant plus the linear-fast-path
+/// facts a policy attempt must match, all read from ONE installed pointer
+/// under the publication lock.
+///
+/// Reading them together is the point: a grant paired with tokens from a
+/// later pointer would authorize an acceptance against state nobody
+/// granted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedPublicationAutoAdvanceGrant {
+    pub enabled: bool,
+    /// The audit reason of the operator advance that installed the grant.
+    pub granted_reason: String,
+    /// Compare-and-swap tokens for the pointer the grant was read from.
+    pub expected_generation_id: String,
+    pub expected_pointer_sha256: String,
+    pub accepted_scope: PublishedScope,
+    pub full_ref: String,
+    pub source: AcceptedPublicationSourceBinding,
+}
+
 /// A publish request after the caller has resolved Git and read sources.
 #[derive(Debug, Clone)]
 pub struct PublishRequest {
@@ -712,6 +751,10 @@ pub struct PublishRequest {
     pub full_ref: String,
     pub accepted_commit: String,
     pub dry_run: bool,
+    /// What this publish does to the standing auto-advance grant. Defaults
+    /// to `Inherit`, so a caller that does not know about the policy
+    /// neither installs nor revokes one.
+    pub auto_advance: AutoAdvanceGrantUpdate,
 }
 
 /// Generations that are durably installed but not yet named by any
@@ -1185,8 +1228,8 @@ impl AcceptedPublicationRuntime {
     ) -> Result<PreparedPublish, PublishError> {
         let full_ref = FullPublisherRef::parse(request.full_ref)?;
         let accepted_commit = GitObjectId::parse(request.accepted_commit)?;
-        let (expectation, prior_pointer) = match &request.mode {
-            PublisherPublishMode::Establish => (PointerExpectationV1::Establish, None),
+        let (expectation, prior_pointer, inherited_auto_advance) = match &request.mode {
+            PublisherPublishMode::Establish => (PointerExpectationV1::Establish, None, None),
             PublisherPublishMode::Advance {
                 expected_generation_id,
                 expected_pointer_sha256,
@@ -1220,6 +1263,9 @@ impl AcceptedPublicationRuntime {
                         "the installed pointer does not match the expected compare-and-swap tokens",
                     ));
                 }
+                // The grant travels with the pointer this advance replaces,
+                // read under the same lock that verified the tokens.
+                let inherited = pointer.auto_advance.clone();
                 let prior = prior_pointer_from(&pointer);
                 (
                     PointerExpectationV1::Advance {
@@ -1227,8 +1273,20 @@ impl AcceptedPublicationRuntime {
                         expected_pointer_sha256,
                     },
                     Some(prior),
+                    inherited,
                 )
             }
+        };
+        let auto_advance = match request.auto_advance {
+            AutoAdvanceGrantUpdate::Inherit => inherited_auto_advance,
+            AutoAdvanceGrantUpdate::Set { enabled: false, .. } => None,
+            AutoAdvanceGrantUpdate::Set {
+                enabled: true,
+                reason,
+            } => Some(AcceptedPublicationAutoAdvanceV1 {
+                enabled: true,
+                granted_reason: reason,
+            }),
         };
         let prepared = prepare_accepted_publication_v1(
             AcceptedPublicationBuildInputV1 {
@@ -1276,6 +1334,7 @@ impl AcceptedPublicationRuntime {
                         source_bytes: file.source_bytes,
                     })
                     .collect(),
+                auto_advance,
                 prior_pointer,
             },
             &self.limits,
@@ -1402,6 +1461,57 @@ impl AcceptedPublicationRuntime {
                 pointer.accepted_generation.as_str().to_string(),
                 digest.as_str().to_string(),
             )
+        }))
+    }
+
+    /// The project's standing auto-advance grant, together with the
+    /// compare-and-swap tokens and linear-fast-path facts of the exact
+    /// pointer it was read from.
+    ///
+    /// `None` means no pointer is installed, so there is nothing to advance
+    /// FROM and no grant could have been made: an establish is always an
+    /// operator act. A returned grant with `enabled: false` means a pointer
+    /// exists and carries no standing grant (or an explicitly revoked one),
+    /// which is the default for every project.
+    ///
+    /// One locked read produces all of it on purpose. Reading the grant and
+    /// the tokens separately would let an advance land between them, and a
+    /// policy attempt would then present tokens for a pointer whose grant it
+    /// never checked.
+    pub fn auto_advance_grant(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<AcceptedPublicationAutoAdvanceGrant>, AcceptedPublicationRuntimeError> {
+        let guard = self.lock()?;
+        let installed =
+            installed_pointer_tokens_locked(&self.paths, &guard, project_id, &self.limits)
+                .map_err(|error| AcceptedPublicationRuntimeError::from_store(&error))?;
+        drop(guard);
+        let Some((pointer, digest)) = installed else {
+            return Ok(None);
+        };
+        // The same binding projection every verified read uses, so a policy
+        // attempt and a status read never disagree about what a pointer is
+        // bound to.
+        let source = runtime_source_binding(
+            selected_pointer_source_binding(
+                &pointer,
+                VerifiedAcceptedPublicationSelectionV1::Current,
+            )
+            .map_err(|error| AcceptedPublicationRuntimeError::from_store(&error))?,
+        );
+        let (enabled, granted_reason) = match &pointer.auto_advance {
+            Some(policy) => (policy.enabled, policy.granted_reason.clone()),
+            None => (false, String::new()),
+        };
+        Ok(Some(AcceptedPublicationAutoAdvanceGrant {
+            enabled,
+            granted_reason,
+            expected_generation_id: pointer.accepted_generation.as_str().to_string(),
+            expected_pointer_sha256: digest.as_str().to_string(),
+            accepted_scope: pointer.accepted_scope.clone(),
+            full_ref: pointer.full_ref.as_str().to_string(),
+            source,
         }))
     }
 
@@ -2326,6 +2436,7 @@ mod tests {
             full_ref: "refs/heads/main".into(),
             accepted_commit: commit.into(),
             dry_run: false,
+            auto_advance: AutoAdvanceGrantUpdate::Inherit,
         }
     }
 
@@ -2347,6 +2458,7 @@ mod tests {
             full_ref: "refs/heads/main".into(),
             accepted_commit: commit.into(),
             dry_run: false,
+            auto_advance: AutoAdvanceGrantUpdate::Inherit,
         }
     }
 
@@ -2363,6 +2475,7 @@ mod tests {
             full_ref: "refs/heads/main".into(),
             accepted_commit: commit.into(),
             dry_run: false,
+            auto_advance: AutoAdvanceGrantUpdate::Inherit,
         }
     }
 
@@ -2373,6 +2486,132 @@ mod tests {
     ) -> Result<PublishReceipt, PublishError> {
         let prepared = runtime.prepare_publish(request, sources(content))?;
         runtime.commit_publish(prepared, &mut || Ok(()))
+    }
+
+    // ── Auto-advance grant (design/daemon-runtime/publisher-auto-advance.md)
+
+    /// Default OFF. A project nobody granted anything to reports a pointer
+    /// with no standing grant, which is what keeps the feature inert for
+    /// every existing project.
+    #[test]
+    fn a_project_without_a_grant_reports_a_disabled_auto_advance_grant() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_grant_off");
+        assert_eq!(runtime.auto_advance_grant(&project_id).unwrap(), None);
+
+        run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        let grant = runtime
+            .auto_advance_grant(&project_id)
+            .unwrap()
+            .expect("an installed pointer always reports a grant record");
+        assert!(!grant.enabled);
+        assert_eq!(grant.granted_reason, "");
+        assert_eq!(grant.full_ref, "refs/heads/main");
+        assert_eq!(grant.source.kind(), "attachment");
+    }
+
+    /// The grant is installed by an operator act and then travels with the
+    /// pointer. `Inherit` is what a policy-driven acceptance passes, so a
+    /// policy acceptance can neither widen nor revoke what it was given.
+    #[test]
+    fn an_operator_grant_is_installed_once_and_then_inherited_by_later_advances() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_grant_on");
+
+        let mut establish = establish_request(&project_id, COMMIT_ONE);
+        establish.auto_advance = AutoAdvanceGrantUpdate::Set {
+            enabled: true,
+            reason: "operator enables the producer lane".into(),
+        };
+        run_publish(&runtime, establish, "first").unwrap();
+        let granted = runtime.auto_advance_grant(&project_id).unwrap().unwrap();
+        assert!(granted.enabled);
+        assert_eq!(granted.granted_reason, "operator enables the producer lane");
+
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        run_publish(
+            &runtime,
+            advance_request(&project_id, COMMIT_TWO, tokens),
+            "second",
+        )
+        .unwrap();
+        let inherited = runtime.auto_advance_grant(&project_id).unwrap().unwrap();
+        assert!(
+            inherited.enabled,
+            "an inheriting advance keeps the operator's standing grant"
+        );
+        assert_eq!(
+            inherited.granted_reason,
+            "operator enables the producer lane"
+        );
+    }
+
+    /// Revocation is the same operator lane in the other direction, and it
+    /// takes effect on the pointer the operator installed.
+    #[test]
+    fn an_operator_can_revoke_a_standing_grant_on_a_later_advance() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_grant_revoked");
+
+        let mut establish = establish_request(&project_id, COMMIT_ONE);
+        establish.auto_advance = AutoAdvanceGrantUpdate::Set {
+            enabled: true,
+            reason: "operator enables the producer lane".into(),
+        };
+        run_publish(&runtime, establish, "first").unwrap();
+
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        let mut revoke = advance_request(&project_id, COMMIT_TWO, tokens);
+        revoke.auto_advance = AutoAdvanceGrantUpdate::Set {
+            enabled: false,
+            reason: "operator revokes the grant".into(),
+        };
+        run_publish(&runtime, revoke, "second").unwrap();
+        let grant = runtime.auto_advance_grant(&project_id).unwrap().unwrap();
+        assert!(!grant.enabled);
+    }
+
+    /// The grant and the compare-and-swap tokens come from ONE locked read
+    /// of ONE pointer, so a caller cannot act on a grant it read from a
+    /// pointer other than the one it will replace.
+    #[test]
+    fn the_grant_carries_the_tokens_of_the_pointer_it_was_read_from() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_grant_tokens");
+
+        let established = run_publish(
+            &runtime,
+            establish_request(&project_id, COMMIT_ONE),
+            "first",
+        )
+        .unwrap();
+        let grant = runtime.auto_advance_grant(&project_id).unwrap().unwrap();
+        assert_eq!(grant.expected_generation_id, established.generation_id());
+        assert_eq!(grant.expected_pointer_sha256, established.pointer_sha256());
+
+        let tokens = runtime.advance_tokens(&project_id).unwrap().unwrap();
+        assert_eq!(grant.expected_generation_id, tokens.0);
+        assert_eq!(grant.expected_pointer_sha256, tokens.1);
+    }
+
+    #[test]
+    fn a_producer_bound_pointer_reports_its_producer_in_the_grant() {
+        let fixture = fixture();
+        let runtime = fixture.runtime();
+        let project_id = project("p_grant_producer");
+        run_publish(&runtime, producer_request(&project_id, COMMIT_ONE), "first").unwrap();
+        let grant = runtime.auto_advance_grant(&project_id).unwrap().unwrap();
+        assert_eq!(grant.source.kind(), "producer");
+        assert_eq!(grant.source.producer_id(), Some("producer-a"));
     }
 
     #[test]
