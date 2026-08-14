@@ -34,6 +34,12 @@ pub enum SlackReadMethod {
     AuthTest,
     /// The channel roster, bounded to the classes policy allows.
     ConversationsList,
+    /// The BOT'S OWN conversation memberships. The membership-mode roster:
+    /// where membership IS the enrollment boundary, asking the workspace for
+    /// every channel and filtering to memberships pages a whole workspace to
+    /// find a handful of rows (observed live: 10k+ channels for under a dozen
+    /// memberships), while this returns exactly the member set.
+    UsersConversations,
     /// One channel's forward history from a `ts` watermark.
     ConversationsHistory,
     /// One thread parent's replies. Design 5.3: threaded replies do not appear
@@ -56,6 +62,7 @@ impl SlackReadMethod {
     pub const ALL: &'static [Self] = &[
         Self::AuthTest,
         Self::ConversationsList,
+        Self::UsersConversations,
         Self::ConversationsHistory,
         Self::ConversationsReplies,
         Self::UsersList,
@@ -71,6 +78,7 @@ impl SlackReadMethod {
         match self {
             Self::AuthTest => "auth.test",
             Self::ConversationsList => "conversations.list",
+            Self::UsersConversations => "users.conversations",
             Self::ConversationsHistory => "conversations.history",
             Self::ConversationsReplies => "conversations.replies",
             Self::UsersList => "users.list",
@@ -157,6 +165,7 @@ mod tests {
             vec![
                 "auth.test",
                 "conversations.list",
+                "users.conversations",
                 "conversations.history",
                 "conversations.replies",
                 "users.list",

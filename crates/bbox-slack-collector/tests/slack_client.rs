@@ -252,6 +252,7 @@ async fn the_client_never_composes_a_path_outside_the_read_allowlist() {
     client.auth_test().await.unwrap();
     client
         .list_channels(&ChannelListRequest {
+            memberships_only: false,
             include_private: false,
             exclude_archived: true,
             page_limit: 100,

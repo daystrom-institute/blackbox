@@ -100,6 +100,11 @@ pub struct ChannelListRequest {
     /// requested TYPES are a policy decision handed down rather than a constant.
     pub include_private: bool,
     pub exclude_archived: bool,
+    /// Roster method: `false` walks the whole workspace roster
+    /// (`conversations.list`, explicit mode); `true` asks for the bot's own
+    /// memberships (`users.conversations`, membership mode), which returns
+    /// exactly the member set instead of paging a workspace to find it.
+    pub memberships_only: bool,
     pub page_limit: u32,
     pub max_pages: u32,
 }
@@ -394,10 +399,19 @@ impl SlackRead for SlackClient {
             ("exclude_archived", request.exclude_archived.to_string()),
             ("limit", request.page_limit.to_string()),
         ];
+        // users.conversations returns only conversations the calling bot is a
+        // member of, so every row is a membership by definition; Slack may
+        // omit is_member on this shape, so it is set below rather than trusted
+        // from the payload.
+        let method = if request.memberships_only {
+            SlackReadMethod::UsersConversations
+        } else {
+            SlackReadMethod::ConversationsList
+        };
         let mut channels: Vec<RawChannel> = Vec::new();
         let (_, complete) = self
             .paginate::<ConversationsListResponse, _>(
-                SlackReadMethod::ConversationsList,
+                method,
                 &params,
                 request.max_pages,
                 |page| {
@@ -406,6 +420,11 @@ impl SlackRead for SlackClient {
                 },
             )
             .await?;
+        if request.memberships_only {
+            for channel in &mut channels {
+                channel.is_member = true;
+            }
+        }
         if !complete {
             // A truncated roster is reported, not silently accepted: an
             // operator whose allowlisted channel fell off the last page would

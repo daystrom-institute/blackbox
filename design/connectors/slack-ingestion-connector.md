@@ -146,7 +146,8 @@ one bot token per install carrying all granted scopes, so a read-only
 credential for the same bot identity does not exist; credential-level
 enforcement is therefore unavailable, and write-safety moves to the collector's
 code path as a threefold contract: the collector has no write call sites, its
-Slack client is allowlisted to the read API families (conversations.history,
+Slack client is allowlisted to the read API families (conversations.list,
+users.conversations for the membership-mode roster, conversations.history,
 conversations.replies, users.*, and cursor pagination) and refuses any other
 method by construction, and the dependency ceiling is enforced by acceptance
 script. The agents-never-post rule is untouched: it binds agents, and the

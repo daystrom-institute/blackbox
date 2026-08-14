@@ -244,6 +244,8 @@ pub async fn run_publication_cycle(
     let roster = slack
         .list_channels(&ChannelListRequest {
             include_private: policy.include_private(),
+            memberships_only: config.channels.enrollment
+                == crate::policy::EnrollmentMode::Membership,
             // Always fetch archived on the wire and let the policy filter
             // them locally: Slack applies exclude_archived AFTER the page
             // window, so an archive-heavy workspace yields a near-empty page
