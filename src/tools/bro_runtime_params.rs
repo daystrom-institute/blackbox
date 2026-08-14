@@ -309,6 +309,20 @@ pub(crate) struct OrchestrateAuthorParams {
     /// suggests matching the named pattern.
     #[serde(default)]
     pub(crate) hint: Option<String>,
+    /// Optional caller-supplied few-shot exemplars: complete workflow
+    /// JSON specs (or spec fragments) the authoring LLM should imitate.
+    /// These are appended after the built-in reference example, so a
+    /// caller with an established house grammar (recipe workflows,
+    /// domain-specific gate/packet idioms) gets specs in that grammar
+    /// instead of generic shapes. Combined budget 64KB; oversize input
+    /// is rejected, not truncated.
+    #[serde(default)]
+    pub(crate) exemplars: Option<Vec<String>>,
+    /// Optional domain preamble injected verbatim ahead of the charter:
+    /// vocabulary, conventions, catalog context the compiler should
+    /// treat as ground truth while authoring.
+    #[serde(default)]
+    pub(crate) preamble: Option<String>,
     /// Working directory for the authoring dispatch.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,

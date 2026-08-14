@@ -54,11 +54,40 @@ impl BlackboxServer {
             .as_deref()
             .map(|h| format!("\nShape hint: match the `{h}` pattern from the runbook if it fits the charter.\n"))
             .unwrap_or_default();
+        // Caller-supplied few-shot corpus: exemplars teach the house
+        // grammar, the preamble carries domain ground truth. Bounded so
+        // a fat catalog paste cannot blow the authoring context.
+        const EXEMPLAR_BUDGET_BYTES: usize = 64 * 1024;
+        let exemplars = p.exemplars.unwrap_or_default();
+        let exemplar_bytes: usize = exemplars.iter().map(String::len).sum();
+        if exemplar_bytes > EXEMPLAR_BUDGET_BYTES {
+            return Self::err_text(&format!(
+                "exemplars total {exemplar_bytes} bytes, over the {EXEMPLAR_BUDGET_BYTES}-byte budget — trim or pass fewer exemplars"
+            ));
+        }
+        let exemplar_section = if exemplars.is_empty() {
+            String::new()
+        } else {
+            let joined = exemplars
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("--- exemplar {} ---\n{e}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            format!(
+                "\n=== CALLER EXEMPLARS (prefer their idioms over the generic example) ===\n{joined}\n"
+            )
+        };
+        let preamble_section = p
+            .preamble
+            .as_deref()
+            .map(|d| format!("\n=== DOMAIN PREAMBLE (treat as ground truth) ===\n{d}\n"))
+            .unwrap_or_default();
 
         let base_prompt = format!(
             "You are a workflow spec compiler. Convert a prose charter into a validated workflow JSON spec for the blackbox `bro_orchestrate_run` engine.\n\n\
 === REFERENCE RUNBOOK ===\n{runbook}\n\n\
-=== REFERENCE EXAMPLE (e2e-gated.json) ===\n{reference_example}\n\n\
+=== REFERENCE EXAMPLE (e2e-gated.json) ===\n{reference_example}\n{exemplar_section}{preamble_section}\n\
 === CHARTER ===\n{charter}\n{hint_line}\n\
 === OUTPUT INSTRUCTIONS ===\n\
 Output ONLY the JSON workflow spec — no preamble, no prose explanation, no trailing commentary. Start with `{{` and end with `}}`. You may wrap in ```json fences; the parser handles both.\n\n\
@@ -267,7 +296,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_orchestrate_run",
-        description = "Dispatch a workflow as a pollable task. Takes a full spec (actors, nodes with per-node `next` transitions: goto / branch / fork / terminal) and returns {taskId, arcId, status} immediately by default; poll with bro_status(task_id=...), await with bro_wait(task_id=...), or inspect arc state with bro_arc_status(arc_id=...). Pass await_completion=true only when the caller intentionally wants blocking behavior. Pass dry_run=true to validate + summarize without dispatching any bros."
+        description = "Dispatch a workflow as a pollable task. Takes a full spec (actors, nodes with per-node `next` transitions: goto / branch / fork / terminal) and returns {taskId, arcId, status} immediately by default; poll with bro_status(task_id=...), await with bro_wait(task_id=...), or inspect arc state with bro_arc_status(arc_id=...). Pass await_completion=true only when the caller intentionally wants blocking behavior. Pass dry_run=true to validate + summarize without dispatching any bros. Run and dry-run both validate `subworkflow_ref` seams strictly: every ref must be installed and its imports/exports must type-check against the child schema. Workflows declaring `admission` enforce at most one non-terminal arc per key; a duplicate start errors with the holding arc named."
     )]
     pub(crate) async fn bro_orchestrate_run(
         &self,
@@ -288,6 +317,18 @@ Constraints:\n\
         // covered. Hard fail rather than silent route-around.
         if let Err(e) = validate_workflow_capabilities(&compiled, &self.state) {
             return Self::err_text(&format!("workflow capability validation failed: {e}"));
+        }
+        // Author-time seam validation, strict form: at run (and
+        // dry-run) every subworkflow_ref must resolve and type-check
+        // its imports/exports against the installed child's schema. A
+        // dry-run that blesses an unresolvable or mistyped seam is the
+        // exact gap this closes.
+        if let Err(e) = workflow::validate_subworkflow_refs(
+            &compiled.spec,
+            &|id: &str| self.resolve_workflow_by_id(id),
+            true,
+        ) {
+            return Self::err_text(&format!("subworkflow_ref validation failed: {e}"));
         }
         if p.dry_run.unwrap_or(false) {
             let result = workflow::engine::dry_run(&compiled);
@@ -754,7 +795,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_workflow_install",
-        description = "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced."
+        description = "Install a workflow spec by id so it can be referenced by name from webhook routing verdicts (`{route: start_arc, workflow: <id>}`) and other lookup paths. Compile-validated before install; capability tags enforced. `subworkflow_ref` seams are validated against already-installed children (required imports covered, exports declared in the child schema); refs not installed yet come back as `warnings` rather than refusals so install order stays free."
     )]
     // migration debt: webhook/poller spec persists belong on a StorePersister; tracked in thread-935b467d.
     #[allow(clippy::disallowed_methods)]
@@ -773,6 +814,19 @@ Constraints:\n\
         if let Err(e) = validate_workflow_capabilities(&compiled, &self.state) {
             return Self::err_text(&format!("capability validation failed: {e}"));
         }
+        // Author-time seam validation for subworkflow_ref: refs that
+        // resolve get their imports/exports contract checked NOW
+        // instead of when a live arc reaches the node. Unresolved refs
+        // are warnings at install time (a parent may legitimately be
+        // installed before its children) and hard errors at run time.
+        let ref_warnings = match workflow::validate_subworkflow_refs(
+            &spec,
+            &|id: &str| self.resolve_workflow_by_id(id),
+            false,
+        ) {
+            Ok(w) => w,
+            Err(e) => return Self::err_text(&format!("subworkflow_ref validation failed: {e}")),
+        };
         let id = p.id.unwrap_or_else(|| spec.name.clone());
         let dir = self.state.store_dir.join("workflows");
         let _ = std::fs::create_dir_all(&dir);
@@ -787,7 +841,11 @@ Constraints:\n\
             .workflow_registry
             .write()
             .insert(id.clone(), spec);
-        Self::ok_json(&serde_json::json!({"status": "installed", "id": id}))
+        Self::ok_json(&serde_json::json!({
+            "status": "installed",
+            "id": id,
+            "warnings": ref_warnings,
+        }))
     }
 
     #[tool(
@@ -1242,6 +1300,7 @@ mod tests {
                 in_flight_nodes: vec![],
                 last_verdict: None,
                 visit_counts: std::collections::HashMap::new(),
+                admission_key: None,
                 started_at: "2026-08-14T00:00:00Z".into(),
                 updated_at: "2026-08-14T00:00:00Z".into(),
             },

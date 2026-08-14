@@ -278,6 +278,7 @@ mod tests {
                 parent_arc_id: None,
                 composition_depth: 0,
                 shell_allowlist: None,
+                admission_key: None,
             }),
             node_outputs: HashMap::new(),
             actor_sessions: HashMap::new(),

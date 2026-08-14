@@ -212,6 +212,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         arc_store: Arc::new(crate::workflow::arc_store::ArcStore::new(
             tmp.path().join("bro").join("arcs"),
         )),
+        arc_admissions: parking_lot::Mutex::new(HashMap::new()),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
         pollers: Arc::new(pollers::PollerRegistry::new()),
         crons: Arc::new(crons::CronRegistry::new()),

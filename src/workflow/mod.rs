@@ -49,6 +49,154 @@ pub fn compile(spec: Workflow) -> Result<CompiledWorkflow> {
     Ok(CompiledWorkflow { spec })
 }
 
+/// Registry-aware author-time validation for `subworkflow_ref` seams.
+/// `compile` cannot resolve refs (it is registry-blind by design), so a
+/// dry-run could bless a spec whose seams don't type-check until the
+/// arc actually reaches the ref node. This closes that gap wherever a
+/// registry is in hand (install, run, dry-run):
+///
+/// - every `subworkflow_ref` (node-level, foreach, matrix) must resolve;
+///   with `strict_missing=false` unresolved refs are returned as
+///   warnings instead (install-order freedom: a parent may be installed
+///   before its children),
+/// - when the child declares a `vars_schema`, its required vars must be
+///   covered by the node's `imports` ∪ `import_renames` keys, and every
+///   node `export` must be declared in the child schema (an export you
+///   cannot see in the child's contract is exactly the soft seam this
+///   check exists to catch),
+/// - resolved children are validated recursively (cycle-guarded,
+///   composition-depth-capped).
+///
+/// Foreach/matrix refs get existence checks only: their per-item var
+/// injection makes static import coverage a false-positive machine.
+///
+/// Returns the list of warnings (unresolved refs in non-strict mode).
+pub fn validate_subworkflow_refs<R>(
+    spec: &Workflow,
+    resolve: &R,
+    strict_missing: bool,
+) -> Result<Vec<String>>
+where
+    R: Fn(&str) -> Option<Workflow>,
+{
+    let mut visited = std::collections::HashSet::new();
+    let mut warnings = Vec::new();
+    validate_refs_inner(spec, resolve, strict_missing, &mut visited, &mut warnings, 0)?;
+    Ok(warnings)
+}
+
+fn validate_refs_inner<R>(
+    spec: &Workflow,
+    resolve: &R,
+    strict_missing: bool,
+    visited: &mut std::collections::HashSet<String>,
+    warnings: &mut Vec<String>,
+    depth: u32,
+) -> Result<()>
+where
+    R: Fn(&str) -> Option<Workflow>,
+{
+    if depth > engine::MAX_COMPOSITION_DEPTH {
+        // The runtime enforces the ceiling with node context; static
+        // recursion just stops here so a ref cycle cannot spin.
+        return Ok(());
+    }
+    let mut node_ids: Vec<&String> = spec.nodes.keys().collect();
+    node_ids.sort();
+    for node_id in node_ids {
+        let node = &spec.nodes[node_id];
+        if let Some(inline) = &node.subworkflow {
+            validate_refs_inner(inline, resolve, strict_missing, visited, warnings, depth + 1)?;
+        }
+        if let Some(ref_id) = &node.subworkflow_ref {
+            match resolve(ref_id) {
+                Some(child) => {
+                    validate_ref_seam(node_id, node, ref_id, &child)?;
+                    if visited.insert(ref_id.clone()) {
+                        validate_refs_inner(
+                            &child,
+                            resolve,
+                            strict_missing,
+                            visited,
+                            warnings,
+                            depth + 1,
+                        )?;
+                    }
+                }
+                None if strict_missing => bail!(
+                    "node '{node_id}': subworkflow_ref '{ref_id}' is not installed — install it via bro_workflow_install or fix the id"
+                ),
+                None => warnings.push(format!(
+                    "node '{node_id}': subworkflow_ref '{ref_id}' not installed yet; its seam cannot be validated until it is"
+                )),
+            }
+        }
+        for (label, fanout_ref) in [
+            (
+                "foreach",
+                node.foreach.as_ref().and_then(|f| f.subworkflow_ref.clone()),
+            ),
+            (
+                "matrix",
+                node.matrix.as_ref().and_then(|m| m.subworkflow_ref.clone()),
+            ),
+        ] {
+            if let Some(id) = fanout_ref {
+                if resolve(&id).is_none() {
+                    if strict_missing {
+                        bail!(
+                            "node '{node_id}': {label}.subworkflow_ref '{id}' is not installed"
+                        );
+                    }
+                    warnings.push(format!(
+                        "node '{node_id}': {label}.subworkflow_ref '{id}' not installed yet"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_ref_seam(
+    node_id: &str,
+    node: &NodeSpec,
+    ref_id: &str,
+    child: &Workflow,
+) -> Result<()> {
+    let Some(schema) = &child.vars_schema else {
+        // No child contract declared: nothing statically checkable.
+        return Ok(());
+    };
+    let mut supplied: std::collections::HashSet<&str> =
+        node.imports.iter().map(String::as_str).collect();
+    supplied.extend(node.import_renames.keys().map(String::as_str));
+    let mut missing: Vec<&String> = schema
+        .iter()
+        .filter(|(_, entry)| entry.required)
+        .map(|(k, _)| k)
+        .filter(|k| !supplied.contains(k.as_str()))
+        .collect();
+    missing.sort();
+    if !missing.is_empty() {
+        bail!(
+            "node '{node_id}': subworkflow_ref '{ref_id}' declares required vars {missing:?} that the node's imports/import_renames do not cover"
+        );
+    }
+    let mut undeclared: Vec<&String> = node
+        .exports
+        .iter()
+        .filter(|k| !schema.contains_key(*k))
+        .collect();
+    undeclared.sort();
+    if !undeclared.is_empty() {
+        bail!(
+            "node '{node_id}': exports {undeclared:?} are not declared in subworkflow_ref '{ref_id}' vars_schema — declare them in the child's schema so the seam is checkable"
+        );
+    }
+    Ok(())
+}
+
 fn cross_validate(spec: &Workflow) -> Result<()> {
     // start must reference a real node.
     if !spec.nodes.contains_key(&spec.start) {
@@ -56,6 +204,20 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
             "workflow start='{}' does not reference any declared node",
             spec.start
         );
+    }
+
+    if let Some(admission) = &spec.admission {
+        if admission.key.is_empty() {
+            bail!("admission.key must name at least one initial var");
+        }
+        if let Some(dup) = admission
+            .key
+            .iter()
+            .enumerate()
+            .find(|(i, k)| admission.key[..*i].contains(k))
+        {
+            bail!("admission.key names '{}' more than once", dup.1);
+        }
     }
 
     for (binding_id, binding) in &spec.atom_bindings {
@@ -3315,5 +3477,111 @@ mod tests {
         // Round ceiling reached → agree-to-disagree; surviving challenges
         // flow into synthesis instead of looping forever.
         assert_eq!(verdict(2, 3), "settled");
+    }
+
+    // ── subworkflow_ref author-time seam validation ──────────────────
+
+    fn child_with_schema() -> Workflow {
+        load_workflow(
+            r#"{
+            "name": "child",
+            "version": 1,
+            "actors": {},
+            "vars_schema": {
+                "issue": {"kind": "int", "required": true},
+                "result": {"kind": "string"}
+            },
+            "nodes": {"Only": {"actor": "", "prompt": "x", "next": {"type": "terminal"}}},
+            "start": "Only"
+        }"#,
+        )
+        .unwrap()
+    }
+
+    fn parent_with_ref(imports: &str, exports: &str) -> Workflow {
+        load_workflow(&format!(
+            r#"{{
+            "name": "parent",
+            "version": 1,
+            "actors": {{}},
+            "nodes": {{
+                "Sub": {{"subworkflow_ref": "child", "imports": {imports}, "exports": {exports}, "next": {{"type": "terminal"}}}}
+            }},
+            "start": "Sub"
+        }}"#,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn subworkflow_ref_seam_validates_clean_contract() {
+        let parent = parent_with_ref(r#"["issue"]"#, r#"["result"]"#);
+        let child = child_with_schema();
+        let warnings =
+            validate_subworkflow_refs(&parent, &|id| (id == "child").then(|| child.clone()), true)
+                .unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn subworkflow_ref_missing_required_import_fails() {
+        let parent = parent_with_ref(r#"[]"#, r#"[]"#);
+        let child = child_with_schema();
+        let err =
+            validate_subworkflow_refs(&parent, &|id| (id == "child").then(|| child.clone()), true)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("required vars"), "err: {err}");
+        assert!(err.contains("issue"), "err: {err}");
+    }
+
+    #[test]
+    fn subworkflow_ref_undeclared_export_fails() {
+        let parent = parent_with_ref(r#"["issue"]"#, r#"["mystery_output"]"#);
+        let child = child_with_schema();
+        let err =
+            validate_subworkflow_refs(&parent, &|id| (id == "child").then(|| child.clone()), true)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("mystery_output"), "err: {err}");
+        assert!(err.contains("not declared"), "err: {err}");
+    }
+
+    #[test]
+    fn subworkflow_ref_unresolved_warns_lenient_errors_strict() {
+        let parent = parent_with_ref(r#"["issue"]"#, r#"[]"#);
+        let warnings = validate_subworkflow_refs(&parent, &|_| None, false).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("not installed"));
+        let err = validate_subworkflow_refs(&parent, &|_| None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not installed"), "err: {err}");
+    }
+
+    #[test]
+    fn subworkflow_ref_child_without_schema_skips_seam_check() {
+        let parent = parent_with_ref(r#"[]"#, r#"["anything"]"#);
+        let mut child = child_with_schema();
+        child.vars_schema = None;
+        let warnings =
+            validate_subworkflow_refs(&parent, &|id| (id == "child").then(|| child.clone()), true)
+                .unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn admission_key_compile_validation() {
+        let bad = load_workflow(
+            r#"{
+            "name": "wf", "version": 1, "actors": {},
+            "admission": {"key": []},
+            "nodes": {"Only": {"actor": "", "next": {"type": "terminal"}}},
+            "start": "Only"
+        }"#,
+        )
+        .unwrap();
+        let err = compile(bad).unwrap_err().to_string();
+        assert!(err.contains("admission.key"), "err: {err}");
     }
 }

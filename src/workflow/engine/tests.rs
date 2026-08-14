@@ -897,3 +897,227 @@ async fn resumed_wait_times_out_immediately_when_deadline_passed_while_down() {
         .any(|snap| snap.arc_id == cp.arc_id && snap.status == "completed");
     assert!(completed, "arc completed through the timeout branch");
 }
+
+// ---------------------------------------------------------------------------
+// Singleton admission
+// ---------------------------------------------------------------------------
+
+fn admission_workflow_json() -> &'static str {
+    r#"{
+        "name": "one-per-issue",
+        "version": 1,
+        "actors": {},
+        "admission": {"key": ["issue"]},
+        "nodes": {
+            "Park": {"actor": "", "wait": {"any_of": [{"signal": "seal"}]}, "next": {"type": "terminal"}}
+        },
+        "start": "Park"
+    }"#
+}
+
+#[tokio::test]
+async fn duplicate_admission_refused_then_admitted_after_release() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    let compiled = compile(load_workflow(admission_workflow_json()).unwrap()).unwrap();
+    let mut vars = Map::new();
+    vars.insert("issue".into(), json!(42));
+
+    let run_state = state.clone();
+    let run_compiled = compiled.clone();
+    let run_vars = vars.clone();
+    let first = tokio::spawn(async move {
+        let server = BlackboxServer::new(run_state);
+        engine::run_workflow_with_initial_vars(&server, &run_compiled, None, Some(20), run_vars)
+            .await
+    });
+    // Wait until the first arc holds the key and is parked.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !state.wait_store.snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first arc parked");
+
+    // Second start with the same key must refuse at the runner claim.
+    let server2 = BlackboxServer::new(state.clone());
+    let dup =
+        engine::run_workflow_with_initial_vars(&server2, &compiled, None, Some(20), vars.clone())
+            .await;
+    assert!(
+        dup.status.contains("duplicate admission"),
+        "dup status: {}",
+        dup.status
+    );
+
+    // A different key admits fine while the first is parked.
+    let mut other = Map::new();
+    other.insert("issue".into(), json!(43));
+    let other_state = state.clone();
+    let other_compiled = compiled.clone();
+    let second = tokio::spawn(async move {
+        let server = BlackboxServer::new(other_state);
+        engine::run_workflow_with_initial_vars(&server, &other_compiled, None, Some(20), other)
+            .await
+    });
+
+    // Seal both; correlation is empty so match is broadcast per wait.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if state.wait_store.snapshot().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both arcs parked");
+    for _ in 0..2 {
+        signal_arc_dispatch(
+            &state,
+            "seal",
+            Map::new(),
+            json!({}),
+            SignalDispatchOrigin::Direct,
+            None,
+        )
+        .await;
+    }
+    let first_result = first.await.unwrap();
+    let second_result = second.await.unwrap();
+    assert_eq!(first_result.status, "completed");
+    assert_eq!(second_result.status, "completed");
+
+    // Terminal release: the key admits again.
+    let rerun_state = state.clone();
+    let rerun_compiled = compiled.clone();
+    let rerun_vars = vars.clone();
+    let rerun = tokio::spawn(async move {
+        let server = BlackboxServer::new(rerun_state);
+        engine::run_workflow_with_initial_vars(&server, &rerun_compiled, None, Some(20), rerun_vars)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !state.wait_store.snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("re-admitted arc parked");
+    signal_arc_dispatch(
+        &state,
+        "seal",
+        Map::new(),
+        json!({}),
+        SignalDispatchOrigin::Direct,
+        None,
+    )
+    .await;
+    assert_eq!(rerun.await.unwrap().status, "completed");
+}
+
+#[tokio::test]
+async fn admission_missing_key_var_refuses_loudly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    let server = BlackboxServer::new(state);
+    let compiled = compile(load_workflow(admission_workflow_json()).unwrap()).unwrap();
+    let result =
+        engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), Map::new())
+            .await;
+    assert!(
+        result.status.contains("admission key var 'issue' missing"),
+        "status: {}",
+        result.status
+    );
+}
+
+#[tokio::test]
+async fn rehydrated_arc_reclaims_admission_key() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    use crate::workflow::arc_store::ArcCheckpointStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    // Phase 1: park an admission-holding arc, then crash.
+    {
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let run_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let server = BlackboxServer::new(run_state);
+            let compiled = compile(load_workflow(admission_workflow_json()).unwrap()).unwrap();
+            let mut vars = Map::new();
+            vars.insert("issue".into(), json!(7));
+            engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let cps = state.arc_store.load_all().await;
+                if cps
+                    .iter()
+                    .any(|c| c.status == ArcCheckpointStatus::Waiting)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("parked");
+        handle.abort();
+        let _ = handle.await;
+    }
+    // Phase 2: restart. The resumed arc re-claims, so a fresh start
+    // with the same key must refuse.
+    let state2 = Arc::new(SharedState::for_test(tmp.path()));
+    engine::rehydrate_arcs(state2.clone()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !state2.wait_store.snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("rehydrated arc re-parked");
+
+    let server2 = BlackboxServer::new(state2.clone());
+    let compiled = compile(load_workflow(admission_workflow_json()).unwrap()).unwrap();
+    let mut vars = Map::new();
+    vars.insert("issue".into(), json!(7));
+    let dup =
+        engine::run_workflow_with_initial_vars(&server2, &compiled, None, Some(20), vars).await;
+    assert!(
+        dup.status.contains("duplicate admission"),
+        "dup status: {}",
+        dup.status
+    );
+
+    // Seal the resumed holder; key releases; checkpoint clears.
+    signal_arc_dispatch(
+        &state2,
+        "seal",
+        Map::new(),
+        json!({}),
+        SignalDispatchOrigin::Direct,
+        None,
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if state2.arc_store.load_all().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("resumed holder completed");
+}

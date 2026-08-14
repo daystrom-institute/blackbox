@@ -82,6 +82,13 @@ pub struct ArcMeta {
     /// Sub-workflow arcs carry their own spec's list, not the parent's.
     #[serde(default)]
     pub shell_allowlist: Option<Vec<String>>,
+    /// Admission key held by this arc (workflow declared `admission`
+    /// and the claim succeeded). The tuple of named initial-vars; its
+    /// canonical form indexes the daemon's admission registry, and the
+    /// terminal epilogue releases it. Serialized into checkpoints so a
+    /// rehydrated arc re-claims the same key.
+    #[serde(default)]
+    pub admission_key: Option<Map<String, Value>>,
 }
 
 /// One Wait resolution. Carried in `last_signal` and `signal_history`.
@@ -488,6 +495,7 @@ mod tests {
             parent_arc_id: None,
             composition_depth: 0,
             shell_allowlist: None,
+            admission_key: None,
         });
         c.vars.insert("issue".into(), json!(42));
         c.vars.insert("repo".into(), json!("foo/bar"));

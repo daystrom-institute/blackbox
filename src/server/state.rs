@@ -302,6 +302,12 @@ pub(crate) struct SharedState {
     /// for live matching; it is rebuilt from these checkpoints by
     /// re-entering each resumed arc's wait node.
     pub(crate) arc_store: Arc<crate::workflow::arc_store::ArcStore>,
+    /// Singleton-admission registry: (workflow name, canonical key) →
+    /// holding arc id. Claimed by the runner at arc start for
+    /// workflows declaring `admission`, released at terminal state.
+    /// In-memory by design: live arcs re-claim through rehydration, so
+    /// the durable source of truth is the checkpoint set, not this map.
+    pub(crate) arc_admissions: parking_lot::Mutex<HashMap<(String, String), String>>,
     /// Operator-installed webhook endpoints. Each carries its
     /// signature scheme + extractor + routing-packet id.
     pub(crate) webhooks: webhooks::SharedRegistry,
@@ -808,6 +814,47 @@ impl SharedState {
         self.arc_cancel_tokens.write().remove(arc_id);
     }
 
+    /// Claim a singleton-admission key for an arc. Returns Err with the
+    /// holding arc id when the key is already held. Claim and check are
+    /// one atomic step under the registry lock.
+    pub(crate) fn claim_arc_admission(
+        &self,
+        workflow: &str,
+        canonical_key: &str,
+        arc_id: &str,
+    ) -> Result<(), String> {
+        let mut map = self.arc_admissions.lock();
+        let slot = (workflow.to_string(), canonical_key.to_string());
+        match map.get(&slot) {
+            Some(holder) if holder != arc_id => Err(holder.clone()),
+            _ => {
+                map.insert(slot, arc_id.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Release an admission key IF this arc holds it. A release from a
+    /// stale loser (claim failed, arc errored out) must not evict the
+    /// legitimate holder.
+    pub(crate) fn release_arc_admission(&self, workflow: &str, canonical_key: &str, arc_id: &str) {
+        let mut map = self.arc_admissions.lock();
+        let slot = (workflow.to_string(), canonical_key.to_string());
+        if map.get(&slot).is_some_and(|holder| holder == arc_id) {
+            map.remove(&slot);
+        }
+    }
+
+    /// Current holder of an admission key, if any. Advisory read for
+    /// the routing layer's duplicate-conversion path; the runner-side
+    /// claim remains the enforcement point.
+    pub(crate) fn arc_admission_holder(&self, workflow: &str, canonical_key: &str) -> Option<String> {
+        self.arc_admissions
+            .lock()
+            .get(&(workflow.to_string(), canonical_key.to_string()))
+            .cloned()
+    }
+
     /// Trigger cancellation for a running arc. Returns whether a
     /// matching token existed (and was triggered). The runner notices
     /// at the next node boundary — or immediately if it's parked on
@@ -1089,6 +1136,7 @@ impl SharedState {
             running_arcs: RwLock::new(HashMap::new()),
             wait_store: Arc::new(workflow::wait::WaitStore::new()),
             arc_store: Arc::new(workflow::arc_store::ArcStore::new(store_dir.join("arcs"))),
+            arc_admissions: parking_lot::Mutex::new(HashMap::new()),
             webhooks: Arc::new(webhooks::WebhookRegistry::new()),
             pollers: Arc::new(pollers::PollerRegistry::new()),
             crons: Arc::new(crons::CronRegistry::new()),
@@ -2218,6 +2266,9 @@ pub(crate) struct ArcSnapshot {
     pub(crate) in_flight_nodes: Vec<String>,
     pub(crate) last_verdict: Option<String>,
     pub(crate) visit_counts: std::collections::HashMap<String, u32>,
+    /// Canonical admission key this arc holds, when its workflow
+    /// declares an `admission` contract.
+    pub(crate) admission_key: Option<String>,
     pub(crate) started_at: String,
     pub(crate) updated_at: String,
 }

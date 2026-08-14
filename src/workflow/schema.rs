@@ -78,6 +78,56 @@ pub struct Workflow {
     /// ref'd sub-workflows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_allowlist: Option<Vec<String>>,
+    /// Optional singleton-admission contract: at most one non-terminal
+    /// TOP-LEVEL arc of this workflow per admission key. The key is the
+    /// canonicalized tuple of the named initial-vars (post entity /
+    /// initial_vars merge), so "one worker per issue" is
+    /// `{"key": ["issue_number"]}`. The runner claims the key at arc
+    /// start (every start path: webhook StartArc, MCP run, rehydration
+    /// resume) and releases it at terminal state. A second start while
+    /// the key is held is refused; the webhook StartArc path
+    /// additionally supports converting the duplicate into a signal on
+    /// the running arc (`on_conflict: "signal"`), which is the
+    /// "second mention becomes steering, not a second worker" pattern.
+    /// Sub-workflow arcs never claim. Interrupted (crash-orphaned)
+    /// arcs do not hold their key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<AdmissionSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdmissionSpec {
+    /// Initial-var names whose values form the admission key. Missing
+    /// values at arc start refuse admission loudly (a dedupe key you
+    /// cannot compute is a routing bug, not a broadcast license).
+    pub key: Vec<String>,
+    /// What the webhook StartArc path does with a duplicate start.
+    #[serde(default)]
+    pub on_conflict: AdmissionConflict,
+    /// Signal name used when `on_conflict: "signal"`; the duplicate
+    /// start's merged vars become the payload and the admission-key
+    /// tuple becomes the correlation, so the running arc can park a
+    /// wait on it. Defaults to `arc-duplicate-start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_signal: Option<String>,
+}
+
+impl AdmissionSpec {
+    pub fn conflict_signal_name(&self) -> &str {
+        self.conflict_signal
+            .as_deref()
+            .unwrap_or("arc-duplicate-start")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionConflict {
+    /// Refuse the duplicate start and report the holding arc.
+    #[default]
+    Ignore,
+    /// Convert the duplicate start into a signal on the holding arc.
+    Signal,
 }
 
 impl Workflow {

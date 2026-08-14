@@ -710,6 +710,67 @@ pub(crate) async fn dispatch_verdict(
             for (k, v) in initial_vars {
                 merged_vars.insert(k, v);
             }
+            // Singleton admission, routing-layer half: when the key is
+            // already held, apply the workflow's on_conflict policy
+            // WITHOUT spawning. The runner-side claim remains the
+            // atomic enforcement point (two deliveries racing past this
+            // advisory check spawn two arcs, and the second's claim
+            // refuses at run start); this layer exists to give the
+            // duplicate a useful outcome - dropped with the holder
+            // named, or converted into a signal on the running arc.
+            if let Some(admission) = compiled.spec.admission.clone() {
+                let mut key_map = serde_json::Map::new();
+                let mut missing: Vec<String> = Vec::new();
+                for k in &admission.key {
+                    match merged_vars.get(k) {
+                        Some(v) if !v.is_null() => {
+                            key_map.insert(k.clone(), v.clone());
+                        }
+                        _ => missing.push(k.clone()),
+                    }
+                }
+                if !missing.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "start_arc admission key var(s) {missing:?} missing from merged vars for workflow '{workflow_id}'"
+                    ));
+                }
+                let canonical = workflow::wait::canonicalize_correlation(&key_map);
+                if let Some(holder) =
+                    state.arc_admission_holder(&compiled.spec.name, &canonical)
+                {
+                    use crate::workflow::schema::AdmissionConflict;
+                    match admission.on_conflict {
+                        AdmissionConflict::Ignore => {
+                            return Ok(json!({
+                                "status": "duplicate_admission",
+                                "workflow": workflow_id,
+                                "admission_key": canonical,
+                                "holder_arc_id": holder,
+                            }));
+                        }
+                        AdmissionConflict::Signal => {
+                            let sig = admission.conflict_signal_name().to_string();
+                            let resolved = signal_arc_dispatch(
+                                &state,
+                                &sig,
+                                key_map.clone(),
+                                Value::Object(merged_vars.clone()),
+                                SignalDispatchOrigin::Direct,
+                                None,
+                            )
+                            .await;
+                            return Ok(json!({
+                                "status": "duplicate_admission_signaled",
+                                "workflow": workflow_id,
+                                "admission_key": canonical,
+                                "holder_arc_id": holder,
+                                "signal": sig,
+                                "dispatch": resolved,
+                            }));
+                        }
+                    }
+                }
+            }
             // Slack thread continuity: if this arc came in through the
             // slack inlet and the entity carries `(team_id, channel,
             // thread_ts)`, look up any prior Claude session_id for
@@ -4110,6 +4171,7 @@ mod tests {
                 in_flight_nodes: vec![],
                 last_verdict: Some("satisfied".into()),
                 visit_counts: std::collections::HashMap::new(),
+                admission_key: None,
                 started_at: "2026-05-16T00:00:00Z".into(),
                 updated_at: "2026-05-16T00:00:01Z".into(),
             },

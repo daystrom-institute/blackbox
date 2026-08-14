@@ -503,8 +503,10 @@ async fn finish_arc_run(
     runner
         .server
         .unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
-    // Terminal state: drop the durable checkpoint (no-op for sub-arcs).
+    // Terminal state: drop the durable checkpoint (no-op for sub-arcs)
+    // and release the admission key so the next start can admit.
     runner.remove_checkpoint().await;
+    runner.release_admission();
     let actor_sessions = runner.actor_sessions.clone();
     let structured_exit = workflow_structured_exit(&runner.ctx.vars);
     if let Some(value) = &structured_exit {
@@ -617,6 +619,7 @@ impl<'a> WorkflowRunner<'a> {
             parent_arc_id: None,
             composition_depth,
             shell_allowlist: compiled.spec.shell_allowlist.clone(),
+            admission_key: None,
         });
         let cancel_token = match parent_cancel_token {
             Some(parent) => server.register_arc_cancel_token_child(&arc_id, parent),
@@ -695,6 +698,9 @@ impl<'a> WorkflowRunner<'a> {
     }
 
     async fn run(&mut self) -> Result<()> {
+        // Singleton admission FIRST: a refused duplicate must not emit
+        // started events, open dispatches, or write checkpoints.
+        self.claim_admission()?;
         let entry = self.entry_node()?;
         self.log_event(
             "start",

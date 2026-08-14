@@ -1172,6 +1172,30 @@ Durability semantics worth knowing:
   that resolution checkpoint can still lose the signal; everything
   coarser is durable.
 
+## Singleton admission
+
+A workflow can declare an `admission` contract:
+
+```json
+"admission": {"key": ["issue_number"], "on_conflict": "signal"}
+```
+
+At most one non-terminal top-level arc runs per (workflow,
+canonicalized key tuple), where the tuple is drawn from the named
+initial vars after the entity / initial_vars merge. The runner claims
+the key atomically at arc start - every start path, including
+rehydration resume - and releases it at terminal state, so two webhook
+deliveries racing for the same issue can spawn two arcs but only one
+ever runs; the loser terminates with `duplicate admission` naming the
+holder. The webhook StartArc path additionally checks BEFORE spawning
+and applies `on_conflict`: `ignore` drops the duplicate (response names
+the holder), `signal` converts it into a signal on the running arc
+(default name `arc-duplicate-start`, correlation = the admission tuple,
+payload = the duplicate's merged vars) - the second mention becomes
+steering input instead of a second worker. A missing key var refuses
+the start loudly. `bro_arc_status` surfaces the held key. Interrupted
+(crash-orphaned) arcs do not hold their key.
+
 ## Retention
 
 What an arc leaves behind, and what bounds it:

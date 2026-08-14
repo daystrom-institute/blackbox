@@ -89,6 +89,12 @@ pub(crate) async fn resume_workflow_from_checkpoint(
             cp.current_node, cp.saved_at
         ),
     );
+    // Re-claim the admission key restored with the context; a resumed
+    // arc holds the same singleton slot it held before the restart.
+    if let Err(e) = runner.claim_admission() {
+        server.state.arc_store.release_claim(&cp.arc_id);
+        return Err(e);
+    }
     runner.update_arc_snapshot("running", "(rehydrated)", Some(&cp.current_node));
     let arc_id = cp.arc_id.clone();
     let run_result = runner.run_from(cp.current_node).await;
@@ -175,6 +181,12 @@ async fn mark_arc_interrupted(state: &Arc<SharedState>, cp: &ArcCheckpoint) {
             in_flight_nodes: cp.in_flight_nodes.clone(),
             last_verdict: cp.last_verdict.clone(),
             visit_counts: cp.visit_counts.clone(),
+            admission_key: cp
+                .ctx
+                .meta
+                .admission_key
+                .as_ref()
+                .map(crate::workflow::wait::canonicalize_correlation),
             started_at: cp.ctx.meta.started_at.clone(),
             updated_at: now,
         },

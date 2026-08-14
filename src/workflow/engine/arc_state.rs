@@ -93,6 +93,12 @@ impl WorkflowRunner<'_> {
             in_flight_nodes: in_flight,
             last_verdict: self.last_verdict.clone(),
             visit_counts,
+            admission_key: self
+                .ctx
+                .meta
+                .admission_key
+                .as_ref()
+                .map(crate::workflow::wait::canonicalize_correlation),
             started_at: existing_started.unwrap_or_else(|| now.clone()),
             updated_at: now,
         };
@@ -193,6 +199,72 @@ impl WorkflowRunner<'_> {
     /// covers them (rehydration marks it interrupted).
     pub(super) fn should_checkpoint(&self) -> bool {
         self.composition_depth == 0 && self.ctx.meta.parent_arc_id.is_none()
+    }
+
+    /// Claim this arc's singleton-admission key, when the workflow
+    /// declares one. Fresh arcs derive the key from seeded vars; a
+    /// checkpoint resume reuses the restored key verbatim. Failing to
+    /// claim is a terminal refusal, not a retryable condition - the
+    /// invariant IS "a second arc must not run".
+    pub(super) fn claim_admission(&mut self) -> Result<()> {
+        if self.composition_depth != 0 || self.ctx.meta.parent_arc_id.is_some() {
+            return Ok(());
+        }
+        let Some(admission) = self.compiled.spec.admission.clone() else {
+            return Ok(());
+        };
+        let key_map = match self.ctx.meta.admission_key.clone() {
+            Some(restored) => restored,
+            None => {
+                let mut m = serde_json::Map::new();
+                for k in &admission.key {
+                    match self.ctx.vars.get(k) {
+                        Some(v) if !v.is_null() => {
+                            m.insert(k.clone(), v.clone());
+                        }
+                        _ => bail!(
+                            "admission key var '{k}' missing from initial vars — refusing to admit workflow '{}' (a dedupe key you cannot compute is a routing bug, not a broadcast license)",
+                            self.compiled.spec.name
+                        ),
+                    }
+                }
+                m
+            }
+        };
+        let canonical = crate::workflow::wait::canonicalize_correlation(&key_map);
+        if let Err(holder) = self.server.state.claim_arc_admission(
+            &self.compiled.spec.name,
+            &canonical,
+            &self.ctx.meta.arc_id,
+        ) {
+            self.arc_note(
+                "blocked",
+                &format!("duplicate admission refused; key {canonical} held by arc {holder}"),
+            );
+            bail!(
+                "duplicate admission: workflow '{}' key {canonical} is already held by arc {holder}",
+                self.compiled.spec.name
+            );
+        }
+        self.ctx.meta.admission_key = Some(key_map);
+        self.log_event(
+            "admission_claimed",
+            serde_json::json!({"workflow": self.compiled.spec.name, "key": canonical}),
+        );
+        Ok(())
+    }
+
+    /// Release the admission key at terminal state (no-op when this arc
+    /// holds none, or when a different arc holds the slot).
+    pub(super) fn release_admission(&self) {
+        if let Some(key_map) = self.ctx.meta.admission_key.as_ref() {
+            let canonical = crate::workflow::wait::canonicalize_correlation(key_map);
+            self.server.state.release_arc_admission(
+                &self.compiled.spec.name,
+                &canonical,
+                &self.ctx.meta.arc_id,
+            );
+        }
     }
 
     pub(super) fn build_checkpoint(
