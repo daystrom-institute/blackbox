@@ -746,9 +746,7 @@ pub(crate) async fn dispatch_verdict(
                     ));
                 }
                 let canonical = workflow::wait::canonicalize_correlation(&key_map);
-                if let Some(holder) =
-                    state.arc_admission_holder(&compiled.spec.name, &canonical)
-                {
+                if let Some(holder) = state.arc_admission_holder(&compiled.spec.name, &canonical) {
                     use crate::workflow::schema::AdmissionConflict;
                     match admission.on_conflict {
                         AdmissionConflict::Ignore => {

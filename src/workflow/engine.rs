@@ -743,11 +743,8 @@ impl<'a> WorkflowRunner<'a> {
         // the wait re-registers would turn a second crash in that
         // window into an interruption of a perfectly resumable arc.
         if self.resume_skip_on_enter.as_deref() != Some(current.as_str()) {
-            self.write_checkpoint(
-                super::arc_store::ArcCheckpointStatus::Running,
-                &current,
-            )
-            .await;
+            self.write_checkpoint(super::arc_store::ArcCheckpointStatus::Running, &current)
+                .await;
         }
         while current != TERMINAL_SENTINEL {
             if self.cancel_token.is_cancelled() {
@@ -773,11 +770,8 @@ impl<'a> WorkflowRunner<'a> {
             // Durable boundary: the completed node's effects (outputs,
             // vars, signals) are on disk before the next body runs.
             if next != TERMINAL_SENTINEL {
-                self.write_checkpoint(
-                    super::arc_store::ArcCheckpointStatus::Running,
-                    &next,
-                )
-                .await;
+                self.write_checkpoint(super::arc_store::ArcCheckpointStatus::Running, &next)
+                    .await;
             }
             // Arc-level policy packet: advisor-as-packet, evaluates
             // arc state mechanically. Halt/escalate/warn verdicts act

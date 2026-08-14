@@ -668,7 +668,10 @@ async fn arc_checkpoint_written_at_wait_and_removed_at_terminal() {
     .expect("Waiting checkpoint appears");
     assert_eq!(cp.current_node, "Park");
     assert_eq!(cp.workflow.name, "wait-durability");
-    assert!(cp.node_outputs.contains_key("Prep"), "Prep output persisted");
+    assert!(
+        cp.node_outputs.contains_key("Prep"),
+        "Prep output persisted"
+    );
     assert!(cp.in_flight_nodes.is_empty());
 
     // The Waiting checkpoint lands BEFORE registrations become visible;
@@ -1059,10 +1062,7 @@ async fn rehydrated_arc_reclaims_admission_key() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let cps = state.arc_store.load_all().await;
-                if cps
-                    .iter()
-                    .any(|c| c.status == ArcCheckpointStatus::Waiting)
-                {
+                if cps.iter().any(|c| c.status == ArcCheckpointStatus::Waiting) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;

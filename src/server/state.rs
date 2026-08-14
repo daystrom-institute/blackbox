@@ -848,7 +848,11 @@ impl SharedState {
     /// Current holder of an admission key, if any. Advisory read for
     /// the routing layer's duplicate-conversion path; the runner-side
     /// claim remains the enforcement point.
-    pub(crate) fn arc_admission_holder(&self, workflow: &str, canonical_key: &str) -> Option<String> {
+    pub(crate) fn arc_admission_holder(
+        &self,
+        workflow: &str,
+        canonical_key: &str,
+    ) -> Option<String> {
         self.arc_admissions
             .lock()
             .get(&(workflow.to_string(), canonical_key.to_string()))

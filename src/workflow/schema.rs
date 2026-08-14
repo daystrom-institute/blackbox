@@ -685,10 +685,7 @@ mod tests {
 
     #[test]
     fn shell_allowlist_round_trips_through_serde() {
-        let wf = load_workflow(&minimal_workflow_json(
-            r#", "shell_allowlist": ["git"]"#,
-        ))
-        .unwrap();
+        let wf = load_workflow(&minimal_workflow_json(r#", "shell_allowlist": ["git"]"#)).unwrap();
         let json = serde_json::to_string(&wf).unwrap();
         let reparsed: Workflow = serde_json::from_str(&json).unwrap();
         assert_eq!(reparsed.shell_allowlist, Some(vec!["git".to_string()]));

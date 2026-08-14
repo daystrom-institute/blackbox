@@ -203,7 +203,10 @@ pub fn classify_retry(
     if !retryable {
         return None;
     }
-    let honors_retry_after = matches!(outcome, FetchOutcome::Status(429) | FetchOutcome::Status(503));
+    let honors_retry_after = matches!(
+        outcome,
+        FetchOutcome::Status(429) | FetchOutcome::Status(503)
+    );
     let delay_ms = match (honors_retry_after, retry_after_secs) {
         (true, Some(secs)) => secs.saturating_mul(1000).min(retry.max_ms),
         _ => backoff_ms(attempt, retry.base_ms, retry.max_ms),
@@ -243,7 +246,10 @@ fn parse_retry_after(value: &str) -> Option<u64> {
     }
     let target = chrono::DateTime::parse_from_rfc2822(trimmed).ok()?;
     let now = chrono::Utc::now();
-    let delta_secs = target.with_timezone(&chrono::Utc).signed_duration_since(now).num_seconds();
+    let delta_secs = target
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(now)
+        .num_seconds();
     Some(delta_secs.max(0) as u64)
 }
 
@@ -327,9 +333,9 @@ impl HttpFetchSpec {
                 let base_ms = match v.get("base_ms") {
                     None => default_retry_base_ms(),
                     Some(x) => {
-                        let raw = x
-                            .as_u64()
-                            .ok_or_else(|| anyhow!("http fetch retry.base_ms must be an integer"))?;
+                        let raw = x.as_u64().ok_or_else(|| {
+                            anyhow!("http fetch retry.base_ms must be an integer")
+                        })?;
                         clamp_retry_delay_ms(raw)
                     }
                 };
@@ -414,7 +420,10 @@ impl HttpFetchSpec {
 
     /// One request attempt. Classifies the failure shape so `execute`'s
     /// retry loop can decide without re-parsing an anyhow message.
-    async fn try_once(&self, parsed_method: &reqwest::Method) -> Result<HttpFetchResult, AttemptError> {
+    async fn try_once(
+        &self,
+        parsed_method: &reqwest::Method,
+    ) -> Result<HttpFetchResult, AttemptError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
             .build()
@@ -428,10 +437,9 @@ impl HttpFetchSpec {
         }
         let method = self.method.clone();
         let url = self.url.clone();
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AttemptError::Transport(anyhow!("http fetch {method} {url}: send: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            AttemptError::Transport(anyhow!("http fetch {method} {url}: send: {e}"))
+        })?;
         let status = resp.status().as_u16();
         let allow = match &self.expect_status {
             Some(arr) => arr.contains(&status),
@@ -642,8 +650,8 @@ mod tests {
 
     #[test]
     fn from_args_retry_not_object_rejected() {
-        let err = HttpFetchSpec::from_args(&json!({"url": "http://x", "retry": "yes"}))
-            .unwrap_err();
+        let err =
+            HttpFetchSpec::from_args(&json!({"url": "http://x", "retry": "yes"})).unwrap_err();
         assert!(format!("{err}").contains("retry must be an object"));
     }
 
@@ -680,16 +688,18 @@ mod tests {
     fn execute_uses_method_default_when_retry_unset() {
         // No `.retry` set at all (None) - unwrap_or_else must compute
         // the method-appropriate default, not silently retry a POST.
-        let get_spec = HttpFetchSpec::from_args(&json!({"url": "http://x", "method": "GET"}))
-            .unwrap();
+        let get_spec =
+            HttpFetchSpec::from_args(&json!({"url": "http://x", "method": "GET"})).unwrap();
         assert_eq!(get_spec.retry, None);
         assert_eq!(
-            get_spec.retry.unwrap_or_else(|| default_retry_for_method(&get_spec.method)),
+            get_spec
+                .retry
+                .unwrap_or_else(|| default_retry_for_method(&get_spec.method)),
             RetrySpec::default()
         );
 
-        let post_spec = HttpFetchSpec::from_args(&json!({"url": "http://x", "method": "POST"}))
-            .unwrap();
+        let post_spec =
+            HttpFetchSpec::from_args(&json!({"url": "http://x", "method": "POST"})).unwrap();
         assert_eq!(post_spec.retry, None);
         assert_eq!(
             post_spec
@@ -709,7 +719,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            s.retry.unwrap_or_else(|| default_retry_for_method(&s.method)).attempts,
+            s.retry
+                .unwrap_or_else(|| default_retry_for_method(&s.method))
+                .attempts,
             4
         );
     }
@@ -774,10 +786,7 @@ mod tests {
 
     #[test]
     fn exceeds_total_delay_budget_does_not_overflow_on_huge_delay() {
-        assert!(exceeds_total_delay_budget(
-            0,
-            Duration::from_secs(u64::MAX)
-        ));
+        assert!(exceeds_total_delay_budget(0, Duration::from_secs(u64::MAX)));
     }
 
     // ── classify_retry: pure, no network ─────────────────────────
@@ -965,7 +974,11 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://127.0.0.1:{}/probe", addr.port()), hits, server_handle)
+        (
+            format!("http://127.0.0.1:{}/probe", addr.port()),
+            hits,
+            server_handle,
+        )
     }
 
     #[tokio::test]

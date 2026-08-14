@@ -115,8 +115,7 @@ pub(crate) async fn rehydrate_arcs(state: Arc<SharedState>) {
     let mut resumed = 0usize;
     let mut interrupted = 0usize;
     for cp in checkpoints {
-        let resumable =
-            cp.status == ArcCheckpointStatus::Waiting && cp.in_flight_nodes.is_empty();
+        let resumable = cp.status == ArcCheckpointStatus::Waiting && cp.in_flight_nodes.is_empty();
         if resumable {
             resumed += 1;
             let state = state.clone();
@@ -137,9 +136,7 @@ pub(crate) async fn rehydrate_arcs(state: Arc<SharedState>) {
             mark_arc_interrupted(&state, &cp).await;
         }
     }
-    tracing::info!(
-        "arc rehydration: {resumed} arc(s) resumed, {interrupted} marked interrupted"
-    );
+    tracing::info!("arc rehydration: {resumed} arc(s) resumed, {interrupted} marked interrupted");
 }
 
 async fn mark_arc_interrupted(state: &Arc<SharedState>, cp: &ArcCheckpoint) {

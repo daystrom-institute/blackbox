@@ -380,8 +380,7 @@ mod tests {
 
     #[test]
     fn parse_shell_allowlist_arg_non_array_fails_closed() {
-        let err =
-            parse_shell_allowlist_arg(&serde_json::json!({"allowlist": "git"})).unwrap_err();
+        let err = parse_shell_allowlist_arg(&serde_json::json!({"allowlist": "git"})).unwrap_err();
         assert!(
             err.to_string().contains("must be an array"),
             "unexpected error: {err}"
@@ -390,8 +389,8 @@ mod tests {
 
     #[test]
     fn parse_shell_allowlist_arg_non_string_entry_fails_closed() {
-        let err = parse_shell_allowlist_arg(&serde_json::json!({"allowlist": ["git", 7]}))
-            .unwrap_err();
+        let err =
+            parse_shell_allowlist_arg(&serde_json::json!({"allowlist": ["git", 7]})).unwrap_err();
         assert!(
             err.to_string().contains("must be strings"),
             "unexpected error: {err}"

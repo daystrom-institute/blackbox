@@ -22,8 +22,7 @@ fn remaining_until(deadline_iso: &str) -> Option<Duration> {
 /// (WaitSpec allows absurdly large ones) clamp to ten years, which is
 /// indistinguishable from "no deadline" for any real arc.
 fn deadline_from_now(timeout: Duration) -> String {
-    let span = chrono::Duration::from_std(timeout)
-        .unwrap_or_else(|_| chrono::Duration::days(3650));
+    let span = chrono::Duration::from_std(timeout).unwrap_or_else(|_| chrono::Duration::days(3650));
     (chrono::Utc::now() + span).to_rfc3339()
 }
 
@@ -178,15 +177,11 @@ impl WorkflowRunner<'_> {
             // list_events returns newest-first; consume the OLDEST
             // unconsumed match so a backlog drains in arrival order
             // instead of starving old events behind new ones.
-            if let Some(event) = events
-                .into_iter()
-                .rev()
-                .find(|event| {
-                    !self.ctx.signal_event_consumed(&event.id)
-                        && matches_correlation(correlation, &event.correlation)
-                })
-                && let Some((resolved, notify, _, _)) =
-                    self.server.wait_store().take_exact(arc, wait_id)
+            if let Some(event) = events.into_iter().rev().find(|event| {
+                !self.ctx.signal_event_consumed(&event.id)
+                    && matches_correlation(correlation, &event.correlation)
+            }) && let Some((resolved, notify, _, _)) =
+                self.server.wait_store().take_exact(arc, wait_id)
             {
                 // Router-persisted idle signals carry the caller's raw
                 // payload; deliver that payload (not the event envelope)

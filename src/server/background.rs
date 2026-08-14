@@ -307,16 +307,15 @@ fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
                             })
                         })
                     };
-                    let resolved =
-                        signal_arc_dispatch(
-                            &shared,
-                            &signal,
-                            correlation,
-                            payload,
-                            SignalDispatchOrigin::SystemEventBridge,
-                            Some(event.id.clone()),
-                        )
-                        .await;
+                    let resolved = signal_arc_dispatch(
+                        &shared,
+                        &signal,
+                        correlation,
+                        payload,
+                        SignalDispatchOrigin::SystemEventBridge,
+                        Some(event.id.clone()),
+                    )
+                    .await;
                     tracing::debug!(
                         signal,
                         result = %resolved,

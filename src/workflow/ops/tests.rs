@@ -1522,8 +1522,7 @@ async fn shell_workflow_level_allowlist_enforced_via_arc_meta() {
     };
     let err = execute_op(&hook, &ctx, None).await.unwrap_err();
     assert!(
-        err.to_string()
-            .contains("workflow-level shell allowlist"),
+        err.to_string().contains("workflow-level shell allowlist"),
         "unexpected error: {err:#}"
     );
 }
@@ -1547,8 +1546,7 @@ async fn shell_per_op_allowlist_cannot_widen_workflow_level() {
     };
     let err = execute_op(&hook, &ctx, None).await.unwrap_err();
     assert!(
-        err.to_string()
-            .contains("workflow-level shell allowlist"),
+        err.to_string().contains("workflow-level shell allowlist"),
         "unexpected error: {err:#}"
     );
 }

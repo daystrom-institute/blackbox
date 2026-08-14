@@ -81,7 +81,14 @@ where
 {
     let mut visited = std::collections::HashSet::new();
     let mut warnings = Vec::new();
-    validate_refs_inner(spec, resolve, strict_missing, &mut visited, &mut warnings, 0)?;
+    validate_refs_inner(
+        spec,
+        resolve,
+        strict_missing,
+        &mut visited,
+        &mut warnings,
+        0,
+    )?;
     Ok(warnings)
 }
 
@@ -106,7 +113,14 @@ where
     for node_id in node_ids {
         let node = &spec.nodes[node_id];
         if let Some(inline) = &node.subworkflow {
-            validate_refs_inner(inline, resolve, strict_missing, visited, warnings, depth + 1)?;
+            validate_refs_inner(
+                inline,
+                resolve,
+                strict_missing,
+                visited,
+                warnings,
+                depth + 1,
+            )?;
         }
         if let Some(ref_id) = &node.subworkflow_ref {
             match resolve(ref_id) {
@@ -134,7 +148,9 @@ where
         for (label, fanout_ref) in [
             (
                 "foreach",
-                node.foreach.as_ref().and_then(|f| f.subworkflow_ref.clone()),
+                node.foreach
+                    .as_ref()
+                    .and_then(|f| f.subworkflow_ref.clone()),
             ),
             (
                 "matrix",
@@ -144,9 +160,7 @@ where
             if let Some(id) = fanout_ref {
                 if resolve(&id).is_none() {
                     if strict_missing {
-                        bail!(
-                            "node '{node_id}': {label}.subworkflow_ref '{id}' is not installed"
-                        );
+                        bail!("node '{node_id}': {label}.subworkflow_ref '{id}' is not installed");
                     }
                     warnings.push(format!(
                         "node '{node_id}': {label}.subworkflow_ref '{id}' not installed yet"
@@ -158,12 +172,7 @@ where
     Ok(())
 }
 
-fn validate_ref_seam(
-    node_id: &str,
-    node: &NodeSpec,
-    ref_id: &str,
-    child: &Workflow,
-) -> Result<()> {
+fn validate_ref_seam(node_id: &str, node: &NodeSpec, ref_id: &str, child: &Workflow) -> Result<()> {
     let Some(schema) = &child.vars_schema else {
         // No child contract declared: nothing statically checkable.
         return Ok(());
