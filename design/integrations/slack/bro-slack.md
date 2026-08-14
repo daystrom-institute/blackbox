@@ -200,7 +200,8 @@ capability to a tier. Implementation phases will live in a companion
 3b. Open the durable spool directory (§5.6) and replay anything a
    previous process left undelivered. Failing to open the spool is
    fatal: a sidecar that cannot write the spool cannot honestly ack.
-4. For each event envelope:
+4. ACCEPTANCE, for each event envelope. Runs to completion on the
+   socket task; never cancelled, never deadline-cut (see below):
      a. Filter loop-back (event.user == self_user_id OR
         event.bot_id == self_bot_id → drop). Nothing to deliver, so
         this acks without spooling.
@@ -210,12 +211,23 @@ capability to a tier. Implementation phases will live in a companion
         `_meta.bbox_can_dispatch`. Unmapped users get
         `bbox_user: "anonymous"`, `bbox_scopes: ["read"]`,
         `bbox_can_dispatch: false` (§6.3).
-     d. Write the normalized envelope to the durable spool and fsync
-        (§5.6). On failure: WITHHOLD the ack, release the in-flight
-        claim, log at error level, and let Slack redeliver.
+     d. Write the normalized envelope to the durable spool, fsync the
+        file, rename, fsync the directory (§5.6). On ANY failure:
+        WITHHOLD the ack, release the in-flight claim, log at error
+        level, and let Slack redeliver.
      e. Ack to Slack. The envelope is now durable locally, so Slack
         can forget it.
-     f. POST to http://127.0.0.1:7264/webhook/slack with envelope.
+     f. Enqueue it for delivery on a bounded worker queue. A full
+        queue is not an error: the entry is durable, so the sweep
+        picks it up.
+5. DELIVERY, on the worker (or a drain lane), after the ack:
+     a. Take the envelope's delivery lease. Held elsewhere means
+        another lane owns it; do nothing.
+     a2. Re-read the CURRENT spool entry by id. Gone means another lane
+        already delivered it; do nothing. Queue entries and drain
+        snapshots carry ids only, never bodies, so a stale request can
+        never be POSTed.
+     b. POST to http://127.0.0.1:7264/webhook/slack with envelope.
         Header: X-Slack-Envelope-Id: <id>.
         On 2xx: delete the spool entry.
         On non-2xx: retry up to 2 more times with 500ms then 1s
@@ -223,32 +235,48 @@ capability to a tier. Implementation phases will live in a companion
         sleep). After the 3rd attempt fails, the envelope STAYS in
         the spool, stamped with the attempt count and last error,
         for the retry sweep (§5.6).
-5. Every --spool-sweep-secs (default 300): re-attempt spooled
-   envelopes that are past the quiet period, and discard entries past
-   the age bound with a structured error log.
-6. On disconnect: exponential backoff reconnect (1s → 60s cap).
-7. On SIGTERM: stop accepting new events, drain in-flight POSTs
-   (≤2s grace), close socket, exit 0. Anything undelivered is already
-   in the spool and is replayed on the next start.
+     c. Three consecutive failed rounds gate the endpoint for an
+        escalating 5s to 60s window; gated lanes skip the POST and
+        leave entries untouched.
+6. Every --spool-sweep-secs (default 300): re-attempt spooled
+   envelopes that are past the quiet period, in batches of 200, and
+   discard entries past the age bound with a structured error log.
+7. On disconnect: exponential backoff reconnect (1s → 60s cap).
+8. On SIGTERM: stop accepting new events, let the delivery worker
+   finish what it holds (≤5s grace), close socket, exit 0. Anything
+   undelivered is already in the spool and is replayed on the next
+   start.
 ```
+
+**The phase split is the safety property, not a structural
+preference.** Acceptance ends by telling Slack to forget the
+envelope, and Slack has no server-side replay, so a cancellation
+between the durable write and the ack loses the event, and an ack
+emitted because a shutdown deadline expired loses an event whose
+spool write may never have landed. Acceptance is therefore bounded by
+one fsync plus one socket write and is allowed to finish even during
+shutdown, which it can do quickly precisely because it does no
+network I/O. Delivery, which does, is the only phase a deadline may
+cut, and by then everything it touches is durable.
 
 Two timing constraints used to overlap. Slack's Socket Mode ack
 deadline is ~3 seconds; exceeding it triggers Slack-side redelivery,
-while the sidecar's 3-attempt local retry budget can reach ~4.5s
-against a slow daemon. Moving the ack to step 4e (immediately after
-the durable write, before the POST) decouples the two: the ack now
-depends only on a local fsync, so daemon latency can no longer push
-the sidecar past Slack's deadline.
+while a 3-attempt POST retry budget can reach ~4.5s against a slow
+daemon. Moving the ack to step 4e (after the durable write, before
+any POST) decouples the two: the ack now depends only on a local
+fsync, so daemon latency can no longer push the sidecar past Slack's
+deadline, and moving delivery off the socket task keeps the reader
+responsive while a round is in flight.
 
 Redelivery dedup still matters for the residual window between
 receiving a frame and completing the spool write. Two layers defend
 it: the daemon's `X-Slack-Envelope-Id` header dedup (§6.5) catches
 POSTs that reach the daemon, and an in-sidecar in-flight-envelope-id
-set drops a Slack-redelivered envelope before a second spool write
-and POST are issued. The sidecar holds the in-flight set for 30s.
-The one case where the claim is deliberately RELEASED is a failed
-spool write: there the sidecar is counting on redelivery, so holding
-the claim would dedupe away its own recovery path.
+set drops a Slack-redelivered envelope before a second spool write is
+issued. The sidecar holds the in-flight set for 30s. The one case
+where the claim is deliberately RELEASED is a failed spool write:
+there the sidecar is counting on redelivery, so holding the claim
+would dedupe away its own recovery path.
 
 The ack-only-after-durability rule in steps 4d/4e is load-bearing.
 Acking before anything is durable means events are silently lost on
@@ -344,24 +372,114 @@ digest of the original id so two ids cannot collide onto one file.
 Unparseable or unknown-version files are renamed to `.json.corrupt`
 rather than deleted or re-read forever.
 
-**Delivery lanes.** Three, all using the same POST path and therefore
-the same daemon-side `X-Slack-Envelope-Id` dedup:
+Directory sync is NOT best effort on this path. A rename whose
+directory entry is lost by a crash, followed by an ack that already
+told Slack to forget the envelope, is the exact loss the spool exists
+to prevent, so a failed directory fsync fails the write and withholds
+the ack. The stamp and delete paths downgrade it: losing an attempt
+counter costs a retry, and losing an unlink costs a duplicate the
+daemon absorbs.
 
-- *Inline*, immediately after the ack, so the happy path is unchanged
+A failed sync still COUNTS the entry, though. The rename has already
+landed by then, so the file is visible to every reader; leaving it out
+of the depth counter understates the spool, which makes the drain skip
+its inventory on a depth of zero and lets later admissions slip past
+the entry cap. The write reports failure (so the ack is withheld) while
+the accounting reflects what is actually on disk. A Slack redelivery
+then finds the entry already present and republishes it without
+double counting.
+
+**Accounting is serialized.** Every entry-path and depth mutation
+(admit, remove, stamp, inventory) runs under one lock. The cap is
+read-modify-write, so unserialized admissions each see the
+pre-eviction depth and overshoot; and a persist that probes an id as
+present, races a concurrent remove, republishes, and skips the
+increment it now owes leaves the same visible-but-uncounted file as
+the sync case. One lock over all four operations removes the family
+rather than patching the instances.
+
+**Acceptance and delivery are separate phases.** Acceptance is
+normalize, spool, ack, hand off. It is bounded by one fsync plus one
+socket write and is never cancelled, never deadline-cut, and never
+raced against shutdown: a cancellation between the durable write and
+the ack, or an ack emitted because a deadline expired, loses the
+envelope outright. Delivery is everything after the ack and is the
+only phase a deadline may cut, because everything it touches is
+already durable.
+
+Delivery therefore runs on a bounded worker queue rather than on the
+socket task. A delivery round can burn ~4.5s against a sick daemon,
+and the socket reader cannot afford to wait through that: Slack keeps
+pushing frames, and a blocked reader turns one slow daemon into a
+backlog of unacked envelopes. A full queue is backpressure, not loss.
+The envelope is already durable, so overflow simply falls to the
+sweep.
+
+**Delivery lanes.** Three, all going through the same lease, breaker,
+POST path, and settlement, and therefore the same daemon-side
+`X-Slack-Envelope-Id` dedup:
+
+- *Worker*, immediately after the ack, so the happy path is unchanged
   in latency.
 - *Boot replay*, on start, with no quiet period. It runs alongside the
   Socket Mode connection rather than ahead of it, so a large backlog
   cannot delay accepting live traffic. Slack does not guarantee event
-  ordering in the first place.
+  ordering in the first place. It keeps issuing batches while batches
+  keep making progress (capped at 64), because one batch is bounded at
+  200 entries and a one-shot replay would strand everything past that
+  until some later pass. A batch that achieves nothing stops the loop
+  rather than spinning on a daemon that is down.
 - *Retry sweep*, every `--spool-sweep-secs` (default 300s). It skips
-  entries touched within a 60s quiet period, which is what keeps it
-  from racing the inline attempt for a just-spooled envelope.
+  entries touched within a 60s quiet period so it does not churn on
+  work the worker is about to do. That quiet period is an efficiency
+  filter, not a safety mechanism: the lease and the entry re-read are
+  what make lane overlap safe.
+- The drain lane also wakes ON DEMAND, independently of the timer,
+  when the delivery queue overflows. Deferring an envelope to "the
+  sweep" is only sound if a sweep is coming, and `--spool-sweep-secs 0`
+  means none is. A wakeup pass uses no quiet period, because the
+  wakeup means the worker explicitly did not take that envelope.
+  Setting the interval to 0 therefore disables the PERIODIC lane only,
+  not the drain lane: the documented consequence is that an envelope
+  whose delivery round fails then waits for the next overflow wakeup or
+  the next process start.
 
-Drains are sequential, not fanned out: a drain runs precisely when the
-daemon has been unhealthy, and firing a backlog at it the moment it
-returns is the wrong first move.
+The boot replay and the sweep share one task, so drains never overlap
+each other, and every lane takes a per-envelope delivery lease before
+touching an entry. The lease is what makes CONCURRENT lanes safe:
+without it two lanes can POST one envelope at once and, worse, race
+each other's settlement, where one deletes the entry while the other
+stamps a failure onto it and resurrects a delivered envelope. The
+lease is in-process; two sidecars sharing one spool directory is not a
+supported deployment.
 
-**Growth bounds.** Two, both loud, neither silent:
+The lease alone does not cover SEQUENTIAL delivery from stale state,
+which is the subtler half. A drain snapshots the spool, the worker
+delivers and removes one of those envelopes, and only then does the
+drain reach it: by that point the lease is free, so a lane holding the
+old body would happily POST it again. Two rules close it. Queue
+requests and drain snapshots carry only envelope ids, never
+independently deliverable bodies; and delivery re-reads the current
+entry by id after taking the lease, treating a missing entry as
+already settled. An envelope's body is therefore only ever read from
+the entry that still exists at the moment of the POST.
+
+Drains are sequential and batched at 200 entries per pass, with the
+deferred remainder logged rather than silently dropped. A drain runs
+precisely when the daemon has been unhealthy, so firing an unbounded
+backlog at it the moment it returns is the wrong first move, and an
+unbounded pass would also delay age-bound discards behind thousands of
+doomed POSTs.
+
+**Endpoint breaker.** After three consecutive failed delivery rounds
+the daemon endpoint is gated for an escalating 5s to 60s window. While
+gated, lanes skip POSTing entirely and leave entries untouched, and a
+drain that hits the gate abandons the pass. Without this, a spool of
+thousands against a daemon that is down spends ~4.5s per entry
+achieving nothing. Any success reshuts the breaker.
+
+**Growth bounds.** Two on entries, both loud, neither silent, plus
+bounds on the incidental artifacts:
 
 - *Age*: `--spool-max-age-secs`, default 86400 (24h). Long enough to
   cover an overnight daemon outage, short enough that the sidecar is
@@ -374,19 +492,28 @@ returns is the wrong first move.
 - *Count*: `--spool-max-entries`, default 5000 (roughly 20MB at a few
   KB per envelope). At the cap the OLDEST entries are evicted to admit
   the newest. Shedding fresh traffic to preserve a day-old backlog is
-  the wrong trade, and refusing to spool would mean refusing to ack,
-  which turns into a Slack redelivery storm. Each eviction is an error
-  log plus `events_spool_evicted_overflow`.
+  the wrong trade. Two ordering rules matter here: whether an id
+  already has an entry is decided BEFORE eviction runs, so re-spooling
+  an existing envelope at the cap does not evict an unrelated one for
+  a slot it will not consume; and admission is serialized, so
+  concurrent writes cannot each see the pre-eviction depth and
+  overshoot. If the spool cannot be brought under the cap, the write
+  is REFUSED and the ack withheld, rather than acking past the bound.
+  Each eviction is an error log plus `events_spool_evicted_overflow`.
+- *Artifacts*: orphaned `.tmp` files older than an hour are deleted,
+  and `.corrupt` quarantines are capped at the newest 50. A crash loop
+  would otherwise leave unbounded partials, and a systematic parse bug
+  would fill the directory with quarantine copies.
 
 **What the spool does not do.** It is not an ordering guarantee, not a
 transaction log, and not a substitute for the daemon's own
 `X-Slack-Envelope-Id` dedup: replay can re-POST an envelope the daemon
-already accepted (a delivered entry whose deletion failed, for
-instance), and the daemon is the layer that makes that harmless. It
-also does not cover the pre-normalization window: a crash between
-reading the WebSocket frame and completing the spool write relies on
-Slack redelivery, which is exactly why the ack is withheld on a failed
-spool write.
+already accepted (a crash between the daemon's 2xx and the spool
+delete, or a delete whose unlink was lost), and the daemon is the
+layer that makes that harmless. It also does not cover the
+pre-acceptance window: a crash between reading the WebSocket frame and
+completing the spool write relies on Slack redelivery, which is
+exactly why the ack is withheld on a failed spool write.
 
 ## 6. Webhook envelope — sidecar to daemon
 
@@ -883,9 +1010,11 @@ operators opt into v1.5 / Phase II by adding scopes and re-installing.
 
 ### 9.3 Token rotation
 
-- **App token:** sidecar SIGTERM → systemd restart with new env. ≤2s
-  inbound buffer; Slack does not redeliver post-ack events, so events
-  arriving in the gap are lost. Acceptable for rotation windows.
+- **App token:** sidecar SIGTERM → systemd restart with new env. The
+  restart gap costs no events: anything not yet acked is still Slack's
+  to redeliver, and anything acked is in the durable spool (§5.6) and
+  replays on the next start. Shutdown lets the delivery worker finish
+  what it holds for ≤5s, and cutting that short only defers delivery.
 - **Bot token:** daemon restart (Web API hooks read env at fire time).
   In-flight workflow nodes mid-POST may fail one call; retry policy
   handles it.
@@ -1299,7 +1428,8 @@ received webhooks. Cross-process correlation key: `envelope_id`.
 |---|---|---|
 | Slack down | Sidecar reconnect loop; daemon untouched | — |
 | Sidecar crash | systemd restart; pre-ack events redeliver from Slack; post-ack events are in the durable spool (§5.6) and replay on start | — |
-| Daemon down | Envelope is spooled and acked, the inline retry budget fails, the entry is RETAINED and re-attempted by the boot replay and the 300s sweep until 2xx or the 24h age bound | — |
+| Daemon down | Envelope is spooled and acked, the worker's retry budget fails, the entry is RETAINED and re-attempted by the boot replay and the 300s sweep until 2xx or the 24h age bound. After 3 consecutive failed rounds the endpoint breaker gates attempts so a large spool does not grind | — |
+| Daemon crashes between returning 2xx and the sidecar deleting the entry | The entry replays on the next pass and the daemon sees the envelope twice. This is the at-least-once ceiling and cannot be closed sidecar-side | Daemon-side `X-Slack-Envelope-Id` dedupe hardening (tracked separately) |
 | Sidecar cannot write its spool (disk full, permissions) | Ack is WITHHELD so Slack redelivers; `events_spool_write_failed` climbs and the error log names the spool dir. Nothing is lost, but the sidecar is not durably accepting traffic and needs an operator | Health-endpoint alerting |
 | Daemon down longer than the spool age bound | Entries past `--spool-max-age-secs` are discarded with a structured error naming each envelope_id; `events_spool_discarded_aged` counts them | Longer bound, or a dead-letter export |
 | Token rotated mid-flight | 401; sidecar exits and systemd restarts | — |
@@ -1310,16 +1440,22 @@ received webhooks. Cross-process correlation key: `envelope_id`.
 | Slack Workflow Builder posting to webhook | Not supported at v1 (loopback-only daemon cannot receive cloud Slack POSTs) | Public-ingress deployment shape (out of v1 scope) |
 | Bot kicked from channel | Channel-scoped events stop; arcs correlated to that channel's threads time out per Wait policies | — |
 
-The contract is now at-least-once delivery, bounded by age: an
+The contract is bounded AT-LEAST-ONCE delivery to the daemon: an
 envelope the sidecar has acked is on local disk and is retried until
 the daemon returns 2xx or the entry passes `--spool-max-age-secs`.
-Duplicates are possible (a replay can re-POST an envelope the daemon
-already accepted) and are absorbed by the daemon's
-`X-Slack-Envelope-Id` dedup, so the guarantee is at-least-once at the
-sidecar hop and effectively exactly-once at the daemon. What the
-sidecar still cannot promise is anything downstream of that POST: once
-the daemon accepts an envelope, persistence is whatever the workflow
-engine offers.
+
+At-least-once is the honest ceiling, and the sidecar cannot raise it.
+Delivery and spool deletion are two operations with no atomic bracket
+around them, so a crash between the daemon's 2xx and the delete leaves
+an entry that is replayed on the next start. Suppressing that
+duplicate is the DAEMON's job, via `X-Slack-Envelope-Id` dedup, and
+whatever guarantee the combined system offers is a property of that
+dedup, not of this spool. Do not read the spool as exactly-once at any
+layer; hardening the daemon-side dedup is tracked separately.
+
+What the sidecar cannot promise at all is anything downstream of the
+POST: once the daemon accepts an envelope, persistence is whatever the
+workflow engine offers.
 
 ## 15. Boundaries — what `bro-slack` is NOT
 

@@ -79,18 +79,6 @@ pub const TMP_ARTIFACT_GRACE: Duration = Duration::from_secs(3_600);
 /// pathological loop cannot fill the disk with them.
 pub const MAX_CORRUPT_ARTIFACTS: usize = 50;
 
-/// Whether a write must prove the directory entry itself is durable.
-///
-/// `Required` is for the acceptance path: the ack that follows promises
-/// the envelope survives a crash, and an unsynced rename does not. The
-/// stamp path uses `BestEffort` because losing an attempt counter costs
-/// an extra retry, not an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirSync {
-    Required,
-    BestEffort,
-}
-
 // ── Entry ───────────────────────────────────────────────────────────
 
 /// One spooled envelope, already normalized and ACL-enriched.
@@ -129,10 +117,10 @@ impl SpoolEntry {
 
 /// Bytes of SHA-256 kept in a spool file name.
 ///
-/// The digest is what makes the name injective, so it has to be wide
-/// enough that a collision is not a practical concern: 16 bytes (128
-/// bits) puts a birthday collision far beyond any spool size, where a
-/// 4-byte suffix would collide within a few tens of thousands of ids.
+/// Sanitization and truncation are lossy, so the digest is what keeps
+/// distinct ids on distinct files. 16 bytes (128 bits) is
+/// collision-resistant at any realistic spool scale; a 4-byte suffix
+/// would be expected to collide within a few tens of thousands of ids.
 const NAME_DIGEST_BYTES: usize = 16;
 
 /// Map an envelope_id to its spool file name.
@@ -141,7 +129,8 @@ const NAME_DIGEST_BYTES: usize = 16;
 /// is never trusted as a path component: everything outside
 /// `[A-Za-z0-9_-]` is replaced, and the name is length-bounded. Because
 /// replacement and truncation are both lossy, a digest of the ORIGINAL
-/// id is appended so two distinct ids can never collide onto one file.
+/// id is appended so two distinct ids do not land on one file at any
+/// realistic spool scale.
 ///
 /// Changing this scheme is safe: `list` renames any entry whose file
 /// name is not the current canonical one, so a spool written by an older
@@ -254,10 +243,28 @@ pub struct EnvelopeSpool {
     policy: SpoolPolicy,
     depth: AtomicU64,
     evicted_overflow: AtomicU64,
-    /// Serializes admission. Capacity accounting is read-modify-write
-    /// (inventory, evict, publish), so concurrent persists would
-    /// otherwise each see the pre-eviction depth and overshoot the cap.
+    /// Serializes EVERY entry-path and depth mutation: persist, remove,
+    /// stamp, inventory.
+    ///
+    /// The cap is read-modify-write (inventory, evict, publish), so
+    /// unserialized persists would each see the pre-eviction depth and
+    /// overshoot. The subtler case is a persist that probes an id as
+    /// present, races a concurrent remove, republishes, and then skips
+    /// the increment it now owes: the file is visible but uncounted, so
+    /// the sweep skips inventory on a depth of zero and later admissions
+    /// bypass the cap. One lock over all four operations removes the
+    /// whole family.
+    ///
+    /// Methods that assume the lock is already held are suffixed
+    /// `_locked`; the public wrappers take it. The lock is NOT reentrant,
+    /// so a `_locked` method must never call a public one.
     admission: tokio::sync::Mutex<()>,
+    /// Test-only fault injection for the post-rename directory sync, the
+    /// one failure that leaves a file visible while the write reports
+    /// failure. There is no portable way to provoke it on a real
+    /// filesystem.
+    #[cfg(test)]
+    fail_dir_sync: std::sync::atomic::AtomicBool,
 }
 
 impl EnvelopeSpool {
@@ -279,6 +286,8 @@ impl EnvelopeSpool {
             depth: AtomicU64::new(0),
             evicted_overflow: AtomicU64::new(0),
             admission: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fail_dir_sync: std::sync::atomic::AtomicBool::new(false),
         };
         // `list` is the authoritative recount and sets `depth`. It also
         // heals file names written by an older naming scheme.
@@ -340,7 +349,7 @@ impl EnvelopeSpool {
             // eviction would ack an envelope into a spool that is over
             // its own cap, which is the unbounded growth the cap exists
             // to prevent.
-            self.enforce_capacity().await?;
+            self.enforce_capacity_locked().await?;
         }
 
         let entry = SpoolEntry {
@@ -352,12 +361,41 @@ impl EnvelopeSpool {
             last_error: None,
             event: event.clone(),
         };
-        self.write_entry(&entry, DirSync::Required).await?;
+        self.publish_entry(&entry).await?;
 
+        // Count it the moment the rename lands, BEFORE the directory sync
+        // that can still fail. A published file that the sync failed on is
+        // visible to every reader, so leaving it uncounted understates
+        // depth, which makes the sweep skip its inventory and lets later
+        // admissions slip past the cap. The write still reports failure so
+        // the caller withholds the ack; a Slack redelivery then finds the
+        // entry already present and republishes without double counting.
         if !already_present {
             self.depth.fetch_add(1, Ordering::Relaxed);
         }
+
+        self.sync_dir().await.with_context(|| {
+            format!("the spool entry for {envelope_id} was written but its directory entry is not durable")
+        })?;
         Ok(())
+    }
+
+    /// Load one entry by id, or `None` when it is no longer spooled.
+    ///
+    /// Delivery lanes call this AFTER taking the envelope's lease so they
+    /// act on the entry as it exists now, never on a body captured in an
+    /// earlier snapshot that another lane has since delivered and removed.
+    pub async fn load(&self, envelope_id: &str) -> Result<Option<SpoolEntry>> {
+        let path = self.entry_path(envelope_id);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                let entry: SpoolEntry = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parsing spool entry {}", path.display()))?;
+                Ok(Some(entry))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading spool entry {}", path.display())),
+        }
     }
 
     /// Drop an entry after confirmed delivery. Missing is success: the
@@ -368,6 +406,11 @@ impl EnvelopeSpool {
     /// envelope-id dedup absorbs; it is not a lost event, so failing the
     /// removal over it would trade a benign duplicate for a hard error.
     pub async fn remove(&self, envelope_id: &str) -> Result<()> {
+        let _admitted = self.admission.lock().await;
+        self.remove_locked(envelope_id).await
+    }
+
+    async fn remove_locked(&self, envelope_id: &str) -> Result<()> {
         let path = self.entry_path(envelope_id);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
@@ -390,6 +433,11 @@ impl EnvelopeSpool {
     /// how long an envelope has been stuck and why. Not loss-bearing: the
     /// entry itself is already durable, so the stamp syncs best effort.
     pub async fn record_failure(&self, envelope_id: &str, error: &str) -> Result<()> {
+        // Under the admission lock so a stamp cannot republish an entry a
+        // concurrent remove just deleted, which would resurrect a
+        // delivered envelope with depth understated.
+        let _admitted = self.admission.lock().await;
+
         let path = self.entry_path(envelope_id);
         let bytes = tokio::fs::read(&path)
             .await
@@ -404,13 +452,26 @@ impl EnvelopeSpool {
             reason.truncate(500);
         }
         entry.last_error = Some(reason);
-        self.write_entry(&entry, DirSync::BestEffort).await
+        self.publish_entry(&entry).await?;
+        if let Err(e) = self.sync_dir().await {
+            tracing::debug!(
+                envelope_id = envelope_id,
+                error = %e,
+                "spool stamp was not directory-synced; worst case is one extra retry"
+            );
+        }
+        Ok(())
     }
 
     /// Every readable entry, oldest first. Unreadable files are
     /// quarantined to `.corrupt` rather than deleted or re-read forever.
     /// Refreshes the depth counter to the true on-disk count.
     pub async fn list(&self) -> Result<Vec<SpoolEntry>> {
+        let _admitted = self.admission.lock().await;
+        self.list_locked().await
+    }
+
+    async fn list_locked(&self) -> Result<Vec<SpoolEntry>> {
         let mut reader = tokio::fs::read_dir(&self.dir)
             .await
             .with_context(|| format!("reading the slack spool directory {}", self.dir.display()))?;
@@ -491,7 +552,7 @@ impl EnvelopeSpool {
     /// Returns Err when the spool cannot be brought under its cap. The
     /// caller refuses the write rather than acking past the bound.
     /// Caller must hold `admission`.
-    async fn enforce_capacity(&self) -> Result<()> {
+    async fn enforce_capacity_locked(&self) -> Result<()> {
         if self.policy.max_entries == 0 {
             return Ok(());
         }
@@ -500,7 +561,7 @@ impl EnvelopeSpool {
         }
 
         let entries = self
-            .list()
+            .list_locked()
             .await
             .context("inventorying the spool to enforce its entry cap")?;
         let to_evict = overflow_evictions(entries.len(), 1, self.policy.max_entries);
@@ -514,7 +575,7 @@ impl EnvelopeSpool {
                 max_entries = self.policy.max_entries,
                 "slack spool is at capacity; evicting the oldest undelivered envelope"
             );
-            match self.remove(&entry.envelope_id).await {
+            match self.remove_locked(&entry.envelope_id).await {
                 Ok(()) => {
                     self.evicted_overflow.fetch_add(1, Ordering::Relaxed);
                 }
@@ -535,7 +596,15 @@ impl EnvelopeSpool {
         Ok(())
     }
 
-    async fn write_entry(&self, entry: &SpoolEntry, dir_sync: DirSync) -> Result<()> {
+    /// Write and rename an entry into place. Returns Ok once the rename
+    /// has landed and the file is VISIBLE to readers.
+    ///
+    /// The directory sync is deliberately NOT part of this: callers have
+    /// to be able to update their accounting for a published file before
+    /// deciding what a sync failure means to them. Folding the sync in
+    /// here is what let a post-rename failure leave a visible file
+    /// uncounted.
+    async fn publish_entry(&self, entry: &SpoolEntry) -> Result<()> {
         let path = self.entry_path(&entry.envelope_id);
         // A unique temp name per write. A deterministic one lets two
         // concurrent writes for the same envelope interleave into one
@@ -580,24 +649,7 @@ impl EnvelopeSpool {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
-
-        match self.sync_dir().await {
-            Ok(()) => Ok(()),
-            Err(e) if dir_sync == DirSync::Required => Err(e).with_context(|| {
-                format!(
-                    "the spool entry for {} was written but its directory entry is not durable",
-                    entry.envelope_id
-                )
-            }),
-            Err(e) => {
-                tracing::debug!(
-                    envelope_id = %entry.envelope_id,
-                    error = %e,
-                    "spool directory fsync failed on a non-acceptance write"
-                );
-                Ok(())
-            }
-        }
+        Ok(())
     }
 
     /// fsync the directory so the rename itself is durable.
@@ -608,6 +660,13 @@ impl EnvelopeSpool {
     /// loss the spool exists to prevent. Callers that are not about to
     /// ack downgrade the failure themselves.
     async fn sync_dir(&self) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_dir_sync
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            anyhow::bail!("injected directory fsync failure");
+        }
         let dir = tokio::fs::File::open(&self.dir)
             .await
             .with_context(|| format!("opening {} for fsync", self.dir.display()))?;
@@ -615,6 +674,14 @@ impl EnvelopeSpool {
             .await
             .with_context(|| format!("fsync of {}", self.dir.display()))?;
         Ok(())
+    }
+
+    /// Test hook: make every subsequent directory sync fail, so the
+    /// published-but-unsynced window is reachable deterministically.
+    #[cfg(test)]
+    pub fn arm_dir_sync_failure(&self, fail: bool) {
+        self.fail_dir_sync
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Rename an entry whose file name predates the current naming
@@ -1129,6 +1196,113 @@ mod tests {
                 e.path().display()
             );
         }
+    }
+
+    /// Count entry files directly, without going through `list`, which
+    /// would itself reset `depth` and hide a drifted counter.
+    async fn count_entry_files(spool: &EnvelopeSpool) -> usize {
+        let mut reader = tokio::fs::read_dir(spool.dir()).await.unwrap();
+        let mut n = 0;
+        while let Some(e) = reader.next_entry().await.unwrap() {
+            if e.path().extension().and_then(|x| x.to_str()) == Some("json") {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Interleaving (a): a persist that probes an id as already present
+    /// while a remove for that id is in flight. Unserialized, the persist
+    /// republishes and skips the increment it now owes, leaving a visible
+    /// file the counter does not know about.
+    #[tokio::test]
+    async fn concurrent_persist_and_remove_keep_depth_truthful() {
+        let (_dir, spool) = spool_fixture(SpoolPolicy::default()).await;
+        let spool = std::sync::Arc::new(spool);
+
+        for round in 0..25 {
+            let id = format!("env-{round}");
+            spool.persist(&id, &body(&id)).await.unwrap();
+
+            let a = spool.clone();
+            let b = spool.clone();
+            let (ida, idb) = (id.clone(), id.clone());
+            let persist = tokio::spawn(async move { a.persist(&ida, &json!({"round": 1})).await });
+            let remove = tokio::spawn(async move { b.remove(&idb).await });
+            persist.await.unwrap().unwrap();
+            remove.await.unwrap().unwrap();
+
+            let on_disk = count_entry_files(&spool).await;
+            assert_eq!(
+                spool.depth() as usize,
+                on_disk,
+                "round {round}: depth {} disagrees with {on_disk} file(s) on disk",
+                spool.depth()
+            );
+            // Leave a clean slate for the next round.
+            spool.remove(&id).await.unwrap();
+        }
+    }
+
+    /// Interleaving (b): the directory sync fails AFTER the rename, so
+    /// the file is visible while the write reports failure. The entry
+    /// must still be counted, or the sweep skips its inventory on a
+    /// depth of zero and later admissions slip past the cap.
+    #[tokio::test]
+    async fn a_post_rename_sync_failure_still_counts_the_visible_entry() {
+        let (_dir, spool) = spool_fixture(SpoolPolicy::default()).await;
+        spool.arm_dir_sync_failure(true);
+
+        let err = spool
+            .persist("env-unsynced", &body("env-unsynced"))
+            .await
+            .expect_err("an unsyncable write must report failure so the ack is withheld");
+        assert!(
+            format!("{err:#}").contains("not durable"),
+            "the error explains why the ack is withheld: {err:#}"
+        );
+
+        // The rename landed, so the file is there and must be counted.
+        assert_eq!(count_entry_files(&spool).await, 1, "the file is visible");
+        assert_eq!(
+            spool.depth(),
+            1,
+            "a visible entry is counted even though the sync failed"
+        );
+
+        spool.arm_dir_sync_failure(false);
+        let entries = spool.list().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].envelope_id, "env-unsynced");
+    }
+
+    /// The follow-on: because the failed write is counted, the cap still
+    /// holds. Understating depth here is what let later admissions bypass
+    /// it.
+    #[tokio::test]
+    async fn the_cap_still_holds_after_an_unsynced_write() {
+        let (_dir, spool) = spool_fixture(policy(86_400, 1)).await;
+        spool.arm_dir_sync_failure(true);
+        let _ = spool.persist("first", &body("first")).await;
+        spool.arm_dir_sync_failure(false);
+
+        assert_eq!(spool.depth(), 1, "the unsynced entry is on the books");
+        spool.persist("second", &body("second")).await.unwrap();
+        // Admitting "second" had to evict "first" to stay at the cap.
+        assert_eq!(spool.depth(), 1);
+        assert_eq!(spool.evicted_overflow(), 1, "the cap was enforced");
+    }
+
+    #[tokio::test]
+    async fn load_returns_none_for_a_settled_entry() {
+        let (_dir, spool) = spool_fixture(SpoolPolicy::default()).await;
+        spool.persist("env-1", &body("env-1")).await.unwrap();
+        assert!(spool.load("env-1").await.unwrap().is_some());
+        spool.remove("env-1").await.unwrap();
+        assert!(
+            spool.load("env-1").await.unwrap().is_none(),
+            "delivery lanes see a settled entry as gone, not as a stale body"
+        );
     }
 
     #[tokio::test]

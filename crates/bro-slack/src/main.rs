@@ -1023,27 +1023,34 @@ struct BridgeContext<'a> {
     health: Option<&'a SharedHealthStats>,
     spool: Arc<EnvelopeSpool>,
     delivery_tx: tokio::sync::mpsc::Sender<DeliveryRequest>,
+    /// Wakes the drain task without waiting for its timer. Deferring to
+    /// "the sweep will get it" is only true if a sweep is coming, and
+    /// with `--spool-sweep-secs 0` none is.
+    spool_wakeup: Arc<tokio::sync::Notify>,
 }
 
 impl BridgeContext<'_> {
     /// Queue an accepted envelope for post-ack delivery.
     ///
     /// A full queue is a backpressure signal, not a loss: the envelope is
-    /// already durable, so the sweep delivers it. Blocking here would
-    /// stall the socket reader, which is exactly what the queue exists to
-    /// prevent.
-    fn enqueue_delivery(&self, envelope_id: &str, body: Value) {
+    /// already durable. Blocking here would stall the socket reader,
+    /// which is exactly what the queue exists to prevent. Overflow hands
+    /// the envelope to the drain task and WAKES it, so the handoff does
+    /// not depend on a periodic timer that may be switched off.
+    fn enqueue_delivery(&self, envelope_id: &str) {
         use tokio::sync::mpsc::error::TrySendError;
         let request = DeliveryRequest {
             envelope_id: envelope_id.to_string(),
-            body,
         };
         match self.delivery_tx.try_send(request) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => tracing::warn!(
-                envelope_id = envelope_id,
-                "delivery queue is full; the envelope stays spooled for the retry sweep"
-            ),
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(
+                    envelope_id = envelope_id,
+                    "delivery queue is full; waking the spool drain to take the envelope"
+                );
+                self.spool_wakeup.notify_one();
+            }
             Err(TrySendError::Closed(_)) => tracing::debug!(
                 envelope_id = envelope_id,
                 "delivery worker is gone; the envelope stays spooled"
@@ -1233,10 +1240,16 @@ const DELIVERY_QUEUE: usize = 256;
 const DELIVERY_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// One post-ack delivery attempt handed to the worker queue.
+///
+/// It carries only the envelope id. A request that carried the body
+/// would be independently deliverable, so a request sitting in the queue
+/// (or an entry captured in a drain's snapshot) could be POSTed after
+/// another lane had already delivered and removed that envelope: the
+/// lease stops simultaneous POSTs, not sequential ones from stale state.
+/// Delivery re-reads the CURRENT entry by id under the lease instead.
 #[derive(Debug, Clone)]
 struct DeliveryRequest {
     envelope_id: String,
-    body: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1250,6 +1263,10 @@ enum DeliveryVerdict {
     Gated,
     /// Another lane holds the lease; this caller did nothing.
     Leased,
+    /// The entry is no longer spooled: another lane delivered it (or the
+    /// cap evicted it) after this caller's work was queued or snapshotted.
+    /// Nothing was POSTed.
+    Vanished,
 }
 
 /// Everything the post-ack delivery phase needs. Shared by the delivery
@@ -1269,8 +1286,9 @@ struct DeliveryContext {
 impl DeliveryContext {
     /// Deliver one already-spooled envelope and settle its entry. Safe to
     /// call from any lane: the lease makes concurrent calls for one
-    /// envelope a no-op for all but the first.
-    async fn deliver(&self, envelope_id: &str, body: &Value, replay: bool) -> DeliveryVerdict {
+    /// envelope a no-op for all but the first, and the re-read below
+    /// makes SEQUENTIAL calls from stale state a no-op too.
+    async fn deliver(&self, envelope_id: &str, replay: bool) -> DeliveryVerdict {
         let Some(_lease) = self.leases.acquire(envelope_id) else {
             tracing::debug!(
                 envelope_id = envelope_id,
@@ -1278,6 +1296,31 @@ impl DeliveryContext {
             );
             return DeliveryVerdict::Leased;
         };
+
+        // Re-read the entry under the lease. Callers reach this from a
+        // queue entry or a drain snapshot taken before another lane may
+        // have delivered and removed the envelope; POSTing a body from
+        // that stale state is a duplicate the lease cannot prevent,
+        // because by then the lease is free. Gone means done.
+        let entry = match self.spool.load(envelope_id).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                tracing::debug!(
+                    envelope_id = envelope_id,
+                    "spool entry is gone; another lane already settled it"
+                );
+                return DeliveryVerdict::Vanished;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    envelope_id = envelope_id,
+                    error = %e,
+                    "could not re-read the spool entry; leaving it for the next pass"
+                );
+                return DeliveryVerdict::Vanished;
+            }
+        };
+        let body = &entry.event;
 
         if self.gate.is_open(Instant::now()) {
             tracing::debug!(
@@ -1370,7 +1413,7 @@ fn spawn_delivery_worker(
                     // short costs a retry, never an event.
                     let mut drained = 0usize;
                     while let Ok(req) = rx.try_recv() {
-                        delivery.deliver(&req.envelope_id, &req.body, false).await;
+                        delivery.deliver(&req.envelope_id, false).await;
                         drained += 1;
                     }
                     tracing::info!(drained, "delivery worker stopped on shutdown");
@@ -1379,7 +1422,7 @@ fn spawn_delivery_worker(
             };
             match request {
                 Some(req) => {
-                    delivery.deliver(&req.envelope_id, &req.body, false).await;
+                    delivery.deliver(&req.envelope_id, false).await;
                 }
                 None => return,
             }
@@ -1505,9 +1548,10 @@ where
     // has to cover daemon latency.
     ack_to_slack(ws_write, envelope_id).await?;
 
-    // 5. Hand off delivery. A full queue is not an error: the envelope is
-    // durable, and the sweep picks up anything the worker never saw.
-    ctx.enqueue_delivery(envelope_id, spooled_body);
+    // 5. Hand off delivery by id. A full queue is not an error: the
+    // envelope is durable, and the drain picks up anything the worker
+    // never saw.
+    ctx.enqueue_delivery(envelope_id);
 
     Ok(EnvelopeOutcome::Acked)
 }
@@ -1529,6 +1573,18 @@ struct DrainReport {
     waiting: usize,
     gated: usize,
     deferred: usize,
+    /// Snapshot entries that were already settled by another lane before
+    /// this pass reached them. Not an error, and deliberately not counted
+    /// as attempted: nothing was POSTed.
+    vanished: usize,
+}
+
+impl DrainReport {
+    /// True when the pass moved work off the spool. A pass that delivered
+    /// nothing has no reason to be repeated immediately.
+    fn made_progress(&self) -> bool {
+        self.delivered > 0 || self.discarded > 0 || self.vanished > 0
+    }
 }
 
 /// Re-attempt spooled envelopes. Shared by the boot replay (which passes
@@ -1592,11 +1648,12 @@ async fn drain_spool(delivery: &DeliveryContext, quiet_period: Duration) -> Drai
         );
     }
 
+    // Only ids travel from the snapshot into delivery. `deliver` re-reads
+    // the entry under the lease, so an envelope another lane settled
+    // between the snapshot and here is skipped rather than re-POSTed from
+    // a stale body.
     for entry in plan.retry.into_iter().take(MAX_DRAIN_BATCH) {
-        match delivery
-            .deliver(&entry.envelope_id, &entry.event, true)
-            .await
-        {
+        match delivery.deliver(&entry.envelope_id, true).await {
             DeliveryVerdict::Delivered => {
                 report.attempted += 1;
                 report.delivered += 1;
@@ -1605,6 +1662,7 @@ async fn drain_spool(delivery: &DeliveryContext, quiet_period: Duration) -> Drai
                 report.attempted += 1;
                 report.retained += 1;
             }
+            DeliveryVerdict::Vanished => report.vanished += 1,
             DeliveryVerdict::Gated => {
                 // The breaker opened mid-pass. Stopping here is the point
                 // of the breaker: the rest of the backlog waits.
@@ -1623,47 +1681,113 @@ async fn drain_spool(delivery: &DeliveryContext, quiet_period: Duration) -> Drai
     report
 }
 
-/// Boot replay plus the periodic retry sweep, in ONE task so the two
-/// never overlap. The first pass runs immediately with no quiet period
-/// (nothing is being delivered yet); subsequent passes honour it.
+/// Ceiling on consecutive boot-replay batches, so a spool that keeps
+/// reporting progress cannot spin forever.
+const MAX_BOOT_BATCHES: usize = 64;
+
+/// Replay the spool at startup, in batches, for as long as batches keep
+/// making progress. A single batch is capped at `MAX_DRAIN_BATCH`, so a
+/// one-shot boot replay strands everything past that cap until the next
+/// periodic pass, and with the periodic pass switched off, forever.
+async fn boot_replay(delivery: &DeliveryContext) {
+    let spool = &delivery.spool;
+    if spool.depth() == 0 {
+        return;
+    }
+    let mut batches = 0usize;
+    loop {
+        // No quiet period: at boot nothing else is delivering yet.
+        let report = drain_spool(delivery, Duration::ZERO).await;
+        batches += 1;
+        tracing::info!(
+            batch = batches,
+            attempted = report.attempted,
+            delivered = report.delivered,
+            retained = report.retained,
+            discarded = report.discarded,
+            vanished = report.vanished,
+            deferred = report.deferred,
+            depth = spool.depth(),
+            "boot replay batch complete"
+        );
+        // Stop when there is nothing deferred, when the pass achieved
+        // nothing (a down daemon; the periodic lane or a later start owns
+        // it), or at the ceiling.
+        if report.deferred == 0 || !report.made_progress() {
+            break;
+        }
+        if batches >= MAX_BOOT_BATCHES {
+            tracing::warn!(
+                batches,
+                deferred = report.deferred,
+                depth = spool.depth(),
+                "boot replay hit its batch ceiling; the remainder is left to the drain lane"
+            );
+            break;
+        }
+    }
+}
+
+/// Boot replay plus the drain lane, in ONE task so passes never overlap
+/// each other.
+///
+/// The lane wakes on two signals: the periodic timer (`interval`, off
+/// when zero) and an on-demand `wakeup` that the acceptance path fires
+/// when the delivery queue overflows. The wakeup exists because
+/// "the sweep will get it" is only true when a sweep is coming, and with
+/// `--spool-sweep-secs 0` none is: without it, a bounded-handoff
+/// deferral would strand the envelope until the next process start.
+///
+/// A timer pass honours the quiet period, which keeps it from churning
+/// on work the delivery worker is about to do. A wakeup pass uses no
+/// quiet period, because the wakeup means the worker explicitly did NOT
+/// take that envelope. Racing the worker is safe either way: delivery
+/// re-reads the entry under its lease, so a duplicate POST is not
+/// reachable from a stale snapshot.
 fn spawn_spool_sweep(
     delivery: Arc<DeliveryContext>,
     interval: Duration,
+    wakeup: Arc<tokio::sync::Notify>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let spool = delivery.spool.clone();
 
-        if spool.depth() > 0 {
-            let report = drain_spool(&delivery, Duration::ZERO).await;
+        boot_replay(&delivery).await;
+
+        if interval.is_zero() {
             tracing::info!(
-                attempted = report.attempted,
-                delivered = report.delivered,
-                retained = report.retained,
-                discarded = report.discarded,
-                deferred = report.deferred,
-                depth = spool.depth(),
-                "boot replay of the durable spool complete"
+                "periodic spool sweep disabled (--spool-sweep-secs 0); \
+                 the drain lane runs on demand only, so an envelope whose \
+                 delivery round fails waits for a queue-overflow wakeup or \
+                 the next start"
+            );
+        } else {
+            tracing::info!(
+                interval_secs = interval.as_secs(),
+                max_age_secs = spool.policy().max_age.as_secs(),
+                max_entries = spool.policy().max_entries,
+                spool_dir = %spool.dir().display(),
+                "spool drain lane armed"
             );
         }
 
-        if interval.is_zero() {
-            tracing::info!("spool retry sweep disabled (--spool-sweep-secs 0)");
-            return;
-        }
-        tracing::info!(
-            interval_secs = interval.as_secs(),
-            max_age_secs = spool.policy().max_age.as_secs(),
-            max_entries = spool.policy().max_entries,
-            spool_dir = %spool.dir().display(),
-            "spool retry sweep armed"
-        );
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = shutdown_notify.notified() => return,
-            }
+            // A zero interval means no timer arm at all, NOT an exit:
+            // on-demand wakeups still have to be served.
+            let on_demand = if interval.is_zero() {
+                tokio::select! {
+                    _ = wakeup.notified() => true,
+                    _ = shutdown_notify.notified() => return,
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => false,
+                    _ = wakeup.notified() => true,
+                    _ = shutdown_notify.notified() => return,
+                }
+            };
             if shutdown.load(Ordering::Relaxed) {
                 return;
             }
@@ -1671,17 +1795,24 @@ fn spawn_spool_sweep(
             if spool.depth() == 0 {
                 continue;
             }
-            let report = drain_spool(&delivery, spool::SWEEP_QUIET_PERIOD).await;
+            let quiet = if on_demand {
+                Duration::ZERO
+            } else {
+                spool::SWEEP_QUIET_PERIOD
+            };
+            let report = drain_spool(&delivery, quiet).await;
             if report.attempted > 0 || report.discarded > 0 {
                 tracing::info!(
+                    on_demand,
                     attempted = report.attempted,
                     delivered = report.delivered,
                     retained = report.retained,
                     discarded = report.discarded,
                     waiting = report.waiting,
+                    vanished = report.vanished,
                     deferred = report.deferred,
                     depth = spool.depth(),
-                    "spool retry sweep pass complete"
+                    "spool drain pass complete"
                 );
             }
         }
@@ -2088,13 +2219,15 @@ async fn main() -> Result<()> {
     let (delivery_tx, delivery_rx) = tokio::sync::mpsc::channel::<DeliveryRequest>(DELIVERY_QUEUE);
     let worker = spawn_delivery_worker(delivery.clone(), delivery_rx, shutdown_notify.clone());
 
-    // Boot replay and the periodic sweep share one task, so they can
-    // never overlap each other. The replay runs alongside the Socket Mode
+    // Boot replay and the drain lane share one task, so they can never
+    // overlap each other. The replay runs alongside the Socket Mode
     // connection rather than ahead of it, so a backlog cannot delay
     // accepting live traffic.
+    let spool_wakeup = Arc::new(tokio::sync::Notify::new());
     spawn_spool_sweep(
         delivery.clone(),
         Duration::from_secs(args.spool_sweep_secs),
+        spool_wakeup.clone(),
         shutdown.clone(),
         shutdown_notify.clone(),
     );
@@ -2106,6 +2239,7 @@ async fn main() -> Result<()> {
         health: health.as_ref(),
         spool: spool.clone(),
         delivery_tx,
+        spool_wakeup,
     };
     let mut reconnect_attempt: u32 = 0;
 
@@ -2301,9 +2435,16 @@ mod tests {
             "the sidecar must not resolve an unpublished identity map"
         );
 
-        // The daemon publishes and releases.
+        // The daemon publishes and releases. Publication is a RENAME of a
+        // fully written staged copy, which is what `resolve_identities_path`
+        // relies on when it treats the destination as authoritative the
+        // moment it exists. Writing in place would let the polling sidecar
+        // observe the file created but not yet filled and fail to parse it,
+        // which is a fixture artifact rather than a real behavior.
         std::fs::create_dir_all(&bro_home).unwrap();
-        std::fs::write(&new, MAPPED).unwrap();
+        let staged = new.with_extension("json.staged");
+        std::fs::write(&staged, MAPPED).unwrap();
+        std::fs::rename(&staged, &new).unwrap();
         drop(held);
 
         let (path, count) = sidecar.join().unwrap().unwrap();
@@ -3790,6 +3931,7 @@ mod tests {
         acks: Arc<parking_lot::Mutex<Vec<String>>>,
         delivery_rx: Option<tokio::sync::mpsc::Receiver<DeliveryRequest>>,
         delivery_tx: tokio::sync::mpsc::Sender<DeliveryRequest>,
+        spool_wakeup: Arc<tokio::sync::Notify>,
         _dir: tempfile::TempDir,
     }
 
@@ -3823,6 +3965,7 @@ mod tests {
             acks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             delivery_rx: Some(delivery_rx),
             delivery_tx,
+            spool_wakeup: Arc::new(tokio::sync::Notify::new()),
             _dir: dir,
         }
     }
@@ -3840,6 +3983,7 @@ mod tests {
                 health: Some(&self.health),
                 spool: self.spool.clone(),
                 delivery_tx: self.delivery_tx.clone(),
+                spool_wakeup: self.spool_wakeup.clone(),
             }
         }
 
@@ -3849,18 +3993,23 @@ mod tests {
             }
         }
 
+        /// Drain the queue into a list of ids without delivering them,
+        /// so a test can interleave other work in between.
+        fn queued_ids(&mut self) -> Vec<String> {
+            let rx = self.delivery_rx.as_mut().expect("receiver not handed off");
+            let mut ids = Vec::new();
+            while let Ok(req) = rx.try_recv() {
+                ids.push(req.envelope_id);
+            }
+            ids
+        }
+
         /// Run whatever acceptance queued, the way the worker would.
         async fn run_queued_deliveries(&mut self) -> usize {
-            let rx = self.delivery_rx.as_mut().expect("receiver not handed off");
-            let mut queued = Vec::new();
-            while let Ok(req) = rx.try_recv() {
-                queued.push(req);
-            }
-            let ran = queued.len();
-            for req in queued {
-                self.delivery
-                    .deliver(&req.envelope_id, &req.body, false)
-                    .await;
+            let ids = self.queued_ids();
+            let ran = ids.len();
+            for id in ids {
+                self.delivery.deliver(&id, false).await;
             }
             ran
         }
@@ -4090,12 +4239,95 @@ mod tests {
         drop(held);
         assert_eq!(rig.delivery.leases.len(), 0);
         // With the lease free the same pass would have worked.
-        let verdict = rig
-            .delivery
-            .deliver("env-leased", &json!({"_meta": {}}), true)
-            .await;
+        let verdict = rig.delivery.deliver("env-leased", true).await;
         assert_eq!(verdict, DeliveryVerdict::Retained);
         assert_eq!(rig.run_queued_deliveries().await, 0);
+    }
+
+    /// The stale-snapshot case the lease alone cannot cover: a drain
+    /// snapshots an entry, the worker delivers and removes it, and only
+    /// then does the drain reach it. By that point the lease is free, so
+    /// nothing but a re-read of the current entry can stop a second POST
+    /// of the same envelope.
+    #[tokio::test]
+    async fn a_settled_envelope_is_not_redelivered_from_a_stale_snapshot() {
+        let mut rig = rig().await;
+        let ctx = rig.ctx();
+        let mut sink = rig.sink();
+        let mut in_flight = InFlightSet::new();
+        accept_envelope(
+            &mut sink,
+            &ctx,
+            &app_mention_envelope("env-once"),
+            &mut in_flight,
+        )
+        .await
+        .unwrap();
+        drop(ctx);
+
+        // A drain takes its snapshot BEFORE the worker runs.
+        let snapshot = rig
+            .spool
+            .plan_sweep(chrono::Utc::now(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.retry.len(), 1);
+
+        // The worker delivers and removes it.
+        assert_eq!(rig.run_queued_deliveries().await, 1);
+        assert_eq!(rig.daemon.received.lock().len(), 1);
+        assert_eq!(rig.spool.depth(), 0);
+
+        // Now the drain reaches its stale snapshot entry. The lease is
+        // free, so only the re-read prevents the duplicate.
+        for entry in snapshot.retry {
+            let verdict = rig.delivery.deliver(&entry.envelope_id, true).await;
+            assert_eq!(
+                verdict,
+                DeliveryVerdict::Vanished,
+                "a settled envelope must not be re-delivered"
+            );
+        }
+        assert_eq!(
+            rig.daemon.received.lock().len(),
+            1,
+            "exactly one POST reached the daemon"
+        );
+    }
+
+    /// The same hazard from the queue side: a request sitting in the
+    /// worker queue after a drain already settled the envelope.
+    #[tokio::test]
+    async fn a_queued_request_for_a_settled_envelope_does_not_repost() {
+        let mut rig = rig().await;
+        let ctx = rig.ctx();
+        let mut sink = rig.sink();
+        let mut in_flight = InFlightSet::new();
+        accept_envelope(
+            &mut sink,
+            &ctx,
+            &app_mention_envelope("env-queued"),
+            &mut in_flight,
+        )
+        .await
+        .unwrap();
+        drop(ctx);
+
+        // The queued request is held while a drain delivers the envelope.
+        let queued = rig.queued_ids();
+        assert_eq!(queued, vec!["env-queued".to_string()]);
+        let report = drain_spool(&rig.delivery, Duration::ZERO).await;
+        assert_eq!(report.delivered, 1);
+        assert_eq!(rig.daemon.received.lock().len(), 1);
+
+        // The worker now pops its stale request.
+        for id in queued {
+            assert_eq!(
+                rig.delivery.deliver(&id, false).await,
+                DeliveryVerdict::Vanished
+            );
+        }
+        assert_eq!(rig.daemon.received.lock().len(), 1);
     }
 
     // ── Endpoint breaker ────────────────────────────────────────
@@ -4304,17 +4536,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_delivery_queue_leaves_the_envelope_to_the_sweep() {
+    async fn a_full_delivery_queue_leaves_the_envelope_to_the_drain_and_wakes_it() {
         let rig = rig().await;
         // Fill the queue so acceptance cannot hand off.
         for i in 0..DELIVERY_QUEUE {
             rig.delivery_tx
                 .try_send(DeliveryRequest {
                     envelope_id: format!("filler-{i}"),
-                    body: Value::Null,
                 })
                 .unwrap();
         }
+
+        // A listener registered before the overflow proves the wakeup
+        // actually fires; without it, a deferral with --spool-sweep-secs 0
+        // would strand the envelope until the next process start.
+        let woken = rig.spool_wakeup.clone();
+        let listener = tokio::spawn(async move { woken.notified().await });
+        tokio::task::yield_now().await;
 
         let ctx = rig.ctx();
         let mut sink = rig.sink();
@@ -4330,11 +4568,64 @@ mod tests {
         drop(ctx);
 
         // Backpressure must never cost an ack or an envelope: the entry
-        // is durable and the sweep owns it.
+        // is durable and the drain lane owns it.
         assert_eq!(outcome, EnvelopeOutcome::Acked);
         assert_eq!(rig.acks.lock().len(), 1);
         let entries = rig.spool.list().await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].envelope_id, "env-backpressure");
+
+        tokio::time::timeout(Duration::from_secs(5), listener)
+            .await
+            .expect("queue overflow wakes the drain lane")
+            .unwrap();
+    }
+
+    // ── Drain lane liveness ─────────────────────────────────────
+
+    /// Boot replay must keep batching while it is making progress. One
+    /// batch is capped at MAX_DRAIN_BATCH, so a one-shot replay strands
+    /// the remainder, and with --spool-sweep-secs 0 nothing ever comes
+    /// back for it.
+    #[tokio::test]
+    async fn boot_replay_continues_past_one_batch_while_it_makes_progress() {
+        let rig = rig().await;
+        let over = MAX_DRAIN_BATCH + 25;
+        for i in 0..over {
+            rig.spool
+                .persist(&format!("env-{i:04}"), &json!({"_meta": {"seq": i}}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(rig.spool.depth() as usize, over);
+
+        boot_replay(&rig.delivery).await;
+
+        assert_eq!(rig.spool.depth(), 0, "the whole backlog drained");
+        assert_eq!(rig.daemon.received.lock().len(), over);
+    }
+
+    /// The other half: a batch that achieves nothing must not spin. A
+    /// down daemon retains everything, so the replay stops after the
+    /// first unproductive pass instead of looping on a dead endpoint.
+    #[tokio::test]
+    async fn boot_replay_stops_when_a_batch_makes_no_progress() {
+        let rig = rig().await;
+        rig.daemon.status.store(503, Ordering::Relaxed);
+        for i in 0..3 {
+            rig.spool
+                .persist(&format!("env-{i}"), &json!({"_meta": {"seq": i}}))
+                .await
+                .unwrap();
+        }
+
+        boot_replay(&rig.delivery).await;
+
+        assert_eq!(rig.spool.depth(), 3, "nothing was lost");
+        let entries = rig.spool.list().await.unwrap();
+        assert!(
+            entries.iter().all(|e| e.attempts >= 1),
+            "each entry was tried exactly once per pass, not spun on"
+        );
     }
 }
