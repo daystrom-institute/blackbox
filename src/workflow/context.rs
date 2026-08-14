@@ -240,11 +240,12 @@ impl ArcContext {
         self.last_signal = None;
     }
 
-    /// Ceiling for `consumed_signal_event_ids`. Old entries age out
-    /// FIFO; an arc that loops through more distinct ledger events than
-    /// this between two visits of the same wait correlation would be
-    /// pathological.
-    const CONSUMED_SIGNAL_EVENT_CAP: usize = 256;
+    /// Ceiling for `consumed_signal_event_ids`. MUST stay at least as
+    /// large as the wait-registration ledger scan window (512 in
+    /// `wait_nodes`): a cap smaller than the window lets consumption of
+    /// event N+cap evict event N while N is still scannable, and the
+    /// next oldest-first pass would re-consume N forever. 2x margin.
+    const CONSUMED_SIGNAL_EVENT_CAP: usize = 1024;
 
     /// Remember that a persisted system event resolved one of this
     /// arc's waits, so ledger catch-up never consumes it again.

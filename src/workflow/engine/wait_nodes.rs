@@ -204,13 +204,23 @@ impl WorkflowRunner<'_> {
                         })
                     })
                 };
-                *resolved.lock() = Some(SignalRef {
-                    name: signal.clone(),
-                    payload,
-                    correlation: event.correlation,
-                    received_at: crate::util::now_iso(),
-                    source_event_id: Some(event.id),
-                });
+                // First-writer-wins: the live bridge may have resolved
+                // the group between registration and this catch-up.
+                {
+                    let mut slot = resolved.lock();
+                    if slot.is_none() {
+                        *slot = Some(SignalRef {
+                            name: signal.clone(),
+                            payload,
+                            correlation: event.correlation,
+                            received_at: crate::util::now_iso(),
+                            source_event_id: Some(event.id),
+                        });
+                    }
+                }
+                // Drop sibling registrations so a racing signal cannot
+                // consume one and contend for the already-filled slot.
+                self.server.wait_store().cancel_node_group(arc, node_id);
                 notify.notify_one();
                 break;
             }
@@ -222,13 +232,21 @@ impl WorkflowRunner<'_> {
             Cancelled,
             TimedOut,
         }
+        // `biased` makes arm order the tiebreak when several arms are
+        // ready at once, which matters for a rehydrated wait whose
+        // deadline expired during the outage: a catch-up resolution
+        // (notify already signalled) must win over the zero-duration
+        // timeout deterministically, and cancellation must win over
+        // timing out.
         let outcome = match timeout {
             Some(d) => tokio::select! {
+                biased;
                 _ = notify.notified() => WaitOutcome::Resolved,
                 _ = cancel_token.cancelled() => WaitOutcome::Cancelled,
                 _ = tokio::time::sleep(d) => WaitOutcome::TimedOut,
             },
             None => tokio::select! {
+                biased;
                 _ = notify.notified() => WaitOutcome::Resolved,
                 _ = cancel_token.cancelled() => WaitOutcome::Cancelled,
             },

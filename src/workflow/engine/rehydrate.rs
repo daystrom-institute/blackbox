@@ -56,6 +56,7 @@ pub(crate) async fn resume_workflow_from_checkpoint(
     runner.node_outputs = cp.node_outputs;
     runner.actor_sessions = cp.actor_sessions;
     runner.ensemble_sessions = cp.ensemble_sessions;
+    runner.atom_invocations = cp.atom_invocations;
     runner.visit_counts = cp.visit_counts;
     runner.last_verdict = cp.last_verdict;
     runner.steps = cp.steps;

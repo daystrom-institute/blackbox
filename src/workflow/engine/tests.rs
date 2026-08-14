@@ -1121,3 +1121,107 @@ async fn rehydrated_arc_reclaims_admission_key() {
     .await
     .expect("resumed holder completed");
 }
+
+#[tokio::test]
+async fn second_signal_into_resolved_any_of_group_is_not_lost() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    use crate::workflow::context::SignalRef;
+    use crate::workflow::wait::PendingWait;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    let resolved = Arc::new(parking_lot::Mutex::new(None::<SignalRef>));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    for (idx, sig) in ["sig-a", "sig-b"].iter().enumerate() {
+        state.wait_store.register(PendingWait {
+            arc_id: "arc-group".into(),
+            wait_id: format!("Park#{idx}"),
+            signal: (*sig).into(),
+            correlation: Map::new(),
+            notify: notify.clone(),
+            resolved: resolved.clone(),
+        });
+    }
+    let first = signal_arc_dispatch(
+        &state,
+        "sig-a",
+        Map::new(),
+        json!({"winner": true}),
+        SignalDispatchOrigin::Direct,
+        None,
+    )
+    .await;
+    assert_eq!(first["status"], "wait_resolved");
+    assert_eq!(
+        resolved.lock().as_ref().map(|s| s.name.clone()),
+        Some("sig-a".to_string())
+    );
+    // Sibling registration is gone, so the second signal falls idle and
+    // is persisted to the ledger instead of overwriting the winner.
+    let second = signal_arc_dispatch(
+        &state,
+        "sig-b",
+        Map::new(),
+        json!({"loser": true}),
+        SignalDispatchOrigin::Direct,
+        None,
+    )
+    .await;
+    assert_eq!(second["status"], "no_matching_wait", "second: {second}");
+    assert_eq!(second["durable_persist"], "ok");
+    assert_eq!(
+        resolved.lock().as_ref().map(|s| s.name.clone()),
+        Some("sig-a".to_string()),
+        "winner not overwritten"
+    );
+}
+
+#[tokio::test]
+async fn signal_into_occupied_slot_reports_group_resolved_and_persists() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    use crate::workflow::context::SignalRef;
+    use crate::workflow::wait::PendingWait;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    // Simulate the narrow race: a sibling registration still exists but
+    // the shared slot is already filled by the group winner.
+    let resolved = Arc::new(parking_lot::Mutex::new(Some(SignalRef {
+        name: "sig-a".into(),
+        payload: json!({"winner": true}),
+        correlation: Map::new(),
+        received_at: crate::util::now_iso(),
+        source_event_id: None,
+    })));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    state.wait_store.register(PendingWait {
+        arc_id: "arc-group".into(),
+        wait_id: "Park#1".into(),
+        signal: "sig-b".into(),
+        correlation: Map::new(),
+        notify,
+        resolved: resolved.clone(),
+    });
+    let second = signal_arc_dispatch(
+        &state,
+        "sig-b",
+        Map::new(),
+        json!({"loser": true}),
+        SignalDispatchOrigin::Direct,
+        None,
+    )
+    .await;
+    assert_eq!(
+        second["status"], "wait_group_already_resolved",
+        "second: {second}"
+    );
+    assert_eq!(
+        resolved.lock().as_ref().map(|s| s.name.clone()),
+        Some("sig-a".to_string()),
+        "winner not overwritten"
+    );
+    // The loser landed in the durable ledger.
+    let events = state
+        .system_events
+        .list_events(Some(16), Some("sig-b"), None, None)
+        .unwrap();
+    assert_eq!(events.len(), 1, "loser persisted for later consumption");
+}

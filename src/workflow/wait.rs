@@ -177,6 +177,19 @@ impl WaitStore {
         Some((p.resolved, p.notify, p.arc_id, p.wait_id))
     }
 
+    /// Remove every pending registration belonging to one arc's wait
+    /// node (`wait_id` = `<node>#<idx>`). Called by the signal router
+    /// after resolving one member of an `any_of` group so a second
+    /// signal cannot consume a sibling registration and overwrite the
+    /// group's shared resolved slot before the runner wakes.
+    pub fn cancel_node_group(&self, arc_id: &str, node_prefix: &str) -> usize {
+        let prefix = format!("{node_prefix}#");
+        let mut pending = self.pending.write();
+        let before = pending.len();
+        pending.retain(|p| !(p.arc_id == arc_id && p.wait_id.starts_with(&prefix)));
+        before - pending.len()
+    }
+
     /// Cancel a wait by (arc_id, wait_id). Used on arc cancel /
     /// timeout cleanup.
     pub fn cancel(&self, arc_id: &str, wait_id: &str) -> bool {

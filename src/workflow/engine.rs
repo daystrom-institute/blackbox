@@ -580,6 +580,13 @@ struct WorkflowRunner<'a> {
     /// the re-entered wait node so it opens the REMAINING window rather
     /// than restarting the full configured timeout.
     resume_wait_deadline: Option<String>,
+    /// Set when a checkpoint write failed AND the stale file could not
+    /// be removed: durable state on disk no longer matches the arc, so
+    /// further checkpoint writes are suppressed (they would flap) and
+    /// the terminal removal retry is the last line of defense against
+    /// a stale-state resurrection. Atomic: flipped from &self contexts
+    /// inside Send futures.
+    checkpoint_poisoned: std::sync::atomic::AtomicBool,
     /// Nesting depth for sub-workflow composition. Threaded through
     /// recursive `run_workflow_at_depth` calls so a chain of nested
     /// sub-workflows can't silently bypass the ceiling.
@@ -645,6 +652,7 @@ impl<'a> WorkflowRunner<'a> {
             arc_thread_id: None,
             resume_skip_on_enter: None,
             resume_wait_deadline: None,
+            checkpoint_poisoned: std::sync::atomic::AtomicBool::new(false),
             composition_depth,
             event_sink: None,
             cancel_token,

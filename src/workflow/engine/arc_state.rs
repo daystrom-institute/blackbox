@@ -292,6 +292,7 @@ impl WorkflowRunner<'_> {
             node_outputs: self.node_outputs.clone(),
             actor_sessions: self.actor_sessions.clone(),
             ensemble_sessions: self.ensemble_sessions.clone(),
+            atom_invocations: self.atom_invocations.clone(),
             visit_counts: self.visit_counts.clone(),
             last_verdict: self.last_verdict.clone(),
             steps: self.steps,
@@ -323,7 +324,7 @@ impl WorkflowRunner<'_> {
         current_node: &str,
         waiting_deadline: Option<String>,
     ) {
-        if !self.should_checkpoint() {
+        if !self.should_checkpoint() || self.checkpoint_poisoned.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let cp = self.build_checkpoint_with_deadline(status, current_node, waiting_deadline);
@@ -337,24 +338,43 @@ impl WorkflowRunner<'_> {
             // restarts, rehydration would re-run already-executed work.
             // Drop durability for this arc instead, and say so on the
             // arc thread.
-            if let Err(remove_err) = self
+            match self
                 .server
                 .state
                 .arc_store
                 .remove(&self.ctx.meta.arc_id)
                 .await
             {
-                tracing::warn!(
-                    "arc {} stale-checkpoint removal also failed: {remove_err:#}",
-                    self.ctx.meta.arc_id
-                );
+                Ok(()) => {
+                    self.arc_note(
+                        "blocked",
+                        &format!(
+                            "arc checkpoint persistence degraded ({e}); crash-resume disabled for this arc"
+                        ),
+                    );
+                }
+                Err(remove_err) => {
+                    // Save AND removal failed (likely an unwritable
+                    // dir): stale resumable state may survive on disk.
+                    // Poison further writes (no flapping) and escalate:
+                    // if the filesystem heals and the daemon restarts,
+                    // that stale checkpoint could resurrect this arc.
+                    // Terminal removal retries once more as the last
+                    // line of defense.
+                    self.checkpoint_poisoned.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        "arc {} checkpoint save AND stale-removal failed ({e}; {remove_err}); a stale checkpoint may survive and resurrect this arc after a restart",
+                        self.ctx.meta.arc_id
+                    );
+                    self.arc_note(
+                        "blocked",
+                        &format!(
+                            "arc checkpoint persistence FAILED and the stale checkpoint could not be removed ({remove_err}); if this arc completes, verify <store_dir>/arcs/{}.json is gone before the next daemon restart",
+                            self.ctx.meta.arc_id
+                        ),
+                    );
+                }
             }
-            self.arc_note(
-                "blocked",
-                &format!(
-                    "arc checkpoint persistence degraded ({e}); crash-resume disabled for this arc"
-                ),
-            );
         }
     }
 
@@ -373,9 +393,22 @@ impl WorkflowRunner<'_> {
             .remove(&self.ctx.meta.arc_id)
             .await
         {
-            tracing::warn!(
-                "arc {} checkpoint remove failed: {e:#}",
+            // A terminal arc whose checkpoint survives WILL rehydrate
+            // after the next restart and re-run from its last durable
+            // position. That is the one persistence failure that turns
+            // into wrong behavior rather than lost durability, so it
+            // escalates to error + an operator-actionable note.
+            tracing::error!(
+                "arc {} TERMINAL checkpoint removal failed ({e:#}); delete <store_dir>/arcs/{}.json before the next daemon restart or this completed arc will rehydrate",
+                self.ctx.meta.arc_id,
                 self.ctx.meta.arc_id
+            );
+            self.arc_note(
+                "blocked",
+                &format!(
+                    "terminal checkpoint removal failed ({e}); delete <store_dir>/arcs/{}.json before the next daemon restart or this completed arc will rehydrate",
+                    self.ctx.meta.arc_id
+                ),
             );
         }
     }

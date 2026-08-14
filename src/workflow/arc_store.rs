@@ -67,6 +67,12 @@ pub struct ArcCheckpoint {
     pub node_outputs: HashMap<String, String>,
     pub actor_sessions: HashMap<String, String>,
     pub ensemble_sessions: HashMap<String, HashMap<String, String>>,
+    /// Node → atom invocation id. The InvocationStore is durable
+    /// (`atom-invocations.json`), so a resumed arc revisiting a durable
+    /// atom node must resume the SAME invocation rather than minting a
+    /// new one.
+    #[serde(default)]
+    pub atom_invocations: HashMap<String, String>,
     pub visit_counts: HashMap<String, u32>,
     pub last_verdict: Option<String>,
     /// Steps consumed so far; resume continues the max_steps budget
@@ -88,12 +94,11 @@ pub struct ArcCheckpoint {
     pub saved_at: String,
 }
 
-// Intentionally NOT checkpointed: `actor_tasks`, `ensemble_tasks`, and
-// `atom_invocations`. Task ids and invocation handles are process-scoped
-// (the daemon task registry does not survive a restart), so restoring
-// them would point resumed arcs at dead entries. Provider-scoped
-// continuity (`actor_sessions`, `ensemble_sessions`) IS checkpointed and
-// is what durable actors need to resume their sessions.
+// Intentionally NOT checkpointed: `actor_tasks` and `ensemble_tasks`.
+// Live task handles are process-scoped; TaskStore restores only recent
+// terminal records on boot, so restored ids would mostly point at dead
+// entries. Provider-scoped continuity (`actor_sessions`,
+// `ensemble_sessions`) and durable atom invocations ARE checkpointed.
 
 /// Disk store for arc checkpoints. All I/O is async; callers hold no
 /// locks across these awaits. Per-arc write ordering is guaranteed by
@@ -283,6 +288,7 @@ mod tests {
             node_outputs: HashMap::new(),
             actor_sessions: HashMap::new(),
             ensemble_sessions: HashMap::new(),
+            atom_invocations: HashMap::new(),
             visit_counts: HashMap::new(),
             last_verdict: None,
             steps: 1,

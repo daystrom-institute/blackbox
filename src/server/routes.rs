@@ -3575,12 +3575,59 @@ pub(crate) async fn signal_arc_dispatch(
     });
     let sig = crate::workflow::context::SignalRef {
         name: signal.to_string(),
-        payload,
-        correlation,
+        payload: payload.clone(),
+        correlation: correlation.clone(),
         received_at: util::now_iso(),
         source_event_id,
     };
-    *resolved_slot.lock() = Some(sig);
+    // First-writer-wins on the group's shared resolved slot. Two
+    // signals racing into one `any_of` group used to let the second
+    // overwrite the first before the runner woke, silently losing it.
+    // Scoped so the guard is provably dead before any await below
+    // (tokio's Send analysis does not credit branch-local drops).
+    let group_already_resolved = {
+        let mut slot = resolved_slot.lock();
+        if slot.is_some() {
+            true
+        } else {
+            *slot = Some(sig);
+            false
+        }
+    };
+    if group_already_resolved {
+        if origin == SignalDispatchOrigin::Direct {
+            // Do not lose the loser: persist it like an idle signal
+            // so the arc's next wait (or another arc) can consume
+            // it from the ledger. Bridge-origin events are already
+            // persisted and stay unconsumed automatically.
+            let draft = crate::system_events::SystemEventDraft {
+                kind: crate::system_events::types::SystemEventKind::from_wire(signal),
+                producer: "signal.router".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation: correlation.clone(),
+                causation_id: None,
+                payload,
+            };
+            if let Err(e) = state.system_events.emit(draft).await {
+                tracing::warn!(
+                    "group-resolved loser signal '{signal}' durable persist failed: {e:#}"
+                );
+            }
+        }
+        return json!({
+            "status": "wait_group_already_resolved",
+            "arc_id": arc_id,
+            "wait_id": wait_id,
+            "signal": signal,
+        });
+    }
+    // Remove the group's sibling registrations so no later signal can
+    // consume one and race the slot; the just-taken wait is already out.
+    if let Some(node_prefix) = wait_id.split('#').next() {
+        store.cancel_node_group(&arc_id, node_prefix);
+    }
     notify.notify_one();
     json!({
         "status": "wait_resolved",
