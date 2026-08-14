@@ -402,9 +402,11 @@ impl EnvelopeSpool {
     /// delivery lanes can both reach this for one envelope.
     ///
     /// The directory sync here is best effort. A lost unlink means the
-    /// entry is replayed and the daemon sees a duplicate, which its
-    /// envelope-id dedup absorbs; it is not a lost event, so failing the
-    /// removal over it would trade a benign duplicate for a hard error.
+    /// entry is replayed and the daemon sees a duplicate; its bounded
+    /// in-memory dedupe usually drops it, but a replay after a daemon
+    /// restart can dispatch twice. That is the at-least-once trade: a
+    /// possible duplicate, never a lost event, so failing the removal
+    /// over it would trade the better side of that for a hard error.
     pub async fn remove(&self, envelope_id: &str) -> Result<()> {
         let _admitted = self.admission.lock().await;
         self.remove_locked(envelope_id).await

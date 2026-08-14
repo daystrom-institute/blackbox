@@ -1355,8 +1355,9 @@ impl DeliveryContext {
                 }
             }
             if let Err(e) = self.spool.remove(envelope_id).await {
-                // The entry is replayed and the daemon dedupes it. Worth
-                // a warning, not a failure.
+                // The entry is replayed; the daemon's bounded dedupe
+                // usually drops it, but a duplicate dispatch is possible
+                // (at-least-once). Worth a warning, not a failure.
                 tracing::warn!(
                     envelope_id = envelope_id,
                     error = %e,
@@ -1585,6 +1586,18 @@ impl DrainReport {
     fn made_progress(&self) -> bool {
         self.delivered > 0 || self.discarded > 0 || self.vanished > 0
     }
+
+    /// True when a drain wake should IMMEDIATELY run another batch:
+    /// work was deferred past the batch cap AND this pass moved some of
+    /// the backlog. Notify coalesces wakeups, so stopping after one
+    /// 200-entry pass would strand the very envelope whose overflow
+    /// fired the wake whenever periodic sweeping is disabled. The
+    /// progress guard keeps a wholly-unreachable backlog (daemon down,
+    /// everything retained) from spinning; the endpoint backoff gate
+    /// spaces those retries instead.
+    fn should_continue_drain(&self) -> bool {
+        self.deferred > 0 && self.made_progress()
+    }
 }
 
 /// Re-attempt spooled envelopes. Shared by the boot replay (which passes
@@ -1800,20 +1813,29 @@ fn spawn_spool_sweep(
             } else {
                 spool::SWEEP_QUIET_PERIOD
             };
-            let report = drain_spool(&delivery, quiet).await;
-            if report.attempted > 0 || report.discarded > 0 {
-                tracing::info!(
-                    on_demand,
-                    attempted = report.attempted,
-                    delivered = report.delivered,
-                    retained = report.retained,
-                    discarded = report.discarded,
-                    waiting = report.waiting,
-                    vanished = report.vanished,
-                    deferred = report.deferred,
-                    depth = spool.depth(),
-                    "spool drain pass complete"
-                );
+            // Drain batch after batch while a pass both left work
+            // deferred AND made progress - see
+            // DrainReport::should_continue_drain for why one wake must
+            // not stop at a single batch.
+            loop {
+                let report = drain_spool(&delivery, quiet).await;
+                if report.attempted > 0 || report.discarded > 0 {
+                    tracing::info!(
+                        on_demand,
+                        attempted = report.attempted,
+                        delivered = report.delivered,
+                        retained = report.retained,
+                        discarded = report.discarded,
+                        waiting = report.waiting,
+                        vanished = report.vanished,
+                        deferred = report.deferred,
+                        depth = spool.depth(),
+                        "spool drain pass complete"
+                    );
+                }
+                if !report.should_continue_drain() || shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
             }
         }
     })
@@ -4627,5 +4649,58 @@ mod tests {
             entries.iter().all(|e| e.attempts >= 1),
             "each entry was tried exactly once per pass, not spun on"
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_continuation_tests {
+    use super::DrainReport;
+
+    #[test]
+    fn a_wake_keeps_draining_while_deferred_work_and_progress_coexist() {
+        let report = DrainReport {
+            attempted: 200,
+            delivered: 200,
+            deferred: 56,
+            ..Default::default()
+        };
+        assert!(report.should_continue_drain());
+    }
+
+    #[test]
+    fn a_wake_stops_when_nothing_was_deferred() {
+        let report = DrainReport {
+            attempted: 42,
+            delivered: 42,
+            deferred: 0,
+            ..Default::default()
+        };
+        assert!(!report.should_continue_drain());
+    }
+
+    #[test]
+    fn a_wake_stops_when_the_backlog_is_unreachable() {
+        // Everything retained (daemon down): the endpoint backoff gate
+        // owns the retry cadence, not a hot loop here.
+        let report = DrainReport {
+            attempted: 200,
+            retained: 200,
+            deferred: 56,
+            ..Default::default()
+        };
+        assert!(!report.should_continue_drain());
+    }
+
+    #[test]
+    fn vanished_entries_count_as_progress_toward_the_next_batch() {
+        // Entries settled by another lane free batch slots, so the
+        // deferred remainder is reachable on the next pass.
+        let report = DrainReport {
+            attempted: 0,
+            vanished: 200,
+            deferred: 56,
+            ..Default::default()
+        };
+        assert!(report.should_continue_drain());
     }
 }

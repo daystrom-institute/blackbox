@@ -377,8 +377,10 @@ directory entry is lost by a crash, followed by an ack that already
 told Slack to forget the envelope, is the exact loss the spool exists
 to prevent, so a failed directory fsync fails the write and withholds
 the ack. The stamp and delete paths downgrade it: losing an attempt
-counter costs a retry, and losing an unlink costs a duplicate the
-daemon absorbs.
+counter costs a retry, and losing an unlink costs a replay that may
+produce an observable duplicate dispatch at the daemon (its delivery-id
+dedupe is a bounded in-memory ring; durable hardening is tracked
+separately).
 
 A failed sync still COUNTS the entry, though. The rename has already
 landed by then, so the file is visible to every reader; leaving it out
@@ -509,8 +511,11 @@ bounds on the incidental artifacts:
 transaction log, and not a substitute for the daemon's own
 `X-Slack-Envelope-Id` dedup: replay can re-POST an envelope the daemon
 already accepted (a crash between the daemon's 2xx and the spool
-delete, or a delete whose unlink was lost), and the daemon is the
-layer that makes that harmless. It also does not cover the
+delete, or a delete whose unlink was lost). The daemon's delivery-id
+dedupe reduces, but does not eliminate, the resulting duplicates: it is
+a bounded in-memory ring that resets on daemon restart, so a replay can
+produce an observable duplicate dispatch. Durable daemon-side dedupe is
+tracked separately. It also does not cover the
 pre-acceptance window: a crash between reading the WebSocket frame and
 completing the spool write relies on Slack redelivery, which is
 exactly why the ack is withheld on a failed spool write.
