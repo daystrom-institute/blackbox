@@ -41,7 +41,7 @@ use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationResolvedLayoutV1, ProjectCatalogTargetSelectionV1,
 };
 use bbox_indexing::project_catalog_rebuild::{
-    ERROR_REBUILD_GENERATION_UNVERIFIED, ERROR_REBUILD_MANIFEST_MISSING,
+    ERROR_REBUILD_GENERATION_UNVERIFIED, ERROR_REBUILD_MANIFEST_MISSING, ERROR_REBUILD_PROOF_MODE,
     PathFreeRebuildVerifyReceiptV1, PathFreeRebuildVerifyRequestV1,
     ProjectCatalogPathFreeRebuildFacadeV1,
 };
@@ -467,6 +467,14 @@ pub enum RebuildStartupGateV1 {
     ExemptZeroLegacyNamespaces,
     /// The gate ran in full.
     Verified {
+        /// Set when the committed manifest's recorded proof was re-founded on
+        /// its pinned-generation lineage before verification, because the
+        /// recorded proof was attributable to a schema-version transition.
+        /// Present in the receipt rather than only in the log: an operator
+        /// reading "the gate passed" needs to see that a durable manifest was
+        /// rewritten on this boot.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refounded: Option<bbox_indexing::index::history_materializer::RebuildManifestRefoundV1>,
         rebuild_id: String,
         /// Generations verified through the manifest's own buckets. This is
         /// the cut-time tier.
@@ -511,9 +519,22 @@ pub enum RebuildStartupGateV1 {
 /// live-refresh generation the gate verifies directly rather than invalidating
 /// the manifest.
 ///
-/// Read-only. It opens no writer, drives nothing, and repairs nothing: a
-/// refusal here means the operator investigates, because the alternative is a
-/// daemon serving history it cannot prove it still has.
+/// **One repair, and its exact scope.** This gate opens no index writer and
+/// drives no replacement. It performs exactly one durable write, and only when
+/// the committed manifest's own recorded evidence attributes its non-Equality
+/// proof to a schema-version transition: P3-D's
+/// `refound_committed_rebuild_manifest` re-founds that manifest's PROOF on its
+/// pinned-generation lineage, carrying the inventory, every bucket, and the
+/// committed block across unchanged. The write is P3-D's, not a second
+/// manifest writer, and it repairs only what the evidence provably owns.
+///
+/// A bump that legitimately replaced the index otherwise leaves a manifest no
+/// binary vintage can ever accept, which is not an operator-actionable refusal
+/// but a durable brick. Everything else still refuses: genuine drift on an
+/// unchanged basis, an unfinished transition, a manifest already founded on a
+/// lineage, and any generation that fails to verify. A refusal here means the
+/// operator investigates, because the alternative is a daemon serving history
+/// it cannot prove it still has.
 pub fn validate_rebuild_coverage_before_bind(
     store: &ProjectCatalogStore,
     index_path: &std::path::Path,
@@ -521,6 +542,9 @@ pub fn validate_rebuild_coverage_before_bind(
     use bbox_corpus_core::project_catalog::RepoHistoryMaterialization;
     use bbox_corpus_index::index::history_generations::{
         HistoryGenerationIdV1, HistoryGenerationStore,
+    };
+    use bbox_indexing::index::history_materializer::{
+        RebuildManifestRefoundV1, refound_committed_rebuild_manifest,
     };
     use bbox_indexing::project_catalog_rebuild::{
         read_committed_rebuild_manifest, require_equality_proof_mode, verify_manifest_generations,
@@ -539,6 +563,25 @@ pub fn validate_rebuild_coverage_before_bind(
     if catalog.repo_histories.is_empty() && catalog.ambiguous_namespaces.is_empty() {
         return Ok(RebuildStartupGateV1::ExemptZeroLegacyNamespaces);
     }
+
+    // Attributable-proof recovery, BEFORE the cut-time tier reads the
+    // manifest. A schema bump drops the index, so the pre-drop guard always
+    // scanned an index whose marker was the outgoing version while the binary
+    // carried the incoming one, and the migration-asset proof is unreachable
+    // in exactly that state. Without this, the first bump after this gate
+    // landed commits a Drift manifest and every subsequent boot of every
+    // binary vintage refuses on durable state that no rollback can undo.
+    //
+    // P3-D owns the repair, including its writer and its crash window; this is
+    // the call site, not a second implementation. Everything it cannot
+    // attribute to a transition it refuses, and the gate below then refuses
+    // exactly as it did before.
+    let refounded = refound_committed_rebuild_manifest(index_path)
+        .map_err(|error| gate_failure(ERROR_REBUILD_PROOF_MODE, error.to_string()))?;
+    let refounded = match refounded {
+        RebuildManifestRefoundV1::Refounded { .. } => Some(refounded),
+        _ => None,
+    };
 
     // Cut-time tier. Each of the three steps raises its own plan code, so a
     // refusal names which property failed rather than a single opaque one:
@@ -582,6 +625,7 @@ pub fn validate_rebuild_coverage_before_bind(
     }
 
     Ok(RebuildStartupGateV1::Verified {
+        refounded,
         rebuild_id: manifest.rebuild_id.clone(),
         cut_time_generations: verified.len() as u64,
         live_refresh_generations: live_refresh,

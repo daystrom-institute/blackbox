@@ -66,10 +66,11 @@ use bbox_corpus_core::project_catalog::{
 use bbox_corpus_index::index::history_generations::{
     HistoryGenerationError, HistoryGenerationIdV1, HistoryGenerationInputV1, HistoryGenerationIo,
     HistoryGenerationOwnerV1, HistoryGenerationRecordV1, HistoryGenerationStore,
-    HistoryIndexScanV1, HistoryNamespaceCaptureV1, HistoryProofModeV1, HistoryScanLimitsV1,
-    PreparedHistoryGenerationV1, RealHistoryGenerationIo, RepoHistoryRebuildDispositionV1,
-    RepoHistoryRebuildManifestV1, RepoHistoryRebuildNamespaceV1, RepoHistoryRebuildPreparedV1,
-    RepoHistoryRebuildRecoveryV1, scan_commit_documents,
+    HistoryIndexScanV1, HistoryLineageRowV1, HistoryNamespaceCaptureV1, HistoryProofBasisV1,
+    HistoryProofModeV1, HistoryScanLimitsV1, PreparedHistoryGenerationV1, RealHistoryGenerationIo,
+    RepoHistoryRebuildDispositionV1, RepoHistoryRebuildManifestV1, RepoHistoryRebuildNamespaceV1,
+    RepoHistoryRebuildPreparedV1, RepoHistoryRebuildRecoveryV1, RepoHistoryRebuildStateV1,
+    fold_history_generation_lineage_fingerprint, scan_commit_documents,
 };
 
 use crate::project_catalog_migration::{
@@ -887,6 +888,48 @@ pub fn prepare_rebuild_manifest(
     planned_lexical_generation_label: impl Into<String>,
     planned_vector_generation_label: impl Into<String>,
 ) -> HistoryMaterializerResult<RepoHistoryRebuildPreparedV1> {
+    let proof = asset_proof_of(outcome);
+    prepare_rebuild_manifest_with_proof(
+        scan,
+        outcome,
+        catalog_epoch,
+        planned_lexical_generation_label,
+        planned_vector_generation_label,
+        proof,
+    )
+}
+
+/// The proof the migration-asset basis produced for this pass, exactly as the
+/// materializer decided it. This is what [`prepare_rebuild_manifest`] binds,
+/// and it is factored out so the transition arm can name the proof it is
+/// REPLACING rather than reconstructing the field-by-field copy.
+pub fn asset_proof_of(outcome: &HistoryMaterializationOutcomeV1) -> HistoryRebuildProofV1 {
+    HistoryRebuildProofV1 {
+        basis: HistoryProofBasisV1::MigrationAsset,
+        proof_mode: outcome.proof_mode,
+        recorded_fingerprint: outcome.recorded_source_index_fingerprint.clone(),
+        observed_fingerprint: outcome.observed_source_index_fingerprint.clone(),
+    }
+}
+
+/// [`prepare_rebuild_manifest`] with the proof supplied rather than read off
+/// the outcome.
+///
+/// This is a PARAMETERIZATION of the one builder, not a second one: the
+/// inventory, the buckets, and the completeness refusal below are the only
+/// implementation of any of those, and the plan's ban on a parallel manifest
+/// writer is precisely a ban on a second copy of them. The only thing a caller
+/// may vary is which predecessor the proof was decided against, because the
+/// migration asset is not the right predecessor for every basis (see
+/// [`prove_pinned_generation_lineage`]).
+pub fn prepare_rebuild_manifest_with_proof(
+    scan: &HistoryIndexScanV1,
+    outcome: &HistoryMaterializationOutcomeV1,
+    catalog_epoch: u64,
+    planned_lexical_generation_label: impl Into<String>,
+    planned_vector_generation_label: impl Into<String>,
+    proof: HistoryRebuildProofV1,
+) -> HistoryMaterializerResult<RepoHistoryRebuildPreparedV1> {
     // "Complete namespace inventory" is the manifest's load-bearing claim:
     // an unclaimed generation has no other durable owner, so a manifest that
     // silently omitted one would leave it unpinned and sweepable. Refuse a
@@ -941,9 +984,10 @@ pub fn prepare_rebuild_manifest(
     Ok(RepoHistoryRebuildPreparedV1 {
         source_index_fingerprint_sha256: scan.source_index_fingerprint_sha256.clone(),
         source_schema_version: scan.schema_version.clone(),
-        proof_mode: outcome.proof_mode,
-        recorded_source_index_fingerprint: outcome.recorded_source_index_fingerprint.clone(),
-        observed_source_index_fingerprint: outcome.observed_source_index_fingerprint.clone(),
+        proof_mode: proof.proof_mode,
+        proof_basis: proof.basis,
+        recorded_source_index_fingerprint: proof.recorded_fingerprint,
+        observed_source_index_fingerprint: proof.observed_fingerprint,
         namespace_inventory,
         catalog_epoch,
         owned_generation_ids,
@@ -952,6 +996,325 @@ pub fn prepare_rebuild_manifest(
         unclaimed_generation_ids,
         planned_lexical_generation_label: planned_lexical_generation_label.into(),
         planned_vector_generation_label: planned_vector_generation_label.into(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild manifest: the pinned-generation lineage basis
+// ---------------------------------------------------------------------------
+
+/// A decided proof, with the predecessor it was decided against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRebuildProofV1 {
+    pub basis: HistoryProofBasisV1,
+    pub proof_mode: HistoryProofModeV1,
+    pub recorded_fingerprint: Option<String>,
+    pub observed_fingerprint: Option<String>,
+}
+
+/// Prove a committed predecessor manifest's pinned generations against the
+/// generation store, and return the proof a manifest founded on that lineage
+/// records.
+///
+/// # What this proves, and what it deliberately does not
+///
+/// It proves that every generation the predecessor manifest names is still
+/// present in the store and still re-derives EXACTLY the row that names it:
+/// `load` re-derives the generation's own content-addressed commitments and
+/// refuses a mismatch, and the row comparison then proves the manifest and the
+/// generation agree about the count and the document-set commitment. The
+/// recorded and observed folds are the two sides of that comparison through
+/// one recipe, so an audit can re-derive the verdict from durable state later
+/// rather than trusting the mode this returns.
+///
+/// It proves NOTHING about namespaces that appeared after the predecessor's
+/// cut. That is the point of the split: the predecessor's inventory is an
+/// exact enumeration of the predecessor's basis, and this function carries
+/// that exactness forward without inventing a claim about anything the
+/// predecessor never described. History that advanced afterwards is the
+/// startup gate's live-refresh tier, which verifies those generations against
+/// the catalog record that names them.
+///
+/// `observed_namespaces`, when supplied, is the namespace set of the scan the
+/// NEW manifest is being prepared over. Every namespace the predecessor named
+/// must appear in it: commit history is append-only, so a namespace that
+/// vanished across the transition is loss evidence and refuses here, with the
+/// outgoing index still intact. It is `None` for the recovery arm, which
+/// re-founds the predecessor's own inventory and therefore has no second
+/// namespace set to compare against.
+pub fn prove_pinned_generation_lineage(
+    store: &HistoryGenerationStore,
+    predecessor: &RepoHistoryRebuildManifestV1,
+    observed_namespaces: Option<&BTreeSet<String>>,
+) -> HistoryMaterializerResult<HistoryRebuildProofV1> {
+    if predecessor.state != RepoHistoryRebuildStateV1::Committed {
+        return Err(HistoryMaterializerError::commitment_mismatch(
+            "a pinned-generation lineage can only be founded on a COMMITTED predecessor \
+             manifest: a prepared one describes a cut that never landed",
+        ));
+    }
+    if predecessor.prepared.namespace_inventory.is_empty() {
+        // An empty inventory folds to a constant, so founding on it would
+        // prove nothing at all while looking exactly like a proof.
+        return Err(HistoryMaterializerError::commitment_mismatch(
+            "the predecessor rebuild manifest names no generation, so it cannot found a \
+             pinned-generation lineage",
+        ));
+    }
+    let mut recorded = Vec::new();
+    let mut observed = Vec::new();
+    for row in &predecessor.prepared.namespace_inventory {
+        if let Some(namespaces) = observed_namespaces
+            && !namespaces.contains(row.namespace.as_str())
+        {
+            return Err(HistoryMaterializerError::commitment_mismatch(format!(
+                "namespace {} is pinned by the predecessor rebuild manifest with {} commit \
+                 documents but is absent from the index this rebuild observed",
+                row.namespace, row.commit_document_count
+            )));
+        }
+        let id = HistoryGenerationIdV1::parse(&row.generation_id)?;
+        let record = store.load(&id).map_err(|error| {
+            HistoryMaterializerError::commitment_mismatch(format!(
+                "the predecessor rebuild manifest pins generation {} which cannot be verified: \
+                 {error}",
+                row.generation_id
+            ))
+        })?;
+        recorded.push(HistoryLineageRowV1 {
+            namespace: row.namespace.as_str().to_string(),
+            generation_id: row.generation_id.clone(),
+            commit_document_count: row.commit_document_count,
+            commit_document_commitment_sha256: row.commit_document_commitment_sha256.clone(),
+        });
+        observed.push(HistoryLineageRowV1 {
+            namespace: record.manifest.body.namespace.as_str().to_string(),
+            generation_id: record.id.as_str().to_string(),
+            commit_document_count: record.manifest.body.commit_document_count,
+            commit_document_commitment_sha256: record
+                .manifest
+                .body
+                .commit_document_commitment_sha256
+                .clone(),
+        });
+    }
+    let recorded_fingerprint = fold_history_generation_lineage_fingerprint(recorded);
+    let observed_fingerprint = fold_history_generation_lineage_fingerprint(observed);
+    if recorded_fingerprint != observed_fingerprint {
+        // Unreachable through the row-by-row comparison above only if that
+        // comparison is complete; asserting the fold anyway is what makes the
+        // recorded pair a real comparison rather than one value written twice.
+        return Err(HistoryMaterializerError::commitment_mismatch(
+            "the predecessor rebuild manifest's pinned generations do not re-derive the \
+             lineage it records",
+        ));
+    }
+    Ok(HistoryRebuildProofV1 {
+        basis: HistoryProofBasisV1::PinnedGenerationLineage,
+        proof_mode: HistoryProofModeV1::Equality,
+        recorded_fingerprint: Some(recorded_fingerprint),
+        observed_fingerprint: Some(observed_fingerprint),
+    })
+}
+
+/// Is a manifest's basis index at a DIFFERENT schema version than the one this
+/// binary runs?
+///
+/// This is the whole schema-transition evidence base, and it is derived from
+/// what the manifest already records rather than from anything inferred. A
+/// prepared manifest binds `source_schema_version`: the marker the index it
+/// scanned actually carried (or the reserved pre-marker sentinel, which is
+/// likewise not a running version). When that differs from
+/// `INDEX_SCHEMA_VERSION`, three things follow, all of them from documented
+/// behavior rather than guesswork:
+///
+/// 1. the basis index no longer exists, because bumping `INDEX_SCHEMA_VERSION`
+///    drops the entire index at the next open;
+/// 2. the migration-asset proof could not have succeeded on it, because
+///    `capture_index` treats a marker that is not the RUNNING version as
+///    corrupt, so the recomputed fingerprint cannot fold to the recorded one;
+/// 3. therefore a non-`Equality` mode on such a manifest is attributable to
+///    the transition, not to lost or unaccounted history.
+///
+/// When the two are EQUAL there is no transition, the asset proof was
+/// reachable, and a non-`Equality` mode is genuine drift that must keep
+/// refusing. That equality is exactly the offline path-free-rebuild's shape:
+/// the marker is unchanged across it by construction.
+pub fn manifest_basis_is_a_schema_transition(manifest: &RepoHistoryRebuildManifestV1) -> bool {
+    manifest.prepared.source_schema_version != bbox_corpus_index::index::INDEX_SCHEMA_VERSION
+}
+
+/// Why a committed manifest that fails the Equality gate was NOT re-founded.
+///
+/// Returned rather than folded into an error because "this shape is not
+/// repairable" and "this repair failed" send an operator to different places,
+/// and the caller refuses either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebuildManifestRefoundRefusalV1 {
+    /// The manifest's basis is at the RUNNING schema version: no transition,
+    /// so the non-Equality mode is genuine drift on an unchanged basis.
+    NoSchemaTransition,
+    /// The index on disk does not carry the running schema marker, so the
+    /// transition this manifest describes has not finished. Repairing here
+    /// would re-found a manifest whose replacement is still in flight; the
+    /// P3-D/P3-E resume path owns that state.
+    TransitionIncomplete,
+    /// The manifest already claims the pinned-generation lineage basis. A
+    /// lineage manifest that fails the gate cannot be repaired by re-deriving
+    /// the same lineage, and doing so would launder its own failure.
+    AlreadyLineageFounded,
+}
+
+/// What [`refound_committed_rebuild_manifest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RebuildManifestRefoundV1 {
+    /// The committed manifest already records an `Equality` proof. Untouched.
+    AlreadyProven,
+    /// No committed manifest is present. Untouched; the caller's own
+    /// missing-manifest refusal owns that shape.
+    NoManifest,
+    /// Re-founded on the pinned-generation lineage and re-committed.
+    Refounded {
+        previous_rebuild_id: String,
+        rebuild_id: String,
+        pinned_generations: u64,
+        basis_schema_version: String,
+    },
+    /// Recognized as unrepairable. The caller refuses exactly as it did before
+    /// this function existed.
+    Refused {
+        reason: RebuildManifestRefoundRefusalV1,
+    },
+}
+
+/// Re-found a committed rebuild manifest whose recorded proof is attributable
+/// to a schema-version transition, so a daemon that legitimately bumped
+/// `INDEX_SCHEMA_VERSION` is not permanently unbootable.
+///
+/// # The class this exists for
+///
+/// A schema bump drops the index. The pre-drop guard therefore always scans an
+/// index whose marker is the OUTGOING version while the binary already carries
+/// the incoming one, and the migration-asset proof is unreachable in exactly
+/// that state (`capture_index` refuses a non-running marker). So the manifest
+/// the bump commits records `Drift`, and the P6-C startup gate then refuses
+/// every subsequent boot, of every binary vintage, because the defective
+/// manifest is durable. [`prepare_rebuild_manifest_with_proof`]'s transition
+/// arm stops NEW bumps from landing there; this repairs a volume that already
+/// did.
+///
+/// # What it repairs, and what it refuses to touch
+///
+/// It re-founds the PROOF and nothing else. The namespace inventory, every
+/// bucket, and therefore every pinned generation id are carried across
+/// byte-for-byte, which is not a convenience: a manifest is the only GC root a
+/// compatibility or unclaimed generation has (D-037), so a repair that
+/// re-derived the inventory could unpin a generation nothing else names. The
+/// committed block is carried across for the same reason - it records the
+/// views and catalog epoch the replacement actually produced, and this repair
+/// did not produce a different one.
+///
+/// Everything it cannot attribute to a transition is refused, not repaired:
+/// see [`RebuildManifestRefoundRefusalV1`].
+///
+/// # Write ordering, and why its crash window is convergent
+///
+/// P3-D owns the manifest writer, and its two states are the writer's:
+///
+/// 1. `write_prepared_rebuild_manifest` publishes the re-founded manifest in
+///    the PREPARED state (atomic rename, fsync, parent fsync);
+/// 2. `commit_rebuild_manifest` promotes it, carrying the predecessor's own
+///    committed block.
+///
+/// A crash between them leaves a prepared manifest whose
+/// `source_schema_version` is the outgoing one while the index on disk carries
+/// the running marker. `classify_rebuild_recovery` reads exactly that
+/// difference and answers `ResumePrepared`, so the next boot re-executes the
+/// replacement from these same pinned generations and commits the manifest
+/// through the ordinary P3-E committer. The window is therefore self-healing
+/// through the path that already exists, and no second recovery state machine
+/// is introduced. Throughout both steps the pinned id set is unchanged, so no
+/// generation is ever unrooted mid-repair.
+///
+/// Callers must run this BEFORE any read view binds, which is where the
+/// startup gate already sits.
+pub fn refound_committed_rebuild_manifest(
+    index_path: &Path,
+) -> HistoryMaterializerResult<RebuildManifestRefoundV1> {
+    let store = HistoryGenerationStore::open_for_index(index_path)?;
+    let Some(manifest) = store.read_rebuild_manifest()? else {
+        return Ok(RebuildManifestRefoundV1::NoManifest);
+    };
+    if manifest.state != RepoHistoryRebuildStateV1::Committed {
+        return Ok(RebuildManifestRefoundV1::NoManifest);
+    }
+    if manifest.prepared.proof_mode == HistoryProofModeV1::Equality
+        && manifest
+            .prepared
+            .recorded_source_index_fingerprint
+            .is_some()
+        && manifest.prepared.recorded_source_index_fingerprint
+            == manifest.prepared.observed_source_index_fingerprint
+    {
+        return Ok(RebuildManifestRefoundV1::AlreadyProven);
+    }
+    if manifest.prepared.proof_basis == HistoryProofBasisV1::PinnedGenerationLineage {
+        return Ok(RebuildManifestRefoundV1::Refused {
+            reason: RebuildManifestRefoundRefusalV1::AlreadyLineageFounded,
+        });
+    }
+    if !manifest_basis_is_a_schema_transition(&manifest) {
+        return Ok(RebuildManifestRefoundV1::Refused {
+            reason: RebuildManifestRefoundRefusalV1::NoSchemaTransition,
+        });
+    }
+    // The transition must have FINISHED. A marker that is absent or is not the
+    // running version means this index is not the post-drop replacement the
+    // manifest's basis was transitioned into, and the resume path owns it.
+    let marker = bbox_corpus_index::index::read_index_schema_marker(index_path)
+        .map_err(|error| HistoryMaterializerError::new("error.history_io", error.to_string()))?;
+    if marker.as_deref() != Some(bbox_corpus_index::index::INDEX_SCHEMA_VERSION) {
+        return Ok(RebuildManifestRefoundV1::Refused {
+            reason: RebuildManifestRefoundRefusalV1::TransitionIncomplete,
+        });
+    }
+
+    // The proof, against the manifest's own pinned generations. Any refusal
+    // here propagates: a manifest whose generations cannot be verified is not
+    // a manifest whose proof may be upgraded.
+    let proof = prove_pinned_generation_lineage(&store, &manifest, None)?;
+    let committed = manifest.committed.clone().ok_or_else(|| {
+        HistoryMaterializerError::commitment_mismatch(
+            "a committed rebuild manifest carries no committed block",
+        )
+    })?;
+    let previous_rebuild_id = manifest.rebuild_id.clone();
+    let basis_schema_version = manifest.prepared.source_schema_version.clone();
+    let pinned_generations = manifest.prepared.namespace_inventory.len() as u64;
+    let mut prepared = manifest.prepared;
+    prepared.proof_mode = proof.proof_mode;
+    prepared.proof_basis = proof.basis;
+    prepared.recorded_source_index_fingerprint = proof.recorded_fingerprint;
+    prepared.observed_source_index_fingerprint = proof.observed_fingerprint;
+
+    store.write_prepared_rebuild_manifest(prepared)?;
+    let refounded = store.commit_rebuild_manifest(committed)?;
+    tracing::warn!(
+        previous_rebuild_id = %previous_rebuild_id,
+        rebuild_id = %refounded.rebuild_id,
+        basis_schema_version = %basis_schema_version,
+        running_schema_version = %bbox_corpus_index::index::INDEX_SCHEMA_VERSION,
+        pinned_generations,
+        "re-founded a committed rebuild manifest on its pinned-generation lineage: its recorded \
+         proof was decided against a migration asset the schema transition made unreachable"
+    );
+    Ok(RebuildManifestRefoundV1::Refounded {
+        previous_rebuild_id,
+        rebuild_id: refounded.rebuild_id,
+        pinned_generations,
+        basis_schema_version,
     })
 }
 

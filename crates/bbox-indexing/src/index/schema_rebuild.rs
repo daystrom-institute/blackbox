@@ -7,7 +7,9 @@
 //! steps the rebuild pass runs:
 //!
 //! 1. catalog guard: materialize every observed namespace to `Ready` and write
-//!    the PREPARED rebuild manifest. Only its success authorizes the reset.
+//!    the PREPARED rebuild manifest, proved against the predecessor that can
+//!    actually describe this basis (`replacement_proof`). Only its success
+//!    authorizes the reset.
 //! 2. bridge guard: write and fsync the commit spill before the drop.
 //! 3. after the drop, inside the rebuild pass and BEFORE any checkout walk:
 //!    re-emit commit documents from the pinned generations, verify each
@@ -28,7 +30,7 @@ use anyhow::{Context, Result};
 use bbox_corpus_core::project_record::ProjectRecordsProvider;
 use bbox_corpus_index::index::FieldHandles;
 use bbox_corpus_index::index::history_generations::{
-    HistoryGenerationIdV1, HistoryGenerationStore, HistoryScanLimitsV1,
+    HistoryGenerationIdV1, HistoryGenerationStore, HistoryProofModeV1, HistoryScanLimitsV1,
     RepoHistoryRebuildCommittedV1, RepoHistoryRebuildManifestV1, RepoHistoryRebuildRecoveryV1,
     RepoHistoryRebuildStateV1, RepoHistoryRebuildVectorRowV1, scan_commit_documents,
 };
@@ -40,7 +42,9 @@ use bbox_corpus_index::index::schema_replacement::{
 use tantivy::IndexWriter;
 
 use crate::index::history_materializer::{
-    HistoryMaterializerRequestV1, materialize_history_generations, prepare_rebuild_manifest,
+    HistoryMaterializerRequestV1, HistoryRebuildProofV1, asset_proof_of,
+    materialize_history_generations, prepare_rebuild_manifest_with_proof,
+    prove_pinned_generation_lineage,
 };
 use crate::project_catalog_store::ProjectCatalogStore;
 use std::path::PathBuf;
@@ -113,16 +117,19 @@ pub fn catalog_schema_replacement_guard(
                 .map(|state| state.epoch())
                 .unwrap_or_default()
         });
-        let prepared = prepare_rebuild_manifest(
+        let generation_store = HistoryGenerationStore::open_for_index(request.index_path)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let proof = replacement_proof(request, &generation_store, &scan, &outcome)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let prepared = prepare_rebuild_manifest_with_proof(
             &scan,
             &outcome,
             catalog_epoch,
             planned_lexical_label(request),
             planned_vector_label(),
+            proof,
         )
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let generation_store = HistoryGenerationStore::open_for_index(request.index_path)
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let manifest = generation_store
             .write_prepared_rebuild_manifest(prepared)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -153,6 +160,81 @@ pub fn catalog_schema_replacement_guard(
             manifest.prepared.namespace_inventory.len()
         )))
     })
+}
+
+/// Decide which predecessor this replacement's manifest is proved against.
+///
+/// # Why the migration asset is not always the right predecessor
+///
+/// The asset is a point-in-time record of the index as it stood at migration.
+/// `capture_index` treats a schema marker that is not the RUNNING
+/// `INDEX_SCHEMA_VERSION` as corrupt, so the recomputed fingerprint cannot fold
+/// to the recorded one whenever the outgoing index is at a different schema
+/// than the binary. A daemon-upgrade replacement is that case BY
+/// CONSTRUCTION - it exists because the markers differ - so the asset proof
+/// lands in `Drift` on every schema bump, deterministically and forever, and
+/// the manifest the bump commits then fails the P6-C startup gate on every
+/// subsequent boot. That is not drift evidence about history; it is the asset
+/// being the wrong predecessor for this basis.
+///
+/// The right predecessor for a transition is the COMMITTED manifest of the
+/// index being replaced: it enumerates that index's namespaces exactly (its
+/// inventory is scan-derived, and `prepare_rebuild_manifest` refuses a scan and
+/// outcome describing different namespace sets), and its generations are
+/// content-addressed and still on disk. Proving them re-loads and re-derives
+/// every one, and additionally refuses if any pinned namespace has vanished
+/// from the index this replacement observed.
+///
+/// # What is deliberately unchanged
+///
+/// The asset proof stands wherever it is reachable, so nothing here weakens the
+/// same-schema case:
+///
+/// - an asset proof that reached `Equality` is used as-is, whatever the
+///   markers say;
+/// - a replacement whose outgoing marker EQUALS the target - the offline
+///   `path-free-rebuild --apply` shape, where the marker is unchanged across
+///   the rebuild - is not a transition, so a `Drift` asset proof stays `Drift`
+///   and the D-036 consumers keep refusing it;
+/// - a store with no committed predecessor manifest keeps the asset verdict:
+///   there is no lineage to found on, and inventing one would be the
+///   unfalsifiable Equality this whole boundary exists to prevent.
+fn replacement_proof(
+    request: &SchemaReplacementRequest<'_>,
+    generation_store: &HistoryGenerationStore,
+    scan: &bbox_corpus_index::index::history_generations::HistoryIndexScanV1,
+    outcome: &crate::index::history_materializer::HistoryMaterializationOutcomeV1,
+) -> anyhow::Result<HistoryRebuildProofV1> {
+    let asset = asset_proof_of(outcome);
+    if asset.proof_mode == HistoryProofModeV1::Equality {
+        return Ok(asset);
+    }
+    // The transition test is the request's own two markers rather than the
+    // global constant: the boundary already resolved both, and under the
+    // operator force it guarantees they are equal, so this arm cannot fire on
+    // a same-schema rebuild.
+    if request.observed_schema_version.as_deref() == Some(request.target_schema_version) {
+        return Ok(asset);
+    }
+    let Some(predecessor) = generation_store
+        .read_rebuild_manifest()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .filter(|manifest| manifest.state == RepoHistoryRebuildStateV1::Committed)
+    else {
+        return Ok(asset);
+    };
+    let namespaces = scan.namespaces.keys().cloned().collect::<BTreeSet<_>>();
+    let proof = prove_pinned_generation_lineage(generation_store, &predecessor, Some(&namespaces))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    tracing::info!(
+        predecessor_rebuild_id = %predecessor.rebuild_id,
+        observed_schema_version = request.observed_schema_version.as_deref().unwrap_or("<absent>"),
+        target_schema_version = request.target_schema_version,
+        pinned_generations = predecessor.prepared.namespace_inventory.len(),
+        "proving this replacement against the predecessor manifest's pinned generations: the \
+         migration asset cannot describe an index observed across a schema transition"
+    );
+    Ok(proof)
 }
 
 /// Bridge-mode guard: the commit spill lane.

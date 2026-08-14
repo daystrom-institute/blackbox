@@ -8,6 +8,12 @@
 //! because a second implementation would fork the crash and recovery semantics
 //! P3-D owns.
 //!
+//! The same rule governs REPAIR. When a committed manifest's recorded proof is
+//! attributable to a schema-version transition, the manifest is re-founded by
+//! P3-D's `refound_committed_rebuild_manifest`, which owns that write and its
+//! crash window; this module keeps refusing until that has happened, and never
+//! rewrites a manifest itself.
+//!
 //! Two contracts are enforced here and nowhere else in this crate:
 //!
 //! - **Equality proof mode is mandatory (D-036).** A `Drift`-mode outcome
@@ -151,6 +157,14 @@ pub fn read_committed_rebuild_manifest(
 /// re-derive the mode decision instead of trusting it; this re-derives it. A
 /// manifest claiming `Equality` whose two fingerprints disagree is refused with
 /// the same code, because the claim and its own evidence contradict.
+///
+/// The check is deliberately basis-agnostic. `HistoryProofBasisV1` records
+/// WHICH predecessor decided the mode, and both bases answer the same question
+/// - is this inventory an exact enumeration of its basis - from a pair of
+/// fingerprints that is re-derivable from durable state. D-036 is a statement
+/// about the strength of the answer, not about which predecessor supplied it,
+/// so this enforces the mode and leaves the basis to the writer that could
+/// actually prove it.
 pub fn require_equality_proof_mode(manifest: &RepoHistoryRebuildManifestV1) -> RebuildResult<()> {
     if manifest.prepared.proof_mode != HistoryProofModeV1::Equality {
         return Err(refuse(
@@ -323,7 +337,7 @@ mod tests {
 
     use bbox_corpus_core::project_catalog::CommitNamespace;
     use bbox_corpus_index::index::history_generations::{
-        RepoHistoryRebuildNamespaceV1, RepoHistoryRebuildPreparedV1,
+        HistoryProofBasisV1, RepoHistoryRebuildNamespaceV1, RepoHistoryRebuildPreparedV1,
     };
 
     fn prepared(proof_mode: HistoryProofModeV1) -> RepoHistoryRebuildPreparedV1 {
@@ -331,6 +345,7 @@ mod tests {
             source_index_fingerprint_sha256: "a".repeat(64),
             source_schema_version: "schema-v1".to_string(),
             proof_mode,
+            proof_basis: HistoryProofBasisV1::MigrationAsset,
             recorded_source_index_fingerprint: Some("f".repeat(64)),
             observed_source_index_fingerprint: Some("f".repeat(64)),
             namespace_inventory: Vec::new(),
