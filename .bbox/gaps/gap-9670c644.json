@@ -1,0 +1,24 @@
+{
+  "id": "gap-9670c644",
+  "title": "Slack lane: channel names are display-only metadata, unsearchable and unfilterable in bbox_search",
+  "gap_kind": "mcp_surface",
+  "domain": "slack-search-projection",
+  "wanted_capability": "Finding a Slack channel's material by naming the channel. bbox_search(query=\"pg-p1-4565\", source=\"slack\") returns nothing even though 7 docs carry Channel: pg-p1-4565: the channel name is rendered per hit but is not an indexed/queryable field, there is no channel filter parameter on bbox_search, and smart mode phrase-matches the hyphenated term against body text only. Wanted: a channel filter param (name or id) on bbox_search for the slack lane, and/or the channel name indexed as a searchable field so \"what's in #pg-p1-4565\" works as a query. This is the first question an operator asks of the lane and it currently reads as \"indexing is broken\" when the index is actually complete.",
+  "missing_primitive": "channel filter / channel-name field query on the slack search projection",
+  "fallback_used": "mode=fulltext with conversation_channel_name:\"<name>\" (verified live, returns the channel's full doc set); file_path:\"slack:<workspace>/<channel-id>\" also works when the id is known.",
+  "notes": "ROOT CAUSE (2026-08-14, same-day): the name IS stamped per doc at index time. Each conversation doc carries conversation_channel_name (roster observed_name at projection time, bbox-corpus-index transcripts/conversation.rs) as a TEXT|STORED tantivy field in the live g12 schema. The only miss is query plumbing: the transcript QueryParser default field list is [content, project, code_content, symbol] (bbox-corpus-index index/search.rs ~420-428), so plain queries never consult the field, and no channel filter param exists. Fix is search-time only, no schema bump, no reindex: (a) add conversation_channel_name to the default parser fields (smart mode already phrase-ifies hyphenated terms, so \"pg-p1-4565\" matches the tokenized name) and/or (b) a channel filter param. Rename semantics: docs keep the name observed at projection time, so post-rename history splits across two names until a schema-drop rebuild restamps; a channel filter that resolves name to channel id via the roster and filters on the stable id would be rename-proof.",
+  "evidence": [
+    "live probe 2026-08-14: bbox_search(query=\"pg-p1-4565\", source=\"slack\") = 0 results vs fulltext file_path:\"slack:T4MNK2L6A/C0BP8JG21FU\" = 7 docs, verified complete against conversations.history",
+    "thread-21347ce5"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/slack-search-projection/channel-name-unsearchable",
+  "resolution": "addressed",
+  "resolution_note": "Shipped same-day: (1) conversation_channel_name joined the transcript QueryParser default fields, so a plain query naming a channel surfaces its documents; (2) bbox_search grew a channel filter param accepting a name (leading # ok) or channel id, resolving names through the current roster to the stable channel id (rename-proof) and also matching documents stamped with the queried name; (3) Slack top hits now render working drill-downs (channel filter + permalink) instead of bbox_context/bbox_messages; (4) tool docs updated. Search-time only, no schema bump. Proven by conversation_channel_search_tests in bbox-corpus-index index/search.rs including the rename double-lane case.",
+  "resolved_at": "2026-08-14T18:20:00Z",
+  "project_id": "89bd722f",
+  "thread_id": "thread-21347ce5",
+  "created_at": "2026-08-14T17:14:17Z",
+  "updated_at": "2026-08-14T17:14:17Z"
+}

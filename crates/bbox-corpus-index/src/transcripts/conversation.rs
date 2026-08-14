@@ -287,6 +287,38 @@ impl ConversationTranscriptAdapter {
     }
 }
 
+/// Channel ids whose CURRENT roster observation carries `name`, across every
+/// enrolled scope under `root`.
+///
+/// The search channel filter resolves names through here so a renamed channel
+/// still matches its WHOLE history by the stable channel id, even though its
+/// older documents were stamped with the name observed when they were indexed.
+/// Best-effort by design: an unreadable store or an unknown name returns
+/// empty, and the caller's name-stamp lane still matches whatever documents
+/// literally carry the queried name.
+pub fn rostered_channel_ids_named(
+    root: &Path,
+    sources: &[ConversationSourceEnrollmentV1],
+    name: &str,
+) -> Vec<String> {
+    let Some(adapter) = ConversationTranscriptAdapter::open(root, sources.to_vec()) else {
+        return Vec::new();
+    };
+    let Ok(channels) = adapter.covered_channels() else {
+        return Vec::new();
+    };
+    channels
+        .into_iter()
+        .filter(|channel| {
+            channel
+                .channel_name
+                .as_deref()
+                .is_some_and(|observed| observed.eq_ignore_ascii_case(name))
+        })
+        .map(|channel| channel.channel_id)
+        .collect()
+}
+
 impl TranscriptReadAdapter for ConversationTranscriptAdapter {
     fn source(&self) -> TranscriptSource {
         TranscriptSource::Slack

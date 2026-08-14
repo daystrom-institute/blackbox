@@ -173,8 +173,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_search",
         category: ToolCategory::Transcripts,
         summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",
-        when_to_use: "Use when you know the topic but not the exact session. Filter by account, project, or role early. Pass `exclude_self=true` for current-turn searches. `source` filters the lane a document came from (`glm`, `claude`, `codex`, `gemini`, `slack`, ...): comma-separated for several, and a `-` prefix excludes one, so `source=\"slack\"` searches only ingested Slack conversations and `source=\"-slack\"` searches everything else. Slack conversations are searchable by default; that one filter is how you include or exclude them. Authorship on a conversation hit is identity, not turn kind, so filter who spoke with `author=<provider user id>` — the `role` lane only distinguishes human from app there. Conversation hits render the channel, the author, and a derived Slack permalink; they have no readable transcript file, so follow the permalink rather than `bbox_context`. See `sm-transcript-retrieval` for ladders.",
-        example: Some(r#"bbox_search(query="redis locking", project="my-app", role="user")"#),
+        when_to_use: "Use when you know the topic but not the exact session. Filter by account, project, or role early. Pass `exclude_self=true` for current-turn searches. `source` filters the lane a document came from (`glm`, `claude`, `codex`, `gemini`, `slack`, ...): comma-separated for several, and a `-` prefix excludes one, so `source=\"slack\"` searches only ingested Slack conversations and `source=\"-slack\"` searches everything else. Slack conversations are searchable by default; that one filter is how you include or exclude them. For \"what's in a channel\" questions reach for `channel=` first: it accepts a channel name (leading `#` accepted) or channel id, resolves names through the current roster to the stable channel id so a renamed channel still matches its whole history, and also matches documents stamped with the queried name. Plain queries match channel names too, so a bare `query=\"ops-incident-4565\"` surfaces that channel's messages even when no message body names it. Authorship on a conversation hit is identity, not turn kind, so filter who spoke with `author=<provider user id>`; the `role` lane only distinguishes human from app there. Conversation hits render the channel, the author, and a derived Slack permalink; they have no readable transcript file, so drill down with `channel=` and the permalink rather than `bbox_context` / `bbox_messages`. See `sm-transcript-retrieval` for ladders.",
+        example: Some(
+            r##"bbox_search(query="import mapping", channel="#ops-incident-4565", source="slack")"##,
+        ),
     },
     ToolDoc {
         name: "bbox_hybrid_search",
@@ -205,7 +207,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_context",
         category: ToolCategory::Transcripts,
         summary: "Conversation context around a specific byte offset.",
-        when_to_use: "Use after `bbox_search` or `bbox_cite` when you want the surrounding turns for a specific hit. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        when_to_use: "Use after `bbox_search` or `bbox_cite` when you want the surrounding turns for a specific hit. Transcript-file hits only: a Slack hit's `slack:` locator is a record key with no file behind it, so read the channel through `bbox_search(channel=...)` and the hit's permalink instead. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
         example: None,
     },
     ToolDoc {
@@ -219,7 +221,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_messages",
         category: ToolCategory::Transcripts,
         summary: "Chronological messages from a session.",
-        when_to_use: "Use when you need the chronological conversation flow for a known session. Supports pagination, role filter, and tail mode. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        when_to_use: "Use when you need the chronological conversation flow for a known session. Supports pagination, role filter, and tail mode. Transcript sessions only: a Slack per-channel-per-day bucket is not a readable session, so page a channel with `bbox_search(channel=...)` instead. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
         example: None,
     },
     ToolDoc {

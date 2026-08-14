@@ -2989,6 +2989,7 @@ mod catalog_view_tests {
                     limit: Some(5),
                     source: None,
                     author: None,
+                    channel: None,
                     exclude_self: None,
                 },
                 &view.active_selectors,

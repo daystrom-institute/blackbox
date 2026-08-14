@@ -51,6 +51,13 @@ pub struct SearchParams {
     /// rather than a `role` value.
     #[serde(default)]
     pub author: Option<String>,
+    /// Filter to one conversation channel (Slack lane): a channel name
+    /// (leading `#` accepted) or a channel id. A name resolves against the
+    /// current roster to the stable channel id, so a renamed channel still
+    /// matches its whole history; documents stamped with the queried name
+    /// match directly even when the roster has moved on.
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Include subagent transcripts (default: true)
     #[serde(default)]
     pub include_subagents: Option<bool>,
@@ -416,7 +423,10 @@ impl TranscriptIndex {
             return Ok("Index is empty. Run blackbox_reindex first.".to_string());
         }
 
-        // Parse the user's text query against content + project fields
+        // Parse the user's text query against content + project fields. The
+        // conversation channel name rides along so "what's in pg-p1-4565"
+        // works as a plain query: only conversation documents carry the
+        // field, so the other lanes are unaffected.
         let mut qp = QueryParser::for_index(
             &self.index,
             vec![
@@ -424,6 +434,7 @@ impl TranscriptIndex {
                 self.fields.project,
                 self.fields.code_content,
                 self.fields.symbol,
+                self.fields.conversation_channel_name,
             ],
         );
         if matches!(mode, TranscriptSearchMode::Fulltext) {
@@ -480,6 +491,10 @@ impl TranscriptIndex {
                     IndexRecordOption::Basic,
                 )),
             ));
+        }
+
+        if let Some(channel) = p.channel.as_deref() {
+            clauses.push((Occur::Must, self.conversation_channel_query(channel)?));
         }
 
         if let Some(filter) = project_filter.as_ref() {
@@ -598,17 +613,86 @@ impl TranscriptIndex {
         );
         if let Some((session_id, file_path, byte_offset)) = top_hit {
             out.push_str("\n\nNext steps:\n");
-            out.push_str(&format!(
-                "  → Surrounding conversation: bbox_context(file_path=\"{file_path}\", byte_offset={byte_offset})\n"
-            ));
-            out.push_str(&format!(
-                "  → Read the whole session: bbox_messages(session_id=\"{session_id}\")\n"
-            ));
+            if file_path.starts_with("slack:") {
+                // A conversation hit has no readable transcript file: its
+                // locator is a record key, so bbox_context / bbox_messages
+                // cannot open it. Recommending them here sent callers into
+                // ENOENT dead ends (gap-2d4d17da); the working drill-downs
+                // are the per-hit permalink and the channel filter. The
+                // session id is the per-channel-per-day bucket, so the
+                // channel id is its first segment.
+                let channel_id = session_id.split('/').next().unwrap_or(&session_id);
+                out.push_str(&format!(
+                    "  → The whole channel's messages: bbox_search(query=\"...\", channel=\"{channel_id}\")\n"
+                ));
+                out.push_str(
+                    "  → Open a specific message in Slack: follow its Permalink line above\n",
+                );
+            } else {
+                out.push_str(&format!(
+                    "  → Surrounding conversation: bbox_context(file_path=\"{file_path}\", byte_offset={byte_offset})\n"
+                ));
+                out.push_str(&format!(
+                    "  → Read the whole session: bbox_messages(session_id=\"{session_id}\")\n"
+                ));
+            }
             out.push_str(
                 "  → Trace a specific claim to its origin: bbox_cite(claim=\"<exact phrase>\")\n",
             );
         }
         Ok(out)
+    }
+
+    /// The filter for one conversation channel, matched on TWO lanes at once:
+    ///
+    /// 1. **Stable id.** The spec itself, plus every channel id whose CURRENT
+    ///    roster observation carries the spec as its name. The roster lane is
+    ///    what makes the filter rename-proof: documents are stamped with the
+    ///    name observed when they were indexed, so after a rename the id is
+    ///    the only coordinate that still covers the whole history.
+    /// 2. **Name stamp.** A phrase over `conversation_channel_name`, so
+    ///    documents indexed under the queried name keep matching even when
+    ///    the roster no longer carries it (renamed away, or unenrolled with
+    ///    documents still in the index).
+    ///
+    /// A name never collides with an id: ids are opaque provider tokens that
+    /// appear only in the raw `conversation_channel_id` field, so ORing the
+    /// spec into the id lane unconditionally is safe.
+    fn conversation_channel_query(&self, spec: &str) -> Result<Box<dyn tantivy::query::Query>> {
+        let spec = spec.trim().trim_start_matches('#').trim();
+        if spec.is_empty() {
+            anyhow::bail!("channel filter is empty (pass a channel name or id)");
+        }
+        let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        ids.insert(spec.to_string());
+        if let Some(root) = self.config.conversation_source_root.as_deref() {
+            ids.extend(
+                crate::transcripts::conversation::rostered_channel_ids_named(
+                    root,
+                    &self.config.conversation_sources,
+                    spec,
+                ),
+            );
+        }
+        let mut lanes: Vec<(Occur, Box<dyn tantivy::query::Query>)> = ids
+            .iter()
+            .map(|id| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.conversation_channel_id, id),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn tantivy::query::Query>,
+                )
+            })
+            .collect();
+        let mut name_qp =
+            QueryParser::for_index(&self.index, vec![self.fields.conversation_channel_name]);
+        name_qp.set_conjunction_by_default();
+        if let Ok(name_query) = name_qp.parse_query(&format!("\"{}\"", spec.replace('"', " "))) {
+            lanes.push((Occur::Should, name_query));
+        }
+        Ok(Box::new(BooleanQuery::new(lanes)))
     }
 
     pub fn hybrid_bm25_hits(
@@ -2162,6 +2246,7 @@ mod agentic_project_file_tests {
                 limit: Some(100),
                 source: None,
                 author: None,
+                channel: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2182,6 +2267,7 @@ mod agentic_project_file_tests {
                 limit: Some(100),
                 source: None,
                 author: None,
+                channel: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2198,6 +2284,7 @@ mod agentic_project_file_tests {
                 limit: Some(100),
                 source: None,
                 author: None,
+                channel: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2277,6 +2364,7 @@ mod agentic_project_file_tests {
                 limit: Some(5),
                 source: None,
                 author: None,
+                channel: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2398,6 +2486,7 @@ mod project_filter_lane_tests {
                     limit: Some(10),
                     source: None,
                     author: None,
+                    channel: None,
                     exclude_self: None,
                 },
                 filter,
@@ -2624,6 +2713,254 @@ mod legacy_purge_exemption_tests {
                 .unwrap()
                 .contains_key("/gone/src/lib.rs"),
             "its freshness row is the preservation authority and must survive too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod conversation_channel_search_tests {
+    use super::*;
+    use crate::index::TranscriptIndex;
+    use crate::transcripts::conversation::ConversationSourceEnrollmentV1;
+    use bbox_conversation_source::{
+        AuthorKindV1, CONVERSATION_POLICY_VERSION, ChannelClassV1, ChannelObservationV1,
+        ConversationBatchV1, ConversationMessageRecordV1, SCHEMA_VERSION, batch_digest,
+    };
+    use bbox_conversation_source_store::ConversationSourceStore;
+    use bbox_corpus_core::project_catalog::ConnectorScope;
+
+    const WORKSPACE: &str = "T0FIXTURE";
+    const OPS_CHANNEL: &str = "C0OPSFIX";
+    const OPS_NAME: &str = "ops-fixture-4565";
+    const NOISE_CHANNEL: &str = "C0NOISEFIX";
+    const NOISE_NAME: &str = "noise-fixture";
+
+    fn scope() -> ConnectorScope {
+        ConnectorScope::try_new("csrc_5f2c1d9a4b6e470e", "slack").unwrap()
+    }
+
+    fn enrollment() -> ConversationSourceEnrollmentV1 {
+        ConversationSourceEnrollmentV1 {
+            scope: scope(),
+            remote_authority: "acme.slack.com".to_string(),
+        }
+    }
+
+    fn observation(channel_id: &str, name: &str) -> ChannelObservationV1 {
+        ChannelObservationV1 {
+            channel_id: channel_id.to_string(),
+            observed_name: Some(name.to_string()),
+            class: ChannelClassV1::Public,
+            is_member: true,
+            observed_at: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    fn record(channel_id: &str, message_ts: &str, text: &str) -> ConversationMessageRecordV1 {
+        ConversationMessageRecordV1 {
+            channel_id: channel_id.to_string(),
+            message_ts: message_ts.to_string(),
+            revision: 0,
+            author_id: "U0HUMAN".to_string(),
+            author_kind: AuthorKindV1::Human,
+            thread_parent_ts: None,
+            subtype: None,
+            text: text.to_string(),
+            edited_ts: None,
+            reactions: Vec::new(),
+            attachments: Vec::new(),
+            observed_at: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    fn batch(channel_id: &str, records: Vec<ConversationMessageRecordV1>) -> ConversationBatchV1 {
+        ConversationBatchV1 {
+            schema_version: SCHEMA_VERSION,
+            conversation_policy_version: CONVERSATION_POLICY_VERSION.to_string(),
+            scope: scope(),
+            workspace_id: WORKSPACE.to_string(),
+            channel_id: channel_id.to_string(),
+            batch_digest: batch_digest(&records),
+            records,
+            observed_at: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Two rostered channels with one landed message each, projected into a
+    /// real `TranscriptIndex` exactly as a reindex pass would.
+    fn indexed_fixture(root: &std::path::Path) -> (TranscriptIndex, ConversationSourceStore) {
+        let conv_root = root.join("conversation-sources");
+        let store = ConversationSourceStore::open(&conv_root).unwrap();
+        store
+            .bind_workspace(&scope(), WORKSPACE, "2026-08-13T00:00:00Z")
+            .unwrap();
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[
+                    observation(NOISE_CHANNEL, NOISE_NAME),
+                    observation(OPS_CHANNEL, OPS_NAME),
+                ],
+            )
+            .unwrap();
+        store
+            .land_batch(
+                &scope(),
+                &batch(
+                    OPS_CHANNEL,
+                    vec![record(
+                        OPS_CHANNEL,
+                        "1712345678.000200",
+                        "the import mapping walkthrough for truck tickets",
+                    )],
+                ),
+            )
+            .unwrap();
+        store
+            .land_batch(
+                &scope(),
+                &batch(
+                    NOISE_CHANNEL,
+                    vec![record(
+                        NOISE_CHANNEL,
+                        "1712345679.000200",
+                        "the import mapping is unrelated noise here",
+                    )],
+                ),
+            )
+            .unwrap();
+
+        let mut index = TranscriptIndex::open_or_create_with_records(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        index.set_conversation_sources(conv_root, vec![enrollment()]);
+        index.build_index_with_project_access(false, &[]).unwrap();
+        index.reader_reload_for_test();
+        (index, store)
+    }
+
+    fn search(index: &TranscriptIndex, query: &str, channel: Option<&str>) -> String {
+        index
+            .search(&SearchParams {
+                query: query.into(),
+                mode: None,
+                account: None,
+                project: None,
+                role: None,
+                include_subagents: None,
+                limit: Some(20),
+                source: None,
+                author: None,
+                channel: channel.map(str::to_string),
+                exclude_self: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_plain_query_naming_the_channel_finds_its_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (index, _store) = indexed_fixture(&root);
+
+        // The exact failure this arc started from: the channel name matched
+        // nothing because the query parser never consulted the stamped
+        // channel-name field, and a caller read that as broken indexing.
+        // A name-field match has no content snippet, so the assertion anchors
+        // on the hit's coordinates rather than its excerpt.
+        let hits = search(&index, OPS_NAME, None);
+        assert!(
+            hits.contains(&format!("slack:{WORKSPACE}/{OPS_CHANNEL}")),
+            "a bare channel-name query must reach the channel's documents: {hits}"
+        );
+        assert!(
+            !hits.contains(NOISE_CHANNEL),
+            "the other channel's documents do not carry the queried name: {hits}"
+        );
+    }
+
+    #[test]
+    fn the_channel_filter_scopes_by_name_hash_prefix_or_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (index, _store) = indexed_fixture(&root);
+
+        for spec in [OPS_NAME, "#ops-fixture-4565", OPS_CHANNEL] {
+            let hits = search(&index, "import mapping", Some(spec));
+            assert!(
+                hits.contains("truck tickets"),
+                "channel={spec} must include the channel's documents: {hits}"
+            );
+            assert!(
+                !hits.contains("unrelated noise"),
+                "channel={spec} must exclude other channels: {hits}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_renamed_channel_matches_its_whole_history_under_either_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (index, store) = indexed_fixture(&root);
+
+        // The rename lands as a roster observation BETWEEN reindex passes:
+        // documents still carry the old stamped name.
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[
+                    observation(NOISE_CHANNEL, NOISE_NAME),
+                    observation(OPS_CHANNEL, "ops-fixture-renamed"),
+                ],
+            )
+            .unwrap();
+
+        // The NEW name resolves through the roster to the stable channel id,
+        // which the old documents are stamped with.
+        let hits = search(&index, "import mapping", Some("ops-fixture-renamed"));
+        assert!(
+            hits.contains("truck tickets"),
+            "the roster lane must cover documents stamped with the old name: {hits}"
+        );
+
+        // The OLD name no longer resolves through the roster, but the
+        // documents literally carry it: the name-stamp lane covers them.
+        let hits = search(&index, "import mapping", Some(OPS_NAME));
+        assert!(
+            hits.contains("truck tickets"),
+            "the name-stamp lane must cover documents whose stamped name left the roster: {hits}"
+        );
+    }
+
+    #[test]
+    fn a_slack_top_hit_recommends_working_drill_downs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (index, _store) = indexed_fixture(&root);
+
+        let hits = search(&index, "truck tickets", None);
+        assert!(
+            hits.contains(&format!("channel=\"{OPS_CHANNEL}\"")),
+            "a slack top hit must point at the channel filter: {hits}"
+        );
+        assert!(
+            !hits.contains("bbox_context("),
+            "bbox_context cannot open a conversation locator and must not be recommended: {hits}"
+        );
+        assert!(
+            !hits.contains("bbox_messages("),
+            "bbox_messages cannot resolve a conversation bucket and must not be recommended: {hits}"
         );
     }
 }

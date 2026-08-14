@@ -3942,6 +3942,7 @@ mod tests {
                 limit: Some(5),
                 source: None,
                 author: None,
+                channel: None,
                 exclude_self: None,
             })
             .unwrap()

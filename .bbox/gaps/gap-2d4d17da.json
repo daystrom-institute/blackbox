@@ -1,0 +1,22 @@
+{
+  "id": "gap-2d4d17da",
+  "title": "Slack lane: bbox_context/bbox_messages drill-downs recommended by search output fail on slack: virtual paths",
+  "gap_kind": "mcp_surface",
+  "domain": "slack-search-projection",
+  "wanted_capability": "Reading the surrounding conversation for a Slack search hit. bbox_search results advertise the standard next steps, but both fail on the slack lane: bbox_context(file_path=\"slack:T4MNK2L6A/C0BP8JG21FU\") errors with \"No such file or directory\" (the virtual slack: path is handed to the filesystem transcript reader), and bbox_messages(session_id=\"C0BP8JG21FU/2026-08-10\") returns \"Session not found\" while bbox_messages(file_path=...) returns 1-of-1 with the same ENOENT rendered inline. Wanted: the slack read plane wired into the context/messages surfaces (resolve slack: refs against the conversation-source landing store instead of the filesystem), and the rendered next-steps hints suppressed or corrected for lanes that cannot serve them.",
+  "missing_primitive": "slack:-scheme resolution in the bbox_context / bbox_messages read plane",
+  "fallback_used": "Read the channel's docs via fulltext file_path:\"slack:T4MNK2L6A/&lt;channel-id&gt;\" search hits and their permalinks; ground truth via read-only conversations.history with the collector's token chain.",
+  "evidence": [
+    "live probe 2026-08-14: bbox_context ENOENT and bbox_messages Session-not-found on hits the search surface itself recommended",
+    "thread-21347ce5"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/slack-search-projection/context-messages-virtual-path",
+  "notes": "PARTIAL (same-day): the misleading breadcrumb half is fixed; Slack top hits now recommend the working drill-downs (bbox_search channel filter + per-hit permalink) instead of bbox_context/bbox_messages, and the tool-doc stanzas for both read tools state the transcript-file-only boundary. REMAINING: the actual read-plane port, resolving slack: locators against the conversation-source landing store so bbox_context/bbox_messages can serve a channel's surrounding turns natively.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-21347ce5",
+  "created_at": "2026-08-14T17:14:25Z",
+  "updated_at": "2026-08-14T17:14:25Z"
+}
