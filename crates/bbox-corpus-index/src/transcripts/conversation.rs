@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn messages_bucket_per_channel_per_utc_day() {
-        // 2024-04-05T18:14:38Z and one 40 hours later.
+        // 2024-04-05T19:34:38Z and one 40 hours later.
         assert_eq!(
             bucket_session_id("C0ABCD", "1712345678.000200"),
             "C0ABCD/2024-04-05"
@@ -634,6 +634,14 @@ mod tests {
         assert_eq!(
             bucket_session_id("C0ABCD", "1712489678.000100"),
             "C0ABCD/2024-04-07"
+        );
+        // One second before a UTC midnight, with the largest fraction a
+        // provider can send. A fraction that leaked into the seconds would
+        // roll this into the next day, which is the whole failure mode the
+        // subsecond part invites.
+        assert_eq!(
+            bucket_session_id("C0ABCD", "1712447999.999999"),
+            "C0ABCD/2024-04-06"
         );
         assert_eq!(
             bucket_session_id("C0ABCD", "garbage"),
@@ -647,13 +655,43 @@ mod tests {
     fn a_message_timestamp_projects_to_a_utc_rfc3339_stamp() {
         assert_eq!(
             rfc3339_from_message_ts("1712345678.000200").unwrap(),
-            "2024-04-05T18:14:38Z"
+            "2024-04-05T19:34:38Z"
+        );
+        // THE SUBSECOND PART NEVER MOVES THE CLOCK. Same second, same
+        // rendering, whatever the fraction: a provider timestamp is
+        // `<seconds>.<microseconds>`, and reading the fraction as anything
+        // else shifts the wall clock by exactly its numeric value. The 4800
+        // here is chosen so a leak would read 20:54:38 (an 80 minute jump)
+        // rather than something a reader might mistake for a time zone.
+        assert_eq!(
+            rfc3339_from_message_ts("1712345678.004800").unwrap(),
+            "2024-04-05T19:34:38Z"
+        );
+        assert_eq!(
+            rfc3339_from_message_ts("1712345678.999999").unwrap(),
+            "2024-04-05T19:34:38Z"
         );
         assert_eq!(
             rfc3339_from_message_ts("0.000000").unwrap(),
             "1970-01-01T00:00:00Z"
         );
         assert_eq!(rfc3339_from_message_ts("nonsense"), None);
+    }
+
+    #[test]
+    fn the_permalink_digits_are_a_one_way_rendering() {
+        // The archives form concatenates seconds and microseconds into one
+        // digit run. Nothing ever reads that run back as a time, and this
+        // pins the direction: the same second with two different fractions
+        // renders two different links and one identical stamp.
+        assert_eq!(
+            permalink("acme.slack.com", "C0ABCD", "1712345678.004800", None).unwrap(),
+            "https://acme.slack.com/archives/C0ABCD/p1712345678004800"
+        );
+        assert_eq!(
+            rfc3339_from_message_ts("1712345678.004800"),
+            rfc3339_from_message_ts("1712345678.000200")
+        );
     }
 
     #[test]
@@ -706,7 +744,7 @@ mod gate_tests {
     const WORKSPACE: &str = "T0FIXTURE";
     const CHANNEL: &str = "C0OPSFIX";
     const AUTHORITY: &str = "acme.slack.com";
-    /// 2024-04-05T18:14:38Z.
+    /// 2024-04-05T19:34:38Z.
     const PARENT_TS: &str = "1712345678.000200";
     /// 22 seconds later, same day.
     const APP_TS: &str = "1712345700.000100";
@@ -936,7 +974,7 @@ mod gate_tests {
                 .search(&parsed, &TopDocs::with_limit(50))
                 .unwrap()
                 .into_iter()
-                .map(|(_, address)| searcher.doc(address).unwrap())
+                .map(|(_, address)| searcher.doc::<TantivyDocument>(address).unwrap())
                 .collect()
         }
 
@@ -952,7 +990,7 @@ mod gate_tests {
                 .search(&query, &TopDocs::with_limit(50))
                 .unwrap()
                 .into_iter()
-                .map(|(_, address)| searcher.doc(address).unwrap())
+                .map(|(_, address)| searcher.doc::<TantivyDocument>(address).unwrap())
                 .collect()
         }
 
@@ -1002,7 +1040,7 @@ mod gate_tests {
         );
         assert_eq!(
             first_text(hit, corpus.fields.timestamp),
-            "2024-04-05T18:14:38Z"
+            "2024-04-05T19:34:38Z"
         );
         assert_eq!(
             first_text(hit, corpus.fields.file_path),
@@ -1277,7 +1315,9 @@ mod gate_tests {
         );
 
         // The same terms the source filter builds: include, then exclude.
-        assert_eq!(corpus.search_term(corpus.fields.source, "slack").len(), 2);
+        // A bare lane term carries no text constraint, so it selects all
+        // THREE landed messages, not just the two that say "wedged".
+        assert_eq!(corpus.search_term(corpus.fields.source, "slack").len(), 3);
 
         let reader = corpus.index.reader().unwrap();
         reader.reload().unwrap();
