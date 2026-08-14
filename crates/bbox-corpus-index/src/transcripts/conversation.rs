@@ -1038,7 +1038,8 @@ mod gate_tests {
 
         // What the purge phase then does with a freshness row whose key is
         // absent from that scan set.
-        let mut writer = corpus.index.writer(50_000_000).unwrap();
+        let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
+            corpus.index.writer(50_000_000).unwrap();
         writer.delete_term(Term::from_field_text(
             corpus.fields.file_path,
             &location.locator(),
