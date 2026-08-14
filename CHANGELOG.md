@@ -10,6 +10,55 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Crash-resumable workflow arcs: top-level arcs write atomic durable
+  checkpoints (spec, context, outputs, sessions, step budget, wait
+  deadline) at every node boundary and Wait entry; a boot rehydration
+  pass re-parks Wait-suspended arcs (on_enter skipped, correlations
+  re-derived, remaining timeout window resumed) and marks mid-body or
+  fork-holding arcs interrupted rather than re-running non-idempotent
+  work. Direct signals that find no matching wait persist to the
+  system-events ledger and are consumed by later or rehydrated waits
+  exactly once per arc; anyOf groups resolve first-writer-wins with
+  losing signals retained durably.
+- Singleton admission for workflows: `admission: {key: [...],
+  on_conflict}` enforces at most one non-terminal arc per key across
+  every start path, including rehydration (keys pre-claimed at boot
+  before the daemon serves). `on_conflict: signal` converts a duplicate
+  webhook start into a signal targeted at the holding arc
+  (`_target_arc` is a reserved correlation key). Held keys surface in
+  `bro_arc_status` and release via an RAII lease that survives task
+  panics.
+- Registry-aware `subworkflow_ref` seam validation: required imports
+  and declared exports type-check against the installed child's schema
+  at install (lenient, warnings), run, dry-run, and routed StartArc
+  (strict), with cycle reporting and composition-ceiling enforcement.
+- Admin removal surfaces: `bro_webhook_remove`, `bro_poller_remove`,
+  `bro_cron_remove`, `bro_workflow_remove` (file-first ordering;
+  workflow removal refuses while arcs run unless forced).
+- `bro_orchestrate_author` accepts caller `exemplars` and a domain
+  `preamble` (64KB rendered budget, 16-exemplar cap) so authored specs
+  follow a house grammar.
+- bro-slack durable envelope spool: envelopes persist before the Slack
+  ack and are deleted only after daemon 2xx; retry exhaustion retains
+  instead of dropping; bounded batch drains with on-demand wakeup and
+  endpoint backoff; per-envelope delivery claims with stale-entry
+  re-reads; honest bounded at-least-once contract in the design doc.
+
+### Changed
+
+- `http_json` / poller fetches retry transient failures (429/502/503/
+  504, transport errors) with capped backoff honoring Retry-After, for
+  idempotent methods by default; POST/PATCH retry only on explicit
+  opt-in, and retry bounds are enforced at execution regardless of how
+  the spec was constructed.
+- Workflow Shell ops support a two-layer argv[0] allowlist
+  (workflow-level `shell_allowlist` intersected with per-op
+  `args.allowlist`, byte-exact matching, PATH overrides rejected while
+  a policy is active, malformed lists fail closed).
+- Webhook delivery-id dedupe is peek-then-commit-on-success (a failed
+  dispatch leaves the id fresh for the sender's retry) with an 8192-id
+  ring covering the Slack spool's replay horizon.
+
 - Slack conversation source, end to end: a producer satellite
   (`bbox-slack-collector`, one-app bot-perspective posture, membership-driven
   enrollment via `users.conversations`, watermark plus thread-parent sweeps,
