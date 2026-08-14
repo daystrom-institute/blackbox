@@ -1,0 +1,22 @@
+{
+  "id": "gap-0b3777f5",
+  "title": "Knowledge publication pipeline stalls silently: producer decode failures starve a granted auto-advance and nothing surfaces the staleness",
+  "gap_kind": "tooling",
+  "domain": "knowledge-publication",
+  "wanted_capability": "The accepted-publication pointer staying current without operator archaeology. Observed 2026-08-14: the pointer sat at a commit ~6 commits and ~30h stale while the auto-advance grant was enabled and eligible (auto_advance.last_attempt=null, so policy never even attempted), because the host code-collector's published-knowledge sync had been failing since the daemon redeploys (\"published knowledge synchronization failed: error decoding response body\", producer/daemon wire-shape skew after the strict Git-transport cutover shipped daemon-side) so no Ready candidate was ever produced. Consequence: the served knowledge/gap view went blind to freshly committed .bbox files, and tools (bbox_gap_update, bbox_learn id=...) refused updates to entries the repo plainly carries, forcing hand-edits of repo-owned JSON. Wanted, in order of value: (1) staleness surfacing, e.g. bbox_inbox / publisher_status flagging pointer_age vs published-ref tip and auto_advance grants that have never fired; (2) producer-side loud degradation, the collector ERROR is buried in a 16MB host log nothing watches, so a persistent sync failure should reach bro_report / system events / inbox; (3) wire-shape version tolerance or an explicit version handshake between collector and daemon so a daemon redeploy does not silently break older satellites; (4) candidate-production health in bbox_project_publisher_status (last candidate seen and when, not just last_attempt).",
+  "missing_primitive": "staleness/starvation telemetry on the accepted-publication pointer and its candidate producer",
+  "fallback_used": "Diagnosed by hand (publisher_status last_attempt=null, host collector log grep), rebuilt and stablesign-redeployed the host bbox-code-collector to clear the wire skew, then let the granted auto-advance accept the next Ready candidate.",
+  "evidence": [
+    "bbox_project_publisher_status 89bd722f 2026-08-14: accepted c0d3345f, grant enabled+eligible, last_attempt=null",
+    "~/Library/Logs/bbox-code-collector.log: kps candidates quiet after 2026-08-13T20:47, decode ERRORs through 2026-08-14T19:53, recovered 20:01 after binary redeploy",
+    "thread-21347ce5"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/knowledge-publication/auto-advance-starved-silently",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-21347ce5",
+  "created_at": "2026-08-14T20:01:42Z",
+  "updated_at": "2026-08-14T20:01:42Z"
+}
