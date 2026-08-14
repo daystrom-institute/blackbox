@@ -567,6 +567,21 @@ impl TranscriptIndex {
             }
 
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
+            // A query that matched only metadata fields (channel name, source
+            // lane, file path, author) produces no content fragments, and an
+            // empty excerpt reads as an empty message. Fall back to the start
+            // of the document so metadata-scoped hits stay legible.
+            let excerpt = if excerpt.trim().is_empty() {
+                let content = self.doc_text(&doc, self.fields.content);
+                let prefix: String = content.chars().take(150).collect();
+                if prefix.chars().count() < content.chars().count() {
+                    format!("{prefix}...")
+                } else {
+                    prefix
+                }
+            } else {
+                excerpt
+            };
 
             // A conversation hit is only useful if the reader can open the
             // message it names, and the archive URL is the only coordinate
@@ -2875,8 +2890,6 @@ mod conversation_channel_search_tests {
         // The exact failure this arc started from: the channel name matched
         // nothing because the query parser never consulted the stamped
         // channel-name field, and a caller read that as broken indexing.
-        // A name-field match has no content snippet, so the assertion anchors
-        // on the hit's coordinates rather than its excerpt.
         let hits = search(&index, OPS_NAME, None);
         assert!(
             hits.contains(&format!("slack:{WORKSPACE}/{OPS_CHANNEL}")),
@@ -2885,6 +2898,13 @@ mod conversation_channel_search_tests {
         assert!(
             !hits.contains(NOISE_CHANNEL),
             "the other channel's documents do not carry the queried name: {hits}"
+        );
+        // A name-field match has no content fragments to highlight; the
+        // excerpt must fall back to the message prefix instead of rendering
+        // an empty line that reads as an empty message.
+        assert!(
+            hits.contains("the import mapping walkthrough for truck tickets"),
+            "a metadata-only match must render the content-prefix excerpt: {hits}"
         );
     }
 
