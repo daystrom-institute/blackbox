@@ -81,12 +81,14 @@ where
 {
     let mut visited = std::collections::HashSet::new();
     let mut warnings = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
     validate_refs_inner(
         spec,
         resolve,
         strict_missing,
         &mut visited,
         &mut warnings,
+        &mut stack,
         0,
     )?;
     Ok(warnings)
@@ -98,16 +100,50 @@ fn validate_refs_inner<R>(
     strict_missing: bool,
     visited: &mut std::collections::HashSet<String>,
     warnings: &mut Vec<String>,
+    stack: &mut Vec<String>,
     depth: u32,
 ) -> Result<()>
 where
     R: Fn(&str) -> Option<Workflow>,
 {
     if depth > engine::MAX_COMPOSITION_DEPTH {
-        // The runtime enforces the ceiling with node context; static
-        // recursion just stops here so a ref cycle cannot spin.
-        return Ok(());
+        // The runtime rejects this same composition depth at dispatch;
+        // accepting it here would bless a spec that cannot run.
+        bail!(
+            "subworkflow nesting exceeds the composition ceiling ({}) along {}",
+            engine::MAX_COMPOSITION_DEPTH,
+            stack.join(" -> ")
+        );
     }
+    // Descend into one resolved ref: cycle-checked against the active
+    // DFS stack (a cycle is an authoring error, reported with its
+    // path), deduped through `visited` so diamond graphs validate each
+    // ref once.
+    let mut descend = |ref_id: &String,
+                       child: &Workflow,
+                       visited: &mut std::collections::HashSet<String>,
+                       warnings: &mut Vec<String>,
+                       stack: &mut Vec<String>|
+     -> Result<()> {
+        if stack.contains(ref_id) {
+            bail!("subworkflow_ref cycle: {} -> {ref_id}", stack.join(" -> "));
+        }
+        if visited.insert(ref_id.clone()) {
+            stack.push(ref_id.clone());
+            let result = validate_refs_inner(
+                child,
+                resolve,
+                strict_missing,
+                visited,
+                warnings,
+                stack,
+                depth + 1,
+            );
+            stack.pop();
+            result?;
+        }
+        Ok(())
+    };
     let mut node_ids: Vec<&String> = spec.nodes.keys().collect();
     node_ids.sort();
     for node_id in node_ids {
@@ -119,6 +155,7 @@ where
                 strict_missing,
                 visited,
                 warnings,
+                stack,
                 depth + 1,
             )?;
         }
@@ -126,16 +163,7 @@ where
             match resolve(ref_id) {
                 Some(child) => {
                     validate_ref_seam(node_id, node, ref_id, &child)?;
-                    if visited.insert(ref_id.clone()) {
-                        validate_refs_inner(
-                            &child,
-                            resolve,
-                            strict_missing,
-                            visited,
-                            warnings,
-                            depth + 1,
-                        )?;
-                    }
+                    descend(ref_id, &child, visited, warnings, stack)?;
                 }
                 None if strict_missing => bail!(
                     "node '{node_id}': subworkflow_ref '{ref_id}' is not installed — install it via bro_workflow_install or fix the id"
@@ -158,13 +186,19 @@ where
             ),
         ] {
             if let Some(id) = fanout_ref {
-                if resolve(&id).is_none() {
-                    if strict_missing {
-                        bail!("node '{node_id}': {label}.subworkflow_ref '{id}' is not installed");
+                match resolve(&id) {
+                    Some(child) => {
+                        // No parent-side seam check: per-item var
+                        // injection defeats static import coverage. The
+                        // resolved child's OWN refs still validate.
+                        descend(&id, &child, visited, warnings, stack)?;
                     }
-                    warnings.push(format!(
+                    None if strict_missing => {
+                        bail!("node '{node_id}': {label}.subworkflow_ref '{id}' is not installed")
+                    }
+                    None => warnings.push(format!(
                         "node '{node_id}': {label}.subworkflow_ref '{id}' not installed yet"
-                    ));
+                    )),
                 }
             }
         }
@@ -3577,6 +3611,56 @@ mod tests {
             validate_subworkflow_refs(&parent, &|id| (id == "child").then(|| child.clone()), true)
                 .unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn subworkflow_ref_cycle_is_reported_with_its_path() {
+        // A -> B -> A. Cycles are authoring errors, reported with the
+        // active path instead of silently accepted.
+        let a = load_workflow(
+            r#"{"name":"A","version":1,"actors":{},
+                "nodes":{"S":{"subworkflow_ref":"B","next":{"type":"terminal"}}},
+                "start":"S"}"#,
+        )
+        .unwrap();
+        let b = load_workflow(
+            r#"{"name":"B","version":1,"actors":{},
+                "nodes":{"S":{"subworkflow_ref":"A","next":{"type":"terminal"}}},
+                "start":"S"}"#,
+        )
+        .unwrap();
+        let resolve = |id: &str| match id {
+            "A" => Some(a.clone()),
+            "B" => Some(b.clone()),
+            _ => None,
+        };
+        let err = validate_subworkflow_refs(&a, &resolve, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cycle"), "err: {err}");
+    }
+
+    #[test]
+    fn foreach_ref_children_are_validated_recursively() {
+        // The foreach child itself resolves, but ITS ref does not: the
+        // strict pass must descend and catch it.
+        let parent = load_workflow(
+            r#"{"name":"P","version":1,"actors":{},
+                "nodes":{"Fan":{"actor":"","foreach":{"items":["x"],"as_var":"item","collect":{"into_var":"results"},"subworkflow_ref":"child"},"next":{"type":"terminal"}}},
+                "start":"Fan"}"#,
+        )
+        .unwrap();
+        let child = load_workflow(
+            r#"{"name":"child","version":1,"actors":{},
+                "nodes":{"S":{"subworkflow_ref":"missing-grandchild","next":{"type":"terminal"}}},
+                "start":"S"}"#,
+        )
+        .unwrap();
+        let resolve = |id: &str| (id == "child").then(|| child.clone());
+        let err = validate_subworkflow_refs(&parent, &resolve, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing-grandchild"), "err: {err}");
     }
 
     #[test]

@@ -156,6 +156,33 @@ impl WaitStore {
         Some((p.resolved, p.notify, p.arc_id, p.wait_id))
     }
 
+    /// Like [`Self::match_and_take`], but restricted to ONE arc's
+    /// registrations. Used for arc-targeted signals (admission
+    /// duplicate conversion): correlation subset-matching alone could
+    /// hand the payload to any arc whose wait keys happen to be a
+    /// subset, including a broadcast (empty-correlation) wait on an
+    /// unrelated arc.
+    pub fn match_and_take_for_arc(
+        &self,
+        signal_name: &str,
+        correlation: &serde_json::Map<String, Value>,
+        arc_id: &str,
+    ) -> Option<(
+        Arc<parking_lot::Mutex<Option<SignalRef>>>,
+        Arc<Notify>,
+        String, // arc_id
+        String, // wait_id
+    )> {
+        let mut pending = self.pending.write();
+        let idx = pending.iter().position(|p| {
+            p.arc_id == arc_id
+                && p.signal == signal_name
+                && matches_correlation(&p.correlation, correlation)
+        })?;
+        let p = pending.remove(idx);
+        Some((p.resolved, p.notify, p.arc_id, p.wait_id))
+    }
+
     /// Pop one exact wait by `(arc_id, wait_id)`. Used by local catch-up
     /// paths that already know the current runner owns the wait and only need
     /// to resolve it against a recently persisted event.

@@ -40,8 +40,12 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     // Replay durable arc checkpoints: re-park Wait-suspended arcs and
     // mark mid-dispatch arcs interrupted. After the signal bridge so a
     // resumed wait's ledger catch-up and live bridge dispatch overlap
-    // instead of leaving a gap.
-    tokio::spawn(crate::workflow::engine::rehydrate_arcs(shared.clone()));
+    // instead of leaving a gap. AWAITED, not spawned: the pass
+    // pre-claims resumable arcs' admission keys and this fn completes
+    // before the daemon serves requests, so a fresh StartArc can never
+    // steal a checkpointed arc's singleton key in the boot window (the
+    // per-arc resumes themselves still run as detached tasks).
+    crate::workflow::engine::rehydrate_arcs(shared.clone()).await;
     // Inventory and checkout reconciliation may probe registered paths on
     // stalled mounts. Keep the initial pass off the listener startup path just
     // like subsequent periodic passes.

@@ -247,6 +247,14 @@ impl WorkflowRunner<'_> {
             );
         }
         self.ctx.meta.admission_key = Some(key_map);
+        // RAII: the lease's Drop performs the holder-checked release,
+        // so even a panicked arc task (future dropped mid-await, no
+        // epilogue) frees the key. The epilogue clears it explicitly.
+        self.admission_lease = Some(self.server.state.admission_lease(
+            self.compiled.spec.name.clone(),
+            canonical.clone(),
+            self.ctx.meta.arc_id.clone(),
+        ));
         self.log_event(
             "admission_claimed",
             serde_json::json!({"workflow": self.compiled.spec.name, "key": canonical}),
@@ -254,17 +262,11 @@ impl WorkflowRunner<'_> {
         Ok(())
     }
 
-    /// Release the admission key at terminal state (no-op when this arc
-    /// holds none, or when a different arc holds the slot).
-    pub(super) fn release_admission(&self) {
-        if let Some(key_map) = self.ctx.meta.admission_key.as_ref() {
-            let canonical = crate::workflow::wait::canonicalize_correlation(key_map);
-            self.server.state.release_arc_admission(
-                &self.compiled.spec.name,
-                &canonical,
-                &self.ctx.meta.arc_id,
-            );
-        }
+    /// Release the admission key at terminal state by dropping the RAII
+    /// lease (no-op when this arc holds none; the release itself is
+    /// holder-checked so a stale loser cannot evict a legitimate holder).
+    pub(super) fn release_admission(&mut self) {
+        self.admission_lease = None;
     }
 
     pub(super) fn build_checkpoint(

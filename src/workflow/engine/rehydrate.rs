@@ -40,6 +40,17 @@ pub(crate) async fn resume_workflow_from_checkpoint(
         Ok(c) => c,
         Err(e) => {
             server.state.arc_store.release_claim(&cp.arc_id);
+            // Release the boot pre-claimed admission key (holder-checked,
+            // so this is a no-op unless this arc holds it) and leave a
+            // durable interrupted state instead of a live-looking
+            // Waiting checkpoint that every future boot retries.
+            if let Some(key_map) = cp.ctx.meta.admission_key.as_ref() {
+                let canonical = crate::workflow::wait::canonicalize_correlation(key_map);
+                server
+                    .state
+                    .release_arc_admission(&cp.workflow.name, &canonical, &cp.arc_id);
+            }
+            mark_arc_interrupted(&server.state, &cp).await;
             return Err(anyhow!("resume compile for arc {}: {e}", cp.arc_id));
         }
     };
@@ -91,8 +102,22 @@ pub(crate) async fn resume_workflow_from_checkpoint(
         ),
     );
     // Re-claim the admission key restored with the context; a resumed
-    // arc holds the same singleton slot it held before the restart.
+    // arc holds the same singleton slot it held before the restart
+    // (the boot pass pre-claimed it, so this normally just constructs
+    // the lease). A conflict here is defensive: stamp the checkpoint
+    // interrupted so it stops looking resumable instead of retrying
+    // on every future boot.
     if let Err(e) = runner.claim_admission() {
+        runner.arc_note(
+            "blocked",
+            &format!("rehydration admission re-claim failed: {e}; arc marked interrupted"),
+        );
+        if let Err(stamp_err) = server.state.arc_store.mark_interrupted(&cp.arc_id).await {
+            tracing::warn!(
+                "arc {} interrupted-stamp after admission conflict failed: {stamp_err:#}",
+                cp.arc_id
+            );
+        }
         server.state.arc_store.release_claim(&cp.arc_id);
         return Err(e);
     }
@@ -104,9 +129,13 @@ pub(crate) async fn resume_workflow_from_checkpoint(
     Ok(result)
 }
 
-/// Boot pass: load every surviving checkpoint, resume the resumable
-/// ones as independent tasks, mark the rest interrupted. Never fails
-/// the boot; every problem is a warning plus a visible arc state.
+/// Boot pass: load every surviving checkpoint, PRE-CLAIM the admission
+/// keys of resumable arcs synchronously (the caller awaits this before
+/// the daemon starts serving, so a fresh StartArc can never steal a
+/// checkpointed arc's singleton key during the boot window), then
+/// resume the claimed arcs as independent tasks and mark the rest
+/// interrupted. Never fails the boot; every problem is a warning plus
+/// a visible arc state.
 pub(crate) async fn rehydrate_arcs(state: Arc<SharedState>) {
     let checkpoints = state.arc_store.load_all().await;
     if checkpoints.is_empty() {
@@ -116,25 +145,45 @@ pub(crate) async fn rehydrate_arcs(state: Arc<SharedState>) {
     let mut interrupted = 0usize;
     for cp in checkpoints {
         let resumable = cp.status == ArcCheckpointStatus::Waiting && cp.in_flight_nodes.is_empty();
-        if resumable {
-            resumed += 1;
-            let state = state.clone();
-            tokio::spawn(async move {
-                let arc_id = cp.arc_id.clone();
-                let server = BlackboxServer::new(state);
-                match resume_workflow_from_checkpoint(&server, cp).await {
-                    Ok(res) => {
-                        tracing::info!("rehydrated arc {arc_id} reached terminal: {}", res.status);
-                    }
-                    Err(e) => {
-                        tracing::warn!("rehydrated arc {arc_id} failed to resume: {e:#}");
-                    }
-                }
-            });
-        } else {
+        if !resumable {
             interrupted += 1;
             mark_arc_interrupted(&state, &cp).await;
+            continue;
         }
+        // Admission pre-claim, BEFORE any spawn and before the daemon
+        // serves: the checkpoint set is the durable truth for who
+        // holds a singleton key across a restart. Two checkpoints
+        // carrying the same key resolve deterministically here: the
+        // first loaded wins, the loser is interrupted instead of
+        // silently retrying on every future boot.
+        if let Some(key_map) = cp.ctx.meta.admission_key.as_ref() {
+            let canonical = crate::workflow::wait::canonicalize_correlation(key_map);
+            if let Err(holder) =
+                state.claim_arc_admission(&cp.workflow.name, &canonical, &cp.arc_id)
+            {
+                tracing::warn!(
+                    "arc {} duplicate admission key {canonical} (held by {holder}); interrupting instead of resuming",
+                    cp.arc_id
+                );
+                interrupted += 1;
+                mark_arc_interrupted(&state, &cp).await;
+                continue;
+            }
+        }
+        resumed += 1;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let arc_id = cp.arc_id.clone();
+            let server = BlackboxServer::new(state);
+            match resume_workflow_from_checkpoint(&server, cp).await {
+                Ok(res) => {
+                    tracing::info!("rehydrated arc {arc_id} reached terminal: {}", res.status);
+                }
+                Err(e) => {
+                    tracing::warn!("rehydrated arc {arc_id} failed to resume: {e:#}");
+                }
+            }
+        });
     }
     tracing::info!("arc rehydration: {resumed} arc(s) resumed, {interrupted} marked interrupted");
 }

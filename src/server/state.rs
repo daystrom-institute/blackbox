@@ -859,6 +859,21 @@ impl SharedState {
             .cloned()
     }
 
+    /// Wrap a successfully claimed admission key in an RAII lease.
+    pub(crate) fn admission_lease(
+        self: &Arc<Self>,
+        workflow: String,
+        canonical_key: String,
+        arc_id: String,
+    ) -> AdmissionLease {
+        AdmissionLease {
+            state: self.clone(),
+            workflow,
+            canonical_key,
+            arc_id,
+        }
+    }
+
     /// Trigger cancellation for a running arc. Returns whether a
     /// matching token existed (and was triggered). The runner notices
     /// at the next node boundary — or immediately if it's parked on
@@ -2255,6 +2270,25 @@ mod code_read_view_tests {
             snapshot.records.is_empty(),
             "the attached-only projection is exactly what must NOT seed this set"
         );
+    }
+}
+
+/// RAII lease on a singleton-admission key. Dropping it performs the
+/// holder-checked release, so an arc task that PANICS (its future is
+/// dropped mid-await, never reaching the terminal epilogue) still frees
+/// its key instead of holding it until daemon restart. The normal
+/// epilogue releases by clearing the runner's lease field explicitly.
+pub(crate) struct AdmissionLease {
+    state: Arc<SharedState>,
+    workflow: String,
+    canonical_key: String,
+    arc_id: String,
+}
+
+impl Drop for AdmissionLease {
+    fn drop(&mut self) {
+        self.state
+            .release_arc_admission(&self.workflow, &self.canonical_key, &self.arc_id);
     }
 }
 

@@ -342,8 +342,9 @@ pub(crate) struct OrchestrateAuthorParams {
     /// These are appended after the built-in reference example, so a
     /// caller with an established house grammar (recipe workflows,
     /// domain-specific gate/packet idioms) gets specs in that grammar
-    /// instead of generic shapes. Combined budget 64KB; oversize input
-    /// is rejected, not truncated.
+    /// instead of generic shapes. At most 16 exemplars; the exemplars
+    /// and preamble RENDER into a combined 64KB budget (framing labels
+    /// included) and oversize input is rejected, not truncated.
     #[serde(default)]
     pub(crate) exemplars: Option<Vec<String>>,
     /// Optional domain preamble injected verbatim ahead of the charter:

@@ -39,30 +39,19 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<OrchestrateAuthorParams>,
     ) -> CallToolResult {
-        // Load the runbook + a reference example.
-        let runbook = match system_memory::get("sm-workflow-orchestration") {
-            Some(sm) => sm.content.as_str(),
-            None => {
-                return Self::err_text(
-                    "sm-workflow-orchestration runbook not found — internal error",
-                );
-            }
-        };
-        let reference_example = include_str!("../../examples/workflows/e2e-gated.json");
-        let hint_line = p
-            .hint
-            .as_deref()
-            .map(|h| format!("\nShape hint: match the `{h}` pattern from the runbook if it fits the charter.\n"))
-            .unwrap_or_default();
         // Caller-supplied few-shot corpus: exemplars teach the house
-        // grammar, the preamble carries domain ground truth. Bounded so
-        // a fat catalog paste cannot blow the authoring context.
-        const EXEMPLAR_BUDGET_BYTES: usize = 64 * 1024;
+        // grammar, the preamble carries domain ground truth. The budget
+        // bounds the FULLY RENDERED sections (bodies + framing labels +
+        // preamble), not just exemplar bytes - otherwise a thousand
+        // tiny exemplars or a fat preamble walks around the cap while
+        // still blowing the authoring context.
+        const AUTHORING_INPUT_BUDGET_BYTES: usize = 64 * 1024;
+        const MAX_EXEMPLARS: usize = 16;
         let exemplars = p.exemplars.unwrap_or_default();
-        let exemplar_bytes: usize = exemplars.iter().map(String::len).sum();
-        if exemplar_bytes > EXEMPLAR_BUDGET_BYTES {
+        if exemplars.len() > MAX_EXEMPLARS {
             return Self::err_text(&format!(
-                "exemplars total {exemplar_bytes} bytes, over the {EXEMPLAR_BUDGET_BYTES}-byte budget — trim or pass fewer exemplars"
+                "{} exemplars passed; the cap is {MAX_EXEMPLARS} — pick the most representative ones",
+                exemplars.len()
             ));
         }
         let exemplar_section = if exemplars.is_empty() {
@@ -82,6 +71,30 @@ impl BlackboxServer {
             .preamble
             .as_deref()
             .map(|d| format!("\n=== DOMAIN PREAMBLE (treat as ground truth) ===\n{d}\n"))
+            .unwrap_or_default();
+        let rendered_input_bytes = exemplar_section
+            .len()
+            .saturating_add(preamble_section.len());
+        if rendered_input_bytes > AUTHORING_INPUT_BUDGET_BYTES {
+            return Self::err_text(&format!(
+                "exemplars + preamble render to {rendered_input_bytes} bytes, over the {AUTHORING_INPUT_BUDGET_BYTES}-byte budget — trim them"
+            ));
+        }
+
+        // Load the runbook + a reference example.
+        let runbook = match system_memory::get("sm-workflow-orchestration") {
+            Some(sm) => sm.content.as_str(),
+            None => {
+                return Self::err_text(
+                    "sm-workflow-orchestration runbook not found — internal error",
+                );
+            }
+        };
+        let reference_example = include_str!("../../examples/workflows/e2e-gated.json");
+        let hint_line = p
+            .hint
+            .as_deref()
+            .map(|h| format!("\nShape hint: match the `{h}` pattern from the runbook if it fits the charter.\n"))
             .unwrap_or_default();
 
         let base_prompt = format!(

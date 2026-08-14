@@ -587,6 +587,12 @@ struct WorkflowRunner<'a> {
     /// a stale-state resurrection. Atomic: flipped from &self contexts
     /// inside Send futures.
     checkpoint_poisoned: std::sync::atomic::AtomicBool,
+    /// RAII lease on this arc's singleton-admission key. Dropped (and
+    /// therefore released, holder-checked) with the runner - which
+    /// covers a PANICKED arc task whose future never reaches the
+    /// terminal epilogue. The epilogue clears it explicitly for
+    /// deterministic ordering.
+    admission_lease: Option<crate::server::state::AdmissionLease>,
     /// Nesting depth for sub-workflow composition. Threaded through
     /// recursive `run_workflow_at_depth` calls so a chain of nested
     /// sub-workflows can't silently bypass the ceiling.
@@ -653,6 +659,7 @@ impl<'a> WorkflowRunner<'a> {
             resume_skip_on_enter: None,
             resume_wait_deadline: None,
             checkpoint_poisoned: std::sync::atomic::AtomicBool::new(false),
+            admission_lease: None,
             composition_depth,
             event_sink: None,
             cancel_token,

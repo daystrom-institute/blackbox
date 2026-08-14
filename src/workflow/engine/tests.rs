@@ -1229,3 +1229,205 @@ async fn signal_into_occupied_slot_reports_group_resolved_and_persists() {
         .unwrap();
     assert_eq!(events.len(), 1, "loser persisted for later consumption");
 }
+
+// ---------------------------------------------------------------------------
+// Admission review round: boot pre-claim, targeted signals, lease drop
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rehydration_preclaims_admission_before_returning() {
+    // The fresh-start-steals-the-key boot race: after rehydrate_arcs
+    // RETURNS (before the resumed arc has even re-registered its wait),
+    // a fresh start with the same key must already be refused.
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let run_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let server = BlackboxServer::new(run_state);
+            let compiled = compile(load_workflow(admission_workflow_json()).unwrap()).unwrap();
+            let mut vars = Map::new();
+            vars.insert("issue".into(), json!(99));
+            engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !state.wait_store.snapshot().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("parked");
+        handle.abort();
+        let _ = handle.await;
+    }
+    let state2 = Arc::new(SharedState::for_test(tmp.path()));
+    engine::rehydrate_arcs(state2.clone()).await;
+    // No polling: the claim must already be held at return.
+    let server2 = BlackboxServer::new(state2.clone());
+    let compiled = compile(load_workflow(admission_workflow_json()).unwrap()).unwrap();
+    let mut vars = Map::new();
+    vars.insert("issue".into(), json!(99));
+    let dup =
+        engine::run_workflow_with_initial_vars(&server2, &compiled, None, Some(20), vars).await;
+    assert!(
+        dup.status.contains("duplicate admission"),
+        "fresh start refused immediately after rehydrate returns: {}",
+        dup.status
+    );
+}
+
+#[tokio::test]
+async fn duplicate_checkpoint_admission_keys_interrupt_the_loser() {
+    use crate::workflow::arc_store::ArcCheckpointStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let cp = {
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+        let run_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let server = BlackboxServer::new(run_state);
+            let compiled = compile(load_workflow(admission_workflow_json()).unwrap()).unwrap();
+            let mut vars = Map::new();
+            vars.insert("issue".into(), json!(5));
+            engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await
+        });
+        let cp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let cps = state.arc_store.load_all().await;
+                if let Some(cp) = cps
+                    .into_iter()
+                    .find(|c| c.status == ArcCheckpointStatus::Waiting)
+                {
+                    break cp;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("parked");
+        handle.abort();
+        let _ = handle.await;
+        cp
+    };
+    let state2 = Arc::new(SharedState::for_test(tmp.path()));
+    // Forge a second Waiting checkpoint holding the SAME admission key.
+    let mut twin = cp.clone();
+    twin.arc_id = "arc-twin-duplicate".into();
+    twin.ctx.meta.arc_id = twin.arc_id.clone();
+    state2.arc_store.save(&twin).await.unwrap();
+    engine::rehydrate_arcs(state2.clone()).await;
+    // Exactly one of the two resumed; the loser's file is Interrupted.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !state2.wait_store.snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("winner re-parked");
+    let cps = state2.arc_store.load_all().await;
+    let interrupted: Vec<_> = cps
+        .iter()
+        .filter(|c| c.status == ArcCheckpointStatus::Interrupted)
+        .collect();
+    assert_eq!(
+        interrupted.len(),
+        1,
+        "exactly one duplicate loser interrupted: {:?}",
+        cps.iter()
+            .map(|c| (&c.arc_id, &c.status))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn targeted_signal_resolves_only_the_named_arc() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    use crate::workflow::context::SignalRef;
+    use crate::workflow::wait::PendingWait;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    // Two arcs, both parked on the same signal with broadcast (empty)
+    // correlations - the exact shape subset-matching would misroute.
+    let slot_a = Arc::new(parking_lot::Mutex::new(None::<SignalRef>));
+    let slot_b = Arc::new(parking_lot::Mutex::new(None::<SignalRef>));
+    for (arc, slot) in [("arc-one", slot_a.clone()), ("arc-two", slot_b.clone())] {
+        state.wait_store.register(PendingWait {
+            arc_id: arc.into(),
+            wait_id: "Park#0".into(),
+            signal: "arc-duplicate-start".into(),
+            correlation: Map::new(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            resolved: slot,
+        });
+    }
+    let mut corr = Map::new();
+    corr.insert("_target_arc".into(), json!("arc-two"));
+    let resolved = signal_arc_dispatch(
+        &state,
+        "arc-duplicate-start",
+        corr,
+        json!({"dup": true}),
+        SignalDispatchOrigin::Direct,
+        None,
+    )
+    .await;
+    assert_eq!(resolved["status"], "wait_resolved", "resolved: {resolved}");
+    assert_eq!(resolved["arc_id"], "arc-two");
+    assert!(slot_a.lock().is_none(), "untargeted arc untouched");
+    assert!(slot_b.lock().is_some(), "targeted arc resolved");
+}
+
+#[tokio::test]
+async fn targeted_signal_with_no_holder_wait_queues_durably() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    let mut corr = Map::new();
+    corr.insert("_target_arc".into(), json!("arc-holder"));
+    let resolved = signal_arc_dispatch(
+        &state,
+        "arc-duplicate-start",
+        corr,
+        json!({"dup": true}),
+        SignalDispatchOrigin::Direct,
+        None,
+    )
+    .await;
+    assert_eq!(resolved["status"], "no_matching_wait");
+    assert_eq!(resolved["durable_persist"], "ok");
+    let events = state
+        .system_events
+        .list_events(Some(8), Some("arc-duplicate-start"), None, None)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].correlation.get("_target_arc"),
+        Some(&json!("arc-holder")),
+        "the queued event stays targeted for ledger catch-up"
+    );
+}
+
+#[tokio::test]
+async fn admission_lease_drop_releases_the_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    state
+        .claim_arc_admission("wf", "{\"issue\":1}", "arc-lease")
+        .unwrap();
+    let lease = state.admission_lease("wf".into(), "{\"issue\":1}".into(), "arc-lease".into());
+    assert_eq!(
+        state.arc_admission_holder("wf", "{\"issue\":1}").as_deref(),
+        Some("arc-lease")
+    );
+    drop(lease); // the panicked-task path: no epilogue, just Drop
+    assert_eq!(
+        state.arc_admission_holder("wf", "{\"issue\":1}"),
+        None,
+        "drop released the key"
+    );
+}

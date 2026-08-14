@@ -700,6 +700,19 @@ pub(crate) async fn dispatch_verdict(
                     "workflow '{workflow_id}' capability validation: {e}"
                 ));
             }
+            // Strict subworkflow_ref seam validation on the ROUTED start
+            // path too: install is deliberately lenient (warnings, so
+            // install order stays free), but an arc must not start and
+            // do real work only to fail at the ref node hours later.
+            if let Err(e) = workflow::validate_subworkflow_refs(
+                &compiled.spec,
+                &|id: &str| state.workflow_registry.read().get(id).cloned(),
+                true,
+            ) {
+                return Err(anyhow::anyhow!(
+                    "workflow '{workflow_id}' subworkflow_ref validation: {e}"
+                ));
+            }
             // Merge: extracted entity → initial_vars → caller's
             // explicit verdict initial_vars. Last writer wins, so
             // a routing rule's verdict can override entity fields if
@@ -759,10 +772,17 @@ pub(crate) async fn dispatch_verdict(
                         }
                         AdmissionConflict::Signal => {
                             let sig = admission.conflict_signal_name().to_string();
+                            // Target the HOLDING arc explicitly: the
+                            // `_target_arc` correlation key restricts both
+                            // live matching and any later ledger catch-up
+                            // to the holder, so an unrelated arc with a
+                            // broadcast wait cannot swallow the duplicate.
+                            let mut targeted = key_map.clone();
+                            targeted.insert("_target_arc".to_string(), json!(holder.clone()));
                             let resolved = signal_arc_dispatch(
                                 &state,
                                 &sig,
-                                key_map.clone(),
+                                targeted,
                                 Value::Object(merged_vars.clone()),
                                 SignalDispatchOrigin::Direct,
                                 None,
@@ -3518,7 +3538,20 @@ pub(crate) async fn signal_arc_dispatch(
         .into_iter()
         .filter(|w| w.signal == signal)
         .collect();
-    let m = store.match_and_take(signal, &correlation);
+    // `_target_arc` in the correlation restricts resolution to ONE
+    // arc's registrations (admission duplicate conversion targets the
+    // holding arc; subset matching alone could hand the payload to any
+    // arc with compatible - including empty broadcast - wait keys).
+    // The key travels in the correlation so a persisted idle event
+    // stays targeted through ledger catch-up and bridge redelivery.
+    let target_arc = correlation
+        .get("_target_arc")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let m = match target_arc.as_deref() {
+        Some(target) => store.match_and_take_for_arc(signal, &correlation, target),
+        None => store.match_and_take(signal, &correlation),
+    };
     let Some((resolved_slot, notify, arc_id, wait_id)) = m else {
         tracing::info!(
             "signal '{signal}' arrived with correlation {correlation:?} — no matching wait (idle). pending_with_same_signal={:?}",

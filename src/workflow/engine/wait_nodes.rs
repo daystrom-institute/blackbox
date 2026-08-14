@@ -178,7 +178,16 @@ impl WorkflowRunner<'_> {
             // unconsumed match so a backlog drains in arrival order
             // instead of starving old events behind new ones.
             if let Some(event) = events.into_iter().rev().find(|event| {
-                !self.ctx.signal_event_consumed(&event.id)
+                // Arc-targeted events (admission duplicate conversions)
+                // are consumable ONLY by the arc they were queued for;
+                // untargeted events match as before.
+                let targeted_elsewhere = event
+                    .correlation
+                    .get("_target_arc")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t != arc.as_str());
+                !targeted_elsewhere
+                    && !self.ctx.signal_event_consumed(&event.id)
                     && matches_correlation(correlation, &event.correlation)
             }) && let Some((resolved, notify, _, _)) =
                 self.server.wait_store().take_exact(arc, wait_id)
