@@ -157,6 +157,22 @@ pub struct RetrySpec {
     pub max_ms: u64,
 }
 
+impl RetrySpec {
+    /// Clamp every field into operational bounds. `execute` applies
+    /// this to the EFFECTIVE policy regardless of how the spec was
+    /// constructed: `from_args` clamps at parse time, but serde paths
+    /// (pollers deserialize `HttpFetchSpec` directly inside
+    /// `PollerSpec`) would otherwise carry `attempts: u32::MAX` /
+    /// `base_ms: 0` straight into the retry loop.
+    pub fn normalized(&self) -> RetrySpec {
+        RetrySpec {
+            attempts: clamp_retry_attempts(u64::from(self.attempts)),
+            base_ms: clamp_retry_delay_ms(self.base_ms),
+            max_ms: clamp_retry_delay_ms(self.max_ms),
+        }
+    }
+}
+
 impl Default for RetrySpec {
     fn default() -> Self {
         RetrySpec {
@@ -388,9 +404,15 @@ impl HttpFetchSpec {
     pub async fn execute(&self) -> Result<HttpFetchResult> {
         let parsed_method = reqwest::Method::from_bytes(self.method.as_bytes())
             .map_err(|e| anyhow!("http fetch invalid method '{}': {e}", self.method))?;
+        // normalized(): the single choke point for retry bounds. Specs
+        // built through from_args are already clamped, but serde-built
+        // specs (poller installs) are not, and unbounded attempts with
+        // zero delay would grind a failing endpoint without ever
+        // consuming the delay budget.
         let retry = self
             .retry
-            .unwrap_or_else(|| default_retry_for_method(&self.method));
+            .unwrap_or_else(|| default_retry_for_method(&self.method))
+            .normalized();
         let mut attempt: u32 = 0;
         let mut total_delay_ms: u64 = 0;
         loop {
@@ -1044,5 +1066,26 @@ mod tests {
         assert!(format!("{err}").contains("503"));
         // Default attempts=3 for an idempotent method: 1 initial try + 2 retries.
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod serde_path_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn serde_built_retry_spec_is_normalized_at_execute_bounds() {
+        // Pollers deserialize HttpFetchSpec directly, bypassing
+        // from_args clamping; normalized() is the execute-time choke
+        // point that bounds them anyway.
+        let spec: RetrySpec = serde_json::from_str(
+            r#"{"attempts": 4294967295, "base_ms": 0, "max_ms": 999999999999}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.attempts, u32::MAX, "serde carries raw values");
+        let n = spec.normalized();
+        assert_eq!(n.attempts, MAX_RETRY_ATTEMPTS);
+        assert!(n.base_ms >= 1, "zero base delay clamps up: {}", n.base_ms);
+        assert!(n.max_ms <= MAX_TOTAL_DELAY_MS, "max_ms bounded: {}", n.max_ms);
     }
 }

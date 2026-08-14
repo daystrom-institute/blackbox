@@ -178,6 +178,23 @@ pub(super) async fn exec_shell(
             strs[0]
         );
     }
+    // With a shell policy active, an env PATH override would defeat
+    // bare-name authorization: tokio's Command resolves a bare argv[0]
+    // through its CONFIGURED environment, so permitting
+    // `env: {"PATH": "/tmp/attacker-bin"}` lets an allowlisted "git"
+    // execute /tmp/attacker-bin/git. Fail closed on either env section.
+    if allowlist.is_some() || ctx.meta.shell_allowlist.is_some() {
+        for (section, value) in [("env", args.get("env")), ("secret_env", args.get("secret_env"))]
+        {
+            if let Some(obj) = value.and_then(|v| v.as_object())
+                && obj.contains_key("PATH")
+            {
+                bail!(
+                    "Shell {section}.PATH override is not allowed while a shell allowlist is active"
+                );
+            }
+        }
+    }
     let cwd = args
         .get("cwd")
         .and_then(|v| v.as_str())
