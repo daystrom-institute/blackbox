@@ -10,6 +10,21 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Slack conversation source, end to end: a producer satellite
+  (`bbox-slack-collector`, one-app bot-perspective posture, membership-driven
+  enrollment via `users.conversations`, watermark plus thread-parent sweeps,
+  full-history backfill) lands messages through the authenticated
+  `/internal/conversation-source/v1/*` routes into a journal-backed store, and
+  the transcript projection indexes them as searchable conversation documents
+  with channel, author, and derived permalink provenance.
+- `bbox_search` conversation filters: `source` includes or excludes the Slack
+  lane, `author` filters by provider user id, and the new `channel` filter
+  accepts a channel name (leading `#` accepted) or channel id, resolving names
+  through the current roster to the stable channel id so a renamed channel
+  still matches its whole history while documents stamped with the queried
+  name keep matching directly. Channel names are also plain-query searchable:
+  the transcript query parser consults the stamped channel-name field, so
+  naming a channel finds its messages without a body-text match.
 - Strict catalog Git transport cutover: the offline
   `project-catalog git-transport-cutover` workflow now supports checksummed
   preflight, apply, verify, and row-preserving re-cutover artifacts. Covered
@@ -84,6 +99,12 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Search hits whose query matched only metadata fields (a channel name, the
+  source lane, a file path, an author id) rendered an empty excerpt that read
+  as an empty message; they now fall back to the first 150 characters of the
+  document. Slack search hits also stopped recommending `bbox_context` /
+  `bbox_messages`, which cannot open a conversation locator; they point at the
+  `channel` filter and the per-hit permalink instead.
 - Isolated daemons can no longer publish a partial knowledge store into the
   production global guidance files. Every daemon now claims its four resolved
   global render targets against other daemon instances, and `scope=global`

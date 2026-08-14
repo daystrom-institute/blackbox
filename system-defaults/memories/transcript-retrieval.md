@@ -68,6 +68,30 @@ Use `bbox_sessions_list`.
 
 This is the fallback when you only know rough recency, project, or session naming.
 
+## Conversation (Slack) lane divergence
+
+Ingested Slack conversations are searchable through the same `bbox_search`,
+but the drill-down half of the ladder diverges: a conversation hit has no
+readable transcript file, so `bbox_context` and `bbox_messages` cannot open
+it. Use these instead:
+
+- **Scope to a channel** with `channel=` (a name, `#name`, or a channel id).
+  Names resolve through the current roster to the stable channel id, so a
+  renamed channel still matches its whole history.
+- **Plain queries match channel names**: `bbox_search(query="ops-incident-4565")`
+  finds that channel's messages even when no message body names it.
+- **Open a message** by following the hit's rendered `Permalink` line.
+- **Filter the lane** with `source="slack"` / `source="-slack"`, and who spoke
+  with `author=<provider user id>` (`role` only distinguishes human from app).
+- A hit whose match was metadata-only (channel name, lane, author) renders
+  the start of the message as its excerpt rather than highlighted fragments.
+
+### "What's in #some-channel about X?"
+
+1. `bbox_search(query="X", channel="#some-channel")`
+2. Broaden: `bbox_search(query="...", channel="<channel id from the hit>")`
+3. Follow the permalink for the full thread in Slack
+
 ## Common patterns
 
 ### "When did we discuss X?"

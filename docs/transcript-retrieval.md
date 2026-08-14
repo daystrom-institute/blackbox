@@ -63,6 +63,30 @@ Filter early:
 | `account` | Separate multiple Claude/Codex accounts. |
 | `include_subagents` | Include or exclude subagent transcript blocks. |
 | `exclude_self` | Avoid echoing the current turn. |
+| `source` | Include or exclude a lane (`slack`, `-slack`, `glm,codex`, ...). |
+| `author` | Conversation documents: who spoke, by provider user id. |
+| `channel` | Conversation documents: one Slack channel by name or id. |
+
+## Conversations (Slack Lane)
+
+Connector-landed Slack conversations are searchable through the same
+`bbox_search`. The channel is a first-class coordinate:
+
+```text
+bbox_search(query="import mapping", channel="#ops-incident-4565")
+bbox_search(query="ops-incident-4565")   # channel names match plain queries
+```
+
+A `channel` name (leading `#` accepted) resolves through the current roster to
+the stable channel id, so a renamed channel still matches its whole history;
+documents stamped with the queried name keep matching directly. A channel id
+works as-is.
+
+Conversation hits render channel, author, and a derived Slack permalink. They
+have no readable transcript file, so `bbox_context` and `bbox_messages` do not
+apply: drill down by narrowing `channel=` queries and follow the permalink to
+open a message in Slack. A hit whose only match was metadata (the channel
+name, lane, or author) shows the start of the message as its excerpt.
 
 ## Sessions And Messages
 
