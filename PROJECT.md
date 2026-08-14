@@ -185,6 +185,12 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   `~/repos/bbox-cage/build/submit-bbox-build.sh --ref <ref>` (native amd64
   in a warm ZFS clone; QEMU emulation and controller-host docker builds are
   legacy fallbacks).
+- **Deploying the built image to the cage is one command**:
+  `~/repos/bbox-cage/scripts/converge.sh --image <tag>` (tag as printed by
+  the build submit; the script resolves the immutable digest, assembles the
+  operator-local stack env, and runs `pulumi up`; `--preview` dry-runs).
+  There is NO local corpus daemon to restart: this host runs only
+  collectors/fleetd, and blackbox.daystrom.app serves everything.
 - **Interactive heavy worktrees are lanes, not local disk**: claim a warm
   standby lane in seconds (`~/repos/bbox-cage/build/lanes/lane-pool.sh
   claim` prints the checkout path), or create a named one from the
