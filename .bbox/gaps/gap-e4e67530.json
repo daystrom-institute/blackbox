@@ -1,0 +1,21 @@
+{
+  "id": "gap-e4e67530",
+  "title": "Edge-index sidecar read latch never releases after a completed watcher rebuild",
+  "gap_kind": "tooling",
+  "domain": "edge-index-watcher",
+  "wanted_capability": "bbox_reindex (and any caller gated on the sidecar-publication read guard) should be admitted once the edge-index watcher rebuild completes. Observed live (2026-08-14): the watcher logged \"EdgeIndex rebuilt ... elapsed_ms=12529\" and the runtime went idle, yet bbox_reindex kept refusing with \"an edge-index rebuild is already reading the sidecar publication\" for 10+ minutes until a daemon restart, with repeated \"deferred a store-only nudge\" warnings in the same window (prime suspect for a set-without-release path). Wanted: exit-path-audited release (or an RAII guard) on the latch across success, deferral, and error paths; a release log line; and an owner timestamp on the guard so a stale hold is detected and reported instead of impersonating an active rebuild.",
+  "missing_primitive": "exit-path-audited release on the sidecar publication read latch",
+  "fallback_used": "Daemon restart clears the latch (at the cost of restarting any in-flight schema rebuild, which is expensive).",
+  "evidence": [
+    "thread-21347ce5",
+    "daemon log 2026-08-14: rebuild complete 03:45:29 vs refusals through 03:54+"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/edge-index-watcher/sidecar-read-latch-stuck",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-21347ce5",
+  "created_at": "2026-08-14T04:39:18Z",
+  "updated_at": "2026-08-14T04:39:18Z"
+}

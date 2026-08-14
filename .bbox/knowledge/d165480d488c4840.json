@@ -1,0 +1,19 @@
+{
+  "id": "d165480d488c4840",
+  "title": "New optional/accumulating state surfaces: fixtures include absent/legacy shapes from day one",
+  "content": "When adding a new optional or accumulating state surface (owner lane, provisioned store, registry, spool), its test fixtures must include the never-provisioned/absent, legacy-shaped, oversized, and orphaned forms of that state from day one — not only the fully-provisioned happy shape — and invariance assertions over such state must first prove the compared state is non-trivially present. Encoded from the 2026-08 catalog-cut fixture-gap post-mortem (24 production defects structurally unreachable from a certified pre-provisioned-happy suite; each fix landed with the pinning test closing its gap; record: thread-fcbdf795).",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-08-06T23:45:25Z",
+  "updated_at": "2026-08-06T23:45:25Z",
+  "recall_count": 0
+}
