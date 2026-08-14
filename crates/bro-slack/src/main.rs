@@ -33,6 +33,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use bbox_config::secrets;
 
+mod spool;
+
+use spool::{EnvelopeSpool, SpoolPolicy};
+
 // ── CLI ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
@@ -77,9 +81,43 @@ struct Args {
     #[arg(long)]
     health_port: Option<u16>,
 
+    /// Directory holding the durable envelope spool. Every accepted
+    /// envelope is written here before Slack is acked, and removed only
+    /// after the daemon accepts it. Defaults to <bro_home>/slack-spool,
+    /// the same state root that holds slack-identities.json.
+    #[arg(long)]
+    spool_dir: Option<String>,
+
+    /// Seconds between spool retry sweeps. 0 disables the sweep, leaving
+    /// only the boot replay and the inline delivery attempt.
+    #[arg(long, default_value_t = spool::DEFAULT_SWEEP_INTERVAL_SECS)]
+    spool_sweep_secs: u64,
+
+    /// Age at which an undelivered spooled envelope is discarded, in
+    /// seconds. Discards are logged at error level and counted.
+    #[arg(long, default_value_t = spool::DEFAULT_MAX_AGE_SECS)]
+    spool_max_age_secs: u64,
+
+    /// Maximum retained spool entries. At the cap, the oldest entries are
+    /// evicted (loudly) so freshly arriving traffic is never refused.
+    /// 0 means unbounded.
+    #[arg(long, default_value_t = spool::DEFAULT_MAX_ENTRIES)]
+    spool_max_entries: usize,
+
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
+}
+
+/// Where the durable spool lives. Mirrors the identities-file convention:
+/// an explicit flag wins (with `~` expansion), otherwise it is derived
+/// from the resolved bro home so the sidecar and the daemon agree on one
+/// state root.
+fn resolve_spool_dir(flag: Option<&str>, bro_home: &Path) -> PathBuf {
+    match flag {
+        Some(p) if !p.trim().is_empty() => bbox_util::util::resolve_tilde(p),
+        _ => bro_home.join("slack-spool"),
+    }
 }
 
 // ── Identities ──────────────────────────────────────────────────────
@@ -652,6 +690,14 @@ impl InFlightSet {
         true
     }
 
+    /// Drop a claim so a Slack redelivery of the same envelope is
+    /// processed rather than deduped away. Used when the sidecar
+    /// deliberately withholds the ack (durable spool write failed), which
+    /// makes redelivery the recovery path rather than a duplicate.
+    pub fn release(&mut self, id: &str) {
+        self.entries.remove(id);
+    }
+
     /// Number of active tracked entries.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -677,27 +723,27 @@ impl Default for InFlightSet {
 // ── Daemon POST with bounded retry ──────────────────────────────────
 //
 // Per §5.1: up to 3 POST attempts with 500ms then 1s delays (3 attempts
-// total including the first). Ack to Slack after 2xx success, or after
-// the 3rd attempt fails (ack-and-drop with warning).
+// total including the first). This is ONE delivery round. Exhausting it
+// is no longer terminal: the envelope is already durable in the spool
+// (§5.6), so it is retained and re-attempted by the sweep.
 
 const MAX_POST_ATTEMPTS: u32 = 3;
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1000)];
-/// Per-attempt timeout for daemon POST. Worst-case: 3 attempts ×
-/// 1s timeout + 1500ms inter-attempt sleep ≈ 4.5s before ack/drop.
-/// This is over Slack's ~3s ack window, but the daemon is loopback
-/// and rarely slow; the in-flight dedup set catches redeliveries.
-/// Honest v1 tradeoff — tighten to 500ms (≈3s total) or drop to
-/// 2 attempts if this proves tight in practice.
+/// Per-attempt timeout for daemon POST. Worst-case: 3 attempts x
+/// 1s timeout + 1500ms inter-attempt sleep, about 4.5s per round.
+/// Overrunning Slack's ~3s ack window used to matter; it no longer
+/// does, because the ack is sent after the durable spool write and
+/// before this round begins (§5.1 step 4e).
 const DAEMON_POST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Outcome of a daemon POST attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostOutcome {
-    /// Daemon returned 2xx → ack to Slack, event delivered.
+    /// Daemon returned 2xx: event delivered, spool entry can be cleared.
     Success,
-    /// Daemon returned non-2xx → retry if attempts remain.
+    /// Daemon returned non-2xx: retry if attempts remain.
     Retryable { status: u16, attempt: u32 },
-    /// Max attempts exhausted → ack-and-drop.
+    /// Max attempts exhausted: the envelope stays in the spool.
     Exhausted,
 }
 
@@ -718,12 +764,13 @@ pub fn classify_post_response(status: u16, attempt: u32) -> PostOutcome {
 ///
 /// `build_body(attempt)` is called per attempt so the body can
 /// carry the current retry_attempt stamp. Each POST is gated by
-/// `DAEMON_POST_TIMEOUT` (1s). Worst case: 3 attempts × 1s timeout +
-/// 1500ms sleep ≈ 4.5s total before ack/drop. Daemon is loopback, rarely
-/// slow; in-flight dedup catches Slack redeliveries.
+/// `DAEMON_POST_TIMEOUT` (1s). Worst case: 3 attempts x 1s timeout +
+/// 1500ms sleep, about 4.5s for one round.
 ///
-/// Returns `true` if the event was delivered (ack to Slack),
-/// `false` if exhausted (ack-and-drop).
+/// Returns `true` if the daemon accepted the event, `false` if this
+/// round was exhausted. A `false` is not a drop: every caller reaches
+/// this with the envelope already durable in the spool, and leaves it
+/// there for the retry sweep.
 pub async fn post_to_daemon_with_retry(
     client: &reqwest::Client,
     daemon_url: &str,
@@ -808,7 +855,7 @@ pub async fn post_to_daemon_with_retry(
                 tracing::warn!(
                     envelope_id = envelope_id,
                     attempts = MAX_POST_ATTEMPTS,
-                    "daemon POST exhausted; ack-and-drop"
+                    "daemon POST round exhausted; envelope stays in the durable spool"
                 );
                 return false;
             }
@@ -890,7 +937,24 @@ pub struct HealthStats {
     pub events_dropped_self_loop: AtomicU64,
     pub events_dropped_malformed: AtomicU64,
     pub events_failed_post: AtomicU64,
+    /// Envelopes whose inline POST budget ran out. These are RETAINED in
+    /// the durable spool, not dropped; the sweep retries them.
     pub events_failed_post_exhausted: AtomicU64,
+    /// Envelopes durably written to the spool (every accepted envelope).
+    pub events_spooled: AtomicU64,
+    /// Envelopes delivered by the boot replay or a retry sweep rather
+    /// than by their inline attempt.
+    pub events_spool_replayed: AtomicU64,
+    /// Spool writes that failed. Each one means an ack was WITHHELD from
+    /// Slack so the envelope is redelivered; nothing was lost, but the
+    /// sidecar cannot durably accept traffic and needs an operator.
+    pub events_spool_write_failed: AtomicU64,
+    /// Envelopes discarded for exceeding the spool age bound.
+    pub events_spool_discarded_aged: AtomicU64,
+    /// Envelopes evicted to keep the spool under its entry cap.
+    pub events_spool_evicted_overflow: AtomicU64,
+    /// Current undelivered spool depth.
+    pub spool_depth: AtomicU64,
     pub reconnects: AtomicU64,
     pub last_disconnect_reason: parking_lot::Mutex<Option<String>>,
     pub workspace_id: parking_lot::Mutex<String>,
@@ -929,6 +993,12 @@ impl HealthStats {
             "events_dropped_malformed": self.events_dropped_malformed.load(Ordering::Relaxed),
             "events_failed_post": self.events_failed_post.load(Ordering::Relaxed),
             "events_failed_post_exhausted": self.events_failed_post_exhausted.load(Ordering::Relaxed),
+            "events_spooled": self.events_spooled.load(Ordering::Relaxed),
+            "events_spool_replayed": self.events_spool_replayed.load(Ordering::Relaxed),
+            "events_spool_write_failed": self.events_spool_write_failed.load(Ordering::Relaxed),
+            "events_spool_discarded_aged": self.events_spool_discarded_aged.load(Ordering::Relaxed),
+            "events_spool_evicted_overflow": self.events_spool_evicted_overflow.load(Ordering::Relaxed),
+            "spool_depth": self.spool_depth.load(Ordering::Relaxed),
             "reconnects": self.reconnects.load(Ordering::Relaxed),
             "last_disconnect_reason": disconnect,
             "self_user_id": self_user_id,
@@ -953,6 +1023,18 @@ struct BridgeContext<'a> {
     self_bot_id: &'a str,
     hmac_secret_env: &'a str,
     health: Option<&'a SharedHealthStats>,
+    spool: Arc<EnvelopeSpool>,
+}
+
+/// Mirror the spool's own counters into the health endpoint. The spool
+/// owns depth and eviction accounting because it is the only writer;
+/// health is a read model refreshed at every mutation point.
+fn sync_spool_health(spool: &EnvelopeSpool, health: Option<&SharedHealthStats>) {
+    if let Some(h) = health {
+        h.spool_depth.store(spool.depth(), Ordering::Relaxed);
+        h.events_spool_evicted_overflow
+            .store(spool.evicted_overflow(), Ordering::Relaxed);
+    }
 }
 
 // ── Health HTTP endpoint ────────────────────────────────────────────
@@ -996,18 +1078,30 @@ fn spawn_health_server(
 
 // ── Event processing ────────────────────────────────────────────────
 
+/// What happened to one envelope. Only the `Acked` variants mean Slack
+/// has been told to forget the envelope; `NotAcked` deliberately leaves
+/// it with Slack so redelivery is the recovery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeOutcome {
+    /// Acked. Either delivered, spooled for retry, or dropped as a
+    /// self-loop / malformed frame with nothing to deliver.
+    Acked,
+    /// Dedup'd: this envelope_id is already in flight.
+    DuplicateInFlight,
+    /// NOT acked. The durable spool write failed, so the sidecar refuses
+    /// to claim the envelope and lets Slack redeliver it.
+    NotAcked,
+}
+
 /// Process a single Socket Mode envelope through the full pipeline:
-/// in-flight dedup, self-loop filter, normalize/enrich, POST to daemon
-/// with retry, ack to Slack.
-///
-/// Returns `true` if the envelope was processed (whether delivered or
-/// ack-and-dropped). Returns `false` if it was dedup'd (duplicate in-flight).
+/// in-flight dedup, self-loop filter, normalize/enrich, durable spool,
+/// ack to Slack, then delivery to the daemon.
 async fn process_slack_envelope<S>(
     ws_write: &mut S,
     ctx: &BridgeContext<'_>,
     envelope_json: &Value,
     in_flight: &mut InFlightSet,
-) -> Result<bool>
+) -> Result<EnvelopeOutcome>
 where
     S: SinkExt<WsMessage> + Unpin,
     S::Error: std::fmt::Display + Send + Sync + 'static,
@@ -1024,7 +1118,7 @@ where
             envelope_id = envelope_id,
             "duplicate envelope dropped (in-flight)"
         );
-        return Ok(false);
+        return Ok(EnvelopeOutcome::DuplicateInFlight);
     }
 
     // Update last-event timestamp
@@ -1035,7 +1129,16 @@ where
     // Process the envelope. One ack per envelope_id is sufficient;
     // Slack deduplicates acks. The id stays in the set until TTL
     // expiry to catch delayed redeliveries.
-    process_envelope_inner(ws_write, ctx, envelope_json, envelope_id).await
+    let outcome = process_envelope_inner(ws_write, ctx, envelope_json, envelope_id).await?;
+
+    // A withheld ack makes Slack's redelivery the recovery path, so the
+    // claim must go: holding it would dedupe away the very redelivery the
+    // sidecar is counting on.
+    if outcome == EnvelopeOutcome::NotAcked {
+        in_flight.release(envelope_id);
+    }
+
+    Ok(outcome)
 }
 
 async fn process_envelope_inner<S>(
@@ -1043,12 +1146,13 @@ async fn process_envelope_inner<S>(
     ctx: &BridgeContext<'_>,
     envelope_json: &Value,
     envelope_id: &str,
-) -> Result<bool>
+) -> Result<EnvelopeOutcome>
 where
     S: SinkExt<WsMessage> + Unpin,
     S::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    // 2. Normalize (includes self-loop filter)
+    // 2. Normalize (includes self-loop filter). Neither of the drop paths
+    // spools: there is nothing to deliver, so acking loses nothing.
     let normalized = match normalize_envelope(
         envelope_json,
         ctx.identities,
@@ -1063,7 +1167,7 @@ where
             }
             tracing::debug!(envelope_id = envelope_id, "self-loop event dropped");
             ack_to_slack(ws_write, envelope_id).await?;
-            return Ok(true);
+            return Ok(EnvelopeOutcome::Acked);
         }
         Err(e) => {
             if let Some(h) = ctx.health {
@@ -1071,11 +1175,40 @@ where
             }
             tracing::warn!(envelope_id = envelope_id, error = %e, "malformed envelope, ack-and-drop");
             ack_to_slack(ws_write, envelope_id).await?;
-            return Ok(true);
+            return Ok(EnvelopeOutcome::Acked);
         }
     };
 
-    // 3. POST to daemon with bounded retry.
+    // 3. Durable spool BEFORE the ack. The spooled body is the normalized,
+    // ACL-enriched event: re-normalizing at replay time would re-read the
+    // identity map and could attribute the message to a different bbox
+    // user than the one in effect when it arrived.
+    let spooled_body = serde_json::to_value(&normalized).unwrap_or(Value::Null);
+    if let Err(e) = ctx.spool.persist(envelope_id, &spooled_body).await {
+        if let Some(h) = ctx.health {
+            h.events_spool_write_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        // Withholding the ack is the whole point: Slack still owns the
+        // envelope, so it redelivers instead of the sidecar losing it.
+        tracing::error!(
+            envelope_id = envelope_id,
+            error = %e,
+            spool_dir = %ctx.spool.dir().display(),
+            "durable spool write failed; withholding the ack so Slack redelivers"
+        );
+        return Ok(EnvelopeOutcome::NotAcked);
+    }
+    if let Some(h) = ctx.health {
+        h.events_spooled.fetch_add(1, Ordering::Relaxed);
+    }
+    sync_spool_health(&ctx.spool, ctx.health);
+
+    // 4. Ack now. The envelope is on disk, so Slack's ~3s deadline no
+    // longer has to cover daemon latency, and the retry budget below can
+    // overrun it without risking a redelivery storm.
+    ack_to_slack(ws_write, envelope_id).await?;
+
+    // 5. Inline delivery attempt, so the happy path stays immediate.
     // The closure re-serializes the body per attempt so
     // _meta.retry_attempt reflects the actual attempt number.
     let delivered = post_to_daemon_with_retry(
@@ -1092,26 +1225,210 @@ where
     )
     .await;
 
-    // 4. Ack to Slack regardless of delivery outcome
-    ack_to_slack(ws_write, envelope_id).await?;
-
-    if let Some(h) = ctx.health {
-        if delivered {
+    // 6. Settle the spool entry. Delivered means gone; exhausted means it
+    // STAYS, stamped, for the boot replay and the retry sweep.
+    if delivered {
+        if let Some(h) = ctx.health {
             h.events_forwarded.fetch_add(1, Ordering::Relaxed);
-        } else {
+        }
+        if let Err(e) = ctx.spool.remove(envelope_id).await {
+            // Harmless: the sweep re-POSTs and the daemon dedupes on
+            // X-Slack-Envelope-Id. Worth a warning, not a failure.
+            tracing::warn!(
+                envelope_id = envelope_id,
+                error = %e,
+                "delivered envelope could not be cleared from the spool"
+            );
+        }
+    } else {
+        if let Some(h) = ctx.health {
             h.events_failed_post_exhausted
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Err(e) = ctx
+            .spool
+            .record_failure(envelope_id, "inline delivery budget exhausted")
+            .await
+        {
+            tracing::warn!(envelope_id = envelope_id, error = %e, "could not stamp the spool entry");
+        }
+        tracing::warn!(
+            envelope_id = envelope_id,
+            spool_depth = ctx.spool.depth(),
+            "inline delivery budget exhausted; envelope retained in the durable spool for retry"
+        );
+    }
+    sync_spool_health(&ctx.spool, ctx.health);
+
+    Ok(EnvelopeOutcome::Acked)
+}
+
+// ── Spool drain (boot replay and retry sweep) ───────────────────────
+
+/// What one drain pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DrainReport {
+    attempted: usize,
+    delivered: usize,
+    retained: usize,
+    discarded: usize,
+    waiting: usize,
+}
+
+/// Re-attempt spooled envelopes. Shared by the boot replay (which passes
+/// `quiet_period = 0` because nothing is being delivered inline yet) and
+/// the periodic sweep (which honours the quiet period so it does not race
+/// the socket loop's own inline attempt for a just-spooled envelope).
+///
+/// Delivery is sequential on purpose: a spool drain runs precisely when
+/// the daemon has been unhealthy, and fanning a backlog at it is the
+/// wrong first move after it comes back.
+async fn drain_spool(
+    spool: &EnvelopeSpool,
+    client: &reqwest::Client,
+    daemon_url: &str,
+    webhook_name: &str,
+    hmac_secret_env: &str,
+    health: Option<&SharedHealthStats>,
+    quiet_period: Duration,
+) -> DrainReport {
+    let plan = match spool.plan_sweep(chrono::Utc::now(), quiet_period).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, spool_dir = %spool.dir().display(), "could not inventory the spool");
+            return DrainReport::default();
+        }
+    };
+
+    let mut report = DrainReport {
+        waiting: plan.waiting,
+        ..DrainReport::default()
+    };
+
+    // Age-bounded discards are the one place the sidecar drops a durably
+    // accepted envelope, so they are loud and individually attributed.
+    for entry in plan.discard {
+        tracing::error!(
+            envelope_id = %entry.envelope_id,
+            spooled_at = %entry.spooled_at,
+            attempts = entry.attempts,
+            last_error = entry.last_error.as_deref().unwrap_or(""),
+            max_age_secs = spool.policy().max_age.as_secs(),
+            "discarding a spooled Slack envelope that exceeded the spool age bound; it was never delivered"
+        );
+        if let Err(e) = spool.remove(&entry.envelope_id).await {
+            tracing::warn!(envelope_id = %entry.envelope_id, error = %e, "aged spool entry could not be removed");
+            continue;
+        }
+        report.discarded += 1;
+        if let Some(h) = health {
+            h.events_spool_discarded_aged
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    if !delivered {
-        tracing::warn!(
-            envelope_id = envelope_id,
-            "ack-and-drop after exhausted retries"
-        );
+    for entry in plan.retry {
+        report.attempted += 1;
+        let body = entry.event.clone();
+        let delivered = post_to_daemon_with_retry(
+            client,
+            daemon_url,
+            webhook_name,
+            |attempt| {
+                let mut b = body.clone();
+                if let Some(meta) = b.get_mut("_meta").and_then(Value::as_object_mut) {
+                    meta.insert("retry_attempt".into(), Value::from(attempt));
+                }
+                b
+            },
+            &entry.envelope_id,
+            hmac_secret_env,
+        )
+        .await;
+
+        if delivered {
+            report.delivered += 1;
+            if let Some(h) = health {
+                h.events_spool_replayed.fetch_add(1, Ordering::Relaxed);
+                h.events_forwarded.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Err(e) = spool.remove(&entry.envelope_id).await {
+                tracing::warn!(envelope_id = %entry.envelope_id, error = %e, "replayed envelope could not be cleared from the spool");
+            }
+        } else {
+            report.retained += 1;
+            if let Err(e) = spool
+                .record_failure(&entry.envelope_id, "spool retry budget exhausted")
+                .await
+            {
+                tracing::warn!(envelope_id = %entry.envelope_id, error = %e, "could not stamp the spool entry");
+            }
+        }
     }
 
-    Ok(true)
+    sync_spool_health(spool, health);
+    report
+}
+
+/// Periodic retry sweep. Runs until shutdown; a zero interval disables it
+/// (the boot replay and the inline attempt still run).
+fn spawn_spool_sweep(
+    spool: Arc<EnvelopeSpool>,
+    client: reqwest::Client,
+    daemon_url: String,
+    webhook_name: String,
+    hmac_secret_env: String,
+    health: Option<SharedHealthStats>,
+    interval: Duration,
+    shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if interval.is_zero() {
+            tracing::info!("spool retry sweep disabled (--spool-sweep-secs 0)");
+            return;
+        }
+        tracing::info!(
+            interval_secs = interval.as_secs(),
+            max_age_secs = spool.policy().max_age.as_secs(),
+            max_entries = spool.policy().max_entries,
+            spool_dir = %spool.dir().display(),
+            "spool retry sweep armed"
+        );
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown_notify.notified() => return,
+            }
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            if spool.depth() == 0 {
+                continue;
+            }
+            let report = drain_spool(
+                &spool,
+                &client,
+                &daemon_url,
+                &webhook_name,
+                &hmac_secret_env,
+                health.as_ref(),
+                spool::SWEEP_QUIET_PERIOD,
+            )
+            .await;
+            if report.attempted > 0 || report.discarded > 0 {
+                tracing::info!(
+                    attempted = report.attempted,
+                    delivered = report.delivered,
+                    retained = report.retained,
+                    discarded = report.discarded,
+                    waiting = report.waiting,
+                    depth = spool.depth(),
+                    "spool retry sweep pass complete"
+                );
+            }
+        }
+    })
 }
 
 // ── WebSocket event loop ────────────────────────────────────────────
@@ -1192,8 +1509,8 @@ async fn run_socket_loop(
                     let drain =
                         process_slack_envelope(&mut ws_write, ctx, &envelope, &mut in_flight);
                     match tokio::time::timeout(Duration::from_secs(2), drain).await {
-                        Ok(Ok(_)) => {
-                            tracing::debug!(envelope_id = %env_id, "drained before shutdown")
+                        Ok(Ok(outcome)) => {
+                            tracing::debug!(envelope_id = %env_id, ?outcome, "drained before shutdown")
                         }
                         Ok(Err(e)) => {
                             tracing::error!(envelope_id = %env_id, error = %e, "drain error");
@@ -1222,7 +1539,7 @@ async fn run_socket_loop(
                     result = &mut process => {
                         drop(process);
                         match result {
-                            Ok(_) => tracing::debug!(envelope_id = %env_id, "envelope processed"),
+                            Ok(outcome) => tracing::debug!(envelope_id = %env_id, ?outcome, "envelope processed"),
                             Err(e) => {
                                 tracing::error!(envelope_id = %env_id, error = %e, "processing failed");
                                 let _ = ack_to_slack(&mut ws_write, &env_id).await;
@@ -1234,7 +1551,7 @@ async fn run_socket_loop(
                         tracing::info!(envelope_id = %env_id, "shutdown during processing; 2s drain");
                         let drain_result = tokio::time::timeout(Duration::from_secs(2), process).await;
                         match drain_result {
-                            Ok(Ok(_)) => tracing::debug!(envelope_id = %env_id, "drained before shutdown"),
+                            Ok(Ok(outcome)) => tracing::debug!(envelope_id = %env_id, ?outcome, "drained before shutdown"),
                             Ok(Err(e)) => {
                                 tracing::error!(envelope_id = %env_id, error = %e, "processing error during drain");
                                 let _ = ack_to_slack(&mut ws_write, &env_id).await;
@@ -1398,6 +1715,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = bbox_config::config::load()?;
+    let spool_dir = resolve_spool_dir(args.spool_dir.as_deref(), &cfg.paths.bro_home);
     let identities_path = if let Some(p) = args.identities_file {
         bbox_util::util::resolve_tilde(&p)
     } else {
@@ -1464,6 +1782,25 @@ async fn main() -> Result<()> {
         args.self_bot_id,
     );
 
+    // The spool is opened before the socket: a sidecar that cannot write
+    // its spool cannot honestly ack Slack, so failing here is correct.
+    let spool = Arc::new(
+        EnvelopeSpool::open(
+            &spool_dir,
+            SpoolPolicy {
+                max_age: Duration::from_secs(args.spool_max_age_secs),
+                max_entries: args.spool_max_entries,
+            },
+        )
+        .await
+        .context("opening the durable Slack envelope spool")?,
+    );
+    tracing::info!(
+        spool_dir = %spool.dir().display(),
+        depth = spool.depth(),
+        "durable envelope spool ready"
+    );
+
     let health = if let Some(port) = args.health_port {
         let stats = Arc::new(HealthStats::default());
         *stats.started_at.lock() = Some(chrono::Utc::now());
@@ -1508,6 +1845,58 @@ async fn main() -> Result<()> {
     });
 
     let daemon_client = reqwest::Client::new();
+    sync_spool_health(&spool, health.as_ref());
+
+    // Boot replay: anything a previous process spooled but never
+    // delivered goes out now, alongside live traffic rather than ahead of
+    // it, so a large backlog cannot delay the Socket Mode connection.
+    // Slack ordering is not guaranteed in the first place, and the daemon
+    // dedupes on X-Slack-Envelope-Id.
+    {
+        let spool = spool.clone();
+        let client = daemon_client.clone();
+        let daemon_url = args.daemon_url.clone();
+        let webhook_name = args.webhook_name.clone();
+        let hmac_secret_env = args.shared_secret_env.clone();
+        let health = health.clone();
+        tokio::spawn(async move {
+            if spool.depth() == 0 {
+                return;
+            }
+            let report = drain_spool(
+                &spool,
+                &client,
+                &daemon_url,
+                &webhook_name,
+                &hmac_secret_env,
+                health.as_ref(),
+                // No quiet period: nothing is being delivered inline yet.
+                Duration::ZERO,
+            )
+            .await;
+            tracing::info!(
+                attempted = report.attempted,
+                delivered = report.delivered,
+                retained = report.retained,
+                discarded = report.discarded,
+                depth = spool.depth(),
+                "boot replay of the durable spool complete"
+            );
+        });
+    }
+
+    spawn_spool_sweep(
+        spool.clone(),
+        daemon_client.clone(),
+        args.daemon_url.clone(),
+        args.webhook_name.clone(),
+        args.shared_secret_env.clone(),
+        health.clone(),
+        Duration::from_secs(args.spool_sweep_secs),
+        shutdown.clone(),
+        shutdown_notify.clone(),
+    );
+
     let ctx = BridgeContext {
         daemon_client: &daemon_client,
         daemon_url: &args.daemon_url,
@@ -1517,6 +1906,7 @@ async fn main() -> Result<()> {
         self_bot_id: &args.self_bot_id,
         hmac_secret_env: &args.shared_secret_env,
         health: health.as_ref(),
+        spool: spool.clone(),
     };
     let mut reconnect_attempt: u32 = 0;
 
@@ -3037,5 +3427,444 @@ mod tests {
         });
         assert_eq!(replay_bot_message["subtype"], "bot_message");
         assert_eq!(replay_bot_message["bot_id"], "Bbot");
+    }
+
+    // ── Durable spool wiring ────────────────────────────────────
+    //
+    // These exercise the ack ordering end to end against a fake daemon on
+    // an ephemeral loopback port and a per-test tempdir spool. Nothing
+    // here touches the real state dir or the prod daemon port.
+
+    #[test]
+    fn spool_dir_defaults_under_the_resolved_bro_home() {
+        let bro_home = PathBuf::from("/state/bro");
+        assert_eq!(
+            resolve_spool_dir(None, &bro_home),
+            PathBuf::from("/state/bro/slack-spool")
+        );
+        // An empty flag is treated as absent rather than as the cwd.
+        assert_eq!(
+            resolve_spool_dir(Some("   "), &bro_home),
+            PathBuf::from("/state/bro/slack-spool")
+        );
+    }
+
+    #[test]
+    fn an_explicit_spool_dir_wins_and_expands_tilde() {
+        let bro_home = PathBuf::from("/state/bro");
+        assert_eq!(
+            resolve_spool_dir(Some("/var/spool/slack"), &bro_home),
+            PathBuf::from("/var/spool/slack")
+        );
+        let expanded = resolve_spool_dir(Some("~/slack-spool"), &bro_home);
+        assert!(
+            !expanded.starts_with("~"),
+            "the tilde is expanded like --identities-file: {}",
+            expanded.display()
+        );
+    }
+
+    /// A `Sink<WsMessage>` that records the acks the pipeline emits.
+    struct RecordingSink {
+        acks: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl futures_util::Sink<WsMessage> for RecordingSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
+            if let WsMessage::Text(text) = item {
+                self.acks.lock().push(text);
+            }
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A fake daemon webhook on an ephemeral loopback port whose response
+    /// status the test can flip mid-run.
+    struct FakeDaemon {
+        url: String,
+        status: Arc<AtomicU64>,
+        received: Arc<parking_lot::Mutex<Vec<Value>>>,
+    }
+
+    async fn start_fake_daemon() -> FakeDaemon {
+        use axum::{Router, routing::post};
+
+        let status = Arc::new(AtomicU64::new(200));
+        let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        async fn handler(
+            axum::extract::State(state): axum::extract::State<(
+                Arc<AtomicU64>,
+                Arc<parking_lot::Mutex<Vec<Value>>>,
+            )>,
+            body: axum::body::Bytes,
+        ) -> axum::http::StatusCode {
+            if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+                state.1.lock().push(v);
+            }
+            axum::http::StatusCode::from_u16(state.0.load(Ordering::Relaxed) as u16)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+        }
+
+        let app = Router::new()
+            .route("/webhook/{name}", post(handler))
+            .with_state((status.clone(), received.clone()));
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        FakeDaemon {
+            url: format!("http://{addr}"),
+            status,
+            received,
+        }
+    }
+
+    fn app_mention_envelope(envelope_id: &str) -> Value {
+        json!({
+            "envelope_id": envelope_id,
+            "type": "events_api",
+            "payload": {
+                "team_id": "T01",
+                "event": {
+                    "type": "app_mention",
+                    "user": "Uhuman",
+                    "channel": "C01",
+                    "text": "<@Ubot> status",
+                    "ts": "1700000000.000100"
+                }
+            }
+        })
+    }
+
+    /// A per-test spool rooted in a canonicalized tempdir.
+    async fn test_spool(dir: &tempfile::TempDir, policy: SpoolPolicy) -> Arc<EnvelopeSpool> {
+        let root = dir.path().canonicalize().unwrap();
+        Arc::new(
+            EnvelopeSpool::open(root.join("slack-spool"), policy)
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_delivered_envelope_is_acked_and_leaves_no_spool_entry() {
+        let daemon = start_fake_daemon().await;
+        let dir = tempfile::tempdir().unwrap();
+        let spool = test_spool(&dir, SpoolPolicy::default()).await;
+        let health: SharedHealthStats = Arc::new(HealthStats::default());
+        let client = reqwest::Client::new();
+        let identities = SlackIdentities::default();
+
+        let ctx = BridgeContext {
+            daemon_client: &client,
+            daemon_url: &daemon.url,
+            webhook_name: "slack",
+            identities: &identities,
+            self_user_id: "Ubot",
+            self_bot_id: "Bbot",
+            hmac_secret_env: "BRO_SLACK_SHARED_SECRET_UNSET_FOR_TEST",
+            health: Some(&health),
+            spool: spool.clone(),
+        };
+
+        let acks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut sink = RecordingSink { acks: acks.clone() };
+        let mut in_flight = InFlightSet::new();
+        let outcome = process_slack_envelope(
+            &mut sink,
+            &ctx,
+            &app_mention_envelope("env-ok"),
+            &mut in_flight,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, EnvelopeOutcome::Acked);
+        assert_eq!(acks.lock().len(), 1, "exactly one ack");
+        assert!(acks.lock()[0].contains("env-ok"));
+        assert_eq!(spool.depth(), 0, "a delivered envelope is cleared");
+        assert!(spool.list().await.unwrap().is_empty());
+        assert_eq!(health.events_forwarded.load(Ordering::Relaxed), 1);
+        assert_eq!(health.events_spooled.load(Ordering::Relaxed), 1);
+        assert_eq!(daemon.received.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_undeliverable_envelope_is_acked_and_retained_not_dropped() {
+        let daemon = start_fake_daemon().await;
+        daemon.status.store(503, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let spool = test_spool(&dir, SpoolPolicy::default()).await;
+        let health: SharedHealthStats = Arc::new(HealthStats::default());
+        let client = reqwest::Client::new();
+        let identities = SlackIdentities::default();
+
+        let ctx = BridgeContext {
+            daemon_client: &client,
+            daemon_url: &daemon.url,
+            webhook_name: "slack",
+            identities: &identities,
+            self_user_id: "Ubot",
+            self_bot_id: "Bbot",
+            hmac_secret_env: "BRO_SLACK_SHARED_SECRET_UNSET_FOR_TEST",
+            health: Some(&health),
+            spool: spool.clone(),
+        };
+
+        let acks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut sink = RecordingSink { acks: acks.clone() };
+        let mut in_flight = InFlightSet::new();
+        let outcome = process_slack_envelope(
+            &mut sink,
+            &ctx,
+            &app_mention_envelope("env-stuck"),
+            &mut in_flight,
+        )
+        .await
+        .unwrap();
+
+        // This is the v1 behavior change: the ack still happens (the
+        // envelope is durable), and the envelope is NOT dropped.
+        assert_eq!(outcome, EnvelopeOutcome::Acked);
+        assert_eq!(acks.lock().len(), 1);
+        let entries = spool.list().await.unwrap();
+        assert_eq!(entries.len(), 1, "the envelope survives retry exhaustion");
+        assert_eq!(entries[0].envelope_id, "env-stuck");
+        assert_eq!(entries[0].attempts, 1, "one exhausted delivery round");
+        assert_eq!(entries[0].event["text"], "<@Ubot> status");
+        assert_eq!(health.events_forwarded.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            health.events_failed_post_exhausted.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(health.spool_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_spool_write_withholds_the_ack_and_frees_the_dedup_claim() {
+        let daemon = start_fake_daemon().await;
+        let dir = tempfile::tempdir().unwrap();
+        let spool = test_spool(&dir, SpoolPolicy::default()).await;
+        // Replace the spool directory with a regular file so every write
+        // under it fails, standing in for a full or unwritable disk.
+        let spool_path = spool.dir().to_path_buf();
+        tokio::fs::remove_dir_all(&spool_path).await.unwrap();
+        tokio::fs::write(&spool_path, b"not a directory")
+            .await
+            .unwrap();
+
+        let health: SharedHealthStats = Arc::new(HealthStats::default());
+        let client = reqwest::Client::new();
+        let identities = SlackIdentities::default();
+        let ctx = BridgeContext {
+            daemon_client: &client,
+            daemon_url: &daemon.url,
+            webhook_name: "slack",
+            identities: &identities,
+            self_user_id: "Ubot",
+            self_bot_id: "Bbot",
+            hmac_secret_env: "BRO_SLACK_SHARED_SECRET_UNSET_FOR_TEST",
+            health: Some(&health),
+            spool: spool.clone(),
+        };
+
+        let acks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut sink = RecordingSink { acks: acks.clone() };
+        let mut in_flight = InFlightSet::new();
+        let outcome = process_slack_envelope(
+            &mut sink,
+            &ctx,
+            &app_mention_envelope("env-nodisk"),
+            &mut in_flight,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, EnvelopeOutcome::NotAcked);
+        assert!(
+            acks.lock().is_empty(),
+            "no ack, so Slack still owns the envelope and redelivers"
+        );
+        assert!(
+            daemon.received.lock().is_empty(),
+            "nothing is forwarded that was not first made durable"
+        );
+        assert_eq!(health.events_spool_write_failed.load(Ordering::Relaxed), 1);
+        // The redelivery must not be deduped away by the claim we took.
+        assert!(
+            in_flight.claim("env-nodisk", Instant::now()),
+            "the in-flight claim was released for the redelivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_delivers_a_retained_envelope_once_the_daemon_recovers() {
+        let daemon = start_fake_daemon().await;
+        daemon.status.store(503, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let spool = test_spool(&dir, SpoolPolicy::default()).await;
+        let health: SharedHealthStats = Arc::new(HealthStats::default());
+        let client = reqwest::Client::new();
+        let identities = SlackIdentities::default();
+
+        {
+            let ctx = BridgeContext {
+                daemon_client: &client,
+                daemon_url: &daemon.url,
+                webhook_name: "slack",
+                identities: &identities,
+                self_user_id: "Ubot",
+                self_bot_id: "Bbot",
+                hmac_secret_env: "BRO_SLACK_SHARED_SECRET_UNSET_FOR_TEST",
+                health: Some(&health),
+                spool: spool.clone(),
+            };
+            let acks = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let mut sink = RecordingSink { acks };
+            let mut in_flight = InFlightSet::new();
+            process_slack_envelope(
+                &mut sink,
+                &ctx,
+                &app_mention_envelope("env-replay"),
+                &mut in_flight,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(spool.depth(), 1);
+        daemon.received.lock().clear();
+
+        // The daemon comes back; the drain (boot replay shape, no quiet
+        // period) clears the backlog.
+        daemon.status.store(200, Ordering::Relaxed);
+        let report = drain_spool(
+            &spool,
+            &client,
+            &daemon.url,
+            "slack",
+            "BRO_SLACK_SHARED_SECRET_UNSET_FOR_TEST",
+            Some(&health),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.discarded, 0);
+        assert_eq!(spool.depth(), 0);
+        assert_eq!(health.events_spool_replayed.load(Ordering::Relaxed), 1);
+        let received = daemon.received.lock();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0]["_meta"]["envelope_id"], "env-replay",
+            "the replayed body is the enriched envelope, not the raw frame"
+        );
+        assert_eq!(received[0]["_meta"]["bbox_user"], "anonymous");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_leaves_a_freshly_spooled_envelope_to_the_inline_attempt() {
+        let daemon = start_fake_daemon().await;
+        daemon.status.store(503, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let spool = test_spool(&dir, SpoolPolicy::default()).await;
+        let client = reqwest::Client::new();
+        spool
+            .persist("env-fresh", &json!({"_meta": {"envelope_id": "env-fresh"}}))
+            .await
+            .unwrap();
+
+        let report = drain_spool(
+            &spool,
+            &client,
+            &daemon.url,
+            "slack",
+            "BRO_SLACK_SHARED_SECRET_UNSET_FOR_TEST",
+            None,
+            spool::SWEEP_QUIET_PERIOD,
+        )
+        .await;
+
+        assert_eq!(
+            report.attempted, 0,
+            "the sweep does not race the inline path"
+        );
+        assert_eq!(report.waiting, 1);
+        assert_eq!(spool.depth(), 1);
+        assert!(daemon.received.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_aged_out_envelope_is_discarded_loudly_and_counted() {
+        let daemon = start_fake_daemon().await;
+        let dir = tempfile::tempdir().unwrap();
+        // max_age of zero ages every entry out immediately, which is the
+        // same code path a 24h-old entry takes.
+        let spool = test_spool(
+            &dir,
+            SpoolPolicy {
+                max_age: Duration::ZERO,
+                max_entries: 5_000,
+            },
+        )
+        .await;
+        let health: SharedHealthStats = Arc::new(HealthStats::default());
+        let client = reqwest::Client::new();
+        spool
+            .persist(
+                "env-ancient",
+                &json!({"_meta": {"envelope_id": "env-ancient"}}),
+            )
+            .await
+            .unwrap();
+
+        let report = drain_spool(
+            &spool,
+            &client,
+            &daemon.url,
+            "slack",
+            "BRO_SLACK_SHARED_SECRET_UNSET_FOR_TEST",
+            Some(&health),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(report.discarded, 1);
+        assert_eq!(report.attempted, 0, "an aged entry is not re-POSTed");
+        assert_eq!(spool.depth(), 0);
+        assert_eq!(
+            health.events_spool_discarded_aged.load(Ordering::Relaxed),
+            1
+        );
+        assert!(daemon.received.lock().is_empty());
     }
 }

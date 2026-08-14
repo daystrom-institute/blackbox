@@ -197,44 +197,63 @@ capability to a tier. Implementation phases will live in a companion
    --self-bot-id from env/CLI. Bot token NEVER touches the sidecar.
 2. Call apps.connections.open with app token → returns wss:// URL.
 3. Open WebSocket; receive events.
+3b. Open the durable spool directory (§5.6) and replay anything a
+   previous process left undelivered. Failing to open the spool is
+   fatal: a sidecar that cannot write the spool cannot honestly ack.
 4. For each event envelope:
      a. Filter loop-back (event.user == self_user_id OR
-        event.bot_id == self_bot_id → drop).
+        event.bot_id == self_bot_id → drop). Nothing to deliver, so
+        this acks without spooling.
      b. Normalize to bbox envelope (§6).
      c. Enrich with ACL: look up event.user in the identities file
         (§9), attach `_meta.bbox_user` and `_meta.bbox_scopes` and
         `_meta.bbox_can_dispatch`. Unmapped users get
         `bbox_user: "anonymous"`, `bbox_scopes: ["read"]`,
         `bbox_can_dispatch: false` (§6.3).
-     d. POST to http://127.0.0.1:7264/webhook/slack with envelope.
+     d. Write the normalized envelope to the durable spool and fsync
+        (§5.6). On failure: WITHHOLD the ack, release the in-flight
+        claim, log at error level, and let Slack redeliver.
+     e. Ack to Slack. The envelope is now durable locally, so Slack
+        can forget it.
+     f. POST to http://127.0.0.1:7264/webhook/slack with envelope.
         Header: X-Slack-Envelope-Id: <id>.
-     e. On 2xx from daemon: ack to Slack.
+        On 2xx: delete the spool entry.
         On non-2xx: retry up to 2 more times with 500ms then 1s
         sleeps between attempts (3 POST attempts total, ~1.5s of
-        sleep). After the 3rd attempt fails, ack-and-drop with a
-        structured warning log.
-5. On disconnect: exponential backoff reconnect (1s → 60s cap).
-6. On SIGTERM: stop accepting new events, drain in-flight POSTs
-   (≤2s grace), close socket, exit 0.
+        sleep). After the 3rd attempt fails, the envelope STAYS in
+        the spool, stamped with the attempt count and last error,
+        for the retry sweep (§5.6).
+5. Every --spool-sweep-secs (default 300): re-attempt spooled
+   envelopes that are past the quiet period, and discard entries past
+   the age bound with a structured error log.
+6. On disconnect: exponential backoff reconnect (1s → 60s cap).
+7. On SIGTERM: stop accepting new events, drain in-flight POSTs
+   (≤2s grace), close socket, exit 0. Anything undelivered is already
+   in the spool and is replayed on the next start.
 ```
 
-Two timing constraints overlap. Slack's Socket Mode ack deadline is
-~3 seconds; exceeding it triggers Slack-side redelivery. The
-sidecar's 3-attempt local retry budget (~1.5s of sleep plus per-POST
-RTT, typically <2s total) usually finishes inside Slack's window —
-but on a slow daemon, the second redelivery from Slack can arrive
-while the sidecar is still inside the first envelope's retry loop.
-Two layers of dedup defend against this: the daemon's
-`X-Slack-Envelope-Id` header dedup (§6.5) catches POSTs that reach
-the daemon, and an in-sidecar in-flight-envelope-id set drops the
-Slack-redelivered envelope before the second POST is issued. The
-sidecar holds the in-flight set for the duration of the retry loop
-plus a 30s eviction TTL.
+Two timing constraints used to overlap. Slack's Socket Mode ack
+deadline is ~3 seconds; exceeding it triggers Slack-side redelivery,
+while the sidecar's 3-attempt local retry budget can reach ~4.5s
+against a slow daemon. Moving the ack to step 4e (immediately after
+the durable write, before the POST) decouples the two: the ack now
+depends only on a local fsync, so daemon latency can no longer push
+the sidecar past Slack's deadline.
 
-The ack-after-success rule in step 4e is load-bearing. Acking before
-the daemon POST succeeds means events are silently lost on daemon
-downtime; acking after creates a bounded redelivery loop that survives
-short blips.
+Redelivery dedup still matters for the residual window between
+receiving a frame and completing the spool write. Two layers defend
+it: the daemon's `X-Slack-Envelope-Id` header dedup (§6.5) catches
+POSTs that reach the daemon, and an in-sidecar in-flight-envelope-id
+set drops a Slack-redelivered envelope before a second spool write
+and POST are issued. The sidecar holds the in-flight set for 30s.
+The one case where the claim is deliberately RELEASED is a failed
+spool write: there the sidecar is counting on redelivery, so holding
+the claim would dedupe away its own recovery path.
+
+The ack-only-after-durability rule in steps 4d/4e is load-bearing.
+Acking before anything is durable means events are silently lost on
+daemon downtime; acking after a local durable write hands ownership
+to the sidecar, which then owns delivery until 2xx or the age bound.
 
 ### 5.2 CLI shape
 
@@ -247,8 +266,12 @@ bro-slack [OPTIONS]
   --daemon-url          base URL of blackboxd                       [http://127.0.0.1:7264]
   --webhook-name        endpoint name on daemon side                [slack]
   --shared-secret-env   optional HMAC key for sidecar→daemon hop    [BRO_SLACK_SHARED_SECRET]
-  --identities-file     ACL mapping file                            [~/.bro/slack-identities.json]
+  --identities-file     ACL mapping file                            [<bro_home>/slack-identities.json]
   --health-port         optional health endpoint port (off by default)
+  --spool-dir           durable envelope spool directory            [<bro_home>/slack-spool]
+  --spool-sweep-secs    gap between spool retry sweeps, 0 disables  [300]
+  --spool-max-age-secs  age at which a spooled envelope is dropped  [86400]
+  --spool-max-entries   spool entry cap, 0 means unbounded          [5000]
   --log-level                                                       [info]
 ```
 
@@ -288,6 +311,82 @@ Socket Mode reconnects are part of the protocol — Slack sends
 `disconnect` with a `reason`; sidecar reopens. Outbound rate limits
 don't apply on the sidecar (it doesn't post outbound; workflow nodes
 do). 429 handling for outbound is a known v1 gap — see §14.
+
+### 5.6 Durable envelope spool
+
+Socket Mode has no server-side replay. Once the sidecar acks an
+envelope_id, Slack forgets it, so an ack is a promise the sidecar has
+to keep. The original v1 sidecar acked after its POST retry budget ran
+out and dropped the envelope, which meant any daemon outage longer
+than ~4.5s silently lost every event that landed inside it. The spool
+retires that drop.
+
+**Location.** A flat directory, one JSON file per envelope, defaulting
+to `<bro_home>/slack-spool`: the same resolved state root that holds
+`slack-identities.json`, so sidecar state does not fan out across the
+filesystem. `--spool-dir` overrides it (with `~` expansion), mirroring
+the `--identities-file` convention.
+
+**Entry.** `{version, envelope_id, spooled_at, attempts,
+last_attempt_at, last_error, event}`. The stored `event` is the
+NORMALIZED, ACL-enriched body, not the raw Socket Mode frame:
+re-normalizing at replay time would re-read the identity map and could
+attribute a message to a different bbox user than the one in effect
+when it arrived.
+
+**Crash safety.** Write to `<name>.json.tmp`, fsync the file, rename
+into place, then fsync the directory. A rename that lands ahead of its
+data is precisely the crash window the spool exists to close. The
+filename derives from the envelope_id with everything outside
+`[A-Za-z0-9_-]` replaced and the length bounded (the id arrives over
+the network and is never trusted as a path component), plus a short
+digest of the original id so two ids cannot collide onto one file.
+Unparseable or unknown-version files are renamed to `.json.corrupt`
+rather than deleted or re-read forever.
+
+**Delivery lanes.** Three, all using the same POST path and therefore
+the same daemon-side `X-Slack-Envelope-Id` dedup:
+
+- *Inline*, immediately after the ack, so the happy path is unchanged
+  in latency.
+- *Boot replay*, on start, with no quiet period. It runs alongside the
+  Socket Mode connection rather than ahead of it, so a large backlog
+  cannot delay accepting live traffic. Slack does not guarantee event
+  ordering in the first place.
+- *Retry sweep*, every `--spool-sweep-secs` (default 300s). It skips
+  entries touched within a 60s quiet period, which is what keeps it
+  from racing the inline attempt for a just-spooled envelope.
+
+Drains are sequential, not fanned out: a drain runs precisely when the
+daemon has been unhealthy, and firing a backlog at it the moment it
+returns is the wrong first move.
+
+**Growth bounds.** Two, both loud, neither silent:
+
+- *Age*: `--spool-max-age-secs`, default 86400 (24h). Long enough to
+  cover an overnight daemon outage, short enough that the sidecar is
+  not replaying two-day-old slash commands into a workspace whose
+  threads have moved on and whose arcs have timed out. Discard emits a
+  structured error naming the envelope_id, age, attempt count, and
+  last error, and increments `events_spool_discarded_aged`. Age beats
+  quiet time in the sweep's decision order, otherwise a permanently
+  failing envelope retried every pass would never reach the bound.
+- *Count*: `--spool-max-entries`, default 5000 (roughly 20MB at a few
+  KB per envelope). At the cap the OLDEST entries are evicted to admit
+  the newest. Shedding fresh traffic to preserve a day-old backlog is
+  the wrong trade, and refusing to spool would mean refusing to ack,
+  which turns into a Slack redelivery storm. Each eviction is an error
+  log plus `events_spool_evicted_overflow`.
+
+**What the spool does not do.** It is not an ordering guarantee, not a
+transaction log, and not a substitute for the daemon's own
+`X-Slack-Envelope-Id` dedup: replay can re-POST an envelope the daemon
+already accepted (a delivered entry whose deletion failed, for
+instance), and the daemon is the layer that makes that harmless. It
+also does not cover the pre-normalization window: a crash between
+reading the WebSocket frame and completing the spool write relies on
+Slack redelivery, which is exactly why the ack is withheld on a failed
+spool write.
 
 ## 6. Webhook envelope — sidecar to daemon
 
@@ -890,6 +989,39 @@ into the envelope. v1 does not implement this. Workflows that need
 mid-thread reactions either constrain UX to bot-post reactions or
 accept the limitation.
 
+That one-sentence fix is not yet a specification, and four questions
+have to be answered before anyone writes the code:
+
+- **Which process holds the credential.** `conversations.replies`
+  needs a bot token with the relevant `*:history` scope. §2.2 puts the
+  bot token in the DAEMON and states as the honest security claim that
+  the sidecar holds only the Socket Mode and signing credentials.
+  Doing the lookup sidecar-side moves a bot token into the sidecar and
+  invalidates that claim, so the alternative (enrich daemon-side, in
+  the extractor or a routing pre-step, where the token already lives)
+  has to be weighed rather than assumed away. §9.2's scope inventory
+  also does not yet carry the history scopes for this purpose.
+- **The envelope contract.** §6.1 defines no `parent_thread_ts` field,
+  and §6 calls the envelope stable because routing packets depend on
+  its shape. Adding a field, versus overwriting `thread_ts` with the
+  parent, is a behavior fork: packets today read `thread_ts` as the
+  reacted message's thread. Neither the field name nor the migration
+  for existing packets is specified.
+- **Failure and latency semantics.** The lookup is a rate-limited Web
+  API call sitting on the INBOUND path, and since §5.6 the inbound
+  path is ordered normalize, spool, ack. An enrichment call has to be
+  placed relative to the durable write, and its failure mode has to be
+  chosen: block the spool write, spool the unenriched envelope and
+  enrich on replay, or drop. A reaction burst on one message also
+  means N identical lookups, so a cache or coalescing policy is part
+  of the answer.
+- **The non-threaded case.** A reaction on a message that is not in a
+  thread has no parent. Whether `parent_thread_ts` is then null or
+  echoes `item_ts` changes what a correlating packet must match on.
+
+Until those are settled, this is a protocol change, not an
+implementation detail, and the v1 constraint above stands.
+
 ### 11.3 Channel-scoped badgey
 
 For a per-channel badgey instance (badgey §10), the badgey's bro
@@ -1122,7 +1254,13 @@ port (off by default; set `--health-port=7299` to enable):
   "events_forwarded": 1284,
   "events_dropped_self_loop": 47,
   "events_failed_post": 2,
-  "events_failed_post_dropped_after_retries": 0,
+  "events_failed_post_exhausted": 0,
+  "events_spooled": 1284,
+  "events_spool_replayed": 3,
+  "events_spool_write_failed": 0,
+  "events_spool_discarded_aged": 0,
+  "events_spool_evicted_overflow": 0,
+  "spool_depth": 0,
   "ack_latency_ms_p50": 14,
   "daemon_post_latency_ms_p50": 6,
   "reconnects": 1,
@@ -1160,20 +1298,28 @@ received webhooks. Cross-process correlation key: `envelope_id`.
 | Failure / gap | v1 behavior | Future fix |
 |---|---|---|
 | Slack down | Sidecar reconnect loop; daemon untouched | — |
-| Sidecar crash | systemd restart; pre-ack events redeliver; post-ack events lost | Persistent dead-letter buffer |
-| Daemon down | Sidecar holds ack until daemon recovers (3-retry budget per envelope), then drops with logged warning | Disk-backed sidecar buffer (v1.5) |
+| Sidecar crash | systemd restart; pre-ack events redeliver from Slack; post-ack events are in the durable spool (§5.6) and replay on start | — |
+| Daemon down | Envelope is spooled and acked, the inline retry budget fails, the entry is RETAINED and re-attempted by the boot replay and the 300s sweep until 2xx or the 24h age bound | — |
+| Sidecar cannot write its spool (disk full, permissions) | Ack is WITHHELD so Slack redelivers; `events_spool_write_failed` climbs and the error log names the spool dir. Nothing is lost, but the sidecar is not durably accepting traffic and needs an operator | Health-endpoint alerting |
+| Daemon down longer than the spool age bound | Entries past `--spool-max-age-secs` are discarded with a structured error naming each envelope_id; `events_spool_discarded_aged` counts them | Longer bound, or a dead-letter export |
 | Token rotated mid-flight | 401; sidecar exits and systemd restarts | — |
 | Outbound 429 | Workflow node fails; engine has no fixed-interval retry — `on_failure: warn` lets the arc continue past the failed post; `on_failure: halt` terminates the arc | Expose response headers in `HttpFetchResult` (v1.5); Slack-aware retry hook |
 | `WaitStore` is in-memory ([Workflow Engine](../../../docs/workflows.md) known limitation) | Daemon restart loses every suspended arc; Slack events arriving while the arc is gone correlate to nothing | Disk-backed WaitStore (v1.5 — daemon-wide phase-next, not Slack-specific) |
 | Two app_mentions on same thread before Wait registers | Both fire start_arc; two arcs race. `bbox_pin` is not atomic so cannot guard | Daemon-side `start_arc` idempotency keyed on `(workflow, correlate)` at v1.5 |
-| Reaction on mid-thread message | `item_ts != thread_ts`; correlation misses | Sidecar enriches `parent_thread_ts` via `conversations.replies` lookup (v1.5) |
+| Reaction on mid-thread message | `item_ts != thread_ts`; correlation misses | Unresolved: the named fix (sidecar `conversations.replies` lookup) contradicts §2.2 token isolation and is underspecified. See §11.2 |
 | Slack Workflow Builder posting to webhook | Not supported at v1 (loopback-only daemon cannot receive cloud Slack POSTs) | Public-ingress deployment shape (out of v1 scope) |
 | Bot kicked from channel | Channel-scoped events stop; arcs correlated to that channel's threads time out per Wait policies | — |
 
-The contract is "if both sidecar and daemon are up, we process; if
-either is down within the ack window, we redeliver up to 3 times; past
-that, we drop." No persistence guarantees beyond what the underlying
-workflow engine offers.
+The contract is now at-least-once delivery, bounded by age: an
+envelope the sidecar has acked is on local disk and is retried until
+the daemon returns 2xx or the entry passes `--spool-max-age-secs`.
+Duplicates are possible (a replay can re-POST an envelope the daemon
+already accepted) and are absorbed by the daemon's
+`X-Slack-Envelope-Id` dedup, so the guarantee is at-least-once at the
+sidecar hop and effectively exactly-once at the daemon. What the
+sidecar still cannot promise is anything downstream of that POST: once
+the daemon accepts an envelope, persistence is whatever the workflow
+engine offers.
 
 ## 15. Boundaries — what `bro-slack` is NOT
 
