@@ -187,6 +187,26 @@ pub fn scan_single_file(path: &Path, out: &mut Vec<(String, u64, u64)>) {
     }
 }
 
+/// Stat an adapter location and push it under the key it is INDEXED by.
+///
+/// The key is [`TranscriptLocation::locator`], not the path: a store-backed
+/// location indexes its documents under a record key, and pushing its host
+/// path here instead would leave that key absent from the scan set, so the
+/// purge phase would delete every one of its documents on the same pass that
+/// indexed them. The bytes still come from `path`, because a freshness row
+/// needs something to stat.
+pub fn scan_location(location: &TranscriptLocation, out: &mut Vec<(String, u64, u64)>) {
+    if let Ok(meta) = fs::metadata(&location.path) {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push((location.locator(), mtime, meta.len()));
+    }
+}
+
 /// Collect (path, mtime, size) for all JSONL files across all roots.
 pub fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
     let mut files = Vec::new();
@@ -235,7 +255,7 @@ pub fn scan_adapter_source_files(config: &ReindexConfig, files: &mut Vec<(String
             match adapter.scan_locations(target) {
                 Ok(locations) => {
                     for location in locations {
-                        scan_single_file(&location.path, files);
+                        scan_location(&location, files);
                     }
                 }
                 Err(err) => {
@@ -361,7 +381,11 @@ pub fn index_adapter_location(
     tool_edges: &ToolEdgeContext,
     commit_progress: bool,
 ) -> Result<()> {
-    let path_str = location.path.to_string_lossy().to_string();
+    // What this location's documents are keyed by: the path for a
+    // source-owned transcript file, the record key for a store-backed
+    // location. It must agree with `scan_location` exactly, or a location is
+    // purged by one key and re-indexed under another forever.
+    let path_str = location.locator();
     let file_meta = match fs::metadata(&location.path) {
         Ok(m) => m,
         Err(_) => return Ok(()),

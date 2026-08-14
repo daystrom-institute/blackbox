@@ -114,6 +114,7 @@ impl HarnessSessionsAdapter {
             project: meta.cwd.clone(),
             cwd: meta.cwd.clone(),
             is_subagent: false,
+            logical_key: None,
         }
     }
 }

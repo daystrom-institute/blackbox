@@ -123,6 +123,7 @@ impl TranscriptReadAdapter for ClaudeTranscriptAdapter {
                             project: None,
                             cwd: None,
                             is_subagent: false,
+                            logical_key: None,
                         });
                     }
                 }
@@ -255,6 +256,7 @@ impl TranscriptReadAdapter for CodexTranscriptAdapter {
                         project: None,
                         cwd: None,
                         is_subagent: false,
+                        logical_key: None,
                     }])
                 } else {
                     Ok(Vec::new())
@@ -546,6 +548,7 @@ fn claude_location(
         project: extract_project_from_path(path, projects_dir),
         cwd: None,
         is_subagent: path_str.contains("/subagents/"),
+        logical_key: None,
     }
 }
 
@@ -561,6 +564,7 @@ fn codex_location(path: &Path) -> TranscriptLocation {
         project: None,
         cwd,
         is_subagent: false,
+        logical_key: None,
     }
 }
 
@@ -589,6 +593,7 @@ fn gemini_location(path: &Path) -> TranscriptLocation {
         project,
         cwd: None,
         is_subagent: false,
+        logical_key: None,
     }
 }
 

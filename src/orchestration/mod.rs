@@ -1473,6 +1473,7 @@ fn harness_transcript_location(
         project: None,
         cwd: cwd.map(str::to_string),
         is_subagent: false,
+        logical_key: None,
     })
 }
 
@@ -3827,6 +3828,7 @@ fn harness_transcript_location_from_spec(
         project: None,
         cwd: cwd.map(str::to_string),
         is_subagent: false,
+        logical_key: None,
     })
 }
 

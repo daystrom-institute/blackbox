@@ -16,6 +16,19 @@ pub enum TranscriptStorage {
     JsonFile,
     Sqlite,
     ProviderCommand,
+    /// Records landed by a connector producer into a daemon-side landing
+    /// store, read back through that store rather than off a transcript file
+    /// the source wrote (the conversation lane,
+    /// `design/connectors/slack-ingestion-connector.md` section 4.3).
+    ///
+    /// The distinction is not cosmetic. Every other variant names a file the
+    /// SOURCE owns, so the host path is a stable identity for it; a landed
+    /// record's identity is `(workspace_id, channel_id, message_ts)` and its
+    /// bytes happen to live under a content-hashed store directory that moves
+    /// with the daemon's state dir. Locations carrying this storage therefore
+    /// identify themselves through [`TranscriptLocation::locator`] rather than
+    /// through their path.
+    LandedRecords,
 }
 
 /// Identity of a transcript-producing source. Dispatch lanes (bro-harness
@@ -31,6 +44,11 @@ pub enum TranscriptSource {
     Claude,
     Codex,
     Gemini,
+    /// Connector-landed Slack conversations. Not a dispatch target and not a
+    /// CLI the operator runs: it is an observed remote corpus that reaches the
+    /// index through the same adapter contract, which is the whole point of
+    /// giving it a source rather than a second projection pipeline.
+    Slack,
 }
 
 impl TranscriptSource {
@@ -48,6 +66,7 @@ impl TranscriptSource {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Slack => "slack",
         }
     }
 }
@@ -76,6 +95,7 @@ impl<'de> Deserialize<'de> for TranscriptSource {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "gemini" => Ok(Self::Gemini),
+            "slack" => Ok(Self::Slack),
             other => other.parse::<Provider>().map(Self::Harness).map_err(|_| {
                 serde::de::Error::custom(format!("unknown transcript source: {other}"))
             }),
@@ -95,6 +115,37 @@ pub struct TranscriptLocation {
     pub project: Option<String>,
     pub cwd: Option<String>,
     pub is_subagent: bool,
+    /// Identity for a location whose bytes are not a source-owned file.
+    ///
+    /// `None` for every file-backed location, which keeps their identity
+    /// exactly what it has always been: the canonical path. A store-backed
+    /// location ([`TranscriptStorage::LandedRecords`]) sets it to the record
+    /// key its records are addressed by, so the cursor fingerprint, the
+    /// indexed `file_path`, the freshness row, and the purge term all agree on
+    /// one stable value that survives the store root moving underneath them.
+    ///
+    /// `path` stays populated on those locations too, because change
+    /// detection still needs bytes to stat; it is the JOURNAL's path, and it
+    /// is deliberately never the thing the location is identified by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_key: Option<String>,
+}
+
+impl TranscriptLocation {
+    /// How this location is identified everywhere identity matters: the
+    /// cursor-store fingerprint, the indexed `file_path`, the freshness-meta
+    /// key, and the purge term.
+    ///
+    /// One accessor rather than four call sites deciding for themselves, so a
+    /// store-backed location cannot be identified by path in one pass and by
+    /// key in the next -- which would show up as documents that are purged
+    /// every reindex and reindexed every purge.
+    pub fn locator(&self) -> String {
+        match &self.logical_key {
+            Some(key) => key.clone(),
+            None => self.path.to_string_lossy().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +472,66 @@ impl RawTranscriptRef {
     }
 }
 
+/// Provenance a conversation-sourced event carries that a session transcript
+/// has no analog for.
+///
+/// It rides the normalized event rather than being stuffed into the role or
+/// account lanes, for the reason design section 4.3 gives: the transcript role
+/// vocabulary describes turn KIND and authorship is identity, so authorship
+/// gets its own indexed field and role collapses to human-versus-app purely so
+/// existing role filters keep meaning something.
+///
+/// Everything here is either the record's own field or derived from it by a
+/// pure function, which is what lets a reprojection over the same journal
+/// produce byte-identical documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationProvenance {
+    pub workspace_id: String,
+    pub channel_id: String,
+    /// Observed, never identity: channels get renamed, ids do not.
+    pub channel_name: Option<String>,
+    /// The provider's own message timestamp, the second half of the durable
+    /// identity and the input the permalink is derived from.
+    pub message_ts: String,
+    pub thread_parent_ts: Option<String>,
+    pub author_id: String,
+    pub author_kind: ConversationAuthorKind,
+    /// Derived at index time, never fetched: one API call per message is
+    /// unaffordable at corpus scale (design section 7).
+    pub permalink: Option<String>,
+}
+
+/// Human versus app, the only authorship distinction the role lane keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationAuthorKind {
+    Human,
+    App,
+    Unknown,
+}
+
+impl ConversationAuthorKind {
+    /// The role a message of this authorship projects onto.
+    ///
+    /// Unknown collapses to `User` rather than getting a role of its own: a
+    /// third value would be a new term in a filter vocabulary every existing
+    /// caller already reasons about, to express something `author_id` answers
+    /// exactly.
+    pub fn role(self) -> TranscriptRole {
+        match self {
+            Self::App => TranscriptRole::Assistant,
+            Self::Human | Self::Unknown => TranscriptRole::User,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::App => "app",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NormalizedTranscriptEvent {
     pub source: TranscriptSource,
@@ -435,6 +546,9 @@ pub struct NormalizedTranscriptEvent {
     pub cwd: Option<String>,
     pub tool_call: Option<NormalizedToolCall>,
     pub raw: RawTranscriptRef,
+    /// `None` for every session-transcript event; `Some` only on the
+    /// conversation lane.
+    pub conversation: Option<ConversationProvenance>,
 }
 
 impl NormalizedTranscriptEvent {
@@ -457,6 +571,7 @@ impl NormalizedTranscriptEvent {
             cwd: event.cwd,
             tool_call: event.tool_call.map(Into::into),
             raw,
+            conversation: None,
         }
     }
 
