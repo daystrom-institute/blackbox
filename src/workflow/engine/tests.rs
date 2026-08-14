@@ -1214,6 +1214,10 @@ async fn signal_into_occupied_slot_reports_group_resolved_and_persists() {
         "second: {second}"
     );
     assert_eq!(
+        second["durable_persist"], "ok",
+        "caller can tell the loser was retained: {second}"
+    );
+    assert_eq!(
         resolved.lock().as_ref().map(|s| s.name.clone()),
         Some("sig-a".to_string()),
         "winner not overwritten"

@@ -3595,6 +3595,7 @@ pub(crate) async fn signal_arc_dispatch(
         }
     };
     if group_already_resolved {
+        let mut durable_persist = Value::Null;
         if origin == SignalDispatchOrigin::Direct {
             // Do not lose the loser: persist it like an idle signal
             // so the arc's next wait (or another arc) can consume
@@ -3610,17 +3611,22 @@ pub(crate) async fn signal_arc_dispatch(
                 causation_id: None,
                 payload,
             };
-            if let Err(e) = state.system_events.emit(draft).await {
-                tracing::warn!(
-                    "group-resolved loser signal '{signal}' durable persist failed: {e:#}"
-                );
-            }
+            durable_persist = match state.system_events.emit(draft).await {
+                Ok(_) => json!("ok"),
+                Err(e) => {
+                    tracing::warn!(
+                        "group-resolved loser signal '{signal}' durable persist failed: {e:#}"
+                    );
+                    json!(format!("failed: {e}"))
+                }
+            };
         }
         return json!({
             "status": "wait_group_already_resolved",
             "arc_id": arc_id,
             "wait_id": wait_id,
             "signal": signal,
+            "durable_persist": durable_persist,
         });
     }
     // Remove the group's sibling registrations so no later signal can
