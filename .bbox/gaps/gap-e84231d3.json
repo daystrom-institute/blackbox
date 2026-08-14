@@ -1,0 +1,22 @@
+{
+  "id": "gap-e84231d3",
+  "title": "Conversation roster has no unenrollment signal for a channel simply omitted from a roster POST",
+  "gap_kind": "tooling",
+  "domain": "connectors-conversation",
+  "wanted_capability": "A clean corpus-side signal that a producer has stopped covering a channel. `ConversationSourceStore::record_roster` writes the latest observation per channel and never deletes one, so a producer that drops a channel from its allowlist and simply stops listing it leaves the last observation on disk forever. Design section 6 says a channel no enrolled source covers must stop being searchable; the S2 projection can only honor that when the roster reports `is_member: false` or when the operator retires the grant.",
+  "missing_primitive": "Either a roster verb with replace-set semantics (with a producer-side completeness assertion so a partial roster from a mid-restart producer cannot purge a workspace), or an explicit per-channel retirement record the producer/operator can land.",
+  "fallback_used": "The S2 conversation transcript adapter treats coverage as ending on `is_member: false` or on the operator removing the conversation-lane grant from config, and otherwise relies on purge-on-reproject for channels absent from the store. The limitation is documented on `ConversationTranscriptAdapter` rather than papered over.",
+  "evidence": [
+    "crates/bbox-corpus-index/src/transcripts/conversation.rs (ConversationTranscriptAdapter doc comment)",
+    "crates/bbox-conversation-source-store/src/lib.rs (record_roster)",
+    "design/connectors/slack-ingestion-connector.md section 6"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/connectors-conversation/roster-omission-unenrollment-signal",
+  "notes": "Filed while implementing Slack ingestion S2 (corpus projection and search). The S2 purge gate passes on the signals that do exist; this names the one that does not.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-14T00:12:48Z",
+  "updated_at": "2026-08-14T00:12:48Z"
+}
