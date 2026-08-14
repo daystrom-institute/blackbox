@@ -98,6 +98,8 @@ const GENERATION_ID_DOMAIN: &[u8] = b"blackbox.repo-history-generation.v1";
 const VECTOR_INPUT_COMMITMENT_DOMAIN: &[u8] = b"blackbox.repo-history-generation.vector-inputs.v1";
 const SOURCE_FINGERPRINT_DOMAIN: &[u8] = b"blackbox.repo-history-generation.source.v1";
 const REBUILD_MANIFEST_ID_DOMAIN: &[u8] = b"blackbox.repo-history-rebuild-manifest.v1";
+const REBUILD_LINEAGE_FINGERPRINT_DOMAIN: &[u8] =
+    b"blackbox.repo-history-rebuild-manifest.pinned-generation-lineage.v1";
 
 /// Tantivy's own index metadata file. Its presence is what distinguishes a
 /// directory that HOLDS an index from a directory that merely sits where one
@@ -1367,6 +1369,10 @@ pub enum RepoHistoryRebuildDispositionV1 {
 /// only that no recorded history was lost, not that the asset enumerates
 /// everything present. A consumer that treats the two as interchangeable is
 /// reading a weaker proof than it needs.
+///
+/// The mode says WHETHER the basis proved exactness, never WHICH basis proved
+/// it: that is [`HistoryProofBasisV1`], and a consumer reasoning about the
+/// strength of an `Equality` must read both fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryProofModeV1 {
@@ -1381,6 +1387,103 @@ pub enum HistoryProofModeV1 {
     Drift,
 }
 
+/// WHICH predecessor the `proof_mode` above was decided against.
+///
+/// The mode alone stopped being self-describing once a rebuild could be
+/// founded on something other than the Phase 1 migration asset, and an
+/// `Equality` whose basis a reader has to guess is exactly the silent
+/// semantics fork this module refuses everywhere else.
+///
+/// The two bases answer the SAME question - "is this manifest's namespace
+/// inventory an exact enumeration of its basis, or merely a lossless one?" -
+/// from different evidence:
+///
+/// - [`Self::MigrationAsset`]: the recomputed source fingerprint versus the
+///   one the Phase 1 asset recorded. Exactness comes from the asset still
+///   describing the index. This is the ONLY basis available at the migration
+///   cut, and it is the only basis the offline path-free rebuild uses.
+/// - [`Self::PinnedGenerationLineage`]: the immediately preceding COMMITTED
+///   manifest's pinned generations, each re-loaded from disk and re-derived
+///   against the row that names it. Exactness comes from the predecessor's
+///   inventory, which is scan-derived and therefore complete for ITS basis
+///   (`prepare_rebuild_manifest` refuses a scan and outcome that describe
+///   different namespace sets), plus the proof that every generation it
+///   pinned is still present and byte-faithful.
+///
+/// The lineage basis deliberately does NOT require the predecessor's own mode
+/// to be `Equality`. A manifest's proof mode has only ever qualified its ASSET
+/// comparison; its inventory is complete by construction in both modes. Making
+/// the chain depend on the predecessor's asset mode would refuse to recover
+/// exactly the stores that need it, for a property the predecessor's inventory
+/// never lacked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryProofBasisV1 {
+    /// The Phase 1 legacy commit-namespace inventory asset.
+    #[default]
+    MigrationAsset,
+    /// The predecessor committed manifest's pinned generations.
+    PinnedGenerationLineage,
+}
+
+impl HistoryProofBasisV1 {
+    /// Serde skip predicate, and the VINTAGE RULE in one place.
+    ///
+    /// A manifest written before this field existed decodes as
+    /// [`Self::MigrationAsset`], which is not a convenient default but a true
+    /// statement: the migration asset was the only basis that existed. Because
+    /// the field is skipped when it holds that value, such a manifest also
+    /// RE-SERIALIZES byte-identically, which is load-bearing:
+    /// `derive_rebuild_id` hashes the encoded `prepared` block, and `validate`
+    /// re-derives that id on every read. A field that always serialized would
+    /// change the id of every manifest already on disk and refuse it as
+    /// self-inconsistent.
+    pub fn is_migration_asset(&self) -> bool {
+        matches!(self, Self::MigrationAsset)
+    }
+}
+
+/// One row of a pinned-generation lineage fold: the identity and content
+/// commitments of a single generation a manifest names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HistoryLineageRowV1 {
+    pub namespace: String,
+    pub generation_id: String,
+    pub commit_document_count: u64,
+    pub commit_document_commitment_sha256: String,
+}
+
+/// Fold a pinned-generation lineage into one fingerprint.
+///
+/// THE single recipe, shared by both sides of the lineage comparison exactly
+/// as `fold_legacy_commit_namespace_source_fingerprint` is shared by the asset
+/// write and its read-back: one side folds the rows a predecessor manifest
+/// RECORDS, the other folds what the generation store OBSERVES on disk, and
+/// two copies of the recipe would let the comparison pass on a difference it
+/// was written to catch. Do not inline it into either caller.
+///
+/// The fold is order-independent (rows sort before hashing) so it cannot
+/// depend on map iteration order, and every field is length-prefixed so no
+/// two distinct row sets can collide by concatenation.
+pub fn fold_history_generation_lineage_fingerprint(
+    rows: impl IntoIterator<Item = HistoryLineageRowV1>,
+) -> String {
+    let sorted = rows.into_iter().collect::<BTreeSet<_>>();
+    let mut hasher = Sha256::new();
+    put_field(&mut hasher, REBUILD_LINEAGE_FINGERPRINT_DOMAIN);
+    hasher.update((sorted.len() as u64).to_be_bytes());
+    for row in sorted {
+        put_field(&mut hasher, row.namespace.as_bytes());
+        put_field(&mut hasher, row.generation_id.as_bytes());
+        hasher.update(row.commit_document_count.to_be_bytes());
+        put_field(
+            &mut hasher,
+            row.commit_document_commitment_sha256.as_bytes(),
+        );
+    }
+    hex::encode(hasher.finalize())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoHistoryRebuildPreparedV1 {
@@ -1390,11 +1493,29 @@ pub struct RepoHistoryRebuildPreparedV1 {
     /// the consumer contract; a reader that requires an exact asset must
     /// refuse anything but `Equality`.
     pub proof_mode: HistoryProofModeV1,
-    /// The `source_index_fingerprint` the migration asset recorded, and the
-    /// one recomputed over the index this rebuild observed. Both are stored
-    /// even in `Equality` mode so a later audit can re-derive the mode
-    /// decision instead of trusting it. `None` means no asset was consulted
-    /// (a fresh v2 store) or no comparable value could be recomputed.
+    /// Which predecessor the mode above was decided against. Skipped when it
+    /// is `MigrationAsset` so manifests written before this field existed
+    /// re-serialize byte-identically and keep re-deriving their own
+    /// `rebuild_id`; see [`HistoryProofBasisV1::is_migration_asset`].
+    #[serde(
+        default,
+        skip_serializing_if = "HistoryProofBasisV1::is_migration_asset"
+    )]
+    pub proof_basis: HistoryProofBasisV1,
+    /// The two values the `proof_basis` above compared. Both are stored even
+    /// in `Equality` mode so a later audit can re-derive the mode decision
+    /// instead of trusting it. `None` means nothing was consulted (a fresh v2
+    /// store) or no comparable value could be recomputed.
+    ///
+    /// Under `MigrationAsset` they are the `source_index_fingerprint` the
+    /// Phase 1 asset recorded and the one recomputed over the index this
+    /// rebuild observed. Under `PinnedGenerationLineage` they are the
+    /// predecessor manifest's lineage fold as RECORDED in its rows and as
+    /// OBSERVED by loading each pinned generation
+    /// (`fold_history_generation_lineage_fingerprint`). The pair is
+    /// re-derivable from durable state under either basis, which is what keeps
+    /// `require_equality_proof_mode`'s re-derivation meaningful rather than a
+    /// self-assertion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_source_index_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2215,6 +2336,7 @@ mod tests {
             source_index_fingerprint_sha256: "1".repeat(64),
             source_schema_version: INDEX_SCHEMA_VERSION.to_string(),
             proof_mode: HistoryProofModeV1::Equality,
+            proof_basis: HistoryProofBasisV1::MigrationAsset,
             recorded_source_index_fingerprint: None,
             observed_source_index_fingerprint: None,
             namespace_inventory: vec![RepoHistoryRebuildNamespaceV1 {
@@ -2305,6 +2427,144 @@ mod tests {
         assert_eq!(
             store.list().unwrap(),
             [record.id.clone()].into_iter().collect()
+        );
+    }
+
+    /// THE VINTAGE RULE. A manifest written before `proof_basis` existed
+    /// carries no such key, and it must keep re-deriving its own `rebuild_id`
+    /// after this field landed. `derive_rebuild_id` hashes the ENCODED
+    /// `prepared` block and `validate` re-derives it on every read, so a field
+    /// that serialized unconditionally would turn every manifest already on a
+    /// production volume into a self-inconsistent one at the next boot.
+    #[test]
+    fn a_manifest_without_a_proof_basis_decodes_as_migration_asset_and_keeps_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+        let record = store
+            .create_or_open(input(
+                "ns1",
+                vec![document("ns1", &"a".repeat(40), "first")],
+            ))
+            .unwrap();
+        let manifest = store
+            .write_prepared_rebuild_manifest(prepared_for(&record))
+            .unwrap();
+
+        // The on-disk encoding of a MigrationAsset-basis manifest carries no
+        // `proof_basis` key at all: that is what makes it byte-identical to a
+        // manifest written before the field existed.
+        let bytes = fs::read(store.root().join("rebuild-manifest.json")).unwrap();
+        let encoded = String::from_utf8(bytes).unwrap();
+        assert!(
+            !encoded.contains("proof_basis"),
+            "a migration-asset manifest must not serialize the field: {encoded}"
+        );
+
+        // Read back through the ordinary reader, which validates the id.
+        let reloaded = store.read_rebuild_manifest().unwrap().unwrap();
+        assert_eq!(reloaded, manifest);
+        assert_eq!(
+            reloaded.prepared.proof_basis,
+            HistoryProofBasisV1::MigrationAsset
+        );
+    }
+
+    /// A lineage-basis manifest DOES serialize the field, so it is
+    /// self-describing on disk rather than an `Equality` whose evidence a
+    /// reader has to infer.
+    #[test]
+    fn a_lineage_basis_manifest_serializes_its_basis() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index_path = root.join("index");
+        let store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+        let record = store
+            .create_or_open(input(
+                "ns1",
+                vec![document("ns1", &"a".repeat(40), "first")],
+            ))
+            .unwrap();
+        let mut prepared = prepared_for(&record);
+        prepared.proof_basis = HistoryProofBasisV1::PinnedGenerationLineage;
+        let manifest = store.write_prepared_rebuild_manifest(prepared).unwrap();
+        let encoded =
+            String::from_utf8(fs::read(store.root().join("rebuild-manifest.json")).unwrap())
+                .unwrap();
+        assert!(encoded.contains("pinned_generation_lineage"), "{encoded}");
+        assert_eq!(store.read_rebuild_manifest().unwrap().unwrap(), manifest);
+    }
+
+    /// The fold is order-independent, so it cannot depend on the iteration
+    /// order of whichever map a caller assembled its rows from.
+    #[test]
+    fn the_lineage_fold_is_order_independent() {
+        let rows = |flip: bool| {
+            let mut rows = vec![
+                HistoryLineageRowV1 {
+                    namespace: "ns1".to_string(),
+                    generation_id: format!("rhg_{}", "a".repeat(64)),
+                    commit_document_count: 2,
+                    commit_document_commitment_sha256: "c".repeat(64),
+                },
+                HistoryLineageRowV1 {
+                    namespace: "ns2".to_string(),
+                    generation_id: format!("rhg_{}", "b".repeat(64)),
+                    commit_document_count: 3,
+                    commit_document_commitment_sha256: "d".repeat(64),
+                },
+            ];
+            if flip {
+                rows.reverse();
+            }
+            rows
+        };
+        assert_eq!(
+            fold_history_generation_lineage_fingerprint(rows(false)),
+            fold_history_generation_lineage_fingerprint(rows(true))
+        );
+    }
+
+    /// Every folded field is load-bearing: changing any one of them changes
+    /// the fingerprint, which is what makes the lineage comparison falsifiable
+    /// rather than a self-assertion.
+    #[test]
+    fn the_lineage_fold_changes_with_every_field() {
+        let base = HistoryLineageRowV1 {
+            namespace: "ns1".to_string(),
+            generation_id: format!("rhg_{}", "a".repeat(64)),
+            commit_document_count: 2,
+            commit_document_commitment_sha256: "c".repeat(64),
+        };
+        let baseline = fold_history_generation_lineage_fingerprint([base.clone()]);
+        for mutated in [
+            HistoryLineageRowV1 {
+                namespace: "ns2".to_string(),
+                ..base.clone()
+            },
+            HistoryLineageRowV1 {
+                generation_id: format!("rhg_{}", "b".repeat(64)),
+                ..base.clone()
+            },
+            HistoryLineageRowV1 {
+                commit_document_count: 3,
+                ..base.clone()
+            },
+            HistoryLineageRowV1 {
+                commit_document_commitment_sha256: "d".repeat(64),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                baseline,
+                fold_history_generation_lineage_fingerprint([mutated])
+            );
+        }
+        // An empty lineage is not the same value as a one-row lineage.
+        assert_ne!(
+            baseline,
+            fold_history_generation_lineage_fingerprint(Vec::new())
         );
     }
 

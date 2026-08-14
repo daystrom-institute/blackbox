@@ -1371,6 +1371,27 @@ pub fn register_code_tokenizer(index: &Index) {
     );
 }
 
+/// The schema marker an index carries on disk, trimmed. `None` means the
+/// index carries no marker at all (the pre-marker arm, or a replacement whose
+/// marker is deliberately withheld); an unreadable marker is an error, never a
+/// silent `None`.
+///
+/// THE single reader. The replacement boundary and the rebuild-manifest
+/// recovery both have to compare an index's OBSERVED schema against the
+/// running `INDEX_SCHEMA_VERSION`, and `SCHEMA_VERSION_FILE` stays private to
+/// this module so a second caller cannot re-derive the location or the
+/// trimming rule slightly differently.
+// one-time boot path before the runtime serves traffic, exactly like the
+// replacement boundary that also calls it.
+#[allow(clippy::disallowed_methods)]
+pub fn read_index_schema_marker(index_path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(index_path.join(SCHEMA_VERSION_FILE)) {
+        Ok(raw) => Ok(Some(raw.trim().to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// The replacement boundary: decide whether the index is dropped, and under
 /// which cause, before anything opens it.
 ///
@@ -1415,12 +1436,7 @@ fn reset_index_on_schema_mismatch(
             intent == CatalogReplacementIntentV1::PreserveInterrupted,
         ));
     }
-    let marker_path = index_path.join(SCHEMA_VERSION_FILE);
-    let observed = match fs::read_to_string(&marker_path) {
-        Ok(raw) => Some(raw.trim().to_string()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err.into()),
-    };
+    let observed = read_index_schema_marker(index_path)?;
     let mismatch_reset = match observed.as_deref() {
         Some(marker) => marker != INDEX_SCHEMA_VERSION,
         // A non-empty index directory with no marker at all predates the
