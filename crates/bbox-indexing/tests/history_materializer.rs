@@ -34,18 +34,21 @@ use bbox_corpus_core::project_catalog::{
 };
 use bbox_corpus_index::index::history_generations::{
     HistoryCommitDocumentV1, HistoryFaultPoint, HistoryGenerationError, HistoryGenerationIo,
-    HistoryGenerationStore, HistoryProofModeV1, HistoryScanLimitsV1, RepoHistoryRebuildCommittedV1,
-    RepoHistoryRebuildRecoveryV1, scan_commit_documents,
+    HistoryGenerationStore, HistoryProofBasisV1, HistoryProofModeV1, HistoryScanLimitsV1,
+    RepoHistoryRebuildCommittedV1, RepoHistoryRebuildManifestV1, RepoHistoryRebuildRecoveryV1,
+    RepoHistoryRebuildStateV1, scan_commit_documents,
 };
-use bbox_corpus_index::index::{TranscriptIndex, register_code_tokenizer};
+use bbox_corpus_index::index::{INDEX_SCHEMA_VERSION, TranscriptIndex, register_code_tokenizer};
 use bbox_edge_sidecar::manifest::ManifestIndex;
 use bbox_indexing::index::consolidated_history::{
     ConsolidatedWalkOutcomeV1, RepoHistoryCursorStoreV1, RepoHistoryIngestGroupV1,
 };
 use bbox_indexing::index::history_materializer::{
-    HistoryMaterializerRequestV1, NamespaceClassificationV1, classify_rebuild_recovery,
-    history_generation_gc_roots, materialize_history_generations,
+    HistoryMaterializerRequestV1, NamespaceClassificationV1, RebuildManifestRefoundRefusalV1,
+    RebuildManifestRefoundV1, classify_rebuild_recovery, history_generation_gc_roots,
+    manifest_basis_is_a_schema_transition, materialize_history_generations,
     materialize_history_generations_with_io, plan_history_generation_gc, prepare_rebuild_manifest,
+    prove_pinned_generation_lineage, refound_committed_rebuild_manifest,
 };
 use bbox_indexing::index::history_refresh::refresh_repo_history_generation;
 use bbox_indexing::project_catalog_inventory::{
@@ -56,6 +59,9 @@ use bbox_indexing::project_catalog_migration::{
     ProjectCatalogMigrationFacadeV1, ProjectCatalogMigrationLayoutOverridesV1,
     ProjectCatalogMigrationPreflightRequestV1, ProjectCatalogMigrationResolvedLayoutV1,
     load_legacy_commit_namespace_inventory_asset, project_catalog_migration_store_limits,
+};
+use bbox_indexing::project_catalog_rebuild::{
+    ERROR_REBUILD_PROOF_MODE, require_equality_proof_mode, verify_manifest_generations,
 };
 use bbox_indexing::project_catalog_store::ProjectCatalogStore;
 use bbox_vectors::VectorStore;
@@ -1744,4 +1750,411 @@ fn generation_documents_and_vector_inputs_survive_the_source_index_drop() {
         "history that must survive"
     );
     record.validate().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The schema-bump rebuild-manifest incident
+// ---------------------------------------------------------------------------
+//
+// The live failure this section pins, end to end:
+//
+// 1. the P6 cut commits a rebuild manifest carrying an Equality proof against
+//    the Phase 1 migration asset, and the startup gate accepts it;
+// 2. INDEX_SCHEMA_VERSION is bumped, so the index on disk carries the OUTGOING
+//    marker while the binary carries the incoming one;
+// 3. the pre-drop guard re-prepares over that index. `capture_index` treats a
+//    marker that is not the RUNNING version as corrupt, so the recomputed
+//    fingerprint cannot fold to the asset's and the proof lands in Drift;
+// 4. that Drift manifest is committed and the drop lands. From then on EVERY
+//    boot of EVERY binary vintage refuses at the P6-C gate, because the
+//    defective manifest is durable and rolling the image back does not touch
+//    it.
+//
+// The fixture reproduces step 3 by changing NOTHING except the marker: the
+// index bytes, the asset, and the catalog are identical across the transition,
+// so the Equality-to-Drift flip is attributable to the schema version alone.
+// That is the incident's mechanism stated as an assertion.
+
+/// The marker a bumped binary finds on the index it is about to replace.
+const OUTGOING_BUMP_SCHEMA: &str = "agentic-corpus-g8-base-project-id";
+
+fn stamp_marker(index_path: &Path, marker: &str) {
+    fs::write(
+        index_path.join("schema_version.txt"),
+        format!("{marker}\n").as_bytes(),
+    )
+    .unwrap();
+}
+
+/// Materialize, prepare, and COMMIT a rebuild manifest over the fixture's
+/// current index, exactly as the guard plus the P3-E committer do.
+fn cut_a_committed_manifest(
+    fixture: &MigratedFixture,
+    lexical: &str,
+) -> RepoHistoryRebuildManifestV1 {
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    let scan = scan_commit_documents(&fixture.index_path(), HistoryScanLimitsV1::default())
+        .unwrap()
+        .unwrap();
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path()).unwrap();
+    generation_store
+        .write_prepared_rebuild_manifest(
+            prepare_rebuild_manifest(&scan, &outcome, epoch, lexical, "vector-next").unwrap(),
+        )
+        .unwrap();
+    generation_store
+        .commit_rebuild_manifest(RepoHistoryRebuildCommittedV1 {
+            verified_lexical_view: lexical.to_string(),
+            verified_vector_view: "vector-next".to_string(),
+            resulting_catalog_epoch: epoch,
+            vector_inventory: Vec::new(),
+        })
+        .unwrap()
+}
+
+/// Steps 1 through 4: a volume in the exact state the incident left behind.
+/// Returns the fixture, the accepted cut-time manifest, and the defective one
+/// that replaced it.
+fn bricked_volume() -> (
+    MigratedFixture,
+    RepoHistoryRebuildManifestV1,
+    RepoHistoryRebuildManifestV1,
+) {
+    let fixture = migrated_fixture(&[
+        (commit_sha(41).as_str(), "cut-time history one"),
+        (commit_sha(42).as_str(), "cut-time history two"),
+    ]);
+
+    // Step 1: the accepted cut. The index is unchanged since migration, so the
+    // asset is an exact description and Equality is genuinely REACHED.
+    let cut = cut_a_committed_manifest(&fixture, "lexical:cut");
+    assert_eq!(cut.prepared.proof_mode, HistoryProofModeV1::Equality);
+    assert_eq!(
+        cut.prepared.proof_basis,
+        HistoryProofBasisV1::MigrationAsset
+    );
+    require_equality_proof_mode(&cut).expect("the cut-time manifest passes the P6-C gate");
+
+    // Step 2: the bump. ONLY the marker changes.
+    stamp_marker(&fixture.index_path(), OUTGOING_BUMP_SCHEMA);
+
+    // Step 3: the g12-style re-preparation, through the asset-only path that
+    // shipped. This is the defect, reproduced.
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(
+        outcome.proof_mode,
+        HistoryProofModeV1::Drift,
+        "the asset proof is unreachable across a schema transition: capture_index refuses a \
+         marker that is not the running version"
+    );
+    let scan = scan_commit_documents(&fixture.index_path(), HistoryScanLimitsV1::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(scan.schema_version, OUTGOING_BUMP_SCHEMA);
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path()).unwrap();
+    generation_store
+        .write_prepared_rebuild_manifest(
+            prepare_rebuild_manifest(&scan, &outcome, epoch, "lexical:bumped", "vector-next")
+                .unwrap(),
+        )
+        .unwrap();
+    let bricked = generation_store
+        .commit_rebuild_manifest(RepoHistoryRebuildCommittedV1 {
+            verified_lexical_view: "lexical:bumped".to_string(),
+            verified_vector_view: "vector-next".to_string(),
+            resulting_catalog_epoch: epoch,
+            vector_inventory: Vec::new(),
+        })
+        .unwrap();
+
+    // Step 4: the durable brick. Every later boot refuses right here.
+    let refusal = require_equality_proof_mode(&bricked).unwrap_err();
+    assert_eq!(refusal.code, ERROR_REBUILD_PROOF_MODE);
+
+    // The replacement completed, so the index carries the running marker.
+    stamp_marker(&fixture.index_path(), INDEX_SCHEMA_VERSION);
+    (fixture, cut, bricked)
+}
+
+/// The incident's mechanism, isolated: the SAME index, the SAME asset, and the
+/// SAME catalog produce Equality at the running marker and Drift at any other
+/// one. Nothing about the history changed, so nothing about the history is
+/// what the recorded Drift describes.
+#[test]
+fn the_asset_proof_flips_to_drift_on_the_schema_marker_alone() {
+    let fixture = migrated_fixture(&[(commit_sha(43).as_str(), "unchanged history")]);
+    let at_schema = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(at_schema.proof_mode, HistoryProofModeV1::Equality);
+
+    stamp_marker(&fixture.index_path(), OUTGOING_BUMP_SCHEMA);
+    let across_bump = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(across_bump.proof_mode, HistoryProofModeV1::Drift);
+    assert_ne!(
+        across_bump.recorded_source_index_fingerprint,
+        across_bump.observed_source_index_fingerprint
+    );
+    // The generations themselves are untouched: source evidence sits outside
+    // the id preimage (D-039), so the transition cost the proof, not the
+    // history.
+    assert_eq!(at_schema.generation_ids(), across_bump.generation_ids());
+}
+
+/// RECOVERY. A boot onto the bricked volume re-founds the committed manifest
+/// on its own pinned generations and then passes the gate it used to fail.
+#[test]
+fn a_bricked_volume_refounds_its_committed_manifest_and_boots() {
+    let (fixture, cut, bricked) = bricked_volume();
+    let index_path = fixture.index_path();
+
+    let refound = refound_committed_rebuild_manifest(&index_path).unwrap();
+    let RebuildManifestRefoundV1::Refounded {
+        previous_rebuild_id,
+        pinned_generations,
+        basis_schema_version,
+        ..
+    } = &refound
+    else {
+        panic!("a schema-transition manifest must be re-founded, got {refound:?}");
+    };
+    assert_eq!(previous_rebuild_id, &bricked.rebuild_id);
+    assert_eq!(*pinned_generations, 1);
+    assert_eq!(basis_schema_version, OUTGOING_BUMP_SCHEMA);
+
+    // The gate, run exactly as the daemon runs it.
+    let generation_store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+    let repaired = generation_store.read_rebuild_manifest().unwrap().unwrap();
+    assert_eq!(repaired.state, RepoHistoryRebuildStateV1::Committed);
+    require_equality_proof_mode(&repaired).expect("the re-founded manifest passes the P6-C gate");
+    assert_eq!(
+        repaired.prepared.proof_basis,
+        HistoryProofBasisV1::PinnedGenerationLineage,
+        "the manifest must SAY which predecessor proved it, not merely claim Equality"
+    );
+    let verified = verify_manifest_generations(&index_path, &repaired).unwrap();
+    assert_eq!(verified.len(), 1);
+
+    // The repair carried the inventory across untouched. This is what keeps a
+    // compatibility or unclaimed generation rooted: the manifest is its only
+    // GC root, so a repair that re-derived the inventory could unpin one.
+    assert_eq!(
+        repaired.prepared.namespace_inventory,
+        bricked.prepared.namespace_inventory
+    );
+    assert_eq!(
+        repaired.pinned_generation_ids(),
+        bricked.pinned_generation_ids()
+    );
+    assert_eq!(
+        repaired.pinned_generation_ids(),
+        cut.pinned_generation_ids()
+    );
+    // And the committed block, which records what the replacement actually
+    // produced. This repair produced no different one.
+    assert_eq!(repaired.committed, bricked.committed);
+    // The basis stays honestly recorded: the manifest still describes the cut
+    // it was prepared for, at the schema that cut observed.
+    assert_eq!(
+        repaired.prepared.source_schema_version,
+        OUTGOING_BUMP_SCHEMA
+    );
+}
+
+/// The repair is idempotent: a second boot observes an Equality manifest and
+/// writes nothing.
+#[test]
+fn refounding_an_already_proven_manifest_is_a_no_op() {
+    let (fixture, _, _) = bricked_volume();
+    let index_path = fixture.index_path();
+    refound_committed_rebuild_manifest(&index_path).unwrap();
+    let after_first = HistoryGenerationStore::open_for_index(&index_path)
+        .unwrap()
+        .read_rebuild_manifest()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        refound_committed_rebuild_manifest(&index_path).unwrap(),
+        RebuildManifestRefoundV1::AlreadyProven
+    );
+    let after_second = HistoryGenerationStore::open_for_index(&index_path)
+        .unwrap()
+        .read_rebuild_manifest()
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_first, after_second);
+}
+
+/// THE COUNTERWEIGHT. The same defective shape, with no schema-version
+/// evidence, must still refuse exactly as it does today. Genuine drift on an
+/// UNCHANGED basis is what D-036 exists to catch, and the recovery must not
+/// launder it.
+#[test]
+fn a_drift_manifest_on_an_unchanged_basis_still_refuses() {
+    let fixture = migrated_fixture(&[(commit_sha(44).as_str(), "same-schema history")]);
+    // Drift WITHOUT a transition: the index is at the running schema, and the
+    // asset simply does not match it any more (an ordinary live-indexed
+    // store).
+    write_commit_documents(
+        &fixture.index_path(),
+        &fixture.namespace,
+        &[(commit_sha(45).as_str(), "history indexed after migration")],
+    );
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    assert_eq!(outcome.proof_mode, HistoryProofModeV1::Drift);
+    let scan = scan_commit_documents(&fixture.index_path(), HistoryScanLimitsV1::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(scan.schema_version, INDEX_SCHEMA_VERSION);
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path()).unwrap();
+    generation_store
+        .write_prepared_rebuild_manifest(
+            prepare_rebuild_manifest(&scan, &outcome, epoch, "lexical:same", "vector-next")
+                .unwrap(),
+        )
+        .unwrap();
+    let committed = generation_store
+        .commit_rebuild_manifest(RepoHistoryRebuildCommittedV1 {
+            verified_lexical_view: "lexical:same".to_string(),
+            verified_vector_view: "vector-next".to_string(),
+            resulting_catalog_epoch: epoch,
+            vector_inventory: Vec::new(),
+        })
+        .unwrap();
+    assert!(!manifest_basis_is_a_schema_transition(&committed));
+
+    assert_eq!(
+        refound_committed_rebuild_manifest(&fixture.index_path()).unwrap(),
+        RebuildManifestRefoundV1::Refused {
+            reason: RebuildManifestRefoundRefusalV1::NoSchemaTransition
+        }
+    );
+    // Untouched, and still refused.
+    let after = generation_store.read_rebuild_manifest().unwrap().unwrap();
+    assert_eq!(after, committed);
+    assert_eq!(
+        require_equality_proof_mode(&after).unwrap_err().code,
+        ERROR_REBUILD_PROOF_MODE
+    );
+}
+
+/// An UNFINISHED transition is not repairable either. The index does not carry
+/// the running marker, so this is not the post-drop replacement the manifest's
+/// basis was transitioned into, and the P3-D/P3-E resume path owns it.
+#[test]
+fn an_unfinished_transition_is_refused_rather_than_refounded() {
+    let (fixture, _, bricked) = bricked_volume();
+    stamp_marker(&fixture.index_path(), OUTGOING_BUMP_SCHEMA);
+    assert_eq!(
+        refound_committed_rebuild_manifest(&fixture.index_path()).unwrap(),
+        RebuildManifestRefoundV1::Refused {
+            reason: RebuildManifestRefoundRefusalV1::TransitionIncomplete
+        }
+    );
+    let after = HistoryGenerationStore::open_for_index(&fixture.index_path())
+        .unwrap()
+        .read_rebuild_manifest()
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, bricked);
+}
+
+/// A manifest already founded on a lineage cannot be re-founded on the same
+/// lineage: that would launder its own failure rather than prove anything.
+#[test]
+fn a_lineage_founded_manifest_is_never_refounded_again() {
+    let (fixture, _, _) = bricked_volume();
+    let index_path = fixture.index_path();
+    refound_committed_rebuild_manifest(&index_path).unwrap();
+
+    // Corrupt the re-founded manifest's own evidence, which is the only way a
+    // lineage manifest reaches the gate failing.
+    let generation_store = HistoryGenerationStore::open_for_index(&index_path).unwrap();
+    let manifest = generation_store.read_rebuild_manifest().unwrap().unwrap();
+    let mut prepared = manifest.prepared.clone();
+    prepared.observed_source_index_fingerprint = Some("0".repeat(64));
+    generation_store
+        .write_prepared_rebuild_manifest(prepared)
+        .unwrap();
+    generation_store
+        .commit_rebuild_manifest(manifest.committed.clone().unwrap())
+        .unwrap();
+
+    assert_eq!(
+        refound_committed_rebuild_manifest(&index_path).unwrap(),
+        RebuildManifestRefoundV1::Refused {
+            reason: RebuildManifestRefoundRefusalV1::AlreadyLineageFounded
+        }
+    );
+}
+
+/// A generation the manifest pins but the store cannot produce refuses the
+/// repair outright. The recovery upgrades a PROOF; it never treats an
+/// unverifiable generation as vacuously fine.
+#[test]
+fn a_missing_pinned_generation_refuses_the_repair() {
+    let (fixture, _, bricked) = bricked_volume();
+    let index_path = fixture.index_path();
+    let pinned = index_path
+        .parent()
+        .unwrap()
+        .join("history-generations")
+        .join(&bricked.prepared.namespace_inventory[0].generation_id);
+    fs::remove_dir_all(&pinned).unwrap();
+
+    let error = refound_committed_rebuild_manifest(&index_path).unwrap_err();
+    assert_eq!(error.code(), "error.history_commitment_mismatch");
+    assert!(error.message().contains("cannot be verified"), "{error}");
+}
+
+/// The lineage proof's non-loss arm: a namespace the predecessor pinned that
+/// is absent from the index the new rebuild observed is loss evidence, and it
+/// refuses with the outgoing index still intact.
+#[test]
+fn a_pinned_namespace_missing_from_the_new_scan_refuses_the_lineage() {
+    let (fixture, cut, _) = bricked_volume();
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path()).unwrap();
+    let observed = BTreeSet::from(["some-other-namespace".to_string()]);
+    let error =
+        prove_pinned_generation_lineage(&generation_store, &cut, Some(&observed)).unwrap_err();
+    assert_eq!(error.code(), "error.history_commitment_mismatch");
+    assert!(error.message().contains("absent from the index"), "{error}");
+
+    // The same predecessor proves cleanly against the namespace set it
+    // actually pinned, so the refusal above is about the loss, not the shape.
+    let present = cut
+        .prepared
+        .namespace_inventory
+        .iter()
+        .map(|row| row.namespace.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    let proof = prove_pinned_generation_lineage(&generation_store, &cut, Some(&present)).unwrap();
+    assert_eq!(proof.proof_mode, HistoryProofModeV1::Equality);
+    assert_eq!(proof.basis, HistoryProofBasisV1::PinnedGenerationLineage);
+    assert_eq!(proof.recorded_fingerprint, proof.observed_fingerprint);
+    assert!(proof.recorded_fingerprint.is_some());
+}
+
+/// A PREPARED predecessor describes a cut that never landed, so it cannot
+/// found a lineage. Accepting one would let an interrupted replacement
+/// authorize the next.
+#[test]
+fn a_prepared_predecessor_cannot_found_a_lineage() {
+    let fixture = migrated_fixture(&[(commit_sha(46).as_str(), "prepared-only history")]);
+    let outcome = materialize_history_generations(&fixture.store, &fixture.request()).unwrap();
+    let scan = scan_commit_documents(&fixture.index_path(), HistoryScanLimitsV1::default())
+        .unwrap()
+        .unwrap();
+    let epoch = fixture.store.snapshot().unwrap().epoch();
+    let generation_store = HistoryGenerationStore::open_for_index(&fixture.index_path()).unwrap();
+    let prepared = generation_store
+        .write_prepared_rebuild_manifest(
+            prepare_rebuild_manifest(&scan, &outcome, epoch, "lexical:x", "vector-next").unwrap(),
+        )
+        .unwrap();
+    let error = prove_pinned_generation_lineage(&generation_store, &prepared, None).unwrap_err();
+    assert_eq!(error.code(), "error.history_commitment_mismatch");
+    assert!(error.message().contains("COMMITTED"), "{error}");
 }

@@ -541,6 +541,135 @@ fn refusal_commitment_mismatch_keeps_the_old_index_readable() {
     );
 }
 
+/// PREVENTION for the schema-bump manifest class: the SECOND bump on a volume
+/// that already carries a committed manifest must leave behind a manifest the
+/// P6-C startup gate accepts.
+///
+/// The guard cannot reach the migration asset across a transition -
+/// `capture_index` treats a marker that is not the running version as corrupt,
+/// so the recomputed fingerprint can never fold to the recorded one - and a
+/// manifest committed with that verdict makes every subsequent boot refuse.
+/// The predecessor manifest is the basis that CAN describe this index, so the
+/// guard proves against it: every generation it pinned is re-loaded and
+/// re-derived, and the resulting manifest records Equality with the lineage
+/// basis it was actually decided from.
+#[test]
+fn a_second_bump_prepares_a_manifest_the_startup_gate_accepts() {
+    let fixture = fixture("repo-outgoing", 3);
+    let guard = catalog_schema_replacement_guard(
+        Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
+        HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
+    );
+    let store = HistoryGenerationStore::open_for_index(&fixture.index_path).unwrap();
+
+    // The first cut, committed exactly as the P3-E pass commits it.
+    guard(&request(&fixture)).expect("the first cut authorizes");
+    let first = commit_prepared_rebuild_manifest(
+        &fixture.index_path,
+        "lexical:first",
+        "vector:first",
+        7,
+        Vec::new(),
+    )
+    .unwrap()
+    .expect("the first cut commits its manifest");
+    assert_eq!(first.state, RepoHistoryRebuildStateV1::Committed);
+
+    // The next bump, over the same still-marker-mismatched index.
+    guard(&request(&fixture)).expect("the second cut authorizes");
+    let second = store.read_rebuild_manifest().unwrap().unwrap();
+    assert_eq!(second.state, RepoHistoryRebuildStateV1::Prepared);
+    assert_eq!(
+        second.prepared.proof_mode,
+        bbox_corpus_index::index::history_generations::HistoryProofModeV1::Equality,
+        "a transitioning bump must not commit a proof no binary vintage can accept"
+    );
+    assert_eq!(
+        second.prepared.proof_basis,
+        bbox_corpus_index::index::history_generations::HistoryProofBasisV1::PinnedGenerationLineage
+    );
+    assert_eq!(
+        second.prepared.recorded_source_index_fingerprint,
+        second.prepared.observed_source_index_fingerprint
+    );
+    assert!(second.prepared.recorded_source_index_fingerprint.is_some());
+    // The re-emission still pins the same content-addressed generations, so
+    // nothing the first cut carried is dropped by the second.
+    assert_eq!(
+        second.pinned_generation_ids(),
+        first.pinned_generation_ids()
+    );
+
+    // And the D-036 half of the startup gate, run against the committed form.
+    let committed = commit_prepared_rebuild_manifest(
+        &fixture.index_path,
+        "lexical:second",
+        "vector:second",
+        8,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+    bbox_indexing::project_catalog_rebuild::require_equality_proof_mode(&committed)
+        .expect("the second cut's manifest passes the P6-C gate");
+    bbox_indexing::project_catalog_rebuild::verify_manifest_generations(
+        &fixture.index_path,
+        &committed,
+    )
+    .expect("every bucket verifies");
+}
+
+/// The prevention arm is scoped to a TRANSITION. A replacement whose outgoing
+/// marker equals the running version is the offline path-free-rebuild shape,
+/// where the asset proof is reachable, so a non-Equality verdict there stays
+/// non-Equality and the D-036 consumers keep refusing it.
+#[test]
+fn a_same_schema_replacement_keeps_its_asset_verdict() {
+    let fixture = fixture_unstamped("repo-outgoing", 2);
+    let guard = catalog_schema_replacement_guard(
+        Arc::new(ProjectCatalogStore::open_existing(&fixture.projects_path).unwrap()),
+        HistoryScanLimitsV1::default(),
+        fixture.projects_path.parent().unwrap().join("vectors"),
+    );
+    let store = HistoryGenerationStore::open_for_index(&fixture.index_path).unwrap();
+    // `fixture_unstamped` leaves the index at the RUNNING marker, so observed
+    // and target agree: the operator same-schema rebuild's shape.
+    let same_schema = SchemaReplacementRequest {
+        index_path: &fixture.index_path,
+        projects_path: &fixture.projects_path,
+        code_source_store_path: &fixture.projects_path,
+        observed_schema_version: Some(bbox_corpus_index::index::INDEX_SCHEMA_VERSION.to_string()),
+        target_schema_version: bbox_corpus_index::index::INDEX_SCHEMA_VERSION,
+        cause: bbox_corpus_index::index::schema_replacement::CatalogIndexReplacementCause::OperatorPathFreeRebuild,
+    };
+    // A committed predecessor exists, so only the marker equality can be what
+    // keeps the asset verdict.
+    guard(&same_schema).expect("the first cut authorizes");
+    commit_prepared_rebuild_manifest(
+        &fixture.index_path,
+        "lexical:first",
+        "vector:first",
+        7,
+        Vec::new(),
+    )
+    .unwrap()
+    .unwrap();
+
+    guard(&same_schema).expect("the same-schema cut authorizes");
+    let prepared = store.read_rebuild_manifest().unwrap().unwrap();
+    // This fixture's catalog is FreshV2, so no asset exists and the verdict is
+    // Drift. The point is that it is UNCHANGED: the lineage arm did not fire.
+    assert_eq!(
+        prepared.prepared.proof_mode,
+        bbox_corpus_index::index::history_generations::HistoryProofModeV1::Drift
+    );
+    assert_eq!(
+        prepared.prepared.proof_basis,
+        bbox_corpus_index::index::history_generations::HistoryProofBasisV1::MigrationAsset
+    );
+}
+
 #[test]
 fn refusal_corrupt_manifest_keeps_the_old_index_readable() {
     let fixture = fixture("repo-outgoing", 3);

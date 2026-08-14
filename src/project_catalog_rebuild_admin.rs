@@ -780,6 +780,33 @@ mod tests {
         drop(directory);
     }
 
+    /// The gate's ORDER: the origin exemptions come first, so a fresh-v2 store
+    /// reaches neither the manifest refusal nor the attributable-proof repair.
+    /// A store that never migrated has no legacy commit documents and
+    /// legitimately has no manifest, and re-founding a proof there would be a
+    /// write on behalf of a cut that never happened.
+    #[test]
+    fn a_fresh_origin_is_exempt_before_any_manifest_read_or_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            &root.join("projects.json"),
+        )
+        .unwrap();
+        let index_path = root.join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+
+        assert_eq!(
+            validate_rebuild_coverage_before_bind(&store, &index_path).unwrap(),
+            RebuildStartupGateV1::ExemptFreshOrigin
+        );
+        // Nothing was written on the store's behalf.
+        assert!(
+            !root.join("history-generations").exists(),
+            "an exempt gate must not create a generation store"
+        );
+    }
+
     fn rebuild_test_layout(root: &Path) -> ProjectCatalogMigrationResolvedLayoutV1 {
         let _guard = bbox_util::util::test_env_lock();
         let config_path = root.join("config.toml");
