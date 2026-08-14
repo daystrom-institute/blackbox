@@ -824,6 +824,250 @@ mod tests {
         assert_eq!(unknown.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    // -----------------------------------------------------------------
+    // End to end, through the route layer
+    // -----------------------------------------------------------------
+    //
+    // The unit tests above prove the authorization helpers in isolation.
+    // These drive the real router with a real bearer, which is the only way
+    // to catch the failures that live BETWEEN the pieces: middleware that
+    // never admits the token, an onboard that mints a catalog project without
+    // binding a workspace, a promotion path that rebuilds producer auth from a
+    // config the fixture never installed.
+    //
+    // Mirrors `file_source_activation::tests::onboarding_mints_the_connector_
+    // project_and_is_idempotent`, including its fixture discipline: the grant
+    // is installed into `state.config` AND the live auth table together,
+    // because the onboard route promotes a freshly minted scope by REBUILDING
+    // auth from `state.config`. A fixture that installs only the table leaves
+    // the daemon self-inconsistent and the next request dies in the
+    // middleware's enabled() gate with a 503 that looks nothing like the
+    // fixture bug it is.
+
+    /// Install one conversation-lane producer grant into both the config and
+    /// the live auth table; returns the bearer secret.
+    fn install_conversation_connectors(
+        state: &Arc<SharedState>,
+        root: &StdPath,
+        catalog: Option<&CatalogSnapshotV2>,
+    ) -> String {
+        let token_secret = "c".repeat(64);
+        let config = crate::config::SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![crate::config::ConnectorProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: token_file(root, "token-e2e", &token_secret),
+                scopes: vec![grant(
+                    SOURCE_A,
+                    crate::config::ConnectorProfile::Conversation,
+                )],
+            }],
+        };
+        state.config.write().source_connectors = config.clone();
+        let connectors = ConnectorGrantRuntime::build(&config, catalog).unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(std::sync::Arc::new(
+                crate::server::producer_auth::ProducerAuthRuntime::for_test_connectors(Arc::new(
+                    connectors,
+                )),
+            ));
+        token_secret
+    }
+
+    /// A catalog-backed daemon whose only producer authority is a granted but
+    /// uncataloged conversation scope: the one state the onboard route admits
+    /// and every ingest route refuses.
+    fn pending_state(root: &StdPath) -> (Arc<SharedState>, String) {
+        let catalog_root = root.join("catalog");
+        std::fs::create_dir_all(&catalog_root).unwrap();
+        let catalog_projects_path = catalog_root.join("projects.json");
+        bbox_indexing::project_catalog_store::ProjectCatalogStore::initialize_empty(
+            &catalog_projects_path,
+        )
+        .unwrap();
+        let state = Arc::new(SharedState::for_test_catalog(root, &catalog_projects_path));
+        let store = state.project_authority.catalog_store().unwrap().clone();
+        let pinned = store.snapshot().unwrap();
+        let token = install_conversation_connectors(&state, root, Some(pinned.catalog()));
+        assert!(
+            state
+                .code_sources
+                .producer_auth()
+                .connectors()
+                .is_pending_onboard(&scope(SOURCE_A)),
+            "a granted conversation scope with no catalog project is pending onboarding"
+        );
+        (state, token)
+    }
+
+    fn http_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: axum::body::Body,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(body)
+            .unwrap()
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(response: Response) -> T {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn onboard_request() -> ConversationCatalogOnboardRequestV1 {
+        ConversationCatalogOnboardRequestV1 {
+            schema_version: bbox_conversation_source::CATALOG_ONBOARD_SCHEMA_VERSION,
+            scope: scope(SOURCE_A),
+            probed_connector_kind: "fixture".into(),
+            probed_remote_authority: "workspace.example".into(),
+            probed_workspace_id: "T0FIXTURE".into(),
+            probed_workspace_display_name: Some("Fixture Workspace".into()),
+            display_name: "Fixture Workspace".into(),
+        }
+    }
+
+    /// One landable batch, digest included, for the pending-scope refusal.
+    fn one_message_batch() -> ConversationBatchV1 {
+        let records = vec![bbox_conversation_source::ConversationMessageRecordV1 {
+            channel_id: "C0OPSFIX".into(),
+            message_ts: "1712345678.000200".into(),
+            revision: 0,
+            author_id: "U0HUMAN".into(),
+            author_kind: bbox_conversation_source::AuthorKindV1::Human,
+            thread_parent_ts: None,
+            subtype: None,
+            text: "the deploy pipeline wedged on the lock table".into(),
+            edited_ts: None,
+            reactions: Vec::new(),
+            attachments: Vec::new(),
+            observed_at: "2026-08-13T00:00:00Z".into(),
+        }];
+        ConversationBatchV1 {
+            schema_version: bbox_conversation_source::SCHEMA_VERSION,
+            conversation_policy_version: bbox_conversation_source::CONVERSATION_POLICY_VERSION
+                .to_string(),
+            scope: scope(SOURCE_A),
+            workspace_id: "T0FIXTURE".into(),
+            channel_id: "C0OPSFIX".into(),
+            batch_digest: bbox_conversation_source::batch_digest(&records),
+            records,
+            observed_at: "2026-08-13T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn onboarding_mints_the_conversation_project_binds_the_workspace_and_is_idempotent() {
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (state, token) = pending_state(&root);
+        let app = router(state.clone()).with_state(state.clone());
+
+        // A pending scope opens NO ingest lane. This refusal is what makes
+        // "add the scope to the daemon config first" possible without opening
+        // a lane for a project that does not exist.
+        let response = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/internal/conversation-source/v1/batches",
+                &token,
+                axum::body::Body::from(serde_json::to_vec(&one_message_batch()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "landing under a pending scope is a conflict, deliberately distinct \
+             from a forbidden one: they are different fixes"
+        );
+        let refusal: ErrorResponse = json_body(response).await;
+        assert_eq!(refusal.code, "scope_pending_onboarding");
+
+        let response = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/internal/conversation-source/v1/catalog/onboard",
+                &token,
+                axum::body::Body::from(serde_json::to_vec(&onboard_request()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let receipt: ConversationCatalogOnboardResponseV1 = json_body(response).await;
+        assert!(receipt.created_project, "the first onboard mints it");
+
+        // The catalog owns the scope-to-project mapping.
+        let store = state.project_authority.catalog_store().unwrap().clone();
+        let pinned = store.snapshot().unwrap();
+        let project = pinned
+            .catalog()
+            .projects
+            .values()
+            .find(|project| {
+                matches!(&project.scope, ProjectScope::Connector(owned) if owned == &scope(SOURCE_A))
+            })
+            .expect("onboarding records a connector-scoped project");
+        assert_eq!(project.project_id.as_str(), receipt.project_id);
+
+        // And the workspace binding exists, which is the durable half of the
+        // tamper check every later batch is measured against. It must be
+        // written by onboarding, or the first batch is refused as unbound.
+        let binding = state
+            .conversation_sources
+            .store()
+            .workspace_binding(&scope(SOURCE_A))
+            .unwrap()
+            .expect("onboarding binds the probed workspace");
+        assert_eq!(binding.workspace_id, "T0FIXTURE");
+
+        // Find-or-create: a producer driving onboard before every cycle is
+        // safe to retry rather than duplicating the project.
+        let response = app
+            .oneshot(http_request(
+                "POST",
+                "/internal/conversation-source/v1/catalog/onboard",
+                &token,
+                axum::body::Body::from(serde_json::to_vec(&onboard_request()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let replayed: ConversationCatalogOnboardResponseV1 = json_body(response).await;
+        assert_eq!(replayed.project_id, receipt.project_id);
+        assert!(
+            !replayed.created_project,
+            "only the call that MINTED the project reports creating it"
+        );
+        assert_eq!(
+            store.snapshot().unwrap().catalog().projects.len(),
+            1,
+            "a retried onboard is not a second project"
+        );
+        assert_eq!(
+            state
+                .conversation_sources
+                .store()
+                .workspace_binding(&scope(SOURCE_A))
+                .unwrap()
+                .map(|binding| binding.workspace_id),
+            Some("T0FIXTURE".to_string()),
+            "a retried onboard rebinds the same workspace rather than a second one"
+        );
+    }
+
     #[test]
     fn the_wire_error_body_is_bounded() {
         let error = HttpError::new(StatusCode::BAD_REQUEST, "code", "x".repeat(4096));
