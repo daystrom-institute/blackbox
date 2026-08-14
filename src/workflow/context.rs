@@ -74,6 +74,14 @@ pub struct ArcMeta {
     pub parent_arc_id: Option<String>,
     /// Composition depth (top-level = 0, sub-of-top = 1, …).
     pub composition_depth: u32,
+    /// Workflow-level `Shell` op argv[0] allowlist, copied from the
+    /// compiled spec at runner construction so every hook op sees it
+    /// through the ArcContext. Enforced in `exec_shell` IN ADDITION to
+    /// any per-op `args.allowlist` (intersection semantics: a per-op
+    /// list can only narrow, never widen, the workflow-level policy).
+    /// Sub-workflow arcs carry their own spec's list, not the parent's.
+    #[serde(default)]
+    pub shell_allowlist: Option<Vec<String>>,
 }
 
 /// One Wait resolution. Carried in `last_signal` and `signal_history`.
@@ -472,6 +480,7 @@ mod tests {
             arc_outcome: None,
             parent_arc_id: None,
             composition_depth: 0,
+            shell_allowlist: None,
         });
         c.vars.insert("issue".into(), json!(42));
         c.vars.insert("repo".into(), json!("foo/bar"));

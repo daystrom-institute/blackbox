@@ -701,6 +701,53 @@ async fn worktree_create_fails_when_branch_in_use() {
 }
 
 #[tokio::test]
+async fn shell_allowlist_blocks_disallowed_command() {
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::Shell,
+        args: json!({"argv": ["false"], "allowlist": ["true"]}),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: None,
+    };
+    let err = execute_op(&hook, &ctx, None).await.unwrap_err();
+    assert!(
+        err.to_string().contains("shell allowlist"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn shell_allowlist_permits_listed_command() {
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::Shell,
+        args: json!({"argv": ["true"], "allowlist": ["true"]}),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: None,
+    };
+    let effect = execute_op(&hook, &ctx, None).await.unwrap();
+    assert!(matches!(effect, OpEffect::None));
+}
+
+#[tokio::test]
+async fn shell_allowlist_absent_preserves_trusted_behavior() {
+    // No `allowlist` key at all: any argv[0] still runs, matching
+    // pre-allowlist behavior.
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::Shell,
+        args: json!({"argv": ["true"]}),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: None,
+    };
+    let effect = execute_op(&hook, &ctx, None).await.unwrap();
+    assert!(matches!(effect, OpEffect::None));
+}
+
+#[tokio::test]
 async fn shell_failure_propagates() {
     let ctx = ArcContext::new(ArcMeta::default());
     let hook = HookOp {
@@ -1455,4 +1502,71 @@ async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
     );
     assert_eq!(server.state.notes.read().all().len(), note_count);
     crate::embed_runtime::install_contradiction_threshold(0.85);
+}
+
+#[tokio::test]
+async fn shell_workflow_level_allowlist_enforced_via_arc_meta() {
+    // The workflow-level allowlist rides ArcMeta; no per-op
+    // args.allowlist repetition is required for enforcement.
+    let meta = ArcMeta {
+        shell_allowlist: Some(vec!["definitely-not-true".to_string()]),
+        ..Default::default()
+    };
+    let ctx = ArcContext::new(meta);
+    let hook = HookOp {
+        op: OpKind::Shell,
+        args: json!({"argv": ["true"]}),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: None,
+    };
+    let err = execute_op(&hook, &ctx, None).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("workflow-level shell allowlist"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn shell_per_op_allowlist_cannot_widen_workflow_level() {
+    // A per-op args.allowlist that permits the command must NOT
+    // override a workflow-level policy that forbids it: the two lists
+    // intersect, they do not shadow.
+    let meta = ArcMeta {
+        shell_allowlist: Some(vec!["git".to_string()]),
+        ..Default::default()
+    };
+    let ctx = ArcContext::new(meta);
+    let hook = HookOp {
+        op: OpKind::Shell,
+        args: json!({"argv": ["true"], "allowlist": ["true"]}),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: None,
+    };
+    let err = execute_op(&hook, &ctx, None).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("workflow-level shell allowlist"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn shell_workflow_level_allowlist_permits_listed_command() {
+    let meta = ArcMeta {
+        shell_allowlist: Some(vec!["true".to_string()]),
+        ..Default::default()
+    };
+    let ctx = ArcContext::new(meta);
+    let hook = HookOp {
+        op: OpKind::Shell,
+        args: json!({"argv": ["true"]}),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: None,
+    };
+    let effect = execute_op(&hook, &ctx, None).await.unwrap();
+    assert!(matches!(effect, OpEffect::None));
 }

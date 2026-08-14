@@ -334,6 +334,7 @@ mod tests {
             vars_schema: None,
             on_arc_exit: Vec::new(),
             on_arc_cancel: Vec::new(),
+            shell_allowlist: None,
         })
         .unwrap()
     }

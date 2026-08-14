@@ -59,6 +59,25 @@ pub struct Workflow {
     /// actions). Run BEFORE on_arc_exit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_arc_cancel: Vec<HookOp>,
+    /// Optional workflow-wide allowlist for `Shell` op `argv[0]`. Entries
+    /// match exact basename (`"git"` matches `argv[0]` of `git` or
+    /// `/usr/bin/git`) or exact absolute path (`"/usr/bin/git"` matches
+    /// only that literal argv[0]). No globs, no prefix matching.
+    ///
+    /// Absent = current trusted-actor behavior (any argv[0] runs).
+    /// Present = every `Shell` op in the workflow must resolve an
+    /// effective allowlist that permits its `argv[0]`, or the op fails
+    /// closed before spawning.
+    ///
+    /// Wiring: the runner copies this field onto `ArcMeta` at
+    /// construction, and `exec_shell` enforces it for every Shell op in
+    /// the arc IN ADDITION to any per-op `args.allowlist` (intersection
+    /// semantics: a per-op list can narrow this policy, never widen it).
+    /// Sub-workflow arcs enforce their own spec's list, not the
+    /// parent's - a parent allowlist does not descend into embedded or
+    /// ref'd sub-workflows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_allowlist: Option<Vec<String>>,
 }
 
 impl Workflow {
@@ -555,4 +574,69 @@ pub enum BranchSelector {
 #[allow(dead_code)] // test-only entry point; tests use this through the workflow::load_workflow reexport
 pub fn load_workflow(src: &str) -> Result<Workflow> {
     serde_json::from_str(src).context("workflow JSON parse failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_workflow_json(extra_top_level: &str) -> String {
+        format!(
+            r#"{{
+                "name": "wf",
+                "version": 1,
+                "actors": {{}},
+                "nodes": {{
+                    "Only": {{"prompt": "hi", "next": {{"type": "terminal"}}}}
+                }},
+                "start": "Only"
+                {extra_top_level}
+            }}"#
+        )
+    }
+
+    // ── example workflow compile validation ──────────────────────
+    //
+    // The main compile-validation suite for examples/workflows/*.json
+    // lives in workflow::mod's `every_example_validates_against_json_schema`
+    // and `compiles` tests (src/workflow/mod.rs), outside this file's
+    // scope for this change. New examples added without a matching edit
+    // there still need SOME compile coverage, so this is a standalone
+    // check: read the file, load it, and run it through the real
+    // `workflow::compile` cross-validator.
+    #[test]
+    fn e2e_approval_gate_example_compiles() {
+        let json = include_str!("../../examples/workflows/e2e-approval-gate.json");
+        let wf = load_workflow(json).expect("e2e-approval-gate.json parses as a Workflow");
+        crate::workflow::compile(wf).expect("e2e-approval-gate.json compiles");
+    }
+
+    #[test]
+    fn shell_allowlist_absent_by_default() {
+        let wf = load_workflow(&minimal_workflow_json("")).unwrap();
+        assert_eq!(wf.shell_allowlist, None);
+    }
+
+    #[test]
+    fn shell_allowlist_parses_when_declared() {
+        let wf = load_workflow(&minimal_workflow_json(
+            r#", "shell_allowlist": ["git", "cargo"]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            wf.shell_allowlist,
+            Some(vec!["git".to_string(), "cargo".to_string()])
+        );
+    }
+
+    #[test]
+    fn shell_allowlist_round_trips_through_serde() {
+        let wf = load_workflow(&minimal_workflow_json(
+            r#", "shell_allowlist": ["git"]"#,
+        ))
+        .unwrap();
+        let json = serde_json::to_string(&wf).unwrap();
+        let reparsed: Workflow = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.shell_allowlist, Some(vec!["git".to_string()]));
+    }
 }

@@ -233,6 +233,7 @@ mod tests {
                 arc_outcome: None,
                 parent_arc_id: None,
                 composition_depth: 0,
+                shell_allowlist: None,
             }),
             node_outputs: HashMap::new(),
             actor_sessions: HashMap::new(),

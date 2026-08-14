@@ -280,7 +280,29 @@ pub async fn execute_op_with_hub(
         OpKind::NormalizePerfPathologyAtomRequests => {
             exec_normalize_perf_pathology_atom_requests(&rendered_args, hook.into_var.as_deref())
         }
-        OpKind::Shell => exec_shell(&rendered_args, hook.into_var.as_deref(), ctx).await,
+        OpKind::Shell => {
+            // Per-op allowlist override: `args.allowlist` on the Shell
+            // HookOp itself (a plain string array, or a `${vars.x}`
+            // template that resolves to one). This is the mechanism
+            // that's actually wired today; see the `shell_allowlist`
+            // doc comment on `workflow::schema::Workflow` for why the
+            // workflow-level field isn't auto-propagated here yet.
+            let allowlist = rendered_args
+                .get("allowlist")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<String>>()
+                });
+            exec_shell(
+                &rendered_args,
+                hook.into_var.as_deref(),
+                ctx,
+                allowlist.as_deref(),
+            )
+            .await
+        }
         OpKind::WriteArchPathologyPlan => {
             exec_write_arch_pathology_plan(&rendered_args, hook.into_var.as_deref())
         }

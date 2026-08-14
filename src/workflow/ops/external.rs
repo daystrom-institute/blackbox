@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Result, anyhow, bail};
@@ -84,15 +85,33 @@ pub(super) async fn exec_http_json(args: &Value, into_var: Option<&str>) -> Resu
     }
 }
 
+/// Match one `argv[0]` value against an allowlist entry set. Exact match
+/// only: an entry matches when it equals `argv0` verbatim (covers both a
+/// bare command name and an absolute path used as-is) or when it equals
+/// `argv0`'s basename (so `"git"` permits `/usr/bin/git`, `./git`, etc).
+/// No globs, no prefix matching, no directory-relative resolution.
+pub(super) fn shell_argv0_allowed(argv0: &str, allowlist: &[String]) -> bool {
+    let basename = Path::new(argv0).file_name().map(|f| f.to_string_lossy());
+    allowlist
+        .iter()
+        .any(|entry| entry == argv0 || basename.as_deref() == Some(entry.as_str()))
+}
+
 /// Execute a shell command. When `into_var` is provided the op captures
 /// `{exit_code, stdout, stderr, parsed}` into `vars[into_var]` and does NOT
 /// fail on a non-zero exit code — the caller decides what to do with the
 /// exit code via downstream ops or packet gates. Without `into_var` the
 /// original behaviour is preserved: non-zero exit aborts the op.
+///
+/// `allowlist`, when `Some`, restricts `argv[0]` to entries matched by
+/// [`shell_argv0_allowed`]; a non-matching command fails closed before
+/// anything spawns. `None` preserves the pre-allowlist trusted-actor
+/// behavior of running any argv.
 pub(super) async fn exec_shell(
     args: &Value,
     into_var: Option<&str>,
     ctx: &ArcContext,
+    allowlist: Option<&[String]>,
 ) -> Result<OpEffect> {
     let argv = args
         .get("argv")
@@ -109,6 +128,26 @@ pub(super) async fn exec_shell(
                 .ok_or_else(|| anyhow!("Shell argv entries must be strings"))
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(list) = allowlist
+        && !shell_argv0_allowed(&strs[0], list)
+    {
+        bail!(
+            "Shell argv[0] '{}' is not on the workflow shell allowlist {list:?}",
+            strs[0]
+        );
+    }
+    // Workflow-level allowlist rides ArcMeta (copied from the compiled
+    // spec at runner construction) and is enforced in ADDITION to the
+    // per-op list above: a per-op `args.allowlist` can narrow the
+    // workflow policy but never widen it.
+    if let Some(list) = ctx.meta.shell_allowlist.as_deref()
+        && !shell_argv0_allowed(&strs[0], list)
+    {
+        bail!(
+            "Shell argv[0] '{}' is not on the workflow-level shell allowlist {list:?}",
+            strs[0]
+        );
+    }
     let cwd = args
         .get("cwd")
         .and_then(|v| v.as_str())
@@ -226,6 +265,48 @@ fn resolve_secret_header_value(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_argv0_allowed_exact_bare_match() {
+        let allowlist = vec!["git".to_string(), "cargo".to_string()];
+        assert!(shell_argv0_allowed("git", &allowlist));
+        assert!(shell_argv0_allowed("cargo", &allowlist));
+    }
+
+    #[test]
+    fn shell_argv0_allowed_basename_match() {
+        let allowlist = vec!["git".to_string()];
+        assert!(shell_argv0_allowed("/usr/bin/git", &allowlist));
+        assert!(shell_argv0_allowed("./git", &allowlist));
+    }
+
+    #[test]
+    fn shell_argv0_allowed_absolute_path_exact_match() {
+        let allowlist = vec!["/usr/bin/git".to_string()];
+        assert!(shell_argv0_allowed("/usr/bin/git", &allowlist));
+        // A different absolute path with the same basename does not match
+        // an allowlist entry that is itself an absolute path.
+        assert!(!shell_argv0_allowed("/opt/bin/git", &allowlist));
+    }
+
+    #[test]
+    fn shell_argv0_allowed_rejects_unlisted() {
+        let allowlist = vec!["git".to_string(), "cargo".to_string()];
+        assert!(!shell_argv0_allowed("rm", &allowlist));
+        assert!(!shell_argv0_allowed("/usr/bin/rm", &allowlist));
+    }
+
+    #[test]
+    fn shell_argv0_allowed_no_glob_no_prefix() {
+        let allowlist = vec!["git*".to_string(), "gi".to_string()];
+        assert!(!shell_argv0_allowed("git", &allowlist));
+        assert!(!shell_argv0_allowed("github", &allowlist));
+    }
+
+    #[test]
+    fn shell_argv0_allowed_empty_list_denies_all() {
+        assert!(!shell_argv0_allowed("true", &[]));
+    }
 
     #[test]
     fn resolve_secret_header_value_with_env_fallback() {

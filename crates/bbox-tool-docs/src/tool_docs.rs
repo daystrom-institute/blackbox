@@ -1240,6 +1240,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some("bro_cron_list()"),
     },
     ToolDoc {
+        name: "bro_cron_remove",
+        category: ToolCategory::Workflows,
+        summary: "Remove an installed cron by name: aborts its running tick loop immediately, clears in-flight concurrency state, and deletes the persisted spec file so it does not respawn on daemon restart.",
+        when_to_use: "Decommission a cron inlet that's no longer needed, or clear one before reinstalling a corrected spec under the same name. Errors if the name isn't currently installed.",
+        example: Some(r#"bro_cron_remove(name="sastquatch-daily")"#),
+    },
+    ToolDoc {
         name: "bro_cron_upcoming",
         category: ToolCategory::Workflows,
         summary: "Compute the next N scheduled times for a cron expression as RFC3339 strings. Pure function — does not touch the registry.",
@@ -1259,6 +1266,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "List installed workflow specs by id.",
         when_to_use: "Inventory check — what workflows can routing verdicts target on this daemon?",
         example: Some("bro_workflow_list()"),
+    },
+    ToolDoc {
+        name: "bro_workflow_remove",
+        category: ToolCategory::Workflows,
+        summary: "Remove an installed workflow by registry id: deletes it from the registry and its persisted spec file so webhook/poller/cron routing verdicts and subworkflow_ref lookups can no longer resolve it. Refuses when any running_arcs entry whose workflow_name matches this id is still non-terminal (status \"running\"), unless force=true. Does not cancel or otherwise touch arcs already dispatched from this workflow (use bro_arc_cancel for that).",
+        when_to_use: "Decommission or replace an installed workflow. Leave force unset in normal operation so an in-flight arc can't be orphaned mid-run; pass force=true only when you've confirmed the running arc(s) should be abandoned (they keep running, but the id can no longer be re-dispatched by name).",
+        example: Some(r#"bro_workflow_remove(id="issue-to-pr")"#),
     },
     // ── Agents ──────────────────────────────────────────────────
     ToolDoc {

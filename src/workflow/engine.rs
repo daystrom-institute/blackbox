@@ -612,6 +612,7 @@ impl<'a> WorkflowRunner<'a> {
             arc_outcome: None,
             parent_arc_id: None,
             composition_depth,
+            shell_allowlist: compiled.spec.shell_allowlist.clone(),
         });
         let cancel_token = match parent_cancel_token {
             Some(parent) => server.register_arc_cancel_token_child(&arc_id, parent),

@@ -196,6 +196,65 @@ bbox_compile(
 
 Then plug the returned packet id into the workflow's `"gate"` field.
 
+### `e2e-approval-gate.json`: human-in-the-loop approval gate
+
+An executor drafts a proposal, then the arc suspends on a `Wait` node until the
+operator (or another agent) delivers an `operator-approval` signal via
+`bro_arc_signal`, correlated on `vars.request_id`. When the signal arrives (or
+the wait times out), the node's gate packet classifies the resolved
+`last_signal` and the `branch` transition routes to `Proceed` or `Cancelled`.
+
+```
+start: PrepareProposal
+PrepareProposal → goto:AwaitApproval
+AwaitApproval (wait.any_of=[operator-approval], timeout=24h)
+               → branch{approved→Proceed, rejected→Cancelled, default→Cancelled}
+Proceed        → terminal
+Cancelled      → terminal
+```
+
+Run it:
+
+```
+bro orchestrate run examples/workflows/e2e-approval-gate.json \
+  --initial-vars '{"request_id": "req-42"}'
+```
+
+While the arc sits on `AwaitApproval`, resolve it from another session:
+
+```
+bro_arc_signal(signal="operator-approval",
+               correlate={"request_id": "req-42"},
+               payload={"decision": "approved"})
+```
+
+Requires a gate packet at `AwaitApproval` that classifies the resolved wait
+into `approved` / `rejected` (e.g. reading `last_signal.payload.decision`, or
+treating `last_signal.name == "__timeout__"` as `rejected`). Compile one like:
+
+```
+bbox_compile(
+  domain="workflow/approval-decision",
+  classification_lattice=["approved", "rejected"],
+  prefix_inference={"approved_": "approved", "rejected_": "rejected"},
+  rules=[
+    {"id": "approved_decision",
+     "antecedent": {"op": "Eq", "field": "last_signal.payload.decision", "value": "approved"},
+     "consequent": "APPROVED"},
+    {"id": "rejected_default", "classification": "rejected", "emit": "fallback",
+     "antecedent": {"op": "True"}, "consequent": "REJECTED"}
+  ]
+)
+```
+
+Then plug the returned packet id into `AwaitApproval`'s `"gate"` field in
+place of the `packet-approval-decision-TODO` placeholder. A live end-to-end
+run (real gate packet installed, real signal delivery) is exercised in
+cluster e2e, not in the unit compile-validation test this example ships with
+(`schema::tests::e2e_approval_gate_example_compiles` in
+`src/workflow/schema.rs`, which only proves the spec parses and cross-
+validates, not that the placeholder gate resolves a real verdict).
+
 ### `optimistic.json` — async ensemble steering (spec only — needs an `ensemble` team on the daemon)
 
 Ensemble version of the optimistic-review shape in `e2e-async-review.json` — phase 1 completes, fork kicks off a durable ensemble review asynchronously, phase 2 runs, ensemble results late-inject into phase 2's brief when available.

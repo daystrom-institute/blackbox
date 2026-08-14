@@ -5,7 +5,7 @@ use crate::orchestration as orch;
 use crate::orchestration::providers::Provider;
 use crate::pollers;
 use crate::server::BlackboxServer;
-use crate::server::routes::{signal_arc_dispatch, webhook_replay_inner};
+use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch, webhook_replay_inner};
 use crate::server::state::{SIGNAL_LOG_CAP, SignalEvent, WEBHOOK_LOG_CAP, WebhookDelivery};
 use crate::server::workflow_capabilities::validate_workflow_capabilities;
 use crate::system_memory;
@@ -21,6 +21,7 @@ use crate::workflow;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
+use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde_json::Value;
 
@@ -331,7 +332,14 @@ Constraints:\n\
         let payload = p
             .payload
             .unwrap_or_else(|| Value::Object(correlation.clone()));
-        let result = signal_arc_dispatch(&self.state, &p.signal, correlation, payload).await;
+        let result = signal_arc_dispatch(
+            &self.state,
+            &p.signal,
+            correlation,
+            payload,
+            SignalDispatchOrigin::Direct,
+        )
+        .await;
         Self::ok_json(&result)
     }
 
@@ -699,6 +707,33 @@ Constraints:\n\
     }
 
     #[tool(
+        name = "bro_cron_remove",
+        description = "Remove an installed cron by name: aborts its running tick loop immediately, clears in-flight concurrency state, and deletes the persisted spec file so it does not respawn on daemon restart."
+    )]
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) async fn bro_cron_remove(
+        &self,
+        Parameters(p): Parameters<CronRemoveParams>,
+    ) -> CallToolResult {
+        let existed = self.state.crons.list().iter().any(|c| c.name == p.name);
+        if !existed {
+            return Self::err_text(&format!("cron '{}' not found", p.name));
+        }
+        self.state.crons.remove(&p.name);
+        let path = self
+            .state
+            .store_dir
+            .join("crons")
+            .join(format!("{}.json", p.name));
+        match std::fs::remove_file(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Self::err_text(&format!("cron persisted file remove failed: {e}")),
+        }
+        Self::ok_json(&serde_json::json!({"status": "removed", "name": p.name}))
+    }
+
+    #[tool(
         name = "bro_cron_upcoming",
         description = "Compute the next N scheduled times for a cron expression as RFC3339 strings. Pure function — does not touch the registry."
     )]
@@ -763,6 +798,75 @@ Constraints:\n\
         let names: Vec<String> = map.keys().cloned().collect();
         Self::ok_json(&serde_json::json!({"workflows": names}))
     }
+
+    #[tool(
+        name = "bro_workflow_remove",
+        description = "Remove an installed workflow by registry id: deletes it from the registry and its persisted spec file so webhook/poller/cron routing verdicts and subworkflow_ref lookups can no longer resolve it. Refuses when any running_arcs entry whose workflow_name matches this id is still non-terminal (status \"running\"), unless force=true. Does not cancel or otherwise touch arcs already dispatched from this workflow (use bro_arc_cancel for that)."
+    )]
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) async fn bro_workflow_remove(
+        &self,
+        Parameters(p): Parameters<WorkflowRemoveParams>,
+    ) -> CallToolResult {
+        let exists = self.state.workflow_registry.read().contains_key(&p.id);
+        if !exists {
+            return Self::err_text(&format!("workflow '{}' not found", p.id));
+        }
+        if !p.force.unwrap_or(false) {
+            // Correlated by `ArcSnapshot.workflow_name`, which is the
+            // spec's internal `name` field, not necessarily this
+            // registry id (an install can pin a custom id via
+            // WorkflowInstallParams.id). This is the best available
+            // signal without threading the registry id through arc
+            // dispatch bookkeeping.
+            let running: Vec<String> = self
+                .state
+                .running_arcs
+                .read()
+                .values()
+                .filter(|s| s.workflow_name == p.id && s.status == "running")
+                .map(|s| s.arc_id.clone())
+                .collect();
+            if !running.is_empty() {
+                return Self::err_text(&format!(
+                    "workflow '{}' has {} non-terminal arc(s) still running ({}); pass force=true to remove anyway",
+                    p.id,
+                    running.len(),
+                    running.join(", ")
+                ));
+            }
+        }
+        self.state.workflow_registry.write().remove(&p.id);
+        let path = self
+            .state
+            .store_dir
+            .join("workflows")
+            .join(format!("{}.json", p.id));
+        match std::fs::remove_file(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Self::err_text(&format!("workflow persisted file remove failed: {e}"));
+            }
+        }
+        Self::ok_json(&serde_json::json!({"status": "removed", "id": p.id}))
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct CronRemoveParams {
+    /// Cron name (as passed to bro_cron_install).
+    pub(crate) name: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct WorkflowRemoveParams {
+    /// Registry id (as passed to, or defaulted by, bro_workflow_install).
+    pub(crate) id: String,
+    /// Remove even if non-terminal arcs for this workflow are still
+    /// running. Default false (fail closed).
+    #[serde(default)]
+    pub(crate) force: Option<bool>,
 }
 
 #[cfg(test)]
@@ -985,6 +1089,195 @@ mod tests {
         assert!(
             server.state.arc_cancel_tokens.read().is_empty(),
             "cancel token still registered after arc terminated"
+        );
+    }
+
+    // ── bro_cron_remove ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bro_cron_remove_deletes_registry_entry_and_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let spec = serde_json::json!({
+            "name": "test-cron-remove",
+            "schedule": "0 0 9 * * *",
+            "routing_packet": "packet-test",
+        });
+        let install = server
+            .bro_cron_install(Parameters(CronInstallParams { spec }))
+            .await;
+        assert!(!install.is_error.unwrap_or(false), "install failed");
+        let store_dir = server.state.store_dir.clone();
+        let persisted = store_dir.join("crons").join("test-cron-remove.json");
+        assert!(persisted.exists(), "expected cron spec to be persisted");
+        assert_eq!(server.state.crons.list().len(), 1);
+
+        let remove = server
+            .bro_cron_remove(Parameters(CronRemoveParams {
+                name: "test-cron-remove".into(),
+            }))
+            .await;
+        assert!(
+            !remove.is_error.unwrap_or(false),
+            "remove failed: {:?}",
+            remove.content
+        );
+        assert!(server.state.crons.list().is_empty());
+        assert!(
+            !persisted.exists(),
+            "expected persisted cron file to be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_cron_remove_unknown_name_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let remove = server
+            .bro_cron_remove(Parameters(CronRemoveParams {
+                name: "does-not-exist".into(),
+            }))
+            .await;
+        assert!(remove.is_error.unwrap_or(false));
+    }
+
+    // ── bro_workflow_remove ──────────────────────────────────────
+
+    fn minimal_workflow_spec(name: &str) -> Value {
+        serde_json::json!({
+            "name": name,
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Only": {"actor": "", "prompt": "done", "next": {"type": "terminal"}}
+            },
+            "start": "Only"
+        })
+    }
+
+    #[tokio::test]
+    async fn bro_workflow_remove_deletes_registry_entry_and_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let install = server
+            .bro_workflow_install(Parameters(WorkflowInstallParams {
+                id: Some("wf-remove-me".into()),
+                spec: minimal_workflow_spec("wf-remove-me"),
+            }))
+            .await;
+        assert!(!install.is_error.unwrap_or(false), "install failed");
+        let persisted = server
+            .state
+            .store_dir
+            .join("workflows")
+            .join("wf-remove-me.json");
+        assert!(persisted.exists());
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("wf-remove-me")
+        );
+
+        let remove = server
+            .bro_workflow_remove(Parameters(WorkflowRemoveParams {
+                id: "wf-remove-me".into(),
+                force: None,
+            }))
+            .await;
+        assert!(
+            !remove.is_error.unwrap_or(false),
+            "remove failed: {:?}",
+            remove.content
+        );
+        assert!(
+            !server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("wf-remove-me")
+        );
+        assert!(!persisted.exists());
+    }
+
+    #[tokio::test]
+    async fn bro_workflow_remove_unknown_id_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let remove = server
+            .bro_workflow_remove(Parameters(WorkflowRemoveParams {
+                id: "does-not-exist".into(),
+                force: None,
+            }))
+            .await;
+        assert!(remove.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn bro_workflow_remove_refuses_when_arc_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server
+            .bro_workflow_install(Parameters(WorkflowInstallParams {
+                id: Some("wf-in-flight".into()),
+                spec: minimal_workflow_spec("wf-in-flight"),
+            }))
+            .await;
+        // Simulate an in-flight arc: running_arcs snapshots persist for
+        // the arc's lifetime (see workflow::engine::arc_state), keyed by
+        // arc_thread_id, distinguished from terminal states by
+        // status == "running".
+        server.state.running_arcs.write().insert(
+            "thread-in-flight".into(),
+            crate::server::state::ArcSnapshot {
+                arc_id: "arc-in-flight".into(),
+                arc_thread_id: "thread-in-flight".into(),
+                workflow_name: "wf-in-flight".into(),
+                workflow_version: 1,
+                status: "running".into(),
+                current_node: Some("Only".into()),
+                completed_nodes: vec![],
+                in_flight_nodes: vec![],
+                last_verdict: None,
+                visit_counts: std::collections::HashMap::new(),
+                started_at: "2026-08-14T00:00:00Z".into(),
+                updated_at: "2026-08-14T00:00:00Z".into(),
+            },
+        );
+
+        let refused = server
+            .bro_workflow_remove(Parameters(WorkflowRemoveParams {
+                id: "wf-in-flight".into(),
+                force: None,
+            }))
+            .await;
+        assert!(refused.is_error.unwrap_or(false));
+        assert!(
+            server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("wf-in-flight"),
+            "workflow must not be removed while an arc is running"
+        );
+
+        let forced = server
+            .bro_workflow_remove(Parameters(WorkflowRemoveParams {
+                id: "wf-in-flight".into(),
+                force: Some(true),
+            }))
+            .await;
+        assert!(
+            !forced.is_error.unwrap_or(false),
+            "force=true should override the running-arc refusal"
+        );
+        assert!(
+            !server
+                .state
+                .workflow_registry
+                .read()
+                .contains_key("wf-in-flight")
         );
     }
 }

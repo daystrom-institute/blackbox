@@ -811,6 +811,7 @@ mod tests {
             vars_schema: None,
             on_arc_exit: Vec::new(),
             on_arc_cancel: Vec::new(),
+            shell_allowlist: None,
         };
         state.workflow_registry.write().insert(name.to_string(), wf);
     }
