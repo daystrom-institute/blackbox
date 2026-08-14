@@ -143,6 +143,34 @@ fn open_checkout_registry(store_dir: &Path) -> bbox_indexing::checkout_registry:
     registry
 }
 
+/// Which conversation-lane connector scopes the corpus may project, from the
+/// operator's connector grants.
+///
+/// Config is the authority, not the landing store: a store directory survives
+/// a grant being retired, and projecting from directories on disk would keep a
+/// retired workspace searchable. Reading the grants means retiring one is what
+/// unenrolls it, and the reindex purge follows on the next pass.
+///
+/// The declared `remote_authority` travels with each scope because it is the
+/// one input permalink derivation needs beyond the record itself, and it is
+/// operator-declared rather than producer-supplied.
+fn conversation_source_enrollments(
+    cfg: &config::Config,
+) -> Vec<bbox_corpus_index::transcripts::conversation::ConversationSourceEnrollmentV1> {
+    cfg.source_connectors
+        .producers
+        .iter()
+        .flat_map(|producer| producer.scopes.iter())
+        .filter(|grant| grant.profile == config::ConnectorProfile::Conversation)
+        .map(
+            |grant| bbox_corpus_index::transcripts::conversation::ConversationSourceEnrollmentV1 {
+                scope: grant.scope(),
+                remote_authority: grant.remote_authority.clone(),
+            },
+        )
+        .collect()
+}
+
 fn backfill_project_languages(
     projects: &Arc<RwLock<ProjectRegistry>>,
     checkout_access: &bbox_indexing::checkout_access::CheckoutAccessBroker,
@@ -523,6 +551,14 @@ pub(super) fn open_shared_state(
     {
         idx.set_gemini_tmp_root(gemini_tmp);
     }
+    // Connector-landed conversations. Enrollment is operator config, read
+    // here from the connector grants that name the conversation lane: a scope
+    // the operator retires stops being scanned and the reindex purge removes
+    // its documents.
+    idx.set_conversation_sources(
+        cfg.paths.state_dir.join("conversation-sources"),
+        conversation_source_enrollments(&cfg),
+    );
     // The daemon's single tantivy writer: every index mutation and reindex
     // pass flows through this actor (concurrency-model §4.3). Spawned AFTER
     // all ReindexConfig mutation — the actor clones the config at spawn.
