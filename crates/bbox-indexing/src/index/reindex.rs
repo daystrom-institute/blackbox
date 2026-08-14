@@ -1399,6 +1399,8 @@ mod tests {
             roadmap_path: root.join("roadmap.json"),
             harness_sessions_dir: Some(sessions_dir),
             gemini_tmp_root: None,
+            conversation_source_root: None,
+            conversation_sources: Vec::new(),
         };
 
         let (schema, fields) = crate::index::build_schema();
@@ -1498,6 +1500,8 @@ mod tests {
             roadmap_path: root.join("roadmap.json"),
             harness_sessions_dir: Some(sessions_dir),
             gemini_tmp_root: None,
+            conversation_source_root: None,
+            conversation_sources: Vec::new(),
         };
 
         let files = scan_all_source_files(&config);

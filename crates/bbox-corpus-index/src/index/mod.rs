@@ -13,7 +13,10 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g11-path-free-project-files";
+// Bumped for the conversation-lane fields (source / author / channel /
+// permalink). A schema bump drops the index at the next open and the reindex
+// IS the backfill, which is the deliberate migration pattern for this crate.
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g12-conversation-projection";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -157,6 +160,35 @@ pub struct FieldHandles {
     pub tool_outcome: Field,
     pub task_id: Field,
     pub tool_use_id: Field,
+    /// The transcript SOURCE lane a document came from (`glm`, `claude`,
+    /// `slack`, ...), stamped on every transcript and tool_call doc.
+    ///
+    /// Distinct from `account`, which names WHICH account or workspace inside
+    /// a lane. Connector-landed conversations need one filter that includes or
+    /// excludes them wholesale (design section 7), and overloading `account`
+    /// for that would make "everything except Slack" unexpressible without
+    /// enumerating every account on the host.
+    pub source: Field,
+    /// Provider-issued author identity on a conversation document.
+    ///
+    /// Its own field rather than a role value: the role vocabulary describes
+    /// turn KIND and authorship is identity (design 4.3). Callers who care who
+    /// spoke filter on this; the role lane only distinguishes human from app.
+    pub author_id: Field,
+    /// `human` / `app` / `unknown`, the authorship distinction the collapsed
+    /// role lane cannot carry.
+    pub author_kind: Field,
+    /// Conversation provenance, indexed so a later graph pass can build
+    /// channel, thread, author, and permalink vertices from landed records
+    /// without a re-ingest (design section 7, gap-5d57d2bb).
+    pub conversation_workspace_id: Field,
+    pub conversation_channel_id: Field,
+    /// Observed channel name, never identity.
+    pub conversation_channel_name: Field,
+    pub conversation_message_ts: Field,
+    pub conversation_thread_ts: Field,
+    /// Derived at index time from workspace, channel, and ts.
+    pub permalink: Field,
 }
 
 /// Config needed by the background reindex thread.
@@ -186,6 +218,17 @@ pub struct ReindexConfig {
     /// hermetic-by-default contract as `harness_sessions_dir`: `None`
     /// disables the adapter. Set via [`TranscriptIndex::set_gemini_tmp_root`].
     pub gemini_tmp_root: Option<PathBuf>,
+    /// The daemon's conversation landing store root
+    /// (`<state_dir>/conversation-sources`) whose landed records project into
+    /// transcript documents. `None` disables the conversation adapter, which
+    /// is what every hermetic index gets.
+    pub conversation_source_root: Option<PathBuf>,
+    /// Which conversation-lane connector scopes the corpus may project, with
+    /// the vendor tenant each grant declares. Empty disables the adapter even
+    /// when the root is set: enrollment is operator config, so retiring the
+    /// last grant purges the lane on the next pass rather than leaving
+    /// documents behind for a source nobody is granted anymore.
+    pub conversation_sources: Vec<crate::transcripts::conversation::ConversationSourceEnrollmentV1>,
 }
 
 pub struct TranscriptIndex {
@@ -510,6 +553,8 @@ impl TranscriptIndex {
             roadmap_path,
             harness_sessions_dir: None,
             gemini_tmp_root: None,
+            conversation_source_root: None,
+            conversation_sources: Vec::new(),
         };
         let active_code_selectors = load_active_code_selectors(
             &records_provider.records_snapshot().corpus_project_ids,
@@ -807,6 +852,23 @@ impl TranscriptIndex {
     /// daemon startup; left unset (disabled) in hermetic test indexes.
     pub fn set_gemini_tmp_root(&mut self, tmp_root: PathBuf) {
         self.config.gemini_tmp_root = Some(tmp_root);
+    }
+
+    /// Enable projection of connector-landed conversations from `root` for the
+    /// operator-granted `sources`. Called by daemon startup from the connector
+    /// grant table; left unset (disabled) in hermetic test indexes.
+    ///
+    /// Both halves are required to project anything, and both are operator
+    /// authority: a granted scope that is later retired disappears from
+    /// `sources`, its channels stop being scanned, and the purge phase removes
+    /// their documents.
+    pub fn set_conversation_sources(
+        &mut self,
+        root: PathBuf,
+        sources: Vec<crate::transcripts::conversation::ConversationSourceEnrollmentV1>,
+    ) {
+        self.config.conversation_source_root = Some(root);
+        self.config.conversation_sources = sources;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1284,6 +1346,20 @@ pub fn build_schema() -> (Schema, FieldHandles) {
         tool_outcome: builder.add_text_field("tool_outcome", STRING | STORED),
         task_id: builder.add_text_field("task_id", STRING | STORED),
         tool_use_id: builder.add_text_field("tool_use_id", STRING | STORED),
+        source: builder.add_text_field("source", STRING | STORED),
+        author_id: builder.add_text_field("author_id", STRING | STORED),
+        author_kind: builder.add_text_field("author_kind", STRING | STORED),
+        conversation_workspace_id: builder
+            .add_text_field("conversation_workspace_id", STRING | STORED),
+        conversation_channel_id: builder.add_text_field("conversation_channel_id", STRING | STORED),
+        // TEXT rather than STRING: a channel name is prose an agent searches
+        // for ("the incident channel"), not a key it filters on. The id next
+        // to it is the exact-match lane.
+        conversation_channel_name: builder
+            .add_text_field("conversation_channel_name", TEXT | STORED),
+        conversation_message_ts: builder.add_text_field("conversation_message_ts", STRING | STORED),
+        conversation_thread_ts: builder.add_text_field("conversation_thread_ts", STRING | STORED),
+        permalink: builder.add_text_field("permalink", STRING | STORED),
     };
     (builder.build(), fields)
 }
@@ -2135,6 +2211,8 @@ mod tests {
                 role: None,
                 include_subagents: None,
                 limit: Some(5),
+                source: None,
+                author: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2235,6 +2313,8 @@ mod tests {
                         role: None,
                         include_subagents: None,
                         limit: Some(10),
+                        source: None,
+                        author: None,
                         exclude_self: None,
                     },
                     Some(&filter),

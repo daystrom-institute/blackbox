@@ -667,6 +667,24 @@ impl ConversationSourceStore {
         Ok(out)
     }
 
+    /// Where one channel's journal lives.
+    ///
+    /// Exposed for the corpus-side projection, which needs bytes to stat for
+    /// change detection: a channel whose journal has not grown since the last
+    /// pass must not be reprojected. It is deliberately NOT an identity. The
+    /// path contains two one-way hashes and moves with the daemon's state dir,
+    /// so anything durable keys on `(workspace_id, channel_id)` instead
+    /// (design section 4.3's non-path location fingerprint).
+    pub fn channel_journal_path(
+        &self,
+        scope: &ConnectorScope,
+        workspace_id: &str,
+        channel_id: &str,
+    ) -> PathBuf {
+        self.channel_dir(scope, workspace_id, channel_id)
+            .join("journal.ndjson")
+    }
+
     /// Every landed message on a channel, chronological, revisions folded in
     /// and tombstones marked.
     ///

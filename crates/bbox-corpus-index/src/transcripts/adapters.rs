@@ -74,6 +74,18 @@ impl TranscriptAdapterRegistry {
                 tmp_root,
             )));
         }
+        // Connector-landed conversations. Same explicit-only contract as every
+        // other source: no root and no enrolled scopes means no adapter, so a
+        // hermetic index never reaches the operator's landing store, and an
+        // operator who retires every conversation grant stops projecting them.
+        if let Some(root) = &config.conversation_source_root
+            && let Some(adapter) = super::conversation::ConversationTranscriptAdapter::open(
+                root,
+                config.conversation_sources.clone(),
+            )
+        {
+            adapters.push(Box::new(adapter));
+        }
         Self::new(adapters)
     }
 
