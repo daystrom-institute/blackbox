@@ -3574,11 +3574,33 @@ fn remove_generation_record(index_root: &Path, generation_id: &str) -> bool {
     removed
 }
 
-/// The startup gate refuses a cut-time manifest whose proof mode is not
-/// Equality (P6-C task 1, D-036), driven through the real gate against a real
-/// committed manifest.
+/// The startup gate over a manifest committed by a daemon-upgrade replacement,
+/// driven through the real gate against a real committed manifest.
+///
+/// **This row inverted, deliberately.** It used to assert the refusal, which
+/// was the correct reading of D-036 while the migration asset was the only
+/// possible predecessor. In production that refusal was not an
+/// operator-actionable signal but a durable brick: the replacement above is the
+/// ordinary schema bump, the asset proof is unreachable across it by
+/// construction (the migration refuses to capture a marker-mismatched index, so
+/// the recomputed fingerprint folds a Corrupt state), and the resulting Drift
+/// manifest survives on the volume, so every later boot of every binary vintage
+/// refused. Rolling the image back did not help, because the manifest is
+/// durable and the rollback does not touch it.
+///
+/// So the gate now re-founds a proof it can attribute to the schema-version
+/// transition, on the manifest's OWN pinned generations, and refuses everything
+/// it cannot attribute. D-036 is unchanged: the manifest that binds must still
+/// record Equality with two matching fingerprints, and this asserts that it
+/// does, from a basis that says which predecessor proved it.
 #[test]
-fn the_startup_gate_refuses_a_non_equality_cut_time_manifest() {
+fn the_startup_gate_refounds_a_schema_transition_manifest_and_binds() {
+    use bbox_corpus_index::index::history_generations::{HistoryProofBasisV1, HistoryProofModeV1};
+    use bbox_indexing::project_catalog_rebuild::{
+        read_committed_rebuild_manifest, require_equality_proof_mode,
+    };
+    use blackbox::project_catalog_rebuild_admin::RebuildStartupGateV1;
+
     let fixture = Arc::new(RebuildFixture::new());
     let index_root = fixture.index_root();
     watchdogged("the shared replacement driver", {
@@ -3587,12 +3609,58 @@ fn the_startup_gate_refuses_a_non_equality_cut_time_manifest() {
     });
     let layout_store = fixture.store();
 
-    let refusal = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+    // What the bump actually committed, before the gate touches it.
+    let bumped = read_committed_rebuild_manifest(&index_root).unwrap();
+    assert_eq!(bumped.prepared.proof_mode, HistoryProofModeV1::Drift);
+    assert_eq!(
+        bumped.prepared.proof_basis,
+        HistoryProofBasisV1::MigrationAsset
+    );
+
+    let coverage = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
         &layout_store,
         &index_root,
     )
-    .unwrap_err();
-    assert_eq!(refusal.code, "error.project_catalog_rebuild_proof_mode");
+    .expect("a manifest whose Drift is attributable to the schema bump must not brick the daemon");
+    let RebuildStartupGateV1::Verified { refounded, .. } = &coverage else {
+        panic!("the gate must run in full: {coverage:?}");
+    };
+    assert!(
+        refounded.is_some(),
+        "the receipt must surface that a durable manifest was rewritten on this boot: {coverage:?}"
+    );
+
+    // The manifest that now binds satisfies D-036 on its own terms, and every
+    // generation the bump pinned is still pinned by it.
+    let repaired = read_committed_rebuild_manifest(&index_root).unwrap();
+    require_equality_proof_mode(&repaired).expect("the re-founded manifest records Equality");
+    assert_eq!(
+        repaired.prepared.proof_basis,
+        HistoryProofBasisV1::PinnedGenerationLineage
+    );
+    assert_eq!(
+        repaired.pinned_generation_ids(),
+        bumped.pinned_generation_ids()
+    );
+
+    // Idempotent: the next boot finds an Equality manifest and rewrites
+    // nothing.
+    let second = blackbox::project_catalog_rebuild_admin::validate_rebuild_coverage_before_bind(
+        &layout_store,
+        &index_root,
+    )
+    .expect("the repaired volume boots");
+    let RebuildStartupGateV1::Verified { refounded, .. } = &second else {
+        panic!("the gate must run in full: {second:?}");
+    };
+    assert!(
+        refounded.is_none(),
+        "the repair must not repeat: {second:?}"
+    );
+    assert_eq!(
+        read_committed_rebuild_manifest(&index_root).unwrap(),
+        repaired
+    );
 }
 
 /// The startup gate refuses a migrated store carrying legacy namespaces with
