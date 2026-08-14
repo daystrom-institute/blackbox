@@ -80,6 +80,8 @@ pub use cycle::{
     run_publication_cycle,
 };
 pub use journal::{ChannelJournal, Journal, MessageBaseline, ThreadMark};
-pub use policy::{ChannelDecision, ChannelPolicy, CompiledChannelPolicy, EnrollmentMode, SkipCounters};
+pub use policy::{
+    ChannelDecision, ChannelPolicy, CompiledChannelPolicy, EnrollmentMode, SkipCounters,
+};
 pub use secret::SecretRef;
 pub use slack::{RatePolicy, SlackClient, SlackRead, SlackReadMethod};

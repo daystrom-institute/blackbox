@@ -410,15 +410,10 @@ impl SlackRead for SlackClient {
         };
         let mut channels: Vec<RawChannel> = Vec::new();
         let (_, complete) = self
-            .paginate::<ConversationsListResponse, _>(
-                method,
-                &params,
-                request.max_pages,
-                |page| {
-                    channels.extend(page.channels);
-                    page.response_metadata.cursor().map(str::to_string)
-                },
-            )
+            .paginate::<ConversationsListResponse, _>(method, &params, request.max_pages, |page| {
+                channels.extend(page.channels);
+                page.response_metadata.cursor().map(str::to_string)
+            })
             .await?;
         if request.memberships_only {
             for channel in &mut channels {
