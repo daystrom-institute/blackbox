@@ -200,6 +200,15 @@ impl WorkflowRunner<'_> {
         status: crate::workflow::arc_store::ArcCheckpointStatus,
         current_node: &str,
     ) -> crate::workflow::arc_store::ArcCheckpoint {
+        self.build_checkpoint_with_deadline(status, current_node, None)
+    }
+
+    pub(super) fn build_checkpoint_with_deadline(
+        &self,
+        status: crate::workflow::arc_store::ArcCheckpointStatus,
+        current_node: &str,
+        waiting_deadline: Option<String>,
+    ) -> crate::workflow::arc_store::ArcCheckpoint {
         let mut in_flight_nodes: Vec<String> = self.in_flight.keys().cloned().collect();
         in_flight_nodes.sort();
         crate::workflow::arc_store::ArcCheckpoint {
@@ -219,6 +228,7 @@ impl WorkflowRunner<'_> {
             status,
             in_flight_nodes,
             arc_thread_id: self.arc_thread_id.clone(),
+            waiting_deadline,
             saved_at: crate::util::now_iso(),
         }
     }
@@ -231,14 +241,47 @@ impl WorkflowRunner<'_> {
         status: crate::workflow::arc_store::ArcCheckpointStatus,
         current_node: &str,
     ) {
+        self.write_checkpoint_with_deadline(status, current_node, None)
+            .await;
+    }
+
+    pub(super) async fn write_checkpoint_with_deadline(
+        &self,
+        status: crate::workflow::arc_store::ArcCheckpointStatus,
+        current_node: &str,
+        waiting_deadline: Option<String>,
+    ) {
         if !self.should_checkpoint() {
             return;
         }
-        let cp = self.build_checkpoint(status, current_node);
+        let cp = self.build_checkpoint_with_deadline(status, current_node, waiting_deadline);
         if let Err(e) = self.server.state.arc_store.save(&cp).await {
             tracing::warn!(
                 "arc {} checkpoint write failed at node '{current_node}': {e:#}",
                 self.ctx.meta.arc_id
+            );
+            // A STALE resumable checkpoint is worse than none: if this
+            // arc advances past the state on disk and the daemon then
+            // restarts, rehydration would re-run already-executed work.
+            // Drop durability for this arc instead, and say so on the
+            // arc thread.
+            if let Err(remove_err) = self
+                .server
+                .state
+                .arc_store
+                .remove(&self.ctx.meta.arc_id)
+                .await
+            {
+                tracing::warn!(
+                    "arc {} stale-checkpoint removal also failed: {remove_err:#}",
+                    self.ctx.meta.arc_id
+                );
+            }
+            self.arc_note(
+                "blocked",
+                &format!(
+                    "arc checkpoint persistence degraded ({e}); crash-resume disabled for this arc"
+                ),
             );
         }
     }

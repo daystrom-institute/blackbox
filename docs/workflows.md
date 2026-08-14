@@ -1150,9 +1150,27 @@ On boot, a rehydration pass replays what survived:
 - Sub-workflow arcs do not checkpoint independently in v1; a crash
   inside one interrupts the parent arc.
 
-The narrow crash window between a live signal resolving a wait and the
-next boundary checkpoint can still lose that one signal; everything
-coarser than a node boundary is durable.
+Durability semantics worth knowing:
+
+- Replayed signals are at-least-once ACROSS arcs: ledger catch-up is
+  per-arc (each arc tracks its own consumed ids), so two arcs parked on
+  the same signal + correlation can both consume one persisted idle
+  signal, where a live delivery resolves exactly one wait. One arc per
+  external subject is the admission invariant's job, not the ledger's.
+- A wait resolution is checkpointed BEFORE on_exit hooks and gates run,
+  so a crash in that window rehydrates as a loud `interrupted` arc
+  rather than silently double-consuming the signal.
+- Finite waits persist an absolute deadline; rehydration opens the
+  REMAINING window (timing out immediately when it passed during the
+  outage) instead of restarting the clock.
+- If a checkpoint write fails, the arc's stale checkpoint is removed
+  and a `blocked` note lands on the arc thread: crash-resume is
+  disabled for that arc rather than risking a stale-state resurrection.
+  Idle direct signals report `durable_persist` in the dispatch response
+  so callers can tell "parked in the ledger" from "lost".
+- The narrow crash window between a LIVE signal resolving a wait and
+  that resolution checkpoint can still lose the signal; everything
+  coarser is durable.
 
 ## Retention
 

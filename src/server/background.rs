@@ -291,13 +291,22 @@ fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
                         continue;
                     }
                     let correlation = event.correlation.clone();
-                    let payload = serde_json::to_value(&event).unwrap_or_else(|e| {
-                        serde_json::json!({
-                            "event_id": event.id,
-                            "kind": signal,
-                            "serialization_error": e.to_string(),
+                    // Router-persisted idle signals deliver the caller's
+                    // raw payload so templates see the same shape as a
+                    // live delivery; other producers keep the envelope
+                    // form consumers already depend on. Either way the
+                    // event id travels for consumed-event bookkeeping.
+                    let payload = if event.producer == "signal.router" {
+                        event.payload.clone()
+                    } else {
+                        serde_json::to_value(&event).unwrap_or_else(|e| {
+                            serde_json::json!({
+                                "event_id": event.id,
+                                "kind": signal,
+                                "serialization_error": e.to_string(),
+                            })
                         })
-                    });
+                    };
                     let resolved =
                         signal_arc_dispatch(
                             &shared,
@@ -305,6 +314,7 @@ fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
                             correlation,
                             payload,
                             SignalDispatchOrigin::SystemEventBridge,
+                            Some(event.id.clone()),
                         )
                         .await;
                     tracing::debug!(

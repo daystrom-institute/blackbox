@@ -91,6 +91,13 @@ pub struct SignalRef {
     pub payload: Value,
     pub correlation: Map<String, Value>,
     pub received_at: String,
+    /// The persisted system-event id this signal was materialized from,
+    /// when it came through the durable ledger (registration catch-up or
+    /// the system-event bridge). Used for consumed-event bookkeeping so
+    /// one event never resolves the same arc twice; None for live direct
+    /// signals, which have no persisted event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
 }
 
 /// Schema entry for a single arc variable. `kind` is enforced when a
@@ -496,6 +503,7 @@ mod tests {
             payload: json!({"pr": 117, "merged_by": "alice"}),
             correlation: serde_json::Map::from_iter([("pr".to_string(), json!(117))]),
             received_at: "2026-04-26T00:01:00Z".into(),
+            source_event_id: None,
         });
         c
     }
@@ -675,6 +683,7 @@ mod tests {
             payload: json!({}),
             correlation: Map::new(),
             received_at: "ts".into(),
+            source_event_id: None,
         };
         c.record_signal(s.clone());
         assert!(c.last_signal.is_some());

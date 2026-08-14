@@ -28,8 +28,21 @@ pub(crate) async fn resume_workflow_from_checkpoint(
     server: &BlackboxServer,
     cp: ArcCheckpoint,
 ) -> Result<WorkflowRunResult> {
-    let compiled = crate::workflow::compile(cp.workflow.clone())
-        .map_err(|e| anyhow!("resume compile for arc {}: {e}", cp.arc_id))?;
+    // Process-local claim: two overlapping rehydration passes (or a
+    // stray double-call) must not spawn two runners for one arc.
+    if !server.state.arc_store.try_claim(&cp.arc_id) {
+        return Err(anyhow!(
+            "arc {} is already claimed by a live runner in this process",
+            cp.arc_id
+        ));
+    }
+    let compiled = match crate::workflow::compile(cp.workflow.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            server.state.arc_store.release_claim(&cp.arc_id);
+            return Err(anyhow!("resume compile for arc {}: {e}", cp.arc_id));
+        }
+    };
     let mut runner = WorkflowRunner::new(
         server,
         &compiled,
@@ -48,7 +61,15 @@ pub(crate) async fn resume_workflow_from_checkpoint(
     runner.steps = cp.steps;
     runner.arc_thread_id = cp.arc_thread_id.clone();
     if cp.status == ArcCheckpointStatus::Waiting {
+        // The Waiting checkpoint was written INSIDE the parked node's
+        // step, which run_from will charge again on re-entry; back off
+        // by one so resuming does not double-bill the budget (and
+        // cannot fail an arc parked exactly at max_steps). Boundary
+        // (Running) checkpoints charge the NEXT node fresh and need no
+        // adjustment.
+        runner.steps = cp.steps.saturating_sub(1);
         runner.resume_skip_on_enter = Some(cp.current_node.clone());
+        runner.resume_wait_deadline = cp.waiting_deadline.clone();
     }
     runner.log_event(
         "rehydrated",
@@ -69,8 +90,11 @@ pub(crate) async fn resume_workflow_from_checkpoint(
         ),
     );
     runner.update_arc_snapshot("running", "(rehydrated)", Some(&cp.current_node));
+    let arc_id = cp.arc_id.clone();
     let run_result = runner.run_from(cp.current_node).await;
-    Ok(finish_arc_run(runner, run_result).await)
+    let result = finish_arc_run(runner, run_result).await;
+    server.state.arc_store.release_claim(&arc_id);
+    Ok(result)
 }
 
 /// Boot pass: load every surviving checkpoint, resume the resumable

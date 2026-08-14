@@ -21,7 +21,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use tokio::io::AsyncWriteExt;
 
 use super::Workflow;
@@ -80,19 +79,21 @@ pub struct ArcCheckpoint {
     pub status: ArcCheckpointStatus,
     pub in_flight_nodes: Vec<String>,
     pub arc_thread_id: Option<String>,
+    /// Absolute wall-clock deadline (ISO 8601) for a Waiting arc whose
+    /// WaitSpec declared a timeout. Rehydration resumes with the
+    /// REMAINING duration (or times out immediately when the deadline
+    /// passed during the outage) instead of restarting the full window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_deadline: Option<String>,
     pub saved_at: String,
 }
 
-/// Registered-wait descriptor derivable from a Waiting checkpoint.
-/// The in-memory WaitStore is rebuilt by re-entering the wait node on
-/// resume, so this is observational (peek/status surfaces), not a
-/// second source of truth.
-#[derive(Debug, Clone, Serialize)]
-pub struct CheckpointWaitView {
-    pub arc_id: String,
-    pub node: String,
-    pub correlation: Map<String, Value>,
-}
+// Intentionally NOT checkpointed: `actor_tasks`, `ensemble_tasks`, and
+// `atom_invocations`. Task ids and invocation handles are process-scoped
+// (the daemon task registry does not survive a restart), so restoring
+// them would point resumed arcs at dead entries. Provider-scoped
+// continuity (`actor_sessions`, `ensemble_sessions`) IS checkpointed and
+// is what durable actors need to resume their sessions.
 
 /// Disk store for arc checkpoints. All I/O is async; callers hold no
 /// locks across these awaits. Per-arc write ordering is guaranteed by
@@ -101,11 +102,30 @@ pub struct CheckpointWaitView {
 #[derive(Debug)]
 pub struct ArcStore {
     dir: PathBuf,
+    /// Arc ids claimed by a live runner in THIS process (fresh runs and
+    /// rehydration resumes both claim). Guards against two runners for
+    /// one arc id - e.g. overlapping rehydration passes - without
+    /// touching the on-disk file, which must stay resumable until the
+    /// claimed runner actually advances it.
+    claims: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ArcStore {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            claims: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Claim an arc id for a live runner. Returns false when another
+    /// runner in this process already holds it.
+    pub fn try_claim(&self, arc_id: &str) -> bool {
+        self.claims.lock().insert(arc_id.to_string())
+    }
+
+    pub fn release_claim(&self, arc_id: &str) {
+        self.claims.lock().remove(arc_id);
     }
 
     fn path_for(&self, arc_id: &str) -> PathBuf {
@@ -124,7 +144,10 @@ impl ArcStore {
             .with_context(|| format!("create arc checkpoint dir {:?}", self.dir))?;
         let path = self.path_for(&cp.arc_id);
         let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(cp).context("serialize arc checkpoint")?;
+        // Compact form: checkpoints are written at node-boundary
+        // frequency and carry the full spec + context, so pretty
+        // printing is pure write amplification.
+        let bytes = serde_json::to_vec(cp).context("serialize arc checkpoint")?;
         let mut f = tokio::fs::File::create(&tmp)
             .await
             .with_context(|| format!("create {tmp:?}"))?;
@@ -153,7 +176,17 @@ impl ArcStore {
         let mut out = Vec::new();
         let mut entries = match tokio::fs::read_dir(&self.dir).await {
             Ok(e) => e,
-            Err(_) => return out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
+            Err(e) => {
+                // An unreadable checkpoint dir is degraded durability,
+                // not an empty one - say so loudly instead of silently
+                // reporting no arcs.
+                tracing::error!(
+                    "arc checkpoint dir {:?} unreadable ({e}); suspended arcs CANNOT rehydrate",
+                    self.dir
+                );
+                return out;
+            }
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
@@ -171,17 +204,28 @@ impl ArcStore {
                 Ok(cp) if cp.schema_version == ARC_CHECKPOINT_SCHEMA_VERSION => out.push(cp),
                 Ok(cp) => {
                     tracing::warn!(
-                        "arc checkpoint {path:?} has schema_version {} (want {}); skipping",
+                        "arc checkpoint {path:?} has schema_version {} (want {}); quarantining",
                         cp.schema_version,
                         ARC_CHECKPOINT_SCHEMA_VERSION
                     );
+                    self.quarantine(&path).await;
                 }
                 Err(e) => {
-                    tracing::warn!("arc checkpoint {path:?} unparseable: {e}");
+                    tracing::warn!("arc checkpoint {path:?} unparseable ({e}); quarantining");
+                    self.quarantine(&path).await;
                 }
             }
         }
         out
+    }
+
+    /// Move a malformed or version-mismatched checkpoint aside so it is
+    /// preserved for triage but not reparsed on every boot.
+    async fn quarantine(&self, path: &std::path::Path) {
+        let target = path.with_extension("json.corrupt");
+        if let Err(e) = tokio::fs::rename(path, &target).await {
+            tracing::warn!("arc checkpoint quarantine {path:?} -> {target:?} failed: {e}");
+        }
     }
 
     /// Stamp a checkpoint interrupted in place (rehydration found it
@@ -246,6 +290,7 @@ mod tests {
             status: ArcCheckpointStatus::Waiting,
             in_flight_nodes: Vec::new(),
             arc_thread_id: Some("thread-00000000".into()),
+            waiting_deadline: None,
             saved_at: crate::util::now_iso(),
         }
     }
@@ -283,6 +328,19 @@ mod tests {
         let loaded = store.load_all().await;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].arc_id, "arc-good");
+        // Malformed and version-mismatched files were quarantined so
+        // they are preserved but never reparsed.
+        assert!(root.join("arcs").join("junk.json.corrupt").exists());
+        assert!(!root.join("arcs").join("junk.json").exists());
+    }
+
+    #[test]
+    fn claims_are_exclusive_until_released() {
+        let store = ArcStore::new(std::path::PathBuf::from("/nonexistent"));
+        assert!(store.try_claim("arc-1"));
+        assert!(!store.try_claim("arc-1"), "second claim must fail");
+        store.release_claim("arc-1");
+        assert!(store.try_claim("arc-1"));
     }
 
     #[tokio::test]

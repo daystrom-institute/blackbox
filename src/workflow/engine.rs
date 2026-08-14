@@ -574,6 +574,10 @@ struct WorkflowRunner<'a> {
     /// on_enter hooks already ran before the daemon restart. Consumed
     /// (cleared) by the first `run_activity_node` that matches it.
     resume_skip_on_enter: Option<String>,
+    /// Absolute deadline restored from a Waiting checkpoint. Consumed by
+    /// the re-entered wait node so it opens the REMAINING window rather
+    /// than restarting the full configured timeout.
+    resume_wait_deadline: Option<String>,
     /// Nesting depth for sub-workflow composition. Threaded through
     /// recursive `run_workflow_at_depth` calls so a chain of nested
     /// sub-workflows can't silently bypass the ceiling.
@@ -637,6 +641,7 @@ impl<'a> WorkflowRunner<'a> {
             steps: 0,
             arc_thread_id: None,
             resume_skip_on_enter: None,
+            resume_wait_deadline: None,
             composition_depth,
             event_sink: None,
             cancel_token,
@@ -719,12 +724,17 @@ impl<'a> WorkflowRunner<'a> {
         let mut current = start_node;
         // Durable position before the first body runs: a crash inside
         // a node body rehydrates as `interrupted` at that node instead
-        // of vanishing.
-        self.write_checkpoint(
-            super::arc_store::ArcCheckpointStatus::Running,
-            &current,
-        )
-        .await;
+        // of vanishing. SKIPPED when resuming into a parked wait node -
+        // overwriting the safe Waiting checkpoint with Running before
+        // the wait re-registers would turn a second crash in that
+        // window into an interruption of a perfectly resumable arc.
+        if self.resume_skip_on_enter.as_deref() != Some(current.as_str()) {
+            self.write_checkpoint(
+                super::arc_store::ArcCheckpointStatus::Running,
+                &current,
+            )
+            .await;
+        }
         while current != TERMINAL_SENTINEL {
             if self.cancel_token.is_cancelled() {
                 self.log_event(

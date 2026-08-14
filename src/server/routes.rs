@@ -615,6 +615,7 @@ pub(crate) async fn dispatch_verdict(
                 correlate.clone(),
                 signal_payload,
                 SignalDispatchOrigin::Direct,
+                None,
             )
             .await;
             // Slack proposal-approved hook: when a `proposal-approved`
@@ -3439,6 +3440,7 @@ pub(crate) async fn signal_arc_dispatch(
     correlation: serde_json::Map<String, Value>,
     payload: Value,
     origin: SignalDispatchOrigin,
+    source_event_id: Option<String>,
 ) -> Value {
     let store = &state.wait_store;
     let pending_before: Vec<_> = store
@@ -3464,6 +3466,7 @@ pub(crate) async fn signal_arc_dispatch(
             matched_wait_id: None,
             idle_pending: pending_before.clone(),
         });
+        let mut durable_persist = Value::Null;
         if origin == SignalDispatchOrigin::Direct {
             // Durable idle signal: persist so Wait-registration ledger
             // catch-up (and the live system-event bridge, which closes
@@ -3478,14 +3481,22 @@ pub(crate) async fn signal_arc_dispatch(
                 causation_id: None,
                 payload,
             };
-            if let Err(e) = state.system_events.emit(draft).await {
-                tracing::warn!("idle signal '{signal}' durable persist failed: {e:#}");
-            }
+            durable_persist = match state.system_events.emit(draft).await {
+                Ok(_) => json!("ok"),
+                Err(e) => {
+                    tracing::warn!("idle signal '{signal}' durable persist failed: {e:#}");
+                    // The caller must know its signal was NOT retained -
+                    // "no_matching_wait" alone reads as "safely parked
+                    // in the ledger", which would be a silent loss.
+                    json!(format!("failed: {e}"))
+                }
+            };
         }
         return json!({
             "status": "no_matching_wait",
             "signal": signal,
             "correlation": correlation,
+            "durable_persist": durable_persist,
             "pending_with_same_signal": pending_before,
         });
     };
@@ -3506,6 +3517,7 @@ pub(crate) async fn signal_arc_dispatch(
         payload,
         correlation,
         received_at: util::now_iso(),
+        source_event_id,
     };
     *resolved_slot.lock() = Some(sig);
     notify.notify_one();

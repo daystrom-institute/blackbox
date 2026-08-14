@@ -450,6 +450,7 @@ async fn system_events_workflow_wait_registered_and_signal_received() {
             payload: serde_json::Value::Null,
             correlation: serde_json::Map::new(),
             received_at: crate::util::now_iso(),
+            source_event_id: None,
         });
         // notify_one (not notify_waiters): the real router uses it
         // because it stores a permit when the runner has not reached

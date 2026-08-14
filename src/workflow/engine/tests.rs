@@ -691,6 +691,7 @@ async fn arc_checkpoint_written_at_wait_and_removed_at_terminal() {
         Map::new(),
         json!({"ok": true}),
         SignalDispatchOrigin::Direct,
+        None,
     )
     .await;
     assert_eq!(resolved["status"], "wait_resolved", "resolved: {resolved}");
@@ -734,6 +735,7 @@ async fn waiting_arc_resumes_across_restart_and_completes() {
         Map::new(),
         json!({"round": 2}),
         SignalDispatchOrigin::Direct,
+        None,
     )
     .await;
     assert_eq!(resolved["status"], "wait_resolved", "resolved: {resolved}");
@@ -772,6 +774,7 @@ async fn idle_direct_signal_persists_and_resumed_wait_replays_it() {
         Map::new(),
         json!({"while_down": true}),
         SignalDispatchOrigin::Direct,
+        None,
     )
     .await;
     assert_eq!(resolved["status"], "no_matching_wait");
@@ -822,4 +825,75 @@ async fn running_checkpoint_marks_interrupted_on_rehydrate() {
         assert_eq!(snap.status, "interrupted");
         assert_eq!(snap.current_node.as_deref(), Some("Park"));
     }
+}
+
+#[tokio::test]
+async fn resumed_wait_times_out_immediately_when_deadline_passed_while_down() {
+    use crate::workflow::arc_store::ArcCheckpointStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    // Same shape as wait_workflow_json but with a finite timeout so the
+    // Waiting checkpoint carries an absolute deadline.
+    let json = r#"{
+        "name": "wait-deadline",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "Park": {"actor": "", "wait": {"any_of": [{"signal": "never-comes"}], "timeout": "2h"}, "next": {"type": "goto", "to": "After"}},
+            "After": {"actor": "", "prompt": "woke on ${last_signal.name}", "next": {"type": "terminal"}}
+        },
+        "start": "Park"
+    }"#;
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    let run_state = state.clone();
+    let json_owned = json.to_string();
+    let handle = tokio::spawn(async move {
+        let server = BlackboxServer::new(run_state);
+        let compiled = compile(load_workflow(&json_owned).unwrap()).unwrap();
+        engine::run_workflow(&server, &compiled, None, Some(20)).await
+    });
+    let mut cp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let cps = state.arc_store.load_all().await;
+            if let Some(cp) = cps
+                .into_iter()
+                .find(|c| c.status == ArcCheckpointStatus::Waiting)
+            {
+                break cp;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("Waiting checkpoint appears");
+    assert!(
+        cp.waiting_deadline.is_some(),
+        "finite wait persists its absolute deadline"
+    );
+    handle.abort();
+    let _ = handle.await;
+
+    // Simulate the deadline expiring during the outage.
+    cp.waiting_deadline = Some("2020-01-01T00:00:00+00:00".to_string());
+    let state2 = Arc::new(SharedState::for_test(tmp.path()));
+    state2.arc_store.save(&cp).await.unwrap();
+    engine::rehydrate_arcs(state2.clone()).await;
+
+    // The resumed wait must open a ZERO remaining window and take the
+    // timeout branch immediately - no signal is ever dispatched.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if state2.arc_store.load_all().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("resumed arc timed out immediately and terminated");
+    let completed = state2
+        .running_arcs
+        .read()
+        .values()
+        .any(|snap| snap.arc_id == cp.arc_id && snap.status == "completed");
+    assert!(completed, "arc completed through the timeout branch");
 }

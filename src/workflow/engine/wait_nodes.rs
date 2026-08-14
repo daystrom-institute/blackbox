@@ -10,6 +10,23 @@ use crate::workflow::wait::{PendingWait, WaitSpec, canonicalize_correlation, mat
 
 use super::WorkflowRunner;
 
+/// Remaining duration until an RFC 3339 deadline; zero when the
+/// deadline already passed, None when the string does not parse.
+fn remaining_until(deadline_iso: &str) -> Option<Duration> {
+    let deadline = chrono::DateTime::parse_from_rfc3339(deadline_iso).ok()?;
+    let remaining = deadline.signed_duration_since(chrono::Utc::now());
+    Some(remaining.to_std().unwrap_or(Duration::ZERO))
+}
+
+/// Absolute RFC 3339 deadline `timeout` from now. Out-of-range spans
+/// (WaitSpec allows absurdly large ones) clamp to ten years, which is
+/// indistinguishable from "no deadline" for any real arc.
+fn deadline_from_now(timeout: Duration) -> String {
+    let span = chrono::Duration::from_std(timeout)
+        .unwrap_or_else(|_| chrono::Duration::days(3650));
+    (chrono::Utc::now() + span).to_rfc3339()
+}
+
 impl WorkflowRunner<'_> {
     pub(super) async fn run_sleep_node(&mut self, node_id: &str, duration_ms: u64) -> Result<()> {
         let duration = Duration::from_millis(duration_ms);
@@ -62,6 +79,25 @@ impl WorkflowRunner<'_> {
 
         self.ctx.clear_last_signal();
 
+        // Effective timeout: a fresh entry opens the spec's full window
+        // and stamps its absolute deadline into the checkpoint; a
+        // rehydration re-entry resumes the REMAINING window from that
+        // stamped deadline (zero if it passed while the daemon was
+        // down), so restarts can never extend a finite wait.
+        let (timeout, waiting_deadline) = match self.resume_wait_deadline.take() {
+            Some(deadline) => match remaining_until(&deadline) {
+                Some(remaining) => (Some(remaining), Some(deadline)),
+                None => {
+                    tracing::warn!(
+                        "arc {} wait '{node_id}': unparseable checkpoint deadline '{deadline}'; restarting the full window",
+                        self.ctx.meta.arc_id
+                    );
+                    (spec.timeout, spec.timeout.map(deadline_from_now))
+                }
+            },
+            None => (spec.timeout, spec.timeout.map(deadline_from_now)),
+        };
+
         // Durable park, written BEFORE the registrations become visible
         // to the signal router: a daemon restart from any point in this
         // node rehydrates the arc by re-entering it (on_enter skipped),
@@ -70,9 +106,10 @@ impl WorkflowRunner<'_> {
         // that arrived while down. Ordering also keeps the write out of
         // the registration-to-park window, which stays as narrow as it
         // was before checkpointing existed.
-        self.write_checkpoint(
+        self.write_checkpoint_with_deadline(
             crate::workflow::arc_store::ArcCheckpointStatus::Waiting,
             node_id,
+            waiting_deadline,
         )
         .await;
 
@@ -134,12 +171,16 @@ impl WorkflowRunner<'_> {
                 self.server
                     .state
                     .system_events
-                    .list_events(Some(128), Some(signal), None, None)
+                    .list_events(Some(512), Some(signal), None, None)
             else {
                 continue;
             };
+            // list_events returns newest-first; consume the OLDEST
+            // unconsumed match so a backlog drains in arrival order
+            // instead of starving old events behind new ones.
             if let Some(event) = events
                 .into_iter()
+                .rev()
                 .find(|event| {
                     !self.ctx.signal_event_consumed(&event.id)
                         && matches_correlation(correlation, &event.correlation)
@@ -147,24 +188,34 @@ impl WorkflowRunner<'_> {
                 && let Some((resolved, notify, _, _)) =
                     self.server.wait_store().take_exact(arc, wait_id)
             {
-                *resolved.lock() = Some(SignalRef {
-                    name: signal.clone(),
-                    payload: serde_json::to_value(&event).unwrap_or_else(|e| {
+                // Router-persisted idle signals carry the caller's raw
+                // payload; deliver that payload (not the event envelope)
+                // so templates see the same shape as a live delivery.
+                // Other producers' events keep the envelope form the
+                // bridge has always delivered.
+                let payload = if event.producer == "signal.router" {
+                    event.payload.clone()
+                } else {
+                    serde_json::to_value(&event).unwrap_or_else(|e| {
                         json!({
                             "event_id": event.id,
                             "kind": signal,
                             "serialization_error": e.to_string(),
                         })
-                    }),
+                    })
+                };
+                *resolved.lock() = Some(SignalRef {
+                    name: signal.clone(),
+                    payload,
                     correlation: event.correlation,
                     received_at: crate::util::now_iso(),
+                    source_event_id: Some(event.id),
                 });
                 notify.notify_one();
                 break;
             }
         }
 
-        let timeout = spec.timeout;
         let cancel_token = self.cancel_token.clone();
         enum WaitOutcome {
             Resolved,
@@ -210,6 +261,7 @@ impl WorkflowRunner<'_> {
                 }),
                 correlation: Map::new(),
                 received_at: crate::util::now_iso(),
+                source_event_id: None,
             };
             self.log_event(
                 "wait_timeout",
@@ -231,11 +283,19 @@ impl WorkflowRunner<'_> {
             .lock()
             .clone()
             .ok_or_else(|| anyhow!("Wait '{node_id}' notified but resolved slot empty"))?;
-        // Ledger- and bridge-resolved signals carry the serialized
-        // system event as payload; remember its id so a loop revisit or
-        // a restart re-registration can't consume the same event twice.
-        // Live direct signals have no persisted event and record nothing.
-        if let Some(event_id) = sig.payload.get("id").and_then(|v| v.as_str()) {
+        // Ledger- and bridge-resolved signals carry the persisted
+        // event's id; remember it so a loop revisit or a restart
+        // re-registration can't consume the same event twice. The
+        // payload["id"] fallback covers pre-source_event_id envelope
+        // payloads still delivered for non-router producers. Live
+        // direct signals have no persisted event and record nothing.
+        let consumed_event_id = sig.source_event_id.clone().or_else(|| {
+            sig.payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+        if let Some(event_id) = consumed_event_id.as_deref() {
             self.ctx.record_consumed_signal_event(event_id);
         }
         self.log_event(
@@ -257,6 +317,17 @@ impl WorkflowRunner<'_> {
         .await;
         self.record_output(node_id, serde_json::to_string(&sig).unwrap_or_default());
         self.ctx.record_signal(sig.clone());
+        // Durable resolution record BEFORE on_exit hooks / gate run: the
+        // context now carries the signal and its consumed event id, and
+        // the status flips to Running so a crash between here and the
+        // next boundary rehydrates as a LOUD interrupted arc instead of
+        // silently re-consuming the event and re-running post-wait
+        // side effects.
+        self.write_checkpoint(
+            crate::workflow::arc_store::ArcCheckpointStatus::Running,
+            node_id,
+        )
+        .await;
         self.arc_note(
             "done",
             &format!("Wait '{node_id}' resolved by signal '{}'", sig.name),
