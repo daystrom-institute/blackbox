@@ -466,6 +466,8 @@ dependencies = [
  "bbox-chunker",
  "bbox-code-source",
  "bbox-code-source-store",
+ "bbox-conversation-source",
+ "bbox-conversation-source-store",
  "bbox-corpus-core",
  "bbox-edge-sidecar",
  "bro-core",
