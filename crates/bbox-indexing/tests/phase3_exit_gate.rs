@@ -1059,6 +1059,8 @@ fn the_remote_only_population_indexes_and_searches_with_zero_checkout_access() {
         role: None,
         include_subagents: Some(true),
         limit: Some(20),
+        source: None,
+        author: None,
         exclude_self: Some(false),
     };
     let rendered = runtime

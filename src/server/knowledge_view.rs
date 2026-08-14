@@ -2987,6 +2987,8 @@ mod catalog_view_tests {
                     role: None,
                     include_subagents: None,
                     limit: Some(5),
+                    source: None,
+                    author: None,
                     exclude_self: None,
                 },
                 &view.active_selectors,

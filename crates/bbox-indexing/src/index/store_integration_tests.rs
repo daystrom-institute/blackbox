@@ -64,6 +64,8 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
             role: None,
             include_subagents: None,
             limit: Some(5),
+            source: None,
+            author: None,
             exclude_self: None,
         })
         .unwrap();
@@ -81,6 +83,8 @@ fn delete_knowledge_entry_removes_tantivy_doc() {
             role: None,
             include_subagents: None,
             limit: Some(5),
+            source: None,
+            author: None,
             exclude_self: None,
         })
         .unwrap();
@@ -145,6 +149,8 @@ fn knowledge_entries_are_searchable_after_reindex() {
             role: None,
             include_subagents: None,
             limit: Some(5),
+            source: None,
+            author: None,
             exclude_self: None,
         })
         .unwrap();

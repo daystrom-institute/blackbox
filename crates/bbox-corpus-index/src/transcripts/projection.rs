@@ -69,6 +69,10 @@ pub fn normalized_to_doc(
             0
         },
     );
+    // Every transcript document names its lane, not just the conversation
+    // ones: a filter that can include Slack must be able to exclude it, and
+    // an exclusion only works if the other lanes are labeled too.
+    doc.add_text(f.source, event.source.label());
     if let Some(ref ts) = parsed.timestamp {
         doc.add_text(f.timestamp, ts);
     }
@@ -78,6 +82,7 @@ pub fn normalized_to_doc(
     if let Some(ref slug) = parsed.agent_slug {
         doc.add_text(f.agent_slug, slug);
     }
+    add_conversation_provenance(&mut doc, event, f);
     if let Some(entity_id) = event
         .raw
         .entity_id
@@ -87,6 +92,35 @@ pub fn normalized_to_doc(
         doc.add_text(f.entity_id, &entity_id);
     }
     Some(doc)
+}
+
+/// Stamp the conversation-lane provenance fields, when there are any.
+///
+/// One function, called from the one document builder: the whole point of
+/// landing conversations through the transcript projection is that there is
+/// no second place a conversation document can be built (design 4.3).
+fn add_conversation_provenance(
+    doc: &mut TantivyDocument,
+    event: &NormalizedTranscriptEvent,
+    f: FieldHandles,
+) {
+    let Some(conversation) = event.conversation.as_ref() else {
+        return;
+    };
+    doc.add_text(f.author_id, &conversation.author_id);
+    doc.add_text(f.author_kind, conversation.author_kind.label());
+    doc.add_text(f.conversation_workspace_id, &conversation.workspace_id);
+    doc.add_text(f.conversation_channel_id, &conversation.channel_id);
+    if let Some(name) = conversation.channel_name.as_deref() {
+        doc.add_text(f.conversation_channel_name, name);
+    }
+    doc.add_text(f.conversation_message_ts, &conversation.message_ts);
+    if let Some(parent) = conversation.thread_parent_ts.as_deref() {
+        doc.add_text(f.conversation_thread_ts, parent);
+    }
+    if let Some(permalink) = conversation.permalink.as_deref() {
+        doc.add_text(f.permalink, permalink);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -141,6 +175,7 @@ pub fn normalized_to_tool_call_doc(
     doc.add_text(f.tool_kind, tool_kind);
     doc.add_text(f.tool_target, &tool_target);
     doc.add_text(f.tool_outcome, "requested");
+    doc.add_text(f.source, event.source.label());
     if !task_id.is_empty() {
         doc.add_text(f.task_id, task_id);
     }

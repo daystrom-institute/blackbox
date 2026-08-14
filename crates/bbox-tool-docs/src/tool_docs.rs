@@ -173,7 +173,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_search",
         category: ToolCategory::Transcripts,
         summary: "Search across all indexed transcripts. Default `mode=smart` broadens adjacent terms for recall; `mode=fulltext` gives raw Tantivy/Lucene-style boolean syntax.",
-        when_to_use: "Use when you know the topic but not the exact session. Filter by account, project, or role early. Pass `exclude_self=true` for current-turn searches. See `sm-transcript-retrieval` for ladders.",
+        when_to_use: "Use when you know the topic but not the exact session. Filter by account, project, or role early. Pass `exclude_self=true` for current-turn searches. `source` filters the lane a document came from (`glm`, `claude`, `codex`, `gemini`, `slack`, ...): comma-separated for several, and a `-` prefix excludes one, so `source=\"slack\"` searches only ingested Slack conversations and `source=\"-slack\"` searches everything else. Slack conversations are searchable by default; that one filter is how you include or exclude them. Authorship on a conversation hit is identity, not turn kind, so filter who spoke with `author=<provider user id>` — the `role` lane only distinguishes human from app there. Conversation hits render the channel, the author, and a derived Slack permalink; they have no readable transcript file, so follow the permalink rather than `bbox_context`. See `sm-transcript-retrieval` for ladders.",
         example: Some(r#"bbox_search(query="redis locking", project="my-app", role="user")"#),
     },
     ToolDoc {

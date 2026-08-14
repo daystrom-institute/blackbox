@@ -39,6 +39,18 @@ pub struct SearchParams {
     /// Filter by message role/type
     #[serde(default)]
     pub role: Option<String>,
+    /// Filter by source lane: `glm`, `claude`, `codex`, `gemini`, `slack`, ...
+    /// Comma-separated for several, and a `-` prefix EXCLUDES a lane
+    /// (`source="-slack"` searches everything except Slack). Slack
+    /// conversations are searchable by default; this is the one filter that
+    /// includes or excludes them.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Filter by author identity on conversation documents (a provider user
+    /// id). Authorship is identity, not turn kind, so it is its own filter
+    /// rather than a `role` value.
+    #[serde(default)]
+    pub author: Option<String>,
     /// Include subagent transcripts (default: true)
     #[serde(default)]
     pub include_subagents: Option<bool>,
@@ -308,6 +320,49 @@ impl TranscriptIndex {
         }
     }
 
+    /// Apply the source-lane filter: one comma-separated spec where a bare
+    /// label includes a lane and a `-` prefix excludes one.
+    ///
+    /// One parameter rather than an include list plus an exclude list,
+    /// because the two questions callers actually ask are "only Slack" and
+    /// "everything but Slack", and a second parameter would exist only to let
+    /// a caller ask both at once about the same lane.
+    ///
+    /// Documents with no source field (knowledge, project files, commits) are
+    /// matched by an exclusion and dropped by an inclusion, which is the
+    /// correct reading both times: they are not in any transcript lane.
+    fn push_source_filter_clauses(
+        &self,
+        clauses: &mut Vec<(Occur, Box<dyn tantivy::query::Query>)>,
+        spec: &str,
+    ) {
+        let (includes, excludes) = parse_source_filter(spec);
+        for label in &excludes {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.source, label),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if !includes.is_empty() {
+            let lanes: Vec<(Occur, Box<dyn tantivy::query::Query>)> = includes
+                .iter()
+                .map(|label| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(self.fields.source, label),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn tantivy::query::Query>,
+                    )
+                })
+                .collect();
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(lanes))));
+        }
+    }
+
     // ── Search ──────────────────────────────────────────────────────
 
     pub fn search(&self, p: &SearchParams) -> Result<String> {
@@ -413,6 +468,20 @@ impl TranscriptIndex {
             ));
         }
 
+        if let Some(spec) = p.source.as_deref() {
+            self.push_source_filter_clauses(&mut clauses, spec);
+        }
+
+        if let Some(author) = p.author.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.author_id, author),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
         if let Some(filter) = project_filter.as_ref() {
             self.push_project_filter_clause(&mut clauses, filter);
         }
@@ -484,12 +553,36 @@ impl TranscriptIndex {
 
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
 
+            // A conversation hit is only useful if the reader can open the
+            // message it names, and the archive URL is the only coordinate
+            // that reaches it: `file_path` is a record key and `bbox_context`
+            // has no file to read. Rendered per hit rather than in the trailing
+            // breadcrumb for that reason.
+            let mut provenance = String::new();
+            let permalink = self.doc_text(&doc, self.fields.permalink);
+            let author = self.doc_text(&doc, self.fields.author_id);
+            let channel = self.doc_text(&doc, self.fields.conversation_channel_name);
+            let channel = if channel.is_empty() {
+                self.doc_text(&doc, self.fields.conversation_channel_id)
+            } else {
+                channel
+            };
+            if !author.is_empty() {
+                provenance.push_str(&format!("\nAuthor: {author}"));
+            }
+            if !channel.is_empty() {
+                provenance.push_str(&format!("\nChannel: {channel}"));
+            }
+            if !permalink.is_empty() {
+                provenance.push_str(&format!("\nPermalink: {permalink}"));
+            }
+
             results.push(format!(
                 "Score: {score:.2} | mode={} | {account} | {role}\n\
                  Session: {session_id}\n\
                  Project: {project}\n\
                  Time: {ts}\n\
-                 File: {file_path}\n\
+                 File: {file_path}{provenance}\n\
                  Excerpt: {excerpt}",
                 match mode {
                     TranscriptSearchMode::Smart => "smart",
@@ -1939,6 +2032,29 @@ fn single_symbol_token(query: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Split a source-lane filter spec into (included lanes, excluded lanes).
+///
+/// `"slack"` includes only Slack; `"-slack"` excludes it and leaves every
+/// other lane; `"glm,claude"` includes both. Empty entries are dropped rather
+/// than treated as a lane, so a trailing comma is not a filter that matches
+/// nothing.
+fn parse_source_filter(spec: &str) -> (Vec<String>, Vec<String>) {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for raw in spec.split(',') {
+        let entry = raw.trim();
+        if let Some(excluded) = entry.strip_prefix('-') {
+            let excluded = excluded.trim();
+            if !excluded.is_empty() {
+                excludes.push(excluded.to_ascii_lowercase());
+            }
+        } else if !entry.is_empty() {
+            includes.push(entry.to_ascii_lowercase());
+        }
+    }
+    (includes, excludes)
+}
+
 fn count_tool_call_edges(edges_dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(edges_dir) else {
         return 0;
@@ -2044,6 +2160,8 @@ mod agentic_project_file_tests {
                 role: None,
                 include_subagents: None,
                 limit: Some(100),
+                source: None,
+                author: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2062,6 +2180,8 @@ mod agentic_project_file_tests {
                 role: None,
                 include_subagents: None,
                 limit: Some(100),
+                source: None,
+                author: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2076,6 +2196,8 @@ mod agentic_project_file_tests {
                 role: None,
                 include_subagents: None,
                 limit: Some(100),
+                source: None,
+                author: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2153,6 +2275,8 @@ mod agentic_project_file_tests {
                 role: None,
                 include_subagents: None,
                 limit: Some(5),
+                source: None,
+                author: None,
                 exclude_self: None,
             })
             .unwrap();
@@ -2179,6 +2303,41 @@ mod agentic_project_file_tests {
 }
 
 /// Phase 3 P3-C filter-lane gate (plan section 7 item 4, F7).
+#[cfg(test)]
+mod source_filter_tests {
+    use super::*;
+
+    #[test]
+    fn one_spec_expresses_include_and_exclude() {
+        assert_eq!(
+            parse_source_filter("slack"),
+            (vec!["slack".to_string()], Vec::new())
+        );
+        assert_eq!(
+            parse_source_filter("-slack"),
+            (Vec::new(), vec!["slack".to_string()]),
+            "the one filter that excludes a lane is the same filter that includes one"
+        );
+        assert_eq!(
+            parse_source_filter("glm, Claude"),
+            (vec!["glm".to_string(), "claude".to_string()], Vec::new()),
+            "lane labels are lowercase terms; whitespace is operator typing"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_ragged_spec_filters_nothing() {
+        // A trailing comma is a typo, not a request for a lane named "".
+        assert_eq!(parse_source_filter(""), (Vec::new(), Vec::new()));
+        assert_eq!(parse_source_filter(" , "), (Vec::new(), Vec::new()));
+        assert_eq!(
+            parse_source_filter("slack,"),
+            (vec!["slack".to_string()], Vec::new())
+        );
+        assert_eq!(parse_source_filter("-"), (Vec::new(), Vec::new()));
+    }
+}
+
 #[cfg(test)]
 mod project_filter_lane_tests {
     use super::*;
@@ -2237,6 +2396,8 @@ mod project_filter_lane_tests {
                     role: None,
                     include_subagents: None,
                     limit: Some(10),
+                    source: None,
+                    author: None,
                     exclude_self: None,
                 },
                 filter,
