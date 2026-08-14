@@ -184,8 +184,10 @@ pub(super) async fn exec_shell(
     // `env: {"PATH": "/tmp/attacker-bin"}` lets an allowlisted "git"
     // execute /tmp/attacker-bin/git. Fail closed on either env section.
     if allowlist.is_some() || ctx.meta.shell_allowlist.is_some() {
-        for (section, value) in [("env", args.get("env")), ("secret_env", args.get("secret_env"))]
-        {
+        for (section, value) in [
+            ("env", args.get("env")),
+            ("secret_env", args.get("secret_env")),
+        ] {
             if let Some(obj) = value.and_then(|v| v.as_object())
                 && obj.contains_key("PATH")
             {

@@ -1086,6 +1086,10 @@ mod serde_path_clamp_tests {
         let n = spec.normalized();
         assert_eq!(n.attempts, MAX_RETRY_ATTEMPTS);
         assert!(n.base_ms >= 1, "zero base delay clamps up: {}", n.base_ms);
-        assert!(n.max_ms <= MAX_TOTAL_DELAY_MS, "max_ms bounded: {}", n.max_ms);
+        assert!(
+            n.max_ms <= MAX_TOTAL_DELAY_MS,
+            "max_ms bounded: {}",
+            n.max_ms
+        );
     }
 }
