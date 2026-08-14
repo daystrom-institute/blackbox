@@ -112,6 +112,18 @@ pub(crate) struct PollerInstallParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct WebhookRemoveParams {
+    /// Webhook name (as passed to bro_webhook_install).
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct PollerRemoveParams {
+    /// Poller name (as passed to bro_poller_install).
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CronInstallParams {
     /// Full CronSpec JSON (name, schedule, optional payload, optional
     /// concurrency cap, routing_packet, optional default_project_dir).
@@ -126,6 +138,12 @@ pub(crate) struct CronUpcomingParams {
     /// How many upcoming times to return. Default 5, max 100.
     #[serde(default)]
     pub(crate) count: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CronRemoveParams {
+    /// Cron name (as passed to bro_cron_install).
+    pub(crate) name: String,
 }
 
 // ── Whiteboard params ──────────────────────────────────────────
@@ -259,6 +277,16 @@ pub(crate) struct WorkflowInstallParams {
     /// Full Workflow spec JSON.
     #[schemars(with = "serde_json::Map<String, Value>")]
     pub(crate) spec: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct WorkflowRemoveParams {
+    /// Registry id (as passed to, or defaulted by, bro_workflow_install).
+    pub(crate) id: String,
+    /// Remove even if non-terminal arcs for this workflow are still
+    /// running. Default false (fail closed).
+    #[serde(default)]
+    pub(crate) force: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

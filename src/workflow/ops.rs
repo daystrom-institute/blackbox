@@ -41,7 +41,7 @@ use auto_digest::{
     exec_validate_schema, exec_write_semantic_edge,
 };
 use eval_score::exec_score_eval_output;
-use external::{exec_http_json, exec_mcp_call, exec_shell};
+use external::{exec_http_json, exec_mcp_call, exec_shell, parse_shell_allowlist_arg};
 use json_ops::exec_parse_json;
 use perf_pathology::{exec_normalize_perf_pathology_atom_requests, exec_write_perf_pathology_plan};
 use schema_migration::{exec_schema_migration_drop, exec_schema_migration_rebuild};
@@ -283,18 +283,16 @@ pub async fn execute_op_with_hub(
         OpKind::Shell => {
             // Per-op allowlist override: `args.allowlist` on the Shell
             // HookOp itself (a plain string array, or a `${vars.x}`
-            // template that resolves to one). This is the mechanism
-            // that's actually wired today; see the `shell_allowlist`
-            // doc comment on `workflow::schema::Workflow` for why the
-            // workflow-level field isn't auto-propagated here yet.
-            let allowlist = rendered_args
-                .get("allowlist")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect::<Vec<String>>()
-                });
+            // template that resolves to one). `exec_shell` enforces this
+            // IN ADDITION to `ctx.meta.shell_allowlist` (the
+            // workflow-level list, copied onto ArcMeta at arc-construction
+            // time from `Workflow.shell_allowlist`): intersection
+            // semantics, a per-op list can only narrow the workflow
+            // policy, never widen it. A malformed `args.allowlist` (not
+            // an array, or a non-string entry) fails the op instead of
+            // silently falling back to "no per-op restriction" - see
+            // `parse_shell_allowlist_arg`.
+            let allowlist = parse_shell_allowlist_arg(&rendered_args)?;
             exec_shell(
                 &rendered_args,
                 hook.into_var.as_deref(),

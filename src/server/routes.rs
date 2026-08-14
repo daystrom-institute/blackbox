@@ -553,6 +553,8 @@ pub(crate) async fn process_webhook(
                 spec.routing_packet,
                 entity
             );
+            // no_match IS a processed outcome: commit the delivery id.
+            state.webhooks.record_delivery_id(name, delivery_id);
             return Ok(json!({
                 "status": "no_match",
                 "reason": "routing packet returned no_match (default → dead-letter)",
@@ -570,14 +572,23 @@ pub(crate) async fn process_webhook(
     let verdict = routing::RoutingVerdict::parse(&resolved_consequent)
         .map_err(|e| anyhow::anyhow!("verdict parse: {e}"))?;
 
-    dispatch_verdict(
+    let result = dispatch_verdict(
         state.clone(),
         &spec.name,
         spec.default_project_dir.clone(),
         verdict,
         entity,
     )
-    .await
+    .await;
+    // Commit-on-success: a delivery whose verdict dispatch FAILED must
+    // stay fresh so the sender's retry reprocesses it instead of
+    // receiving `duplicate_dropped` (a 200 that reads as success to a
+    // durable sender like the bro-slack spool, which would then delete
+    // an envelope that was never dispatched).
+    if result.is_ok() {
+        state.webhooks.record_delivery_id(name, delivery_id);
+    }
+    result
 }
 
 pub(crate) async fn dispatch_verdict(

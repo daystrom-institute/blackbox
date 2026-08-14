@@ -71,7 +71,10 @@ pub struct WebhookRegistry {
     delivery_seen: RwLock<HashMap<String, RecentRing>>,
 }
 
-const DELIVERY_RING_CAP: usize = 256;
+/// Sized to cover the bro-slack sidecar's spool window (5000 retained
+/// envelopes): a dedupe horizon shorter than the replay horizon turns
+/// legitimate replays into duplicate executions after ring churn.
+const DELIVERY_RING_CAP: usize = 8192;
 
 #[derive(Default)]
 struct RecentRing {
@@ -79,15 +82,18 @@ struct RecentRing {
 }
 
 impl RecentRing {
-    fn check_and_record(&mut self, id: &str) -> bool {
-        if self.seen.iter().any(|x| x == id) {
-            return false;
+    fn contains(&self, id: &str) -> bool {
+        self.seen.iter().any(|x| x == id)
+    }
+
+    fn record(&mut self, id: &str) {
+        if self.contains(id) {
+            return;
         }
         if self.seen.len() >= DELIVERY_RING_CAP {
             self.seen.pop_front();
         }
         self.seen.push_back(id.to_string());
-        true
     }
 }
 
@@ -123,13 +129,46 @@ impl WebhookRegistry {
         self.by_name.read().values().cloned().collect()
     }
 
-    /// True if this delivery_id is fresh (not seen recently). False
-    /// = duplicate, drop. `None` delivery_id = always fresh (no dedup).
+    /// True if this delivery_id is fresh (not seen recently). Peek
+    /// only: the id is NOT recorded, so a delivery whose processing
+    /// then FAILS stays fresh and its retry reprocesses instead of
+    /// bouncing off `duplicate_dropped` (which reads as success to a
+    /// durable sender like the bro-slack spool and would delete the
+    /// retained envelope without it ever being dispatched). Callers
+    /// commit with [`Self::record_delivery_id`] after processing
+    /// succeeds. Two identical deliveries racing the peek-process
+    /// window can both process - at-least-once by design; workflow
+    /// admission owns arc-level dedupe.
+    /// `None` delivery_id = always fresh (no dedup).
     pub fn check_delivery_id(&self, webhook_name: &str, delivery_id: Option<&str>) -> bool {
         let Some(id) = delivery_id else { return true };
+        let deliveries = self.delivery_seen.read();
+        deliveries
+            .get(webhook_name)
+            .map(|ring| !ring.contains(id))
+            .unwrap_or(true)
+    }
+
+    /// Commit a successfully processed delivery id into the dedupe
+    /// ring. Only called after the routing verdict dispatched without
+    /// error (ignore / no_match ARE processed outcomes and commit).
+    pub fn record_delivery_id(&self, webhook_name: &str, delivery_id: Option<&str>) {
+        let Some(id) = delivery_id else { return };
         let mut deliveries = self.delivery_seen.write();
         let ring = deliveries.entry(webhook_name.to_string()).or_default();
-        ring.check_and_record(id)
+        ring.record(id);
+    }
+
+    /// Remove a webhook from the in-memory registry: drops its spec and
+    /// its delivery-id dedup ring. Returns `true` if a webhook by this
+    /// name was installed (and is now removed), `false` if there was
+    /// nothing to remove. Persisted-file removal is the caller's
+    /// responsibility (this registry has no filesystem knowledge of its
+    /// own).
+    pub fn remove(&self, name: &str) -> bool {
+        let existed = self.by_name.write().remove(name).is_some();
+        self.delivery_seen.write().remove(name);
+        existed
     }
 }
 
@@ -256,14 +295,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn delivery_dedup() {
+    fn delivery_dedup_commits_only_on_record() {
         let reg = WebhookRegistry::new();
+        // Peek does not record: a failed processing leaves the id
+        // fresh so the sender's retry reprocesses.
         assert!(reg.check_delivery_id("wh", Some("d1")));
+        assert!(reg.check_delivery_id("wh", Some("d1")));
+        // Commit marks it seen.
+        reg.record_delivery_id("wh", Some("d1"));
         assert!(!reg.check_delivery_id("wh", Some("d1")));
         assert!(reg.check_delivery_id("wh", Some("d2")));
-        // None ID always fresh.
+        // Double-record is idempotent.
+        reg.record_delivery_id("wh", Some("d1"));
+        assert!(!reg.check_delivery_id("wh", Some("d1")));
+        // None ID always fresh, records nothing.
         assert!(reg.check_delivery_id("wh", None));
+        reg.record_delivery_id("wh", None);
         assert!(reg.check_delivery_id("wh", None));
+    }
+
+    fn sample_spec(name: &str) -> WebhookSpec {
+        WebhookSpec {
+            name: name.to_string(),
+            signature: SignatureScheme::None,
+            extractor: crate::workflow::extractor::Extractor::default(),
+            routing_packet: "packet-test".to_string(),
+            delivery_id_header: None,
+            default_project_dir: None,
+        }
+    }
+
+    #[test]
+    fn remove_drops_spec_and_reports_existed() {
+        let reg = WebhookRegistry::new();
+        reg.install(sample_spec("wh-remove"));
+        assert!(reg.get("wh-remove").is_some());
+        assert!(reg.remove("wh-remove"), "remove should report it existed");
+        assert!(reg.get("wh-remove").is_none());
+        assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn remove_unknown_name_reports_false() {
+        let reg = WebhookRegistry::new();
+        assert!(!reg.remove("never-installed"));
+    }
+
+    #[test]
+    fn remove_clears_delivery_dedup_ring() {
+        let reg = WebhookRegistry::new();
+        reg.install(sample_spec("wh-dedup"));
+        assert!(reg.check_delivery_id("wh-dedup", Some("d1")));
+        reg.record_delivery_id("wh-dedup", Some("d1"));
+        assert!(!reg.check_delivery_id("wh-dedup", Some("d1")));
+        reg.remove("wh-dedup");
+        // Reinstalling under the same name should not still see the old
+        // delivery id as "seen" - the dedup ring must have been cleared,
+        // not just the spec.
+        reg.install(sample_spec("wh-dedup"));
+        assert!(
+            reg.check_delivery_id("wh-dedup", Some("d1")),
+            "dedup ring should reset on remove, not leak across reinstall"
+        );
     }
 
     // RoutingVerdict tests live in `crate::routing` alongside the type.

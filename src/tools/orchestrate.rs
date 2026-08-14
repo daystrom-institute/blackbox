@@ -12,16 +12,16 @@ use crate::system_memory;
 use crate::tools::bro_helpers::extract_and_compile_workflow;
 use crate::tools::bro_runtime_params::{
     ArcCancelParams, ArcResultParams, ArcSignalParams, ArcStatusParams, CronInstallParams,
-    CronUpcomingParams, OrchestrateAuthorParams, OrchestrateRunParams, PollerInstallParams,
-    SignalsParams, WebhookDeliveriesParams, WebhookInstallParams, WebhookReplayParams,
-    WorkflowInstallParams,
+    CronRemoveParams, CronUpcomingParams, OrchestrateAuthorParams, OrchestrateRunParams,
+    PollerInstallParams, PollerRemoveParams, SignalsParams, WebhookDeliveriesParams,
+    WebhookInstallParams, WebhookRemoveParams, WebhookReplayParams, WorkflowInstallParams,
+    WorkflowRemoveParams,
 };
 use crate::webhooks;
 use crate::workflow;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
-use rmcp::schemars;
 use rmcp::{tool, tool_router};
 use serde_json::Value;
 
@@ -660,6 +660,36 @@ Constraints:\n\
     }
 
     #[tool(
+        name = "bro_webhook_remove",
+        description = "Remove an installed webhook by name: drops it from the in-memory registry (POST /webhook/<name> starts 404ing immediately) and deletes its persisted spec file so it does not reload on daemon restart. Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the webhook fully installed rather than half-removed."
+    )]
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) async fn bro_webhook_remove(
+        &self,
+        Parameters(p): Parameters<WebhookRemoveParams>,
+    ) -> CallToolResult {
+        if self.state.webhooks.get(&p.name).is_none() {
+            return Self::err_text(&format!("webhook '{}' not found", p.name));
+        }
+        // Delete the persisted file FIRST: if this fails, the webhook
+        // stays fully installed (registry untouched) rather than a
+        // half-removed state (registry cleared, stale file on disk that
+        // would silently respawn the endpoint on the next daemon restart).
+        let path = self
+            .state
+            .store_dir
+            .join("webhooks")
+            .join(format!("{}.json", p.name));
+        match std::fs::remove_file(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Self::err_text(&format!("webhook persisted file remove failed: {e}")),
+        }
+        self.state.webhooks.remove(&p.name);
+        Self::ok_json(&serde_json::json!({"status": "removed", "name": p.name}))
+    }
+
+    #[tool(
         name = "bro_poller_install",
         description = "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (>= BBOX_POLLER_MIN_INTERVAL_SECS, default 5), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. Persisted to disk + tick loop spawned immediately; reinstall replaces the running task."
     )]
@@ -700,6 +730,38 @@ Constraints:\n\
     pub(crate) async fn bro_poller_list(&self) -> CallToolResult {
         let list = self.state.pollers.list();
         Self::ok_json(&serde_json::json!({"pollers": list}))
+    }
+
+    #[tool(
+        name = "bro_poller_remove",
+        description = "Remove an installed poller by name: aborts its running tick-loop task immediately, clears its dedup ring, and deletes its persisted spec file so it does not respawn on daemon restart. Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the poller fully installed rather than half-removed."
+    )]
+    #[allow(clippy::disallowed_methods)]
+    pub(crate) async fn bro_poller_remove(
+        &self,
+        Parameters(p): Parameters<PollerRemoveParams>,
+    ) -> CallToolResult {
+        let existed = self.state.pollers.list().iter().any(|s| s.name == p.name);
+        if !existed {
+            return Self::err_text(&format!("poller '{}' not found", p.name));
+        }
+        // Delete the persisted file FIRST: if this fails, the poller
+        // stays fully installed (registry untouched, tick loop still
+        // running) rather than a half-removed state (registry cleared,
+        // stale file on disk that would silently respawn the poller on
+        // the next daemon restart).
+        let path = self
+            .state
+            .store_dir
+            .join("pollers")
+            .join(format!("{}.json", p.name));
+        match std::fs::remove_file(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Self::err_text(&format!("poller persisted file remove failed: {e}")),
+        }
+        self.state.pollers.remove(&p.name);
+        Self::ok_json(&serde_json::json!({"status": "removed", "name": p.name}))
     }
 
     #[tool(
@@ -750,7 +812,7 @@ Constraints:\n\
 
     #[tool(
         name = "bro_cron_remove",
-        description = "Remove an installed cron by name: aborts its running tick loop immediately, clears in-flight concurrency state, and deletes the persisted spec file so it does not respawn on daemon restart."
+        description = "Remove an installed cron by name: aborts its running tick loop immediately, clears in-flight concurrency state, and deletes the persisted spec file so it does not respawn on daemon restart. Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the cron fully installed rather than half-removed. A cron installed via bbox_artifact_install (kind=\"cron\") is catalog-managed and gets re-materialized on the next catalog sync; remove it with bbox_artifact_remove instead."
     )]
     #[allow(clippy::disallowed_methods)]
     pub(crate) async fn bro_cron_remove(
@@ -761,7 +823,10 @@ Constraints:\n\
         if !existed {
             return Self::err_text(&format!("cron '{}' not found", p.name));
         }
-        self.state.crons.remove(&p.name);
+        // Delete the persisted file FIRST: if this fails, the cron stays
+        // fully installed (registry untouched) rather than landing in a
+        // half-removed state (registry cleared, stale file on disk that
+        // would silently respawn the cron on the next daemon restart).
         let path = self
             .state
             .store_dir
@@ -772,6 +837,7 @@ Constraints:\n\
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Self::err_text(&format!("cron persisted file remove failed: {e}")),
         }
+        self.state.crons.remove(&p.name);
         Self::ok_json(&serde_json::json!({"status": "removed", "name": p.name}))
     }
 
@@ -860,30 +926,48 @@ Constraints:\n\
 
     #[tool(
         name = "bro_workflow_remove",
-        description = "Remove an installed workflow by registry id: deletes it from the registry and its persisted spec file so webhook/poller/cron routing verdicts and subworkflow_ref lookups can no longer resolve it. Refuses when any running_arcs entry whose workflow_name matches this id is still non-terminal (status \"running\"), unless force=true. Does not cancel or otherwise touch arcs already dispatched from this workflow (use bro_arc_cancel for that)."
+        description = "Remove an installed workflow by registry id: deletes it from the registry and its persisted spec file so webhook/poller/cron routing verdicts and subworkflow_ref lookups can no longer resolve it. Refuses when any running_arcs entry is still non-terminal (status \"running\") for either this registry id or the resolved spec's own name, unless force=true. Does not cancel or otherwise touch arcs already dispatched from this workflow (use bro_arc_cancel for that). Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the workflow fully installed rather than half-removed. A workflow installed via bbox_artifact_install (kind=\"workflow\") is catalog-managed and gets re-materialized on the next catalog sync; remove it with bbox_artifact_remove instead."
     )]
     #[allow(clippy::disallowed_methods)]
     pub(crate) async fn bro_workflow_remove(
         &self,
         Parameters(p): Parameters<WorkflowRemoveParams>,
     ) -> CallToolResult {
-        let exists = self.state.workflow_registry.read().contains_key(&p.id);
-        if !exists {
+        // Hold the registry write lock across resolve + running-arc check
+        // + file delete + registry mutation: a concurrent
+        // bro_workflow_install for this id, or any lookup path that
+        // resolves it by name (webhook/poller/cron routing verdicts,
+        // subworkflow_ref), blocks until this call finishes rather than
+        // interleaving with it.
+        //
+        // Residual window this does NOT close: a dispatch that already
+        // resolved this workflow (read the registry) before we acquired
+        // this write lock, but whose ArcSnapshot has not yet landed in
+        // `running_arcs` (a separate lock, populated by the engine after
+        // dispatch begins, not atomically with the registry read) is
+        // invisible to the check below no matter how these two locks are
+        // ordered. Closing that fully would need admission bookkeeping
+        // at resolve time, which lives in engine-owned code out of this
+        // change's scope.
+        let mut registry = self.state.workflow_registry.write();
+        let Some(spec) = registry.get(&p.id).cloned() else {
             return Self::err_text(&format!("workflow '{}' not found", p.id));
-        }
+        };
         if !p.force.unwrap_or(false) {
-            // Correlated by `ArcSnapshot.workflow_name`, which is the
-            // spec's internal `name` field, not necessarily this
-            // registry id (an install can pin a custom id via
-            // WorkflowInstallParams.id). This is the best available
-            // signal without threading the registry id through arc
-            // dispatch bookkeeping.
+            // Correlated against BOTH the registry id and the resolved
+            // spec's own `name` field: an install can pin a custom id
+            // via WorkflowInstallParams.id, but `ArcSnapshot.workflow_name`
+            // always records `compiled.spec.name`, so checking the id
+            // alone misses live arcs whenever the two diverge.
             let running: Vec<String> = self
                 .state
                 .running_arcs
                 .read()
                 .values()
-                .filter(|s| s.workflow_name == p.id && s.status == "running")
+                .filter(|s| {
+                    s.status == "running"
+                        && (s.workflow_name == p.id || s.workflow_name == spec.name)
+                })
                 .map(|s| s.arc_id.clone())
                 .collect();
             if !running.is_empty() {
@@ -895,7 +979,10 @@ Constraints:\n\
                 ));
             }
         }
-        self.state.workflow_registry.write().remove(&p.id);
+        // Delete the persisted file FIRST: if this fails, the workflow
+        // stays fully installed (registry untouched) rather than a
+        // half-removed state (registry cleared, stale file on disk that
+        // would silently reload on the next daemon restart).
         let path = self
             .state
             .store_dir
@@ -908,24 +995,9 @@ Constraints:\n\
                 return Self::err_text(&format!("workflow persisted file remove failed: {e}"));
             }
         }
+        registry.remove(&p.id);
         Self::ok_json(&serde_json::json!({"status": "removed", "id": p.id}))
     }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-pub(crate) struct CronRemoveParams {
-    /// Cron name (as passed to bro_cron_install).
-    pub(crate) name: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-pub(crate) struct WorkflowRemoveParams {
-    /// Registry id (as passed to, or defaulted by, bro_workflow_install).
-    pub(crate) id: String,
-    /// Remove even if non-terminal arcs for this workflow are still
-    /// running. Default false (fail closed).
-    #[serde(default)]
-    pub(crate) force: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1151,6 +1223,133 @@ mod tests {
         );
     }
 
+    // ── bro_webhook_remove ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bro_webhook_remove_deletes_registry_entry_file_and_survives_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let spec = serde_json::json!({
+            "name": "wh-remove-test",
+            "signature": {"kind": "none"},
+            "extractor": {"outputs": {}},
+            "routing_packet": "packet-test"
+        });
+        let install = server
+            .bro_webhook_install(Parameters(WebhookInstallParams { spec }))
+            .await;
+        assert!(
+            !install.is_error.unwrap_or(false),
+            "install failed: {:?}",
+            install.content
+        );
+        let persisted = server
+            .state
+            .store_dir
+            .join("webhooks")
+            .join("wh-remove-test.json");
+        assert!(persisted.exists(), "expected webhook spec to be persisted");
+        assert!(server.state.webhooks.get("wh-remove-test").is_some());
+
+        let remove = server
+            .bro_webhook_remove(Parameters(WebhookRemoveParams {
+                name: "wh-remove-test".into(),
+            }))
+            .await;
+        assert!(
+            !remove.is_error.unwrap_or(false),
+            "remove failed: {:?}",
+            remove.content
+        );
+        assert!(server.state.webhooks.get("wh-remove-test").is_none());
+        assert!(!persisted.exists());
+
+        // Restart durability: a fresh `load_all` over the persisted
+        // directory (what the daemon does on boot) must not see the
+        // removed webhook.
+        let reloaded = webhooks::load_all(&server.state.store_dir.join("webhooks"));
+        assert!(
+            !reloaded.iter().any(|w| w.name == "wh-remove-test"),
+            "removed webhook reappeared on simulated restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_webhook_remove_unknown_name_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let remove = server
+            .bro_webhook_remove(Parameters(WebhookRemoveParams {
+                name: "does-not-exist".into(),
+            }))
+            .await;
+        assert!(remove.is_error.unwrap_or(false));
+    }
+
+    // ── bro_poller_remove ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bro_poller_remove_deletes_registry_entry_file_and_survives_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let spec = serde_json::json!({
+            "name": "poller-remove-test",
+            // Long enough that no tick fires during the test.
+            "every_seconds": 3600,
+            "source": {"url": "http://example.invalid"},
+            "extractor": {"outputs": {}},
+            "routing_packet": "packet-test"
+        });
+        let install = server
+            .bro_poller_install(Parameters(PollerInstallParams { spec }))
+            .await;
+        assert!(
+            !install.is_error.unwrap_or(false),
+            "install failed: {:?}",
+            install.content
+        );
+        let persisted = server
+            .state
+            .store_dir
+            .join("pollers")
+            .join("poller-remove-test.json");
+        assert!(persisted.exists(), "expected poller spec to be persisted");
+        assert_eq!(server.state.pollers.list().len(), 1);
+
+        let remove = server
+            .bro_poller_remove(Parameters(PollerRemoveParams {
+                name: "poller-remove-test".into(),
+            }))
+            .await;
+        assert!(
+            !remove.is_error.unwrap_or(false),
+            "remove failed: {:?}",
+            remove.content
+        );
+        assert!(server.state.pollers.list().is_empty());
+        assert!(!persisted.exists());
+
+        // Restart durability: a fresh `load_all` over the persisted
+        // directory must not see the removed poller.
+        let reloaded = pollers::load_all(&server.state.store_dir.join("pollers"));
+        assert!(
+            !reloaded.iter().any(|p| p.name == "poller-remove-test"),
+            "removed poller reappeared on simulated restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_poller_remove_unknown_name_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let remove = server
+            .bro_poller_remove(Parameters(PollerRemoveParams {
+                name: "does-not-exist".into(),
+            }))
+            .await;
+        assert!(remove.is_error.unwrap_or(false));
+    }
+
     // ── bro_cron_remove ──────────────────────────────────────────
 
     #[tokio::test]
@@ -1185,6 +1384,14 @@ mod tests {
         assert!(
             !persisted.exists(),
             "expected persisted cron file to be deleted"
+        );
+
+        // Restart durability: a fresh `load_all` over the persisted
+        // directory must not see the removed cron.
+        let reloaded = crons::load_all(&store_dir.join("crons"));
+        assert!(
+            !reloaded.iter().any(|c| c.name == "test-cron-remove"),
+            "removed cron reappeared on simulated restart"
         );
     }
 

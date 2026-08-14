@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Result, anyhow, bail};
@@ -85,16 +84,47 @@ pub(super) async fn exec_http_json(args: &Value, into_var: Option<&str>) -> Resu
     }
 }
 
-/// Match one `argv[0]` value against an allowlist entry set. Exact match
-/// only: an entry matches when it equals `argv0` verbatim (covers both a
-/// bare command name and an absolute path used as-is) or when it equals
-/// `argv0`'s basename (so `"git"` permits `/usr/bin/git`, `./git`, etc).
+/// Match one `argv[0]` value against an allowlist entry set. Byte-exact
+/// equality only, with the match SHAPE constrained by whether `argv0`
+/// carries a path separator:
+///
+/// - A bare `argv0` (no `/`) matches only a bare allowlist entry equal to
+///   it verbatim, e.g. entry `"git"` matches `argv0 == "git"`.
+/// - A path-bearing `argv0` (`/usr/bin/git`, `./git`, `bin/git`, …)
+///   matches only an allowlist entry that is the exact same string. A
+///   bare entry like `"git"` does NOT authorize any path-bearing argv0,
+///   even `/usr/bin/git`: that basename-matching shortcut let an
+///   allowlisted bare name stand in for an arbitrary path (`/evil/git`
+///   also has basename `git`), which defeats the allowlist as a control.
+///
 /// No globs, no prefix matching, no directory-relative resolution.
 pub(super) fn shell_argv0_allowed(argv0: &str, allowlist: &[String]) -> bool {
-    let basename = Path::new(argv0).file_name().map(|f| f.to_string_lossy());
-    allowlist
-        .iter()
-        .any(|entry| entry == argv0 || basename.as_deref() == Some(entry.as_str()))
+    allowlist.iter().any(|entry| entry == argv0)
+}
+
+/// Parse a Shell op's own `args.allowlist` (a per-node override that can
+/// only NARROW the workflow-level `shell_allowlist`, never widen it — see
+/// `exec_shell`). Absent key = `None` (no per-op narrowing; the
+/// workflow-level list, if any, still applies on its own). Present but
+/// malformed (not an array, or containing a non-string element) is a
+/// hard error: a security allowlist that fails to parse must fail
+/// CLOSED, never silently collapse to "no restriction."
+pub(super) fn parse_shell_allowlist_arg(args: &Value) -> Result<Option<Vec<String>>> {
+    match args.get("allowlist") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let list = items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| anyhow!("Shell args.allowlist entries must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(list))
+        }
+        Some(_) => bail!("Shell args.allowlist must be an array of strings"),
+    }
 }
 
 /// Execute a shell command. When `into_var` is provided the op captures
@@ -274,10 +304,14 @@ mod tests {
     }
 
     #[test]
-    fn shell_argv0_allowed_basename_match() {
+    fn shell_argv0_allowed_bare_entry_rejects_path_bearing_argv0() {
+        // A bare allowlist entry ("git") must NOT authorize a
+        // path-bearing argv0 sharing its basename — that was the
+        // /evil/git-shares-basename-with-git loophole.
         let allowlist = vec!["git".to_string()];
-        assert!(shell_argv0_allowed("/usr/bin/git", &allowlist));
-        assert!(shell_argv0_allowed("./git", &allowlist));
+        assert!(!shell_argv0_allowed("/usr/bin/git", &allowlist));
+        assert!(!shell_argv0_allowed("./git", &allowlist));
+        assert!(!shell_argv0_allowed("/evil/git", &allowlist));
     }
 
     #[test]
@@ -287,6 +321,17 @@ mod tests {
         // A different absolute path with the same basename does not match
         // an allowlist entry that is itself an absolute path.
         assert!(!shell_argv0_allowed("/opt/bin/git", &allowlist));
+        // Nor does the bare basename authorize via a path-bearing entry.
+        assert!(!shell_argv0_allowed("git", &allowlist));
+    }
+
+    #[test]
+    fn shell_argv0_allowed_relative_path_exact_match() {
+        let allowlist = vec!["./git".to_string()];
+        assert!(shell_argv0_allowed("./git", &allowlist));
+        assert!(!shell_argv0_allowed("git", &allowlist));
+        assert!(!shell_argv0_allowed("/usr/bin/git", &allowlist));
+        assert!(!shell_argv0_allowed("bin/git", &allowlist));
     }
 
     #[test]
@@ -306,6 +351,51 @@ mod tests {
     #[test]
     fn shell_argv0_allowed_empty_list_denies_all() {
         assert!(!shell_argv0_allowed("true", &[]));
+    }
+
+    #[test]
+    fn parse_shell_allowlist_arg_absent_is_none() {
+        assert_eq!(
+            parse_shell_allowlist_arg(&serde_json::json!({"argv": ["true"]})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_shell_allowlist_arg_null_is_none() {
+        assert_eq!(
+            parse_shell_allowlist_arg(&serde_json::json!({"allowlist": null})).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_shell_allowlist_arg_parses_string_array() {
+        let parsed = parse_shell_allowlist_arg(&serde_json::json!({
+            "allowlist": ["git", "cargo"]
+        }))
+        .unwrap();
+        assert_eq!(parsed, Some(vec!["git".to_string(), "cargo".to_string()]));
+    }
+
+    #[test]
+    fn parse_shell_allowlist_arg_non_array_fails_closed() {
+        let err =
+            parse_shell_allowlist_arg(&serde_json::json!({"allowlist": "git"})).unwrap_err();
+        assert!(
+            err.to_string().contains("must be an array"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_shell_allowlist_arg_non_string_entry_fails_closed() {
+        let err = parse_shell_allowlist_arg(&serde_json::json!({"allowlist": ["git", 7]}))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be strings"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

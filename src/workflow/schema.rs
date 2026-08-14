@@ -60,9 +60,13 @@ pub struct Workflow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_arc_cancel: Vec<HookOp>,
     /// Optional workflow-wide allowlist for `Shell` op `argv[0]`. Entries
-    /// match exact basename (`"git"` matches `argv[0]` of `git` or
-    /// `/usr/bin/git`) or exact absolute path (`"/usr/bin/git"` matches
-    /// only that literal argv[0]). No globs, no prefix matching.
+    /// match `argv[0]` byte-exact only: a bare entry (`"git"`) matches
+    /// only a bare `argv[0]` equal to it, and a path-bearing entry
+    /// (`"/usr/bin/git"`) matches only that exact literal `argv[0]`. A
+    /// bare entry does NOT authorize any path-bearing `argv[0]` sharing
+    /// its basename (`"git"` does not permit `/usr/bin/git`, `./git`, or
+    /// `/evil/git`) - that shortcut let one allowlisted bare name stand
+    /// in for an arbitrary path. No globs, no prefix matching.
     ///
     /// Absent = current trusted-actor behavior (any argv[0] runs).
     /// Present = every `Shell` op in the workflow must resolve an

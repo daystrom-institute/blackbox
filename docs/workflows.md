@@ -364,11 +364,11 @@ the operator-blessed allow set: `allow`, `pass`, `proceed`, `fire`,
 | `append_var`          | Append to array var.                                   |
 | `merge_var`           | Merge object into object var.                          |
 | `parse_json`          | Parse a string-shaped value into JSON; strips ```` ```json ```` fences. |
-| `shell`               | Sandboxed shell command (gated via packet policy in v-next; today reads `cwd` from `meta.worktree`). |
+| `shell`               | Shell command; `cwd` from `meta.worktree`. Two-layer argv[0] allowlist: workflow-level `shell_allowlist` (rides ArcMeta, enforced on every Shell op) intersected with per-op `args.allowlist` (narrows, never widens). Byte-exact matching; bare entries match bare argv[0] only, path-bearing argv[0] needs an exact-path entry. Absent lists preserve trusted-actor behavior. |
 | `worktree_create`     | `git worktree add` with smart branch reuse (see below). |
 | `worktree_remove`     | `git worktree remove`; idempotent on missing path. No `rm -rf` fallback - surfaces git's error if the path is not a git-tracked worktree. |
 | `set_meta`            | Update `meta.worktree` directly (only mutable meta field today). |
-| `http_json`           | Generic HTTP request → response into_var. Workflow author composes URL/headers/body using `${env.X}` + `${vars.X}` templates to express any code-host integration without baking platform-specific ops into the engine. `response_kind`: `json` (default - parse, error on non-JSON), `text` (capture body as-is, e.g. for `.diff` URLs), or `auto` (try JSON, fall back to text). `expect_status`: optional override of the default 2xx success window. |
+| `http_json`           | Generic HTTP request → response into_var. Workflow author composes URL/headers/body using `${env.X}` + `${vars.X}` templates to express any code-host integration without baking platform-specific ops into the engine. `response_kind`: `json` (default - parse, error on non-JSON), `text` (capture body as-is, e.g. for `.diff` URLs), or `auto` (try JSON, fall back to text). `expect_status`: optional override of the default 2xx success window. Transient statuses (429/502/503/504) and transport errors retry with capped exponential backoff honoring Retry-After, for idempotent methods by default; POST/PATCH retry only on explicit opt-in via the `retry` block. |
 | `find_first`          | Find the first element of an array variable whose nested fields all equal the targets in `where`, write into_var. Writes `Value::Null` (not Err) when no match - downstream `IsNull` / `IsNonNull` packets branch cleanly. Composable primitive for "find existing PR for this branch" / "find label by name" without baking platform-specific search ops or relying on upstream API filters that may be broken. `where` keys use dotted paths (e.g. `head.ref`). |
 | `mcp_call`            | Outbound MCP tool call - sibling of `http_json` but speaking MCP JSON-RPC. Resolves `args.server` against the existing `bro_mcp` registry (global `~/.bro/mcp.json` + project overlay), opens a transient client (stdio child-process or streamable HTTP), invokes `args.tool` with `args.arguments`, captures the result into `vars[into_var]`. Tool errors (`is_error: true`) become op failures so `on_failure` fires. Result normalization preserves typing when `structured_content` is present, falls back to JSON-parsed text content otherwise. Args: `{server, tool, arguments?, timeout_secs?}` (default 300s). Use for engine-level grounding calls - `sast_run` / `sast_findings` against biofilter, `bbox_thread` / `bbox_note` against blackbox-self - instead of dispatching a bro just to make a tool call. |
 
@@ -650,10 +650,13 @@ HTTP POST /webhook/<name>
   → verify_signature(secret)         [HmacSha256 (configurable header
                                        + optional `prefix=`) | None
                                        (loopback-bind only)]
-  → idempotency dedup                [delivery-id ring per webhook]
+  → idempotency dedup PEEK           [per-webhook delivery-id ring, 8192 ids]
   → extractor.project(payload)       [JSON → flat entity]
   → routing_packet.apply(entity)     [verdict]
   → dispatch_verdict(...)            [start_arc | signal_arc | cancel_arc | ignore | dead_letter]
+  → dedup COMMIT on success          [a failed dispatch leaves the id fresh, so a
+                                      durable sender's retry reprocesses instead of
+                                      bouncing off duplicate_dropped-as-200]
 ```
 
 ### Extractor

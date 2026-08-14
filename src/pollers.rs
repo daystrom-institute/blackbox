@@ -144,6 +144,21 @@ impl PollerRegistry {
             prev.abort();
         }
     }
+
+    /// Remove a poller from the in-memory registry: drops its spec,
+    /// aborts its running tick-loop task (if any), and clears its dedup
+    /// ring. Returns `true` if a poller by this name was installed
+    /// (and is now removed), `false` if there was nothing to remove.
+    /// Persisted-file removal is the caller's responsibility (this
+    /// registry has no filesystem knowledge of its own).
+    pub fn remove(&self, name: &str) -> bool {
+        let existed = self.by_name.write().remove(name).is_some();
+        self.seen.write().remove(name);
+        if let Some(handle) = self.handles.write().remove(name) {
+            handle.abort();
+        }
+        existed
+    }
 }
 
 /// Load all persisted poller specs from a directory. Bad files are
@@ -417,5 +432,62 @@ mod tests {
         assert!(r.check_dedup("a", Some("id-2")));
         assert!(r.check_dedup("a", None));
         assert!(r.check_dedup("a", None));
+    }
+
+    fn sample_spec(name: &str) -> PollerSpec {
+        PollerSpec {
+            name: name.to_string(),
+            every_seconds: 3600,
+            source: HttpFetchSpec::from_args(&serde_json::json!({"url": "http://example.invalid"}))
+                .unwrap(),
+            iterate: None,
+            extractor: Extractor::default(),
+            dedup_id_path: None,
+            routing_packet: "packet-test".to_string(),
+            default_project_dir: None,
+        }
+    }
+
+    #[test]
+    fn remove_drops_spec_and_reports_existed() {
+        let r = PollerRegistry::new();
+        r.install(sample_spec("poller-remove"));
+        assert_eq!(r.list().len(), 1);
+        assert!(r.remove("poller-remove"), "remove should report it existed");
+        assert!(r.list().is_empty());
+    }
+
+    #[test]
+    fn remove_unknown_name_reports_false() {
+        let r = PollerRegistry::new();
+        assert!(!r.remove("never-installed"));
+    }
+
+    #[tokio::test]
+    async fn remove_aborts_tracked_handle() {
+        let r = PollerRegistry::new();
+        r.install(sample_spec("poller-handle"));
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        r.track_handle("poller-handle", handle);
+        assert!(r.remove("poller-handle"));
+        // handles map should no longer carry an entry to abort twice;
+        // a second remove reports "didn't exist" for the spec side.
+        assert!(!r.remove("poller-handle"));
+    }
+
+    #[test]
+    fn remove_clears_dedup_ring() {
+        let r = PollerRegistry::new();
+        r.install(sample_spec("poller-dedup"));
+        assert!(r.check_dedup("poller-dedup", Some("id-1")));
+        assert!(!r.check_dedup("poller-dedup", Some("id-1")));
+        r.remove("poller-dedup");
+        r.install(sample_spec("poller-dedup"));
+        assert!(
+            r.check_dedup("poller-dedup", Some("id-1")),
+            "dedup ring should reset on remove, not leak across reinstall"
+        );
     }
 }

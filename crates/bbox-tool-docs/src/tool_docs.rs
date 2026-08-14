@@ -1208,6 +1208,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some("bro_webhook_list()"),
     },
     ToolDoc {
+        name: "bro_webhook_remove",
+        category: ToolCategory::Workflows,
+        summary: "Remove an installed webhook by name: drops it from the in-memory registry (POST /webhook/<name> starts 404ing immediately) and deletes its persisted spec file so it does not reload on daemon restart. Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the webhook fully installed rather than half-removed.",
+        when_to_use: "Decommission a webhook endpoint that's no longer needed, or clear one before reinstalling a corrected spec under the same name. Errors if the name isn't currently installed.",
+        example: Some(r#"bro_webhook_remove(name="forgejo")"#),
+    },
+    ToolDoc {
         name: "bro_poller_install",
         category: ToolCategory::Workflows,
         summary: "Install a scheduled HTTP-source poller that converges on the same routing pipeline as webhook ingress. Use when the upstream doesn't push (no webhook capability) or the daemon has no public ingress. Spec carries: name, every_seconds (>= BBOX_POLLER_MIN_INTERVAL_SECS, default 5), source (HttpFetchSpec), optional iterate (Selector — array path to explode response into N events), per-event extractor, optional dedup_id_path (Selector for stable id, in-memory recent-seen ring per poller), routing_packet, optional default_project_dir. Persisted to disk + tick loop spawned immediately; reinstall replaces the running task.",
@@ -1222,6 +1229,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "List installed pollers with their schedule + source URL + routing packet.",
         when_to_use: "Inventory check before installing to avoid duplicate names; also surfaces effective tick intervals (which may be clamped above your configured value via BBOX_POLLER_MIN_INTERVAL_SECS).",
         example: Some("bro_poller_list()"),
+    },
+    ToolDoc {
+        name: "bro_poller_remove",
+        category: ToolCategory::Workflows,
+        summary: "Remove an installed poller by name: aborts its running tick-loop task immediately, clears its dedup ring, and deletes its persisted spec file so it does not respawn on daemon restart. Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the poller fully installed rather than half-removed.",
+        when_to_use: "Decommission a poller that's no longer needed, or clear one before reinstalling a corrected spec under the same name. Errors if the name isn't currently installed.",
+        example: Some(r#"bro_poller_remove(name="forgejo-issues")"#),
     },
     ToolDoc {
         name: "bro_cron_install",
@@ -1242,7 +1256,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_cron_remove",
         category: ToolCategory::Workflows,
-        summary: "Remove an installed cron by name: aborts its running tick loop immediately, clears in-flight concurrency state, and deletes the persisted spec file so it does not respawn on daemon restart.",
+        summary: "Remove an installed cron by name: aborts its running tick loop immediately, clears in-flight concurrency state, and deletes the persisted spec file so it does not respawn on daemon restart. Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the cron fully installed rather than half-removed. A cron installed via bbox_artifact_install (kind=\"cron\") is catalog-managed and gets re-materialized on the next catalog sync; remove it with bbox_artifact_remove instead.",
         when_to_use: "Decommission a cron inlet that's no longer needed, or clear one before reinstalling a corrected spec under the same name. Errors if the name isn't currently installed.",
         example: Some(r#"bro_cron_remove(name="sastquatch-daily")"#),
     },
@@ -1270,7 +1284,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_workflow_remove",
         category: ToolCategory::Workflows,
-        summary: "Remove an installed workflow by registry id: deletes it from the registry and its persisted spec file so webhook/poller/cron routing verdicts and subworkflow_ref lookups can no longer resolve it. Refuses when any running_arcs entry whose workflow_name matches this id is still non-terminal (status \"running\"), unless force=true. Does not cancel or otherwise touch arcs already dispatched from this workflow (use bro_arc_cancel for that).",
+        summary: "Remove an installed workflow by registry id: deletes it from the registry and its persisted spec file so webhook/poller/cron routing verdicts and subworkflow_ref lookups can no longer resolve it. Refuses when any running_arcs entry is still non-terminal (status \"running\") for either this registry id or the resolved spec's own name, unless force=true. Does not cancel or otherwise touch arcs already dispatched from this workflow (use bro_arc_cancel for that). Deletes the persisted file BEFORE mutating the in-memory registry, so a file-delete failure leaves the workflow fully installed rather than half-removed. A workflow installed via bbox_artifact_install (kind=\"workflow\") is catalog-managed and gets re-materialized on the next catalog sync; remove it with bbox_artifact_remove instead.",
         when_to_use: "Decommission or replace an installed workflow. Leave force unset in normal operation so an in-flight arc can't be orphaned mid-run; pass force=true only when you've confirmed the running arc(s) should be abandoned (they keep running, but the id can no longer be re-dispatched by name).",
         example: Some(r#"bro_workflow_remove(id="issue-to-pr")"#),
     },
