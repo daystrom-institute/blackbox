@@ -62,10 +62,34 @@ pub const DEFAULT_MAX_AGE_SECS: u64 = 86_400;
 pub const DEFAULT_MAX_ENTRIES: usize = 5_000;
 
 /// How recently an entry may have been touched and still be skipped by a
-/// sweep. This is what keeps the sweep from racing the inline delivery
-/// attempt that the socket loop is still running for a just-spooled
-/// envelope (worst case ~4.5s), with a wide margin.
+/// sweep. This is a coarse filter that keeps the sweep from picking up
+/// work the delivery worker is about to do anyway; the per-envelope
+/// delivery lease in the binary is what actually makes concurrent lanes
+/// safe.
 pub const SWEEP_QUIET_PERIOD: Duration = Duration::from_secs(60);
+
+/// How long an orphaned `.tmp` file is left alone before pruning.
+///
+/// A temp file younger than this may belong to a write in flight right
+/// now, so only older ones are certainly abandoned by a crashed process.
+pub const TMP_ARTIFACT_GRACE: Duration = Duration::from_secs(3_600);
+
+/// Quarantined `.corrupt` files retained before the oldest are deleted.
+/// Enough to diagnose a systematic corruption bug, few enough that a
+/// pathological loop cannot fill the disk with them.
+pub const MAX_CORRUPT_ARTIFACTS: usize = 50;
+
+/// Whether a write must prove the directory entry itself is durable.
+///
+/// `Required` is for the acceptance path: the ack that follows promises
+/// the envelope survives a crash, and an unsynced rename does not. The
+/// stamp path uses `BestEffort` because losing an attempt counter costs
+/// an extra retry, not an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirSync {
+    Required,
+    BestEffort,
+}
 
 // ── Entry ───────────────────────────────────────────────────────────
 
@@ -103,19 +127,30 @@ impl SpoolEntry {
 
 // ── Naming ──────────────────────────────────────────────────────────
 
+/// Bytes of SHA-256 kept in a spool file name.
+///
+/// The digest is what makes the name injective, so it has to be wide
+/// enough that a collision is not a practical concern: 16 bytes (128
+/// bits) puts a birthday collision far beyond any spool size, where a
+/// 4-byte suffix would collide within a few tens of thousands of ids.
+const NAME_DIGEST_BYTES: usize = 16;
+
 /// Map an envelope_id to its spool file name.
 ///
 /// Slack envelope_ids are UUIDs, but the id arrives over the network and
 /// is never trusted as a path component: everything outside
 /// `[A-Za-z0-9_-]` is replaced, and the name is length-bounded. Because
-/// replacement and truncation are both lossy, a short digest of the
-/// ORIGINAL id is appended so two distinct ids can never collide onto one
-/// file.
+/// replacement and truncation are both lossy, a digest of the ORIGINAL
+/// id is appended so two distinct ids can never collide onto one file.
+///
+/// Changing this scheme is safe: `list` renames any entry whose file
+/// name is not the current canonical one, so a spool written by an older
+/// build heals on the first pass rather than becoming undeletable.
 pub fn spool_file_name(envelope_id: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(envelope_id.as_bytes());
-    let suffix = hex::encode(&digest[..4]);
+    let suffix = hex::encode(&digest[..NAME_DIGEST_BYTES]);
 
     let mut safe = String::with_capacity(envelope_id.len());
     for ch in envelope_id.chars() {
@@ -209,12 +244,20 @@ pub struct SweepPlan {
 
 // ── Spool ───────────────────────────────────────────────────────────
 
+/// Monotonic suffix making every temp file name unique, so two writes
+/// for one envelope_id can never target the same partial file.
+static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// A directory of durably written envelopes awaiting daemon delivery.
 pub struct EnvelopeSpool {
     dir: PathBuf,
     policy: SpoolPolicy,
     depth: AtomicU64,
     evicted_overflow: AtomicU64,
+    /// Serializes admission. Capacity accounting is read-modify-write
+    /// (inventory, evict, publish), so concurrent persists would
+    /// otherwise each see the pre-eviction depth and overshoot the cap.
+    admission: tokio::sync::Mutex<()>,
 }
 
 impl EnvelopeSpool {
@@ -235,8 +278,10 @@ impl EnvelopeSpool {
             policy,
             depth: AtomicU64::new(0),
             evicted_overflow: AtomicU64::new(0),
+            admission: tokio::sync::Mutex::new(()),
         };
-        // `list` is the authoritative recount and sets `depth`.
+        // `list` is the authoritative recount and sets `depth`. It also
+        // heals file names written by an older naming scheme.
         let existing = spool.list().await?;
         if !existing.is_empty() {
             tracing::info!(
@@ -245,6 +290,7 @@ impl EnvelopeSpool {
                 "adopted spooled Slack envelopes awaiting delivery"
             );
         }
+        spool.prune_artifacts().await;
         Ok(spool)
     }
 
@@ -272,14 +318,30 @@ impl EnvelopeSpool {
         self.dir.join(spool_file_name(envelope_id))
     }
 
-    /// Durably write an envelope. Returns only after the bytes and the
+    /// Durably write an envelope. Returns only after the bytes AND the
     /// containing directory entry are on stable storage, so the caller may
-    /// ack Slack the instant this returns Ok.
+    /// ack Slack the instant this returns Ok. Every failure path returns
+    /// Err, because the caller turns Err into a withheld ack.
+    ///
+    /// Admission order matters: whether this id already has an entry is
+    /// decided BEFORE capacity is enforced, so re-spooling an existing
+    /// envelope at the cap does not evict an unrelated one to make room
+    /// for a slot it is not going to consume.
     pub async fn persist(&self, envelope_id: &str, event: &Value) -> Result<()> {
-        self.enforce_capacity().await;
+        let _admitted = self.admission.lock().await;
 
         let path = self.entry_path(envelope_id);
-        let already_present = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        let already_present = tokio::fs::try_exists(&path)
+            .await
+            .with_context(|| format!("probing spool entry {}", path.display()))?;
+
+        if !already_present {
+            // Refusing here is deliberate. Continuing past a failed
+            // eviction would ack an envelope into a spool that is over
+            // its own cap, which is the unbounded growth the cap exists
+            // to prevent.
+            self.enforce_capacity().await?;
+        }
 
         let entry = SpoolEntry {
             version: SPOOL_ENTRY_VERSION,
@@ -290,7 +352,7 @@ impl EnvelopeSpool {
             last_error: None,
             event: event.clone(),
         };
-        self.write_entry(&entry).await?;
+        self.write_entry(&entry, DirSync::Required).await?;
 
         if !already_present {
             self.depth.fetch_add(1, Ordering::Relaxed);
@@ -299,13 +361,24 @@ impl EnvelopeSpool {
     }
 
     /// Drop an entry after confirmed delivery. Missing is success: the
-    /// sweep and the inline path can both reach this for one envelope.
+    /// delivery lanes can both reach this for one envelope.
+    ///
+    /// The directory sync here is best effort. A lost unlink means the
+    /// entry is replayed and the daemon sees a duplicate, which its
+    /// envelope-id dedup absorbs; it is not a lost event, so failing the
+    /// removal over it would trade a benign duplicate for a hard error.
     pub async fn remove(&self, envelope_id: &str) -> Result<()> {
         let path = self.entry_path(envelope_id);
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
                 self.decrement_depth();
-                self.sync_dir().await;
+                if let Err(e) = self.sync_dir().await {
+                    tracing::debug!(
+                        envelope_id = envelope_id,
+                        error = %e,
+                        "spool removal was not directory-synced; worst case is one replayed duplicate"
+                    );
+                }
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -314,7 +387,8 @@ impl EnvelopeSpool {
     }
 
     /// Stamp a failed delivery round onto the entry so operators can see
-    /// how long an envelope has been stuck and why.
+    /// how long an envelope has been stuck and why. Not loss-bearing: the
+    /// entry itself is already durable, so the stamp syncs best effort.
     pub async fn record_failure(&self, envelope_id: &str, error: &str) -> Result<()> {
         let path = self.entry_path(envelope_id);
         let bytes = tokio::fs::read(&path)
@@ -330,7 +404,7 @@ impl EnvelopeSpool {
             reason.truncate(500);
         }
         entry.last_error = Some(reason);
-        self.write_entry(&entry).await
+        self.write_entry(&entry, DirSync::BestEffort).await
     }
 
     /// Every readable entry, oldest first. Unreadable files are
@@ -351,7 +425,10 @@ impl EnvelopeSpool {
             }
             match tokio::fs::read(&path).await {
                 Ok(bytes) => match serde_json::from_slice::<SpoolEntry>(&bytes) {
-                    Ok(entry) if entry.version == SPOOL_ENTRY_VERSION => entries.push(entry),
+                    Ok(entry) if entry.version == SPOOL_ENTRY_VERSION => {
+                        self.heal_file_name(&path, &entry.envelope_id).await;
+                        entries.push(entry);
+                    }
                     Ok(entry) => {
                         tracing::error!(
                             path = %path.display(),
@@ -410,22 +487,24 @@ impl EnvelopeSpool {
     /// Evict oldest-first so one incoming envelope fits under the cap.
     /// Loud on every eviction: a spool that is shedding is a daemon that
     /// has been unreachable for a long time.
-    async fn enforce_capacity(&self) {
+    ///
+    /// Returns Err when the spool cannot be brought under its cap. The
+    /// caller refuses the write rather than acking past the bound.
+    /// Caller must hold `admission`.
+    async fn enforce_capacity(&self) -> Result<()> {
         if self.policy.max_entries == 0 {
-            return;
+            return Ok(());
         }
         if (self.depth() as usize) < self.policy.max_entries {
-            return;
+            return Ok(());
         }
 
-        let entries = match self.list().await {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not inventory the spool to enforce its cap");
-                return;
-            }
-        };
+        let entries = self
+            .list()
+            .await
+            .context("inventorying the spool to enforce its entry cap")?;
         let to_evict = overflow_evictions(entries.len(), 1, self.policy.max_entries);
+        let mut failed = 0usize;
         for entry in entries.into_iter().take(to_evict) {
             tracing::error!(
                 envelope_id = %entry.envelope_id,
@@ -440,51 +519,191 @@ impl EnvelopeSpool {
                     self.evicted_overflow.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    tracing::warn!(envelope_id = %entry.envelope_id, error = %e, "spool eviction failed")
+                    failed += 1;
+                    tracing::error!(envelope_id = %entry.envelope_id, error = %e, "spool eviction failed");
                 }
             }
         }
-    }
 
-    async fn write_entry(&self, entry: &SpoolEntry) -> Result<()> {
-        let path = self.entry_path(&entry.envelope_id);
-        let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(entry).context("serializing a spool entry")?;
-
-        let mut file = tokio::fs::File::create(&tmp)
-            .await
-            .with_context(|| format!("creating spool temp file {}", tmp.display()))?;
-        file.write_all(&bytes)
-            .await
-            .with_context(|| format!("writing spool temp file {}", tmp.display()))?;
-        // fsync before the rename: a rename that lands ahead of the data
-        // is exactly the crash window this spool exists to close.
-        file.sync_all()
-            .await
-            .with_context(|| format!("fsync of spool temp file {}", tmp.display()))?;
-        drop(file);
-
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .with_context(|| format!("publishing spool entry {}", path.display()))?;
-        self.sync_dir().await;
+        if (self.depth() as usize) >= self.policy.max_entries {
+            anyhow::bail!(
+                "the slack spool is at its {} entry cap and {failed} eviction(s) failed; \
+                 refusing to admit another envelope",
+                self.policy.max_entries
+            );
+        }
         Ok(())
     }
 
-    /// fsync the directory so the rename itself is durable. Best effort:
-    /// some filesystems refuse a directory fsync, and failing the write
-    /// over that would be worse than the residual risk.
-    async fn sync_dir(&self) {
-        match tokio::fs::File::open(&self.dir).await {
-            Ok(dir) => {
-                if let Err(e) = dir.sync_all().await {
-                    tracing::debug!(dir = %self.dir.display(), error = %e, "spool directory fsync unsupported");
-                }
-            }
+    async fn write_entry(&self, entry: &SpoolEntry, dir_sync: DirSync) -> Result<()> {
+        let path = self.entry_path(&entry.envelope_id);
+        // A unique temp name per write. A deterministic one lets two
+        // concurrent writes for the same envelope interleave into one
+        // partial file and then publish it.
+        let tmp = self.dir.join(format!(
+            "{}.{}.{}.tmp",
+            spool_file_name(&entry.envelope_id),
+            std::process::id(),
+            TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bytes = serde_json::to_vec(entry).context("serializing a spool entry")?;
+
+        // create_new is O_EXCL: if this name somehow exists, fail rather
+        // than silently adopt another writer's partial file.
+        let write = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .await
+                .with_context(|| format!("creating spool temp file {}", tmp.display()))?;
+            file.write_all(&bytes)
+                .await
+                .with_context(|| format!("writing spool temp file {}", tmp.display()))?;
+            // fsync before the rename: a rename that lands ahead of the
+            // data is exactly the crash window this spool exists to close.
+            file.sync_all()
+                .await
+                .with_context(|| format!("fsync of spool temp file {}", tmp.display()))?;
+            drop(file);
+
+            tokio::fs::rename(&tmp, &path)
+                .await
+                .with_context(|| format!("publishing spool entry {}", path.display()))?;
+            anyhow::Ok(())
+        }
+        .await;
+
+        if let Err(e) = write {
+            // Do not leave the partial behind for the pruner to find an
+            // hour later.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+
+        match self.sync_dir().await {
+            Ok(()) => Ok(()),
+            Err(e) if dir_sync == DirSync::Required => Err(e).with_context(|| {
+                format!(
+                    "the spool entry for {} was written but its directory entry is not durable",
+                    entry.envelope_id
+                )
+            }),
             Err(e) => {
-                tracing::debug!(dir = %self.dir.display(), error = %e, "could not open the spool directory for fsync");
+                tracing::debug!(
+                    envelope_id = %entry.envelope_id,
+                    error = %e,
+                    "spool directory fsync failed on a non-acceptance write"
+                );
+                Ok(())
             }
         }
+    }
+
+    /// fsync the directory so the rename itself is durable.
+    ///
+    /// This is NOT best effort on the acceptance path. Without it the
+    /// rename can be lost by a crash while the ack that followed it has
+    /// already told Slack to forget the envelope, which is precisely the
+    /// loss the spool exists to prevent. Callers that are not about to
+    /// ack downgrade the failure themselves.
+    async fn sync_dir(&self) -> Result<()> {
+        let dir = tokio::fs::File::open(&self.dir)
+            .await
+            .with_context(|| format!("opening {} for fsync", self.dir.display()))?;
+        dir.sync_all()
+            .await
+            .with_context(|| format!("fsync of {}", self.dir.display()))?;
+        Ok(())
+    }
+
+    /// Rename an entry whose file name predates the current naming
+    /// scheme. Without this, a scheme change makes old entries
+    /// undeletable by id: they would be replayed on every pass until the
+    /// age bound discarded them.
+    async fn heal_file_name(&self, path: &Path, envelope_id: &str) {
+        let canonical = self.entry_path(envelope_id);
+        if path == canonical {
+            return;
+        }
+        if tokio::fs::try_exists(&canonical).await.unwrap_or(false) {
+            // The canonical file already holds this envelope; the stale
+            // name is a duplicate of the same id, so drop it.
+            let _ = tokio::fs::remove_file(path).await;
+            return;
+        }
+        match tokio::fs::rename(path, &canonical).await {
+            Ok(()) => tracing::info!(
+                envelope_id = envelope_id,
+                from = %path.display(),
+                "migrated a spool entry to the current file naming scheme"
+            ),
+            Err(e) => tracing::warn!(
+                envelope_id = envelope_id,
+                path = %path.display(),
+                error = %e,
+                "could not migrate a spool entry file name; it stays readable but not removable by id"
+            ),
+        }
+    }
+
+    /// Delete abandoned `.tmp` files and cap retained `.corrupt` files.
+    /// Without this, a crash loop leaves unbounded partials and a
+    /// systematic parse bug fills the directory with quarantine copies.
+    pub async fn prune_artifacts(&self) -> (usize, usize) {
+        let mut reader = match tokio::fs::read_dir(&self.dir).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "could not scan the spool for stale artifacts");
+                return (0, 0);
+            }
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut tmp_removed = 0usize;
+        let mut corrupt: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+
+        while let Ok(Some(dir_entry)) = reader.next_entry().await {
+            let path = dir_entry.path();
+            let ext = path.extension().and_then(|e| e.to_str());
+            let modified = dir_entry
+                .metadata()
+                .await
+                .and_then(|m| m.modified())
+                .unwrap_or(now);
+            match ext {
+                Some("tmp") => {
+                    let age = now
+                        .duration_since(modified)
+                        .unwrap_or(std::time::Duration::ZERO);
+                    if age >= TMP_ARTIFACT_GRACE && tokio::fs::remove_file(&path).await.is_ok() {
+                        tmp_removed += 1;
+                    }
+                }
+                Some("corrupt") => corrupt.push((modified, path)),
+                _ => {}
+            }
+        }
+
+        // Newest first, then drop the tail past the retention cap.
+        corrupt.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+        let mut corrupt_removed = 0usize;
+        for (_, path) in corrupt.iter().skip(MAX_CORRUPT_ARTIFACTS) {
+            if tokio::fs::remove_file(path).await.is_ok() {
+                corrupt_removed += 1;
+            }
+        }
+
+        if tmp_removed > 0 || corrupt_removed > 0 {
+            tracing::warn!(
+                tmp_removed = tmp_removed,
+                corrupt_removed = corrupt_removed,
+                retained_corrupt = corrupt.len().min(MAX_CORRUPT_ARTIFACTS),
+                dir = %self.dir.display(),
+                "pruned stale spool artifacts"
+            );
+        }
+        (tmp_removed, corrupt_removed)
     }
 
     async fn quarantine(&self, path: &Path) {
@@ -791,6 +1010,149 @@ mod tests {
                 .await
                 .unwrap(),
             "the bytes are preserved for an operator, not deleted"
+        );
+    }
+
+    /// Admission order: an id that already has an entry consumes no new
+    /// slot, so re-spooling it at the cap must not evict an unrelated
+    /// envelope to make room it does not need.
+    #[tokio::test]
+    async fn re_spooling_at_the_cap_evicts_nothing() {
+        let (_dir, spool) = spool_fixture(policy(86_400, 2)).await;
+        spool.persist("first", &body("first")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        spool.persist("second", &body("second")).await.unwrap();
+        assert_eq!(spool.depth(), 2, "at the cap");
+
+        // Re-spool an id that is already present.
+        spool.persist("second", &body("second")).await.unwrap();
+
+        let ids: Vec<_> = spool
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.envelope_id)
+            .collect();
+        assert!(
+            ids.contains(&"first".to_string()),
+            "the unrelated oldest entry survived: {ids:?}"
+        );
+        assert_eq!(spool.depth(), 2);
+        assert_eq!(spool.evicted_overflow(), 0);
+    }
+
+    /// A cap that cannot be honoured refuses the write. Continuing would
+    /// ack an envelope into a spool that is already over its own bound.
+    #[tokio::test]
+    async fn persist_refuses_when_the_spool_cannot_be_brought_under_its_cap() {
+        let (_dir, spool) = spool_fixture(policy(86_400, 1)).await;
+        spool.persist("resident", &body("resident")).await.unwrap();
+        assert_eq!(spool.depth(), 1);
+
+        // Make the directory unreadable/unwritable by replacing it with a
+        // file: the inventory that eviction depends on now fails.
+        let dir = spool.dir().to_path_buf();
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+        tokio::fs::write(&dir, b"not a directory").await.unwrap();
+
+        let err = spool
+            .persist("incoming", &body("incoming"))
+            .await
+            .expect_err("an unenforceable cap refuses the write");
+        assert!(
+            !format!("{err:#}").is_empty(),
+            "the refusal carries a cause the caller can log"
+        );
+    }
+
+    /// A spool written by a build with a different naming scheme heals on
+    /// the first list, so its entries stay removable by id instead of
+    /// being replayed until the age bound.
+    #[tokio::test]
+    async fn a_legacy_file_name_is_migrated_and_stays_removable() {
+        let (_dir, spool) = spool_fixture(SpoolPolicy::default()).await;
+        spool
+            .persist("env-legacy", &body("env-legacy"))
+            .await
+            .unwrap();
+
+        // Rename it to a name the current scheme would never produce.
+        let canonical = spool.entry_path("env-legacy");
+        let legacy = spool.dir().join("env-legacy-dead.json");
+        tokio::fs::rename(&canonical, &legacy).await.unwrap();
+        assert!(!tokio::fs::try_exists(&canonical).await.unwrap());
+
+        let entries = spool.list().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            tokio::fs::try_exists(&canonical).await.unwrap(),
+            "list migrated the entry to the canonical name"
+        );
+        assert!(!tokio::fs::try_exists(&legacy).await.unwrap());
+
+        spool.remove("env-legacy").await.unwrap();
+        assert_eq!(spool.depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_for_one_envelope_never_share_a_temp_file() {
+        let (_dir, spool) = spool_fixture(SpoolPolicy::default()).await;
+        let spool = std::sync::Arc::new(spool);
+        // Deterministic temp names would let these interleave into one
+        // partial file and publish it.
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let s = spool.clone();
+            handles.push(tokio::spawn(async move {
+                s.persist("env-hot", &json!({"writer": i})).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        let entries = spool.list().await.unwrap();
+        assert_eq!(entries.len(), 1, "one envelope, one entry");
+        assert!(
+            entries[0].event.get("writer").is_some(),
+            "the published entry is a whole document, not a torn one"
+        );
+        assert_eq!(spool.depth(), 1);
+        // No temp files survive a successful write.
+        let mut reader = tokio::fs::read_dir(spool.dir()).await.unwrap();
+        while let Some(e) = reader.next_entry().await.unwrap() {
+            assert_ne!(
+                e.path().extension().and_then(|x| x.to_str()),
+                Some("tmp"),
+                "leftover temp file {}",
+                e.path().display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_artifacts_are_pruned_and_quarantines_are_capped() {
+        let (_dir, spool) = spool_fixture(SpoolPolicy::default()).await;
+
+        // A temp file inside the grace window may belong to a live write.
+        tokio::fs::write(spool.dir().join("fresh.json.tmp"), b"{}")
+            .await
+            .unwrap();
+        // More quarantines than the retention cap.
+        for i in 0..(MAX_CORRUPT_ARTIFACTS + 7) {
+            tokio::fs::write(spool.dir().join(format!("q{i}.json.corrupt")), b"x")
+                .await
+                .unwrap();
+        }
+
+        let (tmp_removed, corrupt_removed) = spool.prune_artifacts().await;
+        assert_eq!(tmp_removed, 0, "a fresh temp file is left alone");
+        assert_eq!(corrupt_removed, 7, "quarantines are capped, not unbounded");
+        assert!(
+            tokio::fs::try_exists(spool.dir().join("fresh.json.tmp"))
+                .await
+                .unwrap()
         );
     }
 
