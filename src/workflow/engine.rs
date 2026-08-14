@@ -292,97 +292,8 @@ async fn run_workflow_streaming_with_vars_inner(
         }
     }
     runner.open_arc_thread();
-    let mut status = match runner.run().await {
-        Ok(()) => "completed".to_string(),
-        Err(e) => {
-            let msg = e.to_string();
-            // "arc cancelled" is the canonical sentinel emitted by
-            // the runner when its CancellationToken trips. Surface
-            // it as a first-class terminal outcome (not an error) so
-            // on_arc_cancel hooks fire and consumers can distinguish
-            // a manual cancel from a runtime error.
-            if msg == "arc cancelled" {
-                runner.log_event("cancelled_terminal", json!({"message": msg}));
-                runner.arc_note("blocked", "workflow cancelled");
-                let status_str = "cancelled".to_string();
-                runner.update_arc_snapshot(&status_str, "(cancelled)", None);
-                runner
-                    .emit_arc_system_event(
-                        crate::system_events::types::SystemEventKind::WorkflowArcCancelled,
-                        json!({"arc_id": runner.ctx.meta.arc_id}),
-                    )
-                    .await;
-                status_str
-            } else {
-                runner.log_event("error", json!({"message": msg.clone()}));
-                runner.arc_note("blocked", &format!("workflow errored: {msg}"));
-                let status_str = format!("error: {msg}");
-                runner.update_arc_snapshot(&status_str, "(error)", None);
-                runner
-                    .emit_arc_system_event(
-                        crate::system_events::types::SystemEventKind::WorkflowArcFailed,
-                        json!({"arc_id": runner.ctx.meta.arc_id, "error": msg}),
-                    )
-                    .await;
-                status_str
-            }
-        }
-    };
-    let arc_thread_id = runner.arc_thread_id.clone();
-    if matches!(status.as_str(), "completed") {
-        runner.arc_note(
-            "done",
-            &format!(
-                "workflow {} (v{}) completed in {} event(s)",
-                runner.compiled.spec.name,
-                runner.compiled.spec.version,
-                runner.events.len()
-            ),
-        );
-    }
-    let final_outcome = runner.ctx.meta.arc_outcome.clone().unwrap_or_else(|| {
-        if status == "completed" {
-            "success".into()
-        } else if status.starts_with("cancelled") {
-            "cancelled".into()
-        } else {
-            "failed".into()
-        }
-    });
-    runner.ctx.meta.arc_outcome = Some(final_outcome);
-    runner.run_arc_exit_hooks().await;
-    // Surface terminal-hook halt failures in `status` + the
-    // running_arcs snapshot. Operators polling /orchestrate/peek or
-    // reading WorkflowRunResult.status would otherwise see stale
-    // "completed" while meta.arc_outcome silently records the
-    // cleanup failure.
-    if let Some(outcome) = runner.ctx.meta.arc_outcome.clone() {
-        if outcome.starts_with("failed") && !status.starts_with("error") {
-            status = format!("error: {outcome}");
-            runner.update_arc_snapshot(&status, "(error)", None);
-        }
-    }
-    // Release the arc's cancel-token registry entry. Doing this
-    // before moving fields out of the runner avoids needing a Drop
-    // impl (which would conflict with the by-value field moves into
-    // WorkflowRunResult below).
-    server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
-    let actor_sessions = runner.actor_sessions.clone();
-    let structured_exit = workflow_structured_exit(&runner.ctx.vars);
-    if let Some(value) = &structured_exit {
-        runner.log_event("structured_exit", json!({ "value": value }));
-    }
-    WorkflowRunResult {
-        status,
-        events: runner.events,
-        node_outputs: runner.node_outputs,
-        vars: runner.ctx.vars,
-        structured_exit,
-        arc_id: runner.ctx.meta.arc_id,
-        plan: None,
-        arc_thread_id,
-        actor_sessions,
-    }
+    let run_result = runner.run().await;
+    finish_arc_run(runner, run_result).await
 }
 
 /// Internal entry point that tracks nested-composition depth and
@@ -503,7 +414,19 @@ async fn run_workflow_at_depth_with_cancel(
         }
     }
     runner.open_arc_thread();
-    let mut status = match runner.run().await {
+    let run_result = runner.run().await;
+    finish_arc_run(runner, run_result).await
+}
+
+/// Shared terminal epilogue for every arc-runner path (top-level,
+/// nested, checkpoint-resume): classify the run result, fire arc-exit
+/// hooks, reconcile the peek snapshot, release the cancel token, drop
+/// the durable checkpoint, and assemble the WorkflowRunResult.
+async fn finish_arc_run(
+    mut runner: WorkflowRunner<'_>,
+    run_result: Result<()>,
+) -> WorkflowRunResult {
+    let mut status = match run_result {
         Ok(()) => "completed".to_string(),
         Err(e) => {
             let msg = e.to_string();
@@ -573,7 +496,15 @@ async fn run_workflow_at_depth_with_cancel(
             runner.update_arc_snapshot(&status, "(error)", None);
         }
     }
-    server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
+    // Release the arc's cancel-token registry entry. Doing this
+    // before moving fields out of the runner avoids needing a Drop
+    // impl (which would conflict with the by-value field moves into
+    // WorkflowRunResult below).
+    runner
+        .server
+        .unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
+    // Terminal state: drop the durable checkpoint (no-op for sub-arcs).
+    runner.remove_checkpoint().await;
     let actor_sessions = runner.actor_sessions.clone();
     let structured_exit = workflow_structured_exit(&runner.ctx.vars);
     if let Some(value) = &structured_exit {
@@ -635,7 +566,14 @@ struct WorkflowRunner<'a> {
     last_verdict: Option<String>,
     events: Vec<Value>,
     max_steps: usize,
+    /// Steps consumed so far against `max_steps`. A field (not a run()
+    /// local) so Wait-node checkpoints can persist the budget position.
+    steps: usize,
     arc_thread_id: Option<String>,
+    /// Set by checkpoint resume when re-entering a Wait node whose
+    /// on_enter hooks already ran before the daemon restart. Consumed
+    /// (cleared) by the first `run_activity_node` that matches it.
+    resume_skip_on_enter: Option<String>,
     /// Nesting depth for sub-workflow composition. Threaded through
     /// recursive `run_workflow_at_depth` calls so a chain of nested
     /// sub-workflows can't silently bypass the ceiling.
@@ -695,7 +633,9 @@ impl<'a> WorkflowRunner<'a> {
             last_verdict: None,
             events: Vec::new(),
             max_steps,
+            steps: 0,
             arc_thread_id: None,
+            resume_skip_on_enter: None,
             composition_depth,
             event_sink: None,
             cancel_token,
@@ -768,38 +708,62 @@ impl<'a> WorkflowRunner<'a> {
         )
         .await;
         self.update_arc_snapshot("running", "(start)", Some(&entry));
-        let mut current = entry;
-        let mut steps = 0usize;
+        self.run_from(entry).await
+    }
+
+    /// The node-walk loop, entered at `start_node` with `self.steps`
+    /// already positioned (0 for fresh arcs; the checkpointed budget
+    /// position on rehydration resume).
+    async fn run_from(&mut self, start_node: String) -> Result<()> {
+        let mut current = start_node;
+        // Durable position before the first body runs: a crash inside
+        // a node body rehydrates as `interrupted` at that node instead
+        // of vanishing.
+        self.write_checkpoint(
+            super::arc_store::ArcCheckpointStatus::Running,
+            &current,
+        )
+        .await;
         while current != TERMINAL_SENTINEL {
             if self.cancel_token.is_cancelled() {
                 self.log_event(
                     "cancelled",
-                    json!({"steps": steps, "next_was": current.clone()}),
+                    json!({"steps": self.steps, "next_was": current.clone()}),
                 );
                 bail!("arc cancelled");
             }
-            if steps >= self.max_steps {
+            if self.steps >= self.max_steps {
                 bail!("workflow exceeded max_steps ({})", self.max_steps);
             }
-            steps += 1;
+            self.steps += 1;
             self.run_node(&current).await?;
             let next = self.next_node(&current)?;
+            let steps = self.steps;
             // Compaction anchor — emit a rolling summary after each
             // boundary so an observer can reconstruct arc state
             // without reading every per-node event.
             self.write_compaction_anchor(steps, &current, &next);
             // Update the in-flight arc snapshot for /orchestrate/peek.
             self.update_arc_snapshot("running", &current, Some(&next));
+            // Durable boundary: the completed node's effects (outputs,
+            // vars, signals) are on disk before the next body runs.
+            if next != TERMINAL_SENTINEL {
+                self.write_checkpoint(
+                    super::arc_store::ArcCheckpointStatus::Running,
+                    &next,
+                )
+                .await;
+            }
             // Arc-level policy packet: advisor-as-packet, evaluates
             // arc state mechanically. Halt/escalate/warn verdicts act
             // on the arc without needing an LLM advisor round.
             self.apply_policy_packet(steps, &current, &next)?;
             current = next;
         }
-        self.log_event("complete", json!({"steps": steps}));
+        self.log_event("complete", json!({"steps": self.steps}));
         self.emit_arc_system_event(
             crate::system_events::types::SystemEventKind::WorkflowArcCompleted,
-            json!({"arc_id": self.ctx.meta.arc_id, "steps": steps}),
+            json!({"arc_id": self.ctx.meta.arc_id, "steps": self.steps}),
         )
         .await;
         self.update_arc_snapshot("completed", "(end)", None);
@@ -1021,7 +985,10 @@ mod fanout;
 mod hooks;
 mod node_dispatch;
 mod provider_events;
+mod rehydrate;
 mod subworkflow_nodes;
 #[cfg(test)]
 mod tests;
 mod wait_nodes;
+
+pub(crate) use rehydrate::rehydrate_arcs;

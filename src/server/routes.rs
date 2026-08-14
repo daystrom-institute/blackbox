@@ -609,8 +609,14 @@ pub(crate) async fn dispatch_verdict(
             // `set_var feedback_text = ${last_signal.payload.review.body}`
             // would only see the correlation tuple.
             let signal_payload = payload.unwrap_or_else(|| entity.clone());
-            let resolved =
-                signal_arc_dispatch(&state, &signal, correlate.clone(), signal_payload).await;
+            let resolved = signal_arc_dispatch(
+                &state,
+                &signal,
+                correlate.clone(),
+                signal_payload,
+                SignalDispatchOrigin::Direct,
+            )
+            .await;
             // Slack proposal-approved hook: when a `proposal-approved`
             // signal falls idle (no workflow waiting) AND the reacted
             // message maps to a posted triage proposal, acknowledge in
@@ -3413,11 +3419,26 @@ pub(crate) async fn admin_team_upsert(
     axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
 }
 
+/// Where a signal dispatch originated. Direct signals (webhook
+/// `signal_arc` verdicts, `bro_arc_signal` MCP calls) that find no
+/// matching wait are persisted to the system-events ledger so a wait
+/// registered later - including one re-registered by daemon-restart
+/// rehydration - can still consume them. Bridge-originated dispatches
+/// are already replaying a persisted event and must not re-persist it
+/// (that would ping-pong between the bridge and the router forever
+/// whenever a name-matched wait has a mismatched correlation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignalDispatchOrigin {
+    Direct,
+    SystemEventBridge,
+}
+
 pub(crate) async fn signal_arc_dispatch(
     state: &Arc<SharedState>,
     signal: &str,
     correlation: serde_json::Map<String, Value>,
     payload: Value,
+    origin: SignalDispatchOrigin,
 ) -> Value {
     let store = &state.wait_store;
     let pending_before: Vec<_> = store
@@ -3443,6 +3464,24 @@ pub(crate) async fn signal_arc_dispatch(
             matched_wait_id: None,
             idle_pending: pending_before.clone(),
         });
+        if origin == SignalDispatchOrigin::Direct {
+            // Durable idle signal: persist so Wait-registration ledger
+            // catch-up (and the live system-event bridge, which closes
+            // the register-vs-dispatch race) can deliver it later.
+            let draft = crate::system_events::SystemEventDraft {
+                kind: crate::system_events::types::SystemEventKind::from_wire(signal),
+                producer: "signal.router".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation: correlation.clone(),
+                causation_id: None,
+                payload,
+            };
+            if let Err(e) = state.system_events.emit(draft).await {
+                tracing::warn!("idle signal '{signal}' durable persist failed: {e:#}");
+            }
+        }
         return json!({
             "status": "no_matching_wait",
             "signal": signal,

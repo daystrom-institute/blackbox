@@ -1,7 +1,7 @@
 use super::restore::restore_runtime_state;
 use super::{SharedState, dispatch_routed_event, spawn_edge_index_rebuild_watcher};
 use crate::packets::ScannerConfig;
-use crate::server::routes::signal_arc_dispatch;
+use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
 use crate::server::runtime_metrics::{
     spawn_runtime_metrics_sampler, spawn_scheduler_latency_probe,
 };
@@ -37,6 +37,11 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     spawn_scheduler_latency_probe(runtime_handle.clone());
     spawn_task_completed_router(shared.clone());
     spawn_system_event_signal_bridge(shared.clone());
+    // Replay durable arc checkpoints: re-park Wait-suspended arcs and
+    // mark mid-dispatch arcs interrupted. After the signal bridge so a
+    // resumed wait's ledger catch-up and live bridge dispatch overlap
+    // instead of leaving a gap.
+    tokio::spawn(crate::workflow::engine::rehydrate_arcs(shared.clone()));
     // Inventory and checkout reconciliation may probe registered paths on
     // stalled mounts. Keep the initial pass off the listener startup path just
     // like subsequent periodic passes.
@@ -294,7 +299,14 @@ fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
                         })
                     });
                     let resolved =
-                        signal_arc_dispatch(&shared, &signal, correlation, payload).await;
+                        signal_arc_dispatch(
+                            &shared,
+                            &signal,
+                            correlation,
+                            payload,
+                            SignalDispatchOrigin::SystemEventBridge,
+                        )
+                        .await;
                     tracing::debug!(
                         signal,
                         result = %resolved,

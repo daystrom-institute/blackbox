@@ -6,6 +6,7 @@ use serde_json::{Map, Value, json};
 
 use super::{CompiledWorkflow, NodeTransition, TERMINAL_SENTINEL, workflow_structured_exit};
 use crate::server::{BlackboxServer, state::SharedState};
+use crate::workflow::engine;
 use crate::workflow::{compile, load_workflow};
 
 fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
@@ -589,4 +590,236 @@ async fn workflow_foreach_continue_collects_item_failures() {
             .unwrap()
             .contains("did not export declared key")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Arc durability: checkpoints, restart rehydration, late-signal replay
+// ---------------------------------------------------------------------------
+
+fn wait_workflow_json() -> &'static str {
+    r#"{
+        "name": "wait-durability",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "Prep": {"actor": "", "prompt": "prep done", "next": {"type": "goto", "to": "Park"}},
+            "Park": {"actor": "", "wait": {"any_of": [{"signal": "go-signal"}]}, "next": {"type": "goto", "to": "After"}},
+            "After": {"actor": "", "prompt": "woke on ${last_signal.name}", "next": {"type": "terminal"}}
+        },
+        "start": "Prep"
+    }"#
+}
+
+async fn park_arc_then_abort(dir: &std::path::Path) -> crate::workflow::arc_store::ArcCheckpoint {
+    use crate::workflow::arc_store::ArcCheckpointStatus;
+    let state = Arc::new(SharedState::for_test(dir));
+    let run_state = state.clone();
+    let handle = tokio::spawn(async move {
+        let server = BlackboxServer::new(run_state);
+        let compiled = compile(load_workflow(wait_workflow_json()).unwrap()).unwrap();
+        engine::run_workflow(&server, &compiled, None, Some(20)).await
+    });
+    let cp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let cps = state.arc_store.load_all().await;
+            if let Some(cp) = cps
+                .into_iter()
+                .find(|c| c.status == ArcCheckpointStatus::Waiting)
+            {
+                break cp;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("arc parked at Wait within deadline");
+    // Simulated daemon crash: the runner future is dropped mid-park, so
+    // no terminal epilogue runs and the checkpoint file survives.
+    handle.abort();
+    let _ = handle.await;
+    cp
+}
+
+#[tokio::test]
+async fn arc_checkpoint_written_at_wait_and_removed_at_terminal() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    use crate::workflow::arc_store::ArcCheckpointStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(SharedState::for_test(tmp.path()));
+    let run_state = state.clone();
+    let handle = tokio::spawn(async move {
+        let server = BlackboxServer::new(run_state);
+        let compiled = compile(load_workflow(wait_workflow_json()).unwrap()).unwrap();
+        engine::run_workflow(&server, &compiled, None, Some(20)).await
+    });
+    let cp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let cps = state.arc_store.load_all().await;
+            if let Some(cp) = cps
+                .into_iter()
+                .find(|c| c.status == ArcCheckpointStatus::Waiting)
+            {
+                break cp;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("Waiting checkpoint appears");
+    assert_eq!(cp.current_node, "Park");
+    assert_eq!(cp.workflow.name, "wait-durability");
+    assert!(cp.node_outputs.contains_key("Prep"), "Prep output persisted");
+    assert!(cp.in_flight_nodes.is_empty());
+
+    // The Waiting checkpoint lands BEFORE registrations become visible;
+    // wait for the WaitStore entry so the dispatch below resolves live
+    // instead of falling idle onto the durable ledger.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !state.wait_store.snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("wait registration visible");
+
+    let resolved = signal_arc_dispatch(
+        &state,
+        "go-signal",
+        Map::new(),
+        json!({"ok": true}),
+        SignalDispatchOrigin::Direct,
+    )
+    .await;
+    assert_eq!(resolved["status"], "wait_resolved", "resolved: {resolved}");
+    let result = handle.await.unwrap();
+    assert_eq!(result.status, "completed", "events: {:?}", result.events);
+    assert!(
+        result.node_outputs["After"].contains("go-signal"),
+        "wait output template rendered: {:?}",
+        result.node_outputs["After"]
+    );
+    assert!(
+        state.arc_store.load_all().await.is_empty(),
+        "terminal arc removed its checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn waiting_arc_resumes_across_restart_and_completes() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    let tmp = tempfile::tempdir().unwrap();
+    let cp = park_arc_then_abort(tmp.path()).await;
+
+    // "Restarted daemon": fresh SharedState over the same store dir.
+    let state2 = Arc::new(SharedState::for_test(tmp.path()));
+    engine::rehydrate_arcs(state2.clone()).await;
+    // The resumed arc re-registers its wait in the new WaitStore.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if !state2.wait_store.snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("rehydrated arc re-registered its wait");
+
+    let resolved = signal_arc_dispatch(
+        &state2,
+        "go-signal",
+        Map::new(),
+        json!({"round": 2}),
+        SignalDispatchOrigin::Direct,
+    )
+    .await;
+    assert_eq!(resolved["status"], "wait_resolved", "resolved: {resolved}");
+    assert_eq!(resolved["arc_id"], cp.arc_id.as_str());
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if state2.arc_store.load_all().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("resumed arc reached terminal and removed its checkpoint");
+    let completed = state2
+        .running_arcs
+        .read()
+        .values()
+        .any(|snap| snap.arc_id == cp.arc_id && snap.status == "completed");
+    assert!(completed, "resumed arc snapshot reached completed");
+}
+
+#[tokio::test]
+async fn idle_direct_signal_persists_and_resumed_wait_replays_it() {
+    use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
+    let tmp = tempfile::tempdir().unwrap();
+    let cp = park_arc_then_abort(tmp.path()).await;
+
+    let state2 = Arc::new(SharedState::for_test(tmp.path()));
+    // Signal arrives while "down" (before rehydration): no wait matches,
+    // so the router persists it to the system-events ledger.
+    let resolved = signal_arc_dispatch(
+        &state2,
+        "go-signal",
+        Map::new(),
+        json!({"while_down": true}),
+        SignalDispatchOrigin::Direct,
+    )
+    .await;
+    assert_eq!(resolved["status"], "no_matching_wait");
+
+    engine::rehydrate_arcs(state2.clone()).await;
+    // The resumed wait's ledger catch-up must consume the idle signal
+    // without any further dispatch.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if state2.arc_store.load_all().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("resumed arc consumed the idle signal and terminated");
+    let completed = state2
+        .running_arcs
+        .read()
+        .values()
+        .any(|snap| snap.arc_id == cp.arc_id && snap.status == "completed");
+    assert!(completed, "arc completed off the replayed idle signal");
+}
+
+#[tokio::test]
+async fn running_checkpoint_marks_interrupted_on_rehydrate() {
+    use crate::workflow::arc_store::ArcCheckpointStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cp = park_arc_then_abort(tmp.path()).await;
+    // Rewrite the surviving checkpoint as if the crash hit mid-node.
+    cp.status = ArcCheckpointStatus::Running;
+
+    let state2 = Arc::new(SharedState::for_test(tmp.path()));
+    state2.arc_store.save(&cp).await.unwrap();
+    engine::rehydrate_arcs(state2.clone()).await;
+
+    let cps = state2.arc_store.load_all().await;
+    assert_eq!(cps.len(), 1);
+    assert_eq!(cps[0].status, ArcCheckpointStatus::Interrupted);
+    assert!(
+        state2.wait_store.snapshot().is_empty(),
+        "interrupted arcs must not re-register waits"
+    );
+    if let Some(thread_id) = cp.arc_thread_id.as_deref() {
+        let arcs = state2.running_arcs.read();
+        let snap = arcs.get(thread_id).expect("interrupted snapshot present");
+        assert_eq!(snap.status, "interrupted");
+        assert_eq!(snap.current_node.as_deref(), Some("Park"));
+    }
 }

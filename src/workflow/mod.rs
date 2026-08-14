@@ -9,6 +9,7 @@
 //! The execution loop (`bro orchestrate run`) is separate; this module is
 //! parsing + validation only.
 
+pub mod arc_store;
 pub mod context;
 pub mod engine;
 pub mod extractor;

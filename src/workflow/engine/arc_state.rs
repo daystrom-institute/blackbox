@@ -188,6 +188,83 @@ impl WorkflowRunner<'_> {
         Ok(())
     }
 
+    /// Only top-level arcs checkpoint. Sub-workflow runners are not
+    /// independently resumable in v1: their parent's Running checkpoint
+    /// covers them (rehydration marks it interrupted).
+    pub(super) fn should_checkpoint(&self) -> bool {
+        self.composition_depth == 0 && self.ctx.meta.parent_arc_id.is_none()
+    }
+
+    pub(super) fn build_checkpoint(
+        &self,
+        status: crate::workflow::arc_store::ArcCheckpointStatus,
+        current_node: &str,
+    ) -> crate::workflow::arc_store::ArcCheckpoint {
+        let mut in_flight_nodes: Vec<String> = self.in_flight.keys().cloned().collect();
+        in_flight_nodes.sort();
+        crate::workflow::arc_store::ArcCheckpoint {
+            schema_version: crate::workflow::arc_store::ARC_CHECKPOINT_SCHEMA_VERSION,
+            arc_id: self.ctx.meta.arc_id.clone(),
+            workflow: self.compiled.spec.clone(),
+            project_dir: self.project_dir.clone(),
+            ctx: self.ctx.clone(),
+            node_outputs: self.node_outputs.clone(),
+            actor_sessions: self.actor_sessions.clone(),
+            ensemble_sessions: self.ensemble_sessions.clone(),
+            visit_counts: self.visit_counts.clone(),
+            last_verdict: self.last_verdict.clone(),
+            steps: self.steps,
+            max_steps: self.max_steps,
+            current_node: current_node.to_string(),
+            status,
+            in_flight_nodes,
+            arc_thread_id: self.arc_thread_id.clone(),
+            saved_at: crate::util::now_iso(),
+        }
+    }
+
+    /// Persist the arc's durable position. Failures are logged, never
+    /// propagated: losing crash-resume durability must not fail a live
+    /// arc that would otherwise run to completion.
+    pub(super) async fn write_checkpoint(
+        &self,
+        status: crate::workflow::arc_store::ArcCheckpointStatus,
+        current_node: &str,
+    ) {
+        if !self.should_checkpoint() {
+            return;
+        }
+        let cp = self.build_checkpoint(status, current_node);
+        if let Err(e) = self.server.state.arc_store.save(&cp).await {
+            tracing::warn!(
+                "arc {} checkpoint write failed at node '{current_node}': {e:#}",
+                self.ctx.meta.arc_id
+            );
+        }
+    }
+
+    /// Remove the checkpoint at terminal state. Called from the shared
+    /// arc epilogue for every terminal outcome (completed, cancelled,
+    /// errored): the arc thread keeps the audit trail, and a terminal
+    /// arc must not rehydrate.
+    pub(super) async fn remove_checkpoint(&self) {
+        if !self.should_checkpoint() {
+            return;
+        }
+        if let Err(e) = self
+            .server
+            .state
+            .arc_store
+            .remove(&self.ctx.meta.arc_id)
+            .await
+        {
+            tracing::warn!(
+                "arc {} checkpoint remove failed: {e:#}",
+                self.ctx.meta.arc_id
+            );
+        }
+    }
+
     pub(super) fn write_compaction_anchor(&self, step: usize, just_ran: &str, next: &str) {
         let completed = self.completed_node_names();
         let mut in_flight: Vec<&String> = self.in_flight.keys().collect();

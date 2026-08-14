@@ -46,6 +46,13 @@ pub struct ArcContext {
     /// Hooks read this; gates typically only need `last_signal`.
     #[serde(default)]
     pub signal_history: Vec<SignalRef>,
+    /// System-event ids this arc has already consumed through the
+    /// Wait-registration ledger catch-up. Prevents a wait node revisited
+    /// in a loop (or re-entered on daemon-restart rehydration) from
+    /// resolving against the same persisted event twice. Bounded FIFO;
+    /// see `record_consumed_signal_event`.
+    #[serde(default)]
+    pub consumed_signal_event_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +140,7 @@ impl ArcContext {
             meta,
             last_signal: None,
             signal_history: Vec::new(),
+            consumed_signal_event_ids: Vec::new(),
         }
     }
 
@@ -208,6 +216,31 @@ impl ArcContext {
     /// history is preserved.
     pub fn clear_last_signal(&mut self) {
         self.last_signal = None;
+    }
+
+    /// Ceiling for `consumed_signal_event_ids`. Old entries age out
+    /// FIFO; an arc that loops through more distinct ledger events than
+    /// this between two visits of the same wait correlation would be
+    /// pathological.
+    const CONSUMED_SIGNAL_EVENT_CAP: usize = 256;
+
+    /// Remember that a persisted system event resolved one of this
+    /// arc's waits, so ledger catch-up never consumes it again.
+    pub fn record_consumed_signal_event(&mut self, event_id: &str) {
+        if self.signal_event_consumed(event_id) {
+            return;
+        }
+        self.consumed_signal_event_ids.push(event_id.to_string());
+        if self.consumed_signal_event_ids.len() > Self::CONSUMED_SIGNAL_EVENT_CAP {
+            let excess = self.consumed_signal_event_ids.len() - Self::CONSUMED_SIGNAL_EVENT_CAP;
+            self.consumed_signal_event_ids.drain(..excess);
+        }
+    }
+
+    pub fn signal_event_consumed(&self, event_id: &str) -> bool {
+        self.consumed_signal_event_ids
+            .iter()
+            .any(|id| id == event_id)
     }
 
     /// Flatten the full context into one JSON Value. Used as the

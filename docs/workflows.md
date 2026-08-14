@@ -1125,22 +1125,64 @@ spawn arc
 - `--dry-run` validates + summarizes without dispatching
 - `bro orchestrate run --stream` SSE event firehose during execution
 
+## Arc durability
+
+Top-level arcs are crash-resumable. The engine writes a durable
+checkpoint (full workflow spec, ArcContext, node outputs, actor
+sessions, visit counts, step budget) under `<store_dir>/arcs/` at every
+node boundary and at Wait-node entry, and removes it at terminal state.
+On boot, a rehydration pass replays what survived:
+
+- Arcs parked on a `wait` re-enter their wait node (on_enter hooks
+  skipped), re-register the same correlations into the in-memory
+  `WaitStore`, and replay the system-events ledger for anything that
+  arrived while the daemon was down. A worker parked on a signal for
+  days survives restarts invisibly.
+- Arcs that died mid-node-body (or waiting with live fork dispatches)
+  are marked `interrupted`, never silently re-run: node bodies are not
+  idempotent. Interrupted arcs surface in `/orchestrate/peek`,
+  `bro_arc_status`, and a `blocked` note on the arc thread.
+- Direct signals (webhook `signal_arc` verdicts, `bro_arc_signal`)
+  that find no matching wait are persisted to the system-events ledger,
+  so a wait registered later - including one re-registered by
+  rehydration - still consumes them. Arcs track consumed event ids, so
+  a wait revisited in a loop never resolves twice off the same event.
+- Sub-workflow arcs do not checkpoint independently in v1; a crash
+  inside one interrupts the parent arc.
+
+The narrow crash window between a live signal resolving a wait and the
+next boundary checkpoint can still lose that one signal; everything
+coarser than a node boundary is durable.
+
+## Retention
+
+What an arc leaves behind, and what bounds it:
+
+- Durable checkpoints: removed at terminal state; only interrupted
+  arcs keep theirs, and those are operator-visible debts, not silent
+  accretion.
+- Signal and webhook-delivery logs: bounded in-memory rings (~200),
+  gone on restart.
+- Arc threads and notes: append-only and durable BY DESIGN - they are
+  the audit trail, including for one-off inline-spec runs. Policy:
+  ad-hoc topologies are cheap to mint and are not auto-deleted; triage
+  accretion through `bbox_inbox` staleness surfacing and resolve dead
+  arc threads in bulk via `bbox_thread`. If a deployment mints
+  thousands of throwaway arcs, prefer an installed workflow id over
+  inline specs so runs share one lineage, and prune with the storage
+  maintenance surfaces (`bbox_storage_gc`) rather than hand-deleting
+  store files.
+
 ## Phase-next
 
-- `bro orchestrate resume <thread-id>` - genuine re-entry at the last
-  recorded step for arcs that paused or errored. Needs persistent
-  full-output snapshots to survive daemon restarts.
-- Disk-backed `WaitStore` (currently in-memory) so suspended arcs
-  survive daemon restart.
-- Disk-backed `running_arcs` registry so `peek` works after a restart.
+- Generic `bro orchestrate resume <thread-id>` - manual re-entry for
+  `interrupted` arcs (rehydration already auto-resumes waiting arcs;
+  interrupted ones currently need a fresh run).
 - YAML workflow loader (JSON-only today; one-line add once `serde_yaml`
   is introduced).
-- `cancel_arc` routing verdict actually wired through.
 - Push-storm debouncing (real deployments want a `vars.review_in_progress`
   flag the routing packet checks). Pattern documented; not yet wired
   in the keystone example.
-- Sandboxed `Shell` op gated via packet policy (today: shell runs
-  with `cwd` from `meta.worktree` but no allowlist enforcement).
 
 ## Examples
 

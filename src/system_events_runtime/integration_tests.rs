@@ -209,6 +209,9 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         store_dir: tmp.path().join("bro"),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
+        arc_store: Arc::new(crate::workflow::arc_store::ArcStore::new(
+            tmp.path().join("bro").join("arcs"),
+        )),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
         pollers: Arc::new(pollers::PollerRegistry::new()),
         crons: Arc::new(crons::CronRegistry::new()),
@@ -448,7 +451,11 @@ async fn system_events_workflow_wait_registered_and_signal_received() {
             correlation: serde_json::Map::new(),
             received_at: crate::util::now_iso(),
         });
-        notify.notify_waiters();
+        // notify_one (not notify_waiters): the real router uses it
+        // because it stores a permit when the runner has not reached
+        // its suspension select yet; notify_waiters would lose the
+        // wake in that window and hang the arc.
+        notify.notify_one();
     }
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)

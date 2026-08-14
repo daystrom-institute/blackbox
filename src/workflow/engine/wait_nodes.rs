@@ -62,6 +62,20 @@ impl WorkflowRunner<'_> {
 
         self.ctx.clear_last_signal();
 
+        // Durable park, written BEFORE the registrations become visible
+        // to the signal router: a daemon restart from any point in this
+        // node rehydrates the arc by re-entering it (on_enter skipped),
+        // re-deriving the same correlations from the restored context,
+        // and re-running the ledger catch-up below against everything
+        // that arrived while down. Ordering also keeps the write out of
+        // the registration-to-park window, which stays as narrow as it
+        // was before checkpointing existed.
+        self.write_checkpoint(
+            crate::workflow::arc_store::ArcCheckpointStatus::Waiting,
+            node_id,
+        )
+        .await;
+
         let mut registered_ids: Vec<(String, String)> = Vec::new();
         let mut registered_waits: Vec<(String, String, String, Map<String, Value>)> = Vec::new();
         let resolved_slot: Arc<parking_lot::Mutex<Option<SignalRef>>> =
@@ -126,7 +140,10 @@ impl WorkflowRunner<'_> {
             };
             if let Some(event) = events
                 .into_iter()
-                .find(|event| matches_correlation(correlation, &event.correlation))
+                .find(|event| {
+                    !self.ctx.signal_event_consumed(&event.id)
+                        && matches_correlation(correlation, &event.correlation)
+                })
                 && let Some((resolved, notify, _, _)) =
                     self.server.wait_store().take_exact(arc, wait_id)
             {
@@ -214,6 +231,13 @@ impl WorkflowRunner<'_> {
             .lock()
             .clone()
             .ok_or_else(|| anyhow!("Wait '{node_id}' notified but resolved slot empty"))?;
+        // Ledger- and bridge-resolved signals carry the serialized
+        // system event as payload; remember its id so a loop revisit or
+        // a restart re-registration can't consume the same event twice.
+        // Live direct signals have no persisted event and record nothing.
+        if let Some(event_id) = sig.payload.get("id").and_then(|v| v.as_str()) {
+            self.ctx.record_consumed_signal_event(event_id);
+        }
         self.log_event(
             "wait_resolved",
             json!({

@@ -79,11 +79,23 @@ impl WorkflowRunner<'_> {
             .ok_or_else(|| anyhow!("no metadata for activity node '{node_id}'"))?
             .clone();
 
+        // Checkpoint resume re-enters a Wait node whose on_enter hooks
+        // already ran before the restart; re-running them would repeat
+        // non-idempotent setup (worktree creation, var seeding). The
+        // marker is one-shot and node-scoped.
+        let skip_on_enter = match self.resume_skip_on_enter.take() {
+            Some(marked) if marked == node_id => true,
+            Some(marked) => {
+                self.resume_skip_on_enter = Some(marked);
+                false
+            }
+            None => false,
+        };
         // on_enter hooks fire BEFORE every node body — including
         // subworkflow descents, Wait registrations, and actor
         // dispatches. They set up state (worktree, vars, branch
         // names) and are the right place to run setup ops.
-        if !spec.on_enter.is_empty() {
+        if !spec.on_enter.is_empty() && !skip_on_enter {
             self.run_hooks(&spec.on_enter, &format!("{node_id}/on_enter"))
                 .await?;
         }

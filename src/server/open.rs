@@ -1044,6 +1044,9 @@ pub(super) fn open_shared_state(
         store_dir: store_dir.clone(),
         running_arcs: RwLock::new(HashMap::new()),
         wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
+        arc_store: Arc::new(crate::workflow::arc_store::ArcStore::new(
+            store_dir.join("arcs"),
+        )),
         webhooks: Arc::new(webhooks::WebhookRegistry::new()),
         pollers: Arc::new(pollers::PollerRegistry::new()),
         crons: Arc::new(crons::CronRegistry::new()),

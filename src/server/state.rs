@@ -295,6 +295,13 @@ pub(crate) struct SharedState {
     /// calls write into this; suspended arcs block on the per-wait
     /// Notify until a matching signal arrives.
     pub(crate) wait_store: Arc<crate::workflow::wait::WaitStore>,
+    /// Durable per-arc checkpoints under `<store_dir>/arcs/`. Written
+    /// by the engine at node boundaries and Wait registration, replayed
+    /// by the boot rehydration pass so suspended arcs survive daemon
+    /// restarts. The in-memory `wait_store` above stays authoritative
+    /// for live matching; it is rebuilt from these checkpoints by
+    /// re-entering each resumed arc's wait node.
+    pub(crate) arc_store: Arc<crate::workflow::arc_store::ArcStore>,
     /// Operator-installed webhook endpoints. Each carries its
     /// signature scheme + extractor + routing-packet id.
     pub(crate) webhooks: webhooks::SharedRegistry,
@@ -1081,6 +1088,7 @@ impl SharedState {
             store_dir: store_dir.to_path_buf(),
             running_arcs: RwLock::new(HashMap::new()),
             wait_store: Arc::new(workflow::wait::WaitStore::new()),
+            arc_store: Arc::new(workflow::arc_store::ArcStore::new(store_dir.join("arcs"))),
             webhooks: Arc::new(webhooks::WebhookRegistry::new()),
             pollers: Arc::new(pollers::PollerRegistry::new()),
             crons: Arc::new(crons::CronRegistry::new()),
