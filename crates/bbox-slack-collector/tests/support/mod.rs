@@ -807,6 +807,7 @@ pub fn test_config(
         slack_api_base_url: slack_api_base_url.to_string(),
         poll_interval_secs: 120,
         channels: bbox_slack_collector::ChannelPolicy {
+            enrollment: bbox_slack_collector::EnrollmentMode::Explicit,
             include: include.iter().map(|glob| glob.to_string()).collect(),
             exclude: Vec::new(),
             private_channels: false,

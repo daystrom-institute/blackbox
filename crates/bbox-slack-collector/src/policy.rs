@@ -16,13 +16,17 @@
 //! 3. **Exclude beats include.** A denylist overrides an allowlist, same shape
 //!    as remote project onboarding, for the same reason: the rule an operator
 //!    writes to keep something OUT has to be the one that wins.
-//! 4. **An empty include list enrolls nothing.** This is the deliberate
-//!    inversion of the file lane, where an empty include means "everything the
-//!    other rules allow". Design section 8 is explicit that there is no "index
-//!    everything" posture for this connector and that enrollment is explicit
-//!    and per-conversation, so the empty-config default here is a satellite
-//!    that observes NOTHING and says so, not one that indexes a workspace
-//!    because a config field was left blank.
+//! 4. **Under the DEFAULT `explicit` mode, an empty include list enrolls
+//!    nothing.** This is the deliberate inversion of the file lane, where an
+//!    empty include means "everything the other rules allow": the
+//!    empty-config default is a satellite that observes NOTHING and says so,
+//!    not one that indexes a workspace because a config field was left blank.
+//!    The operator may instead opt in BY NAME to `enrollment = "membership"`
+//!    (ruled 2026-08-14 for the first deployment, whose bot has deliberately
+//!    narrow membership): every member channel of an enabled class enrolls,
+//!    an invite is enrollment, a non-empty include still narrows, and
+//!    excludes still win. Membership mode never widens visibility beyond
+//!    rule 2; it only stops re-stating rule 2 in globs.
 //!
 //! Every refusal is counted under a named reason, because a policy quietly
 //! dropping half a workspace is indistinguishable from a broken connector.
@@ -45,9 +49,26 @@ pub const REASON_DIRECT_MESSAGE: &str = "direct_message";
 pub const REASON_ARCHIVED: &str = "archived";
 pub const REASON_UNNAMED: &str = "unnamed";
 
+/// How a channel becomes enrolled: named in config, never inferred.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrollmentMode {
+    /// Only channels matching a non-empty `include` glob enroll.
+    #[default]
+    Explicit,
+    /// Every member channel of an enabled class enrolls (an invite is
+    /// enrollment); a non-empty `include` still narrows and `exclude` still
+    /// wins. The operator opt-in for bots whose membership IS the intended
+    /// index boundary.
+    Membership,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelPolicy {
+    /// Enrollment mode; defaults to `explicit`.
+    #[serde(default)]
+    pub enrollment: EnrollmentMode,
     /// Channel-name globs to enroll. EMPTY ENROLLS NOTHING; see the module
     /// note. Patterns are matched against the observed name without a leading
     /// `#`.
@@ -70,7 +91,7 @@ pub struct ChannelPolicy {
 impl ChannelPolicy {
     pub fn validate(&self) -> Result<()> {
         CompiledChannelPolicy::compile(self)?;
-        if self.include.is_empty() {
+        if self.enrollment == EnrollmentMode::Explicit && self.include.is_empty() {
             // Not an error: a satellite that observes nothing is a legitimate
             // (if pointless) deployment, and refusing it would break the
             // onboard-then-configure order. It is a warning because the far
@@ -92,6 +113,7 @@ pub enum ChannelDecision {
 
 #[derive(Debug)]
 pub struct CompiledChannelPolicy {
+    enrollment: EnrollmentMode,
     include: Option<GlobSet>,
     exclude: Option<GlobSet>,
     private_channels: bool,
@@ -101,6 +123,7 @@ pub struct CompiledChannelPolicy {
 impl CompiledChannelPolicy {
     pub fn compile(policy: &ChannelPolicy) -> Result<Self> {
         Ok(Self {
+            enrollment: policy.enrollment,
             include: compile_set(&policy.include).context("compiling channel include globs")?,
             exclude: compile_set(&policy.exclude).context("compiling channel exclude globs")?,
             private_channels: policy.private_channels,
@@ -159,17 +182,22 @@ impl CompiledChannelPolicy {
                 reason: REASON_EXCLUDED,
             };
         }
-        match &self.include {
-            Some(include) if include.is_match(name) => ChannelDecision::Enroll {
-                class: if channel.is_private {
-                    ChannelClassV1::Private
-                } else {
-                    ChannelClassV1::Public
-                },
-            },
-            _ => ChannelDecision::Skip {
-                reason: REASON_NOT_INCLUDED,
-            },
+        let class = if channel.is_private {
+            ChannelClassV1::Private
+        } else {
+            ChannelClassV1::Public
+        };
+        match (&self.enrollment, &self.include) {
+            // Membership mode with no narrowing globs: membership (already
+            // proven above) is the whole rule.
+            (EnrollmentMode::Membership, None) => ChannelDecision::Enroll { class },
+            // A non-empty include narrows either mode.
+            (_, Some(include)) if include.is_match(name) => ChannelDecision::Enroll { class },
+            (EnrollmentMode::Membership, Some(_)) | (EnrollmentMode::Explicit, _) => {
+                ChannelDecision::Skip {
+                    reason: REASON_NOT_INCLUDED,
+                }
+            }
         }
     }
 }
@@ -357,6 +385,87 @@ mod tests {
             ChannelDecision::Skip {
                 reason: REASON_ARCHIVED
             }
+        );
+    }
+
+    #[test]
+    fn membership_mode_enrolls_a_member_channel_with_no_globs() {
+        let policy = ChannelPolicy {
+            enrollment: EnrollmentMode::Membership,
+            ..ChannelPolicy::default()
+        };
+        let compiled = CompiledChannelPolicy::compile(&policy).unwrap();
+        let channel = channel("anything-at-all");
+        assert_eq!(
+            compiled.decide(&channel),
+            ChannelDecision::Enroll {
+                class: ChannelClassV1::Public
+            },
+            "an invite is enrollment under membership mode"
+        );
+    }
+
+    #[test]
+    fn membership_mode_still_honors_exclude_and_membership() {
+        let policy = ChannelPolicy {
+            enrollment: EnrollmentMode::Membership,
+            exclude: vec!["secret-*".into()],
+            ..ChannelPolicy::default()
+        };
+        let compiled = CompiledChannelPolicy::compile(&policy).unwrap();
+        let excluded = channel("secret-plans");
+        assert_eq!(
+            compiled.decide(&excluded),
+            ChannelDecision::Skip {
+                reason: REASON_EXCLUDED
+            },
+            "the rule an operator writes to keep something out still wins"
+        );
+        let mut outsider = channel("general");
+        outsider.is_member = false;
+        assert_eq!(
+            compiled.decide(&outsider),
+            ChannelDecision::Skip {
+                reason: REASON_NOT_A_MEMBER
+            },
+            "membership mode never widens past the membership bound"
+        );
+    }
+
+    #[test]
+    fn membership_mode_with_globs_narrows_rather_than_widens() {
+        let policy = ChannelPolicy {
+            enrollment: EnrollmentMode::Membership,
+            include: vec!["pg-*".into()],
+            ..ChannelPolicy::default()
+        };
+        let compiled = CompiledChannelPolicy::compile(&policy).unwrap();
+        assert_eq!(
+            compiled.decide(&channel("pg-triage")),
+            ChannelDecision::Enroll {
+                class: ChannelClassV1::Public
+            }
+        );
+        assert_eq!(
+            compiled.decide(&channel("random")),
+            ChannelDecision::Skip {
+                reason: REASON_NOT_INCLUDED
+            },
+            "a non-empty include narrows membership mode"
+        );
+    }
+
+    #[test]
+    fn explicit_mode_default_is_unchanged_by_the_new_field() {
+        let policy = ChannelPolicy::default();
+        assert_eq!(policy.enrollment, EnrollmentMode::Explicit);
+        let compiled = CompiledChannelPolicy::compile(&policy).unwrap();
+        assert_eq!(
+            compiled.decide(&channel("general")),
+            ChannelDecision::Skip {
+                reason: REASON_NOT_INCLUDED
+            },
+            "empty include still enrolls nothing under the default mode"
         );
     }
 }

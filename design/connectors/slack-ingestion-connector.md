@@ -342,6 +342,15 @@ on the status endpoint, not as errors.
 
 ## 6. Scope, visibility, and privacy
 
+**RULED (operator, 2026-08-14): membership-driven enrollment is a named
+config mode.** The default posture stays explicit per-conversation
+enrollment (an empty include enrolls nothing). A deployment whose bot has
+deliberately narrow membership may set `enrollment = "membership"`: every
+member channel of an enabled class enrolls, an invite is enrollment, a
+non-empty include still narrows, and excludes still win. This never widens
+visibility beyond the membership bound; it removes the need to restate that
+bound in globs. The first deployment runs membership mode.
+
 - **Index only what the token can already see.** The connector never widens its
   own visibility: it never calls `conversations.join`, never enrolls a channel
   because it was mentioned or linked, and never follows a Slack Connect link
