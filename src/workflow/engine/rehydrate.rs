@@ -129,19 +129,24 @@ pub(crate) async fn resume_workflow_from_checkpoint(
     Ok(result)
 }
 
-/// Boot pass: load every surviving checkpoint, PRE-CLAIM the admission
-/// keys of resumable arcs synchronously (the caller awaits this before
-/// the daemon starts serving, so a fresh StartArc can never steal a
-/// checkpointed arc's singleton key during the boot window), then
-/// resume the claimed arcs as independent tasks and mark the rest
-/// interrupted. Never fails the boot; every problem is a warning plus
-/// a visible arc state.
+/// Boot pass, two-phase: (1) classify every surviving checkpoint and
+/// PRE-CLAIM resumable arcs' admission keys over the complete set -
+/// the caller awaits this before the daemon serves, so neither a fresh
+/// StartArc nor an early-finishing resumed arc can hand a singleton
+/// key to a duplicate checkpoint; (2) spawn the claimed resumes as
+/// detached tasks. Never fails the boot; every problem is a warning
+/// plus a visible arc state.
 pub(crate) async fn rehydrate_arcs(state: Arc<SharedState>) {
     let checkpoints = state.arc_store.load_all().await;
     if checkpoints.is_empty() {
         return;
     }
-    let mut resumed = 0usize;
+    // PASS 1: classify and pre-claim over the COMPLETE checkpoint set
+    // before any resume is spawned. Interleaving spawn with claiming
+    // would let a fast winner reach terminal and release its key
+    // before a later duplicate checkpoint is classified, letting the
+    // duplicate claim and resume instead of being interrupted.
+    let mut winners: Vec<ArcCheckpoint> = Vec::new();
     let mut interrupted = 0usize;
     for cp in checkpoints {
         let resumable = cp.status == ArcCheckpointStatus::Waiting && cp.in_flight_nodes.is_empty();
@@ -150,12 +155,10 @@ pub(crate) async fn rehydrate_arcs(state: Arc<SharedState>) {
             mark_arc_interrupted(&state, &cp).await;
             continue;
         }
-        // Admission pre-claim, BEFORE any spawn and before the daemon
-        // serves: the checkpoint set is the durable truth for who
-        // holds a singleton key across a restart. Two checkpoints
-        // carrying the same key resolve deterministically here: the
-        // first loaded wins, the loser is interrupted instead of
-        // silently retrying on every future boot.
+        // The checkpoint set is the durable truth for who holds a
+        // singleton key across a restart. Duplicate keys resolve
+        // deterministically: first loaded wins, the loser is
+        // interrupted instead of silently retrying on every boot.
         if let Some(key_map) = cp.ctx.meta.admission_key.as_ref() {
             let canonical = crate::workflow::wait::canonicalize_correlation(key_map);
             if let Err(holder) =
@@ -170,7 +173,11 @@ pub(crate) async fn rehydrate_arcs(state: Arc<SharedState>) {
                 continue;
             }
         }
-        resumed += 1;
+        winners.push(cp);
+    }
+    // PASS 2: every claim is settled; resumes run as detached tasks.
+    let resumed = winners.len();
+    for cp in winners {
         let state = state.clone();
         tokio::spawn(async move {
             let arc_id = cp.arc_id.clone();

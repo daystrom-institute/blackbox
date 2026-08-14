@@ -79,7 +79,11 @@ pub fn validate_subworkflow_refs<R>(
 where
     R: Fn(&str) -> Option<Workflow>,
 {
-    let mut visited = std::collections::HashSet::new();
+    // Memoized by (ref_id, depth): a ref validated at a SHALLOW depth
+    // must still be re-validated when reached through a deeper path,
+    // because its remaining composition budget differs (a plain
+    // ref-id set would skip a chain that runtime rejects).
+    let mut visited: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     let mut warnings = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     validate_refs_inner(
@@ -98,7 +102,7 @@ fn validate_refs_inner<R>(
     spec: &Workflow,
     resolve: &R,
     strict_missing: bool,
-    visited: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<(String, u32)>,
     warnings: &mut Vec<String>,
     stack: &mut Vec<String>,
     depth: u32,
@@ -121,14 +125,14 @@ where
     // ref once.
     let mut descend = |ref_id: &String,
                        child: &Workflow,
-                       visited: &mut std::collections::HashSet<String>,
+                       visited: &mut std::collections::HashSet<(String, u32)>,
                        warnings: &mut Vec<String>,
                        stack: &mut Vec<String>|
      -> Result<()> {
         if stack.contains(ref_id) {
             bail!("subworkflow_ref cycle: {} -> {ref_id}", stack.join(" -> "));
         }
-        if visited.insert(ref_id.clone()) {
+        if visited.insert((ref_id.clone(), depth)) {
             stack.push(ref_id.clone());
             let result = validate_refs_inner(
                 child,
@@ -253,6 +257,11 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
         if admission.key.is_empty() {
             bail!("admission.key must name at least one initial var");
         }
+        if admission.key.iter().any(|k| k == "_target_arc") {
+            bail!(
+                "admission.key may not use the reserved name '_target_arc' (the engine stamps it onto duplicate-conversion signals to target the holding arc)"
+            );
+        }
         if let Some(dup) = admission
             .key
             .iter()
@@ -291,6 +300,16 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
     // Every node's `next` targets must reference declared nodes; gate
     // packet, actor, late_inject, subworkflow, wait_for cross-checks.
     for (node_id, node) in &spec.nodes {
+        if let Some(wait) = &node.wait
+            && wait
+                .any_of
+                .iter()
+                .any(|w| w.correlate.contains_key("_target_arc"))
+        {
+            bail!(
+                "node '{node_id}': wait correlation may not use the reserved key '_target_arc' (the engine stamps it onto arc-targeted signals; a workflow-declared key would be overwritten)"
+            );
+        }
         if node.subworkflow.is_some() && node.subworkflow_ref.is_some() {
             bail!("node '{node_id}' has BOTH subworkflow (inline) and subworkflow_ref — pick one");
         }
@@ -3661,6 +3680,84 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing-grandchild"), "err: {err}");
+    }
+
+    #[test]
+    fn deep_path_to_a_shallow_visited_ref_still_fails_the_ceiling() {
+        // Diamond-with-depth: the root reaches X directly (depth 1,
+        // memoized) AND through a chain long enough that X would sit
+        // past the composition ceiling. Plain ref-id memoization
+        // skipped the deep edge; (ref, depth) memoization must not.
+        let leaf_ref_node = r#"{"S":{"subworkflow_ref":"X","next":{"type":"terminal"}}}"#;
+        let chain = |name: &str, next_ref: &str| {
+            load_workflow(&format!(
+                r#"{{"name":"{name}","version":1,"actors":{{}},
+                    "nodes":{{"S":{{"subworkflow_ref":"{next_ref}","next":{{"type":"terminal"}}}}}},
+                    "start":"S"}}"#
+            ))
+            .unwrap()
+        };
+        let root = load_workflow(&format!(
+            r#"{{"name":"root","version":1,"actors":{{}},
+                "nodes":{{
+                    "Direct":{{"subworkflow_ref":"X","next":{{"type":"goto","to":"Deep"}}}},
+                    "Deep":{{"subworkflow_ref":"B1","next":{{"type":"terminal"}}}}
+                }},
+                "start":"Direct"}}"#
+        ))
+        .unwrap();
+        let x = load_workflow(
+            &format!(
+                r#"{{"name":"X","version":1,"actors":{{}},
+                    "nodes":{leaf_ref_node},
+                    "start":"S"}}"#
+            )
+            .replace(r#""subworkflow_ref":"X","#, ""),
+        )
+        .unwrap();
+        let b1 = chain("B1", "B2");
+        let b2 = chain("B2", "B3");
+        let b3 = chain("B3", "B4");
+        let b4 = chain("B4", "B5");
+        let b5 = chain("B5", "X");
+        let resolve = |id: &str| match id {
+            "X" => Some(x.clone()),
+            "B1" => Some(b1.clone()),
+            "B2" => Some(b2.clone()),
+            "B3" => Some(b3.clone()),
+            "B4" => Some(b4.clone()),
+            "B5" => Some(b5.clone()),
+            _ => None,
+        };
+        let err = validate_subworkflow_refs(&root, &resolve, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("composition ceiling"),
+            "deep path must fail the ceiling despite the shallow visit: {err}"
+        );
+    }
+
+    #[test]
+    fn target_arc_is_reserved_in_admission_keys_and_wait_correlations() {
+        let bad_admission = load_workflow(
+            r#"{"name":"wf","version":1,"actors":{},
+                "admission":{"key":["_target_arc"]},
+                "nodes":{"Only":{"actor":"","next":{"type":"terminal"}}},
+                "start":"Only"}"#,
+        )
+        .unwrap();
+        let err = compile(bad_admission).unwrap_err().to_string();
+        assert!(err.contains("_target_arc"), "err: {err}");
+
+        let bad_wait = load_workflow(
+            r#"{"name":"wf","version":1,"actors":{},
+                "nodes":{"W":{"actor":"","wait":{"any_of":[{"signal":"s","correlate":{"_target_arc":{"kind":"json_path","path":"vars.x"}}}]},"next":{"type":"terminal"}}},
+                "start":"W"}"#,
+        )
+        .unwrap();
+        let err = compile(bad_wait).unwrap_err().to_string();
+        assert!(err.contains("_target_arc"), "err: {err}");
     }
 
     #[test]
