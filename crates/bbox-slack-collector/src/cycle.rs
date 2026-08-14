@@ -244,7 +244,15 @@ pub async fn run_publication_cycle(
     let roster = slack
         .list_channels(&ChannelListRequest {
             include_private: policy.include_private(),
-            exclude_archived: !policy.include_archived(),
+            // Always fetch archived on the wire and let the policy filter
+            // them locally: Slack applies exclude_archived AFTER the page
+            // window, so an archive-heavy workspace yields a near-empty page
+            // per request and the roster burns its whole page budget finding
+            // a handful of live channels (observed live: ~2 live channels per
+            // 200-slot page). Archived-ness is an efficiency class, not a
+            // privacy class, so the policy-reaches-the-request rule for
+            // private channels does not apply to it.
+            exclude_archived: false,
             page_limit: config.sweep.page_limit,
             max_pages: config.sweep.max_roster_pages,
         })
