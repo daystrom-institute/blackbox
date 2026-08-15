@@ -412,8 +412,10 @@ Two-sided operator config, mirroring `remote-project-onboarding.md`. No agent
 tool creates a source and no MCP call triggers a fetch.
 
 1. The operator adds the scope to the daemon's connector producer grant
-   (`[[source_connectors.producers]]`: `producer_id`, `token_file`, allowlisted
-   scopes, each carrying its expected connector kind and remote authority).
+   (`[[source_connectors.producers]]`: `producer_id`, `token_file` (or the
+   ordered `token_files` rotation list, `secrets-provider.md` section 6),
+   allowlisted scopes, each carrying its expected connector kind and remote
+   authority).
 2. The operator adds the source to the satellite config on the producer host
    (scope, connector kind, remote root, policy, secret references).
 3. On its next cycle the satellite calls `validate`, probes the remote for

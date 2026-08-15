@@ -43,6 +43,16 @@ out explicitly under `Changed` or `Removed`.
   instead of dropping; bounded batch drains with on-demand wakeup and
   endpoint backoff; per-envelope delivery claims with stale-entry
   re-reads; honest bounded at-least-once contract in the design doc.
+- Overlap-tolerant producer-grant token rotation (gap-bb84c77f):
+  `[[code_collection.producers]]` and `[[source_connectors.producers]]`
+  accept an ordered `token_files` list alongside the legacy singular
+  `token_file`, so a rotation can stage a new token, redeploy the
+  producer, and retire the old one across independently safe steps
+  instead of a simultaneous two-sided cutover. Verification checks
+  every staged token in constant time per slot and records which slot
+  matched (index only, never the token value) in logs and on a new
+  per-producer rotation-status view threaded into each grant runtime's
+  redacted `Debug` rendering.
 
 ### Changed
 
