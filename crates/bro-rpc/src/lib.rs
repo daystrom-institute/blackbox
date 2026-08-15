@@ -19,7 +19,7 @@ mod handshake;
 
 #[cfg(unix)]
 pub use auth::verify_peer_uid;
-pub use auth::{ServiceToken, ServiceTokenError};
+pub use auth::{ServiceToken, ServiceTokenError, ServiceTokenSet, ServiceTokenSetError};
 pub use envelope::{
     ConnectionBinding, Envelope, MAX_MESSAGE_ID_BYTES, NegotiatedIo, validate_envelope,
 };

@@ -12,19 +12,43 @@
 //! operator config; identity is the operator-minted `connector_source_id`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
 use bbox_corpus_core::project_catalog::{
     CatalogSnapshotV2, ConnectorScope, ConnectorSourceId, ProjectId,
 };
 use bbox_indexing::project_catalog_admin::{ConnectorGrantExpectation, find_connector_project};
-use bro_rpc::ServiceToken;
+use bro_rpc::ServiceTokenSet;
 use sha2::{Digest, Sha256};
 
-/// One authenticated producer: its operator-declared id and its live bearer.
+/// Sentinel stored in [`ConnectorProducerToken::last_matched_slot`] before
+/// this producer's token set has ever verified a request this boot. Not a
+/// valid slot index.
+const NEVER_MATCHED: usize = usize::MAX;
+
+/// One authenticated producer: its operator-declared id and its ordered,
+/// overlap-tolerant set of live bearers.
 struct ConnectorProducerToken {
     producer_id: String,
-    token: ServiceToken,
+    tokens: ServiceTokenSet,
+    /// Slot index of the LAST successful verification against this
+    /// producer's token set, this boot (`NEVER_MATCHED` before the first
+    /// one). Rotation observability only, never token material: an
+    /// operator watching this move off slot 0 toward a higher index knows
+    /// the fleet has migrated onto a staged token and the retired slot is
+    /// safe to remove.
+    last_matched_slot: Arc<AtomicUsize>,
+}
+
+/// One producer's token-rotation observability snapshot. Never carries
+/// token material -- `matched_slot` is an index, not a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectorTokenRotationStatus {
+    pub(crate) producer_id: String,
+    pub(crate) slots: usize,
+    pub(crate) matched_slot: Option<usize>,
 }
 
 /// Immutable grant table, rebuilt whenever the producer snapshot is rebuilt.
@@ -40,9 +64,11 @@ struct ConnectorProducerToken {
 ///
 /// The consequence is that `Debug` can no longer be DERIVED. It is written by
 /// hand below and renders producer ids, connector scopes, remote authorities,
-/// and catalog project ids -- all operator-declared config -- while the
-/// tokens are reduced to a count. That follows the `bro_rpc::ServiceToken`
-/// precedent, whose own `Debug` prints `REDACTED`: this is the second line of
+/// catalog project ids, and token-rotation status (slot count, matched slot
+/// index) -- all operator-declared config or index-only metadata -- while
+/// the token values themselves are unreachable. That follows the
+/// `bro_rpc::ServiceToken`/`ServiceTokenSet` precedent, whose own `Debug`
+/// prints `REDACTED`/a slot count: this is the second line of
 /// that defense, not a replacement for it.
 ///
 /// `the_grant_table_holds_no_credential_material` still passes verbatim and is
@@ -72,14 +98,15 @@ pub(crate) struct ConnectorGrantRuntime {
 
 impl std::fmt::Debug for ConnectorGrantRuntime {
     /// Hand-written so a bearer can never reach a panic message, a tracing
-    /// field, or a test log through this type. Only the token COUNT is
-    /// rendered; everything else here is operator-declared config.
+    /// field, or a test log through this type. Token slot counts and
+    /// rotation-status metadata (matched slot index) are rendered; the
+    /// token values themselves never are.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ConnectorGrantRuntime")
             .field("enabled", &self.enabled)
             .field("grants", &self.grants)
-            .field("producer_tokens", &self.producers.len())
+            .field("producer_tokens", &self.token_rotation_status())
             .field("scope_to_project", &self.scope_to_project)
             .field("pending_onboard", &self.pending_onboard)
             .field("profiles", &self.profiles)
@@ -131,25 +158,35 @@ impl ConnectorGrantRuntime {
             if !producer_ids.insert(producer.producer_id.clone()) {
                 bail!("duplicate source-connector producer id");
             }
-            // Load to VALIDATE and to RETAIN. `ServiceToken::load` performs
-            // the owner, mode, symlink, hardlink, and shape checks, so a
-            // misconfigured token file refuses startup here rather than on a
-            // first publication attempt. The digest proves no two producers
-            // share a token value; the token itself is kept because phase 1
-            // mounts an endpoint this table has to authenticate.
-            let token = ServiceToken::load(&producer.token_file).map_err(|error| {
+            // Load to VALIDATE and to RETAIN. `ServiceTokenSet::load`
+            // performs the owner, mode, symlink, hardlink, and shape checks
+            // on every staged token file, so a misconfigured token file
+            // refuses startup here rather than on a first publication
+            // attempt. The digest proves no two producers share a token
+            // value; the tokens themselves are kept because phase 1 mounts
+            // an endpoint this table has to authenticate.
+            let token_paths = producer.resolved_token_files().map_err(|error| {
                 anyhow::anyhow!(
-                    "loading source-connector token for {}: {error}",
+                    "resolving source-connector token files for {}: {error}",
                     producer.producer_id
                 )
             })?;
-            let token_digest = Sha256::digest(token.expose_secret().as_bytes());
-            if !token_digests.insert(token_digest.to_vec()) {
-                bail!("source-connector token values must be unique");
+            let tokens = ServiceTokenSet::load(&token_paths).map_err(|error| {
+                anyhow::anyhow!(
+                    "loading source-connector tokens for {}: {error}",
+                    producer.producer_id
+                )
+            })?;
+            for token in tokens.tokens() {
+                let token_digest = Sha256::digest(token.expose_secret().as_bytes());
+                if !token_digests.insert(token_digest.to_vec()) {
+                    bail!("source-connector token values must be unique");
+                }
             }
             producer_tokens.push(ConnectorProducerToken {
                 producer_id: producer.producer_id.clone(),
-                token,
+                tokens,
+                last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
             });
             if producer.scopes.is_empty() {
                 bail!("enabled source-connector producer has no scopes");
@@ -205,23 +242,50 @@ impl ConnectorGrantRuntime {
 
     /// Resolve a presented bearer to the producer it authenticates.
     ///
-    /// Comparison runs through `ServiceToken::verify`, which is constant
-    /// time, and EVERY configured producer is checked even after a match so
-    /// the number of comparisons does not vary with which producer presented
-    /// the bearer. Returns the operator-declared `producer_id`, which is what
+    /// Comparison runs through `ServiceTokenSet::verify`, which checks every
+    /// staged slot in constant time without short-circuiting, and EVERY
+    /// configured producer is checked even after a match so the number of
+    /// comparisons does not vary with which producer or slot presented the
+    /// bearer. Returns the operator-declared `producer_id`, which is what
     /// the onboarding composite matches grants against; the token never
-    /// leaves this method.
+    /// leaves this method. On a match, the matched slot is recorded (index
+    /// only, never token material) for rotation observability and logged
+    /// with the producer id.
     pub(crate) fn authenticate(&self, bearer: &str) -> Option<&str> {
         if !self.enabled {
             return None;
         }
         let mut matched: Option<&str> = None;
         for producer in &self.producers {
-            if producer.token.verify(bearer) {
+            if let Some(slot) = producer.tokens.verify(bearer) {
+                producer.last_matched_slot.store(slot, Ordering::Relaxed);
+                tracing::info!(
+                    producer_id = %producer.producer_id,
+                    matched_slot = slot,
+                    total_slots = producer.tokens.len(),
+                    "source-connector token matched"
+                );
                 matched = Some(producer.producer_id.as_str());
             }
         }
         matched
+    }
+
+    /// Per-producer token-rotation observability: how many slots are
+    /// staged and which one last verified a request, this boot. Never
+    /// returns token material.
+    pub(crate) fn token_rotation_status(&self) -> Vec<ConnectorTokenRotationStatus> {
+        self.producers
+            .iter()
+            .map(|producer| {
+                let slot = producer.last_matched_slot.load(Ordering::Relaxed);
+                ConnectorTokenRotationStatus {
+                    producer_id: producer.producer_id.clone(),
+                    slots: producer.tokens.len(),
+                    matched_slot: (slot != NEVER_MATCHED).then_some(slot),
+                }
+            })
+            .collect()
     }
 
     // The read surface below is consumed by the file-source route layer: the
@@ -321,7 +385,7 @@ mod tests {
     use bbox_corpus_core::project_catalog::{ConnectorKind, CorpusProject, ProjectScope};
     use std::collections::BTreeSet as Set;
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     const SOURCE_A: &str = "csrc_5f2c1d9a4b6e470e";
     /// A second operator-minted source id, granted alongside `SOURCE_A` but
@@ -403,6 +467,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -444,6 +509,7 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 // Granted identically, and deliberately absent from the
@@ -452,6 +518,7 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-b".into(),
                     token_file: token_file(&root, "token-b", &"b".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_B, "gdrive", "tenant.example")],
                 },
             ],
@@ -511,11 +578,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-files".into(),
                     token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-conversation".into(),
                     token_file: token_file(&root, "token-b", &"b".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant_on(
                         SOURCE_B,
                         "slack",
@@ -555,6 +624,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "graph", "tenant.example")],
             }],
             true,
@@ -579,6 +649,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -596,6 +667,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &secret),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -619,6 +691,109 @@ mod tests {
     }
 
     #[test]
+    fn the_grant_table_holds_no_credential_material_across_a_staged_rotation() {
+        // Extends the test above to the token_files list form: a producer
+        // staging TWO accepted tokens (an overlap-tolerant rotation) must
+        // leak neither value through Debug, only the slot count and, once a
+        // request has verified, which slot matched.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let secret_old = "1".repeat(64);
+        let secret_new = "2".repeat(64);
+        let config = config_with(
+            vec![ConnectorProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: PathBuf::new(),
+                token_files: vec![
+                    token_file(&root, "token-old", &secret_old),
+                    token_file(&root, "token-new", &secret_new),
+                ],
+                scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+            }],
+            true,
+        );
+        let catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let runtime = ConnectorGrantRuntime::build(&config, Some(&catalog)).unwrap();
+        assert_eq!(runtime.authenticate(&secret_new), Some("producer-a"));
+
+        let rendered = format!("{runtime:?}");
+        assert!(
+            !rendered.contains(&secret_old) && !rendered.contains(&secret_new),
+            "no staged token value may ever be reachable through Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("producer-a") && rendered.contains(SOURCE_A),
+            "the rendering must still carry the operator-declared grant facts: {rendered}"
+        );
+        assert!(
+            rendered.contains("slots: 2") && rendered.contains("matched_slot: Some(1)"),
+            "the rendering carries rotation-status metadata by index only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_rotation_overlap_accepts_the_old_and_new_token_then_refuses_the_retired_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let secret_old = "1".repeat(64);
+        let secret_new = "2".repeat(64);
+        let staged = config_with(
+            vec![ConnectorProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: PathBuf::new(),
+                token_files: vec![
+                    token_file(&root, "token-old", &secret_old),
+                    token_file(&root, "token-new", &secret_new),
+                ],
+                scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+            }],
+            true,
+        );
+        let catalog = CatalogSnapshotV2::empty(1).unwrap();
+        let runtime = ConnectorGrantRuntime::build(&staged, Some(&catalog)).unwrap();
+
+        assert_eq!(
+            runtime.authenticate(&secret_old),
+            Some("producer-a"),
+            "the old token stays accepted during the overlap window"
+        );
+        assert_eq!(
+            runtime.authenticate(&secret_new),
+            Some("producer-a"),
+            "the newly staged token is accepted immediately"
+        );
+        assert_eq!(
+            runtime.token_rotation_status(),
+            vec![ConnectorTokenRotationStatus {
+                producer_id: "producer-a".into(),
+                slots: 2,
+                matched_slot: Some(1),
+            }],
+            "the most recent verification (slot 1, the new token) is what an operator sees"
+        );
+
+        // Retirement is a config reload dropping the old slot, not a
+        // runtime call: a freshly built table with only the new token
+        // refuses the old one.
+        let rotated = config_with(
+            vec![ConnectorProducerConfig {
+                producer_id: "producer-a".into(),
+                token_file: token_file(&root, "token-new", &secret_new),
+                token_files: Vec::new(),
+                scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
+            }],
+            true,
+        );
+        let runtime = ConnectorGrantRuntime::build(&rotated, Some(&catalog)).unwrap();
+        assert_eq!(
+            runtime.authenticate(&secret_old),
+            None,
+            "a retired token must be refused once its slot is removed"
+        );
+        assert_eq!(runtime.authenticate(&secret_new), Some("producer-a"));
+    }
+
+    #[test]
     fn a_retained_bearer_resolves_to_exactly_its_own_producer() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -629,11 +804,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: token_file(&root, "token-a", &secret_a),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-b".into(),
                     token_file: token_file(&root, "token-b", &secret_b),
+                    token_files: Vec::new(),
                     scopes: vec![grant("csrc_00000000deadbeef", "gdrive", "tenant.example")],
                 },
             ],
@@ -681,6 +858,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: path,
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -712,11 +890,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: shared.clone(),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: shared.clone(),
+                    token_files: Vec::new(),
                     scopes: vec![grant("csrc_00000000deadbeef", "gdrive", "tenant.example")],
                 },
             ],
@@ -730,11 +910,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: shared.clone(),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-b".into(),
                     token_file: shared,
+                    token_files: Vec::new(),
                     scopes: vec![grant("csrc_00000000deadbeef", "gdrive", "tenant.example")],
                 },
             ],

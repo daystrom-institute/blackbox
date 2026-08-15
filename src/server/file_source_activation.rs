@@ -924,6 +924,7 @@ mod tests {
             producers: vec![crate::config::ConnectorProducerConfig {
                 producer_id: PRODUCER.into(),
                 token_file: token_file(root, &token_secret),
+                token_files: Vec::new(),
                 scopes: vec![crate::config::ConnectorScopeGrant {
                     connector_source_id: ConnectorSourceId::parse(SOURCE_ID).unwrap(),
                     connector_kind: ConnectorKind::parse("fixture").unwrap(),

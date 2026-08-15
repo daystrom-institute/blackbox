@@ -822,6 +822,7 @@ mod tests {
         config.code_collection.producers = vec![CodeCollectionProducerConfig {
             producer_id: "producer".into(),
             token_file: root.join("producer-token"),
+            token_files: Vec::new(),
             scopes: vec![scope.clone()],
         }];
         let layout = ProjectCatalogMigrationResolvedLayoutV1::from_config(

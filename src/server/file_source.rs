@@ -794,11 +794,13 @@ mod tests {
                 crate::config::ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: token_file(root, "token-a", &"a".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A)],
                 },
                 crate::config::ConnectorProducerConfig {
                     producer_id: "producer-b".into(),
                     token_file: token_file(root, "token-b", &"b".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_B)],
                 },
             ],
@@ -877,6 +879,7 @@ mod tests {
             producers: vec![crate::config::ConnectorProducerConfig {
                 producer_id: "producer-conversation".into(),
                 token_file: token_file(&root, "token-c", &"c".repeat(64)),
+                token_files: Vec::new(),
                 scopes: vec![crate::config::ConnectorScopeGrant {
                     connector_source_id: ConnectorSourceId::parse(SOURCE_A).unwrap(),
                     connector_kind: ConnectorKind::parse("fixture").unwrap(),

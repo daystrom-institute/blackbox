@@ -15,7 +15,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const TOKEN_HEX_BYTES: usize = 64;
 const TOKEN_RANDOM_BYTES: usize = TOKEN_HEX_BYTES / 2;
@@ -182,6 +182,97 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+/// An ordered, overlap-tolerant set of accepted bearer tokens for one
+/// producer. Index 0 is conventionally the oldest still-accepted token;
+/// staging a rotation appends a new slot at the end, and retiring the old
+/// token removes index 0 once every publisher has moved off it. Every slot
+/// is compared in constant time and the comparison loop never
+/// short-circuits on a match, so the number of comparisons performed does
+/// not depend on whether, or where, a candidate matches -- the same
+/// per-slot guarantee [`ServiceToken::verify`] already gives a single
+/// token, extended across the whole staged list.
+#[derive(Clone)]
+pub struct ServiceTokenSet {
+    tokens: Vec<ServiceToken>,
+}
+
+impl std::fmt::Debug for ServiceTokenSet {
+    /// Only the slot COUNT is ever rendered; no token value is reachable
+    /// through this type's `Debug`, matching the `ServiceToken` precedent
+    /// this type wraps.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceTokenSet")
+            .field("slots", &self.tokens.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceTokenSetError {
+    #[error("a producer token list must name at least one token")]
+    Empty,
+    #[error(transparent)]
+    Token(#[from] ServiceTokenError),
+}
+
+impl ServiceTokenSet {
+    /// Load one [`ServiceToken`] per path, in order. Fails closed on the
+    /// first unsafe or malformed file, exactly like a single
+    /// [`ServiceToken::load`], and on an empty path list.
+    pub fn load(paths: &[PathBuf]) -> Result<Self, ServiceTokenSetError> {
+        if paths.is_empty() {
+            return Err(ServiceTokenSetError::Empty);
+        }
+        let tokens = paths
+            .iter()
+            .map(|path| ServiceToken::load(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { tokens })
+    }
+
+    /// Build a set from already-parsed tokens (in-memory secrets, no file
+    /// I/O). Public rather than `#[cfg(test)]` because callers outside this
+    /// crate build `ServiceTokenSet`s from [`ServiceToken::parse`] in their
+    /// own tests, the same way [`ServiceToken::parse`] itself is already
+    /// public for that purpose.
+    pub fn from_tokens(tokens: Vec<ServiceToken>) -> Result<Self, ServiceTokenSetError> {
+        if tokens.is_empty() {
+            return Err(ServiceTokenSetError::Empty);
+        }
+        Ok(Self { tokens })
+    }
+
+    /// Verify a candidate against every staged slot without short-
+    /// circuiting, returning the index of the slot that matched. Every slot
+    /// is checked even after a match is found, so the number of
+    /// constant-time comparisons performed never varies with which slot (if
+    /// any) matched.
+    pub fn verify(&self, candidate: &str) -> Option<usize> {
+        let mut matched = None;
+        for (index, token) in self.tokens.iter().enumerate() {
+            if token.verify(candidate) {
+                matched = Some(index);
+            }
+        }
+        matched
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Every staged token, for cross-producer digest/uniqueness checks at
+    /// grant-table build time. Never log, persist, or `Debug`-print these.
+    pub fn tokens(&self) -> &[ServiceToken] {
+        &self.tokens
+    }
+}
+
 /// Confirm a connected [`tokio::net::UnixStream`] peer is running as this
 /// process's own effective uid, via `SO_PEERCRED` on Linux and
 /// `LOCAL_PEERCRED`/`getpeereid` on macOS. `tokio::net::UnixStream::peer_cred`
@@ -283,6 +374,56 @@ mod tests {
             ServiceToken::load(&broad),
             Err(ServiceTokenError::UnsafeFile)
         ));
+    }
+
+    #[test]
+    fn token_set_is_redacted_and_verifies_every_staged_slot_constant_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path_a = root.join("auth/producer.token");
+        let path_b = root.join("auth/producer.token.next");
+        let token_a = ServiceToken::load_or_create(&path_a).unwrap();
+        let token_b = ServiceToken::load_or_create(&path_b).unwrap();
+        let secret_a = token_a.expose_secret().to_string();
+        let secret_b = token_b.expose_secret().to_string();
+
+        let set = ServiceTokenSet::load(&[path_a.clone(), path_b.clone()]).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(!set.is_empty());
+
+        // Debug never renders either secret, only the slot count.
+        let rendered = format!("{set:?}");
+        assert!(!rendered.contains(&secret_a));
+        assert!(!rendered.contains(&secret_b));
+        assert!(rendered.contains("slots"));
+        assert!(rendered.contains('2'));
+
+        // Every staged slot is independently accepted, by index.
+        assert_eq!(set.verify(&secret_a), Some(0));
+        assert_eq!(set.verify(&secret_b), Some(1));
+        assert_eq!(set.verify("wrong"), None);
+    }
+
+    #[test]
+    fn token_set_refuses_an_empty_list() {
+        assert!(matches!(
+            ServiceTokenSet::load(&[]),
+            Err(ServiceTokenSetError::Empty)
+        ));
+        assert!(matches!(
+            ServiceTokenSet::from_tokens(Vec::new()),
+            Err(ServiceTokenSetError::Empty)
+        ));
+    }
+
+    #[test]
+    fn token_set_from_tokens_matches_the_same_slot_by_index() {
+        let a = ServiceToken::parse("a".repeat(TOKEN_HEX_BYTES)).unwrap();
+        let b = ServiceToken::parse("b".repeat(TOKEN_HEX_BYTES)).unwrap();
+        let set = ServiceTokenSet::from_tokens(vec![a, b]).unwrap();
+        assert_eq!(set.verify(&"a".repeat(TOKEN_HEX_BYTES)), Some(0));
+        assert_eq!(set.verify(&"b".repeat(TOKEN_HEX_BYTES)), Some(1));
+        assert_eq!(set.verify(&"c".repeat(TOKEN_HEX_BYTES)), None);
     }
 
     #[tokio::test]

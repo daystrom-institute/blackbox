@@ -574,6 +574,7 @@ mod tests {
             .push(CodeCollectionProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: root.join("producer.token"),
+                token_files: Vec::new(),
                 scopes: vec![scope.clone()],
             });
         config

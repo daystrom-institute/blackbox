@@ -670,9 +670,35 @@ pub struct CodeCollectionConfig {
 #[serde(deny_unknown_fields)]
 pub struct CodeCollectionProducerConfig {
     pub producer_id: String,
+    /// Legacy singular bearer-token file, kept for back-compat. An empty
+    /// path is the established sentinel for "not set" (see
+    /// `resolved_token_files`). Mutually exclusive with `token_files`.
+    #[serde(default)]
     pub token_file: PathBuf,
+    /// Ordered, overlap-tolerant list of accepted bearer-token files. Index
+    /// 0 is conventionally the oldest still-accepted token: staging a
+    /// rotation appends a new slot, and retiring the superseded token
+    /// removes index 0 once nothing verifies against it anymore. Mutually
+    /// exclusive with `token_file`.
+    #[serde(default)]
+    pub token_files: Vec<PathBuf>,
     #[serde(default)]
     pub scopes: Vec<bbox_corpus_core::identity::PublishedScope>,
+}
+
+impl CodeCollectionProducerConfig {
+    /// Resolve the operator-configured `token_file`/`token_files` pair into
+    /// one ordered token-file list, refusing the ambiguous (both set) and
+    /// unconfigured (neither set) shapes loudly rather than picking one
+    /// silently.
+    pub fn resolved_token_files(&self) -> Result<Vec<PathBuf>> {
+        resolve_producer_token_files(
+            "code-collection",
+            &self.producer_id,
+            &self.token_file,
+            &self.token_files,
+        )
+    }
 }
 
 /// Operator grants for connector producers (remote-source connectors,
@@ -699,9 +725,64 @@ pub struct SourceConnectorsConfig {
 #[serde(deny_unknown_fields)]
 pub struct ConnectorProducerConfig {
     pub producer_id: String,
+    /// Legacy singular bearer-token file, kept for back-compat. An empty
+    /// path is the established sentinel for "not set" (see
+    /// `resolved_token_files`). Mutually exclusive with `token_files`.
+    #[serde(default)]
     pub token_file: PathBuf,
+    /// Ordered, overlap-tolerant list of accepted bearer-token files. Same
+    /// contract as `CodeCollectionProducerConfig::token_files`: index 0 is
+    /// the oldest still-accepted token. Mutually exclusive with
+    /// `token_file`.
+    #[serde(default)]
+    pub token_files: Vec<PathBuf>,
     #[serde(default)]
     pub scopes: Vec<ConnectorScopeGrant>,
+}
+
+impl ConnectorProducerConfig {
+    /// Resolve the operator-configured `token_file`/`token_files` pair into
+    /// one ordered token-file list. Same contract as
+    /// `CodeCollectionProducerConfig::resolved_token_files`.
+    pub fn resolved_token_files(&self) -> Result<Vec<PathBuf>> {
+        resolve_producer_token_files(
+            "source_connectors",
+            &self.producer_id,
+            &self.token_file,
+            &self.token_files,
+        )
+    }
+}
+
+/// Resolve a producer's `token_file`/`token_files` pair into one ordered,
+/// overlap-tolerant token-file list. Exactly one of the two forms may be
+/// set: `token_file` (legacy singular, back-compat; deserializes as a
+/// one-element list here) or `token_files` (ordered rotation list). Both
+/// present is ambiguous and both absent is unconfigured; either shape
+/// refuses loudly rather than silently picking one.
+fn resolve_producer_token_files(
+    family: &str,
+    producer_id: &str,
+    token_file: &Path,
+    token_files: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let singular_set = !token_file.as_os_str().is_empty();
+    let list_set = !token_files.is_empty();
+    match (singular_set, list_set) {
+        (true, true) => anyhow::bail!(
+            "{family} producer {producer_id} sets both token_file and token_files; configure exactly one"
+        ),
+        (false, false) => {
+            anyhow::bail!("{family} producer {producer_id} has no token_file or token_files")
+        }
+        (true, false) => Ok(vec![token_file.to_path_buf()]),
+        (false, true) => {
+            if token_files.iter().any(|path| path.as_os_str().is_empty()) {
+                anyhow::bail!("{family} producer {producer_id} token_files contains an empty path");
+            }
+            Ok(token_files.to_vec())
+        }
+    }
 }
 
 /// One granted connector scope plus the operator's declared expectation for
@@ -800,12 +881,10 @@ fn validate_source_connectors(config: &SourceConnectorsConfig) -> Result<()> {
         if !producer_ids.insert(producer.producer_id.clone()) {
             anyhow::bail!("duplicate source_connectors producer id");
         }
-        if producer.token_file.as_os_str().is_empty() {
-            anyhow::bail!(
-                "source_connectors producer {} has no token_file",
-                producer.producer_id
-            );
-        }
+        // Validates the token_file/token_files shape (exactly one, and
+        // non-empty); the resolved list itself is consumed later, at grant
+        // table build time.
+        producer.resolved_token_files()?;
         if config.enabled && producer.scopes.is_empty() {
             anyhow::bail!(
                 "enabled source_connectors producer {} has no scopes",
@@ -1235,6 +1314,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         .cloned()
         .map(|mut producer| {
             producer.token_file = expand_tilde(&producer.token_file.to_string_lossy(), &home)?;
+            producer.token_files = expand_tilde_list(&producer.token_files, &home)?;
             Ok(producer)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1248,6 +1328,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             .cloned()
             .map(|mut producer| {
                 producer.token_file = expand_tilde(&producer.token_file.to_string_lossy(), &home)?;
+                producer.token_files = expand_tilde_list(&producer.token_files, &home)?;
                 Ok(producer)
             })
             .collect::<Result<Vec<_>>>()?,
@@ -1740,6 +1821,14 @@ fn expand_tilde(s: &str, home: &Path) -> Result<PathBuf> {
         return Ok(home.join(stripped));
     }
     anyhow::bail!("~user paths are not supported: {s}")
+}
+
+/// Expand tilde paths across an ordered producer token-file list, in order.
+fn expand_tilde_list(paths: &[PathBuf], home: &Path) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| expand_tilde(&path.to_string_lossy(), home))
+        .collect()
 }
 
 /// Resolve all path configurations from raw inputs and home directory.
@@ -3252,6 +3341,78 @@ state_dir = "~"
         );
     }
 
+    fn producer_with(token_file: &str, token_files: Vec<&str>) -> CodeCollectionProducerConfig {
+        CodeCollectionProducerConfig {
+            producer_id: "producer-a".into(),
+            token_file: PathBuf::from(token_file),
+            token_files: token_files.into_iter().map(PathBuf::from).collect(),
+            scopes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn code_collection_producer_token_files_parses_the_ordered_list_form() {
+        let raw: CodeCollectionProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"host-a\"\n\
+                 token_files = [\"/tmp/token-0\", \"/tmp/token-1\"]\n",
+            ))
+            .extract()
+            .expect("an ordered token_files list parses");
+        assert_eq!(
+            raw.token_files,
+            vec![PathBuf::from("/tmp/token-0"), PathBuf::from("/tmp/token-1")]
+        );
+        assert!(raw.token_file.as_os_str().is_empty());
+        assert_eq!(
+            raw.resolved_token_files().unwrap(),
+            vec![PathBuf::from("/tmp/token-0"), PathBuf::from("/tmp/token-1")],
+            "index 0 is the oldest slot, preserved in declared order"
+        );
+    }
+
+    #[test]
+    fn code_collection_producer_singular_token_file_resolves_as_a_one_element_list() {
+        let producer = producer_with("/tmp/token", Vec::new());
+        assert_eq!(
+            producer.resolved_token_files().unwrap(),
+            vec![PathBuf::from("/tmp/token")]
+        );
+    }
+
+    #[test]
+    fn code_collection_producer_refuses_both_and_neither_token_shape() {
+        let both = producer_with("/tmp/token", vec!["/tmp/token-0"]);
+        let error = both.resolved_token_files().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("both token_file and token_files"),
+            "the refusal must name the ambiguity: {error}"
+        );
+
+        let neither = producer_with("", Vec::new());
+        let error = neither.resolved_token_files().unwrap_err();
+        assert!(
+            error.to_string().contains("no token_file or token_files"),
+            "the refusal must name what is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn code_collection_producer_refuses_an_empty_slot_inside_token_files() {
+        // An explicit `token_files = []` is indistinguishable from omitting
+        // the field (both deserialize to an empty Vec), so it is already
+        // covered by the "neither shape" refusal above. This covers the
+        // distinct case: a non-empty list that names an empty path.
+        let empty_slot = producer_with("", vec!["/tmp/token-0", ""]);
+        let error = empty_slot.resolved_token_files().unwrap_err();
+        assert!(
+            error.to_string().contains("empty path"),
+            "the refusal must name the empty slot: {error}"
+        );
+    }
+
     fn connector_grant(
         connector_source_id: &str,
         connector_kind: &str,
@@ -3274,6 +3435,7 @@ state_dir = "~"
             producers: vec![ConnectorProducerConfig {
                 producer_id: producer_id.to_string(),
                 token_file: PathBuf::from("/tmp/connector-token"),
+                token_files: Vec::new(),
                 scopes,
             }],
         }
@@ -3427,6 +3589,7 @@ profile = "conversation"
         duplicated.producers.push(ConnectorProducerConfig {
             producer_id: "producer-b".into(),
             token_file: PathBuf::from("/tmp/other-token"),
+            token_files: Vec::new(),
             scopes: vec![connector_grant(
                 "csrc_5f2c1d9a4b6e470e",
                 "graph",
@@ -3450,6 +3613,7 @@ profile = "conversation"
         duplicate_producer.producers.push(ConnectorProducerConfig {
             producer_id: "producer-a".into(),
             token_file: PathBuf::from("/tmp/other-token"),
+            token_files: Vec::new(),
             scopes: vec![connector_grant(
                 "csrc_00000000deadbeef",
                 "graph",
@@ -3503,6 +3667,53 @@ profile = "conversation"
         bad_producer_id.producers[0].producer_id = "producer-a".into();
         bad_producer_id.producers[0].token_file = PathBuf::new();
         assert!(validate_source_connectors(&bad_producer_id).is_err());
+    }
+
+    #[test]
+    fn source_connectors_producer_token_files_parses_the_ordered_list_form() {
+        let raw: ConnectorProducerConfig = Figment::new()
+            .merge(Toml::string(
+                "producer_id = \"producer-a\"\n\
+                 token_files = [\"/tmp/connector-token-0\", \"/tmp/connector-token-1\"]\n",
+            ))
+            .extract()
+            .expect("an ordered token_files list parses");
+        assert_eq!(
+            raw.resolved_token_files().unwrap(),
+            vec![
+                PathBuf::from("/tmp/connector-token-0"),
+                PathBuf::from("/tmp/connector-token-1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_connectors_producer_refuses_both_and_neither_token_shape() {
+        let mut config = connector_producer(
+            "producer-a",
+            vec![connector_grant(
+                "csrc_5f2c1d9a4b6e470e",
+                "gdrive",
+                "tenant.example",
+            )],
+        );
+
+        config.producers[0].token_files = vec![PathBuf::from("/tmp/connector-token-0")];
+        let error = validate_source_connectors(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("both token_file and token_files"),
+            "the refusal must name the ambiguity: {error}"
+        );
+
+        config.producers[0].token_file = PathBuf::new();
+        config.producers[0].token_files = Vec::new();
+        let error = validate_source_connectors(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("no token_file or token_files"),
+            "the refusal must name what is missing: {error}"
+        );
     }
 
     #[test]

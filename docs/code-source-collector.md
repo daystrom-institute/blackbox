@@ -59,6 +59,36 @@ assigned twice, or a scope does not resolve to exactly one registered project.
 On SIGHUP, an invalid replacement retains the previous complete assignment and
 authentication table.
 
+### Rotating a producer's token without a downtime window
+
+`token_file` names exactly one accepted token file. To rotate without a
+simultaneous two-sided cutover, replace it with `token_files`, an ordered
+list: index 0 is the oldest still-accepted token, and later indices are
+staged tokens the daemon will also accept.
+
+```toml
+[[code_collection.producers]]
+producer_id = "checkout-host-a"
+token_files = [
+  "~/.config/blackbox/code-collectors/checkout-host-a.token",
+  "~/.config/blackbox/code-collectors/checkout-host-a.token.next",
+]
+scopes = [
+  { repo_id = "<recorded-repo-id>", bbox_root_relpath = "." },
+]
+```
+
+`token_file` and `token_files` are mutually exclusive; configuring both, or
+neither, refuses at load. The rotation sequence is add-new, redeploy-producer,
+remove-old: create the new token file, add it as a later slot and reload,
+point the collector's own `token_file` at the new value, confirm it is
+verifying against the new slot, then drop the old file from `token_files` (or
+collapse back to a singular `token_file`) and reload again to retire it. Every
+successful verification logs which slot matched (by index, never the token
+value), so an operator can confirm the fleet has moved off slot 0 before
+removing it. `[[source_connectors.producers]]` accepts the identical
+`token_file`/`token_files` shape.
+
 ## Configure the collector
 
 Copy the same private token file to the checkout host through the operator's

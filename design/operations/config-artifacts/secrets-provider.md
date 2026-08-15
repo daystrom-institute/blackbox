@@ -29,10 +29,12 @@ date: 2026-08-11
 > implemented in blackbox is narrow and named where it appears: the static
 > secret resolver in `bbox-config` (systemd credential directory, managed file
 > secrets directory, prefixed env), the file-sourced `ServiceToken` bearer used
-> by producer transports and the fleet supervisor, and the harness
-> credential-scrub and non-secret `shell_env` lanes. Every other consumer named
-> in section 1 reads process env directly today. Line cites rot; reverify
-> contracts against code before building on this snapshot.
+> by producer transports and the fleet supervisor (now with an ordered,
+> overlap-tolerant `ServiceTokenSet` form for the two producer-grant families,
+> section 6, phase 6), and the harness credential-scrub and non-secret
+> `shell_env` lanes. Every other consumer named in section 1 reads process env
+> directly today. Line cites rot; reverify contracts against code before
+> building on this snapshot.
 
 ## 0. Decision
 
@@ -324,14 +326,25 @@ This document is the **custody** story around that:
   grant entry points at a projected file path rather than a value. Producer
   side: an entry in the managed secrets directory, materialized once at
   provisioning from the operator's password vault, never fetched per request.
-- **Rotation needs an overlap window and does not have one.** A grant entry
-  names exactly one token file today, making rotation a simultaneous two-sided
-  cutover with a guaranteed failure window. Proposal, tracked as
-  gap-bb84c77f: let a grant accept an ordered list of accepted token files for
-  one `producer_id`, so rotation is add-new, redeploy-producer, remove-old,
-  each step independently safe. Verification tries each accepted token in
-  constant time and records which matched, so the operator can see when the
-  old credential fell out of use.
+- **Rotation needs an overlap window, and now has one (phase 6,
+  gap-bb84c77f).** A grant entry no longer names exactly one token file. Both
+  producer-grant families (`[[code_collection.producers]]` and
+  `[[source_connectors.producers]]`) accept `token_files`, an ordered list,
+  alongside the legacy singular `token_file`; the singular form resolves as a
+  one-element list, and the config loader refuses loudly if both or neither
+  are set, or if the list is empty. Rotation is add-new, redeploy-producer,
+  remove-old, each step independently safe: append the new token as a later
+  slot and reload, point the producer at the new value, confirm the fleet has
+  moved off slot 0, then drop the old slot and reload again. Verification
+  (`bro_rpc::ServiceTokenSet`) tries every staged token in constant time per
+  slot without short-circuiting the loop across slots, and on a match records
+  which slot matched -- by index only, never the token value -- both in a
+  tracing log line and on a queryable per-producer rotation-status view
+  (`ProducerAuthRuntime::token_rotation_status`,
+  `ConnectorGrantRuntime::token_rotation_status`), threaded into each
+  runtime's redacted `Debug` rendering as the grant table's status surface.
+  This closes the doc's "does not have one" gap; see `docs/code-source-collector.md`
+  for the operator-facing rotation runbook.
 - **Revocation is grant removal.** Deleting the producer's token file is best
   effort and only affects a process that has not already loaded it. Removing
   the grant entry daemon-side is authoritative, applies on reload, and is the
@@ -453,10 +466,14 @@ single-operator posture stands.
 5. **Secrets-plane provider.** `bao://` KV v2 reads with JWT auth; the
    synced-versus-direct choice recorded per secret with its justification.
    Gate: a live read against the deployed instance using JWT exchange.
-6. **Producer-grant rotation overlap** (gap-bb84c77f). Multi-token grants,
-   constant-time verification across accepted tokens, matched-token
-   observability. Gate: a producer token rotates with zero failed requests
-   across the window.
+6. **Producer-grant rotation overlap** (gap-bb84c77f). Multi-token grants
+   (`token_files`, both producer-grant families), constant-time verification
+   across accepted tokens, matched-token observability
+   (`token_rotation_status`, logged and rendered on each runtime's `Debug`).
+   Landed. Gate: a producer token rotates with zero failed requests across the
+   window -- provable in a unit test today (stage both tokens, retire the
+   old one, assert zero refusals across the transition); a live-fleet gate
+   still wants an end-to-end rotation exercise against a deployed daemon.
 7. **Hosted multi-principal.** Blocked on the section 7 gate.
 
 ## 12. Acceptance criteria
@@ -478,9 +495,10 @@ single-operator posture stands.
   stopped, and resumes publishing when the corpus returns.
 - A project-local artifact referencing an external or absolute-file secret
   with no host-local grant fails closed with grant-shaped remediation.
-- A producer token rotation completes with no request failures once
-  multi-token grants land; until then the doc and runbook both state plainly
-  that rotation has a failure window.
+- A producer token rotation completes with no request failures: multi-token
+  grants (`token_files`) landed in phase 6, proven by unit coverage of the
+  stage/verify/retire sequence; a live-fleet exercise against a deployed
+  daemon remains open follow-on work.
 - No harness shell grandchild observes a provider credential in its
   environment.
 
