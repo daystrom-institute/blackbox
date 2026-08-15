@@ -1,0 +1,23 @@
+{
+  "id": "gap-bacd5e20",
+  "title": "Checkout call-site audit scanner has a sticky test-scope flag: any column-0 cfg(test) line silently unaudits the rest of the file",
+  "gap_kind": "tooling",
+  "domain": "daemon-runtime/acceptance-audits",
+  "wanted_capability": "scripts/acceptance-checkout-callsites.sh should track test scope structurally instead of via a sticky flag. Today the scanner sets in_test=true on any column-0 \"#[cfg(test)]\" line and never resets it for the remainder of the file, so a bare test-gated item (e.g. an unindented \"#[cfg(test)] use ...\" import) placed before a real acquisition site makes the scanner classify every later call as test-only. The audited site then \"no longer exists\" per checkout_callsite_audit_is_complete even though the code and the TSV ledger are both correct, and the failure message points the author at editing the ledger, which is exactly the wrong fix. Wanted: brace-depth or item-scope aware test detection (or at minimum resetting the flag at the next top-level item), plus a failure message that distinguishes \"site vanished from the scan\" from \"row is stale\", so authors are not steered toward weakening the ledger.",
+  "missing_primitive": "scope-aware cfg(test) detection in the checkout call-site scanner",
+  "fallback_used": "Removed the stray column-0 cfg(test) import from src/server/producer_auth.rs and kept test-only imports inside the trailing cfg(test) mod tests block, matching the shape the scanner expects (feat/producer-grant-rotation, sha 7f12891d).",
+  "evidence": [
+    "scripts/acceptance-checkout-callsites.sh",
+    "src/server/state.rs::blocking_acceptance_proofs::checkout_callsite_audit_is_complete",
+    "verify bbox-verify-5nnnf (2026-08-14): false 'audited site src/server/producer_auth.rs::build no longer exists'",
+    "thread-a2062843"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/daemon-runtime-acceptance-audits/callsite-scanner-sticky-cfg-test",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-a2062843",
+  "created_at": "2026-08-15T02:59:06Z",
+  "updated_at": "2026-08-15T02:59:06Z"
+}

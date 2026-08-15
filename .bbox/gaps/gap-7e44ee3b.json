@@ -14,9 +14,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/file-source-activation/retirement-redrive",
   "notes": "Named by the phase-1 implementing agent rather than half-built; the RetirementCoordinator reuse is the follow-up shape. Fits naturally into M4 (graph-aware connector runtime) or a small standalone slice.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-21347ce5",
   "created_at": "2026-08-13T21:40:36Z",
-  "updated_at": "2026-08-13T21:40:36Z"
+  "updated_at": "2026-08-15T03:14:29Z",
+  "resolved_at": "2026-08-15T03:14:29Z",
+  "resolution_note": "Retirement redrive shipped on beta/blackbox-v2 ea551ae8 (fold of feat/connector-retirement-redrive, cluster-verified): ConnectorRetirementCoordinator journals deferred selector retirements durably in the file-source store, redrives with backoff after the vector-warmup nudge, recovers at boot, drains stacked deferrals to completion, and is idempotent on already-retired selectors."
 }

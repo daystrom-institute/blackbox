@@ -14,9 +14,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/slack-search-projection/context-messages-virtual-path",
   "notes": "PARTIAL (same-day): the misleading breadcrumb half is fixed; Slack top hits now recommend the working drill-downs (bbox_search channel filter + per-hit permalink) instead of bbox_context/bbox_messages, and the tool-doc stanzas for both read tools state the transcript-file-only boundary. REMAINING: the actual read-plane port, resolving slack: locators against the conversation-source landing store so bbox_context/bbox_messages can serve a channel's surrounding turns natively.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-21347ce5",
   "created_at": "2026-08-14T17:14:25Z",
-  "updated_at": "2026-08-14T17:14:25Z"
+  "updated_at": "2026-08-15T03:14:20Z",
+  "resolved_at": "2026-08-15T03:14:20Z",
+  "resolution_note": "Slack read plane shipped on beta/blackbox-v2 ea551ae8 (fold of feat/slack-read-plane, cluster-verified): bbox_context and bbox_messages resolve slack: locators (file_path and session_id forms) against the conversation-source landing store; byte_offset carries the permalink-style digit-encoded message timestamp; unknown-channel refusals name a working lane; search breadcrumbs recommend the drill-downs again; tool_docs/docs/system memory updated."
 }
