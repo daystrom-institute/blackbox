@@ -316,18 +316,80 @@ impl ConversationSourceStore {
     /// Latest observation wins per channel. Names are stored as observations
     /// and never used as identity or as a lookup key, so a renamed channel
     /// updates its label and keeps every landed record.
+    ///
+    /// **The unenrollment signal.** `channels` alone can only ever ADD or
+    /// UPDATE observations; a producer that quietly stops listing a channel
+    /// (dropped from an allowlist, kicked, archived) leaves that channel's
+    /// last observation on disk forever, and the S2 projection keeps serving
+    /// its documents. `complete` closes that gap: when the caller asserts
+    /// `channels` is its ENTIRE current member set for this workspace, every
+    /// channel this scope previously held a `is_member: true` observation for
+    /// but that is absent from `channels` gets a synthetic `is_member: false`
+    /// observation recorded, stamped `swept_at`. This is a WRITE, never a
+    /// delete: the record lands through the same `write_durable_json` path as
+    /// any other roster observation, so it participates in the same "latest
+    /// observation wins" read and the channel's identity and history survive
+    /// exactly as a producer-reported unenrollment's would (see
+    /// [`ChannelObservationV1::is_member`] and the S2 projection's coverage
+    /// gate in `bbox-corpus-index::transcripts::conversation`).
+    ///
+    /// Idempotent: a channel already recorded `is_member: false` is left
+    /// alone rather than rewritten with a new `swept_at` on every replay, so a
+    /// steady state of complete rosters that keep omitting the same channel
+    /// costs one write, not one per cycle. A channel this scope never
+    /// rostered at all (only landed records exist for it, recovered from the
+    /// journal by [`Self::channels`]) is left alone too: there is no prior
+    /// membership claim to retract, and inventing one from nothing would be a
+    /// guess about a class and name this call was never told.
+    ///
+    /// `complete: false` is the safe default and changes nothing beyond what
+    /// `channels` itself states, exactly the pre-existing behavior: an old
+    /// producer, or a producer whose enumeration this cycle was provably
+    /// partial, must never cause an unenrollment it cannot back up.
     pub fn record_roster(
         &self,
         scope: &ConnectorScope,
         workspace_id: &str,
         channels: &[ChannelObservationV1],
+        complete: bool,
+        swept_at: &str,
     ) -> Result<u64> {
         self.require_workspace(scope, workspace_id)?;
+        let mut posted: BTreeSet<&str> = BTreeSet::new();
         for channel in channels {
+            posted.insert(channel.channel_id.as_str());
             let path = self
                 .channel_dir(scope, workspace_id, &channel.channel_id)
                 .join("roster.json");
             write_durable_json(&path, channel)?;
+        }
+        if complete {
+            for channel_id in self.channels(scope)? {
+                if posted.contains(channel_id.as_str()) {
+                    continue;
+                }
+                let Some(existing) = self.roster(scope, workspace_id, &channel_id)? else {
+                    // Never rostered, only landed: nothing to retract. See the
+                    // doc comment above.
+                    continue;
+                };
+                if !existing.is_member {
+                    // Already recorded absent; a replay of the same complete
+                    // sweep must not keep rewriting this file.
+                    continue;
+                }
+                let unenrolled = ChannelObservationV1 {
+                    channel_id: channel_id.clone(),
+                    observed_name: existing.observed_name,
+                    class: existing.class,
+                    is_member: false,
+                    observed_at: swept_at.to_string(),
+                };
+                let path = self
+                    .channel_dir(scope, workspace_id, &channel_id)
+                    .join("roster.json");
+                write_durable_json(&path, &unenrolled)?;
+            }
         }
         Ok(channels.len() as u64)
     }
@@ -1076,6 +1138,7 @@ mod tests {
     const WORKSPACE: &str = "T0FIXTURE01";
     const OTHER_WORKSPACE: &str = "T0INTRUDER";
     const CHANNEL: &str = "C0FIXTURE01";
+    const OTHER_CHANNEL: &str = "C0FIXTURE02";
 
     fn scope() -> ConnectorScope {
         ConnectorScope::try_new(SOURCE_ID, "fixture").unwrap()
@@ -1672,6 +1735,8 @@ mod tests {
                     is_member: true,
                     observed_at: "2026-08-13T00:00:00Z".into(),
                 }],
+                false,
+                "2026-08-13T00:00:00Z",
             )
             .unwrap();
         store
@@ -1704,6 +1769,8 @@ mod tests {
                     is_member: true,
                     observed_at: "2026-08-13T00:00:00Z".into(),
                 }],
+                false,
+                "2026-08-13T00:00:00Z",
             )
             .unwrap();
         let status = store.status(&scope(), 1_755_000_060).unwrap();
@@ -1726,13 +1793,25 @@ mod tests {
             observed_at: "2026-08-13T00:00:00Z".into(),
         };
         store
-            .record_roster(&scope(), WORKSPACE, &[observation("ops")])
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation("ops")],
+                false,
+                "2026-08-13T00:00:00Z",
+            )
             .unwrap();
         store
             .land_batch(&scope(), &batch(vec![record("1755000000.000100", "hi")]))
             .unwrap();
         store
-            .record_roster(&scope(), WORKSPACE, &[observation("ops-archive")])
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation("ops-archive")],
+                false,
+                "2026-08-13T00:01:00Z",
+            )
             .unwrap();
 
         let cursors = store.cursors(&scope()).unwrap();
@@ -1740,6 +1819,198 @@ mod tests {
         assert_eq!(cursors[0].landed_records, 1);
         let status = store.status(&scope(), 1_755_000_000).unwrap();
         assert_eq!(status[0].observed_name.as_deref(), Some("ops-archive"));
+    }
+
+    // -- complete-roster unenrollment (gap-e84231d3) -----------------------
+
+    fn observation_for(channel_id: &str, is_member: bool) -> ChannelObservationV1 {
+        ChannelObservationV1 {
+            channel_id: channel_id.to_string(),
+            observed_name: Some("ops".into()),
+            class: ChannelClassV1::Public,
+            is_member,
+            observed_at: "2026-08-13T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_complete_roster_unenrolls_a_channel_it_omits() {
+        // The defect: a producer that stops listing a channel used to leave
+        // its last `is_member: true` observation on disk forever. A complete
+        // sweep that omits the channel must now record its absence.
+        let dir = tempfile::tempdir().unwrap();
+        let store = bound_store(&dir);
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[
+                    observation_for(CHANNEL, true),
+                    observation_for(OTHER_CHANNEL, true),
+                ],
+                true,
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        assert!(
+            store
+                .roster(&scope(), WORKSPACE, CHANNEL)
+                .unwrap()
+                .unwrap()
+                .is_member,
+            "both channels start enrolled"
+        );
+
+        // The next sweep is complete and only reports OTHER_CHANNEL: CHANNEL
+        // was dropped from the allowlist (or lost membership) and the
+        // producer simply stopped listing it.
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation_for(OTHER_CHANNEL, true)],
+                true,
+                "2026-08-13T01:00:00Z",
+            )
+            .unwrap();
+
+        let unenrolled = store.roster(&scope(), WORKSPACE, CHANNEL).unwrap().unwrap();
+        assert!(
+            !unenrolled.is_member,
+            "a channel omitted from a complete roster is recorded absent"
+        );
+        assert_eq!(unenrolled.observed_at, "2026-08-13T01:00:00Z");
+        // Never erased: the channel id and its last known name survive, which
+        // is what lets the projection and any status surface still name it.
+        assert_eq!(unenrolled.channel_id, CHANNEL);
+        assert_eq!(unenrolled.observed_name.as_deref(), Some("ops"));
+        assert!(
+            store
+                .roster(&scope(), WORKSPACE, OTHER_CHANNEL)
+                .unwrap()
+                .unwrap()
+                .is_member,
+            "the channel still reported this sweep is untouched"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_roster_never_unenrolls_an_omitted_channel() {
+        // The safe default: `complete: false` (an old producer, or a producer
+        // whose enumeration this cycle was partial) must change nothing
+        // beyond what it explicitly reported.
+        let dir = tempfile::tempdir().unwrap();
+        let store = bound_store(&dir);
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[
+                    observation_for(CHANNEL, true),
+                    observation_for(OTHER_CHANNEL, true),
+                ],
+                true,
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+
+        // A partial roster that omits CHANNEL but does not claim completeness.
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation_for(OTHER_CHANNEL, true)],
+                false,
+                "2026-08-13T01:00:00Z",
+            )
+            .unwrap();
+
+        let untouched = store.roster(&scope(), WORKSPACE, CHANNEL).unwrap().unwrap();
+        assert!(
+            untouched.is_member,
+            "an incomplete sweep is not a license to unenroll what it did not mention"
+        );
+        assert_eq!(
+            untouched.observed_at, "2026-08-13T00:00:00Z",
+            "the stale observation is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_complete_roster_unenrollment_is_idempotent_under_replay() {
+        // A replayed (or steadily repeated) complete sweep that keeps omitting
+        // the same channel must not keep rewriting its unenrollment: one
+        // state transition, not one write per cycle.
+        let dir = tempfile::tempdir().unwrap();
+        let store = bound_store(&dir);
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation_for(CHANNEL, true)],
+                true,
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .record_roster(&scope(), WORKSPACE, &[], true, "2026-08-13T01:00:00Z")
+            .unwrap();
+        let first_unenroll = store.roster(&scope(), WORKSPACE, CHANNEL).unwrap().unwrap();
+        assert!(!first_unenroll.is_member);
+        assert_eq!(first_unenroll.observed_at, "2026-08-13T01:00:00Z");
+
+        // Replaying the same complete-and-empty sweep must not touch the
+        // observation again.
+        store
+            .record_roster(&scope(), WORKSPACE, &[], true, "2026-08-13T02:00:00Z")
+            .unwrap();
+        let replayed = store.roster(&scope(), WORKSPACE, CHANNEL).unwrap().unwrap();
+        assert_eq!(
+            replayed.observed_at, "2026-08-13T01:00:00Z",
+            "a channel already recorded absent is left alone by a later replay"
+        );
+    }
+
+    #[test]
+    fn re_enrollment_restores_membership_after_a_complete_sweep_dropped_it() {
+        // The reverse transition: a channel the producer re-lists after a
+        // complete sweep had unenrolled it must come back as a plain,
+        // ordinary roster observation, exactly like any other enrollment.
+        let dir = tempfile::tempdir().unwrap();
+        let store = bound_store(&dir);
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation_for(CHANNEL, true)],
+                true,
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        store
+            .record_roster(&scope(), WORKSPACE, &[], true, "2026-08-13T01:00:00Z")
+            .unwrap();
+        assert!(
+            !store
+                .roster(&scope(), WORKSPACE, CHANNEL)
+                .unwrap()
+                .unwrap()
+                .is_member
+        );
+
+        // The channel reappears in a later complete sweep.
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation_for(CHANNEL, true)],
+                true,
+                "2026-08-13T02:00:00Z",
+            )
+            .unwrap();
+        let restored = store.roster(&scope(), WORKSPACE, CHANNEL).unwrap().unwrap();
+        assert!(restored.is_member, "re-listing restores membership");
+        assert_eq!(restored.observed_at, "2026-08-13T02:00:00Z");
     }
 
     // -- the storage crash story ------------------------------------------
