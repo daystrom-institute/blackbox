@@ -364,15 +364,22 @@ static CLAUDE_EFFORTS: &[EffortInfo] = &[
 
 static GLM_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "glm-5.2",
+        id: "glm-5.3",
         description: "Z.AI Coding Plan flagship GLM model via Claude Code",
         default: true,
         efforts: &[],
         default_effort: None,
     },
     ModelInfo {
-        id: "glm-5.1",
+        id: "glm-5.2",
         description: "Prior flagship GLM model via Claude Code",
+        default: false,
+        efforts: &[],
+        default_effort: None,
+    },
+    ModelInfo {
+        id: "glm-5.1",
+        description: "Earlier flagship GLM model via Claude Code",
         default: false,
         efforts: &[],
         default_effort: None,
