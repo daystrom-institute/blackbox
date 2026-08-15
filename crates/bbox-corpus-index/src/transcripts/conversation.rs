@@ -63,9 +63,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use bbox_conversation_source::{AuthorKindV1, message_ts_order_key};
 use bbox_conversation_source_store::{ConversationSourceStore, LandedMessageV1};
 use bbox_corpus_core::project_catalog::ConnectorScope;
+use bro_transcript::MessageRole;
 
 use super::adapters::{TranscriptReadAdapter, TranscriptScanTarget};
 use super::types::{
@@ -602,6 +604,390 @@ fn store_error(op: &'static str, error: anyhow::Error) -> TranscriptReadError {
         kind: std::io::ErrorKind::Other,
         message: error.to_string(),
     }
+}
+
+// ── The read plane (bbox_context / bbox_messages) ───────────────────────
+//
+// `bbox_context` and `bbox_messages` read session-transcript FILES by
+// default: a byte offset into a JSONL file, or a session id resolved to
+// one. A `slack:<workspace_id>/<channel_id>` locator (this module's own
+// [`channel_locator`], the `file_path` a slack search hit carries) and a
+// `<channel_id>/<date>` bucket (`bucket_session_id`, the `session_id` a
+// slack hit carries) name no file at all — handing either to the
+// filesystem reader is exactly the ENOENT / "Session not found" dead end
+// gap-2d4d17da reports.
+//
+// The functions below are the seam `TranscriptIndex::context` and
+// `::messages` call into instead of the filesystem when a locator or
+// session id parses to one of those two shapes: they resolve straight
+// against the landing store, render surrounding messages in channel-time
+// order, and refuse with a message that NAMES a working lane
+// (`bbox_search(channel=...)`) when the channel does not resolve, rather
+// than letting a filesystem error render inline or bubble as an opaque
+// `Err`.
+
+/// Parse a `slack:<workspace_id>/<channel_id>` locator — the `file_path`
+/// form both a slack search hit and this module's own [`channel_locator`]
+/// produce. `None` for anything else, including a bare `slack:` with no
+/// channel segment.
+pub fn parse_channel_locator(locator: &str) -> Option<(&str, &str)> {
+    let body = locator.strip_prefix("slack:")?;
+    let (workspace_id, channel_id) = body.split_once('/')?;
+    if workspace_id.is_empty() || channel_id.is_empty() {
+        return None;
+    }
+    Some((workspace_id, channel_id))
+}
+
+/// Parse a `<channel_id>/<date>` session id — the per-channel-per-day
+/// bucket [`bucket_session_id`] stamps. Distinguished from an arbitrary
+/// slash-bearing session id by requiring the date half to look like
+/// `YYYY-MM-DD` or the literal `undated` fallback bucket, which is narrow
+/// enough that no other session id shape in this corpus collides with it.
+pub fn parse_session_bucket(session_id: &str) -> Option<(&str, &str)> {
+    let (channel_id, date) = session_id.split_once('/')?;
+    if channel_id.is_empty() || !looks_like_date_bucket(date) {
+        return None;
+    }
+    Some((channel_id, date))
+}
+
+fn looks_like_date_bucket(date: &str) -> bool {
+    if date == "undated" {
+        return true;
+    }
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+/// The `byte_offset` `bbox_context` borrows to name one message: the same
+/// digit-concatenation the archive permalink derives (see [`permalink`]
+/// above), so two different messages never collide as long as their
+/// timestamps differ. `None` for a `message_ts` shape `message_ts_order_key`
+/// would refuse.
+pub fn message_ts_digits(message_ts: &str) -> Option<u64> {
+    message_ts_order_key(message_ts)?;
+    let digits: String = message_ts.chars().filter(|c| *c != '.').collect();
+    digits.parse::<u64>().ok()
+}
+
+fn not_configured_message() -> String {
+    "This server has no Slack conversation source configured, so \
+     bbox_context/bbox_messages cannot resolve a slack: locator here. \
+     bbox_search still works regardless (source=\"slack\" or channel=\"...\" \
+     filters)."
+        .to_string()
+}
+
+fn unknown_channel_message(channel_id: &str) -> String {
+    format!(
+        "Channel {channel_id} is not indexed on this server right now (not \
+         enrolled, never onboarded, or the observing identity is no longer a \
+         member). Try bbox_search(channel=\"{channel_id}\") or \
+         bbox_search(source=\"slack\") to find indexed channels."
+    )
+}
+
+/// What resolving a channel against the landing store produced: either a
+/// covering adapter and location ready to read, or a refusal message that
+/// already names a working lane.
+enum ChannelResolution {
+    Ready(ConversationTranscriptAdapter, TranscriptLocation),
+    Refused(String),
+}
+
+/// Resolve a channel to a covering adapter + read location, or a refusal.
+/// Shared by every read-plane entry point below: all of them need the same
+/// covering-scope answer before they can read anything.
+fn open_covered_channel(
+    conversation_source_root: Option<&Path>,
+    sources: &[ConversationSourceEnrollmentV1],
+    workspace_id: &str,
+    channel_id: &str,
+) -> Result<ChannelResolution> {
+    let Some(root) = conversation_source_root else {
+        return Ok(ChannelResolution::Refused(not_configured_message()));
+    };
+    let Some(adapter) = ConversationTranscriptAdapter::open(root, sources.to_vec()) else {
+        return Ok(ChannelResolution::Refused(not_configured_message()));
+    };
+    let location = TranscriptLocation {
+        source: TranscriptSource::Slack,
+        storage: TranscriptStorage::LandedRecords,
+        path: PathBuf::new(),
+        account: Some(workspace_id.to_string()),
+        session_id: Some(channel_id.to_string()),
+        project: None,
+        cwd: None,
+        is_subagent: false,
+        logical_key: Some(channel_locator(workspace_id, channel_id)),
+    };
+    if adapter.covering(&location)?.is_none() {
+        return Ok(ChannelResolution::Refused(unknown_channel_message(
+            channel_id,
+        )));
+    }
+    Ok(ChannelResolution::Ready(adapter, location))
+}
+
+/// Resolve a bare channel id to the workspace an enrolled source currently
+/// covers it under. Used by the `bbox_messages(session_id=...)` form, whose
+/// session id carries only the channel id: the daemon has to find which
+/// workspace binding that id belongs to before it can read anything.
+pub fn workspace_for_channel(
+    conversation_source_root: Option<&Path>,
+    sources: &[ConversationSourceEnrollmentV1],
+    channel_id: &str,
+) -> Option<String> {
+    let adapter = ConversationTranscriptAdapter::open(conversation_source_root?, sources.to_vec())?;
+    let channels = adapter.covered_channels().ok()?;
+    channels
+        .into_iter()
+        .find(|channel| channel.channel_id == channel_id)
+        .map(|channel| channel.workspace_id)
+}
+
+/// Every live message (tombstones dropped) a covered channel currently
+/// holds, in ascending channel-time order — the actual send time, not the
+/// thread-anchor bucket search groups them under, since a context window
+/// can legitimately span midnight or a thread reply landing days later.
+fn ordered_messages(
+    adapter: &ConversationTranscriptAdapter,
+    location: &TranscriptLocation,
+) -> Result<Vec<NormalizedTranscriptEvent>> {
+    let mut events = adapter.load_snapshot(location)?.events;
+    events.sort_by_cached_key(|event| {
+        event
+            .conversation
+            .as_ref()
+            .and_then(|provenance| message_ts_order_key(&provenance.message_ts))
+            .unwrap_or_default()
+    });
+    Ok(events)
+}
+
+/// Shared preview truncation: `max_length == 0` means unbounded
+/// (`bbox_messages`'s contract); a positive cap always applies
+/// (`bbox_context`'s fixed 400-char preview, matching the file-based
+/// reader).
+fn truncate_preview(content: &str, max_length: usize) -> String {
+    if max_length == 0 || content.len() <= max_length {
+        return content.to_string();
+    }
+    let mut end = max_length;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &content[..end])
+}
+
+/// `bbox_context`'s per-line rendering: `>>>` marks the target message, no
+/// timestamp — matching the file-based reader's own format exactly.
+fn render_context_line(event: &NormalizedTranscriptEvent, is_target: bool) -> String {
+    let marker = if is_target { ">>>" } else { "   " };
+    let role: MessageRole = event.role.into();
+    format!(
+        "{marker} [{}] {}",
+        role.as_ref(),
+        truncate_preview(&event.content, 400)
+    )
+}
+
+/// `bbox_messages`'s per-line rendering: timestamped, no marker — matching
+/// the file-based reader's own format exactly.
+fn render_message_line(event: &NormalizedTranscriptEvent, max_length: usize) -> String {
+    let role: MessageRole = event.role.into();
+    let ts = event.timestamp.as_deref().unwrap_or("");
+    format!(
+        "[{ts}] [{}] {}",
+        role.as_ref(),
+        truncate_preview(&event.content, max_length)
+    )
+}
+
+/// `bbox_context` for a `slack:<workspace_id>/<channel_id>` locator: a
+/// window of `context_lines` messages either side of the message whose
+/// [`message_ts_digits`] equals `target`, in channel-time order. A `target`
+/// that matches no live message falls back to the channel's earliest one,
+/// mirroring the file-based reader's own fallback when a byte offset lands
+/// past every line.
+pub fn context_for_channel(
+    conversation_source_root: Option<&Path>,
+    sources: &[ConversationSourceEnrollmentV1],
+    workspace_id: &str,
+    channel_id: &str,
+    target: u64,
+    context_lines: usize,
+) -> Result<String> {
+    let (adapter, location) =
+        match open_covered_channel(conversation_source_root, sources, workspace_id, channel_id)? {
+            ChannelResolution::Ready(adapter, location) => (adapter, location),
+            ChannelResolution::Refused(message) => return Ok(message),
+        };
+    let events = ordered_messages(&adapter, &location)?;
+    if events.is_empty() {
+        return Ok(format!("Channel {channel_id} has no landed messages yet."));
+    }
+    let target_idx = events
+        .iter()
+        .position(|event| {
+            event
+                .conversation
+                .as_ref()
+                .and_then(|provenance| message_ts_digits(&provenance.message_ts))
+                == Some(target)
+        })
+        .unwrap_or(0);
+    let start = target_idx.saturating_sub(context_lines);
+    let end = (target_idx + context_lines + 1).min(events.len());
+
+    let output: Vec<String> = events[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, event)| render_context_line(event, start + i == target_idx))
+        .collect();
+    Ok(output.join("\n\n"))
+}
+
+/// `bbox_messages` for a whole channel (`file_path` form, `date_bucket =
+/// None`) or one per-channel-per-day bucket (`session_id` form,
+/// `date_bucket = Some(date)`). Pagination mirrors the file-based reader:
+/// `offset`/`limit` page forward, `from_end` reverses so offset 0 means the
+/// newest page.
+#[allow(clippy::too_many_arguments)]
+pub fn messages_for_channel(
+    conversation_source_root: Option<&Path>,
+    sources: &[ConversationSourceEnrollmentV1],
+    workspace_id: &str,
+    channel_id: &str,
+    date_bucket: Option<&str>,
+    role_filter: Option<&str>,
+    max_length: usize,
+    from_end: bool,
+    offset: usize,
+    limit: usize,
+) -> Result<String> {
+    let (adapter, location) =
+        match open_covered_channel(conversation_source_root, sources, workspace_id, channel_id)? {
+            ChannelResolution::Ready(adapter, location) => (adapter, location),
+            ChannelResolution::Refused(message) => return Ok(message),
+        };
+    let mut events = ordered_messages(&adapter, &location)?;
+    if let Some(date) = date_bucket {
+        let wanted = format!("{channel_id}/{date}");
+        events.retain(|event| event.session_id == wanted);
+    }
+    if let Some(role) = role_filter {
+        events.retain(|event| {
+            let event_role: MessageRole = event.role.into();
+            event_role.as_ref() == role
+        });
+    }
+
+    if events.is_empty() {
+        return Ok(match date_bucket {
+            Some(date) => format!("No messages found for {channel_id}/{date}."),
+            None => "No messages found matching filters.".to_string(),
+        });
+    }
+
+    let all_messages: Vec<String> = events
+        .iter()
+        .map(|event| render_message_line(event, max_length))
+        .collect();
+    let total = all_messages.len();
+
+    let (page, showing_start, showing_end): (Vec<&String>, usize, usize) = if from_end {
+        let tail_start = total.saturating_sub(offset + limit);
+        let tail_end = total.saturating_sub(offset);
+        (
+            all_messages[tail_start..tail_end].iter().collect(),
+            tail_start,
+            tail_end,
+        )
+    } else {
+        let end = (offset + limit).min(total);
+        (
+            all_messages.iter().skip(offset).take(limit).collect(),
+            offset,
+            end,
+        )
+    };
+
+    let mut header = format!(
+        "Messages {}-{} of {} total",
+        showing_start + 1,
+        showing_end,
+        total
+    );
+    if !from_end && showing_end < total {
+        header.push_str(&format!(" (next page: offset={showing_end})"));
+    }
+    if from_end && showing_start > 0 {
+        header.push_str(&format!(
+            " (earlier: from_end=true, offset={})",
+            offset + limit
+        ));
+    }
+
+    const MAX_RESPONSE_BYTES: usize = 80_000;
+    let mut body = String::new();
+    for (included, msg) in page.iter().enumerate() {
+        let entry = format!("{msg}\n\n");
+        if body.len() + entry.len() > MAX_RESPONSE_BYTES {
+            body.push_str(&format!(
+                "[Response truncated at {included} messages — narrow with role \
+                 filter, smaller limit, or a day-bucket session_id]\n"
+            ));
+            break;
+        }
+        body.push_str(&entry);
+    }
+    Ok(format!("{header}\n\n{}", body.trim_end()))
+}
+
+/// `bbox_messages(session_id="<channel_id>/<date>")`: resolve the channel's
+/// workspace, then defer to [`messages_for_channel`]. The bucket shape
+/// [`parse_session_bucket`] requires is narrow enough that an id which
+/// matches it but resolves to no covered channel is confidently a slack
+/// refusal rather than a coincidental non-slack session id, so this refuses
+/// by name even when nothing is enrolled at all.
+#[allow(clippy::too_many_arguments)]
+pub fn messages_for_session_bucket(
+    conversation_source_root: Option<&Path>,
+    sources: &[ConversationSourceEnrollmentV1],
+    channel_id: &str,
+    date: &str,
+    role_filter: Option<&str>,
+    max_length: usize,
+    from_end: bool,
+    offset: usize,
+    limit: usize,
+) -> Result<String> {
+    if conversation_source_root.is_none() {
+        return Ok(not_configured_message());
+    }
+    let Some(workspace_id) = workspace_for_channel(conversation_source_root, sources, channel_id)
+    else {
+        return Ok(unknown_channel_message(channel_id));
+    };
+    messages_for_channel(
+        conversation_source_root,
+        sources,
+        &workspace_id,
+        channel_id,
+        Some(date),
+        role_filter,
+        max_length,
+        from_end,
+        offset,
+        limit,
+    )
 }
 
 #[cfg(test)]

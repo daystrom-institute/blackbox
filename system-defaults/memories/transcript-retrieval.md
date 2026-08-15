@@ -71,13 +71,23 @@ This is the fallback when you only know rough recency, project, or session namin
 ## Conversation (Slack) lane divergence
 
 Ingested Slack conversations are searchable through the same `bbox_search`,
-but the drill-down half of the ladder diverges: a conversation hit has no
-readable transcript file, so `bbox_context` and `bbox_messages` cannot open
-it. Use these instead:
+and the drill-down half of the ladder now reaches them too: `bbox_context`
+and `bbox_messages` resolve a slack hit's coordinates against the
+conversation landing store directly rather than reading a transcript file.
+The search breadcrumb on a slack top hit already fills these in for you:
 
-- **Scope to a channel** with `channel=` (a name, `#name`, or a channel id).
-  Names resolve through the current roster to the stable channel id, so a
-  renamed channel still matches its whole history.
+- **Surrounding turns**: `bbox_context(file_path="slack:<workspace>/<channel>",
+  byte_offset=<digit-encoded message ts>)`. The locator is the hit's
+  `file_path`; `byte_offset` is not a byte position but the target message's
+  timestamp with the decimal point removed (same digit-concatenation the
+  permalink uses) — copy it straight from the breadcrumb rather than deriving
+  it by hand.
+- **The day's conversation**: `bbox_messages(session_id="<channel>/<date>")`
+  — the per-channel-per-day bucket the hit's `session_id` already carries.
+- **The whole channel**: `bbox_messages(file_path="slack:<workspace>/<channel>")`.
+- **Scope to a channel** with `channel=` (a name, `#name`, or a channel id) on
+  `bbox_search` itself. Names resolve through the current roster to the
+  stable channel id, so a renamed channel still matches its whole history.
 - **Plain queries match channel names**: `bbox_search(query="ops-incident-4565")`
   finds that channel's messages even when no message body names it.
 - **Open a message** by following the hit's rendered `Permalink` line.
@@ -85,12 +95,17 @@ it. Use these instead:
   with `author=<provider user id>` (`role` only distinguishes human from app).
 - A hit whose match was metadata-only (channel name, lane, author) renders
   the start of the message as its excerpt rather than highlighted fragments.
+- An unenrolled or unknown channel refuses by name (pointing at a working
+  `bbox_search(channel=...)` call) instead of an ENOENT or "Session not
+  found" — treat that refusal text as the answer, not a bug.
 
 ### "What's in #some-channel about X?"
 
 1. `bbox_search(query="X", channel="#some-channel")`
 2. Broaden: `bbox_search(query="...", channel="<channel id from the hit>")`
-3. Follow the permalink for the full thread in Slack
+3. `bbox_context(...)` / `bbox_messages(...)` with the hit's coordinates for
+   surrounding turns or the day's flow
+4. Follow the permalink for the full thread in Slack
 
 ## Common patterns
 

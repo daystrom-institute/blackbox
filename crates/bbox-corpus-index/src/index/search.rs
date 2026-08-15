@@ -563,7 +563,19 @@ impl TranscriptIndex {
                 })
                 .unwrap_or_default();
             if top_hit.is_none() {
-                top_hit = Some((session_id.clone(), file_path.clone(), byte_offset));
+                // Every slack document carries `byte_offset: 0` (it has no
+                // file to offset into — see `RawTranscriptRef::provider_event`);
+                // the breadcrumb below needs the message's own digit-encoded
+                // timestamp instead, which is what `bbox_context`'s slack
+                // branch actually reads as `byte_offset`.
+                let slack_offset = if file_path.starts_with("slack:") {
+                    let message_ts = self.doc_text(&doc, self.fields.conversation_message_ts);
+                    crate::transcripts::conversation::message_ts_digits(&message_ts)
+                        .unwrap_or(byte_offset)
+                } else {
+                    byte_offset
+                };
+                top_hit = Some((session_id.clone(), file_path.clone(), slack_offset));
             }
 
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
@@ -629,14 +641,19 @@ impl TranscriptIndex {
         if let Some((session_id, file_path, byte_offset)) = top_hit {
             out.push_str("\n\nNext steps:\n");
             if file_path.starts_with("slack:") {
-                // A conversation hit has no readable transcript file: its
-                // locator is a record key, so bbox_context / bbox_messages
-                // cannot open it. Recommending them here sent callers into
-                // ENOENT dead ends (gap-2d4d17da); the working drill-downs
-                // are the per-hit permalink and the channel filter. The
-                // session id is the per-channel-per-day bucket, so the
-                // channel id is its first segment.
+                // The slack read plane resolves these against the landing
+                // store (gap-2d4d17da), so both read tools work again here:
+                // bbox_context's byte_offset is this hit's digit-encoded
+                // message timestamp, and bbox_messages' session_id is its
+                // per-channel-per-day bucket. The channel id is that
+                // session_id's first segment.
                 let channel_id = session_id.split('/').next().unwrap_or(&session_id);
+                out.push_str(&format!(
+                    "  → Surrounding conversation: bbox_context(file_path=\"{file_path}\", byte_offset={byte_offset})\n"
+                ));
+                out.push_str(&format!(
+                    "  → Read the day's messages: bbox_messages(session_id=\"{session_id}\")\n"
+                ));
                 out.push_str(&format!(
                     "  → The whole channel's messages: bbox_search(query=\"...\", channel=\"{channel_id}\")\n"
                 ));
@@ -1036,8 +1053,26 @@ impl TranscriptIndex {
 
     pub fn context(&self, p: &ContextParams) -> Result<String> {
         let file_path = p.file_path.as_str();
-        let target_offset = p.byte_offset;
         let ctx_lines = p.context_lines.unwrap_or(5) as usize;
+
+        // A `slack:<workspace_id>/<channel_id>` locator names no file at
+        // all: the virtual path used to reach the filesystem reader and
+        // ENOENT (gap-2d4d17da). Resolve it against the landing store
+        // instead.
+        if let Some((workspace_id, channel_id)) =
+            crate::transcripts::conversation::parse_channel_locator(file_path)
+        {
+            return crate::transcripts::conversation::context_for_channel(
+                self.config.conversation_source_root.as_deref(),
+                &self.config.conversation_sources,
+                workspace_id,
+                channel_id,
+                p.byte_offset,
+                ctx_lines,
+            );
+        }
+
+        let target_offset = p.byte_offset;
 
         let content =
             fs::read_to_string(file_path).with_context(|| format!("Failed to read {file_path}"))?;
@@ -1188,6 +1223,45 @@ impl TranscriptIndex {
         let from_end = p.from_end.unwrap_or(false);
         let offset = p.offset.unwrap_or(0) as usize;
         let limit = p.limit.unwrap_or(50).min(200) as usize;
+
+        // A slack: locator or a channel/day session id names no file the
+        // filesystem reader below can open — that dead end is gap-2d4d17da.
+        // Resolve against the landing store instead, before falling through
+        // to the file-based resolution every other lane still uses.
+        if let Some(fp) = p.file_path.as_deref()
+            && let Some((workspace_id, channel_id)) =
+                crate::transcripts::conversation::parse_channel_locator(fp)
+        {
+            return crate::transcripts::conversation::messages_for_channel(
+                self.config.conversation_source_root.as_deref(),
+                &self.config.conversation_sources,
+                workspace_id,
+                channel_id,
+                None,
+                role_filter,
+                max_length,
+                from_end,
+                offset,
+                limit,
+            );
+        }
+        if p.file_path.is_none()
+            && let Some(sid) = p.session_id.as_deref()
+            && let Some((channel_id, date)) =
+                crate::transcripts::conversation::parse_session_bucket(sid)
+        {
+            return crate::transcripts::conversation::messages_for_session_bucket(
+                self.config.conversation_source_root.as_deref(),
+                &self.config.conversation_sources,
+                channel_id,
+                date,
+                role_filter,
+                max_length,
+                from_end,
+                offset,
+                limit,
+            );
+        }
 
         // Resolve to file path(s) — accept either file_path or session_id
         let files: Vec<String> = if let Some(fp) = p.file_path.as_deref() {
@@ -2974,13 +3048,325 @@ mod conversation_channel_search_tests {
             hits.contains(&format!("channel=\"{OPS_CHANNEL}\"")),
             "a slack top hit must point at the channel filter: {hits}"
         );
+        // The slack read plane (gap-2d4d17da) resolves both read tools
+        // against the landing store now, so the breadcrumb recommends them
+        // again — with a slack: locator and a channel/day session id rather
+        // than the file-based coordinates a non-slack hit would carry.
         assert!(
-            !hits.contains("bbox_context("),
-            "bbox_context cannot open a conversation locator and must not be recommended: {hits}"
+            hits.contains(&format!(
+                "bbox_context(file_path=\"slack:{WORKSPACE}/{OPS_CHANNEL}\""
+            )),
+            "bbox_context must be recommended with the slack channel locator: {hits}"
         );
         assert!(
-            !hits.contains("bbox_messages("),
-            "bbox_messages cannot resolve a conversation bucket and must not be recommended: {hits}"
+            hits.contains(&format!("bbox_messages(session_id=\"{OPS_CHANNEL}/")),
+            "bbox_messages must be recommended with the channel/day session id: {hits}"
         );
+    }
+}
+
+#[cfg(test)]
+mod conversation_read_plane_tests {
+    //! gap-2d4d17da: `bbox_context` and `bbox_messages` must resolve
+    //! `slack:` locators and channel/day session ids against the
+    //! conversation landing store instead of the filesystem reader, both
+    //! forms, with a refusal that names a working lane for an unknown
+    //! channel — and must leave every non-slack path unchanged.
+
+    use super::*;
+    use crate::index::TranscriptIndex;
+    use crate::transcripts::conversation::ConversationSourceEnrollmentV1;
+    use bbox_conversation_source::{
+        AuthorKindV1, CONVERSATION_POLICY_VERSION, ChannelClassV1, ChannelObservationV1,
+        ConversationBatchV1, ConversationMessageRecordV1, SCHEMA_VERSION, batch_digest,
+    };
+    use bbox_conversation_source_store::ConversationSourceStore;
+    use bbox_corpus_core::project_catalog::ConnectorScope;
+
+    const WORKSPACE: &str = "T1READPLANE";
+    const CHANNEL: &str = "C1READPLANE";
+    const CHANNEL_NAME: &str = "read-plane-fixture";
+    // All three on 2026-08-10 (UTC), well clear of midnight, so the
+    // per-day-bucket tests below never risk crossing a day boundary.
+    const TS_A: &str = "1786390478.000100"; // 2026-08-10T19:34:38Z
+    const TS_B: &str = "1786390538.000200"; // 2026-08-10T19:35:38Z
+    const TS_C: &str = "1786390598.000300"; // 2026-08-10T19:36:38Z
+
+    fn scope() -> ConnectorScope {
+        ConnectorScope::try_new("csrc_read_plane_fixture0", "slack").unwrap()
+    }
+
+    fn enrollment() -> ConversationSourceEnrollmentV1 {
+        ConversationSourceEnrollmentV1 {
+            scope: scope(),
+            remote_authority: "acme.slack.com".to_string(),
+        }
+    }
+
+    fn record(message_ts: &str, text: &str) -> ConversationMessageRecordV1 {
+        ConversationMessageRecordV1 {
+            channel_id: CHANNEL.to_string(),
+            message_ts: message_ts.to_string(),
+            revision: 0,
+            author_id: "U0HUMAN".to_string(),
+            author_kind: AuthorKindV1::Human,
+            thread_parent_ts: None,
+            subtype: None,
+            text: text.to_string(),
+            edited_ts: None,
+            reactions: Vec::new(),
+            attachments: Vec::new(),
+            observed_at: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    fn batch(records: Vec<ConversationMessageRecordV1>) -> ConversationBatchV1 {
+        ConversationBatchV1 {
+            schema_version: SCHEMA_VERSION,
+            conversation_policy_version: CONVERSATION_POLICY_VERSION.to_string(),
+            scope: scope(),
+            workspace_id: WORKSPACE.to_string(),
+            channel_id: CHANNEL.to_string(),
+            batch_digest: batch_digest(&records),
+            records,
+            observed_at: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    /// One rostered channel with three landed messages, same UTC day.
+    /// Deliberately NOT indexed into tantivy: `context`/`messages` resolve
+    /// a slack locator against the landing store directly and never touch
+    /// the searcher, so a fixture that only exercises the read plane has no
+    /// need to build one.
+    fn landed_index(root: &std::path::Path) -> TranscriptIndex {
+        let conv_root = root.join("conversation-sources");
+        let store = ConversationSourceStore::open(&conv_root).unwrap();
+        store
+            .bind_workspace(&scope(), WORKSPACE, "2026-08-13T00:00:00Z")
+            .unwrap();
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[ChannelObservationV1 {
+                    channel_id: CHANNEL.to_string(),
+                    observed_name: Some(CHANNEL_NAME.to_string()),
+                    class: ChannelClassV1::Public,
+                    is_member: true,
+                    observed_at: "2026-08-13T00:00:00Z".to_string(),
+                }],
+            )
+            .unwrap();
+        store
+            .land_batch(
+                &scope(),
+                &batch(vec![
+                    record(TS_A, "first message of the day"),
+                    record(TS_B, "the middle message everyone quotes"),
+                    record(TS_C, "the last message before the thread reply"),
+                ]),
+            )
+            .unwrap();
+
+        let mut index = TranscriptIndex::open_or_create_with_records(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        index.set_conversation_sources(conv_root, vec![enrollment()]);
+        index
+    }
+
+    #[test]
+    fn bbox_context_serves_a_slack_channel_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = landed_index(&root);
+
+        let target = crate::transcripts::conversation::message_ts_digits(TS_B).unwrap();
+        let out = index
+            .context(&ContextParams {
+                file_path: format!("slack:{WORKSPACE}/{CHANNEL}"),
+                byte_offset: target,
+                context_lines: Some(1),
+            })
+            .unwrap();
+
+        assert!(out.contains("the middle message everyone quotes"), "{out}");
+        assert!(out.contains(">>>"), "{out}");
+        assert!(out.contains("first message of the day"), "{out}");
+        assert!(
+            out.contains("the last message before the thread reply"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn bbox_context_falls_back_to_the_earliest_message_for_an_unmatched_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = landed_index(&root);
+
+        // 0 encodes no real timestamp this channel holds — the file-based
+        // reader's own fallback (a byte offset past every line still
+        // renders the file's start) is mirrored here.
+        let out = index
+            .context(&ContextParams {
+                file_path: format!("slack:{WORKSPACE}/{CHANNEL}"),
+                byte_offset: 0,
+                context_lines: Some(0),
+            })
+            .unwrap();
+        assert!(out.contains("first message of the day"), "{out}");
+        assert!(out.contains(">>>"), "{out}");
+    }
+
+    #[test]
+    fn bbox_messages_serves_the_whole_channel_via_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = landed_index(&root);
+
+        let out = index
+            .messages(&MessagesParams {
+                session_id: None,
+                file_path: Some(format!("slack:{WORKSPACE}/{CHANNEL}")),
+                role: None,
+                include_subagents: None,
+                max_content_length: None,
+                from_end: None,
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(out.contains("Messages 1-3 of 3 total"), "{out}");
+        assert!(out.contains("first message of the day"), "{out}");
+        assert!(out.contains("the middle message everyone quotes"), "{out}");
+        assert!(
+            out.contains("the last message before the thread reply"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn bbox_messages_serves_a_day_bucket_via_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = landed_index(&root);
+
+        let out = index
+            .messages(&MessagesParams {
+                session_id: Some(format!("{CHANNEL}/2026-08-10")),
+                file_path: None,
+                role: None,
+                include_subagents: None,
+                max_content_length: None,
+                from_end: None,
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(out.contains("Messages 1-3 of 3 total"), "{out}");
+        assert!(out.contains("first message of the day"), "{out}");
+
+        // A different day's bucket for the same channel is empty rather
+        // than falling through to the whole channel.
+        let empty = index
+            .messages(&MessagesParams {
+                session_id: Some(format!("{CHANNEL}/2026-08-11")),
+                file_path: None,
+                role: None,
+                include_subagents: None,
+                max_content_length: None,
+                from_end: None,
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(empty.contains("No messages found for"), "{empty}");
+    }
+
+    #[test]
+    fn an_unknown_slack_channel_refuses_by_name_instead_of_enoent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = landed_index(&root);
+
+        let context_out = index
+            .context(&ContextParams {
+                file_path: format!("slack:{WORKSPACE}/C0UNKNOWNXX"),
+                byte_offset: 0,
+                context_lines: None,
+            })
+            .unwrap();
+        assert!(
+            !context_out.contains("No such file or directory"),
+            "{context_out}"
+        );
+        assert!(context_out.contains("not indexed"), "{context_out}");
+        assert!(context_out.contains("bbox_search"), "{context_out}");
+
+        let messages_out = index
+            .messages(&MessagesParams {
+                session_id: Some("C0UNKNOWNXX/2026-08-10".to_string()),
+                file_path: None,
+                role: None,
+                include_subagents: None,
+                max_content_length: None,
+                from_end: None,
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert!(
+            !messages_out.contains("Session not found"),
+            "{messages_out}"
+        );
+        assert!(messages_out.contains("not indexed"), "{messages_out}");
+        assert!(messages_out.contains("bbox_search"), "{messages_out}");
+    }
+
+    #[test]
+    fn a_non_slack_file_path_and_session_id_keep_the_filesystem_reader_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = landed_index(&root);
+
+        // A regular (non-existent) transcript path still hits the
+        // filesystem reader and its ordinary ENOENT error, unaffected by
+        // the slack: branch.
+        let missing = root.join("no-such-transcript.jsonl");
+        let err = index
+            .context(&ContextParams {
+                file_path: missing.to_string_lossy().to_string(),
+                byte_offset: 0,
+                context_lines: None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to read"), "{err}");
+
+        // A session id with no slash (the ordinary shape) still falls
+        // through to the file-based resolver and its own "not found" text.
+        let out = index
+            .messages(&MessagesParams {
+                session_id: Some("some-uuid-session".to_string()),
+                file_path: None,
+                role: None,
+                include_subagents: None,
+                max_content_length: None,
+                from_end: None,
+                offset: None,
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(out, "Session not found.");
     }
 }
