@@ -2891,6 +2891,8 @@ mod conversation_channel_search_tests {
                     observation(NOISE_CHANNEL, NOISE_NAME),
                     observation(OPS_CHANNEL, OPS_NAME),
                 ],
+                false,
+                "2026-08-13T00:00:00Z",
             )
             .unwrap();
         store
@@ -3017,6 +3019,8 @@ mod conversation_channel_search_tests {
                     observation(NOISE_CHANNEL, NOISE_NAME),
                     observation(OPS_CHANNEL, "ops-fixture-renamed"),
                 ],
+                false,
+                "2026-08-13T00:10:00Z",
             )
             .unwrap();
 

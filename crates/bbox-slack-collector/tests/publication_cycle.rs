@@ -410,3 +410,29 @@ async fn structural_channel_noise_is_counted_rather_than_indexed() {
     );
     assert!(harness.sink.record(CHANNEL, &ts_before(90, 8)).is_none());
 }
+
+#[tokio::test]
+async fn membership_mode_posts_a_complete_roster_and_explicit_mode_does_not() {
+    // gap-e84231d3: only membership mode's roster read (`users.conversations`)
+    // is provably the producer's entire current member set, so only it may
+    // claim `complete` on the wire. Explicit mode's enrolled set is narrowed
+    // by an operator glob and must not tell the corpus host it saw everything.
+    let mut membership_harness = Harness::start(workspace(three_messages())).await;
+    membership_harness.config.channels.enrollment =
+        bbox_slack_collector::EnrollmentMode::Membership;
+    membership_harness.config.channels.include = Vec::new();
+    membership_harness.cycle(0).await;
+    assert_eq!(
+        membership_harness.sink.last_roster_complete(),
+        Some(true),
+        "membership mode's roster read is the bot's own full membership"
+    );
+
+    let explicit_harness = Harness::start(workspace(three_messages())).await;
+    explicit_harness.cycle(0).await;
+    assert_eq!(
+        explicit_harness.sink.last_roster_complete(),
+        Some(false),
+        "explicit mode's policy-narrowed enrolled set is not a proven full sweep"
+    );
+}

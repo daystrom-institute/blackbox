@@ -103,14 +103,34 @@ pub struct ConversationSourceEnrollmentV1 {
 /// observer hands the channel to the next covering scope rather than removing
 /// documents another observer still covers.
 ///
-/// **The enrollment signal this lane does not have.** `record_roster` writes
-/// the latest observation per channel and never deletes one, so a producer
-/// that simply stops listing a channel leaves its last observation on disk.
-/// Coverage therefore ends when the roster reports `is_member: false` or when
-/// the operator removes the grant; a silently omitted channel keeps projecting
-/// until one of those happens. That is stated rather than papered over: the
-/// alternative (treat every roster POST as a complete replacement set) would
-/// let one partial roster from a mid-restart producer purge a workspace.
+/// **The enrollment signal.** Coverage ends when the roster reports
+/// `is_member: false` or when the operator removes the grant; this adapter
+/// reads only that signal and does not care how it got there.
+///
+/// `record_roster` writes the latest observation per channel and never
+/// deletes one on its own, so a producer that just stops listing a channel
+/// (an ordinary partial roster) leaves that channel's last observation on
+/// disk unchanged, and it keeps projecting. That is deliberate: treating
+/// every roster POST as a complete replacement set would let one partial
+/// roster from a mid-restart producer purge a workspace.
+///
+/// A producer that CAN prove a roster is its entire current member set for
+/// the workspace says so on the wire (`ChannelRosterRequestV1::complete`),
+/// and `ConversationSourceStore::record_roster` then records `is_member:
+/// false` for every channel it previously held that the sweep omitted (see
+/// that method's doc for the full contract, including idempotency under
+/// replay). This adapter needs no separate handling for that case: it already
+/// treats an `is_member: false` observation, however it was produced, as
+/// coverage ended. Re-enrollment (the channel reappearing in a later roster)
+/// is symmetric for the same reason: the next `is_member: true` observation
+/// makes the channel covered again with no adapter-side state to reset.
+///
+/// The gap this closes is `gap-e84231d3`. It is still possible for a channel
+/// to keep projecting after real-world coverage ended: a producer that never
+/// posts a complete roster (an old, unredeployed satellite, or one whose
+/// enumeration this cycle was provably partial) still leaves a stale
+/// observation in place until an explicit `is_member: false` arrives or the
+/// operator removes the grant, exactly as before.
 pub struct ConversationTranscriptAdapter {
     store: ConversationSourceStore,
     sources: Vec<ConversationSourceEnrollmentV1>,
@@ -1246,7 +1266,13 @@ mod gate_tests {
             .bind_workspace(&scope(), WORKSPACE, "2026-08-13T00:00:00Z")
             .unwrap();
         store
-            .record_roster(&scope(), WORKSPACE, &[observation(true)])
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation(true)],
+                false,
+                "2026-08-13T00:00:00Z",
+            )
             .unwrap();
         store
             .land_batch(
@@ -1479,7 +1505,13 @@ mod gate_tests {
 
         // Coverage ends: the observing identity is no longer a member.
         store
-            .record_roster(&scope(), WORKSPACE, &[observation(false)])
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation(false)],
+                false,
+                "2026-08-13T00:10:00Z",
+            )
             .unwrap();
 
         let adapter = ConversationTranscriptAdapter::open(&root, vec![enrollment()]).unwrap();
@@ -1505,6 +1537,79 @@ mod gate_tests {
             corpus.total_documents(),
             0,
             "a channel no enrolled source covers must stop being searchable"
+        );
+    }
+
+    #[test]
+    fn a_complete_roster_that_omits_a_channel_purges_it_and_re_enrollment_restores_it() {
+        // gap-e84231d3: the producer never posted `is_member: false`, it just
+        // stopped listing the channel. A complete sweep must produce the same
+        // purge `unenrolling_a_channel_purges_its_documents` proves for an
+        // explicit `is_member: false`, and the channel must come back the
+        // moment a later complete sweep re-lists it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = landed_store(&root);
+        let (location, events) = project_channel(&root);
+        let corpus = Corpus::new();
+        corpus.reindex(&location, &events);
+        assert_eq!(corpus.total_documents(), 3);
+
+        // A complete sweep that simply does not mention the channel anymore.
+        store
+            .record_roster(&scope(), WORKSPACE, &[], true, "2026-08-13T00:20:00Z")
+            .unwrap();
+
+        let adapter = ConversationTranscriptAdapter::open(&root, vec![enrollment()]).unwrap();
+        assert!(
+            adapter
+                .scan_locations(TranscriptScanTarget::Sessions)
+                .unwrap()
+                .is_empty(),
+            "an omitted channel in a complete sweep leaves the scan set exactly \
+             like an explicit is_member: false"
+        );
+
+        let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
+            corpus.index.writer(50_000_000).unwrap();
+        writer.delete_term(Term::from_field_text(
+            corpus.fields.file_path,
+            &location.locator(),
+        ));
+        writer.commit().unwrap();
+        // Released explicitly, BEFORE `corpus.reindex` below opens its own
+        // writer on the same directory: tantivy allows exactly one live
+        // `IndexWriter` per directory, and this writer would otherwise stay
+        // alive until the end of the test function (this is a single-writer
+        // test, unlike the sibling purge-only test where the manual writer
+        // is the last thing the function opens).
+        drop(writer);
+        assert_eq!(corpus.total_documents(), 0);
+
+        // The channel reappears in a later complete sweep: re-enrollment.
+        store
+            .record_roster(
+                &scope(),
+                WORKSPACE,
+                &[observation(true)],
+                true,
+                "2026-08-13T00:30:00Z",
+            )
+            .unwrap();
+        let restored = adapter
+            .scan_locations(TranscriptScanTarget::Sessions)
+            .unwrap();
+        assert_eq!(
+            restored.len(),
+            1,
+            "re-listing in a later complete sweep restores coverage"
+        );
+        let snapshot = adapter.load_snapshot(&restored[0]).unwrap();
+        corpus.reindex(&restored[0], &snapshot.events);
+        assert_eq!(
+            corpus.total_documents(),
+            3,
+            "a re-enrolled channel is searchable again"
         );
     }
 

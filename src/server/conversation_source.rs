@@ -239,8 +239,18 @@ async fn post_channels(
 
     let store = state.conversation_sources.store();
     let workspace_id = request.workspace_id.clone();
+    // The clock is read HERE, mirroring `get_status`: the store holds no time
+    // dependency, and this is the stamp a synthesized unenrollment
+    // observation carries when `request.complete` asks for one.
+    let swept_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let recorded = blocking(move || {
-        store.record_roster(&request.scope, &request.workspace_id, &request.channels)
+        store.record_roster(
+            &request.scope,
+            &request.workspace_id,
+            &request.channels,
+            request.complete,
+            &swept_at,
+        )
     })
     .await?;
     Ok((

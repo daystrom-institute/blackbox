@@ -199,7 +199,7 @@ A dedicated authenticated endpoint family, mounted beside the code-source
 routes and never reachable from model or shell authority:
 
 ```text
-POST /internal/conversation-source/v1/channels     roster visible under policy
+POST /internal/conversation-source/v1/channels     roster visible under policy; `complete` marks a full member-set sweep
 GET  /internal/conversation-source/v1/cursors      server's per-channel high-water marks
 POST /internal/conversation-source/v1/batches      ordered batch of new message records
 POST /internal/conversation-source/v1/revisions    edits and tombstones for landed records
@@ -376,6 +376,21 @@ bound in globs. The first deployment runs membership mode.
   documents are purged when no enrolled source still covers them, and remain
   searchable (with updated attribution) while another observer does. A channel
   no enrolled source covers must stop being searchable.
+- **The complete-roster unenrollment signal (gap-e84231d3).** A producer that
+  simply stops listing a channel (dropped from an allowlist, kicked,
+  archived) does not, on its own, remove that channel's stale
+  `is_member: true` observation; the roster POST is additive by default. A
+  producer that can prove a roster is its ENTIRE current member set for the
+  workspace marks it `complete: true`
+  (`ChannelRosterRequestV1::complete`), and the store then records an
+  `is_member: false` observation for every channel it previously held that
+  the sweep omits, journaled rather than deleted so history and re-enrollment
+  both survive. Under the deployed membership-mode posture, `users.conversations`
+  is exactly the bot's own membership, so the collector's membership-mode
+  roster genuinely is that complete set and marks it so; explicit mode's
+  policy-narrowed enrolled set is not provably complete and leaves the flag
+  false. `complete` is additive and optional on the wire (default `false`),
+  so an old producer changes nothing.
 
 ## 7. Retrieval
 
