@@ -686,6 +686,14 @@ retains either valid, stale, or unresolved evidence bindings without fact loss.
 
 ## 15. Milestone 9: unified retrieval and evidence bundles
 
+Owned in detail by [Unified retrieval for reflective graph vertices](unified-retrieval.md),
+which resolves the design frame for `gap-5d57d2bb`: meaning-bearing vertex
+kinds and the per-graph policy extension, the indexing seam and its
+interaction with graph generations, the query path and its
+before-ranking authority filter, the result shape, the tool-surface
+deltas, and a five-slice phasing with exit gates. This section states the
+milestone; that document states the contracts.
+
 Resolve graph retrieval limitations tracked by `gap-5d57d2bb`:
 
 - reflective graph vertices participate in exact and text retrieval according
