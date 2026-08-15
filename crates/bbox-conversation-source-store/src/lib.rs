@@ -1823,13 +1823,22 @@ mod tests {
 
     // -- complete-roster unenrollment (gap-e84231d3) -----------------------
 
-    fn observation_for(channel_id: &str, is_member: bool) -> ChannelObservationV1 {
+    // `observed_at` is an explicit parameter, never a hardcoded literal: it is
+    // the field that distinguishes a producer-reported observation (this
+    // helper) from a store-synthesized unenrollment (`swept_at`), and a test
+    // that cannot vary it independently of `swept_at` cannot prove the two
+    // are different things.
+    fn observation_for(
+        channel_id: &str,
+        is_member: bool,
+        observed_at: &str,
+    ) -> ChannelObservationV1 {
         ChannelObservationV1 {
             channel_id: channel_id.to_string(),
             observed_name: Some("ops".into()),
             class: ChannelClassV1::Public,
             is_member,
-            observed_at: "2026-08-13T00:00:00Z".into(),
+            observed_at: observed_at.to_string(),
         }
     }
 
@@ -1845,8 +1854,8 @@ mod tests {
                 &scope(),
                 WORKSPACE,
                 &[
-                    observation_for(CHANNEL, true),
-                    observation_for(OTHER_CHANNEL, true),
+                    observation_for(CHANNEL, true, "2026-08-13T00:00:00Z"),
+                    observation_for(OTHER_CHANNEL, true, "2026-08-13T00:00:00Z"),
                 ],
                 true,
                 "2026-08-13T00:00:00Z",
@@ -1868,7 +1877,7 @@ mod tests {
             .record_roster(
                 &scope(),
                 WORKSPACE,
-                &[observation_for(OTHER_CHANNEL, true)],
+                &[observation_for(OTHER_CHANNEL, true, "2026-08-13T01:00:00Z")],
                 true,
                 "2026-08-13T01:00:00Z",
             )
@@ -1906,8 +1915,8 @@ mod tests {
                 &scope(),
                 WORKSPACE,
                 &[
-                    observation_for(CHANNEL, true),
-                    observation_for(OTHER_CHANNEL, true),
+                    observation_for(CHANNEL, true, "2026-08-13T00:00:00Z"),
+                    observation_for(OTHER_CHANNEL, true, "2026-08-13T00:00:00Z"),
                 ],
                 true,
                 "2026-08-13T00:00:00Z",
@@ -1919,7 +1928,7 @@ mod tests {
             .record_roster(
                 &scope(),
                 WORKSPACE,
-                &[observation_for(OTHER_CHANNEL, true)],
+                &[observation_for(OTHER_CHANNEL, true, "2026-08-13T01:00:00Z")],
                 false,
                 "2026-08-13T01:00:00Z",
             )
@@ -1947,7 +1956,7 @@ mod tests {
             .record_roster(
                 &scope(),
                 WORKSPACE,
-                &[observation_for(CHANNEL, true)],
+                &[observation_for(CHANNEL, true, "2026-08-13T00:00:00Z")],
                 true,
                 "2026-08-13T00:00:00Z",
             )
@@ -1976,13 +1985,24 @@ mod tests {
         // The reverse transition: a channel the producer re-lists after a
         // complete sweep had unenrolled it must come back as a plain,
         // ordinary roster observation, exactly like any other enrollment.
+        //
+        // The chosen semantic (deliberate, not incidental): an explicitly
+        // POSTED channel observation always carries its OWN `observed_at`,
+        // the producer's report of when it actually saw that channel.
+        // `swept_at` is a fallback that exists only for channels the sweep
+        // never mentions at all -- there is nothing else to stamp a
+        // synthetic unenrollment with. A directly-reported re-enrollment is
+        // not synthetic, so it must never be overwritten by `swept_at`. This
+        // test proves that by giving the two timestamps different values:
+        // if the code ever started preferring `swept_at` for posted
+        // channels, this would catch it.
         let dir = tempfile::tempdir().unwrap();
         let store = bound_store(&dir);
         store
             .record_roster(
                 &scope(),
                 WORKSPACE,
-                &[observation_for(CHANNEL, true)],
+                &[observation_for(CHANNEL, true, "2026-08-13T00:00:00Z")],
                 true,
                 "2026-08-13T00:00:00Z",
             )
@@ -1998,19 +2018,24 @@ mod tests {
                 .is_member
         );
 
-        // The channel reappears in a later complete sweep.
+        // The channel reappears in a later complete sweep. Its OWN reported
+        // observed_at (2:30) deliberately differs from this call's
+        // `swept_at` (2:00), so the assertion below can tell them apart.
         store
             .record_roster(
                 &scope(),
                 WORKSPACE,
-                &[observation_for(CHANNEL, true)],
+                &[observation_for(CHANNEL, true, "2026-08-13T02:30:00Z")],
                 true,
                 "2026-08-13T02:00:00Z",
             )
             .unwrap();
         let restored = store.roster(&scope(), WORKSPACE, CHANNEL).unwrap().unwrap();
         assert!(restored.is_member, "re-listing restores membership");
-        assert_eq!(restored.observed_at, "2026-08-13T02:00:00Z");
+        assert_eq!(
+            restored.observed_at, "2026-08-13T02:30:00Z",
+            "a posted observation carries its own observed_at, never the sweep's swept_at"
+        );
     }
 
     // -- the storage crash story ------------------------------------------
