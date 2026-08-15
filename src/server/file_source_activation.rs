@@ -48,7 +48,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use bbox_corpus_core::project_catalog::ConnectorScope;
 use bbox_file_source::FileGenerationStateV1;
-use bbox_file_source_store::{ActivationTear, FileSourceStore};
+use bbox_file_source_store::{ActivationTear, ConnectorRetirementRecord, FileSourceStore};
 
 use super::SharedState;
 
@@ -180,7 +180,7 @@ pub(crate) fn activate_generation(
     // Retirement is enqueued only AFTER the staged hold is released. The
     // writer actor is parked on that hold, so sending it another op while the
     // token is alive would deadlock the lane against itself.
-    retire_superseded_generation(state, &project_id, superseded.as_deref());
+    retire_superseded_generation(state, scope, &project_id, superseded.as_deref());
     Ok(())
 }
 
@@ -200,11 +200,20 @@ pub(crate) fn activate_generation(
 /// selector that is still active in the manifest, so the failure mode is a
 /// retained corpus, never a live one deleted out from under readers.
 ///
+/// A retryable refusal (writer readiness: a reindex pass holds the lane, or
+/// the vector store is still warming up) is journaled and handed to the
+/// redrive coordinator rather than dropped on the floor. See
+/// [`ConnectorRetirementCoordinator`] and gap-7e44ee3b: before the redrive
+/// existed, an activation landing during post-boot vector warming stranded
+/// its predecessor's whole corpus, unreachable through the active selector,
+/// forever.
+///
 /// Blobs and sidecar snapshots are not touched here: they are content
 /// addressed and shared across generations, and their reclamation is a
 /// separate sweep with its own grace window.
 fn retire_superseded_generation(
     state: &Arc<SharedState>,
+    scope: &ConnectorScope,
     project_id: &str,
     superseded_generation_id: Option<&str>,
 ) {
@@ -214,7 +223,7 @@ fn retire_superseded_generation(
     };
     let selector =
         crate::index::project_files::collected_materialization_selector(project_id, superseded);
-    match state.index_writer.retire_code_selector(selector) {
+    match state.index_writer.retire_code_selector(selector.clone()) {
         Ok(retired) => {
             tracing::info!(
                 project_id,
@@ -232,22 +241,33 @@ fn retire_superseded_generation(
         // apart from a real failure so an operator reading the log is not
         // sent hunting a fault that does not exist.
         //
-        // Phase 1 has no redrive for the connector lane, so a deferred
-        // retirement is NOT retried: those documents stay in the index,
-        // unreachable through the active selector. The next activation
-        // supersedes a different predecessor, so it does not pick this one
-        // up. That is a known gap, and it is bounded (one stranded corpus per
-        // deferral) rather than silent.
+        // The deferral is journaled durably and handed to the redrive
+        // coordinator, which retries with backoff until the readiness gate
+        // opens (or the daemon restarts and boot recovery picks the journal
+        // row back up). Bounded at one journal row per superseded selector,
+        // which is exactly what makes it safe to keep retrying forever rather
+        // than giving up: the row is idempotent to complete twice.
         Err(error) if super::code_source::selector_retirement_retryable(&error) => {
             tracing::warn!(
                 project_id,
                 superseded_generation = %superseded,
                 error = %error,
                 "retirement of the superseded connector generation was \
-                 deferred by writer readiness and phase 1 does not redrive \
-                 it; its documents remain in the index and are not reachable \
-                 through the active selector"
-            )
+                 deferred by writer readiness; it is journaled for the \
+                 connector retirement redrive and will be retried until it \
+                 completes"
+            );
+            defer_connector_retirement(
+                state,
+                ConnectorRetirementRecord {
+                    version: 1,
+                    project_id: project_id.to_string(),
+                    scope: scope.clone(),
+                    superseded_generation_id: superseded.to_string(),
+                    selector,
+                    reason: error.to_string(),
+                },
+            );
         }
         Err(error) => tracing::warn!(
             project_id,
@@ -258,6 +278,303 @@ fn retire_superseded_generation(
              active selector"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Connector retirement redrive (gap-7e44ee3b)
+//
+// A selector retirement deferred by writer readiness (the vector store still
+// warming up, or a reindex pass holding the lane) is journaled durably by
+// `bbox_file_source_store::FileSourceStore::enqueue_retirement` and handed to
+// this coordinator, which retries it with backoff until it completes. Boot
+// recovery (`recover_connector_retirements`) re-enqueues every row still
+// journaled from a prior process, so a restart mid-deferral does not lose it,
+// and completing an already-completed row is a no-op
+// (`FileSourceStore::complete_retirement`), so redriving an already-retired
+// selector is safe.
+//
+// TWIN: `src/server/code_source.rs`'s `RetirementCoordinator` is the code
+// lane's equivalent, wired to `bbox-code-source-store`'s retirement journal.
+// This coordinator mirrors its scheduling shape (a durable journal row, an
+// in-memory backoff queue, one lazily-spawned redrive thread) rather than
+// reusing that type directly: the code lane's coordinator is threaded through
+// `PublishedScope`, `ProjectId`, collision-retirement variants, and
+// catalog-generation-state transitions that have no connector-lane
+// equivalent, and the connector store's simpler single-activation-per-scope
+// model (no `BridgeV1`/`CatalogV2` split, no collision lane) does not need
+// any of that. Sharing only the parts that are actually the same -- the
+// selector-retryable predicate `code_source::selector_retirement_retryable`
+// and the underlying `retire_code_selector` writer op -- keeps this lane's
+// machinery proportionate to what it actually has to redrive.
+// ---------------------------------------------------------------------------
+
+struct ConnectorRetirementEntry {
+    record: ConnectorRetirementRecord,
+    attempts: u32,
+    retry_delay: std::time::Duration,
+    next_due: std::time::Instant,
+}
+
+/// In-memory backoff scheduler for journaled connector selector retirements.
+/// One per daemon, owned by [`super::file_source::FileSourceRuntime`].
+pub(crate) struct ConnectorRetirementCoordinator {
+    queue: std::sync::Mutex<std::collections::BTreeMap<String, ConnectorRetirementEntry>>,
+    notify: std::sync::Condvar,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl ConnectorRetirementCoordinator {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            notify: std::sync::Condvar::new(),
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+const CONNECTOR_RETIREMENT_RETRY_LIMIT: u32 = 8;
+const CONNECTOR_RETIREMENT_REDRIVE_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Exponential backoff up to a cap, matching the code lane's cadence
+/// (`SELECTOR_RETIREMENT_RETRY_LIMIT` / `SELECTOR_RETIREMENT_REDRIVE_DELAY`
+/// in `code_source.rs`). Exhausting the budget does not stop the redrive: it
+/// only widens the delay to the slow cadence, because giving up would
+/// reintroduce the exact strand this coordinator exists to close.
+fn take_connector_retirement_retry(
+    attempts: &mut u32,
+    delay: &mut std::time::Duration,
+) -> Option<std::time::Duration> {
+    if *attempts >= CONNECTOR_RETIREMENT_RETRY_LIMIT {
+        return None;
+    }
+    *attempts += 1;
+    let current = *delay;
+    *delay = (*delay * 2).min(std::time::Duration::from_secs(30));
+    Some(current)
+}
+
+/// Journal a deferred retirement, THEN enqueue it in memory.
+///
+/// The order is load-bearing: journaling first means a crash between the two
+/// calls loses only the in-memory schedule, which boot recovery rebuilds from
+/// the journal, never the durable fact that this selector still needs
+/// retiring.
+fn defer_connector_retirement(state: &Arc<SharedState>, record: ConnectorRetirementRecord) {
+    if let Err(error) = state.file_sources.store().enqueue_retirement(&record) {
+        tracing::error!(
+            project_id = %record.project_id,
+            selector = %record.selector,
+            %error,
+            "journaling a deferred connector retirement failed; the redrive \
+             cannot recover this deferral across a restart"
+        );
+    }
+    enqueue_connector_retirement_work(state.clone(), record);
+}
+
+fn enqueue_connector_retirement_work(state: Arc<SharedState>, record: ConnectorRetirementRecord) {
+    let coordinator = state.file_sources.retirement_coordinator();
+    {
+        let mut queue = coordinator.queue.lock().unwrap();
+        let key = record.selector.clone();
+        queue
+            .entry(key)
+            .and_modify(|entry| entry.next_due = std::time::Instant::now())
+            .or_insert_with(|| ConnectorRetirementEntry {
+                record,
+                attempts: 0,
+                retry_delay: std::time::Duration::from_secs(1),
+                next_due: std::time::Instant::now(),
+            });
+    }
+    coordinator.notify.notify_one();
+
+    if coordinator
+        .started
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        let shutdown = state.reconciler_shutdown.read().clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("blackbox-connector-retirement".to_string())
+            .spawn(move || connector_retirement_coordinator_loop(state, coordinator, shutdown))
+        {
+            tracing::error!(%error, "spawning connector retirement coordinator failed");
+        }
+    }
+}
+
+fn connector_retirement_coordinator_loop(
+    state: Arc<SharedState>,
+    coordinator: Arc<ConnectorRetirementCoordinator>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+    while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        let mut entry = {
+            let mut queue = coordinator.queue.lock().unwrap();
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                let next = queue
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.next_due)
+                    .map(|(key, entry)| (key.clone(), entry.next_due));
+                match next {
+                    Some((key, due)) if due <= now => {
+                        break queue
+                            .remove(&key)
+                            .expect("selected connector retirement work exists");
+                    }
+                    Some((_key, due)) => {
+                        let wait = due
+                            .saturating_duration_since(now)
+                            .min(CONNECTOR_RETIREMENT_REDRIVE_DELAY);
+                        (queue, _) = coordinator.notify.wait_timeout(queue, wait).unwrap();
+                    }
+                    None => {
+                        (queue, _) = coordinator
+                            .notify
+                            .wait_timeout(queue, CONNECTOR_RETIREMENT_REDRIVE_DELAY)
+                            .unwrap();
+                    }
+                }
+            }
+        };
+
+        let result = run_connector_retirement_attempt(&state, &entry.record);
+        let requeue_delay = match result {
+            ConnectorRetirementAttempt::Complete => None,
+            ConnectorRetirementAttempt::Retryable(error) => {
+                let delay =
+                    take_connector_retirement_retry(&mut entry.attempts, &mut entry.retry_delay)
+                        .unwrap_or(CONNECTOR_RETIREMENT_REDRIVE_DELAY);
+                tracing::warn!(
+                    project_id = %entry.record.project_id,
+                    selector = %entry.record.selector,
+                    attempts = entry.attempts,
+                    retry_secs = delay.as_secs_f64(),
+                    %error,
+                    "connector retirement redrive attempt deferred"
+                );
+                Some(delay)
+            }
+            ConnectorRetirementAttempt::Failed(error) => {
+                tracing::error!(
+                    project_id = %entry.record.project_id,
+                    selector = %entry.record.selector,
+                    %error,
+                    "connector retirement redrive attempt failed; it remains \
+                     journaled and will be retried"
+                );
+                Some(CONNECTOR_RETIREMENT_REDRIVE_DELAY)
+            }
+        };
+
+        if let Some(delay) = requeue_delay {
+            entry.next_due = std::time::Instant::now() + delay;
+            let key = entry.record.selector.clone();
+            let mut queue = coordinator.queue.lock().unwrap();
+            queue.entry(key).or_insert(entry);
+        }
+    }
+}
+
+enum ConnectorRetirementAttempt {
+    Complete,
+    Retryable(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
+fn run_connector_retirement_attempt(
+    state: &Arc<SharedState>,
+    record: &ConnectorRetirementRecord,
+) -> ConnectorRetirementAttempt {
+    let retired = match state
+        .index_writer
+        .retire_code_selector(record.selector.clone())
+    {
+        Ok(retired) => retired,
+        Err(error) if super::code_source::selector_retirement_retryable(&error) => {
+            return ConnectorRetirementAttempt::Retryable(error);
+        }
+        Err(error) => return ConnectorRetirementAttempt::Failed(error),
+    };
+    let document_count = retired.document_count;
+    // Dropping the token releases the writer lane's retirement hold, exactly
+    // as the first attempt does in `retire_superseded_generation`. Sidecar
+    // snapshots are never touched by this lane (content addressed, shared
+    // across generations, reclaimed by a separate sweep), so there is no
+    // cleanup hold to extend the way the code lane's redrive does.
+    drop(retired);
+    if let Err(error) = state.file_sources.store().complete_retirement(record) {
+        return ConnectorRetirementAttempt::Failed(error);
+    }
+    tracing::info!(
+        project_id = %record.project_id,
+        connector_source_id = record.scope.connector_source_id().as_str(),
+        superseded_generation = %record.superseded_generation_id,
+        selector = %record.selector,
+        documents = document_count,
+        "connector retirement redrive completed a deferred retirement; the \
+         stranded corpus is healed"
+    );
+    ConnectorRetirementAttempt::Complete
+}
+
+/// Boot recovery: re-enqueue every retirement still journaled from a prior
+/// process. Runs after [`recover_connector_activations`] for the same reason
+/// that call documents -- the read view must exist first -- though this sweep
+/// does not itself touch the read view.
+///
+/// Failure for one row is logged and skipped, matching
+/// `recover_connector_activations`'s per-scope failure isolation: a store
+/// read error here must not take a working daemon boot down with it.
+pub(crate) fn recover_connector_retirements(state: &Arc<SharedState>) {
+    let store = state.file_sources.store();
+    match store.retirement_records() {
+        Ok(records) => {
+            for record in records {
+                tracing::info!(
+                    project_id = %record.project_id,
+                    selector = %record.selector,
+                    superseded_generation = %record.superseded_generation_id,
+                    "recovering a journaled connector retirement from a prior process"
+                );
+                enqueue_connector_retirement_work(state.clone(), record);
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "connector retirement recovery skipped: the retirement journal is unreadable"
+            );
+        }
+    }
+}
+
+/// Nudge every journaled deferral to retry promptly once the vector store
+/// finishes warming, instead of waiting out its current backoff. Called from
+/// the same place the code lane's `notify_cutback_readiness_available` is
+/// (`spawn_vector_warmup_thread` in `background.rs`); purely an optimization,
+/// since the coordinator's own backoff already retries without it.
+pub(crate) fn notify_connector_retirement_readiness_available(state: &Arc<SharedState>) {
+    let coordinator = state.file_sources.retirement_coordinator();
+    let now = std::time::Instant::now();
+    {
+        let mut queue = coordinator.queue.lock().unwrap();
+        for entry in queue.values_mut() {
+            entry.next_due = now;
+        }
+    }
+    coordinator.notify.notify_one();
 }
 
 /// Replace the workspace manifest so readers select this generation, and swap
@@ -1405,5 +1722,231 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    /// The retirement redrive (gap-7e44ee3b): a selector retirement deferred
+    /// by the vector-store readiness gate is journaled at defer time and
+    /// redriven to completion once the gate opens, rather than stranding the
+    /// superseded generation's corpus forever.
+    mod retirement_redrive {
+        use std::time::Duration;
+
+        use super::*;
+
+        /// Poll a predicate on a bounded schedule, matching the polling style
+        /// the rest of this module's fixtures use for "eventually true"
+        /// background-thread outcomes.
+        async fn await_true(mut predicate: impl FnMut() -> bool, what: &str) {
+            for _ in 0..600 {
+                if predicate() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("{what} never became true");
+        }
+
+        #[tokio::test]
+        async fn a_deferred_retirement_is_journaled_and_redriven_once_the_vector_store_warms() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let _visual = bbox_visual_store::install_test_global(Arc::new(
+                bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
+            ));
+            let (state, token) = onboarded_state(&root);
+            // Deliberately NOT installing the vector store global yet: a
+            // superseded selector with documents under it must defer on
+            // `try_global()` returning `None`, exactly the "vector store is
+            // still warming up during post-boot activation" shape the gap
+            // names.
+
+            let first_documents = documents();
+            let first = publish(&state, &token, &first_documents, 0).await;
+            assert_eq!(
+                await_terminal(&state, &token, &first).await.state,
+                FileGenerationStateV1::Active
+            );
+            let first_selector =
+                crate::index::project_files::collected_materialization_selector(PROJECT_ID, &first);
+            assert!(
+                !documents_under(&state, &first_selector).is_empty(),
+                "the first generation must have documents for its retirement \
+                 to be anything other than the count==0 short-circuit"
+            );
+
+            let mut second_documents = documents();
+            second_documents[1].bytes =
+                b"# Plan\n\nThe quarterly widget targets were revised upward.\n".to_vec();
+            let second = publish(&state, &token, &second_documents, 0).await;
+            assert_eq!(
+                await_terminal(&state, &token, &second).await.state,
+                FileGenerationStateV1::Active
+            );
+
+            // The activation completed, but retirement of the first
+            // generation's selector must have deferred: the store's
+            // journal names it, and its documents are still there.
+            let store = state.file_sources.store();
+            await_true(
+                || store.retirement_pending(&first_selector).unwrap(),
+                "the deferred retirement was journaled",
+            )
+            .await;
+            assert!(
+                !documents_under(&state, &first_selector).is_empty(),
+                "a deferred retirement must not have deleted anything"
+            );
+
+            // The vector store finishes warming, and the redrive completes
+            // the deferral it recorded.
+            let _vectors = bbox_vectors::install_test_global(state.vector_store.clone());
+            notify_connector_retirement_readiness_available(&state);
+
+            await_true(
+                || documents_under(&state, &first_selector).is_empty(),
+                "the redrive retired the deferred selector's documents",
+            )
+            .await;
+            assert!(
+                !store.retirement_pending(&first_selector).unwrap(),
+                "a completed retirement must clear its journal row"
+            );
+        }
+
+        #[tokio::test]
+        async fn stacked_deferrals_from_several_activations_are_all_redriven_to_completion() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let _visual = bbox_visual_store::install_test_global(Arc::new(
+                bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
+            ));
+            let (state, token) = onboarded_state(&root);
+            // No vector store installed: every activation below supersedes a
+            // predecessor with documents, so every one of them defers.
+
+            let mut selectors = Vec::new();
+            let first = publish(&state, &token, &documents(), 0).await;
+            assert_eq!(
+                await_terminal(&state, &token, &first).await.state,
+                FileGenerationStateV1::Active
+            );
+            let mut previous_id = first;
+
+            // Three more activations, each superseding the last, all landing
+            // while the vector store is still warming -- the "several
+            // activations during one long warmup" shape. Each revision's
+            // bytes differ from every other so each publish derives its own
+            // generation id.
+            for revision in 1..=3u8 {
+                let selector = crate::index::project_files::collected_materialization_selector(
+                    PROJECT_ID,
+                    &previous_id,
+                );
+                selectors.push(selector);
+
+                let mut next_documents = documents();
+                next_documents[1].bytes = format!(
+                    "# Plan\n\nThe quarterly widget targets were revised {revision} times.\n"
+                )
+                .into_bytes();
+                let next = publish(&state, &token, &next_documents, 0).await;
+                assert_eq!(
+                    await_terminal(&state, &token, &next).await.state,
+                    FileGenerationStateV1::Active
+                );
+                previous_id = next;
+            }
+
+            let store = state.file_sources.store();
+            for selector in &selectors {
+                await_true(
+                    || store.retirement_pending(selector).unwrap(),
+                    "every superseded selector from a stacked-deferral run was journaled",
+                )
+                .await;
+                assert!(!documents_under(&state, selector).is_empty());
+            }
+            assert_eq!(
+                store.retirement_records().unwrap().len(),
+                selectors.len(),
+                "every deferral in the stack must have its own journal row"
+            );
+
+            let _vectors = bbox_vectors::install_test_global(state.vector_store.clone());
+            notify_connector_retirement_readiness_available(&state);
+
+            for selector in &selectors {
+                await_true(
+                    || documents_under(&state, selector).is_empty(),
+                    "the redrive completed every stacked deferral, not just the most recent",
+                )
+                .await;
+            }
+            assert!(
+                store.retirement_records().unwrap().is_empty(),
+                "no deferral may remain journaled once the redrive has run"
+            );
+        }
+
+        #[tokio::test]
+        async fn redriving_an_already_retired_connector_selector_is_a_no_op() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let _visual = bbox_visual_store::install_test_global(Arc::new(
+                bbox_visual_store::VisualPayloadStore::open(root.join("visual")),
+            ));
+            let (state, token) = onboarded_state(&root);
+            // Vectors installed up front: this generation's retirement
+            // succeeds on the first attempt, so the case under test is a
+            // REDRIVE of a selector that already has nothing left to do.
+            let _vectors = bbox_vectors::install_test_global(state.vector_store.clone());
+
+            let first_documents = documents();
+            let first = publish(&state, &token, &first_documents, 0).await;
+            assert_eq!(
+                await_terminal(&state, &token, &first).await.state,
+                FileGenerationStateV1::Active
+            );
+            let first_selector =
+                crate::index::project_files::collected_materialization_selector(PROJECT_ID, &first);
+
+            let mut second_documents = documents();
+            second_documents[1].bytes =
+                b"# Plan\n\nThe quarterly widget targets were revised upward.\n".to_vec();
+            let second = publish(&state, &token, &second_documents, 0).await;
+            assert_eq!(
+                await_terminal(&state, &token, &second).await.state,
+                FileGenerationStateV1::Active
+            );
+
+            await_true(
+                || documents_under(&state, &first_selector).is_empty(),
+                "retirement completed synchronously since the vector store was already warm",
+            )
+            .await;
+            let store = state.file_sources.store();
+            assert!(!store.retirement_pending(&first_selector).unwrap());
+
+            // Redrive the same identity directly, as boot recovery or a
+            // racing coordinator entry would. Both the writer's count==0
+            // short-circuit and the store's missing-row no-op must make this
+            // a clean success, not an error.
+            let record = ConnectorRetirementRecord {
+                version: 1,
+                project_id: PROJECT_ID.to_string(),
+                scope: scope(),
+                superseded_generation_id: first.clone(),
+                selector: first_selector.clone(),
+                reason: "idempotency probe".to_string(),
+            };
+            for _ in 0..2 {
+                let outcome = run_connector_retirement_attempt(&state, &record);
+                assert!(
+                    matches!(outcome, ConnectorRetirementAttempt::Complete),
+                    "redriving an already-retired selector must succeed as a no-op"
+                );
+            }
+            assert!(!store.retirement_pending(&first_selector).unwrap());
+        }
     }
 }
