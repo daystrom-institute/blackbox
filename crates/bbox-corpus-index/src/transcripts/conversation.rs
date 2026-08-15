@@ -1191,6 +1191,13 @@ mod gate_tests {
             &location.locator(),
         ));
         writer.commit().unwrap();
+        // Released explicitly, BEFORE `corpus.reindex` below opens its own
+        // writer on the same directory: tantivy allows exactly one live
+        // `IndexWriter` per directory, and this writer would otherwise stay
+        // alive until the end of the test function (this is a single-writer
+        // test, unlike the sibling purge-only test where the manual writer
+        // is the last thing the function opens).
+        drop(writer);
         assert_eq!(corpus.total_documents(), 0);
 
         // The channel reappears in a later complete sweep: re-enrollment.
