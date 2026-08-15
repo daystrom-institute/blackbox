@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! POST /internal/conversation-source/v1/catalog/onboard   mint the catalog project
-//! POST /internal/conversation-source/v1/channels          roster visible under policy
+//! POST /internal/conversation-source/v1/channels          roster visible under policy, `complete` marks a full member-set sweep
 //! GET  /internal/conversation-source/v1/cursors           server's per-channel high-water marks
 //! POST /internal/conversation-source/v1/batches           ordered batch of new message records
 //! POST /internal/conversation-source/v1/revisions         edits and tombstones for landed records
@@ -680,6 +680,27 @@ pub struct ChannelRosterRequestV1 {
     pub scope: ConnectorScope,
     pub workspace_id: String,
     pub channels: Vec<ChannelObservationV1>,
+    /// True when `channels` is the producer's ENTIRE current member set for
+    /// this workspace, not a partial or filtered view of it.
+    ///
+    /// Additive and optional (`#[serde(default)]`): an old producer that has
+    /// not been redeployed against this field omits it, and the default
+    /// `false` reproduces the pre-existing behavior exactly, so this is a
+    /// non-breaking wire change. A producer sets it `true` only when it can
+    /// prove the claim; a partial or policy-narrowed enumeration that
+    /// happened to omit a channel this cycle must never be reported complete,
+    /// because the store treats `true` as license to record an unenrollment
+    /// observation for every channel it previously held that is absent here.
+    ///
+    /// This is the completeness signal the store previously lacked: without
+    /// it, a producer that quietly stops listing a channel (dropped from an
+    /// allowlist, or lost membership without the corresponding `is_member`
+    /// observation ever being sent) leaves that channel's last observation on
+    /// disk forever, and design section 6's "a channel no enrolled source
+    /// covers must stop being searchable" never fires. See
+    /// `ConversationSourceStore::record_roster`.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 impl ChannelRosterRequestV1 {
@@ -1526,6 +1547,7 @@ mod tests {
                     observed_at: "2026-08-13T00:00:00Z".into(),
                 },
             ],
+            complete: false,
         };
         roster.validate().unwrap();
 
@@ -1535,6 +1557,42 @@ mod tests {
             unsorted.validate(),
             Err(ConversationSourceError::RecordsNotOrdered)
         ));
+    }
+
+    #[test]
+    fn an_old_producer_payload_with_no_complete_field_defaults_to_incomplete() {
+        // The additive-field contract: a producer that has not been
+        // redeployed against `complete` never sends it, and the default must
+        // reproduce the pre-existing behavior (never a license to unenroll)
+        // rather than accidentally opting an old producer into sweep
+        // semantics it does not implement.
+        let json = format!(
+            r#"{{"schema_version":{SCHEMA_VERSION},
+                "conversation_policy_version":"{CONVERSATION_POLICY_VERSION}",
+                "scope":{{"connector_source_id":"{SOURCE_ID}","connector_kind":"fixture"}},
+                "workspace_id":"{WORKSPACE}",
+                "channels":[]}}"#
+        );
+        let parsed: ChannelRosterRequestV1 = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.complete);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn a_complete_roster_round_trips_the_flag() {
+        let roster = ChannelRosterRequestV1 {
+            schema_version: SCHEMA_VERSION,
+            conversation_policy_version: CONVERSATION_POLICY_VERSION.into(),
+            scope: scope(),
+            workspace_id: WORKSPACE.into(),
+            channels: Vec::new(),
+            complete: true,
+        };
+        roster.validate().unwrap();
+        let value = serde_json::to_value(&roster).unwrap();
+        assert_eq!(value["complete"], true);
+        let parsed: ChannelRosterRequestV1 = serde_json::from_value(value).unwrap();
+        assert!(parsed.complete);
     }
 
     #[test]
