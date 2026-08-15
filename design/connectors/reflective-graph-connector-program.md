@@ -575,6 +575,11 @@ the profiles share. API-dataset connectors add semantic projection and action
 surfaces without making file-tree connectors synthesize business graphs, and
 the Slack profile adds conversation-corpus ingestion without either.
 
+The API-dataset profile's own contracts (its wire lane, schema-directed
+projection, action surface, grant discriminant, and status shape) are owned by
+[API-Dataset Connector](api-dataset-connector.md), which is the profile design
+this milestone names.
+
 Exit gate: one file-tree fixture and one API-dataset fixture run through the
 same orchestration, checkpoint, status, secret-reference, and witness
 boundaries.
@@ -886,6 +891,9 @@ Still open (backburner, re-evaluate at decision time):
   file-tree profile and owner of the shared connector transport and non-git
   scope identity; [Slack Ingestion Connector](slack-ingestion-connector.md),
   the transcript-shaped profile;
+  [API-Dataset Connector](api-dataset-connector.md), the API-dataset profile
+  this program's M4 names, which owns that profile's wire lane, projection,
+  action, and status contracts;
   [Secret custody across the checkout and corpus planes](../operations/config-artifacts/secrets-provider.md),
   which owns credential custody across both planes.
 - Constrained by:
