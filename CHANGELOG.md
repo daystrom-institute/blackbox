@@ -43,6 +43,15 @@ out explicitly under `Changed` or `Removed`.
   instead of dropping; bounded batch drains with on-demand wakeup and
   endpoint backoff; per-envelope delivery claims with stale-entry
   re-reads; honest bounded at-least-once contract in the design doc.
+- Conversation-source roster gets a clean unenrollment signal: an
+  additive, optional `complete` marker on the channel-roster POST lets a
+  producer assert a sweep is its entire current member set for the
+  workspace, and the landing store then records `is_member: false` for
+  every channel it previously held that the sweep omits (journaled, not
+  deleted, idempotent under replay, restored on re-enrollment). The
+  membership-mode collector marks its rosters complete; explicit mode
+  does not, since its policy-narrowed enrolled set is not a proven full
+  sweep.
 
 ### Changed
 
