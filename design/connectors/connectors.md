@@ -46,6 +46,10 @@ code-source collector transport.
   the delivery program tying the reflective graph kernel, source-owned graph
   projections, the Xero profile, evidence bindings, and unified retrieval
   into one arc.
+- [Unified retrieval for reflective graph vertices](unified-retrieval.md) -
+  the campaign's M9 detail doc: how graph vertices join the word index and
+  the optional vector lane under per-graph policy, and how authority
+  filtering precedes ranking and traversal expansion.
 
 ## Crosscuts
 
