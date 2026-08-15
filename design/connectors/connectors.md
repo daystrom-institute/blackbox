@@ -40,6 +40,9 @@ code-source collector transport.
 - [Remote Source Connectors](remote-source-connectors.md) - the file-tree
   profile and the shared transport, identity, policy, and onboarding
   contracts.
+- [API-Dataset Connector](api-dataset-connector.md) - the API-dataset
+  profile: typed business systems observed into connector-owned source graphs
+  under versioned schema artifacts, with declared targeted actions.
 - [Slack Ingestion Connector](slack-ingestion-connector.md) - the
   conversation profile: visible Slack messages, corpus-searchable, read-only.
 - [Graph-native connector campaign](reflective-graph-connector-program.md) -
