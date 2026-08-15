@@ -224,6 +224,7 @@ fn spawn_vector_warmup_thread(shared: Arc<SharedState>) -> anyhow::Result<()> {
                 "vector store warmed"
             );
             super::code_source::notify_cutback_readiness_available(&shared);
+            super::file_source_activation::notify_connector_retirement_readiness_available(&shared);
         })
         .map_err(|e| anyhow::anyhow!("spawning vector store warmup thread: {e}"))?;
     Ok(())

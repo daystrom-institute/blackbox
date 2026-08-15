@@ -1104,6 +1104,12 @@ pub(super) fn open_shared_state(
     // the read view exists because a forward republish swaps it.
     super::file_source_activation::recover_connector_activations(&shared);
 
+    // Re-enqueue any connector selector retirement a prior process deferred
+    // on writer readiness (gap-7e44ee3b): without this, a deferral that
+    // outlives the daemon strands its corpus permanently instead of being
+    // redriven to completion on the next boot.
+    super::file_source_activation::recover_connector_retirements(&shared);
+
     // Start the single-writer task-store persist actor (control-plane starvation
     // fix). Hot paths now signal `request_persist` instead of doing a blocking
     // `task_store.read().persist(dir)` on a tokio worker. Production only — tests
