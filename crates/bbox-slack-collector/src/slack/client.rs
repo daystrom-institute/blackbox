@@ -109,6 +109,21 @@ pub struct ChannelListRequest {
     pub max_pages: u32,
 }
 
+/// What one channel-roster enumeration produced.
+///
+/// `complete` mirrors [`Sweep::complete`]: it is `false` the moment the
+/// enumeration hit its page budget before Slack ran out of pages, and the
+/// cycle must never treat a truncated read as proof it saw every channel.
+/// This is the enumeration-side half of the completeness question; whether
+/// the roster the cycle goes on to POST also equals the producer's entire
+/// current member set is a separate, policy-shaped decision the cycle makes
+/// (see `ChannelRosterRequestV1::complete`).
+#[derive(Debug, Clone, Default)]
+pub struct ChannelRoster {
+    pub channels: Vec<RawChannel>,
+    pub complete: bool,
+}
+
 /// The read surface the publication cycle depends on.
 ///
 /// The cycle is written against this rather than against [`SlackClient`] so its
@@ -119,7 +134,7 @@ pub struct ChannelListRequest {
 #[async_trait]
 pub trait SlackRead: Send + Sync {
     async fn auth_test(&self) -> Result<SlackIdentity>;
-    async fn list_channels(&self, request: &ChannelListRequest) -> Result<Vec<RawChannel>>;
+    async fn list_channels(&self, request: &ChannelListRequest) -> Result<ChannelRoster>;
     async fn history(&self, request: &HistoryRequest) -> Result<Sweep>;
     async fn replies(&self, request: &RepliesRequest) -> Result<Sweep>;
 }
@@ -385,7 +400,7 @@ impl SlackRead for SlackClient {
         })
     }
 
-    async fn list_channels(&self, request: &ChannelListRequest) -> Result<Vec<RawChannel>> {
+    async fn list_channels(&self, request: &ChannelListRequest) -> Result<ChannelRoster> {
         let mut types = vec!["public_channel"];
         if request.include_private {
             types.push("private_channel");
@@ -429,7 +444,7 @@ impl SlackRead for SlackClient {
                 "the channel roster hit its page budget; some channels were not seen this cycle"
             );
         }
-        Ok(channels)
+        Ok(ChannelRoster { channels, complete })
     }
 
     async fn history(&self, request: &HistoryRequest) -> Result<Sweep> {

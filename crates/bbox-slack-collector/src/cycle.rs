@@ -63,7 +63,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use crate::config::{BackfillHorizon, SatelliteConfig};
 use crate::journal::Journal;
 use crate::normalize::{edit_stamp, normalize};
-use crate::policy::{ChannelDecision, CompiledChannelPolicy, SkipCounters};
+use crate::policy::{ChannelDecision, CompiledChannelPolicy, EnrollmentMode, SkipCounters};
 use crate::slack::{
     ChannelListRequest, HistoryRequest, RawMessage, RepliesRequest, SlackIdentity, SlackRead,
 };
@@ -241,11 +241,11 @@ pub async fn run_publication_cycle(
     // -- enrollment ----------------------------------------------------------
     let policy =
         CompiledChannelPolicy::compile(&config.channels).context("compiling the channel policy")?;
+    let membership_mode = config.channels.enrollment == EnrollmentMode::Membership;
     let roster = slack
         .list_channels(&ChannelListRequest {
             include_private: policy.include_private(),
-            memberships_only: config.channels.enrollment
-                == crate::policy::EnrollmentMode::Membership,
+            memberships_only: membership_mode,
             // Always fetch archived on the wire and let the policy filter
             // them locally: Slack applies exclude_archived AFTER the page
             // window, so an archive-heavy workspace yields a near-empty page
@@ -263,7 +263,7 @@ pub async fn run_publication_cycle(
 
     let mut skips = SkipCounters::default();
     let mut enrolled: BTreeMap<String, ChannelObservationV1> = BTreeMap::new();
-    for channel in &roster {
+    for channel in &roster.channels {
         match policy.decide(channel) {
             ChannelDecision::Skip { reason } => skips.record(reason),
             ChannelDecision::Enroll { class } => {
@@ -292,6 +292,24 @@ pub async fn run_publication_cycle(
     outcome.channels_enrolled = enrolled.len() as u64;
     outcome.channels_skipped = skips.into_map();
 
+    // COMPLETENESS (gap-e84231d3): only membership mode's enrolled map is
+    // provably the producer's entire current member set for this workspace.
+    // `users.conversations` (design section 6, RULED 2026-08-14) returns
+    // exactly the bot's own membership, and under membership mode every
+    // member channel of an enabled class enrolls -- an invite IS enrollment
+    // -- so `enrolled` equals that member set precisely when the read itself
+    // was not truncated by the page budget (`roster.complete`). Under
+    // explicit mode `enrolled` is narrowed by an operator-authored include
+    // glob: a channel absent from it may simply be un-included, not
+    // unmembered or unenrolled by any coverage decision this cycle actually
+    // made, and this satellite has no way to prove the read enumerated the
+    // whole workspace roster rather than a partial page walk. Leaving
+    // `complete` false there is deliberate rather than an oversight: a later
+    // pass could mark explicit mode complete too once it can prove a full
+    // page walk happened, but a policy-narrowed enrolled set is not that
+    // proof on its own.
+    let complete = membership_mode && roster.complete;
+
     let roster_request = ChannelRosterRequestV1 {
         schema_version: SCHEMA_VERSION,
         conversation_policy_version: CONVERSATION_POLICY_VERSION.to_string(),
@@ -300,6 +318,7 @@ pub async fn run_publication_cycle(
         // BTreeMap iteration gives the channel-id ordering the wire's roster
         // validation requires, and it deduplicates by construction.
         channels: enrolled.values().cloned().collect(),
+        complete,
     };
     roster_request
         .validate()

@@ -12,8 +12,8 @@ pub mod model;
 pub mod throttle;
 
 pub use client::{
-    ChannelListRequest, ClientStats, DEFAULT_API_BASE_URL, DEFAULT_PAGE_LIMIT, HistoryRequest,
-    MAX_RESPONSE_BYTES, RepliesRequest, SlackClient, SlackRead, Sweep,
+    ChannelListRequest, ChannelRoster, ClientStats, DEFAULT_API_BASE_URL, DEFAULT_PAGE_LIMIT,
+    HistoryRequest, MAX_RESPONSE_BYTES, RepliesRequest, SlackClient, SlackRead, Sweep,
 };
 pub use method::SlackReadMethod;
 pub use model::{
