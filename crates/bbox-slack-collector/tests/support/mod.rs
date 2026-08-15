@@ -209,6 +209,7 @@ impl FakeSlack {
         let app = Router::new()
             .route("/api/auth.test", get(auth_test))
             .route("/api/conversations.list", get(conversations_list))
+            .route("/api/users.conversations", get(users_conversations))
             .route("/api/conversations.history", get(conversations_history))
             .route("/api/conversations.replies", get(conversations_replies))
             // Anything else is recorded and refused. A collector that somehow
@@ -311,6 +312,40 @@ async fn conversations_list(
     let channels: Vec<Value> = state
         .channels
         .iter()
+        .filter(|channel| want_private || !channel.is_private)
+        .filter(|channel| !(exclude_archived && channel.is_archived))
+        .map(FakeChannel::to_json)
+        .collect();
+    (
+        scopes_header(&state),
+        Json(json!({
+            "ok": true,
+            "channels": channels,
+            "response_metadata": { "next_cursor": "" },
+        })),
+    )
+        .into_response()
+}
+
+/// `users.conversations`: the calling bot's own membership only, unlike
+/// `conversations.list`'s whole-workspace roster. Membership mode's
+/// completeness claim depends on this filter being real in the fixture too,
+/// not just asserted by the collector after the fact.
+async fn users_conversations(
+    State(state): State<Arc<Mutex<FakeSlackState>>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut state = state.lock().unwrap();
+    if let Some(response) = intercept(&mut state, "users.conversations") {
+        return response;
+    }
+    let types = query.get("types").cloned().unwrap_or_default();
+    let want_private = types.contains("private_channel");
+    let exclude_archived = query.get("exclude_archived").map(String::as_str) == Some("true");
+    let channels: Vec<Value> = state
+        .channels
+        .iter()
+        .filter(|channel| channel.is_member)
         .filter(|channel| want_private || !channel.is_private)
         .filter(|channel| !(exclude_archived && channel.is_archived))
         .map(FakeChannel::to_json)
@@ -488,6 +523,10 @@ pub struct SinkState {
     pub batches: u64,
     pub revision_requests: u64,
     pub last_observed_at: Option<String>,
+    /// `ChannelRosterRequestV1::complete` from the most recent roster POST,
+    /// so a producer-side test can assert which enrollment modes claim a
+    /// complete sweep without reaching into the real store.
+    pub last_roster_complete: Option<bool>,
 }
 
 #[derive(Default)]
@@ -526,6 +565,10 @@ impl ModelSink {
 
     pub fn batches(&self) -> u64 {
         self.state.lock().unwrap().batches
+    }
+
+    pub fn last_roster_complete(&self) -> Option<bool> {
+        self.state.lock().unwrap().last_roster_complete
     }
 
     /// Derive the cursor from what this store HOLDS, never from what a producer
@@ -607,6 +650,7 @@ impl ConversationSink for ModelSink {
             .iter()
             .map(|channel| channel.channel_id.clone())
             .collect();
+        state.last_roster_complete = Some(request.complete);
         Ok(ChannelRosterReceiptV1 {
             workspace_id: request.workspace_id.clone(),
             channels_recorded: request.channels.len() as u64,
