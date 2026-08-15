@@ -29,8 +29,6 @@ use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
     CheckoutAccessSourceLane, CheckoutAttachmentSelector,
 };
-#[cfg(test)]
-use bro_rpc::ServiceToken;
 use bro_rpc::ServiceTokenSet;
 use sha2::{Digest, Sha256};
 
@@ -415,7 +413,7 @@ impl ProducerAuthRuntime {
     pub(crate) fn for_test(
         enabled: bool,
         git_transport_enabled: bool,
-        entries: Vec<(ServiceToken, ProducerGrant)>,
+        entries: Vec<(bro_rpc::ServiceToken, ProducerGrant)>,
     ) -> Self {
         Self::for_test_rotating(
             enabled,
@@ -435,7 +433,7 @@ impl ProducerAuthRuntime {
     pub(crate) fn for_test_rotating(
         enabled: bool,
         git_transport_enabled: bool,
-        entries: Vec<(Vec<ServiceToken>, ProducerGrant)>,
+        entries: Vec<(Vec<bro_rpc::ServiceToken>, ProducerGrant)>,
     ) -> Self {
         Self {
             enabled,
@@ -462,7 +460,7 @@ impl ProducerAuthRuntime {
 
     #[cfg(test)]
     pub(crate) fn for_test_catalog(
-        entries: Vec<(ServiceToken, ProducerGrant)>,
+        entries: Vec<(bro_rpc::ServiceToken, ProducerGrant)>,
         catalog: &CatalogSnapshotV2,
     ) -> Self {
         let entries = entries
@@ -517,7 +515,7 @@ impl ProducerAuthRuntime {
 
     #[cfg(test)]
     pub(crate) fn for_test_with_pending(
-        entries: Vec<(ServiceToken, ProducerGrant)>,
+        entries: Vec<(bro_rpc::ServiceToken, ProducerGrant)>,
         pending: BTreeSet<PublishedScope>,
     ) -> Self {
         let mut runtime = Self::for_test(true, false, entries);
@@ -927,6 +925,7 @@ mod tests {
         CommitNamespace, CorpusProject, RecordedRepoAuthority, RepoHistoryAuthority,
         RepoHistoryMaterialization, RepoHistoryRecord,
     };
+    use bro_rpc::ServiceToken;
 
     fn project(
         project_id: &str,
