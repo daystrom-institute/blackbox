@@ -29,7 +29,9 @@ use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
     CheckoutAccessSourceLane, CheckoutAttachmentSelector,
 };
-use bro_rpc::{ServiceToken, ServiceTokenSet};
+#[cfg(test)]
+use bro_rpc::ServiceToken;
+use bro_rpc::ServiceTokenSet;
 use sha2::{Digest, Sha256};
 
 use super::SharedState;
