@@ -65,6 +65,16 @@ reconnect-proof rotation, the priority-queued `RpcPeer` connection actor).
   for `ServiceToken`. It confirms the connected process is running as this
   process's own effective uid; it says nothing about which *service* is on
   the other end of that uid's sockets. Use both.
+- **`ServiceTokenSet` is an ordered list of `ServiceToken`s for one
+  producer**, used by the daemon's HTTP producer-grant lanes (code
+  collection, source connectors) to stage an overlap-tolerant token
+  rotation: add the new token as a later slot, redeploy the producer,
+  remove the old slot once nothing verifies against it anymore. `verify`
+  checks every slot without short-circuiting and returns the matching
+  slot's index (never the token itself); callers use that index for
+  matched-token observability (logs, rotation-status surfaces), never for
+  branching on which credential value matched. `Debug` renders only the
+  slot count, same redaction discipline as `ServiceToken` itself.
 
 ## Where things live
 
