@@ -74,14 +74,16 @@ const MAX_BLOB_BODY_BYTES: usize = bbox_code_source::MAX_DOCUMENT_FILE_BYTES as 
 /// Runtime holder for the connector generation store.
 ///
 /// Deliberately thin next to `CodeSourceRuntime`: that type also owns producer
-/// auth, cutback reconciliation, transition guards, and a retirement
-/// coordinator. This lane's authorization lives in the connector grant table
-/// (rebuilt with `ProducerAuthRuntime`, so there is exactly one place grants
-/// are resolved), and phase 1 has no cutback lane at all, so a struct with one
-/// field is the honest shape rather than a placeholder for machinery that does
-/// not exist.
+/// auth, cutback reconciliation, and transition guards. This lane's
+/// authorization lives in the connector grant table (rebuilt with
+/// `ProducerAuthRuntime`, so there is exactly one place grants are resolved),
+/// and phase 1 had no cutback lane at all. The retirement coordinator is the
+/// one piece of code-lane-shaped machinery this runtime does own: a deferred
+/// selector retirement is real durable state (gap-7e44ee3b), not a
+/// placeholder for a lane that does not exist yet.
 pub(crate) struct FileSourceRuntime {
     store: Arc<FileSourceStore>,
+    retirement_coordinator: Arc<super::file_source_activation::ConnectorRetirementCoordinator>,
 }
 
 impl FileSourceRuntime {
@@ -89,6 +91,9 @@ impl FileSourceRuntime {
         let store = FileSourceStore::open(config.paths.state_dir.join(FILE_SOURCE_DIR))?;
         Ok(Self {
             store: Arc::new(store),
+            retirement_coordinator: Arc::new(
+                super::file_source_activation::ConnectorRetirementCoordinator::new(),
+            ),
         })
     }
 
@@ -96,10 +101,19 @@ impl FileSourceRuntime {
         self.store.clone()
     }
 
+    pub(crate) fn retirement_coordinator(
+        &self,
+    ) -> Arc<super::file_source_activation::ConnectorRetirementCoordinator> {
+        self.retirement_coordinator.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(root: &std::path::Path) -> Self {
         Self {
             store: Arc::new(FileSourceStore::open(root.join(FILE_SOURCE_DIR)).unwrap()),
+            retirement_coordinator: Arc::new(
+                super::file_source_activation::ConnectorRetirementCoordinator::new(),
+            ),
         }
     }
 }
