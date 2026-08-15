@@ -83,9 +83,27 @@ documents stamped with the queried name keep matching directly. A channel id
 works as-is.
 
 Conversation hits render channel, author, and a derived Slack permalink. They
-have no readable transcript file, so `bbox_context` and `bbox_messages` do not
-apply: drill down by narrowing `channel=` queries and follow the permalink to
-open a message in Slack. A hit whose only match was metadata (the channel
+have no readable transcript FILE, but `bbox_context` and `bbox_messages` still
+apply: both resolve a slack hit's coordinates against the conversation landing
+store directly instead of reading a file, exactly as the search breadcrumb
+recommends.
+
+```text
+bbox_context(file_path="slack:T4MNK2L6A/C0BP8JG21FU", byte_offset=1712345678000200)
+bbox_messages(session_id="C0BP8JG21FU/2026-08-10")
+```
+
+`bbox_context`'s `file_path` is the hit's `slack:<workspace_id>/<channel_id>`
+locator; its `byte_offset` is not a byte position but the target message's
+timestamp with the decimal point removed (the same digit-concatenation the
+permalink derivation uses) — the value the breadcrumb already fills in for
+you. `bbox_messages` pages the whole channel with `file_path="slack:..."`, or
+just one day with `session_id="<channel_id>/<date>"` (the per-channel-per-day
+bucket a hit's `session_id` carries). Either way, an unenrolled or unknown
+channel refuses with a message naming a working `bbox_search(channel=...)`
+lane rather than an ENOENT or "Session not found". Narrowing `channel=`
+queries and following the permalink to open a message in Slack remain the
+other two working paths. A hit whose only match was metadata (the channel
 name, lane, or author) shows the start of the message as its excerpt.
 
 ## Sessions And Messages
