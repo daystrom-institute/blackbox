@@ -6996,6 +6996,7 @@ mod tests {
         config.code_collection.producers = vec![CodeCollectionProducerConfig {
             producer_id: "producer".into(),
             token_file,
+            token_files: Vec::new(),
             scopes: vec![scope.clone()],
         }];
         let catalog = catalog_grant_store(
@@ -8172,6 +8173,7 @@ mod tests {
             |producer_id: &str, token_file: &Path, scopes| CodeCollectionProducerConfig {
                 producer_id: producer_id.to_string(),
                 token_file: token_file.to_path_buf(),
+                token_files: Vec::new(),
                 scopes,
             };
 
@@ -8606,6 +8608,7 @@ mod tests {
         config.code_collection.producers = vec![CodeCollectionProducerConfig {
             producer_id: "catalog-producer".into(),
             token_file: token_file.to_path_buf(),
+            token_files: Vec::new(),
             scopes: vec![scope.clone()],
         }];
         config
@@ -8806,6 +8809,7 @@ mod tests {
         config.code_collection.producers = vec![CodeCollectionProducerConfig {
             producer_id: "bridge-producer".into(),
             token_file: token_file.to_path_buf(),
+            token_files: Vec::new(),
             scopes: vec![scope.clone()],
         }];
 
@@ -8856,11 +8860,13 @@ mod tests {
             CodeCollectionProducerConfig {
                 producer_id: "dup-producer-a".into(),
                 token_file: token_a,
+                token_files: Vec::new(),
                 scopes: vec![scope.clone()],
             },
             CodeCollectionProducerConfig {
                 producer_id: "dup-producer-b".into(),
                 token_file: token_b,
+                token_files: Vec::new(),
                 scopes: vec![scope.clone()],
             },
         ];

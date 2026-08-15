@@ -308,6 +308,7 @@ mod tests {
         initial_cfg.code_collection.producers = vec![CodeCollectionProducerConfig {
             producer_id: "producer-a".to_string(),
             token_file,
+            token_files: Vec::new(),
             scopes: vec![scope.clone()],
         }];
 
