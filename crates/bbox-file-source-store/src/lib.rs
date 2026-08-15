@@ -194,6 +194,47 @@ impl UploadRecord {
     }
 }
 
+/// A deferred connector selector retirement, journaled durably so a
+/// vector-store readiness deferral survives a daemon restart and can be
+/// redriven to completion rather than stranding the superseded generation's
+/// documents forever (gap-7e44ee3b).
+///
+/// TWIN: `bbox-code-source-store::RetirementRecord` is the code lane's
+/// equivalent. This record is deliberately its own type rather than a reuse
+/// of that one: it is keyed on [`ConnectorScope`] and carries the connector's
+/// own generation identity, and the two stores are already kept separate for
+/// the reasons the module doc explains. `reason` is a short operator-facing
+/// diagnostic (for example the readiness error's `Display`), kept for the
+/// same audit purpose `bbox-code-source-store`'s health records serve.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRetirementRecord {
+    pub version: u32,
+    pub project_id: String,
+    pub scope: ConnectorScope,
+    /// The superseded generation whose documents this retirement removes.
+    pub superseded_generation_id: String,
+    /// The `collected:` selector the superseded generation's documents are
+    /// indexed under. Identity for the journal row: one selector can only
+    /// ever have one outstanding deferred retirement.
+    pub selector: String,
+    /// Why the retirement was deferred, for operators reading the journal
+    /// directly. Not interpreted by any code path.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectorRetirementEnqueueConflict;
+
+impl std::fmt::Display for ConnectorRetirementEnqueueConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("connector selector already has a different retirement identity journaled")
+    }
+}
+
+impl std::error::Error for ConnectorRetirementEnqueueConflict {}
+
 // ---------------------------------------------------------------------------
 // Activation tear classification
 // ---------------------------------------------------------------------------
@@ -256,6 +297,7 @@ impl FileSourceStore {
         std::fs::create_dir_all(root.join("blobs"))
             .with_context(|| format!("creating {}", root.join("blobs").display()))?;
         std::fs::create_dir_all(root.join("scopes"))?;
+        std::fs::create_dir_all(root.join("retirements"))?;
         Ok(Self {
             root,
             retained_generations: DEFAULT_RETAINED_GENERATIONS,
@@ -803,6 +845,96 @@ impl FileSourceStore {
             generation.state,
             manifest_generation,
         )))
+    }
+
+    // -- retirement journal -------------------------------------------------
+    //
+    // Durable redrive state for a selector retirement deferred by writer
+    // readiness (typically the vector store still warming up just after
+    // boot). Rows are journaled at defer time, before any retry, so a
+    // restart mid-deferral does not lose the stranded selector. See
+    // `ConnectorRetirementRecord` for the shape and gap-7e44ee3b for the
+    // defect this closes.
+
+    fn retirement_path(&self, selector: &str) -> PathBuf {
+        let hash = hex::encode(Sha256::digest(selector.as_bytes()));
+        self.root.join("retirements").join(format!("{hash}.json"))
+    }
+
+    /// Journal one deferred retirement. Idempotent for the identical record
+    /// (a redundant defer of the same selector is a no-op); refuses a
+    /// different record under the same selector, which would mean two
+    /// generations minted the same selector and is a bug rather than a state
+    /// to paper over.
+    pub fn enqueue_retirement(&self, record: &ConnectorRetirementRecord) -> Result<()> {
+        let path = self.retirement_path(&record.selector);
+        if let Some(existing) = read_json_optional::<ConnectorRetirementRecord>(&path)? {
+            if existing == *record {
+                return Ok(());
+            }
+            return Err(anyhow::Error::new(ConnectorRetirementEnqueueConflict));
+        }
+        write_durable_json(&path, record)
+    }
+
+    /// Every retirement still journaled, for the redrive's boot recovery
+    /// sweep. Order is deterministic (by selector) but otherwise
+    /// unimportant: the redrive coordinator schedules each independently.
+    pub fn retirement_records(&self) -> Result<Vec<ConnectorRetirementRecord>> {
+        let dir = self.root.join("retirements");
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+        {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Some(record) = read_json_optional(&entry.path())? {
+                    records.push(record);
+                }
+            }
+        }
+        records
+            .sort_by(|left: &ConnectorRetirementRecord, right| left.selector.cmp(&right.selector));
+        Ok(records)
+    }
+
+    pub fn retirement_pending(&self, selector: &str) -> Result<bool> {
+        Ok(
+            read_json_optional::<ConnectorRetirementRecord>(&self.retirement_path(selector))?
+                .is_some(),
+        )
+    }
+
+    /// Mark a journaled retirement complete, removing its row.
+    ///
+    /// Idempotent: a selector with no journaled row (already completed, or
+    /// never deferred in the first place) is a no-op success rather than an
+    /// error, so redriving an already-retired selector is safe to repeat.
+    /// Refuses if the row present disagrees with `record`, which would mean
+    /// the journal was rewritten out from under an in-flight redrive.
+    pub fn complete_retirement(&self, record: &ConnectorRetirementRecord) -> Result<()> {
+        let path = self.retirement_path(&record.selector);
+        let Some(queued) = read_json_optional::<ConnectorRetirementRecord>(&path)? else {
+            return Ok(());
+        };
+        if queued != *record {
+            bail!("connector retirement journal row changed before completion");
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    if let Ok(dir) = std::fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context(format!("removing {}", path.display())),
+        }
     }
 }
 
@@ -1499,5 +1631,112 @@ mod tests {
         );
         assert_eq!(generation.telemetry.skipped.get("oversize"), Some(&3));
         assert_eq!(generation.status().cursor_epoch, 7);
+    }
+
+    fn retirement_record(selector: &str, generation_id: &str) -> ConnectorRetirementRecord {
+        ConnectorRetirementRecord {
+            version: 1,
+            project_id: "p_project".into(),
+            scope: scope(),
+            superseded_generation_id: generation_id.into(),
+            selector: selector.into(),
+            reason: "the vector store is still warming up".into(),
+        }
+    }
+
+    #[test]
+    fn a_deferred_retirement_is_journaled_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = retirement_record("collected:p_project:gen-1", "gen-1");
+        {
+            let store = store(&dir);
+            assert!(!store.retirement_pending(&record.selector).unwrap());
+            store.enqueue_retirement(&record).unwrap();
+            assert!(store.retirement_pending(&record.selector).unwrap());
+        }
+        // A fresh open of the same root is the durable-restart proof: the
+        // journal row is bytes on disk, not in-memory state the process
+        // owns.
+        let reopened = store(&dir);
+        let records = reopened.retirement_records().unwrap();
+        assert_eq!(records, vec![record]);
+    }
+
+    #[test]
+    fn enqueueing_the_identical_record_twice_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let record = retirement_record("collected:p_project:gen-1", "gen-1");
+        store.enqueue_retirement(&record).unwrap();
+        store.enqueue_retirement(&record).unwrap();
+        assert_eq!(store.retirement_records().unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn enqueueing_a_conflicting_record_under_the_same_selector_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let record = retirement_record("collected:p_project:gen-1", "gen-1");
+        store.enqueue_retirement(&record).unwrap();
+        let mut conflicting = record.clone();
+        conflicting.superseded_generation_id = "gen-2".into();
+        let error = store.enqueue_retirement(&conflicting).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ConnectorRetirementEnqueueConflict>()
+                .is_some(),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn completing_a_journaled_retirement_removes_its_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let record = retirement_record("collected:p_project:gen-1", "gen-1");
+        store.enqueue_retirement(&record).unwrap();
+        store.complete_retirement(&record).unwrap();
+        assert!(!store.retirement_pending(&record.selector).unwrap());
+        assert!(store.retirement_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn redriving_an_already_retired_selector_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let record = retirement_record("collected:p_project:gen-1", "gen-1");
+        store.enqueue_retirement(&record).unwrap();
+        store.complete_retirement(&record).unwrap();
+        // A redrive that observes the completed row (for example a stale
+        // in-memory entry raced by a concurrent completion) must not error.
+        store.complete_retirement(&record).unwrap();
+        store.complete_retirement(&record).unwrap();
+        assert!(store.retirement_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stacked_deferrals_for_distinct_selectors_are_all_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let first = retirement_record("collected:p_project:gen-1", "gen-1");
+        let second = retirement_record("collected:p_project:gen-2", "gen-2");
+        let third = retirement_record("collected:p_project:gen-3", "gen-3");
+        store.enqueue_retirement(&first).unwrap();
+        store.enqueue_retirement(&second).unwrap();
+        store.enqueue_retirement(&third).unwrap();
+        let mut records = store.retirement_records().unwrap();
+        records.sort_by(|a, b| a.selector.cmp(&b.selector));
+        let mut expected = vec![first.clone(), second.clone(), third.clone()];
+        expected.sort_by(|a, b| a.selector.cmp(&b.selector));
+        assert_eq!(records, expected);
+
+        // Completing one leaves the other two stranded corpora still queued,
+        // not silently dropped.
+        store.complete_retirement(&second).unwrap();
+        let remaining = store.retirement_records().unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&first));
+        assert!(remaining.contains(&third));
+        assert!(!remaining.contains(&second));
     }
 }
