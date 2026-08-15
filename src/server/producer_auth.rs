@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use axum::Json;
@@ -28,11 +29,16 @@ use bbox_indexing::checkout_access::{
     CheckoutAccessBroker, CheckoutAccessIntent, CheckoutAccessKind, CheckoutAccessRequest,
     CheckoutAccessSourceLane, CheckoutAttachmentSelector,
 };
-use bro_rpc::ServiceToken;
+use bro_rpc::{ServiceToken, ServiceTokenSet};
 use sha2::{Digest, Sha256};
 
 use super::SharedState;
 use super::connector_grants::ConnectorGrantRuntime;
+
+/// Sentinel stored in [`AuthEntry::last_matched_slot`] before this
+/// producer's token set has ever verified a request this boot. Not a valid
+/// slot index (a [`ServiceTokenSet`] cannot hold `usize::MAX` slots).
+const NEVER_MATCHED: usize = usize::MAX;
 
 #[derive(Clone)]
 pub(crate) struct ProducerGrant {
@@ -55,8 +61,26 @@ pub(crate) struct ConnectorGrant {
 
 #[derive(Clone)]
 struct AuthEntry {
-    token: ServiceToken,
+    tokens: ServiceTokenSet,
     grant: ProducerGrant,
+    /// Slot index of the LAST successful verification against this
+    /// producer's token set, this boot (`NEVER_MATCHED` before the first
+    /// one). Rotation observability only: an operator watching this move
+    /// off slot 0 toward a higher index knows the fleet has migrated onto a
+    /// staged token and the retired slot is safe to remove. Never carries
+    /// token material. Reset on every grant-table rebuild, which is the
+    /// correct behavior: a reloaded config is a fresh window to observe.
+    last_matched_slot: Arc<AtomicUsize>,
+}
+
+/// One producer's token-rotation observability snapshot: how many slots are
+/// staged and which one last verified a request. Never carries token
+/// material -- `matched_slot` is an index, not a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProducerTokenRotationStatus {
+    pub(crate) producer_id: String,
+    pub(crate) slots: usize,
+    pub(crate) matched_slot: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +137,27 @@ pub(crate) struct ProducerAuthRuntime {
     connectors: Arc<ConnectorGrantRuntime>,
     #[cfg(test)]
     catalog_mode: bool,
+}
+
+impl std::fmt::Debug for ProducerAuthRuntime {
+    /// Hand-written so a bearer can never reach a panic message, a tracing
+    /// field, or a test log through this type -- the same discipline
+    /// `ConnectorGrantRuntime`'s own `Debug` follows. Producer ids, scope
+    /// counts, and rotation-status metadata (slot count, matched slot
+    /// index) are operator-facing; token values are unreachable through
+    /// this rendering.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProducerAuthRuntime")
+            .field("enabled", &self.enabled)
+            .field("git_transport_enabled", &self.git_transport_enabled)
+            .field(
+                "knowledge_transport_enabled",
+                &self.knowledge_transport_enabled,
+            )
+            .field("producers", &self.token_rotation_status())
+            .finish()
+    }
 }
 
 /// How configured scopes resolve during one replacement build.
@@ -229,12 +274,23 @@ impl ProducerAuthRuntime {
             if !producer_ids.insert(producer.producer_id.clone()) {
                 bail!("duplicate code-collection producer id");
             }
-            let token = ServiceToken::load(&producer.token_file).with_context(|| {
-                format!("loading code-collection token for {}", producer.producer_id)
+            let token_paths = producer.resolved_token_files().with_context(|| {
+                format!(
+                    "resolving code-collection token files for {}",
+                    producer.producer_id
+                )
             })?;
-            let token_digest = Sha256::digest(token.expose_secret().as_bytes());
-            if !token_digests.insert(token_digest.to_vec()) {
-                bail!("code-collection token values must be unique");
+            let tokens = ServiceTokenSet::load(&token_paths).with_context(|| {
+                format!(
+                    "loading code-collection tokens for {}",
+                    producer.producer_id
+                )
+            })?;
+            for token in tokens.tokens() {
+                let token_digest = Sha256::digest(token.expose_secret().as_bytes());
+                if !token_digests.insert(token_digest.to_vec()) {
+                    bail!("code-collection token values must be unique");
+                }
             }
             if producer.scopes.is_empty() {
                 bail!("enabled code-collection producer has no scopes");
@@ -279,7 +335,8 @@ impl ProducerAuthRuntime {
                 producer.scopes.iter().cloned().collect(),
             );
             entries.push(AuthEntry {
-                token,
+                tokens,
+                last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
                 grant: ProducerGrant {
                     producer_id: producer.producer_id.clone(),
                     projects: resolved,
@@ -358,13 +415,38 @@ impl ProducerAuthRuntime {
         git_transport_enabled: bool,
         entries: Vec<(ServiceToken, ProducerGrant)>,
     ) -> Self {
+        Self::for_test_rotating(
+            enabled,
+            git_transport_enabled,
+            entries
+                .into_iter()
+                .map(|(token, grant)| (vec![token], grant))
+                .collect(),
+        )
+    }
+
+    /// Like [`Self::for_test`], but each producer stages an ORDERED list of
+    /// tokens rather than exactly one, for rotation-overlap tests: index 0
+    /// is the oldest accepted slot, matching the config-level
+    /// `token_files` contract.
+    #[cfg(test)]
+    pub(crate) fn for_test_rotating(
+        enabled: bool,
+        git_transport_enabled: bool,
+        entries: Vec<(Vec<ServiceToken>, ProducerGrant)>,
+    ) -> Self {
         Self {
             enabled,
             git_transport_enabled,
             knowledge_transport_enabled: git_transport_enabled,
             entries: entries
                 .into_iter()
-                .map(|(token, grant)| AuthEntry { token, grant })
+                .map(|(tokens, grant)| AuthEntry {
+                    tokens: ServiceTokenSet::from_tokens(tokens)
+                        .expect("test entries stage at least one token"),
+                    last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
+                    grant,
+                })
                 .collect(),
             scope_to_project: BTreeMap::new(),
             pending_onboard_scopes: BTreeSet::new(),
@@ -383,7 +465,12 @@ impl ProducerAuthRuntime {
     ) -> Self {
         let entries = entries
             .into_iter()
-            .map(|(token, grant)| AuthEntry { token, grant })
+            .map(|(token, grant)| AuthEntry {
+                tokens: ServiceTokenSet::from_tokens(vec![token])
+                    .expect("test entries stage at least one token"),
+                last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
+                grant,
+            })
             .collect::<Vec<_>>();
         let scope_to_project = entries
             .iter()
@@ -448,17 +535,49 @@ impl ProducerAuthRuntime {
         self.knowledge_transport_enabled
     }
 
+    /// `verify` is constant time and checks every staged slot even after a
+    /// match, and this loop checks EVERY configured producer even after a
+    /// match, so the number of comparisons performed does not vary with
+    /// which producer or slot presented the bearer. On a match, the
+    /// matched slot is recorded for rotation observability (never the
+    /// token itself) and logged with the producer id.
     pub(crate) fn authenticate(&self, candidate: &str) -> Option<ProducerGrant> {
         if !self.enabled {
             return None;
         }
         let mut matched = None;
         for entry in &self.entries {
-            if entry.token.verify(candidate) {
+            if let Some(slot) = entry.tokens.verify(candidate) {
+                entry.last_matched_slot.store(slot, Ordering::Relaxed);
+                tracing::info!(
+                    producer_id = %entry.grant.producer_id,
+                    matched_slot = slot,
+                    total_slots = entry.tokens.len(),
+                    "producer-grant token matched"
+                );
                 matched = Some(entry.grant.clone());
             }
         }
         matched
+    }
+
+    /// Per-producer token-rotation observability: how many slots are
+    /// staged and which one last verified a request, this boot. Never
+    /// returns token material. The seam an operator-facing status surface
+    /// (a doctor section, an admin route) reads to see when the fleet has
+    /// migrated off slot 0 and the old token is safe to retire.
+    pub(crate) fn token_rotation_status(&self) -> Vec<ProducerTokenRotationStatus> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                let slot = entry.last_matched_slot.load(Ordering::Relaxed);
+                ProducerTokenRotationStatus {
+                    producer_id: entry.grant.producer_id.clone(),
+                    slots: entry.tokens.len(),
+                    matched_slot: (slot != NEVER_MATCHED).then_some(slot),
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn assignments(&self) -> Vec<(PublishedScope, String)> {
@@ -862,7 +981,11 @@ mod tests {
 
     fn entry(producer_id: &str, scopes: &[(PublishedScope, &str)]) -> AuthEntry {
         AuthEntry {
-            token: ServiceToken::parse("a".repeat(64)).unwrap(),
+            tokens: ServiceTokenSet::from_tokens(vec![
+                ServiceToken::parse("a".repeat(64)).unwrap(),
+            ])
+            .unwrap(),
+            last_matched_slot: Arc::new(AtomicUsize::new(NEVER_MATCHED)),
             grant: ProducerGrant {
                 producer_id: producer_id.into(),
                 projects: scopes
@@ -1020,5 +1143,143 @@ mod tests {
             "publication lanes see published projects only"
         );
         assert!(auth.connectors().publication_project_ids().is_empty());
+    }
+
+    fn rotating_entry(
+        producer_id: &str,
+        secrets: &[&str],
+        scope: &PublishedScope,
+        project_id: &str,
+    ) -> (Vec<ServiceToken>, ProducerGrant) {
+        (
+            secrets
+                .iter()
+                .map(|secret| ServiceToken::parse(secret.repeat(64)).unwrap())
+                .collect(),
+            ProducerGrant {
+                producer_id: producer_id.into(),
+                projects: BTreeMap::from([(scope.clone(), project_id.to_string())]),
+            },
+        )
+    }
+
+    #[test]
+    fn a_rotation_overlap_accepts_the_old_and_new_token_then_refuses_the_retired_one() {
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        // Staged rotation: slot 0 is the still-live old token, slot 1 is the
+        // freshly staged new one. Both must authenticate during the overlap
+        // window -- that is the entire point of the feature.
+        let auth = ProducerAuthRuntime::for_test_rotating(
+            true,
+            false,
+            vec![rotating_entry(
+                "producer-a",
+                &["a", "b"],
+                &scope,
+                "project-a",
+            )],
+        );
+
+        assert!(
+            auth.authenticate(&"a".repeat(64)).is_some(),
+            "the old token stays accepted during the overlap window"
+        );
+        assert!(
+            auth.authenticate(&"b".repeat(64)).is_some(),
+            "the newly staged token is accepted immediately, before the old one retires"
+        );
+        assert!(auth.authenticate(&"c".repeat(64)).is_none());
+
+        // Retirement is removing the old slot from the grant table (a
+        // config reload dropping token_files[0]), not a runtime call: a
+        // freshly built table with only the new token refuses the old one.
+        let rotated = ProducerAuthRuntime::for_test_rotating(
+            true,
+            false,
+            vec![rotating_entry("producer-a", &["b"], &scope, "project-a")],
+        );
+        assert!(
+            rotated.authenticate(&"a".repeat(64)).is_none(),
+            "a retired token must be refused once its slot is removed"
+        );
+        assert!(rotated.authenticate(&"b".repeat(64)).is_some());
+    }
+
+    #[test]
+    fn matched_slot_observability_names_the_slot_index_never_the_token() {
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let auth = ProducerAuthRuntime::for_test_rotating(
+            true,
+            false,
+            vec![rotating_entry(
+                "producer-a",
+                &["a", "b", "c"],
+                &scope,
+                "project-a",
+            )],
+        );
+
+        // Never matched yet: no slot reported.
+        assert_eq!(
+            auth.token_rotation_status(),
+            vec![ProducerTokenRotationStatus {
+                producer_id: "producer-a".into(),
+                slots: 3,
+                matched_slot: None,
+            }]
+        );
+
+        auth.authenticate(&"a".repeat(64));
+        assert_eq!(
+            auth.token_rotation_status()[0].matched_slot,
+            Some(0),
+            "slot 0 (the oldest token) matched"
+        );
+
+        // A fleet migrating onto the newest staged token moves the observed
+        // slot up, which is the signal an operator watches for before
+        // retiring an old credential.
+        auth.authenticate(&"c".repeat(64));
+        assert_eq!(
+            auth.token_rotation_status()[0].matched_slot,
+            Some(2),
+            "the most recent verification wins, so the operator sees the fleet has moved"
+        );
+
+        // A failed attempt does not disturb the last-observed slot.
+        auth.authenticate("wrong");
+        assert_eq!(auth.token_rotation_status()[0].matched_slot, Some(2));
+    }
+
+    #[test]
+    fn producer_auth_runtime_debug_never_leaks_token_material_across_multiple_slots() {
+        let scope = PublishedScope::try_new("repo-a", ".").unwrap();
+        let secret_a = "1".repeat(64);
+        let secret_b = "2".repeat(64);
+        let auth = ProducerAuthRuntime::for_test_rotating(
+            true,
+            false,
+            vec![rotating_entry(
+                "producer-a",
+                &["1", "2"],
+                &scope,
+                "project-a",
+            )],
+        );
+        auth.authenticate(&secret_b);
+
+        let rendered = format!("{auth:?}");
+        assert!(
+            !rendered.contains(&secret_a) && !rendered.contains(&secret_b),
+            "no token value may ever be reachable through Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("producer-a"),
+            "the rendering still carries operator-declared producer facts: {rendered}"
+        );
+        assert!(
+            rendered.contains("slots: 2") && rendered.contains("matched_slot: Some(1)"),
+            "the rendering carries rotation-status metadata by index only: {rendered}"
+        );
     }
 }
