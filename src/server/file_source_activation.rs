@@ -1802,14 +1802,22 @@ mod tests {
             let _vectors = bbox_vectors::install_test_global(state.vector_store.clone());
             notify_connector_retirement_readiness_available(&state);
 
+            // Poll the JOURNAL, not the index, as the completion signal.
+            // `run_connector_retirement_attempt` deletes the selector's
+            // documents and only THEN clears the journal row, so waiting on
+            // the row (the later of the two writes) is race-free; polling
+            // `documents_under` first and asserting the journal afterward
+            // with no wait raced the two writes directly and could observe
+            // the index already clear while the coordinator thread had not
+            // yet reached `complete_retirement`.
             await_true(
-                || documents_under(&state, &first_selector).is_empty(),
-                "the redrive retired the deferred selector's documents",
+                || !store.retirement_pending(&first_selector).unwrap(),
+                "the redrive completed the deferred retirement and cleared its journal row",
             )
             .await;
             assert!(
-                !store.retirement_pending(&first_selector).unwrap(),
-                "a completed retirement must clear its journal row"
+                documents_under(&state, &first_selector).is_empty(),
+                "a completed retirement must have removed the selector's documents"
             );
         }
 
@@ -1875,17 +1883,33 @@ mod tests {
             let _vectors = bbox_vectors::install_test_global(state.vector_store.clone());
             notify_connector_retirement_readiness_available(&state);
 
+            // Poll the JOURNAL as the completion signal, not the index: the
+            // coordinator's single background thread drains due entries in a
+            // tight loop after one nudge (it does not require one nudge per
+            // row), but `run_connector_retirement_attempt` deletes a
+            // selector's documents strictly before it clears that selector's
+            // journal row. Waiting on `documents_under` per selector and then
+            // asserting the whole journal empty with no further wait raced
+            // the LAST selector's own two writes: its documents could already
+            // read as gone while its journal row had not yet been removed,
+            // which is exactly the flake the cluster caught (documents_under
+            // for the last selector observed the tantivy commit slightly
+            // ahead of complete_retirement's own separate fsync). The journal
+            // row is written after the document deletion in every case, so
+            // waiting on "every row cleared" is the race-free, and strictly
+            // later, signal; checking `documents_under` afterward can never
+            // fail once the journal has drained.
+            await_true(
+                || store.retirement_records().unwrap().is_empty(),
+                "the redrive completed every stacked deferral, not just the most recent",
+            )
+            .await;
             for selector in &selectors {
-                await_true(
-                    || documents_under(&state, selector).is_empty(),
-                    "the redrive completed every stacked deferral, not just the most recent",
-                )
-                .await;
+                assert!(
+                    documents_under(&state, selector).is_empty(),
+                    "a completed retirement must have removed the selector's documents"
+                );
             }
-            assert!(
-                store.retirement_records().unwrap().is_empty(),
-                "no deferral may remain journaled once the redrive has run"
-            );
         }
 
         #[tokio::test]
