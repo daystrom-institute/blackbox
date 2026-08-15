@@ -403,6 +403,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -444,6 +445,7 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 // Granted identically, and deliberately absent from the
@@ -452,6 +454,7 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-b".into(),
                     token_file: token_file(&root, "token-b", &"b".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_B, "gdrive", "tenant.example")],
                 },
             ],
@@ -511,11 +514,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-files".into(),
                     token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-conversation".into(),
                     token_file: token_file(&root, "token-b", &"b".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant_on(
                         SOURCE_B,
                         "slack",
@@ -555,6 +560,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "graph", "tenant.example")],
             }],
             true,
@@ -579,6 +585,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &"a".repeat(64)),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -596,6 +603,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(&root, "token-a", &secret),
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -629,11 +637,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: token_file(&root, "token-a", &secret_a),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-b".into(),
                     token_file: token_file(&root, "token-b", &secret_b),
+                    token_files: Vec::new(),
                     scopes: vec![grant("csrc_00000000deadbeef", "gdrive", "tenant.example")],
                 },
             ],
@@ -681,6 +691,7 @@ mod tests {
             vec![ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: path,
+                token_files: Vec::new(),
                 scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
             }],
             true,
@@ -712,11 +723,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: shared.clone(),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: shared.clone(),
+                    token_files: Vec::new(),
                     scopes: vec![grant("csrc_00000000deadbeef", "gdrive", "tenant.example")],
                 },
             ],
@@ -730,11 +743,13 @@ mod tests {
                 ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: shared.clone(),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_A, "gdrive", "tenant.example")],
                 },
                 ConnectorProducerConfig {
                     producer_id: "producer-b".into(),
                     token_file: shared,
+                    token_files: Vec::new(),
                     scopes: vec![grant("csrc_00000000deadbeef", "gdrive", "tenant.example")],
                 },
             ],

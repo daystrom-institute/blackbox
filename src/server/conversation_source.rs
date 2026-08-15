@@ -640,6 +640,7 @@ mod tests {
                 crate::config::ConnectorProducerConfig {
                     producer_id: "producer-a".into(),
                     token_file: token_file(root, "token-a", &"a".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![
                         grant(SOURCE_A, ConnectorProfile::Conversation),
                         grant(SOURCE_B, ConnectorProfile::Conversation),
@@ -648,6 +649,7 @@ mod tests {
                 crate::config::ConnectorProducerConfig {
                     producer_id: "producer-files".into(),
                     token_file: token_file(root, "token-b", &"b".repeat(64)),
+                    token_files: Vec::new(),
                     scopes: vec![grant(SOURCE_C, ConnectorProfile::File)],
                 },
             ],
@@ -857,6 +859,7 @@ mod tests {
             producers: vec![crate::config::ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
                 token_file: token_file(root, "token-e2e", &token_secret),
+                token_files: Vec::new(),
                 scopes: vec![grant(
                     SOURCE_A,
                     crate::config::ConnectorProfile::Conversation,
