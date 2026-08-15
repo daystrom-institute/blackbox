@@ -3159,6 +3159,8 @@ mod conversation_read_plane_tests {
                     is_member: true,
                     observed_at: "2026-08-13T00:00:00Z".to_string(),
                 }],
+                false,
+                "2026-08-13T00:00:00Z",
             )
             .unwrap();
         store
