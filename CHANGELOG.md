@@ -148,12 +148,21 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- `bbox_context` and `bbox_messages` now serve Slack locators instead of
+  handing them to the filesystem reader (gap-2d4d17da): a slack hit's
+  `file_path` (`slack:<workspace>/<channel>`) resolves against the
+  conversation landing store for `bbox_context` (its `byte_offset` becomes
+  the target message's digit-encoded timestamp rather than a byte position)
+  and for `bbox_messages` (whole channel); a hit's `session_id`
+  (`<channel>/<date>`) resolves to that day's bucket for `bbox_messages`. An
+  unenrolled or unknown channel refuses with a message naming a working
+  `bbox_search(channel=...)` lane instead of rendering an ENOENT or "Session
+  not found" inline. The `bbox_search` top-hit breadcrumb recommends both
+  tools again for slack hits, now that they resolve.
 - Search hits whose query matched only metadata fields (a channel name, the
   source lane, a file path, an author id) rendered an empty excerpt that read
   as an empty message; they now fall back to the first 150 characters of the
-  document. Slack search hits also stopped recommending `bbox_context` /
-  `bbox_messages`, which cannot open a conversation locator; they point at the
-  `channel` filter and the per-hit permalink instead.
+  document.
 - Isolated daemons can no longer publish a partial knowledge store into the
   production global guidance files. Every daemon now claims its four resolved
   global render targets against other daemon instances, and `scope=global`
