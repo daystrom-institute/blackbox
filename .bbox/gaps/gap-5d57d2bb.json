@@ -13,8 +13,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "ontology/agentic-corpus/graph-retrieval-participation",
   "suggested_owner": "blackbox",
-  "notes": "Re-filed 2026-08-11 for the modernized connector campaign; replaces a pre-locality gap reference that was never present in any surviving store.",
+  "notes": "Re-filed 2026-08-11 for the modernized connector campaign; replaces a pre-locality gap reference that was never present in any surviving store. PARTIAL 2026-08-16: M9a (word-index participation, pre-ranking authority filter, traversal gate + fan-out cap, describe participation, Q6 project_id stamp, Q10 provisional alias) folded to beta/blackbox-v2 at dff4faf6 (branch feat/m9a-graph-word-index @ 765707ca, cluster verify green, opus-reviewed through three rounds). Schema g12->g13. REMAINING per design/connectors/unified-retrieval.md section 7: M9b connector plane (gated on M4), M9c provisional lanes, M9d evidence expansion + placed-chunk back-pointers, M9e schema-directed embeddings. Not yet deployed as of the fold.",
   "resolution": "unresolved",
+  "project_id": "89bd722f",
   "created_at": "2026-08-11T00:00:00Z",
-  "updated_at": "2026-08-11T00:00:00Z"
+  "updated_at": "2026-08-16T20:26:53Z"
 }

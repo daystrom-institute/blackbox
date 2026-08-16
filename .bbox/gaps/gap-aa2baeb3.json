@@ -14,11 +14,12 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/bro-harness-shell/stdin-open-pipe-hang",
+  "notes": "Recurrence tally 2026-08-16: four hangs across two glm-5.3 workers in one afternoon (three on the docs worker, one on the M9a worker), each 7-15 minutes of dead time until the orchestrator killed the host-side rg by hand. Steering the worker to always pass a path helped but did not fully generalize (one worker read `-g '*.md'` as a path). The fix belongs in shell_run, not in prompts.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "task_id": "df7a62ef-1183-4b8d-8f67-c37c9f177b8f",
   "provider": "glm",
   "thread_id": "thread-a2062843",
   "created_at": "2026-08-16T16:43:33Z",
-  "updated_at": "2026-08-16T16:43:33Z"
+  "updated_at": "2026-08-16T20:26:55Z"
 }
