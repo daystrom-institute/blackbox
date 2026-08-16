@@ -101,6 +101,13 @@ Log keys must not conflate them: the staleness field is named
 `max_channel_staleness_seconds`, and the backfill surface is
 `backfill_windows` / `channels_backfilling` / `oldest_backfilled_to`.
 
+**The plaintext opt-in is corpus-only and licenses only private hops.**
+`corpus_url_allow_plaintext` exists for the same-cluster hop where TLS is
+terminated inside the cluster. It must never apply to the Slack wire (that far
+end is not ours to trust), and a public IP-literal corpus host is refused even
+under it. Default-off is load-bearing: both wires carry a bearer, and the
+default is what keeps it out of clear text.
+
 ## Testing
 
 `cargo nextest run --workspace -E 'package(bbox-slack-collector)'`.

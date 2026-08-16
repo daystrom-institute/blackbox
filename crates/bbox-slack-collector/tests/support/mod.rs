@@ -855,6 +855,7 @@ pub fn test_config(
 ) -> bbox_slack_collector::SatelliteConfig {
     bbox_slack_collector::SatelliteConfig {
         corpus_url: "http://127.0.0.1:7264".to_string(),
+        corpus_url_allow_plaintext: false,
         producer_token: bbox_slack_collector::SecretRef::from_file("/nonexistent/producer"),
         slack_token: bbox_slack_collector::SecretRef::from_file("/nonexistent/slack"),
         connector_source_id: SOURCE_ID.to_string(),

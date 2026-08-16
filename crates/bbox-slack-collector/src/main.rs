@@ -78,7 +78,11 @@ async fn main() -> Result<()> {
         .await
         .context("resolving the Slack bot token")?;
 
-    let sink = ConversationSourceClient::new(config.corpus_url.clone(), producer_bearer)?;
+    let sink = ConversationSourceClient::new(
+        config.corpus_url.clone(),
+        producer_bearer,
+        config.corpus_url_allow_plaintext,
+    )?;
     let slack = SlackClient::new(
         config.slack_api_base_url.clone(),
         slack_token,

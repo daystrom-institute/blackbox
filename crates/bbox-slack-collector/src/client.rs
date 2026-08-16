@@ -65,9 +65,17 @@ impl std::fmt::Debug for ConversationSourceClient {
 }
 
 impl ConversationSourceClient {
-    pub fn new(base_url: impl Into<String>, bearer: impl Into<String>) -> Result<Self> {
+    /// `allow_plaintext` is the corpus-only transport opt-in, and it flows in
+    /// from config rather than defaulting here so that constructing this
+    /// client is a decision about transport safety, never an accident of
+    /// forgetting a builder step. The default at config level is refusal.
+    pub fn new(
+        base_url: impl Into<String>,
+        bearer: impl Into<String>,
+        allow_plaintext: bool,
+    ) -> Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        crate::config::require_safe_transport(&base_url, "corpus_url")?;
+        crate::config::require_safe_transport(&base_url, "corpus_url", allow_plaintext)?;
         let bearer = bearer.into();
         if bearer.trim().is_empty() {
             bail!("the conversation-source client needs a producer bearer");
@@ -284,16 +292,34 @@ mod tests {
 
     #[test]
     fn a_non_loopback_plain_http_corpus_url_is_refused() {
-        let error = ConversationSourceClient::new("http://corpus.example.com", "bearer")
+        let error = ConversationSourceClient::new("http://corpus.example.com", "bearer", false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("corpus_url"), "{error}");
     }
 
     #[test]
+    fn the_plaintext_opt_in_licenses_a_private_hop_and_only_a_private_hop() {
+        // The same constructor must honor both sides of the opt-in: refusal
+        // without it, admission with it for a private hop, and refusal even
+        // with it for a public address, because a bearer to a public host in
+        // clear text is what the flag must never become a shortcut for.
+        let private = "http://10.4.5.6:7264";
+        ConversationSourceClient::new(private, "bearer", false).unwrap_err();
+        ConversationSourceClient::new(private, "bearer", true).unwrap();
+
+        let public = "http://203.0.113.10:7264";
+        let error = ConversationSourceClient::new(public, "bearer", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a private hop"), "{error}");
+    }
+
+    #[test]
     fn the_debug_rendering_never_carries_the_bearer() {
         let client =
-            ConversationSourceClient::new("http://127.0.0.1:7264", "producer-secret").unwrap();
+            ConversationSourceClient::new("http://127.0.0.1:7264", "producer-secret", false)
+                .unwrap();
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("producer-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
@@ -329,8 +355,8 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let mut client =
-            ConversationSourceClient::new(base_url, "bearer").expect("loopback corpus is safe");
+        let mut client = ConversationSourceClient::new(base_url, "bearer", false)
+            .expect("loopback corpus is safe");
         client.retry_backoff_secs = Vec::new();
         let cursors: ConversationCursorsResponseV1 = client
             .round_trip("the corpus cursors call", || {
@@ -364,8 +390,8 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let mut client =
-            ConversationSourceClient::new(base_url, "bearer").expect("loopback corpus is safe");
+        let mut client = ConversationSourceClient::new(base_url, "bearer", false)
+            .expect("loopback corpus is safe");
         client.retry_backoff_secs = Vec::new();
         let error = client
             .round_trip::<ConversationCursorsResponseV1>("the corpus cursors call", || {
@@ -403,8 +429,8 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let mut client =
-            ConversationSourceClient::new(base_url, "bearer").expect("loopback corpus is safe");
+        let mut client = ConversationSourceClient::new(base_url, "bearer", false)
+            .expect("loopback corpus is safe");
         client.retry_backoff_secs = Vec::new();
         let error = client
             .round_trip::<ConversationCursorsResponseV1>("the corpus cursors call", || {
