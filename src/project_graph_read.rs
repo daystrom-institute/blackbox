@@ -158,6 +158,45 @@ impl BlackboxServer {
             .collect())
     }
 
+    /// Snapshot of which graph lanes the word-search authority admits
+    /// (unified-retrieval design 5.1). Taken under ONE read lock of the view
+    /// catalog before a search starts, so the answer cannot change mid-query
+    /// and the lock is never held across the Tantivy call. Lanes whose policy
+    /// disables text retrieval, and never-indexable local-scratch sources,
+    /// land in `disabled_graph_lanes`; per-lane excluded vertex types ride
+    /// along as the query-time re-check of the index-time gate.
+    pub(crate) fn graph_word_policy_snapshot(
+        &self,
+    ) -> bbox_indexing::index::GraphWordPolicySnapshot {
+        use bbox_project_graph::GraphSource;
+
+        let mut snapshot = bbox_indexing::index::GraphWordPolicySnapshot::default();
+        let views = self.state.project_graph_views.read();
+        for (project_id, view) in views.iter_published() {
+            for entry in view.graphs.values() {
+                let Some(graph) = entry.graph() else {
+                    continue;
+                };
+                let lane = (project_id.as_str().to_string(), entry.graph_id.clone());
+                let never_indexable = matches!(graph.key.source, GraphSource::LocalScratch);
+                if never_indexable || !graph.schema.index_policy.text_retrieval_enabled {
+                    snapshot.disabled_graph_lanes.insert(lane);
+                } else if !graph
+                    .schema
+                    .index_policy
+                    .retrieval_excluded_types
+                    .is_empty()
+                {
+                    snapshot.excluded_vertex_types.insert(
+                        lane,
+                        graph.schema.index_policy.retrieval_excluded_types.clone(),
+                    );
+                }
+            }
+        }
+        snapshot
+    }
+
     pub(crate) fn resolve_project_graph_vertex(
         &self,
         entity_ref: &EntityRef,

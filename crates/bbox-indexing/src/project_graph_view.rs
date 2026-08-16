@@ -178,6 +178,13 @@ impl ProjectGraphViewCatalog {
             .unwrap_or_default()
     }
 
+    /// Every installed published view, project by project. The word-search
+    /// authority snapshot walks this under one read lock so a mid-query view
+    /// install cannot change the filter halfway through a search.
+    pub fn iter_published(&self) -> impl Iterator<Item = (&ProjectId, &PublishedProjectGraphView)> {
+        self.published.iter()
+    }
+
     pub fn list_own(
         &self,
         project_id: &ProjectId,
