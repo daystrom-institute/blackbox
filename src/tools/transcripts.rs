@@ -65,17 +65,28 @@ impl BlackboxServer {
                     .map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             let read_view = server.state.code_read_view.read().clone();
+            let graph_policy = server.graph_word_policy_snapshot();
+            // Corpus search carries no project or graph selection parameters,
+            // so its authority is the policy snapshot alone: disabled lanes
+            // stay out even on this compatibility surface.
+            let graph_authority = crate::index::GraphWordAuthority::from_parts(
+                Some(&graph_policy),
+                None,
+                Default::default(),
+                None,
+            );
             let hits = server
                 .state
                 .idx
                 .read()
-                .hybrid_bm25_hits_filtered_with_active_selectors_and_searcher(
+                .hybrid_bm25_hits_with_graph_authority_and_searcher(
                     query,
                     p.limit.unwrap_or(10).clamp(1, 100),
                     None,
                     false,
                     &read_view.active_selectors,
                     &read_view.searcher,
+                    (!graph_authority.is_empty()).then_some(&graph_authority),
                 )?;
             Ok(serde_json::to_string(&json!({
                 "hits": hits
@@ -124,7 +135,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_hybrid_search",
-        description = "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only."
+        description = "Hybrid BM25+vector search over typed entities + graph vertices; vector_weight=0.6 default, 0.0 BM25-only, 1.0 vector-only."
     )]
     pub(crate) async fn bbox_hybrid_search(
         &self,
@@ -154,6 +165,7 @@ impl BlackboxServer {
                 .provider_context()
                 .with_knowledge_view(&knowledge_view.knowledge)
                 .with_searcher(&read_view.searcher);
+            let graph_policy = server.graph_word_policy_snapshot();
             let response =
                 mcp_tools::hybrid_search::hybrid_search_typed_with_active_selectors_and_searcher(
                     &server.state.idx.read(),
@@ -162,6 +174,7 @@ impl BlackboxServer {
                     &p,
                     &read_view.active_selectors,
                     &read_view.searcher,
+                    Some(&graph_policy),
                 )?;
             knowledge_view.enrich_json_response(serde_json::to_string(&response)?)
         })
@@ -170,7 +183,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_discover_seed_entities",
-        description = "Find seed entities with notable_edges; inspect before answering."
+        description = "Find seeds with notable_edges; inspect before answering; graph vertices: graph_source/graph_ids."
     )]
     pub(crate) async fn bbox_discover_seed_entities(
         &self,
@@ -195,6 +208,7 @@ impl BlackboxServer {
                 .provider_context()
                 .with_knowledge_view(&knowledge_view.knowledge)
                 .with_searcher(&read_view.searcher);
+            let graph_policy = server.graph_word_policy_snapshot();
             let output = mcp_tools::discover_seed::discover_seed_entities(
                 &server.state.idx.read(),
                 &knowledge_view.knowledge,
@@ -202,6 +216,7 @@ impl BlackboxServer {
                 read_view.edge_index.as_ref(),
                 &read_view.active_selectors,
                 &read_view.searcher,
+                Some(&graph_policy),
                 &p,
             )?;
             knowledge_view.enrich_json_response(output)

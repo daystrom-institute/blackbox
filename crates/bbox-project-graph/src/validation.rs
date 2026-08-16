@@ -318,6 +318,46 @@ fn validate_schema(schema: &GraphSchema, errors: &mut Vec<ValidationError>) {
         }
         validate_edge_property_definition(definition, &schema.index_policy, errors);
     }
+
+    let declared_vertex_types = schema_vertex_ids;
+    validate_retrieval_policy(schema, &declared_vertex_types, errors);
+}
+
+/// Validate the per-graph retrieval policy block (unified-retrieval design
+/// section 3.2).
+///
+/// A type-malformed block (a string where a bool belongs, an unknown key) is
+/// refused at parse time as `json.malformed`, exactly like every other typed
+/// schema field; the codes here cover what a parseable block can still get
+/// wrong. An exclusion naming a type the schema does not declare is an error
+/// rather than a no-op: a silently ignored exclusion is a policy the operator
+/// believes is in force and is not.
+fn validate_retrieval_policy(
+    schema: &GraphSchema,
+    declared_vertex_types: &BTreeSet<String>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for excluded in &schema.index_policy.retrieval_excluded_types {
+        if excluded.is_empty() || excluded.chars().any(char::is_whitespace) {
+            errors.push(ValidationError::new(
+                "schema.invalid_retrieval_policy",
+                "schema.json",
+                None,
+                format!("index_policy exclusion `{excluded}` is not a well-formed type name"),
+            ));
+            continue;
+        }
+        if !declared_vertex_types.contains(excluded) {
+            errors.push(ValidationError::new(
+                "schema.unknown_excluded_type",
+                "schema.json",
+                None,
+                format!(
+                    "index_policy excludes vertex type `{excluded}`, which the schema does not declare"
+                ),
+            ));
+        }
+    }
 }
 
 fn validate_facts(
@@ -1263,5 +1303,103 @@ mod tests {
                 .iter()
                 .any(|error| error.code == "schema.empty_endpoint_pairs")
         );
+    }
+
+    /// The retrieval policy extension stays additive: a schema written before
+    /// the new fields existed keeps its meaning, and text retrieval defaults
+    /// ON because the conservative default already lives in the per-property
+    /// annotations (unified-retrieval design section 3.2).
+    #[test]
+    fn retrieval_policy_defaults_are_additive() {
+        let schema: GraphSchema = serde_json::from_value(json!({
+            "version": 1,
+            "namespace": "repo",
+            "vertex_types": {
+                "repo:Claim": {
+                    "required": [],
+                    "properties": {}
+                }
+            },
+            "edge_types": []
+        }))
+        .unwrap();
+        assert!(!schema.index_policy.embeddings_enabled);
+        assert!(schema.index_policy.text_retrieval_enabled);
+        assert!(schema.index_policy.retrieval_excluded_types.is_empty());
+
+        let wire = serde_json::to_value(&schema.index_policy).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "embeddings_enabled": false,
+                "text_retrieval_enabled": true,
+                "retrieval_excluded_types": []
+            })
+        );
+        let parsed: crate::GraphIndexPolicy = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed, schema.index_policy);
+    }
+
+    #[test]
+    fn retrieval_exclusion_naming_an_undeclared_type_is_an_error() {
+        let mut schema = schema();
+        schema
+            .index_policy
+            .retrieval_excluded_types
+            .insert("repo:Secret".into());
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "schema.unknown_excluded_type"),
+            "{errors:?}"
+        );
+
+        schema.index_policy.retrieval_excluded_types.clear();
+        schema
+            .index_policy
+            .retrieval_excluded_types
+            .insert("repo:Claim".into());
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn malformed_retrieval_exclusions_are_rejected() {
+        for malformed in ["", "repo: Claim", "repo:Claim\n"] {
+            let mut schema = schema();
+            schema
+                .index_policy
+                .retrieval_excluded_types
+                .insert(malformed.to_string());
+            let errors = validate_graph(
+                "repo",
+                GraphSource::Committed,
+                &descriptor(),
+                &schema,
+                &[],
+                &[],
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.code == "schema.invalid_retrieval_policy"),
+                "{malformed:?} missing code in {errors:?}"
+            );
+        }
     }
 }

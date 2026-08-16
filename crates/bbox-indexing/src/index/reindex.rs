@@ -307,6 +307,17 @@ pub(super) fn execute_reindex_pass(
     } else {
         Vec::new()
     };
+    // Graph word lanes have no durable store this pass walks: like provisional
+    // knowledge they are carried across a full rebuild, so a periodic pass
+    // does not purge every indexed graph. The schema-migration rebuild starts
+    // from an already-empty index and re-activates lanes at the next accepted
+    // view install, mirroring the in-memory view catalog's own lifecycle.
+    let preserved_graph_documents = if full {
+        let reader = index.reader()?;
+        super::graph_docs::collect_graph_lane_documents(&reader.searcher(), fields)?
+    } else {
+        Vec::new()
+    };
     let preserved_published_knowledge = collect_scoped_published_knowledge(index, fields)?;
     // Source planning walks the pinned catalog snapshot, not the attached-only
     // compatibility rows (Phase 3 plan section 7 item 1). `prior_meta` is the
@@ -462,6 +473,9 @@ pub(super) fn execute_reindex_pass(
         tracing::info!("auto-reindex: periodic full rebuild requested");
         writer.delete_all_documents()?;
         for document in provisional_documents {
+            writer.add_document(document)?;
+        }
+        for document in preserved_graph_documents {
             writer.add_document(document)?;
         }
         for document in &preserved_collected.documents {

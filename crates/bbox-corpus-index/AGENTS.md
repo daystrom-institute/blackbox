@@ -63,3 +63,21 @@
   schema bump (operator ruling 2026-08-16, Q6).
 - Graph vertices ride the existing BM25 and vector lanes; they add no RRF
   list. A dedicated graph lane is a metrics sweep, not a feature.
+- The graph identity fields (`graph_vertex_type`, `graph_id`, `graph_source`,
+  `graph_source_connector`, `graph_generation`) must keep flowing through
+  `properties_from_doc`: that projection is the only surface inspect and
+  hybrid search read, and a stored-but-unprojected field is invisible on
+  every response.
+- The word-lane graph authority filter is composed into the BM25
+  `BooleanQuery` BEFORE `TopDocs`, never post-fusion. A post-filter turns an
+  authorization boundary into a silent relevance perturbation: unreadable
+  documents would consume rank positions and shift the RRF scores of the
+  survivors.
+- Tantivy footgun hit while building the project-scope clause: a
+  `BooleanQuery` whose clauses are all `MustNot` matches NOTHING (Lucene
+  semantics, not "everything except"). The non-graph arm of an OR needs an
+  explicit `AllQuery` conjoined with the `MustNot`.
+- Graph documents never join the file dedup/aggregation lanes: a graph vertex
+  has no file, and a dedup key that fell back to `entity_id` would make every
+  vertex its own singleton file group. `file_dedup_key` returning `None` for
+  graph refs is the invariant, not an accident of prefix matching.

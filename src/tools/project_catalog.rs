@@ -3448,7 +3448,7 @@ mod tests {
         let listed = server
             .bbox_project_graph_list(Parameters(crate::tools::graph::ProjectGraphListParams {
                 project: Some("p_candidate_tool".into()),
-                visibility: Some("published".into()),
+                provisional: Some("published".into()),
             }))
             .await;
         let listed_text = error_text(&listed);
@@ -3458,7 +3458,7 @@ mod tests {
             .bbox_project_graph_describe(Parameters(crate::tools::graph::ProjectGraphExactParams {
                 project: "p_candidate_tool".into(),
                 graph_id: "governance-record".into(),
-                visibility: Some("published".into()),
+                provisional: Some("published".into()),
             }))
             .await;
         let described_text = error_text(&described);

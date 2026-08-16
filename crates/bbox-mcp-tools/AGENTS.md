@@ -53,3 +53,18 @@
   special case: visual chunks are `project_file` entities (chunk_kind, not
   doc_type, distinguishes them), so `doc_type="project_file"` already
   includes them by prefix match.
+
+## Traversal admission (M9a, design/connectors/unified-retrieval.md 5.2)
+
+- Graph selection gates neighbor ENUMERATION, not the response: a vertex
+  whose graph the caller cannot read (policy-disabled text retrieval,
+  local scratch) never enters the frontier. The per-hop admission check
+  consults the resolver's live view, never a readability stamp baked into
+  an indexed document. The gate owns graph refs only; non-graph refs pass
+  through to their own providers and evidence algebra.
+- Fan-out truncation must say what it cut: `truncated_expansions` carries
+  the vertex and the full edge count beside the rendered bullets, so a
+  capped prefix never masquerades as the neighborhood. Truncation or
+  exclusion must never disclose the existence or size of unreadable
+  vertices: unreadable graph is absent everywhere, not labeled hidden. The
+  fan-out budget and edge_count are computed on the admitted list only.

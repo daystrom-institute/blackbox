@@ -11,7 +11,7 @@ use bbox_corpus_core::search::rrf::{self, RankedHit, RankedList};
 use bbox_embed::embed::rerank::{RerankConfig, RerankHit, rerank_blocking};
 use bbox_embed::embed::{Bucket, EmbeddingRouter, VisualRouteMeta, query_cache};
 use bbox_embed::embed_queue;
-use bbox_indexing::index::{HybridBm25Hit, TranscriptIndex};
+use bbox_indexing::index::{GRAPH_VERTEX_DOC_TYPE, HybridBm25Hit, TranscriptIndex};
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_providers::entity_loader;
 use bbox_providers::providers::{ProviderContext, ProviderProjectAuthority};
@@ -44,10 +44,11 @@ pub struct HybridSearchParams {
     /// Restrict results to entities scoped to a specific project. Accepts
     /// an absolute project path (e.g. `/home/user/repos/my-app`), a
     /// project_id (8-hex), or a registered project alias (declared in the
-    /// repo's `.bbox/config.toml` `[project] aliases`). When set, only project_file entries from that
-    /// project and thread entries whose stored project resolves to that id
-    /// are kept; commits, knowledge, transcripts, and other project-agnostic
-    /// entity types pass through unfiltered. Use this to scope queries to
+    /// repo's `.bbox/config.toml` `[project] aliases`). When set, only
+    /// project_file entries from that project, thread entries whose stored
+    /// project resolves to that id, and project graph vertices stamped with
+    /// that project id are kept; commits, knowledge, transcripts, and other
+    /// project-agnostic entity types pass through unfiltered. Use this to
     /// your current repo when cross-project keyword pollution would otherwise
     /// dominate the top-N (a common case when multiple registered repos share
     /// vocabulary like "voyage" or "embed").
@@ -63,6 +64,19 @@ pub struct HybridSearchParams {
     /// Knowledge visibility policy: published, own, or all.
     #[serde(default)]
     pub provisional: Option<String>,
+    /// Read-surface plane filter for graph vertex documents: `published`,
+    /// `provisional`, or `connector`. Repeatable; unset means every plane.
+    /// Composed into the word lane BEFORE ranking, so off-plane graph
+    /// documents never consume rank positions. M9a indexes the published
+    /// plane only; the other plane names parse but match no documents until
+    /// their milestones land.
+    #[serde(default)]
+    pub graph_source: Option<Vec<String>>,
+    /// Restrict graph vertex results to the named graphs within the resolved
+    /// project. Unset means all graphs. Composed into the word lane BEFORE
+    /// ranking together with `graph_source`.
+    #[serde(default)]
+    pub graph_ids: Option<Vec<String>>,
     /// Operator-probe override for the combined rerank multiplier cap
     /// (default 1.5, clamped to [1.0, 4.0]). Exists so eval sweeps can
     /// measure ranking quality per candidate cap (gap-39b3ce16 protocol in
@@ -124,6 +138,31 @@ pub struct HybridResult {
     /// Stable machine identifier; unchanged when aliases or attachments change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_uri: Option<String>,
+    /// Graph vertex identity (unified-retrieval design 6.1). Present only on
+    /// `project_graph_vertex` documents; non-graph results are unchanged on
+    /// the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_id: Option<String>,
+    /// The authority plane this hit was indexed under: `published`,
+    /// `provisional`, or `connector`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_source: Option<String>,
+    /// Owning connector identity; present on connector-plane hits only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_source_connector: Option<String>,
+    /// The schema type name of the vertex, e.g. `repo:Record`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_vertex_type: Option<String>,
+    /// The generation identity content hash the document was indexed under;
+    /// compare against `bbox_project_graph_describe`'s accepted generation to
+    /// detect staleness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_generation: Option<String>,
+    /// The pasteable `project_graph_vertex` form of the hit. Provisional hits
+    /// carry a compound ref as `entity_id` whose scope segments make a poor
+    /// handle; the logical form resolves through the read plane directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_logical_ref: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sources: BTreeMap<String, f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,6 +229,7 @@ pub fn hybrid_search_with_active_selectors_and_searcher(
     p: &HybridSearchParams,
     active_selectors: &BTreeMap<String, String>,
     searcher: &tantivy::Searcher,
+    graph_policy: Option<&bbox_indexing::index::GraphWordPolicySnapshot>,
 ) -> Result<String> {
     Ok(serde_json::to_string_pretty(
         &hybrid_search_typed_with_active_selectors_and_searcher(
@@ -199,6 +239,7 @@ pub fn hybrid_search_with_active_selectors_and_searcher(
             p,
             active_selectors,
             searcher,
+            graph_policy,
         )?,
     )?)
 }
@@ -210,11 +251,27 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
     p: &HybridSearchParams,
     active_selectors: &BTreeMap<String, String>,
     searcher: &tantivy::Searcher,
+    graph_policy: Option<&bbox_indexing::index::GraphWordPolicySnapshot>,
 ) -> Result<HybridSearchResponse> {
     let query = p.query.trim();
     if query.is_empty() {
         anyhow::bail!("query is required");
     }
+    // The word lane's graph authority (design 5.1): the caller supplies the
+    // pinned policy snapshot (what the view catalog says is readable, taken
+    // before the search started) and the parameters supply project scope,
+    // plane selection, and named-graph selection. Everything composes into
+    // the BM25 BooleanQuery BEFORE TopDocs.
+    let graph_authority = bbox_indexing::index::GraphWordAuthority::from_parts(
+        graph_policy,
+        p.resolved_project_id.clone(),
+        bbox_indexing::index::GraphWordAuthority::parse_graph_sources(
+            p.graph_source.as_deref().unwrap_or_default(),
+        )?,
+        p.graph_ids
+            .as_ref()
+            .map(|graph_ids| graph_ids.iter().cloned().collect::<BTreeSet<_>>()),
+    );
     let limit = p
         .limit
         .unwrap_or(DEFAULT_LIMIT as u64)
@@ -232,13 +289,14 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
     // single chunk is competitive.
     let bm25_fetch = (limit * 32).max(fetch);
     let (bm25_weight, vector_weight) = fusion_weights(p.vector_weight);
-    let bm25_hits_full = index.hybrid_bm25_hits_filtered_with_active_selectors_and_searcher(
+    let bm25_hits_full = index.hybrid_bm25_hits_with_graph_authority_and_searcher(
         query,
         bm25_fetch,
         p.doc_type.as_deref(),
         true,
         active_selectors,
         searcher,
+        (!graph_authority.is_empty()).then_some(&graph_authority),
     )?;
     // Truncate the chunk-level list to `fetch` so it doesn't dilute RRF with
     // tail chunks that rank too low to matter. The full set still feeds
@@ -262,6 +320,13 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
                 role: String::new(),
                 title: Some(hit.title),
                 excerpt: hit.excerpt,
+                project_id: None,
+                graph_id: None,
+                graph_source: None,
+                graph_source_connector: None,
+                graph_vertex_type: None,
+                graph_generation: None,
+                logical_ref: None,
             })
             .collect::<Vec<_>>()
     } else {
@@ -419,6 +484,11 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
                     .filter(|value| !value.is_empty())
                     .cloned()
             };
+            let graph_logical_ref = (feature.doc_type.as_deref() == Some(GRAPH_VERTEX_DOC_TYPE))
+                .then(|| {
+                    stored("logical_ref").or_else(|| bm25.and_then(|hit| hit.logical_ref.clone()))
+                })
+                .flatten();
             HybridResult {
                 rank: 0,
                 entity_id: hit.entity_id.clone(),
@@ -435,9 +505,27 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
                 role: feature.role,
                 // Structured triple straight off the stored fields (P3-E item
                 // 4): no entity-id string parsing, no path de-fabrication.
-                project_id: stored("project_id"),
+                // The BM25 hit is the fallback because pure word-lane hits
+                // skip the provider property walk when their features were
+                // already built from the lane.
+                project_id: stored("project_id")
+                    .or_else(|| bm25.and_then(|hit| hit.project_id.clone())),
                 relative_path: stored("relative_path"),
                 source_uri: stored("source_uri"),
+                // Graph identity straight off the stored fields of the exact
+                // document the hit was ranked from: no entity-id parsing, and
+                // absent on every non-graph document so the wire stays
+                // unchanged.
+                graph_id: stored("graph_id").or_else(|| bm25.and_then(|hit| hit.graph_id.clone())),
+                graph_source: stored("graph_source")
+                    .or_else(|| bm25.and_then(|hit| hit.graph_source.clone())),
+                graph_source_connector: stored("graph_source_connector")
+                    .or_else(|| bm25.and_then(|hit| hit.graph_source_connector.clone())),
+                graph_vertex_type: stored("graph_vertex_type")
+                    .or_else(|| bm25.and_then(|hit| hit.graph_vertex_type.clone())),
+                graph_generation: stored("graph_generation")
+                    .or_else(|| bm25.and_then(|hit| hit.graph_generation.clone())),
+                graph_logical_ref,
                 sources: hit.sources,
                 excerpt: bm25.map(|hit| hit.excerpt.clone()),
             }
@@ -657,6 +745,12 @@ fn keep_under_project_filter(
     let mut parts = entity_id.split(':');
     match parts.next() {
         Some("project_file" | "project_file_v2") => parts.next() == Some(target_project_id),
+        // Graph vertices are project-scoped: segment 1 of the logical ref is
+        // the project id (design 5.1). The provisional ref form carries scope
+        // and checkout segments instead, so it passes here and relies on the
+        // pre-ranking authority clause, which filters on the project_id field
+        // stamped into the document at index time (Q6 ruling).
+        Some("project_graph_vertex") => parts.next() == Some(target_project_id),
         Some("thread") => thread_matches_project_filter(parts.next(), target_project_id, ctx),
         _ => true,
     }
@@ -741,6 +835,13 @@ fn file_dedup_key(entity_id: &str) -> Option<String> {
                 "project_file_v2:{project}:{snapshot}:{relative_path_hash}"
             ))
         }
+        // Graph vertex documents are excluded from file dedup and file
+        // aggregation EXPLICITLY (design 4.1), not by falling through the
+        // catch-all: a graph vertex has no file, and a key that fell back to
+        // the entity id would pollute the aggregate lane with singleton
+        // groups. Keeping the arm visible also documents that the source-path
+        // pseudo-path stamped for provenance must never become a dedup key.
+        "project_graph_vertex" | "provisional_project_graph_vertex" => None,
         _ => None,
     }
 }
@@ -1182,7 +1283,21 @@ fn label_for_entity(
 ) -> String {
     EntityRef::parse(entity_id)
         .ok()
-        .and_then(|r| entity_loader::compact_label(ctx, &r, loaded))
+        .and_then(|r| {
+            // A graph vertex's label is the first line of its indexed
+            // content (design 4.1) and the BM25 lane already materializes it
+            // as the hit title. Preferring it keeps label resolution off the
+            // provider registry for a hit whose identity came from the index,
+            // and keeps the label on the generation the hit was ranked from.
+            if matches!(
+                r,
+                EntityRef::ProjectGraphVertex { .. }
+                    | EntityRef::ProvisionalProjectGraphVertex { .. }
+            ) {
+                return bm25_title.map(str::to_string);
+            }
+            entity_loader::compact_label(ctx, &r, loaded)
+        })
         .or_else(|| bm25_title.map(str::to_string))
         .unwrap_or_else(|| compact_entity_label(entity_id))
 }
@@ -1451,6 +1566,13 @@ mod tests {
             role: String::new(),
             title: Some("retry policy".into()),
             excerpt: "the **retry** policy is exponential".into(),
+            project_id: None,
+            graph_id: None,
+            graph_source: None,
+            graph_source_connector: None,
+            graph_vertex_type: None,
+            graph_generation: None,
+            logical_ref: None,
         }];
         let properties = BTreeMap::from([(
             "project_file:p:f:h:1".to_string(),
@@ -1585,6 +1707,12 @@ mod tests {
             source_uri: None,
             sources: BTreeMap::new(),
             excerpt: None,
+            graph_id: None,
+            graph_source: None,
+            graph_source_connector: None,
+            graph_vertex_type: None,
+            graph_generation: None,
+            graph_logical_ref: None,
         }];
         let next_steps = build_next_steps(&results);
         let text = render_text(
@@ -1629,6 +1757,12 @@ mod tests {
                 source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
+                graph_id: None,
+                graph_source: None,
+                graph_source_connector: None,
+                graph_vertex_type: None,
+                graph_generation: None,
+                graph_logical_ref: None,
             }],
             vector_status: HybridVectorStatus::default(),
             degraded: HybridDegraded::default(),
@@ -1717,6 +1851,12 @@ mod tests {
                 source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
+                graph_id: None,
+                graph_source: None,
+                graph_source_connector: None,
+                graph_vertex_type: None,
+                graph_generation: None,
+                graph_logical_ref: None,
             },
             HybridResult {
                 rank: 2,
@@ -1732,6 +1872,12 @@ mod tests {
                 source_uri: None,
                 sources: BTreeMap::new(),
                 excerpt: None,
+                graph_id: None,
+                graph_source: None,
+                graph_source_connector: None,
+                graph_vertex_type: None,
+                graph_generation: None,
+                graph_logical_ref: None,
             },
         ];
         let steps = build_next_steps(&results);
@@ -2273,6 +2419,314 @@ mod catalog_thread_filter_exit_gate {
                 &hashed,
             ),
             "catalog mode must not derive project identity from a host path"
+        );
+    }
+}
+
+/// End-to-end word-lane tests over graph vertex documents (unified-retrieval
+/// design 7.1 exit gates a and d): a plain query that names no ref finds a
+/// project-authored record vertex carrying its full graph identity, and the
+/// per-call selectors and the pinned policy snapshot compose BEFORE ranking.
+#[cfg(test)]
+mod graph_word_lane_pipeline {
+    use super::*;
+    use bbox_indexing::index::{
+        GraphVertexIndexDocument, StaticProjectRecordsProvider, TranscriptIndex,
+        build_graph_vertex_doc,
+    };
+    use std::sync::Arc;
+
+    const PROJECT: &str = "p_000000000000000000000000000000a1";
+    const FOREIGN_PROJECT: &str = "p_000000000000000000000000000000b2";
+    const GENERATION: &str = "content-hash-gen-1";
+
+    fn vertex_doc(
+        project_id: &str,
+        graph_id: &str,
+        vertex_id: &str,
+        label: &str,
+    ) -> GraphVertexIndexDocument {
+        GraphVertexIndexDocument {
+            project_id: project_id.to_string(),
+            graph_id: graph_id.to_string(),
+            graph_source: "published".to_string(),
+            graph_source_connector: None,
+            graph_generation: GENERATION.to_string(),
+            vertex_id: vertex_id.to_string(),
+            vertex_type: "repo:Record".to_string(),
+            label: label.to_string(),
+            word_properties: Vec::new(),
+            text_properties: vec!["quarterly settlement record".to_string()],
+            entity_id: format!("project_graph_vertex:{project_id}:{graph_id}:{vertex_id}"),
+            logical_ref: format!("project_graph_vertex:{project_id}:{graph_id}:{vertex_id}"),
+        }
+    }
+
+    /// A real TranscriptIndex on a caller-held tempdir (the reader keeps
+    /// files open, so the directory must outlive the index). No roots, no
+    /// records: the graph documents are added directly through the writer,
+    /// exactly the way the activation path emits them.
+    fn index_with_documents(
+        root: &std::path::Path,
+        documents: &[GraphVertexIndexDocument],
+    ) -> TranscriptIndex {
+        let state = root.canonicalize().unwrap().join("state");
+        let index = TranscriptIndex::open_or_create_with_records(
+            &state.join("index"),
+            Vec::new(),
+            None,
+            state.join("projects.json"),
+            state.join("knowledge.json"),
+            state.join("threads.json"),
+            state.join("roadmap.json"),
+            Arc::new(StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        {
+            let fields = index.field_handles();
+            let handle = index.index_handle();
+            let mut writer = handle.writer(50_000_000).unwrap();
+            for document in documents {
+                writer
+                    .add_document(build_graph_vertex_doc(document, fields))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        index.reader_reload_for_test();
+        index
+    }
+
+    fn search(
+        index: &TranscriptIndex,
+        params: &HybridSearchParams,
+        graph_policy: Option<&bbox_indexing::index::GraphWordPolicySnapshot>,
+    ) -> HybridSearchResponse {
+        let knowledge = Knowledge::detached_view(Vec::new(), BTreeMap::new());
+        let ctx = ProviderContext::empty_for_tests();
+        let active_selectors = BTreeMap::new();
+        let searcher = index.searcher();
+        hybrid_search_typed_with_active_selectors_and_searcher(
+            index,
+            &knowledge,
+            &ctx,
+            params,
+            &active_selectors,
+            &searcher,
+            graph_policy,
+        )
+        .unwrap()
+    }
+
+    fn params(query: &str) -> HybridSearchParams {
+        HybridSearchParams {
+            query: query.to_string(),
+            limit: Some(10),
+            doc_type: None,
+            include_vectors: None,
+            vector_weight: Some(0.0),
+            query_vector: None,
+            project: None,
+            resolved_project_id: None,
+            provisional: None,
+            graph_source: None,
+            graph_ids: None,
+            rerank_cap: None,
+            rerank: Some("none".to_string()),
+        }
+    }
+
+    /// Exit gate (a): a query naming no ref finds a project-authored record
+    /// vertex, and the hit carries its graph id, source label, generation,
+    /// type, and logical ref alongside the structured project id.
+    #[test]
+    fn plain_query_finds_graph_vertex_with_identity_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = index_with_documents(
+            directory.path(),
+            &[vertex_doc(
+                PROJECT,
+                "governance-record",
+                "record-1",
+                "Alpha settlement record",
+            )],
+        );
+        let response = search(&index, &params("quarterly settlement record"), None);
+
+        assert_eq!(response.results.len(), 1, "{}", response.text);
+        let hit = &response.results[0];
+        assert_eq!(
+            hit.entity_id,
+            format!("project_graph_vertex:{PROJECT}:governance-record:record-1")
+        );
+        assert_eq!(hit.doc_type.as_deref(), Some("project_graph_vertex"));
+        assert_eq!(hit.graph_id.as_deref(), Some("governance-record"));
+        assert_eq!(hit.graph_source.as_deref(), Some("published"));
+        assert_eq!(hit.graph_source_connector, None);
+        assert_eq!(hit.graph_vertex_type.as_deref(), Some("repo:Record"));
+        assert_eq!(hit.graph_generation.as_deref(), Some(GENERATION));
+        assert_eq!(
+            hit.graph_logical_ref.as_deref(),
+            Some(hit.entity_id.as_str())
+        );
+        assert_eq!(hit.project_id.as_deref(), Some(PROJECT));
+        assert_eq!(hit.label, "Alpha settlement record");
+    }
+
+    /// The Q6 filter: project scope admits graph documents from the stamped
+    /// project_id and drops foreign ones before ranking, and a named-graph
+    /// selection narrows within the project.
+    #[test]
+    fn project_scope_and_graph_selection_reach_the_word_lane() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = index_with_documents(
+            directory.path(),
+            &[
+                vertex_doc(
+                    PROJECT,
+                    "governance-record",
+                    "record-1",
+                    "Alpha settlement record",
+                ),
+                vertex_doc(
+                    PROJECT,
+                    "other-record",
+                    "record-2",
+                    "Beta settlement record",
+                ),
+                vertex_doc(
+                    FOREIGN_PROJECT,
+                    "governance-record",
+                    "record-9",
+                    "Foreign settlement record",
+                ),
+            ],
+        );
+
+        let mut scoped = params("settlement record");
+        scoped.resolved_project_id = Some(PROJECT.to_string());
+        let response = search(&index, &scoped, None);
+        let ids: Vec<&str> = response
+            .results
+            .iter()
+            .map(|hit| hit.entity_id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.iter().all(|id| id.contains(&format!(":{PROJECT}:"))));
+
+        let mut named = params("settlement record");
+        named.resolved_project_id = Some(PROJECT.to_string());
+        named.graph_ids = Some(vec!["other-record".to_string()]);
+        let response = search(&index, &named, None);
+        assert_eq!(response.results.len(), 1, "{}", response.text);
+        assert!(
+            response.results[0]
+                .entity_id
+                .contains(":other-record:record-2")
+        );
+
+        // The keep-filter arm is the backstop, not the filter itself: without
+        // a resolved project the foreign vertex is findable.
+        let unscoped = search(&index, &params("Foreign settlement record"), None);
+        assert!(
+            unscoped
+                .results
+                .iter()
+                .any(|hit| hit.entity_id.contains(FOREIGN_PROJECT))
+        );
+    }
+
+    /// Plane selection and the pinned policy snapshot compose into the same
+    /// pre-ranking conjunct: a provisional-plane request sees no published
+    /// documents, and a lane the snapshot disables never enters the ranked
+    /// list even though its documents sit in the index.
+    #[test]
+    fn plane_selection_and_policy_snapshot_filter_before_ranking() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = index_with_documents(
+            directory.path(),
+            &[
+                vertex_doc(
+                    PROJECT,
+                    "governance-record",
+                    "record-1",
+                    "Alpha settlement record",
+                ),
+                vertex_doc(
+                    PROJECT,
+                    "secret-record",
+                    "record-2",
+                    "Beta settlement record",
+                ),
+            ],
+        );
+
+        let mut provisional = params("settlement record");
+        provisional.graph_source = Some(vec!["provisional".to_string()]);
+        let response = search(&index, &provisional, None);
+        assert!(
+            response.results.is_empty(),
+            "provisional-plane selection must match no published lane: {}",
+            response.text
+        );
+
+        let policy = bbox_indexing::index::GraphWordPolicySnapshot {
+            disabled_graph_lanes: BTreeSet::from([(
+                PROJECT.to_string(),
+                "secret-record".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let response = search(&index, &params("settlement record"), Some(&policy));
+        let ids: Vec<&str> = response
+            .results
+            .iter()
+            .map(|hit| hit.entity_id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        assert!(ids[0].contains(":governance-record:"));
+    }
+
+    /// Design 4.1: vertex documents carry no file stamp at all, so file
+    /// dedup and file aggregation have nothing to key on. Two vertices of one
+    /// graph are two addressable units and must both surface, and neither may
+    /// grow a filesystem path on the result wire.
+    #[test]
+    fn graph_vertices_carry_no_file_path_and_never_collapse() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = vertex_doc(PROJECT, "governance-record", "record-1", "Alpha settlement");
+        let second = vertex_doc(PROJECT, "governance-record", "record-2", "Beta settlement");
+        let index = index_with_documents(directory.path(), &[first, second]);
+
+        let response = search(&index, &params("settlement"), None);
+        assert_eq!(response.results.len(), 2, "{}", response.text);
+        for hit in &response.results {
+            assert!(
+                hit.relative_path.is_none(),
+                "graph vertex hit must not surface a filesystem path: {:?}",
+                hit.relative_path
+            );
+            let properties = index
+                .entity_properties(&hit.entity_id)
+                .unwrap()
+                .expect("vertex document must project properties");
+            assert!(
+                !properties.contains_key("file_path"),
+                "projected graph vertex properties must not carry file_path: {:?}",
+                properties
+            );
+        }
+        assert!(
+            response
+                .results
+                .iter()
+                .any(|hit| hit.entity_id.ends_with(":record-1"))
+        );
+        assert!(
+            response
+                .results
+                .iter()
+                .any(|hit| hit.entity_id.ends_with(":record-2"))
         );
     }
 }

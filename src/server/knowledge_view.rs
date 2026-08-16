@@ -32,7 +32,7 @@ use bbox_knowledge::overlay::{
     recompute_catalog_overlay_result,
 };
 
-use super::BlackboxServer;
+use super::{BlackboxServer, SharedState};
 
 #[derive(Clone)]
 pub(crate) struct PublishedKnowledgeCacheEntry {
@@ -1585,10 +1585,7 @@ impl BlackboxServer {
         };
         match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
             Ok(view) => {
-                self.state
-                    .project_graph_views
-                    .write()
-                    .install_published(view);
+                install_published_graph_view(&self.state, view);
             }
             Err(error) => {
                 tracing::warn!(
@@ -1653,6 +1650,147 @@ impl BlackboxServer {
         })?;
         Ok(hydrated)
     }
+}
+
+/// Install one published project-graph view and converge the project's
+/// published graph word lanes to it (unified-retrieval design 7.1).
+///
+/// Delegates to [`converge_published_graph_word_lanes`] for the durable side,
+/// then swaps the catalog view under its own write guard. Callers that also
+/// install a provisional overlay in the same step must use
+/// [`converge_published_graph_word_lanes`] plus one shared write guard
+/// instead, so a reader can never observe the new published view with the old
+/// (or missing) provisional overlay.
+pub(crate) fn install_published_graph_view(
+    state: &SharedState,
+    view: bbox_indexing::project_graph_view::PublishedProjectGraphView,
+) {
+    converge_published_graph_word_lanes(state, &view);
+    state.project_graph_views.write().install_published(view);
+}
+
+/// Converge the published graph word lanes to one view WITHOUT touching the
+/// in-memory catalog: the lane replacements and purges are computed and
+/// enqueued here, and the caller performs the catalog swap under whatever
+/// guard it needs (alone, or shared with a provisional install).
+///
+/// Every graph in the view gets a whole-lane replacement keyed on its
+/// generation stamp: same generation no-ops, a new generation rewrites the
+/// lane, and a graph whose policy now disables text retrieval (or that left
+/// the accepted view entirely) has its lane purged so its documents are
+/// ABSENT from the index, not merely filtered out of one result list. M9a
+/// indexes the published plane only; provisional and connector planes do not
+/// reach the word index yet and must not piggyback on this path.
+pub(crate) fn converge_published_graph_word_lanes(
+    state: &SharedState,
+    view: &bbox_indexing::project_graph_view::PublishedProjectGraphView,
+) {
+    use bbox_indexing::index::{
+        GRAPH_SOURCE_PUBLISHED as PUBLISHED, published_graph_vertex_documents,
+    };
+
+    let project_id = view.project_id.as_str().to_string();
+    let indexed_lanes = state
+        .idx
+        .read()
+        .graph_lanes_for_project(&project_id, PUBLISHED)
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "published graph word lane inventory failed during view install"
+            );
+            BTreeMap::new()
+        });
+    let mut planned = BTreeSet::new();
+    for (graph_id, entry) in &view.graphs {
+        planned.insert(graph_id.clone());
+        let Some(graph) = entry.graph() else {
+            state
+                .index_writer
+                .purge_project_graph_lane(&project_id, graph_id, PUBLISHED);
+            continue;
+        };
+        let documents =
+            published_graph_vertex_documents(&project_id, graph, &entry.generation.content_hash);
+        state.index_writer.replace_project_graph_lane(
+            &project_id,
+            graph_id,
+            PUBLISHED,
+            &entry.generation.content_hash,
+            documents,
+        );
+    }
+    for graph_id in indexed_lanes.keys() {
+        if !planned.contains(graph_id) {
+            state
+                .index_writer
+                .purge_project_graph_lane(&project_id, graph_id, PUBLISHED);
+        }
+    }
+}
+
+/// Reconcile the published graph views and their word lanes at boot
+/// (unified-retrieval design 7.1).
+///
+/// `project_graph_views` is in-memory and only populated by accept-advance
+/// and checkout-bind, but graph word-lane documents are durable. Without
+/// this pass, a graph disabled or removed while the daemon was down stays
+/// searchable with stale documents until the next install, and a schema
+/// replacement (g13 drops the whole index) leaves the lanes empty until the
+/// next accept. Driving one install per published catalog project at boot
+/// closes both: the install's converge step purges lanes that left the
+/// accepted view or lost text retrieval, and re-emits the rest. The lane
+/// writes then settle asynchronously through the writer queue, so queries
+/// that race ahead of the queue may briefly see the previous lane state.
+/// Per-project failure degrades with a warning, matching the boot scan's
+/// policy; bridge mode has no accepted-publication runtime and reconciles
+/// nothing.
+pub(crate) fn reconcile_published_graph_word_lanes_at_boot(
+    state: &SharedState,
+    projects: impl IntoIterator<Item = ProjectId>,
+) {
+    let Some(runtime) = &state.accepted_publications else {
+        return;
+    };
+    let mut installed = 0usize;
+    let mut skipped = 0usize;
+    for project_id in projects {
+        let verified = match runtime.load_verified(&project_id) {
+            Ok(verified) => verified,
+            Err(error) => {
+                // The pre-bind scan already reported published-capability
+                // damage per project; reconciling that project's lanes is
+                // neither possible nor needed until its pointer recovers.
+                tracing::debug!(
+                    project_id = %project_id,
+                    code = error.code(),
+                    "boot graph view reconcile skipped: no verified accepted content"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
+            Ok(view) => {
+                install_published_graph_view(state, view);
+                installed += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "boot graph view reconcile failed; graph reads may serve stale content"
+                );
+                skipped += 1;
+            }
+        }
+    }
+    tracing::info!(
+        installed,
+        skipped,
+        "published graph views reconciled at boot"
+    );
 }
 
 // ── Catalog overlay baseline path (plan section 8, P5-D) ─────────────────

@@ -77,7 +77,7 @@ pub struct GraphSchema {
 
 /// Per-graph retrieval policy. Conservative by construction: with the default
 /// policy no property is embedded, whatever a property annotation asks for.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphIndexPolicy {
     /// Whether any property in this graph may participate in embeddings.
@@ -85,6 +85,38 @@ pub struct GraphIndexPolicy {
     /// error, not a silent downgrade.
     #[serde(default)]
     pub embeddings_enabled: bool,
+
+    /// Whether this graph participates in text retrieval at all. Default
+    /// true: the conservative default lives in the per-property annotations,
+    /// not here, and a graph whose properties are all unannotated already
+    /// contributes only labels. The field exists to be turned OFF.
+    #[serde(default = "default_text_retrieval_enabled")]
+    pub text_retrieval_enabled: bool,
+
+    /// Vertex types excluded from retrieval regardless of annotation. The
+    /// operator escape hatch for a shipped connector schema the tenant does
+    /// not own. Policy only ever subtracts: it can widen participation past
+    /// nothing that a property annotation declined to request.
+    #[serde(default)]
+    pub retrieval_excluded_types: BTreeSet<String>,
+}
+
+impl Default for GraphIndexPolicy {
+    /// Text retrieval defaults ON because the conservative default already
+    /// lives in the per-property annotations: with no annotations a graph
+    /// contributes labels and nothing else. A default-OFF gate would make
+    /// every schema author opt in twice to get the documented default.
+    fn default() -> Self {
+        Self {
+            embeddings_enabled: false,
+            text_retrieval_enabled: default_text_retrieval_enabled(),
+            retrieval_excluded_types: BTreeSet::new(),
+        }
+    }
+}
+
+fn default_text_retrieval_enabled() -> bool {
+    true
 }
 
 /// How a property participates in text retrieval. Vertex labels are word

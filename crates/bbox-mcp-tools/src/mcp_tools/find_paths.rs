@@ -25,6 +25,13 @@ pub struct FindPathsParams {
     pub edge_types: Option<EdgeTypesParam>,
     pub max_depth: Option<usize>,
     pub limit: Option<usize>,
+    /// Per-hop fan-out cap: the maximum edges enumerated out of any single
+    /// vertex (default 16, range 1..=64). A vertex whose neighborhood exceeds
+    /// the cap is expanded to the cap only, and the response says so
+    /// explicitly under `truncated_expansions` rather than silently returning
+    /// a prefix of the neighborhood.
+    #[serde(default)]
+    pub max_fanout: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -81,6 +88,13 @@ pub fn find_paths(
     if !(1..=30).contains(&limit) {
         return Ok(bad_input("limit", "limit must be between 1 and 30"));
     }
+    let max_fanout = p.max_fanout.unwrap_or(16);
+    if !(1..=64).contains(&max_fanout) {
+        return Ok(bad_input(
+            "max_fanout",
+            "max_fanout must be between 1 and 64",
+        ));
+    }
     let edge_filter = parse_edge_filter(p.edge_types.as_ref());
     // Over-fetch so we can dedup terminal-file collisions and still return
     // `limit` distinct files. Without this, queries terminating at chunked
@@ -88,7 +102,7 @@ pub fn find_paths(
     // pointing at successive chunks of the same file, starving the agent
     // of breadth across other files reachable in the same step budget.
     let raw_limit = limit.saturating_mul(8).max(20);
-    let raw = bfs(
+    let (raw, truncated_expansions) = bfs(
         ctx,
         edge_index,
         from,
@@ -97,10 +111,11 @@ pub fn find_paths(
         edge_filter.as_ref(),
         max_depth,
         raw_limit,
+        max_fanout,
     );
     let collapsed = collapse_paths_by_terminal_file(raw, limit);
     let cached = cache.insert_paths(PROCESS_SESSION_KEY, collapsed);
-    Ok(render_response(ctx, &cached))
+    Ok(render_response(ctx, &cached, &truncated_expansions))
 }
 
 /// The `to_type` acceptance test for a traversal.
@@ -202,6 +217,19 @@ fn path_terminal_file_key(entity: &EntityRef) -> Option<String> {
     }
 }
 
+/// A vertex whose ADMITTED neighborhood exceeded the per-hop fan-out cap,
+/// with the count of admitted edges the traversal refused to enumerate past
+/// the cap. Reported in the response so a truncated expansion is never
+/// mistaken for the whole neighborhood. The count is post-admission by
+/// construction: unreadable edges never reach the budget and are never
+/// counted, so the disclosure the record makes is bounded by what the caller
+/// may already read.
+#[derive(Debug)]
+struct FanoutTruncation {
+    vertex: EntityRef,
+    edge_count: usize,
+}
+
 fn bfs(
     ctx: &ProviderContext<'_>,
     edge_index: &EdgeIndex,
@@ -211,7 +239,8 @@ fn bfs(
     edge_filter: Option<&HashSet<String>>,
     max_depth: usize,
     limit: usize,
-) -> Vec<Vec<PathStep>> {
+    max_fanout: usize,
+) -> (Vec<Vec<PathStep>>, Vec<FanoutTruncation>) {
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
     visited.insert(from.clone());
@@ -221,16 +250,39 @@ fn bfs(
         visited,
     });
     let mut found = Vec::new();
+    let mut truncated_expansions = Vec::new();
+    let mut truncated_vertices = HashSet::new();
     while let Some(entry) = queue.pop_front() {
+        // Graph selection precedes neighbor enumeration: a vertex whose lane
+        // the caller may not read is absent, including the root, so the walk
+        // never discloses the existence of an unreadable graph by expanding
+        // out of it.
+        if !ctx.graph_lane_admitted(&entry.current) {
+            continue;
+        }
         if entry.steps.len() >= max_depth {
             continue;
+        }
+        let node_expansions = expansions(ctx, edge_index, &entry.current, edge_filter);
+        // Admission also owns the budget and the count: unreadable neighbors
+        // never consume fan-out and never appear in edge_count, so a capped
+        // answer cannot imply an excluded lane exists.
+        let admitted: Vec<Expansion> = node_expansions
+            .into_iter()
+            .filter(|expansion| ctx.graph_lane_admitted(&expansion.next))
+            .collect();
+        if admitted.len() > max_fanout && truncated_vertices.insert(entry.current.clone()) {
+            truncated_expansions.push(FanoutTruncation {
+                vertex: entry.current.clone(),
+                edge_count: admitted.len(),
+            });
         }
         for Expansion {
             edge_kind,
             direction,
             next,
             metadata,
-        } in expansions(ctx, edge_index, &entry.current, edge_filter)
+        } in admitted.into_iter().take(max_fanout)
         {
             if entry.visited.contains(&next) {
                 continue;
@@ -248,7 +300,7 @@ fn bfs(
             {
                 found.push(steps.clone());
                 if found.len() >= limit {
-                    return found;
+                    return (found, truncated_expansions);
                 }
             }
             let mut path_visited = entry.visited.clone();
@@ -260,7 +312,7 @@ fn bfs(
             });
         }
     }
-    found
+    (found, truncated_expansions)
 }
 
 /// One admissible next hop, plus whatever per-edge labels produced it.
@@ -379,8 +431,12 @@ fn parse_edge_filter(raw: Option<&EdgeTypesParam>) -> Option<HashSet<String>> {
     (!set.is_empty()).then_some(set)
 }
 
-fn render_response(ctx: &ProviderContext<'_>, paths: &[CachedPath]) -> String {
-    let text = if paths.is_empty() {
+fn render_response(
+    ctx: &ProviderContext<'_>,
+    paths: &[CachedPath],
+    truncated_expansions: &[FanoutTruncation],
+) -> String {
+    let mut text = if paths.is_empty() {
         "No paths found.".to_string()
     } else {
         paths
@@ -389,6 +445,23 @@ fn render_response(ctx: &ProviderContext<'_>, paths: &[CachedPath]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    if !truncated_expansions.is_empty() {
+        // A capped expansion is a partial answer by construction; say so in
+        // the rendered text as well as the structured field, because the
+        // text is what a model reads first.
+        text.push_str("\n\nExpansion truncated at the max_fanout cap:");
+        for truncation in truncated_expansions.iter().take(8) {
+            text.push_str(&format!(
+                "\n- {} ({} edges enumerated up to the cap)",
+                render_node(ctx, &truncation.vertex),
+                truncation.edge_count,
+            ));
+        }
+        let hidden = truncated_expansions.len().saturating_sub(8);
+        if hidden > 0 {
+            text.push_str(&format!("\n- and {hidden} more truncated vertices"));
+        }
+    }
     let text = cap_rendered_text(text);
     serde_json::to_string_pretty(&json!({
         "status": "ok",
@@ -397,6 +470,10 @@ fn render_response(ctx: &ProviderContext<'_>, paths: &[CachedPath]) -> String {
             "id": path.id,
             "summary": render_path(ctx, path),
             "steps": path.steps,
+        })).collect::<Vec<_>>(),
+        "truncated_expansions": truncated_expansions.iter().map(|truncation| json!({
+            "vertex": truncation.vertex.render(),
+            "edge_count": truncation.edge_count,
         })).collect::<Vec<_>>(),
     }))
     .expect("path response serializes")
@@ -582,9 +659,10 @@ mod tests {
         };
         let index = EdgeIndex::from_edges_for_tests(vec![edge]);
         let ctx = ProviderContext::empty_for_tests();
-        let paths = bfs(&ctx, &index, a, Some(&b), None, None, 3, 5);
+        let (paths, truncated) = bfs(&ctx, &index, a, Some(&b), None, None, 3, 5, 16);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0][0].direction, PathDirection::Out);
+        assert!(truncated.is_empty());
     }
 
     #[test]
@@ -597,7 +675,7 @@ mod tests {
         let index = EdgeIndex::default();
         let ctx = ProviderContext::empty_for_tests();
 
-        let paths = bfs(
+        let (paths, truncated) = bfs(
             &ctx,
             &index,
             transcript.clone(),
@@ -606,12 +684,14 @@ mod tests {
             None,
             3,
             5,
+            16,
         );
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].len(), 1);
         assert_eq!(paths[0][0].edge_kind, "IN_SESSION");
         assert_eq!(paths[0][0].direction, PathDirection::Out);
         assert_eq!(paths[0][0].to, session);
+        assert!(truncated.is_empty());
 
         // Reachable by to_type too (mirrors the max-depth/limit-boundary
         // traversal an agent would actually run).
@@ -624,8 +704,9 @@ mod tests {
             None,
             3,
             5,
+            16,
         );
-        assert_eq!(by_type.len(), 1);
+        assert_eq!(by_type.0.len(), 1);
     }
 
     #[test]
@@ -644,6 +725,7 @@ mod tests {
             edge_types: None,
             max_depth: None,
             limit: None,
+            max_fanout: None,
         };
 
         let raw = find_paths(&params, &ctx, &index, &mut cache).unwrap();
@@ -676,6 +758,7 @@ mod tests {
             edge_types: None,
             max_depth: None,
             limit: None,
+            max_fanout: None,
         };
 
         let raw = find_paths(&params, &ctx, &index, &mut cache).unwrap();
@@ -683,6 +766,292 @@ mod tests {
 
         assert_eq!(value["status"], "ok");
         assert_eq!(value["paths"].as_array().unwrap().len(), 1);
+    }
+
+    /// A resolver that admits every ref except a named set, so the graph
+    /// lane gate can be exercised without a daemon. `resolve_entity` is
+    /// never reached: the gate refuses (or admits) before the loader runs.
+    struct DenyingResolver {
+        denied: HashSet<EntityRef>,
+    }
+
+    impl bbox_providers::providers::ProjectGraphEntityResolver for DenyingResolver {
+        fn resolve_entity(
+            &self,
+            _r: &EntityRef,
+            _provisional: Option<&str>,
+        ) -> Result<bbox_providers::providers::EntityView> {
+            anyhow::bail!("the admission gate must run before entity loading")
+        }
+
+        fn traversal_admits(&self, r: &EntityRef, _provisional: Option<&str>) -> bool {
+            !self.denied.contains(r)
+        }
+    }
+
+    /// Unified-retrieval 5.2: graph selection precedes neighbor enumeration.
+    /// An edge may name a vertex in a lane the caller may not read; the hop
+    /// must drop out before the target test, before the frontier, and before
+    /// any count, so the answer cannot imply the excluded graph exists.
+    #[test]
+    fn bfs_drops_hops_into_graph_lanes_the_resolver_refuses() {
+        let from = EntityRef::parse("knowledge:a").unwrap();
+        let readable = EntityRef::parse("project_graph_vertex:proj1:graph-a:v1").unwrap();
+        let excluded = EntityRef::parse("project_graph_vertex:proj1:graph-b:v2").unwrap();
+        let edges = [readable.clone(), excluded.clone()]
+            .into_iter()
+            .map(|target| Edge {
+                source: from.clone(),
+                kind: "record:CORRESPONDS_TO".into(),
+                target,
+                provenance: EdgeProvenance::Explicit,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+                project_id: None,
+            })
+            .collect();
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let resolver = DenyingResolver {
+            denied: HashSet::from([excluded.clone()]),
+        };
+        let ctx = ProviderContext::empty_for_tests().with_project_graph_resolver(&resolver, None);
+
+        let (paths, truncated) = bfs(
+            &ctx,
+            &index,
+            from.clone(),
+            None,
+            Some(TargetTypeFilter::new(EntityType::ProjectGraphVertex, None)),
+            None,
+            1,
+            5,
+            16,
+        );
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0][0].to, readable);
+        assert!(truncated.is_empty());
+
+        // Same walk aimed only at the excluded lane: no path, and equally
+        // important no truncated-expansion note, because nothing about the
+        // excluded vertex was ever enumerated.
+        let denied_only = bfs(&ctx, &index, from, Some(&excluded), None, None, 1, 5, 16);
+        assert!(denied_only.0.is_empty());
+        assert!(denied_only.1.is_empty());
+
+        // The root is gated by the same live check: a walk that starts inside
+        // an unreadable lane is absent, not half-expanded.
+        let rooted_in_excluded = bfs(
+            &ctx,
+            &index,
+            excluded,
+            Some(&readable),
+            None,
+            None,
+            1,
+            5,
+            16,
+        );
+        assert!(rooted_in_excluded.0.is_empty());
+    }
+
+    /// The admission filter owns the fan-out budget, not just the output: a
+    /// hub with a neighborhood beyond the cap still reads as untruncated when
+    /// the unreadable edges are what pushed it over, and the readable
+    /// neighbors all survive. Unreadable edges consuming budget (or showing
+    /// up in edge_count) would disclose the excluded lane's existence.
+    #[test]
+    fn unreadable_neighbors_neither_consume_fanout_nor_count() {
+        let from = EntityRef::parse("knowledge:hub").unwrap();
+        let readable: Vec<EntityRef> = (1..=10)
+            .map(|idx| EntityRef::parse(&format!("knowledge:leaf-{idx}")).unwrap())
+            .collect();
+        let excluded: Vec<EntityRef> = (1..=10)
+            .map(|idx| {
+                EntityRef::parse(&format!("project_graph_vertex:proj1:graph-disabled:v{idx}"))
+                    .unwrap()
+            })
+            .collect();
+        let edges = readable
+            .iter()
+            .chain(excluded.iter())
+            .cloned()
+            .map(|target| Edge {
+                source: from.clone(),
+                kind: "SUPERSEDES".into(),
+                target,
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+                project_id: None,
+            })
+            .collect();
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let resolver = DenyingResolver {
+            denied: excluded.into_iter().collect(),
+        };
+        let ctx = ProviderContext::empty_for_tests().with_project_graph_resolver(&resolver, None);
+
+        let (paths, truncated) = bfs(
+            &ctx,
+            &index,
+            from,
+            None,
+            Some(TargetTypeFilter::new(EntityType::Knowledge, None)),
+            None,
+            1,
+            30,
+            16,
+        );
+        assert_eq!(
+            paths.len(),
+            10,
+            "every readable neighbor survives: {paths:?}"
+        );
+        assert!(
+            truncated.is_empty(),
+            "admitted count is 10, so a 16 cap must not truncate: {truncated:?}"
+        );
+    }
+
+    /// Unified-retrieval 5.2: the per-hop fan-out cap bounds expansion, and a
+    /// capped expansion says so explicitly instead of silently returning a
+    /// prefix of the neighborhood.
+    #[test]
+    fn fanout_cap_bounds_expansion_and_reports_the_truncation() {
+        let from = EntityRef::parse("knowledge:hub").unwrap();
+        let edges = (1..=20)
+            .map(|idx| Edge {
+                source: from.clone(),
+                kind: "SUPERSEDES".into(),
+                target: EntityRef::parse(&format!("knowledge:leaf-{idx}")).unwrap(),
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+                project_id: None,
+            })
+            .collect();
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let ctx = ProviderContext::empty_for_tests();
+        let mut cache = PathCache::default();
+
+        let (paths, truncated) = bfs(
+            &ctx,
+            &index,
+            from.clone(),
+            None,
+            Some(TargetTypeFilter::new(EntityType::Knowledge, None)),
+            None,
+            3,
+            40,
+            5,
+        );
+        assert_eq!(paths.len(), 5, "only the first five hops are enumerated");
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated[0].vertex, from);
+        assert_eq!(truncated[0].edge_count, 20);
+
+        // The tool response carries the truncation in both the structured
+        // field and the rendered text the model reads first.
+        let params = FindPathsParams {
+            from: "knowledge:hub".into(),
+            provisional: None,
+            to: None,
+            to_type: Some("knowledge".into()),
+            edge_types: None,
+            max_depth: Some(1),
+            limit: Some(5),
+            max_fanout: Some(6),
+        };
+        let raw = find_paths(&params, &ctx, &index, &mut cache).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["truncated_expansions"][0]["edge_count"], 20, "{raw}");
+        let text = value["text"].as_str().unwrap();
+        assert!(text.contains("Expansion truncated"), "{text}");
+        assert!(text.contains("max_fanout"), "{text}");
+
+        // Out-of-range caps are refused loudly, mirroring max_depth.
+        for bad in [0usize, 65] {
+            let params = FindPathsParams {
+                from: "knowledge:hub".into(),
+                provisional: None,
+                to: Some("knowledge:leaf-1".into()),
+                to_type: None,
+                edge_types: None,
+                max_depth: None,
+                limit: None,
+                max_fanout: Some(bad),
+            };
+            let raw = find_paths(&params, &ctx, &index, &mut cache).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(value["status"], "error.bad_input", "{raw}");
+            assert_eq!(value["error"]["field"], "max_fanout", "{raw}");
+        }
+    }
+
+    /// Fix-dedupe regression for the truncation disclosure: `visited` is
+    /// per-path, so a diamond makes the hub reachable along two paths and the
+    /// raw walk dequeues it twice. A hub that truncates must be reported once
+    /// in `truncated_expansions`, not once per arriving path.
+    #[test]
+    fn diamond_reachable_vertex_reports_one_truncation() {
+        let from = EntityRef::parse("knowledge:start").unwrap();
+        let mid1 = EntityRef::parse("knowledge:mid-1").unwrap();
+        let mid2 = EntityRef::parse("knowledge:mid-2").unwrap();
+        let hub = EntityRef::parse("knowledge:hub").unwrap();
+        let raw_targets = [from.clone(), mid1.clone(), mid2.clone(), hub.clone()];
+        let mut edges: Vec<Edge> = [
+            (from.clone(), mid1.clone()),
+            (from.clone(), mid2.clone()),
+            (mid1.clone(), hub.clone()),
+            (mid2.clone(), hub.clone()),
+        ]
+        .into_iter()
+        .map(|(source, target)| Edge {
+            source,
+            kind: "SUPERSEDES".into(),
+            target,
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        })
+        .collect();
+        for idx in 1..=6 {
+            edges.push(Edge {
+                source: hub.clone(),
+                kind: "SUPERSEDES".into(),
+                target: EntityRef::parse(&format!("knowledge:leaf-{idx}")).unwrap(),
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+                project_id: None,
+            });
+        }
+        edges.sort_by_key(|edge| raw_targets.iter().position(|t| *t == edge.source));
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let ctx = ProviderContext::empty_for_tests();
+
+        let (paths, truncated) = bfs(
+            &ctx,
+            &index,
+            from,
+            None,
+            Some(TargetTypeFilter::new(EntityType::Knowledge, None)),
+            None,
+            3,
+            30,
+            5,
+        );
+        assert_eq!(
+            paths.len(),
+            14,
+            "mid-1, mid-2, and the hub match the type filter too, plus five \
+             leaves along each diamond arm: {paths:?}"
+        );
+        assert_eq!(truncated.len(), 1, "{truncated:?}");
+        assert_eq!(truncated[0].vertex, hub);
+        assert_eq!(truncated[0].edge_count, 8);
     }
 
     #[test]

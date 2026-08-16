@@ -1096,6 +1096,44 @@ pub(super) fn open_shared_state(
     });
     shared.install_code_read_view_commit_hook();
 
+    // M9a boot reconciliation: `project_graph_views` is in-memory while the
+    // graph word-lane documents are durable, so a graph disabled or removed
+    // while the daemon was down would stay searchable until the next install
+    // (and a schema-replacement rebuild leaves every lane empty until then).
+    // One published-view install per catalog project converges both cases.
+    if let Some(store) = &catalog_store {
+        let published_projects: Vec<bbox_corpus_core::project_catalog::ProjectId> =
+            match store.snapshot() {
+                Ok(snapshot) => snapshot
+                    .catalog()
+                    .projects
+                    .iter()
+                    .filter(|(_, project)| {
+                        matches!(
+                            project.scope,
+                            bbox_corpus_core::project_catalog::ProjectScope::Published(_)
+                        )
+                    })
+                    .map(|(project_id, _)| project_id.clone())
+                    .collect(),
+                Err(error) => {
+                    // Degrade-and-warn, matching the reconcile's own
+                    // per-project policy: a snapshot failure skips this boot
+                    // pass, and the next install (or a later boot) converges
+                    // the lanes rather than taking the whole daemon down.
+                    tracing::warn!(
+                        error = %error,
+                        "catalog snapshot failed; skipping boot graph view reconcile"
+                    );
+                    Vec::new()
+                }
+            };
+        super::knowledge_view::reconcile_published_graph_word_lanes_at_boot(
+            &shared,
+            published_projects,
+        );
+    }
+
     // Reconcile every granted connector scope against the derived manifest.
     // The activation record, the manifest, and the state flip are three
     // writes across two stores that share no transaction, so a crash between

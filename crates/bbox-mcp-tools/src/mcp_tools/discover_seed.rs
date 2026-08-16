@@ -31,9 +31,9 @@ pub struct DiscoverSeedParams {
     pub vector_weight: Option<f32>,
     #[serde(default)]
     pub query_vector: Option<Vec<f32>>,
-    /// Restrict project_file results to a specific project (path or
-    /// project_id). Identical semantics to `bbox_hybrid_search`'s `project`
-    /// parameter — see that tool's docs.
+    /// Restrict project_file and project graph vertex results to a specific
+    /// project (path or project_id). Identical semantics to
+    /// `bbox_hybrid_search`'s `project` parameter: see that tool's docs.
     #[serde(default)]
     pub project: Option<String>,
     /// Pre-resolved project filter id installed by the daemon boundary
@@ -45,6 +45,14 @@ pub struct DiscoverSeedParams {
     /// when the MCP session has authoritative checkout context.
     #[serde(default)]
     pub provisional: Option<String>,
+    /// Read-surface plane filter for graph vertex documents, identical
+    /// semantics to `bbox_hybrid_search`'s `graph_source` parameter.
+    #[serde(default)]
+    pub graph_source: Option<Vec<String>>,
+    /// Named-graph selection for graph vertex documents, identical semantics
+    /// to `bbox_hybrid_search`'s `graph_ids` parameter.
+    #[serde(default)]
+    pub graph_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +90,7 @@ pub fn discover_seed_entities(
     edge_index: &EdgeIndex,
     active_selectors: &BTreeMap<String, String>,
     searcher: &tantivy::Searcher,
+    graph_policy: Option<&bbox_indexing::index::GraphWordPolicySnapshot>,
     p: &DiscoverSeedParams,
 ) -> Result<String> {
     let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
@@ -99,11 +108,14 @@ pub fn discover_seed_entities(
             project: p.project.clone(),
             resolved_project_id: p.resolved_project_id.clone(),
             provisional: p.provisional.clone(),
+            graph_source: p.graph_source.clone(),
+            graph_ids: p.graph_ids.clone(),
             rerank_cap: None,
             rerank: None,
         },
         active_selectors,
         searcher,
+        graph_policy,
     )?;
     let seeds = hybrid
         .results
@@ -343,6 +355,12 @@ mod tests {
             source_uri: None,
             sources: std::collections::BTreeMap::from([("bm25".into(), 0.1)]),
             excerpt: None,
+            graph_id: None,
+            graph_source: None,
+            graph_source_connector: None,
+            graph_vertex_type: None,
+            graph_generation: None,
+            graph_logical_ref: None,
         };
         let ctx = ProviderContext::empty_for_tests();
         let seed = seed_from_hybrid_result(&ctx, &EdgeIndex::default(), &result).unwrap();

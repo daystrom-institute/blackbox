@@ -39,6 +39,28 @@
   must not commit edges for a project without staging and finalizing that same
   project's durable snapshot receipt.
 
+## Graph word lanes replace whole lanes
+
+- One graph's word-index documents are keyed `(project_id, graph_id, plane)`.
+  Activation replaces the whole lane (or purges it) through the writer actor;
+  per-document upserts are forbidden because a generation flip may remove
+  vertices. The generation stamp is the no-op key: a re-activation carrying
+  the same stamp writes nothing.
+- A graph whose policy disables text retrieval, and a graph that left the
+  accepted view, must have ZERO documents in the index. Purging the lane is
+  the mechanism; filtering at query time is not a substitute.
+- Property text reaches the index only through schema annotations
+  (`index: word` into the code-tokenized lane, `index: text` into the prose
+  body) under the graph's index policy. Unannotated property values and
+  schema-as-data (meta) vertices are never indexed.
+- Every graph vertex document carries `project_id` as an exact term (Q6).
+  Query-side project scoping filters on that field; it never parses the
+  entity ref or consults the catalog inside the filter.
+- Full reindex passes preserve graph lanes like provisional knowledge: there
+  is no durable store the pass walks for them. The schema-migration rebuild
+  starts empty and lanes re-activate at the next accepted view install,
+  mirroring the in-memory view catalog's own lifecycle.
+
 ## Aliases fail closed at every layer
 
 - Declared in the repo's committed `.bbox/config.toml` `[project] aliases`;

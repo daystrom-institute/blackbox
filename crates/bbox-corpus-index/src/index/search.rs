@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
@@ -16,11 +16,254 @@ use walkdir::WalkDir;
 use super::helpers::*;
 use super::passes::*;
 use super::project_files;
-use super::{FileMeta, TranscriptIndex};
+use super::{FieldHandles, FileMeta, TranscriptIndex};
 use bbox_corpus_core::query::smart_query_to_tantivy;
 use bro_transcript as parser;
 
 // ── MCP parameter structs ─────────────────────────────────────────
+
+/// Query-side graph authority for the word lane (unified-retrieval design
+/// section 5.1).
+///
+/// Composed INTO the BM25 `BooleanQuery` as part of the authority conjunct
+/// BEFORE ranking, so graph documents that fail it never enter the ranked
+/// list and never consume rank positions. Built from a pinned view snapshot
+/// before the search starts, never consulted lazily mid-query.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphWordAuthority {
+    /// `(project_id, graph_id)` lanes whose current policy disables text
+    /// retrieval, plus lanes that are never indexable (local scratch). Keys
+    /// carry the project because graph ids are only unique within a project,
+    /// and a same-named graph in another project must not inherit this
+    /// exclusion. Emits one `MustNot (project_id AND graph_id)` clause per
+    /// lane, inert on non-graph documents because they carry no `graph_id`
+    /// term.
+    pub disabled_graph_lanes: std::collections::BTreeSet<(String, String)>,
+    /// Per-lane vertex types excluded from retrieval regardless of
+    /// annotation. Emits one `MustNot (project_id AND graph_id AND
+    /// graph_vertex_type)` clause per triple.
+    pub excluded_vertex_types: BTreeMap<(String, String), std::collections::BTreeSet<String>>,
+    /// Caller-resolved project scope (`resolved_project_id`). Graph
+    /// documents outside it are excluded before ranking; non-graph documents
+    /// are untouched, keeping their existing post-fusion project semantics
+    /// and their scores.
+    pub resolved_project_id: Option<String>,
+    /// Requested read-surface planes (`graph_source` parameter). Empty means
+    /// every plane. Graph documents on other planes are excluded before
+    /// ranking; non-graph documents are untouched.
+    pub graph_sources: std::collections::BTreeSet<String>,
+    /// Named-graph selection within the resolved project. `None` and the
+    /// empty set both mean every graph; an explicit selection excludes graph
+    /// documents outside it before ranking.
+    pub selected_graph_ids: Option<std::collections::BTreeSet<String>>,
+}
+
+impl GraphWordAuthority {
+    /// Whether the filter carries no clause at all. An empty filter keeps the
+    /// query byte-identical to the pre-graph pipeline, which is also how the
+    /// non-graph ranking regression stays honest.
+    pub fn is_empty(&self) -> bool {
+        self.disabled_graph_lanes.is_empty()
+            && self.excluded_vertex_types.is_empty()
+            && self.resolved_project_id.is_none()
+            && self.graph_sources.is_empty()
+            && self
+                .selected_graph_ids
+                .as_ref()
+                .is_none_or(std::collections::BTreeSet::is_empty)
+    }
+
+    /// Parse the repeatable `graph_source` parameter. The vocabulary is the
+    /// read-surface plane vocabulary (`source_label` / `GraphSummary.source`),
+    /// never the `GraphSource` authority enum.
+    pub fn parse_graph_sources(raw: &[String]) -> Result<std::collections::BTreeSet<String>> {
+        let mut sources = std::collections::BTreeSet::new();
+        for value in raw {
+            match value.as_str() {
+                super::GRAPH_SOURCE_PUBLISHED
+                | super::GRAPH_SOURCE_PROVISIONAL
+                | super::GRAPH_SOURCE_CONNECTOR => {
+                    sources.insert(value.clone());
+                }
+                other => anyhow::bail!(
+                    "invalid graph_source {other:?} (expected \"published\", \"provisional\", or \"connector\")"
+                ),
+            }
+        }
+        Ok(sources)
+    }
+
+    /// Compose the query-time authority from the two halves that must stay
+    /// separable: the pinned policy snapshot (what the catalog says is
+    /// readable, taken once before the search starts) and the per-call
+    /// parameters (project scope, plane selection, graph selection).
+    pub fn from_parts(
+        policy: Option<&GraphWordPolicySnapshot>,
+        resolved_project_id: Option<String>,
+        graph_sources: std::collections::BTreeSet<String>,
+        selected_graph_ids: Option<std::collections::BTreeSet<String>>,
+    ) -> Self {
+        let mut authority = Self {
+            resolved_project_id,
+            graph_sources,
+            selected_graph_ids,
+            ..Default::default()
+        };
+        if let Some(policy) = policy {
+            authority.disabled_graph_lanes = policy.disabled_graph_lanes.clone();
+            authority.excluded_vertex_types = policy.excluded_vertex_types.clone();
+        }
+        authority
+    }
+}
+
+/// The view-catalog half of [`GraphWordAuthority`]: which lanes the caller
+/// may read at all, snapshotted once before a search so the catalog lock is
+/// never held across the query and a mid-search view install cannot change
+/// the answer halfway through.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphWordPolicySnapshot {
+    pub disabled_graph_lanes: std::collections::BTreeSet<(String, String)>,
+    pub excluded_vertex_types: BTreeMap<(String, String), std::collections::BTreeSet<String>>,
+}
+
+/// Indexed state of one graph lane, for the describe participation report
+/// (unified-retrieval design section 6.5). `indexed_generation` is the
+/// `graph_generation` stamp the lane's documents carry; `None` means the lane
+/// has no documents at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GraphLaneIndexStats {
+    pub indexed_vertex_count: usize,
+    pub indexed_generation: Option<String>,
+}
+
+/// Free-function form of [`TranscriptIndex::graph_lane_stats`] over any
+/// searcher, so the daemon-side writer actor can run the same
+/// fingerprint no-op check without owning a `TranscriptIndex`.
+pub fn graph_lane_stats_for_searcher(
+    searcher: &tantivy::Searcher,
+    fields: FieldHandles,
+    project_id: &str,
+    graph_id: &str,
+    graph_source: &str,
+) -> Result<GraphLaneIndexStats> {
+    let query = graph_lane_boolean_query(fields, project_id, Some(graph_id), graph_source);
+    let (top, count) = searcher.search(&query, &(TopDocs::with_limit(1), Count))?;
+    let indexed_generation = if count == 0 {
+        None
+    } else {
+        let doc: TantivyDocument = searcher.doc(top[0].1)?;
+        let generation = doc
+            .get_first(fields.graph_generation)
+            .and_then(|value| match value {
+                OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        (!generation.is_empty()).then_some(generation)
+    };
+    Ok(GraphLaneIndexStats {
+        indexed_vertex_count: count,
+        indexed_generation,
+    })
+}
+
+/// Every indexed graph lane of one project + plane, keyed by graph id. The
+/// inventory the activation path diffs against so a graph REMOVED from a new
+/// accepted view gets its lane purged instead of serving stale documents.
+pub fn graph_lanes_for_project_searcher(
+    searcher: &tantivy::Searcher,
+    fields: FieldHandles,
+    project_id: &str,
+    graph_source: &str,
+) -> Result<BTreeMap<String, GraphLaneIndexStats>> {
+    // Distinct graph ids come from the graph_id term dictionaries, not from
+    // a stored-document walk: this inventory runs under the caller's idx
+    // read lock on every view install, and vertex counts dwarf lane counts.
+    // One Count per candidate lane plus a single stored fetch for the
+    // generation stamp keeps the walk O(lanes), not O(vertices).
+    let mut candidates = BTreeSet::new();
+    for reader in searcher.segment_readers() {
+        let inverted_index = reader.inverted_index(fields.graph_id)?;
+        let mut stream = inverted_index.terms().stream()?;
+        while let Some((bytes, _)) = stream.next() {
+            if let Ok(value) = std::str::from_utf8(bytes) {
+                if !value.is_empty() {
+                    candidates.insert(value.to_string());
+                }
+            }
+        }
+    }
+    let mut lanes = BTreeMap::<String, GraphLaneIndexStats>::new();
+    for graph_id in candidates {
+        let query = graph_lane_boolean_query(fields, project_id, Some(&graph_id), graph_source);
+        let indexed_vertex_count = searcher.search(&query, &Count)?;
+        if indexed_vertex_count == 0 {
+            continue;
+        }
+        let indexed_generation = searcher
+            .search(&query, &TopDocs::with_limit(1))?
+            .first()
+            .map(|(_, address)| searcher.doc::<TantivyDocument>(*address))
+            .transpose()?
+            .and_then(|doc| {
+                doc.get_first(fields.graph_generation)
+                    .and_then(|value| match value {
+                        OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
+                        _ => None,
+                    })
+            });
+        lanes.insert(
+            graph_id,
+            GraphLaneIndexStats {
+                indexed_vertex_count: indexed_vertex_count as usize,
+                indexed_generation,
+            },
+        );
+    }
+    Ok(lanes)
+}
+
+pub fn graph_lane_boolean_query(
+    fields: FieldHandles,
+    project_id: &str,
+    graph_id: Option<&str>,
+    graph_source: &str,
+) -> BooleanQuery {
+    let mut clauses = vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.doc_type, super::GRAPH_VERTEX_DOC_TYPE),
+                IndexRecordOption::Basic,
+            )) as Box<dyn tantivy::query::Query>,
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.project_id, project_id),
+                IndexRecordOption::Basic,
+            )),
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.graph_source, graph_source),
+                IndexRecordOption::Basic,
+            )),
+        ),
+    ];
+    if let Some(graph_id) = graph_id {
+        clauses.push((
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.graph_id, graph_id),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+    BooleanQuery::new(clauses)
+}
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
@@ -83,6 +326,20 @@ pub struct HybridBm25Hit {
     pub role: String,
     pub title: Option<String>,
     pub excerpt: String,
+    /// Structured project identity straight off the stored field. Graph
+    /// vertex documents always carry it (Q6); other doc types may not.
+    pub project_id: Option<String>,
+    /// Graph vertex identity (unified-retrieval design 4.1 and 6.1),
+    /// populated only for `project_graph_vertex` documents and read from the
+    /// stored fields of the exact document the hit was ranked from.
+    pub graph_id: Option<String>,
+    pub graph_source: Option<String>,
+    pub graph_source_connector: Option<String>,
+    pub graph_vertex_type: Option<String>,
+    pub graph_generation: Option<String>,
+    /// The pasteable logical ref; equals the entity id on the published plane
+    /// and carries the project form for provisional hits in later milestones.
+    pub logical_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,6 +1042,32 @@ impl TranscriptIndex {
         active_selectors: &BTreeMap<String, String>,
         searcher: &tantivy::Searcher,
     ) -> Result<Vec<HybridBm25Hit>> {
+        self.hybrid_bm25_hits_with_graph_authority_and_searcher(
+            query,
+            limit,
+            doc_type,
+            exclude_knowledge,
+            active_selectors,
+            searcher,
+            None,
+        )
+    }
+
+    /// The word-lane graph authority seam (unified-retrieval design 5.1).
+    ///
+    /// Everything else about the pipeline is unchanged; the authority clause
+    /// is composed into the same `BooleanQuery` that carries the `doc_type`
+    /// term and the active-code-selector clause, before `TopDocs`.
+    pub fn hybrid_bm25_hits_with_graph_authority_and_searcher(
+        &self,
+        query: &str,
+        limit: usize,
+        doc_type: Option<&str>,
+        exclude_knowledge: bool,
+        active_selectors: &BTreeMap<String, String>,
+        searcher: &tantivy::Searcher,
+        graph_authority: Option<&GraphWordAuthority>,
+    ) -> Result<Vec<HybridBm25Hit>> {
         if searcher.num_docs() == 0 || query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -857,6 +1140,9 @@ impl TranscriptIndex {
                 )),
             ));
         }
+        if let Some(authority) = graph_authority.filter(|authority| !authority.is_empty()) {
+            clauses.push((Occur::Must, self.graph_authority_clause(authority)));
+        }
         let query = BooleanQuery::new(clauses);
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
         if top_docs.is_empty() {
@@ -882,9 +1168,206 @@ impl TranscriptIndex {
                 role: self.doc_text(&doc, self.fields.role),
                 title: self.hybrid_title(&doc),
                 excerpt,
+                project_id: super::optional_text(&doc, self.fields.project_id),
+                graph_id: super::optional_text(&doc, self.fields.graph_id),
+                graph_source: super::optional_text(&doc, self.fields.graph_source),
+                graph_source_connector: super::optional_text(
+                    &doc,
+                    self.fields.graph_source_connector,
+                ),
+                graph_vertex_type: super::optional_text(&doc, self.fields.graph_vertex_type),
+                graph_generation: super::optional_text(&doc, self.fields.graph_generation),
+                logical_ref: super::optional_text(&doc, self.fields.logical_ref),
             });
         }
         Ok(hits)
+    }
+
+    /// The authority conjunct for graph documents (unified-retrieval 5.1).
+    ///
+    /// Three clause families, all inert on non-graph documents because they
+    /// key on fields only graph docs carry:
+    ///
+    /// - `MustNot graph_id` per disabled graph: the query-time re-check of
+    ///   `text_retrieval_enabled` (and of never-indexable sources), so a
+    ///   policy change takes effect before the lane is rewritten;
+    /// - `MustNot (graph_id AND graph_vertex_type)` per excluded type;
+    /// - a project-scope clause that admits every non-graph document and only
+    ///   graph documents whose stamped `project_id` matches. Q6 ruling: the
+    ///   project comes from the field the installer stamped, never from
+    ///   parsing a ref or consulting the catalog inside the query filter.
+    ///
+    /// The project-scope clause is wrapped in a zero boost so it acts as a
+    /// pure filter: without it the `project_id` term match would add its BM25
+    /// idf to graph documents only, silently perturbing ranking.
+    fn graph_authority_clause(
+        &self,
+        authority: &GraphWordAuthority,
+    ) -> Box<dyn tantivy::query::Query> {
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+        // A boolean whose clauses are all MustNot matches nothing in tantivy
+        // (same as Lucene). The anchor keeps the conjunct positive while the
+        // MustNot lanes subtract from it, and its zero boost keeps authority
+        // filtering from perturbing scores at all.
+        clauses.push((
+            Occur::Must,
+            Box::new(BoostQuery::new(Box::new(tantivy::query::AllQuery), 0.0)),
+        ));
+        for (project_id, graph_id) in &authority.disabled_graph_lanes {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Must,
+                        self.graph_term(self.fields.project_id, project_id),
+                    ),
+                    (Occur::Must, self.graph_term(self.fields.graph_id, graph_id)),
+                ])),
+            ));
+        }
+        for ((project_id, graph_id), vertex_types) in &authority.excluded_vertex_types {
+            for vertex_type in vertex_types {
+                clauses.push((
+                    Occur::MustNot,
+                    Box::new(BooleanQuery::new(vec![
+                        (
+                            Occur::Must,
+                            self.graph_term(self.fields.project_id, project_id),
+                        ),
+                        (Occur::Must, self.graph_term(self.fields.graph_id, graph_id)),
+                        (
+                            Occur::Must,
+                            self.graph_term(self.fields.graph_vertex_type, vertex_type),
+                        ),
+                    ])),
+                ));
+            }
+        }
+        // Plane and named-graph selection (design 5.1): non-graph documents
+        // ride the AllQuery arm untouched; graph documents must match every
+        // supplied selector. Both outer arms are Should, so a graph document
+        // that fails a selector matches neither arm and drops out before
+        // ranking, while a non-graph document never depends on the selectors.
+        if !authority.graph_sources.is_empty()
+            || authority
+                .selected_graph_ids
+                .as_ref()
+                .is_some_and(|selected| !selected.is_empty())
+        {
+            let mut graph_arms: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+            if !authority.graph_sources.is_empty() {
+                let plane_terms = authority
+                    .graph_sources
+                    .iter()
+                    .map(|source| {
+                        (
+                            Occur::Should,
+                            self.graph_term(self.fields.graph_source, source),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                graph_arms.push((Occur::Must, Box::new(BooleanQuery::new(plane_terms))));
+            }
+            if let Some(selected) = authority
+                .selected_graph_ids
+                .as_ref()
+                .filter(|selected| !selected.is_empty())
+            {
+                let graph_terms = selected
+                    .iter()
+                    .map(|graph_id| {
+                        (
+                            Occur::Should,
+                            self.graph_term(self.fields.graph_id, graph_id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                graph_arms.push((Occur::Must, Box::new(BooleanQuery::new(graph_terms))));
+            }
+            let selected_graphs = BooleanQuery::new(graph_arms);
+            let non_graph = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(tantivy::query::AllQuery)),
+                (
+                    Occur::MustNot,
+                    self.graph_term(self.fields.doc_type, super::GRAPH_VERTEX_DOC_TYPE),
+                ),
+            ]);
+            clauses.push((
+                Occur::Must,
+                Box::new(BoostQuery::new(
+                    Box::new(BooleanQuery::new(vec![
+                        (Occur::Should, Box::new(non_graph)),
+                        (Occur::Should, Box::new(selected_graphs)),
+                    ])),
+                    0.0,
+                )),
+            ));
+        }
+        if let Some(project_id) = &authority.resolved_project_id {
+            // A boolean whose clauses are all MustNot matches nothing in
+            // tantivy (same as Lucene), so the non-graph arm needs the
+            // explicit AllQuery: every document minus the graph documents.
+            let non_graph = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(tantivy::query::AllQuery)),
+                (
+                    Occur::MustNot,
+                    self.graph_term(self.fields.doc_type, super::GRAPH_VERTEX_DOC_TYPE),
+                ),
+            ]);
+            let graph_in_project = BooleanQuery::new(vec![(
+                Occur::Must,
+                self.graph_term(self.fields.project_id, project_id),
+            )]);
+            let scope = BooleanQuery::new(vec![
+                (Occur::Should, Box::new(non_graph)),
+                (Occur::Should, Box::new(graph_in_project)),
+            ]);
+            clauses.push((Occur::Must, Box::new(BoostQuery::new(Box::new(scope), 0.0))));
+        }
+        Box::new(BooleanQuery::new(clauses))
+    }
+
+    fn graph_term(
+        &self,
+        field: tantivy::schema::Field,
+        value: &str,
+    ) -> Box<dyn tantivy::query::Query> {
+        Box::new(TermQuery::new(
+            Term::from_field_text(field, value),
+            IndexRecordOption::Basic,
+        ))
+    }
+
+    /// Indexed state of one `(project_id, graph_id, plane)` lane, for the
+    /// describe participation report (unified-retrieval design 6.5) and for
+    /// the activation enqueue path's no-op check.
+    pub fn graph_lane_stats(
+        &self,
+        project_id: &str,
+        graph_id: &str,
+        graph_source: &str,
+    ) -> Result<GraphLaneIndexStats> {
+        graph_lane_stats_for_searcher(
+            &self.reader.searcher(),
+            self.fields,
+            project_id,
+            graph_id,
+            graph_source,
+        )
+    }
+
+    /// Every indexed graph lane of one project + plane, keyed by graph id.
+    pub fn graph_lanes_for_project(
+        &self,
+        project_id: &str,
+        graph_source: &str,
+    ) -> Result<BTreeMap<String, GraphLaneIndexStats>> {
+        graph_lanes_for_project_searcher(
+            &self.reader.searcher(),
+            self.fields,
+            project_id,
+            graph_source,
+        )
     }
 
     fn hybrid_entity_id(&self, doc: &TantivyDocument) -> String {
@@ -922,6 +1405,17 @@ impl TranscriptIndex {
     }
 
     fn hybrid_title(&self, doc: &TantivyDocument) -> Option<String> {
+        // A graph vertex's title is its label (unified-retrieval design
+        // 4.1): the label is prose-tokenized into `content` as its first
+        // line, and none of the file/commit/session fields below can exist
+        // on a graph document.
+        if self.doc_text(doc, self.fields.doc_type) == super::GRAPH_VERTEX_DOC_TYPE {
+            let content = self.doc_text(doc, self.fields.content);
+            let label = content.split('\n').next().unwrap_or_default();
+            if !label.is_empty() {
+                return Some(label.chars().take(80).collect());
+            }
+        }
         // P3-E: `relative_path` precedes `file_path` so a project-file title is
         // explicitly the relative path rather than whatever the compat field
         // happens to hold. Both carry the same value after the bump; the order
@@ -3374,5 +3868,590 @@ mod conversation_read_plane_tests {
             })
             .unwrap();
         assert_eq!(out, "Session not found.");
+    }
+}
+
+#[cfg(test)]
+mod graph_word_lane_tests {
+    use super::*;
+    use crate::index::TranscriptIndex;
+    use std::collections::{BTreeMap as TestBTreeMap, BTreeSet};
+
+    const PROJECT: &str = "p_00000000000000000000000000000f71";
+    const FOREIGN_PROJECT: &str = "p_0000000000000000000000000000ffff";
+    const GENERATION: &str = "generation-content-hash-a";
+
+    fn open_index(root: &std::path::Path) -> TranscriptIndex {
+        TranscriptIndex::open_or_create_with_records(
+            &root.join("idx"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("kb.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(crate::index::StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap()
+    }
+
+    fn graph_vertex_doc(
+        fields: &crate::index::FieldHandles,
+        project_id: &str,
+        graph_id: &str,
+        vertex_type: &str,
+        label: &str,
+        body: &str,
+        generation: &str,
+    ) -> TantivyDocument {
+        let mut document = TantivyDocument::new();
+        document.add_text(fields.doc_type, "project_graph_vertex");
+        document.add_text(
+            fields.entity_id,
+            &format!("project_graph_vertex:{project_id}:{graph_id}:vertex/{label}"),
+        );
+        document.add_text(fields.project_id, project_id);
+        document.add_text(fields.graph_id, graph_id);
+        document.add_text(fields.graph_source, "published");
+        document.add_text(fields.graph_generation, generation);
+        document.add_text(fields.graph_vertex_type, vertex_type);
+        document.add_text(fields.content, format!("{label}\n{body}"));
+        document
+    }
+
+    fn plain_doc(
+        fields: &crate::index::FieldHandles,
+        entity_id: &str,
+        content: &str,
+    ) -> TantivyDocument {
+        let mut document = TantivyDocument::new();
+        document.add_text(fields.doc_type, "transcript");
+        document.add_text(fields.entity_id, entity_id);
+        document.add_text(fields.content, content);
+        document
+    }
+
+    /// Visible corpus: one non-graph doc plus the readable graph vertex.
+    fn write_visible(writer: &mut IndexWriter, fields: &crate::index::FieldHandles) {
+        writer
+            .add_document(plain_doc(
+                fields,
+                "transcript:claude:sess-1:0:0",
+                "quarterly settlement record for the alpha account",
+            ))
+            .unwrap();
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                PROJECT,
+                "domain-alpha",
+                "repo:Record",
+                "Alpha settlement record",
+                "quarterly settlement record for the alpha account",
+                GENERATION,
+            ))
+            .unwrap();
+    }
+
+    /// Unreadable corpus additions: a policy-disabled graph, an excluded
+    /// vertex type inside the readable graph, and a foreign project's graph.
+    fn write_unreadable(writer: &mut IndexWriter, fields: &crate::index::FieldHandles) {
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                PROJECT,
+                "domain-disabled",
+                "repo:Record",
+                "Hidden settlement record",
+                "quarterly settlement record for the alpha account",
+                "generation-disabled",
+            ))
+            .unwrap();
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                PROJECT,
+                "domain-alpha",
+                "repo:Secret",
+                "Secret settlement record",
+                "quarterly settlement record for the alpha account",
+                GENERATION,
+            ))
+            .unwrap();
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                FOREIGN_PROJECT,
+                "domain-foreign",
+                "repo:Record",
+                "Foreign settlement record",
+                "quarterly settlement record for the alpha account",
+                "generation-foreign",
+            ))
+            .unwrap();
+    }
+
+    fn authority() -> GraphWordAuthority {
+        GraphWordAuthority {
+            disabled_graph_lanes: BTreeSet::from([(
+                PROJECT.to_string(),
+                "domain-disabled".to_string(),
+            )]),
+            excluded_vertex_types: TestBTreeMap::from([(
+                (PROJECT.to_string(), "domain-alpha".to_string()),
+                BTreeSet::from(["repo:Secret".to_string()]),
+            )]),
+            resolved_project_id: Some(PROJECT.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn search(
+        index: &TranscriptIndex,
+        authority: Option<&GraphWordAuthority>,
+    ) -> Vec<(String, usize, Option<String>)> {
+        let searcher = index.searcher();
+        index
+            .hybrid_bm25_hits_with_graph_authority_and_searcher(
+                "quarterly settlement record",
+                10,
+                None,
+                true,
+                &BTreeMap::new(),
+                &searcher,
+                authority,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.entity_id, hit.rank, hit.title))
+            .collect()
+    }
+
+    /// The filter-order invariant (unified-retrieval design section 8): the
+    /// authority filter runs BEFORE ranking, so unreadable documents never
+    /// consume rank positions. Ranks and the returned set of the visible
+    /// results are identical whether or not the unreadable documents are
+    /// present in the corpus. A post-filtering implementation starves the
+    /// cutoff and returns visibly different ranks.
+    #[test]
+    fn graph_authority_filter_preserves_visible_ranks_and_drops_unreadable_docs() {
+        let control_dir = tempfile::tempdir().unwrap();
+        let control_root = control_dir.path().canonicalize().unwrap();
+        let control = open_index(&control_root);
+        {
+            let fields = control.field_handles();
+            let handle = control.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_visible(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        control.reader_reload_for_test();
+
+        let full_dir = tempfile::tempdir().unwrap();
+        let full_root = full_dir.path().canonicalize().unwrap();
+        let full = open_index(&full_root);
+        {
+            let fields = full.field_handles();
+            let handle = full.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_visible(&mut writer, &fields);
+            write_unreadable(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        full.reader_reload_for_test();
+
+        let control_hits = search(&control, None);
+        assert_eq!(control_hits.len(), 2, "{control_hits:?}");
+
+        let filtered_hits = search(&full, Some(&authority()));
+        assert_eq!(
+            filtered_hits, control_hits,
+            "pre-ranking filtering must preserve the visible corpus's ranks exactly"
+        );
+
+        // Every unreadable lane is present without the filter, proving the
+        // drop above is the authority filter's doing, not the query's.
+        let unfiltered = search(&full, None);
+        assert_eq!(unfiltered.len(), 5, "{unfiltered:?}");
+        assert!(
+            unfiltered
+                .iter()
+                .any(|(entity_id, _, _)| entity_id.contains("domain-disabled"))
+                && unfiltered
+                    .iter()
+                    .any(|(entity_id, _, _)| entity_id.contains("Secret settlement record"))
+                && unfiltered
+                    .iter()
+                    .any(|(entity_id, _, _)| entity_id.contains("domain-foreign"))
+        );
+    }
+
+    /// A graph document's title is its label (design 4.1), which lives as
+    /// the first line of `content`.
+    #[test]
+    fn graph_document_title_is_the_vertex_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        {
+            let fields = index.field_handles();
+            let handle = index.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_visible(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        index.reader_reload_for_test();
+
+        let hits = search(&index, None);
+        let graph_hit = hits
+            .iter()
+            .find(|(entity_id, _, _)| entity_id.starts_with("project_graph_vertex:"))
+            .expect("graph vertex is findable by plain query");
+        assert_eq!(graph_hit.2.as_deref(), Some("Alpha settlement record"));
+    }
+
+    #[test]
+    fn graph_lane_stats_report_count_and_generation_per_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        {
+            let fields = index.field_handles();
+            let handle = index.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_visible(&mut writer, &fields);
+            write_unreadable(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        index.reader_reload_for_test();
+
+        let stats = index
+            .graph_lane_stats(PROJECT, "domain-alpha", "published")
+            .unwrap();
+        assert_eq!(stats.indexed_vertex_count, 2);
+        assert_eq!(stats.indexed_generation.as_deref(), Some(GENERATION));
+
+        // The plane is part of the lane key: a connector-plane query over the
+        // same graph id sees nothing in M9a.
+        let wrong_plane = index
+            .graph_lane_stats(PROJECT, "domain-alpha", "connector")
+            .unwrap();
+        assert_eq!(wrong_plane.indexed_vertex_count, 0);
+        assert_eq!(wrong_plane.indexed_generation, None);
+    }
+
+    /// Named-graph selection and plane selection compose into the same
+    /// pre-ranking conjunct (design 5.1). A selection that excludes every
+    /// indexed plane drops graph documents entirely while leaving non-graph
+    /// documents untouched; a named-graph selection keeps only that lane.
+    #[test]
+    fn graph_selection_and_plane_filters_drop_graph_docs_before_ranking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = open_index(&root);
+        {
+            let fields = index.field_handles();
+            let handle = index.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_visible(&mut writer, &fields);
+            write_unreadable(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        index.reader_reload_for_test();
+
+        let baseline = search(&index, None);
+        assert_eq!(baseline.len(), 5, "{baseline:?}");
+
+        // Plane selection: no M9a document lives on the provisional plane,
+        // so selecting it must remove every graph document and keep the
+        // non-graph transcript hits.
+        let provisional_only = GraphWordAuthority {
+            graph_sources: BTreeSet::from(["provisional".to_string()]),
+            ..Default::default()
+        };
+        let hits = search(&index, Some(&provisional_only));
+        assert!(
+            hits.iter()
+                .all(|(entity_id, _, _)| !entity_id.starts_with("project_graph_vertex:")),
+            "provisional-plane selection must drop every published graph doc: {hits:?}"
+        );
+
+        // Named-graph selection keeps the requested lane and drops the rest.
+        let alpha_only = GraphWordAuthority {
+            selected_graph_ids: Some(BTreeSet::from(["domain-alpha".to_string()])),
+            ..Default::default()
+        };
+        let hits = search(&index, Some(&alpha_only));
+        let graph_hits: Vec<_> = hits
+            .iter()
+            .filter(|(entity_id, _, _)| entity_id.starts_with("project_graph_vertex:"))
+            .collect();
+        assert_eq!(graph_hits.len(), 2, "{hits:?}");
+        assert!(
+            graph_hits
+                .iter()
+                .all(|(entity_id, _, _)| entity_id.contains(":domain-alpha:")),
+            "named-graph selection must keep only the requested lane: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn graph_source_vocabulary_is_the_read_plane_not_the_authority_enum() {
+        let sources = GraphWordAuthority::parse_graph_sources(&[
+            "published".to_string(),
+            "connector".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            sources,
+            BTreeSet::from(["connector".to_string(), "published".to_string()])
+        );
+        assert!(GraphWordAuthority::parse_graph_sources(&["project".to_string()]).is_err());
+        assert!(GraphWordAuthority::parse_graph_sources(&["provisional".to_string()]).is_ok());
+    }
+
+    /// from_parts merges the pinned policy snapshot with per-call selection
+    /// without letting either half silently overwrite the other.
+    #[test]
+    fn authority_from_parts_merges_snapshot_and_call_parameters() {
+        let snapshot = GraphWordPolicySnapshot {
+            disabled_graph_lanes: BTreeSet::from([("p1".to_string(), "g1".to_string())]),
+            excluded_vertex_types: TestBTreeMap::from([(
+                ("p1".to_string(), "g2".to_string()),
+                BTreeSet::from(["repo:Secret".to_string()]),
+            )]),
+        };
+        let authority = GraphWordAuthority::from_parts(
+            Some(&snapshot),
+            Some("p1".to_string()),
+            BTreeSet::from(["published".to_string()]),
+            Some(BTreeSet::from(["g2".to_string()])),
+        );
+        assert_eq!(
+            authority.disabled_graph_lanes,
+            snapshot.disabled_graph_lanes
+        );
+        assert_eq!(
+            authority.excluded_vertex_types,
+            snapshot.excluded_vertex_types
+        );
+        assert_eq!(authority.resolved_project_id.as_deref(), Some("p1"));
+        assert_eq!(
+            authority.graph_sources,
+            BTreeSet::from(["published".to_string()])
+        );
+        assert_eq!(
+            authority.selected_graph_ids,
+            Some(BTreeSet::from(["g2".to_string()]))
+        );
+        assert!(!authority.is_empty());
+
+        let bare = GraphWordAuthority::from_parts(None, None, BTreeSet::new(), None);
+        assert!(bare.is_empty());
+    }
+
+    fn write_ranking_transcripts(writer: &mut IndexWriter, fields: &crate::index::FieldHandles) {
+        let transcripts = [
+            (
+                "transcript:claude:sess-r1:0:0",
+                "quarterly settlement record for the alpha account plus quarterly settlement adjustments",
+            ),
+            (
+                "transcript:claude:sess-r2:0:0",
+                "quarterly settlement notes for the beta ledger",
+            ),
+            (
+                "transcript:claude:sess-r3:0:0",
+                "monthly settlement record for the gamma account",
+            ),
+            (
+                "transcript:claude:sess-r4:0:0",
+                "unrelated release notes for the depot tooling",
+            ),
+        ];
+        for (entity_id, content) in transcripts {
+            writer
+                .add_document(plain_doc(fields, entity_id, content))
+                .unwrap();
+        }
+    }
+
+    fn write_ranking_graph_documents(
+        writer: &mut IndexWriter,
+        fields: &crate::index::FieldHandles,
+    ) {
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                PROJECT,
+                "domain-alpha",
+                "repo:Record",
+                "Alpha settlement record",
+                "quarterly settlement record for the alpha account",
+                GENERATION,
+            ))
+            .unwrap();
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                PROJECT,
+                "domain-disabled",
+                "repo:Record",
+                "Hidden settlement record",
+                "quarterly settlement record for the alpha account",
+                "generation-disabled",
+            ))
+            .unwrap();
+    }
+
+    fn transcript_hits_for_query(
+        index: &TranscriptIndex,
+        authority: Option<&GraphWordAuthority>,
+        query: &str,
+    ) -> Vec<String> {
+        let searcher = index.searcher();
+        index
+            .hybrid_bm25_hits_with_graph_authority_and_searcher(
+                query,
+                10,
+                None,
+                true,
+                &BTreeMap::new(),
+                &searcher,
+                authority,
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|hit| hit.entity_id.starts_with("transcript:"))
+            .map(|hit| hit.entity_id)
+            .collect()
+    }
+
+    /// Exit gate (e): the graph lane must be additive content, not a ranking
+    /// perturbation. Adding graph vertex documents to the word index leaves
+    /// the non-graph corpus's ranking byte-identical: same transcript hits,
+    /// same relative order, measured with the shared ranking metrics so the
+    /// comparison is the same one eval sweeps use. Graph documents occupy
+    /// their own ranks in the treatment corpus (the growth is real), but the
+    /// transcript subsequence is unchanged.
+    #[test]
+    fn graph_documents_do_not_perturb_non_graph_corpus_ranking() {
+        let control_dir = tempfile::tempdir().unwrap();
+        let control_root = control_dir.path().canonicalize().unwrap();
+        let control = open_index(&control_root);
+        {
+            let fields = control.field_handles();
+            let handle = control.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_ranking_transcripts(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        control.reader_reload_for_test();
+
+        let treatment_dir = tempfile::tempdir().unwrap();
+        let treatment_root = treatment_dir.path().canonicalize().unwrap();
+        let treatment = open_index(&treatment_root);
+        {
+            let fields = treatment.field_handles();
+            let handle = treatment.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_ranking_transcripts(&mut writer, &fields);
+            write_ranking_graph_documents(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        treatment.reader_reload_for_test();
+
+        // Sanity: the graph lane really did join the treatment corpus, and
+        // the authority filter keeps only the readable lane visible.
+        let quarterly_searcher = treatment.searcher();
+        let quarterly = treatment
+            .hybrid_bm25_hits_with_graph_authority_and_searcher(
+                "quarterly settlement",
+                10,
+                None,
+                true,
+                &BTreeMap::new(),
+                &quarterly_searcher,
+                Some(&authority()),
+            )
+            .unwrap();
+        assert!(
+            quarterly
+                .iter()
+                .any(|hit| hit.entity_id.contains(":domain-alpha:")),
+            "treatment corpus must contain the readable graph lane: {quarterly:?}"
+        );
+        assert!(
+            !quarterly
+                .iter()
+                .any(|hit| hit.entity_id.contains(":domain-disabled:")),
+            "disabled graph lane must be filtered before ranking: {quarterly:?}"
+        );
+
+        // The authority clause is anchored by a zero-boost AllQuery so it can
+        // only subtract documents, never perturb scores: on the same index,
+        // the filtered and unfiltered scores of every surviving non-graph
+        // hit are bit-identical.
+        let unfiltered_searcher = treatment.searcher();
+        let unfiltered = treatment
+            .hybrid_bm25_hits_with_graph_authority_and_searcher(
+                "quarterly settlement",
+                10,
+                None,
+                true,
+                &BTreeMap::new(),
+                &unfiltered_searcher,
+                None,
+            )
+            .unwrap();
+        for filtered_hit in &quarterly {
+            if !filtered_hit.entity_id.starts_with("transcript:") {
+                continue;
+            }
+            let unfiltered_score = unfiltered
+                .iter()
+                .find(|hit| hit.entity_id == filtered_hit.entity_id)
+                .map(|hit| hit.score)
+                .expect("filter must not drop readable non-graph hits");
+            assert_eq!(
+                filtered_hit.score, unfiltered_score,
+                "authority clause must not perturb non-graph scores"
+            );
+        }
+
+        // Hand-authored relevance labels, independent of the system under
+        // test, so MRR/recall can actually go red; cross-index absolute BM25
+        // scores necessarily shift with corpus growth (idf), which is why the
+        // gate is order stability plus the same-index bit-identical score
+        // check above rather than score equality between control and
+        // treatment.
+        let expected_relevant: &[&[&str]] = &[
+            &[
+                "transcript:claude:sess-r1:0:0",
+                "transcript:claude:sess-r2:0:0",
+            ],
+            &["transcript:claude:sess-r3:0:0"],
+        ];
+        let mut per_query: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for (query, expected) in ["quarterly settlement", "monthly settlement"]
+            .iter()
+            .zip(expected_relevant)
+        {
+            let control_order = transcript_hits_for_query(&control, None, query);
+            let treatment_order = transcript_hits_for_query(&treatment, Some(&authority()), query);
+            assert_eq!(
+                treatment_order, control_order,
+                "graph documents must not reorder the non-graph corpus for {query:?}"
+            );
+            per_query.push((
+                treatment_order,
+                expected.iter().map(|id| id.to_string()).collect(),
+            ));
+        }
+
+        let report = bbox_corpus_core::search::metrics::aggregate(&per_query, &[3]);
+        assert_eq!(report.queries, 2);
+        assert_eq!(report.mrr, 1.0);
+        assert_eq!(report.recall_at.get(&3), Some(&1.0));
     }
 }
