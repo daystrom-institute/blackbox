@@ -1,7 +1,7 @@
 ---
 title: "Slack Ingestion Connector"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - connectors
@@ -20,15 +20,13 @@ date: 2026-08-11
 
 # Slack Ingestion Connector
 
-Status (2026-08-11): proposed, nothing implemented. The transports this design
-rides on are real: the authenticated producer wire, `ServiceToken` producer
-grants, and two-sided operator-config onboarding all shipped with the
-code-source collector. The conversation ingest lane described here does not
-exist. The transcript adapter registry today reads local provider session files
-only; there is no Slack source, endpoint family, or producer binary. The
-`bro-slack` bridge is design (archived v1, proposed next), not deployed code.
-Reverify against the `bbox-corpus-index` transcripts module and the code-source
-server routes before treating any contract name here as landed.
+Status (2026-08-16): partial. The corpus lane is landed on
+`beta/blackbox-v2` (first committed 2026-08-13):
+`bbox-conversation-source`, `bbox-conversation-source-store`, and
+`bbox-slack-collector` project Slack messages into the word index
+through the transcript adapter. The rest of this connector design
+remains proposed, including the `bro-slack` interaction bridge.
+Reverify contract names against code before building on them.
 
 ## 1. What this connector observes
 
