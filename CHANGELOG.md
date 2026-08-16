@@ -10,6 +10,23 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Reflective project-graph vertices now participate in word retrieval
+  (milestone M9a of the graph-native connector campaign,
+  design/connectors/unified-retrieval.md). Every authored vertex of a
+  published graph is a word-index document carrying graph identity fields
+  (graph id, source, connector, generation, vertex type) and a stamped
+  project id; per-graph `GraphIndexPolicy` gains `text_retrieval_enabled`
+  and `retrieval_excluded_types`; the authority filter is composed into the
+  BM25 query before ranking; `bbox_hybrid_search` and
+  `bbox_discover_seed_entities` accept `graph_source` and `graph_ids` and
+  return graph identity fields plus a pasteable `graph_logical_ref`;
+  `bbox_find_paths` gates expansion on lane readability and caps fan-out
+  with a `max_fanout` parameter and `truncated_expansions` disclosure;
+  `bbox_project_graph_describe` reports index participation; the
+  `bbox_project_graph_*` family aligns on `provisional` with `visibility`
+  kept as a deprecated alias. Graph lanes are replaced whole per accepted
+  generation and reconciled from accepted views at boot.
+
 - Crash-resumable workflow arcs: top-level arcs write atomic durable
   checkpoints (spec, context, outputs, sessions, step budget, wait
   deadline) at every node boundary and Wait entry; a boot rehydration
@@ -64,6 +81,11 @@ out explicitly under `Changed` or `Removed`.
   redacted `Debug` rendering.
 
 ### Changed
+
+- Index schema bumps to `agentic-corpus-g13-graph-vertex-docs`; the first
+  daemon open after upgrade drops and rebuilds the index through the guarded
+  replacement boundary, and boot now runs a published-graph-view install per
+  catalog project with a published scope before serving.
 
 - `http_json` / poller fetches retry transient failures (429/502/503/
   504, transport errors) with capped backoff honoring Retry-After, for
