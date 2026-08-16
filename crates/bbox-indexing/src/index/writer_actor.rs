@@ -352,6 +352,7 @@ struct ActorCtx {
     records_provider: Arc<dyn ProjectRecordsProvider>,
     assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>>,
     publication_activity: Arc<AtomicU8>,
+    enqueued_graph_generations: Arc<parking_lot::Mutex<BTreeMap<(String, String, String), String>>>,
 }
 
 const PUBLICATION_IDLE: u8 = 0;
@@ -1076,6 +1077,7 @@ impl IndexWriterActor {
         let assignments: Arc<parking_lot::RwLock<Option<Arc<dyn ProducerAssignmentSource>>>> =
             Arc::new(parking_lot::RwLock::new(None));
         let publication_activity = Arc::new(AtomicU8::new(PUBLICATION_IDLE));
+        let enqueued_graph_generations = Arc::new(parking_lot::Mutex::new(BTreeMap::new()));
         let ctx = ActorCtx {
             index,
             fields,
@@ -1087,6 +1089,7 @@ impl IndexWriterActor {
             records_provider: records_provider.clone(),
             assignments: assignments.clone(),
             publication_activity: publication_activity.clone(),
+            enqueued_graph_generations: enqueued_graph_generations.clone(),
         };
         if let Err(err) = std::thread::Builder::new()
             .name("blackbox-index-writer".into())
@@ -1106,7 +1109,7 @@ impl IndexWriterActor {
             checkout_access,
             records_provider,
             assignments,
-            enqueued_graph_generations: Arc::new(parking_lot::Mutex::new(BTreeMap::new())),
+            enqueued_graph_generations,
             config,
         }
     }
@@ -1167,18 +1170,27 @@ impl IndexWriterActor {
             graph_source.to_string(),
         );
         if !generation.is_empty() {
-            let mut enqueued = self.enqueued_graph_generations.lock();
-            if let Some(last_enqueued) = enqueued.get(&lane_key) {
-                if last_enqueued.as_str() == generation {
-                    tracing::debug!(
-                        project_id,
-                        graph_id,
-                        graph_source,
-                        "graph word lane already has this generation enqueued; skipping replace"
-                    );
-                    return;
+            // The guard covers the map access only: the reader fallback
+            // below runs a search, and holding the lane-intent mutex across
+            // it would serialize every concurrent activation of every lane
+            // behind one another's reader latency.
+            let has_enqueued_intent = {
+                let enqueued = self.enqueued_graph_generations.lock();
+                match enqueued.get(&lane_key) {
+                    Some(last_enqueued) if last_enqueued.as_str() == generation => {
+                        tracing::debug!(
+                            project_id,
+                            graph_id,
+                            graph_source,
+                            "graph word lane already has this generation enqueued; skipping replace"
+                        );
+                        return;
+                    }
+                    Some(_) => true,
+                    None => false,
                 }
-            } else {
+            };
+            if !has_enqueued_intent {
                 let indexed = super::graph_docs::graph_lane_generation(
                     &self.reader,
                     self.fields,
@@ -1196,7 +1208,9 @@ impl IndexWriterActor {
                     return;
                 }
             }
-            enqueued.insert(lane_key, generation.to_string());
+            self.enqueued_graph_generations
+                .lock()
+                .insert(lane_key, generation.to_string());
         }
         if documents.is_empty() {
             self.purge_project_graph_lane(project_id, graph_id, graph_source);
@@ -2688,6 +2702,24 @@ fn run_pass(
     outcome
 }
 
+/// Drop one lane's enqueued-generation intent after its replacement op
+/// failed. Returns whether the intent was removed.
+fn rollback_enqueued_graph_generation(
+    enqueued: &mut BTreeMap<(String, String, String), String>,
+    lane_key: (String, String, String),
+    generation: &str,
+) -> bool {
+    if enqueued
+        .get(&lane_key)
+        .is_some_and(|enqueued| enqueued == generation)
+    {
+        enqueued.remove(&lane_key);
+        true
+    } else {
+        false
+    }
+}
+
 fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
     let (kind, result): (&str, Result<()>) = match op {
         IndexWriteOp::UpsertKnowledge(entry) => (
@@ -2738,10 +2770,30 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &documents,
             ),
         ),
-        IndexWriteOp::ReplaceProjectGraphLane { documents } => (
-            "replace_project_graph_lane",
-            super::graph_docs::apply_graph_lane_replace(writer, ctx.fields, &documents),
-        ),
+        IndexWriteOp::ReplaceProjectGraphLane { documents } => {
+            let result =
+                super::graph_docs::apply_graph_lane_replace(writer, ctx.fields, &documents);
+            if result.is_err() {
+                // The enqueued-generation intent must describe an op that
+                // landed. A non-retryable failure rolls it back so a later
+                // activation of the same generation re-emits instead of
+                // skipping against an intent that never committed; a newer
+                // intent recorded meanwhile stays (its op is queued behind
+                // this one and still owns the lane's next state).
+                if let Some(key_document) = documents.first() {
+                    rollback_enqueued_graph_generation(
+                        &mut ctx.enqueued_graph_generations.lock(),
+                        (
+                            key_document.project_id.clone(),
+                            key_document.graph_id.clone(),
+                            key_document.graph_source.clone(),
+                        ),
+                        &key_document.graph_generation,
+                    );
+                }
+            }
+            ("replace_project_graph_lane", result)
+        }
         IndexWriteOp::PurgeProjectGraphLane {
             project_id,
             graph_id,
@@ -2964,6 +3016,47 @@ mod tests {
             std::sync::Arc::new(bbox_corpus_index::index::StaticProjectRecordsProvider::empty()),
         )
         .unwrap()
+    }
+
+    /// The lane-intent map must only describe replacements that landed: a
+    /// failed op rolls its own generation back, leaves a newer queued
+    /// generation alone, and tolerates an absent entry.
+    #[test]
+    fn failed_lane_replacement_rolls_back_only_its_own_generation_intent() {
+        let lane_key = (
+            "project".to_string(),
+            "graph".to_string(),
+            "published".to_string(),
+        );
+        let mut enqueued = BTreeMap::from([(lane_key.clone(), "generation-failed".to_string())]);
+        assert!(rollback_enqueued_graph_generation(
+            &mut enqueued,
+            lane_key.clone(),
+            "generation-failed",
+        ));
+        assert!(!enqueued.contains_key(&lane_key));
+
+        enqueued.insert(lane_key.clone(), "generation-newer".to_string());
+        assert!(!rollback_enqueued_graph_generation(
+            &mut enqueued,
+            lane_key.clone(),
+            "generation-failed",
+        ));
+        assert_eq!(
+            enqueued.get(&lane_key).map(String::as_str),
+            Some("generation-newer")
+        );
+
+        assert!(!rollback_enqueued_graph_generation(
+            &mut enqueued,
+            (
+                "other".to_string(),
+                "graph".to_string(),
+                "published".to_string()
+            ),
+            "generation-failed",
+        ));
+        assert_eq!(enqueued.len(), 1);
     }
 
     #[test]

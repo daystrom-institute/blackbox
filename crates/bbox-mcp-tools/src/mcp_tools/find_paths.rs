@@ -989,6 +989,71 @@ mod tests {
         }
     }
 
+    /// Fix-dedupe regression for the truncation disclosure: `visited` is
+    /// per-path, so a diamond makes the hub reachable along two paths and the
+    /// raw walk dequeues it twice. A hub that truncates must be reported once
+    /// in `truncated_expansions`, not once per arriving path.
+    #[test]
+    fn diamond_reachable_vertex_reports_one_truncation() {
+        let from = EntityRef::parse("knowledge:start").unwrap();
+        let mid1 = EntityRef::parse("knowledge:mid-1").unwrap();
+        let mid2 = EntityRef::parse("knowledge:mid-2").unwrap();
+        let hub = EntityRef::parse("knowledge:hub").unwrap();
+        let raw_targets = [from.clone(), mid1.clone(), mid2.clone(), hub.clone()];
+        let mut edges: Vec<Edge> = [
+            (from.clone(), mid1.clone()),
+            (from.clone(), mid2.clone()),
+            (mid1.clone(), hub.clone()),
+            (mid2.clone(), hub.clone()),
+        ]
+        .into_iter()
+        .map(|(source, target)| Edge {
+            source,
+            kind: "SUPERSEDES".into(),
+            target,
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+            project_id: None,
+        })
+        .collect();
+        for idx in 1..=6 {
+            edges.push(Edge {
+                source: hub.clone(),
+                kind: "SUPERSEDES".into(),
+                target: EntityRef::parse(&format!("knowledge:leaf-{idx}")).unwrap(),
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+                project_id: None,
+            });
+        }
+        edges.sort_by_key(|edge| raw_targets.iter().position(|t| *t == edge.source));
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let ctx = ProviderContext::empty_for_tests();
+
+        let (paths, truncated) = bfs(
+            &ctx,
+            &index,
+            from,
+            None,
+            Some(TargetTypeFilter::new(EntityType::Knowledge, None)),
+            None,
+            3,
+            30,
+            5,
+        );
+        assert_eq!(
+            paths.len(),
+            14,
+            "mid-1, mid-2, and the hub match the type filter too, plus five \
+             leaves along each diamond arm: {paths:?}"
+        );
+        assert_eq!(truncated.len(), 1, "{truncated:?}");
+        assert_eq!(truncated[0].vertex, hub);
+        assert_eq!(truncated[0].edge_count, 8);
+    }
+
     #[test]
     fn logical_graph_vertex_to_type_matches_provisional_overlay_vertices() {
         // gap-e41499a9: under a visibility policy that admits the overlay,

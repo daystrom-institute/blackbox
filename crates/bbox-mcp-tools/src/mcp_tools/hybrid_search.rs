@@ -2706,6 +2706,15 @@ mod graph_word_lane_pipeline {
                 "graph vertex hit must not surface a filesystem path: {:?}",
                 hit.relative_path
             );
+            let properties = index
+                .entity_properties(&hit.entity_id)
+                .unwrap()
+                .expect("vertex document must project properties");
+            assert!(
+                !properties.contains_key("file_path"),
+                "projected graph vertex properties must not carry file_path: {:?}",
+                properties
+            );
         }
         assert!(
             response

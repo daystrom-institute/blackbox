@@ -1740,9 +1740,12 @@ pub(crate) fn converge_published_graph_word_lanes(
 /// replacement (g13 drops the whole index) leaves the lanes empty until the
 /// next accept. Driving one install per published catalog project at boot
 /// closes both: the install's converge step purges lanes that left the
-/// accepted view or lost text retrieval, and re-emits the rest. Per-project
-/// failure degrades with a warning, matching the boot scan's policy; bridge
-/// mode has no accepted-publication runtime and reconciles nothing.
+/// accepted view or lost text retrieval, and re-emits the rest. The lane
+/// writes then settle asynchronously through the writer queue, so queries
+/// that race ahead of the queue may briefly see the previous lane state.
+/// Per-project failure degrades with a warning, matching the boot scan's
+/// policy; bridge mode has no accepted-publication runtime and reconciles
+/// nothing.
 pub(crate) fn reconcile_published_graph_word_lanes_at_boot(
     state: &SharedState,
     projects: impl IntoIterator<Item = ProjectId>,

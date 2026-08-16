@@ -1102,20 +1102,32 @@ pub(super) fn open_shared_state(
     // (and a schema-replacement rebuild leaves every lane empty until then).
     // One published-view install per catalog project converges both cases.
     if let Some(store) = &catalog_store {
-        let published_projects: Vec<bbox_corpus_core::project_catalog::ProjectId> = store
-            .snapshot()
-            .context("catalog snapshot for the boot graph view reconcile")?
-            .catalog()
-            .projects
-            .iter()
-            .filter(|(_, project)| {
-                matches!(
-                    project.scope,
-                    bbox_corpus_core::project_catalog::ProjectScope::Published(_)
-                )
-            })
-            .map(|(project_id, _)| project_id.clone())
-            .collect();
+        let published_projects: Vec<bbox_corpus_core::project_catalog::ProjectId> =
+            match store.snapshot() {
+                Ok(snapshot) => snapshot
+                    .catalog()
+                    .projects
+                    .iter()
+                    .filter(|(_, project)| {
+                        matches!(
+                            project.scope,
+                            bbox_corpus_core::project_catalog::ProjectScope::Published(_)
+                        )
+                    })
+                    .map(|(project_id, _)| project_id.clone())
+                    .collect(),
+                Err(error) => {
+                    // Degrade-and-warn, matching the reconcile's own
+                    // per-project policy: a snapshot failure skips this boot
+                    // pass, and the next install (or a later boot) converges
+                    // the lanes rather than taking the whole daemon down.
+                    tracing::warn!(
+                        error = %error,
+                        "catalog snapshot failed; skipping boot graph view reconcile"
+                    );
+                    Vec::new()
+                }
+            };
         super::knowledge_view::reconcile_published_graph_word_lanes_at_boot(
             &shared,
             published_projects,
