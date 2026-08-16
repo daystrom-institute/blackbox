@@ -2918,7 +2918,6 @@ mod tests {
             text_properties: Vec::new(),
             logical_ref: entity_id.clone(),
             entity_id,
-            source_path: format!("/tmp/checkout/.bbox/graphs/{graph_id}/vertices.jsonl"),
         }
     }
 
@@ -4348,7 +4347,6 @@ mod tests {
                 text_properties: Vec::new(),
                 logical_ref: entity_id.clone(),
                 entity_id,
-                source_path: "/tmp/checkout/.bbox/graphs/governance-record/vertices.jsonl".into(),
             }
         }
 

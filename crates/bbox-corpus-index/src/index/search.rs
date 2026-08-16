@@ -4419,15 +4419,34 @@ mod graph_word_lane_tests {
             );
         }
 
+        // Hand-authored relevance labels, independent of the system under
+        // test, so MRR/recall can actually go red; cross-index absolute BM25
+        // scores necessarily shift with corpus growth (idf), which is why the
+        // gate is order stability plus the same-index bit-identical score
+        // check above rather than score equality between control and
+        // treatment.
+        let expected_relevant: &[&[&str]] = &[
+            &[
+                "transcript:claude:sess-r1:0:0",
+                "transcript:claude:sess-r2:0:0",
+            ],
+            &["transcript:claude:sess-r3:0:0"],
+        ];
         let mut per_query: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-        for query in ["quarterly settlement", "monthly settlement"] {
+        for (query, expected) in ["quarterly settlement", "monthly settlement"]
+            .iter()
+            .zip(expected_relevant)
+        {
             let control_order = transcript_hits_for_query(&control, None, query);
             let treatment_order = transcript_hits_for_query(&treatment, Some(&authority()), query);
             assert_eq!(
                 treatment_order, control_order,
                 "graph documents must not reorder the non-graph corpus for {query:?}"
             );
-            per_query.push((treatment_order, control_order));
+            per_query.push((
+                treatment_order,
+                expected.iter().map(|id| id.to_string()).collect(),
+            ));
         }
 
         let report = bbox_corpus_core::search::metrics::aggregate(&per_query, &[3]);

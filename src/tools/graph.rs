@@ -1026,7 +1026,7 @@ impl BlackboxServer {
                 server.project_graph_list_domain(p.project.as_deref(), p.provisional.as_deref())?;
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
-                "visibility": p.provisional,
+                "provisional": p.provisional,
                 "graphs": graphs,
             }))?)
         })

@@ -52,8 +52,6 @@ pub struct GraphVertexIndexDocument {
     pub entity_id: String,
     /// Logical ref, equal to the entity id on the published plane.
     pub logical_ref: String,
-    /// Provenance pseudo-path of the vertex's source file.
-    pub source_path: String,
 }
 
 /// Whether a projected vertex is schema-as-data rather than an authored fact.
@@ -79,11 +77,6 @@ pub fn published_graph_vertex_documents(
         return Vec::new();
     }
     let graph_id = generation.key.graph_id.clone();
-    let source_path = generation
-        .source_root
-        .join("vertices.jsonl")
-        .to_string_lossy()
-        .into_owned();
     let mut documents = Vec::new();
     for vertex in generation.vertices.values() {
         if is_meta_vertex(vertex) {
@@ -134,7 +127,6 @@ pub fn published_graph_vertex_documents(
             text_properties,
             logical_ref: entity_id.clone(),
             entity_id,
-            source_path: source_path.clone(),
         });
     }
     documents
@@ -184,7 +176,6 @@ pub fn build_graph_vertex_doc(
     doc.add_text(f.graph_vertex_type, &source.vertex_type);
     doc.add_text(f.chunk_hash, graph_vertex_chunk_hash(source));
     doc.add_text(f.chunk_kind, GRAPH_VERTEX_DOC_TYPE);
-    doc.add_text(f.file_path, &source.source_path);
     let mut content = source.label.clone();
     for value in &source.text_properties {
         content.push('\n');
@@ -470,8 +461,11 @@ mod tests {
         assert_eq!(documents[0].vertex_id, "vertex/Alpha");
     }
 
+    /// Builder-only claim: the committed-index half (a policy flip driving
+    /// whole-lane replacement down to an empty, absent lane) is asserted in
+    /// writer_actor's graph_lane_replacement_is_generation_gated_and_policy_flip_purges.
     #[test]
-    fn policy_disabled_graph_emits_no_documents() {
+    fn policy_disabled_graph_emits_no_builder_documents() {
         let mut schema = schema_with(annotated_schema());
         schema.index_policy.text_retrieval_enabled = false;
         let generation = generation(schema, &["Alpha"]);

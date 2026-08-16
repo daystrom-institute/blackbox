@@ -902,7 +902,11 @@ mod tests {
             30,
             16,
         );
-        assert_eq!(paths.len(), 10, "every readable neighbor survives: {paths:?}");
+        assert_eq!(
+            paths.len(),
+            10,
+            "every readable neighbor survives: {paths:?}"
+        );
         assert!(
             truncated.is_empty(),
             "admitted count is 10, so a 16 cap must not truncate: {truncated:?}"

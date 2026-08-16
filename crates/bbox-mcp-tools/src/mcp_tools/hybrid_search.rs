@@ -2459,18 +2459,18 @@ mod graph_word_lane_pipeline {
             text_properties: vec!["quarterly settlement record".to_string()],
             entity_id: format!("project_graph_vertex:{project_id}:{graph_id}:{vertex_id}"),
             logical_ref: format!("project_graph_vertex:{project_id}:{graph_id}:{vertex_id}"),
-            source_path: format!("/{project_id}/{graph_id}/vertices.jsonl"),
         }
     }
 
-    /// A real TranscriptIndex on a leaked tempdir (the reader keeps files
-    /// open, so the directory must outlive the test). No roots, no records:
-    /// the graph documents are added directly through the writer, exactly the
-    /// way the activation path emits them.
-    fn index_with_documents(documents: &[GraphVertexIndexDocument]) -> TranscriptIndex {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.keep().canonicalize().unwrap();
-        let state = root.join("state");
+    /// A real TranscriptIndex on a caller-held tempdir (the reader keeps
+    /// files open, so the directory must outlive the index). No roots, no
+    /// records: the graph documents are added directly through the writer,
+    /// exactly the way the activation path emits them.
+    fn index_with_documents(
+        root: &std::path::Path,
+        documents: &[GraphVertexIndexDocument],
+    ) -> TranscriptIndex {
+        let state = root.canonicalize().unwrap().join("state");
         let index = TranscriptIndex::open_or_create_with_records(
             &state.join("index"),
             Vec::new(),
@@ -2541,12 +2541,16 @@ mod graph_word_lane_pipeline {
     /// type, and logical ref alongside the structured project id.
     #[test]
     fn plain_query_finds_graph_vertex_with_identity_fields() {
-        let index = index_with_documents(&[vertex_doc(
-            PROJECT,
-            "governance-record",
-            "record-1",
-            "Alpha settlement record",
-        )]);
+        let directory = tempfile::tempdir().unwrap();
+        let index = index_with_documents(
+            directory.path(),
+            &[vertex_doc(
+                PROJECT,
+                "governance-record",
+                "record-1",
+                "Alpha settlement record",
+            )],
+        );
         let response = search(&index, &params("quarterly settlement record"), None);
 
         assert_eq!(response.results.len(), 1, "{}", response.text);
@@ -2574,26 +2578,30 @@ mod graph_word_lane_pipeline {
     /// selection narrows within the project.
     #[test]
     fn project_scope_and_graph_selection_reach_the_word_lane() {
-        let index = index_with_documents(&[
-            vertex_doc(
-                PROJECT,
-                "governance-record",
-                "record-1",
-                "Alpha settlement record",
-            ),
-            vertex_doc(
-                PROJECT,
-                "other-record",
-                "record-2",
-                "Beta settlement record",
-            ),
-            vertex_doc(
-                FOREIGN_PROJECT,
-                "governance-record",
-                "record-9",
-                "Foreign settlement record",
-            ),
-        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let index = index_with_documents(
+            directory.path(),
+            &[
+                vertex_doc(
+                    PROJECT,
+                    "governance-record",
+                    "record-1",
+                    "Alpha settlement record",
+                ),
+                vertex_doc(
+                    PROJECT,
+                    "other-record",
+                    "record-2",
+                    "Beta settlement record",
+                ),
+                vertex_doc(
+                    FOREIGN_PROJECT,
+                    "governance-record",
+                    "record-9",
+                    "Foreign settlement record",
+                ),
+            ],
+        );
 
         let mut scoped = params("settlement record");
         scoped.resolved_project_id = Some(PROJECT.to_string());
@@ -2634,20 +2642,24 @@ mod graph_word_lane_pipeline {
     /// list even though its documents sit in the index.
     #[test]
     fn plane_selection_and_policy_snapshot_filter_before_ranking() {
-        let index = index_with_documents(&[
-            vertex_doc(
-                PROJECT,
-                "governance-record",
-                "record-1",
-                "Alpha settlement record",
-            ),
-            vertex_doc(
-                PROJECT,
-                "secret-record",
-                "record-2",
-                "Beta settlement record",
-            ),
-        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let index = index_with_documents(
+            directory.path(),
+            &[
+                vertex_doc(
+                    PROJECT,
+                    "governance-record",
+                    "record-1",
+                    "Alpha settlement record",
+                ),
+                vertex_doc(
+                    PROJECT,
+                    "secret-record",
+                    "record-2",
+                    "Beta settlement record",
+                ),
+            ],
+        );
 
         let mut provisional = params("settlement record");
         provisional.graph_source = Some(vec!["provisional".to_string()]);
@@ -2675,21 +2687,26 @@ mod graph_word_lane_pipeline {
         assert!(ids[0].contains(":governance-record:"));
     }
 
-    /// Design 4.1: graph documents are excluded from file dedup and file
-    /// aggregation explicitly. Two vertices stamped with the same provenance
-    /// path are two addressable units and must both surface, not collapse to
-    /// the better-scoring one the way same-file chunks do.
+    /// Design 4.1: vertex documents carry no file stamp at all, so file
+    /// dedup and file aggregation have nothing to key on. Two vertices of one
+    /// graph are two addressable units and must both surface, and neither may
+    /// grow a filesystem path on the result wire.
     #[test]
-    fn graph_vertices_are_not_collapsed_by_file_dedup() {
-        let mut first = vertex_doc(PROJECT, "governance-record", "record-1", "Alpha settlement");
-        let mut second = vertex_doc(PROJECT, "governance-record", "record-2", "Beta settlement");
-        second.graph_generation = GENERATION.to_string();
-        first.source_path = "/same/vertices.jsonl".to_string();
-        second.source_path = "/same/vertices.jsonl".to_string();
-        let index = index_with_documents(&[first, second]);
+    fn graph_vertices_carry_no_file_path_and_never_collapse() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = vertex_doc(PROJECT, "governance-record", "record-1", "Alpha settlement");
+        let second = vertex_doc(PROJECT, "governance-record", "record-2", "Beta settlement");
+        let index = index_with_documents(directory.path(), &[first, second]);
 
         let response = search(&index, &params("settlement"), None);
         assert_eq!(response.results.len(), 2, "{}", response.text);
+        for hit in &response.results {
+            assert!(
+                hit.relative_path.is_none(),
+                "graph vertex hit must not surface a filesystem path: {:?}",
+                hit.relative_path
+            );
+        }
         assert!(
             response
                 .results
