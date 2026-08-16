@@ -1730,6 +1730,66 @@ pub(crate) fn converge_published_graph_word_lanes(
     }
 }
 
+/// Reconcile the published graph views and their word lanes at boot
+/// (unified-retrieval design 7.1).
+///
+/// `project_graph_views` is in-memory and only populated by accept-advance
+/// and checkout-bind, but graph word-lane documents are durable. Without
+/// this pass, a graph disabled or removed while the daemon was down stays
+/// searchable with stale documents until the next install, and a schema
+/// replacement (g13 drops the whole index) leaves the lanes empty until the
+/// next accept. Driving one install per published catalog project at boot
+/// closes both: the install's converge step purges lanes that left the
+/// accepted view or lost text retrieval, and re-emits the rest. Per-project
+/// failure degrades with a warning, matching the boot scan's policy; bridge
+/// mode has no accepted-publication runtime and reconciles nothing.
+pub(crate) fn reconcile_published_graph_word_lanes_at_boot(
+    state: &SharedState,
+    projects: impl IntoIterator<Item = ProjectId>,
+) {
+    let Some(runtime) = &state.accepted_publications else {
+        return;
+    };
+    let mut installed = 0usize;
+    let mut skipped = 0usize;
+    for project_id in projects {
+        let verified = match runtime.load_verified(&project_id) {
+            Ok(verified) => verified,
+            Err(error) => {
+                // The pre-bind scan already reported published-capability
+                // damage per project; reconciling that project's lanes is
+                // neither possible nor needed until its pointer recovers.
+                tracing::debug!(
+                    project_id = %project_id,
+                    code = error.code(),
+                    "boot graph view reconcile skipped: no verified accepted content"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
+            Ok(view) => {
+                install_published_graph_view(state, view);
+                installed += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %error,
+                    "boot graph view reconcile failed; graph reads may serve stale content"
+                );
+                skipped += 1;
+            }
+        }
+    }
+    tracing::info!(
+        installed,
+        skipped,
+        "published graph views reconciled at boot"
+    );
+}
+
 // ── Catalog overlay baseline path (plan section 8, P5-D) ─────────────────
 
 /// `own` refuses with this code and carries the exact underlying overlay or
