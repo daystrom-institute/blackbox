@@ -23,9 +23,10 @@ Each graph tool is shaped to feed the next.
 
 Output: ranked entity refs, each with a `notable_edges` preview.
 
-`bbox_hybrid_search` is the default search call. It blends lexical,
-file-level, and vector lanes. `bbox_discover_seed_entities` is the same
-orientation pattern with notable edges rendered inline for each seed.
+`bbox_hybrid_search` is the default search call. It fuses four lane
+families: lexical chunk, file-level lexical, knowledge, and per-route
+vector lanes. `bbox_discover_seed_entities` is the same orientation
+pattern with notable edges rendered inline for each seed.
 
 The important behavior is that search returns graph refs, not just text.
 The next call can inspect those refs without reconstructing paths or
@@ -107,11 +108,13 @@ types are:
 | `thread` | Persistent work across sessions | "what is still active?" |
 | `note` | Structured side-channel records | "what did the executor flag?" |
 | `symbol` | Named code symbols | "what calls or defines this?" |
+| `symbol_v2` | Snapshot-scoped code symbols | "which definition is live?" |
 | `brofile` | Persona/model/lens triple | "which agent produced this?" |
 | `whiteboard` | Multi-agent deliberation state | "what is on the board?" |
 | `commit` | Git commit metadata and touched files | "when did this change?" |
 | `task` | A dispatched bro unit | "what produced this artifact?" |
 | `bash_call` | One shell invocation in a transcript | "what did this command emit?" |
+| `project_graph_vertex` | A project-graph vertex (provisional refs cover working generations) | "what does the graph say about X?" |
 
 One Tantivy document is indexed per content block, not per session. A
 long session yields many searchable blocks with independent roles and
@@ -123,50 +126,99 @@ Edges are directional and typed.
 
 | Family | Edge kinds |
 |---|---|
-| Structural | `IN_FILE`, `IN_SESSION`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`, `THREAD_HAS_SESSION` |
+| Structural | `IN_FILE`, `IN_SESSION`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES` |
 | AST | `DEFINED_IN`, `CONTAINS_SYMBOL`, `CALLS`, `USES_TYPE`, `HAS_FIELD`, `IMPLEMENTS_TRAIT` |
-| Knowledge | `SUPERSEDES`, `DERIVED_FROM`, `CONTRADICTS`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
+| Knowledge | `SUPERSEDES`, `DERIVED_FROM`, `Contradicts`, `RelatesTo`, `TensionWith`, `Supports`, `DependsOn`, `References`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
 | Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
 | Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
+| Roadmap | `ROADMAP_SPAWNS`, `ROADMAP_DEFERRED_FROM`, `ROADMAP_DESIGNED_IN`, `ROADMAP_DEPENDS_ON`, `ROADMAP_BLOCKED_BY`, `ROADMAP_SUPERSEDES`, `ROADMAP_SUBSUMES`, `ROADMAP_RELATED_TO` |
 | Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
 | Tool-call | `EDITED_FILE`, `EDITED_BY_SESSION`, `READ_FILE`, `RAN_BASH` |
 
 The EdgeIndex is built from per-project JSONL sidecars plus live
-knowledge, thread, and note stores.
+knowledge, thread, note, and roadmap stores, with virtual edges for
+tasks and tool calls.
 
 ## Hybrid search mechanics
 
-`bbox_hybrid_search` fuses three ranked lists with Reciprocal Rank
-Fusion, then applies result-shaping passes.
+`bbox_hybrid_search` fuses four lane families with weighted Reciprocal
+Rank Fusion, layers a rerank stage over the fused order, then applies
+result-shaping passes.
 
 ### Ranked lanes
 
 | Lane | Source | Why it exists |
 |---|---|---|
-| BM25 chunk | Tantivy fields such as `content`, `code_content`, `symbol`, `path_tokens` | Precise lexical recall |
-| BM25 file | Aggregate score per file | Lifts files with many sparse mentions |
-| Vector | HNSW over route-specific embeddings | Catches paraphrases and concept matches |
+| BM25 chunk | Tantivy fields such as `content`, `code_content`, `symbol`, `commit_author_name`, `path_tokens` | Precise lexical recall |
+| BM25 file | Chunk scores summed per `(project_id, rel_path_hash)` over the full BM25 fetch | Lifts files with many sparse mentions |
+| Knowledge | Authorized knowledge search, resolved outside the static index | Joins fusion only when it has hits, under session visibility policy |
+| Vector | HNSW over per-route embeddings | Catches paraphrases and concept matches |
 
-`path_tokens` and `symbol` are boosted so code-shaped queries can find
-paths and definitions without exact prose matches.
+In the BM25 query, `path_tokens` and `symbol` carry a 1.5 field boost, so
+code-shaped queries find paths and definitions without exact prose
+matches. A single-token query that looks like a code symbol adds a
+`symbol_exact` clause boosted 6.0, lifting the defining chunk above
+passing textual mentions.
+
+The BM25 chunk list is truncated to the fusion fetch window, but the
+file-level aggregation sums scores over the full (deeper) BM25 fetch, so
+a file whose mentions are spread across many chunks still surfaces. The
+knowledge lane is searched separately because provisional-visibility
+policy must be resolved against the caller's session before fusion.
+
+Vector lanes are per route: the router walks the configured text buckets
+(`code`, `docs`, `knowledge`, `transcripts`, `git_message`, `notes`,
+`threads`, `agent_manifest`) plus any configured visual routes, and each
+active partition contributes its own ranked list.
 
 ### RRF fusion
 
 ```text
-score(d) = sum(1 / (60 + rank(d, lane_i)))
+score(d) = sum(weight(lane_i) / (60 + rank(d, lane_i)))
 ```
 
-The smoothing constant keeps one strong lane from fully suppressing
-items that are consistently good across several lanes.
+The smoothing constant (`RRF_K = 60.0`) keeps one strong lane from fully
+suppressing items that are consistently good across several lanes.
+`vector_weight` defaults to `0.6` and is clamped to `[0.0, 1.0]`; the
+BM25-family lanes carry `1.0 - vector_weight`, so `0.0` is BM25-only and
+`1.0` is vector-only.
+
+### Rerank stage
+
+After fusion, candidates pass through one of three rerank modes:
+
+- `model` (default): the fused top-k are re-scored by the configured
+  Voyage cross-encoder (`rerank-2.5-lite` by default); model-scored
+  candidates land in a strictly higher score band than the unsent tail.
+- `heuristic`: type and temporal multipliers only (confirmed knowledge
+  `1.35`, imported `0.85`, doc sections `1.20`; temporal decay clamped
+  to `[0.50, 1.25]`), capped at `1.75` over the fused score.
+- `none`: raw fusion order.
+
+A rerank API failure degrades to the heuristic path and reports
+`degraded.rerank_unavailable` rather than failing the search.
 
 ### Post-processing
 
-Applied after fusion:
+Applied after the rerank stage:
 
-1. Project filter: keeps local project-file refs when `project=` is set.
-2. Per-file collapse: avoids returning many chunks from one file.
-3. Modal diversification: preserves a mix of code, docs, and commits.
-4. Symbol exact boost: raises defining chunks for exact symbol queries.
+1. Project filter: keeps local project-file and thread refs when
+   `project=` is set; project-agnostic types pass through.
+2. `doc_type` filter: drops results whose type differs when set.
+3. Per-file collapse: keeps only the best chunk per file.
+4. Modal diversification: preserves a mix of `code_block`,
+   `doc_section`, and `git_message` in the final window.
+
+### In progress: graph vertex documents
+
+A sibling lane is implementing
+[Unified Retrieval For Reflective Graph Vertices](../design/connectors/unified-retrieval.md),
+milestone M9 of the graph-native connector campaign: project-graph
+vertices become word-indexed (and optionally vector-indexed) documents
+under per-graph policy, with authority filters running before ranking.
+That design is in progress; until it lands, graph vertices remain
+reachable only through exact-ref inspection and traversal, not
+`bbox_hybrid_search`.
 
 ## Provider behavior
 
