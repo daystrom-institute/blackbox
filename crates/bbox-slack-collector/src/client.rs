@@ -37,8 +37,11 @@ use reqwest::Client;
 
 use crate::cycle::ConversationSink;
 
-/// Retries after a transport failure or a 5xx, bounded so a hard-down corpus
-/// still returns control to the watch loop within one cycle's lifetime.
+/// Retries after a transport failure or a 5xx, bounded in BOTH dimensions a
+/// watch loop cares about: by COUNT (three retries) and by WALL CLOCK (a 10s
+/// connect timeout and a 30s whole-request timeout per attempt, plus the
+/// 5+15+30s backoff ladder), so a hard-down corpus still returns control to
+/// the watch loop within one cycle's lifetime.
 const CORPUS_RETRIES: u32 = 3;
 const CORPUS_RETRY_BACKOFF_SECS: [u64; 3] = [5, 15, 30];
 
@@ -48,7 +51,7 @@ pub struct ConversationSourceClient {
     http: Client,
     /// Injectable so the retry tests do not pay real seconds. Production gets
     /// [`CORPUS_RETRY_BACKOFF_SECS`].
-    retry_backoff_secs: Vec<u64>,
+    retry_backoff_secs: &'static [u64],
 }
 
 impl std::fmt::Debug for ConversationSourceClient {
@@ -88,6 +91,12 @@ impl ConversationSourceClient {
                 // credential-forwarding primitive and this request carries a
                 // bearer.
                 .redirect(reqwest::redirect::Policy::none())
+                // The wall-clock halves of the bounded-cycle claim: a corpus
+                // that accepts connections but never answers must not hold a
+                // cycle hostage for the socket's default lifetime. Mirrors
+                // the Slack client's budgets.
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
                 // Presence, not telemetry: the daemon records the User-Agent
                 // of each authenticated producer contact so a silent satellite
                 // is distinguishable from a missing one on the status surface.
@@ -96,7 +105,7 @@ impl ConversationSourceClient {
                 .map_err(|error| {
                     anyhow!("building the conversation-source HTTP client: {error}")
                 })?,
-            retry_backoff_secs: CORPUS_RETRY_BACKOFF_SECS.to_vec(),
+            retry_backoff_secs: &CORPUS_RETRY_BACKOFF_SECS,
         })
     }
 
@@ -312,6 +321,12 @@ mod tests {
         ConversationSourceClient::new(private, "bearer", false).unwrap_err();
         ConversationSourceClient::new(private, "bearer", true).unwrap();
 
+        // The deployed shape: a cluster-internal service NAME, admitted as the
+        // operator's assertion that the hop is private.
+        let hostname = "http://corpus.internal:7264";
+        ConversationSourceClient::new(hostname, "bearer", false).unwrap_err();
+        ConversationSourceClient::new(hostname, "bearer", true).unwrap();
+
         let public = "http://203.0.113.10:7264";
         let error = ConversationSourceClient::new(public, "bearer", true)
             .unwrap_err()
@@ -339,20 +354,38 @@ mod tests {
         assert_eq!(query[1].1, "slack");
     }
 
+    /// The ladder is fixed policy, so pin it: three retries, backoffs of
+    /// 5+15+30 seconds, and one backoff slot per retry. The wall-clock cost
+    /// of a hard-down corpus (backoff plus per-attempt timeouts) is derived
+    /// from exactly these numbers, which is why they may not drift silently.
+    #[test]
+    fn the_retry_ladder_is_pinned() {
+        assert_eq!(CORPUS_RETRY_BACKOFF_SECS, [5, 15, 30]);
+        assert_eq!(
+            CORPUS_RETRY_BACKOFF_SECS.len(),
+            usize::try_from(CORPUS_RETRIES).unwrap(),
+            "one backoff slot per retry, or a retry would sleep zero"
+        );
+    }
+
     /// A corpus that answers 503 twice and then succeeds: the call must ride
-    /// out the blip rather than costing the whole cycle.
+    /// out the blip rather than costing the whole cycle, and it must do so
+    /// in exactly three sends.
     #[tokio::test]
     async fn a_5xx_blip_is_retried_and_the_call_succeeds() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = seen.clone();
         let app = axum::Router::new().route(
             "/internal/conversation-source/v1/cursors",
-            axum::routing::get(|| async {
-                static FAILURES: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let seen = FAILURES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if seen < 2 {
-                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    let seen = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if seen < 2 {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    axum::Json(fixed_cursors()).into_response()
                 }
-                axum::Json(fixed_cursors()).into_response()
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -361,7 +394,7 @@ mod tests {
 
         let mut client = ConversationSourceClient::new(base_url, "bearer", false)
             .expect("loopback corpus is safe");
-        client.retry_backoff_secs = Vec::new();
+        client.retry_backoff_secs = &[];
         let cursors: ConversationCursorsResponseV1 = client
             .round_trip("the corpus cursors call", || {
                 client
@@ -372,6 +405,57 @@ mod tests {
             .await
             .expect("two 503s are a blip, not an outage");
         assert_eq!(cursors.channels.len(), 1);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two failures plus the success: exactly three sends"
+        );
+    }
+
+    /// The count bound is real: a corpus that is hard down is asked exactly
+    /// four times (the initial attempt plus three retries), the ladder
+    /// exhausts itself, and the error names the budget it burned.
+    #[tokio::test]
+    async fn a_hard_down_corpus_is_asked_exactly_four_times_then_fails() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = seen.clone();
+        let app = axum::Router::new().route(
+            "/internal/conversation-source/v1/cursors",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut client = ConversationSourceClient::new(base_url, "bearer", false)
+            .expect("loopback corpus is safe");
+        client.retry_backoff_secs = &[];
+        let error = client
+            .round_trip::<ConversationCursorsResponseV1>("the corpus cursors call", || {
+                client
+                    .http
+                    .get(client.url("/internal/conversation-source/v1/cursors"))
+                    .bearer_auth(&client.bearer)
+            })
+            .await
+            .expect_err("a hard-down corpus must fail, not hang");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "initial attempt plus exactly three retries"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("kept failing after 3 retries"),
+            "the error must name the exhausted budget: {rendered}"
+        );
+        assert!(rendered.contains("503"), "{rendered}");
     }
 
     /// A 4xx is the daemon's answer to this request. Retrying it would burn
@@ -396,7 +480,7 @@ mod tests {
 
         let mut client = ConversationSourceClient::new(base_url, "bearer", false)
             .expect("loopback corpus is safe");
-        client.retry_backoff_secs = Vec::new();
+        client.retry_backoff_secs = &[];
         let error = client
             .round_trip::<ConversationCursorsResponseV1>("the corpus cursors call", || {
                 client
@@ -435,7 +519,7 @@ mod tests {
 
         let mut client = ConversationSourceClient::new(base_url, "bearer", false)
             .expect("loopback corpus is safe");
-        client.retry_backoff_secs = Vec::new();
+        client.retry_backoff_secs = &[];
         let error = client
             .round_trip::<ConversationCursorsResponseV1>("the corpus cursors call", || {
                 client

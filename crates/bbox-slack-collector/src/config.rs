@@ -325,6 +325,21 @@ impl SatelliteConfig {
         if self.sweep.window_secs == 0 {
             bail!("sweep.window_secs must be greater than zero");
         }
+        // An unparseable Since horizon must fail HERE, at startup: the cycle
+        // turns it into "backfill disabled" (no floor), which would otherwise
+        // report a complete, healthy backfill that never runs.
+        if let BackfillHorizon::Since { ts } = &self.backfill.horizon
+            && ts
+                .split('.')
+                .next()
+                .and_then(|secs| secs.parse::<i64>().ok())
+                .is_none()
+        {
+            bail!(
+                "backfill.horizon ts must be a Slack message timestamp like \
+                 \"1750000000.000000\", got \"{ts}\""
+            );
+        }
         if self.sweep.page_limit == 0 || self.sweep.page_limit > 1_000 {
             bail!("sweep.page_limit must be in 1..=1000");
         }
@@ -526,6 +541,22 @@ token_secret_ref = "op://producer/slack-bot/token"
         let config = parse(&text).unwrap();
         assert!(config.backfill.enabled());
         assert_eq!(config.backfill.horizon, BackfillHorizon::Days { days: 30 });
+    }
+
+    #[test]
+    fn an_unparseable_since_horizon_fails_at_startup() {
+        // The cycle would silently treat this as "backfill off"; validate must
+        // say so instead, because the report block would otherwise claim a
+        // complete healthy backfill that never runs.
+        let text = format!("{MINIMAL}\n[backfill.horizon]\nmode = \"since\"\nts = \"yesterday\"\n");
+        let error = parse(&text).unwrap_err().to_string();
+        assert!(error.contains("backfill.horizon"), "{error}");
+        assert!(error.contains("Slack message timestamp"), "{error}");
+
+        let text = format!(
+            "{MINIMAL}\n[backfill.horizon]\nmode = \"since\"\nts = \"1750000000.000000\"\n"
+        );
+        parse(&text).expect("a Slack epoch ts is a valid since horizon");
     }
 
     #[test]

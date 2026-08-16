@@ -124,8 +124,9 @@ pub struct CycleOutcome {
     /// Enrolled channels whose backfill lane has NOT reached its floor: the
     /// horizon is still being walked for them. Zero with backfill off.
     pub channels_backfilling: u64,
-    /// The oldest backfill mark across enrolled channels, as an RFC3339
-    /// timestamp. `None` when no channel has walked a window yet.
+    /// The oldest backfill mark across enrolled channels, as a Slack epoch
+    /// `ts` string (whole seconds, the journal's own mark format). `None`
+    /// when no channel has walked a window yet.
     pub oldest_backfilled_to: Option<String>,
     pub normalization_skips: BTreeMap<String, u64>,
     /// Whether the reconciliation pass ran this cycle (it runs on a slower

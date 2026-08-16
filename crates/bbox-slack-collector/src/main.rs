@@ -126,6 +126,11 @@ async fn main() -> Result<()> {
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .context("installing the SIGTERM listener")?;
+            // The non-unix arm keeps the same shape so both `interrupt` call
+            // sites below compile everywhere: there is no SIGTERM to hold, so
+            // the placeholder carries nothing.
+            #[cfg(not(unix))]
+            let mut sigterm = ();
             let shutdown = Shutdown::default();
             // The one-app posture cannot refuse a write scope, so watch mode
             // states the whole grant at startup and re-states it whenever the
@@ -236,7 +241,7 @@ async fn interrupt(sigterm: &mut tokio::signal::unix::Signal) -> &'static str {
 }
 
 #[cfg(not(unix))]
-async fn interrupt() -> &'static str {
+async fn interrupt(_sigterm: &mut ()) -> &'static str {
     tokio::signal::ctrl_c().await.ok();
     "ctrl_c"
 }
@@ -247,8 +252,33 @@ async fn interrupt() -> &'static str {
 /// collector cannot refuse a write scope, so the operator's compensating
 /// control is SEEING the whole grant on every run.
 fn report(outcome: &bbox_slack_collector::CycleOutcome, slack: &SlackClient) {
-    let stats = slack.stats();
-    println!(
+    println!("{}", report_summary_line(outcome, &slack.stats()));
+    println!("granted scopes: {}", outcome.granted_scopes.join(", "));
+    if !outcome.write_scopes.is_empty() {
+        println!(
+            "write scopes on the shared credential (reported, not used): {}",
+            outcome.write_scopes.join(", ")
+        );
+    }
+    if !outcome.channels_skipped.is_empty() {
+        println!("channels not enrolled: {:?}", outcome.channels_skipped);
+    }
+    if !outcome.normalization_skips.is_empty() {
+        println!("messages not recorded: {:?}", outcome.normalization_skips);
+    }
+}
+
+/// The one-line summary `report` prints, split out so its keys are testable.
+///
+/// Key names are load-bearing: staleness is `max_channel_staleness_seconds`
+/// because backfill depth and producer staleness are different axes (design
+/// 5.5), and a key like `lag_seconds=` would re-conflate them the moment
+/// somebody grepped for it.
+fn report_summary_line(
+    outcome: &bbox_slack_collector::CycleOutcome,
+    stats: &bbox_slack_collector::slack::ClientStats,
+) -> String {
+    format!(
         "workspace {} channels={} landed={} duplicates={} thread_replies={} revisions={} \
          tombstones={} deferred_windows={} backfill_windows={} channels_backfilling={} \
          oldest_backfilled_to={} reconciled={} requests={} throttled={} \
@@ -271,18 +301,35 @@ fn report(outcome: &bbox_slack_collector::CycleOutcome, slack: &SlackClient) {
             .max_lag_seconds
             .map(|lag| lag.to_string())
             .unwrap_or_else(|| "none".to_string()),
-    );
-    println!("granted scopes: {}", outcome.granted_scopes.join(", "));
-    if !outcome.write_scopes.is_empty() {
-        println!(
-            "write scopes on the shared credential (reported, not used): {}",
-            outcome.write_scopes.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_report_line_names_staleness_and_never_lag() {
+        let line = report_summary_line(
+            &bbox_slack_collector::CycleOutcome {
+                workspace_id: "T0FIXTURE".into(),
+                max_lag_seconds: Some(42),
+                ..bbox_slack_collector::CycleOutcome::default()
+            },
+            &bbox_slack_collector::slack::ClientStats {
+                requests: 7,
+                throttled: 1,
+                ..Default::default()
+            },
         );
-    }
-    if !outcome.channels_skipped.is_empty() {
-        println!("channels not enrolled: {:?}", outcome.channels_skipped);
-    }
-    if !outcome.normalization_skips.is_empty() {
-        println!("messages not recorded: {:?}", outcome.normalization_skips);
+        assert!(line.contains("max_channel_staleness_seconds=42"), "{line}");
+        assert!(
+            !line.contains("lag_seconds="),
+            "lag_seconds would re-conflate staleness with backfill depth: {line}"
+        );
+        assert!(
+            line.contains("requests=7") && line.contains("throttled=1"),
+            "{line}"
+        );
     }
 }
