@@ -1,7 +1,7 @@
 ---
 title: "Graph-native connector campaign"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - connectors
@@ -23,23 +23,42 @@ date: 2026-08-11
 
 # Graph-native connector campaign
 
-Status: partial, re-grounded 2026-08-11 on the post-locality architecture;
-status refreshed 2026-08-13. **M1 is LANDED**: the reflective graph kernel
-shipped on `beta/blackbox-v2` on 2026-08-12 (`crates/bbox-project-graph`,
-descriptors, schema-as-data validation, atomic generations, the
-`project_graph_vertex` ref family, `bbox_project_graph_list/describe/
-validate`, provisional visibility through workspace-binding capture) and is
-proven live by `examples/graph-live-exercise.sh` plus a real external
-authoring exercise against production (a private project authored a domain
-graph end to end; findings on thread-a2062843). The non-git scope identity
-question (section 8 of `remote-source-connectors.md`) was RESOLVED by
-operator decision on 2026-08-12: grant-time operator-minted
-`connector_source_id` with provider coordinates as observations (knowledge
-4b7b8ab0); `gap-0c7ec76c` tracks the catalog implementation. Connector
-source projections and cross-entity evidence bindings (M2-M3) remain
-salvage donor material on `campaign/reflective-graph-r2-projection`
-(pre-locality base), to be ported against current contracts, never merged
-wholesale. Reverify contract names against code before building.
+Status: partial; grounded 2026-08-11 on the post-locality architecture,
+status refreshed 2026-08-16. Landed on `beta/blackbox-v2`:
+
+- **M1 (2026-08-12)**: the reflective graph kernel,
+  `crates/bbox-project-graph` - descriptors, schema-as-data validation,
+  atomic generations, the `project_graph_vertex` ref family,
+  `bbox_project_graph_list/describe/validate`, provisional visibility -
+  proven live by `examples/graph-live-exercise.sh` and a real external
+  authoring exercise (findings on thread-a2062843).
+- **M2-M3 (2026-08-13)**: source projections in
+  `crates/bbox-source-graph` (dedicated connector source-projection
+  store, atomic snapshot acceptance, `SourceProjectionStatus`) and
+  cross-entity evidence bindings in
+  `crates/bbox-project-graph/src/evidence.rs` with the
+  `.bbox/evidence/bindings.json` checkout lane.
+- **Connector identity (phase 0, 2026-08-12/13)**: operator-minted
+  `connector_source_id` grants in `crates/bbox-config` and
+  `ProjectScope::Connector(ConnectorScope)` in
+  `crates/bbox-corpus-core`.
+- **File-source transport (phase 1, 2026-08-13)**: `bbox-file-source`
+  wire crate, `bbox-file-collector` satellite, `bbox-file-source-store`
+  generation store.
+- **Slack conversation lane (M5b corpus lane, 2026-08-13)**:
+  `bbox-conversation-source`, `bbox-conversation-source-store`,
+  `bbox-slack-collector`, projected into the word index through the
+  transcript adapter (schema `agentic-corpus-g12-conversation-projection`).
+
+M4's API-dataset profile is designed, not landed; its contracts are
+owned by [API-Dataset Connector](api-dataset-connector.md)
+(`gap-0378c305`). M9 unified retrieval is designed and under active
+implementation by a sibling lane
+([Unified retrieval for reflective graph vertices](unified-retrieval.md),
+`gap-5d57d2bb`); treat neither as shipped. The pre-locality
+`campaign/reflective-graph-r2-projection` implementation is history: it
+was ported milestone by milestone against current contracts, never
+merged wholesale. Reverify contract names against code before building.
 
 ## 0. Outcome
 
@@ -98,8 +117,9 @@ What changed since the original writing is the substrate underneath: the
 locality program decomposed the monolith, moved the daemon into the cluster
 with zero checkout authority, and established the producer/collector transport
 as the only way bytes enter the corpus. Every milestone below now assumes that
-substrate; a salvage implementation of M1-M3 exists on the pre-locality branch
-and is inverted into the milestone notes where it applies.
+substrate; the pre-locality implementation of M1-M3 was ported onto it
+milestone by milestone, and the milestone notes retain its salvage-era
+wording as history.
 
 ## 2. Program invariants
 
@@ -399,6 +419,10 @@ later as a second worked example.
 
 ## 6. Milestone 0: contracts and custody matrix
 
+Status: accepted. The 2026-08-13 operator ratification settled the open
+M0 decision points (retained observation, schema shipping, index
+eligibility, scope identity); see the decision ledger.
+
 Deliverables:
 
 - authority table for schema, facts, edges, checkpoints, bytes, and witness
@@ -421,6 +445,8 @@ authority, plane, and retention owner named at every step.
 
 ## 7. Milestone 1: reflective graph kernel
 
+Status: LANDED 2026-08-12 in `crates/bbox-project-graph`.
+
 Implement the smallest accepted slice of the reflective project graph:
 
 - graph descriptors and schema documents;
@@ -435,19 +461,22 @@ Implement the smallest accepted slice of the reflective project graph:
 Keep lifecycle systems, epistemic frameworks, graph query languages, automatic
 knowledge promotion, and full-text indexing out of this milestone.
 
-Salvage note: the kernel was implemented once on the salvage branch as
-`crates/bbox-project-graph` (model, validation, store) with daemon wiring,
-a `project_graph_vertex` ref family in the entity-ref grammar, entity-provider
-integration, and `bbox_project_graph_list/describe/validate` tools. The port
-must re-cut the wiring against the current crate tree (the entity-ref and
-provider surfaces moved during the locality decomposition) and must place
-graph-fact reads behind the same published-vs-provisional visibility the
-knowledge lane uses, which the salvage implementation predates.
+History note: the kernel was first implemented on the pre-locality
+salvage branch as `crates/bbox-project-graph` (model, validation, store)
+with daemon wiring, a `project_graph_vertex` ref family in the
+entity-ref grammar, entity-provider integration, and
+`bbox_project_graph_list/describe/validate` tools. The port re-cut the
+wiring against the current crate tree (the entity-ref and provider
+surfaces moved during the locality decomposition) and placed graph-fact
+reads behind the same published-vs-provisional visibility the knowledge
+lane uses.
 
 Exit gate: two unrelated schemas can be loaded, validated, inspected, and
 traversed with no new Rust domain variants.
 
 ## 8. Milestone 2: source-managed graph projections
+
+Status: LANDED 2026-08-13 in `crates/bbox-source-graph`.
 
 Add connector authority without weakening project ownership:
 
@@ -466,8 +495,8 @@ stale or unresolved and remain diagnosable.
 Exit gate: a synthetic API-dataset connector advances a source graph through
 create, update, delete, checkpoint resume, and schema reprojection.
 
-Accepted implementation contract (carried from the salvage implementation,
-which proved it):
+Accepted implementation contract (first proven on the pre-locality
+branch, landed in `bbox-source-graph`):
 
 - connector-managed generations live in a dedicated source projection store,
   not under either project-authored graph root;
@@ -487,6 +516,10 @@ atomically, retain the prior generation for diagnosis.
 
 ## 9. Milestone 3: cross-graph and cross-entity evidence
 
+Status: LANDED 2026-08-13 in
+`crates/bbox-project-graph/src/evidence.rs`, with the
+`.bbox/evidence/bindings.json` checkout lane.
+
 Resolve the evidence endpoint limitation tracked by `gap-616857f8`:
 
 - graph vertices can be endpoints of generic Blackbox edges;
@@ -503,7 +536,8 @@ only gives the graph and evidence layers a stable generic reference boundary.
 Exit gate: a tenant record vertex traverses through a source vertex to a
 published project file, and the reverse traversal preserves provenance.
 
-Accepted implementation contract (carried from the salvage implementation):
+Accepted implementation contract (landed in
+`crates/bbox-project-graph/src/evidence.rs`):
 
 - tenant-owned bindings live in `.bbox/evidence/bindings.json`, outside both
   project-authored graph facts and connector-managed source snapshots; as
@@ -552,6 +586,14 @@ Two further notes on the implemented shape:
   shape a binary of that vintage could have produced.
 
 ## 10. Milestone 4: graph-aware connector runtime
+
+Status: partial. The shared transport and identity layers are landed for
+the file-tree and conversation profiles (`bbox-file-source`,
+`bbox-file-collector`, `bbox-file-source-store`,
+`bbox-conversation-source`, `bbox-conversation-source-store`,
+`bbox-slack-collector`). The API-dataset profile is designed, not
+landed; [API-Dataset Connector](api-dataset-connector.md) owns its
+contracts.
 
 Generalize the connector shape into composable profiles on the producer/corpus
 split, resolving the connector-class limitation tracked by `gap-0378c305`:
@@ -617,6 +659,11 @@ unknown fields and enum values according to policy, reconcile deletion, and
 survive a schema-version replay.
 
 ### Milestone 5b: Slack ingestion (corpus lane)
+
+Status: LANDED 2026-08-13 (corpus lane):
+`bbox-conversation-source`, `bbox-conversation-source-store`,
+`bbox-slack-collector`, projected into the word index through the
+transcript adapter.
 
 The Slack connector's v1 ships message ingestion into the conversation corpus
 without graph projection; its design, producer shape, cursors, and privacy
@@ -691,6 +738,10 @@ retains either valid, stale, or unresolved evidence bindings without fact loss.
 
 ## 15. Milestone 9: unified retrieval and evidence bundles
 
+Status: designed, under active implementation by a sibling lane
+(`gap-5d57d2bb`); treat as proposed, not landed. Do not document that
+lane's in-flight code as shipped behavior.
+
 Owned in detail by [Unified retrieval for reflective graph vertices](unified-retrieval.md),
 which resolves the design frame for `gap-5d57d2bb`: meaning-bearing vertex
 kinds and the per-graph policy extension, the indexing seam and its
@@ -755,19 +806,19 @@ all pass integration tests.
 
 ## 17. Release increments
 
-| Release | Useful capability | Included milestones |
-|---|---|---|
-| R0 | Accepted contracts and fixtures | M0 |
-| R1 | Project-defined reflective graphs | M1 |
-| R2 | Rebuildable source graphs and generic evidence endpoints | M2-M3 |
-| R3 | File-tree and API-dataset profiles on one runtime | M4 |
-| R3b | Slack messages corpus-searchable | M5b |
-| R4 | Inspectable Xero semantic projection from fixtures | M5 |
-| R5 | Project-code to bounded Xero file evidence | M6 |
-| R6 | Durable Xero books overlay | M7 |
-| R7 | Tenant record overlay with explicit mappings | M8 |
-| R8 | Unified graph, evidence, and content retrieval | M9 |
-| R9 | Hosted, auditable Xero operation | M10 |
+| Release | Useful capability | Included milestones | Status |
+|---|---|---|---|
+| R0 | Accepted contracts and fixtures | M0 | Accepted |
+| R1 | Project-defined reflective graphs | M1 | LANDED |
+| R2 | Rebuildable source graphs and generic evidence endpoints | M2-M3 | LANDED |
+| R3 | File-tree and API-dataset profiles on one runtime | M4 | Partial (file-tree and conversation transport landed; API-dataset proposed) |
+| R3b | Slack messages corpus-searchable | M5b | LANDED (corpus lane) |
+| R4 | Inspectable Xero semantic projection from fixtures | M5 | Proposed |
+| R5 | Project-code to bounded Xero file evidence | M6 | Proposed |
+| R6 | Durable Xero books overlay | M7 | Proposed |
+| R7 | Tenant record overlay with explicit mappings | M8 | Proposed |
+| R8 | Unified graph, evidence, and content retrieval | M9 | In progress (design landed, implementation in flight) |
+| R9 | Hosted, auditable Xero operation | M10 | Proposed |
 
 R5 is the first product-shaped release for the Xero lane; R3b is the first
 product-shaped release overall (searchable Slack history has standalone
@@ -846,8 +897,9 @@ Added by the 2026-08-11 re-grounding:
 - Connectors observe and publish from the producer plane; the daemon accepts,
   projects, and activates. This replaces the original program's daemon-side
   connector runtime and follows the locality split rather than amending it.
-- The salvage-branch implementation of M1-M3 is donor code, ported milestone
-  by milestone against current contracts, never merged wholesale.
+- The salvage-branch implementation of M1-M3 was donor code, ported
+  milestone by milestone against current contracts and never merged
+  wholesale; that port completed on 2026-08-13.
 - Record graphs and evidence bindings are checkout-plane committed state with
   publication visibility semantics, not daemon-local files.
 - The Slack ingestion connector joins the program as the transcript-shaped
@@ -873,7 +925,9 @@ knowledge decisions referenced):
   per-graph policy. Schema authors annotate as they write.
 - Durable scope identity for non-git sources: resolved 2026-08-12
   (operator-minted `connector_source_id`, coordinates as observations);
-  catalog implementation is `gap-0c7ec76c`, in flight.
+  the catalog implementation landed as `ProjectScope::Connector` in
+  `crates/bbox-corpus-core` with grants in `crates/bbox-config`
+  (`gap-0c7ec76c`).
 
 Still open (backburner, re-evaluate at decision time):
 
@@ -889,8 +943,9 @@ Still open (backburner, re-evaluate at decision time):
 ## 21. Relationship
 
 - Continues: the original graph-native connector campaign authored on the
-  pre-locality branch `campaign/reflective-graph-r2-projection`, which also
-  carries the salvage implementation of M1-M3.
+  pre-locality branch `campaign/reflective-graph-r2-projection`, which
+  carried the pre-locality implementation of M1-M3, since ported onto
+  this campaign.
 - Extends: [Reflective Project Graph](../corpus/agentic-corpus/reflective-project-graph.md),
   which owns the project-defined schema and fact model; this campaign pulls
   its kernel forward and adds the delivery sequence for source graphs,
@@ -909,10 +964,13 @@ Still open (backburner, re-evaluate at decision time):
   (plane split, producer transport, no daemon checkout authority) and
   [Remote project onboarding](../daemon-runtime/remote-project-onboarding.md)
   (two-sided operator onboarding, no agent self-service).
-- Gap ledger: API-dataset connector class `gap-0378c305`; cross-entity
-  evidence endpoints `gap-616857f8`; graph participation in unified retrieval
-  `gap-5d57d2bb`; durable scope identity for non-git sources `gap-0c7ec76c`
-  (owned by the remote-source design, consumed here).
+- Gap ledger: API-dataset connector class `gap-0378c305` (designed,
+  owned by `api-dataset-connector.md`); cross-entity evidence endpoints
+  `gap-616857f8` (landed 2026-08-13 with M3); graph participation in
+  unified retrieval `gap-5d57d2bb` (design landed, implementation in
+  flight, owned by `unified-retrieval.md`); durable scope identity for
+  non-git sources `gap-0c7ec76c` (landed; owned by the remote-source
+  design, consumed here).
 
 The campaign coordinates these designs and gaps. It does not duplicate their
 lower-level contracts or close them by documentation alone.
