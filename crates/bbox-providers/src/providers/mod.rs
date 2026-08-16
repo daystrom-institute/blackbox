@@ -147,6 +147,20 @@ pub struct ProviderContext<'a> {
 pub trait ProjectGraphEntityResolver: Send + Sync {
     fn resolve_entity(&self, r: &EntityRef, provisional: Option<&str>) -> Result<EntityView>;
 
+    /// Whether traversal may step into the graph lane that owns `r`
+    /// (unified-retrieval design 5.2).
+    ///
+    /// Graph selection precedes neighbor enumeration: an unreadable graph is
+    /// not walked, its vertices never enter the frontier, and no truncated
+    /// path or count discloses that it exists. The check is live per hop
+    /// against the resolver's current view, never a stale index stamp. The
+    /// default admits everything, so contexts without a project-graph
+    /// resolver keep their existing traversal behavior.
+    fn traversal_admits(&self, r: &EntityRef, provisional: Option<&str>) -> bool {
+        let _ = (r, provisional);
+        true
+    }
+
     /// Tenant-owned evidence bindings touching `r`, in both directions.
     ///
     /// Distinct from `resolve_entity` because an evidence binding can name an
@@ -264,6 +278,14 @@ impl<'a> ProviderContext<'a> {
 
     pub fn provisional_mode(&self) -> Option<&'a str> {
         self.provisional
+    }
+
+    /// Whether a traversal may step into `r`'s graph lane. Non-graph refs
+    /// stay admissible; the bound resolver owns the live per-lane policy
+    /// check, including the plane mode this context was built with.
+    pub fn graph_lane_admitted(&self, r: &EntityRef) -> bool {
+        self.project_graph_resolver
+            .is_none_or(|resolver| resolver.traversal_admits(r, self.provisional))
     }
 
     /// Evidence bindings touching `r`. Empty when no project-graph resolver is

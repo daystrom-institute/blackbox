@@ -47,6 +47,32 @@ pub(crate) struct GraphDescription {
     pub descriptor: Option<bbox_project_graph::GraphDescriptor>,
     pub schema: Option<bbox_project_graph::GraphSchema>,
     pub generation: bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity,
+    pub retrieval: GraphRetrievalParticipation,
+}
+
+/// Word-lane participation for one graph lane (unified-retrieval 6.5): the
+/// surface that answers "why is my graph not showing up in search" without
+/// reading a schema artifact. `embedded_vertex_count` stays 0 until the
+/// optional vector lane lands; M9a indexes the published plane only.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GraphRetrievalParticipation {
+    /// Authored policy flag: the per-graph kill switch for text retrieval.
+    pub text_retrieval_enabled: bool,
+    /// Effective indexability: the policy flag AND a source that may be
+    /// indexed at all (local-scratch never participates).
+    pub indexable: bool,
+    /// Vertex types the policy excludes from word retrieval, sorted.
+    pub excluded_vertex_types: Vec<String>,
+    /// Documents this lane currently holds in the word index.
+    pub indexed_vertex_count: usize,
+    /// Generation stamp on the indexed documents, if any. Compare against
+    /// `accepted_generation`: an empty count or a stale stamp means the lane
+    /// is waiting for (or was dropped by) an activation.
+    pub indexed_generation: Option<String>,
+    /// Generation of the currently accepted view, for a one-place comparison.
+    pub accepted_generation: String,
+    /// Placeholder until the optional vector lane lands (M9 scope split).
+    pub embedded_vertex_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,19 +138,24 @@ impl BlackboxServer {
         graph_id: &str,
         provisional: Option<&str>,
     ) -> Result<Vec<GraphDescription>> {
-        let entries = self.graph_entries(project, graph_id, provisional)?;
-        Ok(entries
+        let (project_id, _mode, _own) = self.graph_read_context(Some(project), provisional)?;
+        let index = self.state.idx.read();
+        let descriptions = self
+            .graph_entries(project, graph_id, provisional)?
             .into_iter()
             .map(|entry| {
                 let summary = summary(entry.clone());
-                GraphDescription {
+                let retrieval = graph_retrieval_participation(&entry, &*index, &project_id)?;
+                Ok(GraphDescription {
                     summary,
                     descriptor: entry.graph().map(|graph| graph.descriptor.clone()),
                     schema: entry.graph().map(|graph| graph.schema.clone()),
                     generation: entry.generation,
-                }
+                    retrieval,
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(descriptions)
     }
 
     pub(crate) fn project_graph_validate_domain(
@@ -472,6 +503,34 @@ impl BlackboxServer {
 }
 
 impl ProjectGraphEntityResolver for BlackboxServer {
+    /// Live graph-selection gate for traversal expansion (unified-retrieval
+    /// 5.2). The gate owns GRAPH lanes only: a non-graph ref (a project file,
+    /// a knowledge entry) is admitted untouched, because its readability is
+    /// enforced by its own provider and the evidence-status algebra. A graph
+    /// hop is admitted only when the destination lane resolves under the
+    /// caller's active plane AND its policy leaves text retrieval on AND its
+    /// source is not the never-indexable local-scratch plane. Resolution
+    /// failure means the lane is absent for this caller, which is the same
+    /// answer the entity loader would give one step later; refusing here
+    /// keeps the vertex out of the frontier instead of leaking a truncated
+    /// path that implies it exists.
+    fn traversal_admits(&self, r: &EntityRef, provisional: Option<&str>) -> bool {
+        use bbox_project_graph::GraphSource;
+
+        if !matches!(
+            r.entity_type(),
+            bbox_corpus_core::entity_ref::EntityType::ProjectGraphVertex
+                | bbox_corpus_core::entity_ref::EntityType::ProvisionalProjectGraphVertex
+        ) {
+            return true;
+        }
+        let Ok(resolved) = self.resolve_project_graph_vertex(r, provisional) else {
+            return false;
+        };
+        !matches!(resolved.graph.key.source, GraphSource::LocalScratch)
+            && resolved.graph.schema.index_policy.text_retrieval_enabled
+    }
+
     fn resolve_entity(&self, r: &EntityRef, provisional: Option<&str>) -> Result<EntityView> {
         let resolved = self.resolve_project_graph_vertex(r, provisional)?;
         let mut properties = BTreeMap::from([
@@ -737,6 +796,43 @@ pub(crate) fn graph_neighborhood(
         .map(|edge| (edge.type_name.clone(), make_ref(&edge.from)))
         .collect();
     (forward, reverse)
+}
+
+fn graph_retrieval_participation(
+    entry: &ProjectGraphViewEntry,
+    index: &bbox_indexing::index::TranscriptIndex,
+    project_id: &ProjectId,
+) -> Result<GraphRetrievalParticipation> {
+    use bbox_project_graph::GraphSource;
+
+    let stats =
+        index.graph_lane_stats(project_id.as_str(), &entry.graph_id, source_label(entry))?;
+    let graph = entry.graph();
+    let text_retrieval_enabled = graph
+        .map(|graph| graph.schema.index_policy.text_retrieval_enabled)
+        .unwrap_or(false);
+    let never_indexable = graph
+        .map(|graph| matches!(graph.key.source, GraphSource::LocalScratch))
+        .unwrap_or(true);
+    Ok(GraphRetrievalParticipation {
+        text_retrieval_enabled,
+        indexable: text_retrieval_enabled && !never_indexable,
+        excluded_vertex_types: graph
+            .map(|graph| {
+                graph
+                    .schema
+                    .index_policy
+                    .retrieval_excluded_types
+                    .iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default(),
+        indexed_vertex_count: stats.indexed_vertex_count,
+        indexed_generation: stats.indexed_generation,
+        accepted_generation: entry.generation.content_hash.clone(),
+        embedded_vertex_count: 0,
+    })
 }
 
 fn summary(entry: ProjectGraphViewEntry) -> GraphSummary {
