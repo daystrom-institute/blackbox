@@ -88,6 +88,10 @@ impl ConversationSourceClient {
                 // credential-forwarding primitive and this request carries a
                 // bearer.
                 .redirect(reqwest::redirect::Policy::none())
+                // Presence, not telemetry: the daemon records the User-Agent
+                // of each authenticated producer contact so a silent satellite
+                // is distinguishable from a missing one on the status surface.
+                .user_agent(concat!("bbox-slack-collector/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .map_err(|error| {
                     anyhow!("building the conversation-source HTTP client: {error}")

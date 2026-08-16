@@ -797,6 +797,7 @@ impl ConversationSink for ModelSink {
             scope: scope(),
             workspace_id: Some(WORKSPACE_ID.to_string()),
             channels,
+            producer: None,
         })
     }
 }

@@ -80,6 +80,24 @@ pub enum CronScheduleAlert {
     CronMissingPacket { cron_name: String, domain: String },
 }
 
+/// Conversation producer silence: the "satellite quietly died" class. A
+/// granted conversation scope is supposed to have a live producer polling it,
+/// and one that stops calling lands nothing further while every durable
+/// surface still reads healthy. Plain rows like `failed_task_rows`: the
+/// presence state is daemon-side and in memory, so the attention tool builds
+/// these rows from the contact map.
+#[derive(Debug, Clone)]
+pub enum ConversationProducerSilence {
+    /// A scope with authenticated contact, but none inside the window.
+    Stale {
+        scope: String,
+        last_seen_at: String,
+        silent_minutes: u64,
+    },
+    /// A granted scope with no authenticated contact since daemon boot.
+    NeverSeen { scope: String },
+}
+
 pub fn compute_inbox(
     kb: &Knowledge,
     threads: &Threads,
@@ -88,6 +106,7 @@ pub fn compute_inbox(
     failed_task_rows: &[(String, String, u64)],
     vector_alerts: &[VectorConnectivityAlert],
     cron_alerts: &[CronScheduleAlert],
+    conversation_silence: &[ConversationProducerSilence],
     whiteboards: &WhiteboardRegistry,
     p: &InboxParams,
 ) -> Result<String> {
@@ -168,6 +187,34 @@ pub fn compute_inbox(
                         "  cron '{cron_name}' — routing packet domain '{domain}' is not installed; ticks dispatch nowhere (install the packet: bbox_artifact_install kind=packet)\n"
                     ));
                 }
+            }
+        }
+        out.push('\n');
+    }
+
+    // 1d. Conversation producer silence: an ingestion lane whose satellite
+    // stopped calling the corpus wire. Not project-filtered: the scope to
+    // project mapping is catalog state the presence map deliberately does
+    // not hold, and a silent lane degrades whatever project it feeds.
+    if !conversation_silence.is_empty() {
+        out.push_str(&format!(
+            "## Conversation producer silence ({})\n",
+            conversation_silence.len()
+        ));
+        for alert in conversation_silence {
+            match alert {
+                ConversationProducerSilence::Stale {
+                    scope,
+                    last_seen_at,
+                    silent_minutes,
+                } => out.push_str(&format!(
+                    "  {scope} - last producer contact {last_seen_at}, silent for \
+                     {silent_minutes}m; the satellite stopped calling the corpus wire\n"
+                )),
+                ConversationProducerSilence::NeverSeen { scope } => out.push_str(&format!(
+                    "  {scope} - no producer contact since boot; the satellite has never \
+                     called the corpus wire\n"
+                )),
             }
         }
         out.push('\n');
@@ -969,6 +1016,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -1011,6 +1059,7 @@ mod tests {
             &[],
             &alerts,
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/unrelated-project".into()),
@@ -1051,6 +1100,7 @@ mod tests {
             &gaps,
             &[],
             &alerts,
+            &[],
             &[],
             &WhiteboardRegistry::new(),
             &InboxParams {
@@ -1099,6 +1149,7 @@ mod tests {
             &[],
             &[],
             &alerts,
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/unrelated-project".into()),
@@ -1118,6 +1169,58 @@ mod tests {
             "cron-routing/daily-compaction — cron-routing packet installed but no cron schedules it"
         ));
         assert!(out.contains("cron 'embed-compaction-nightly' — routing packet domain 'cron-routing/embed-compaction' is not installed"));
+        assert!(!out.contains("clean plate"));
+    }
+
+    /// Silence rows are host-level ingestion risk: they render their own
+    /// section, survive a project filter, and defeat the clean plate, because
+    /// a satellite that stopped calling lands nothing further anywhere.
+    #[test]
+    fn inbox_surfaces_conversation_producer_silence() {
+        let dir = tempdir().unwrap();
+        let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        let threads = Threads::open(&dir.path().join("th.json")).unwrap();
+        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = empty_gaps(&dir);
+        let whiteboards = WhiteboardRegistry::new();
+        let silence = vec![
+            ConversationProducerSilence::Stale {
+                scope: "slack/csrc_fixture01".into(),
+                last_seen_at: "2026-08-14T12:00:00Z".into(),
+                silent_minutes: 47,
+            },
+            ConversationProducerSilence::NeverSeen {
+                scope: "slack/csrc_fixture02".into(),
+            },
+        ];
+
+        let out = compute_inbox(
+            &kb,
+            &threads,
+            &notes,
+            &gaps,
+            &[],
+            &[],
+            &[],
+            &silence,
+            &whiteboards,
+            &InboxParams {
+                project: Some("/repo/unrelated-project".into()),
+                provisional: None,
+                limit: None,
+                stale_days: None,
+                include_tasks: None,
+                import_gap_spool: None,
+                aggregate_gaps: None,
+                check_gap_closeouts: None,
+                gap_commit_range: None,
+            },
+        )
+        .unwrap();
+        assert!(out.contains("## Conversation producer silence (2)"));
+        assert!(out.contains("slack/csrc_fixture01 - last producer contact 2026-08-14T12:00:00Z"));
+        assert!(out.contains("silent for 47m"));
+        assert!(out.contains("slack/csrc_fixture02 - no producer contact since boot"));
         assert!(!out.contains("clean plate"));
     }
 
@@ -1271,6 +1374,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: None,
@@ -1334,6 +1438,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &[],
             &[],
@@ -1435,6 +1540,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             &whiteboards,
             &InboxParams {
                 project: Some("/repo/x".into()),
@@ -1498,6 +1604,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &[],
             &[],
@@ -1571,6 +1678,7 @@ mod tests {
             &threads,
             &notes,
             &gaps,
+            &[],
             &[],
             &[],
             &[],
