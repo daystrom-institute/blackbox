@@ -103,6 +103,7 @@ types are:
 |---|---|---|
 | `knowledge` | Rules, decisions, conventions | "what is the policy on X?" |
 | `project_file` | Source and doc chunks | "where does X live?" |
+| `project_file_v2` | Snapshot-scoped source and doc chunks | "which snapshot's copy of X is live?" |
 | `transcript` | One content block from a session | "what did this turn say?" |
 | `session` | A full agent conversation | "what was this session about?" |
 | `thread` | Persistent work across sessions | "what is still active?" |
@@ -114,6 +115,7 @@ types are:
 | `commit` | Git commit metadata and touched files | "when did this change?" |
 | `task` | A dispatched bro unit | "what produced this artifact?" |
 | `bash_call` | One shell invocation in a transcript | "what did this command emit?" |
+| `roadmap_item` | Prospective work items | "what is planned or deferred?" |
 | `project_graph_vertex` | A project-graph vertex (provisional refs cover working generations) | "what does the graph say about X?" |
 
 One Tantivy document is indexed per content block, not per session. A
@@ -128,12 +130,17 @@ Edges are directional and typed.
 |---|---|
 | Structural | `IN_FILE`, `IN_SESSION`, `NEXT_SECTION`, `NEXT_CHUNK`, `PREV_CHUNK`, `THREAD_HAS_SESSION`, `THREAD_SPAWNED_FROM`, `THREAD_BLOCKED_BY`, `THREAD_RELATES_TO`, `THREAD_SUBSUMES` |
 | AST | `DEFINED_IN`, `CONTAINS_SYMBOL`, `CALLS`, `USES_TYPE`, `HAS_FIELD`, `IMPLEMENTS_TRAIT` |
-| Knowledge | `SUPERSEDES`, `DERIVED_FROM`, `Contradicts`, `RelatesTo`, `TensionWith`, `Supports`, `DependsOn`, `References`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
+| Knowledge | `SUPERSEDES`, `DERIVED_FROM`, `Contradicts`, `RelatesTo`, `TensionWith`, `Supports`, `DependsOn`, `REFERENCES`, `KNOWLEDGE_FROM_SESSION`, `KNOWLEDGE_FROM_BOARD` |
 | Provenance | `SESSION_USED_BROFILE`, `ARC_USED_BROFILE`, `ARC_OPENED_BOARD`, `NOTE_FROM_SESSION`, `NOTE_IN_THREAD`, `NOTE_FROM_TASK`, `TASK_PRODUCED_NOTE` |
 | Git | `COMMIT_PARENT`, `COMMIT_TOUCHED_FILE`, `COMMIT_PRODUCED_BY_ARC` |
 | Roadmap | `ROADMAP_SPAWNS`, `ROADMAP_DEFERRED_FROM`, `ROADMAP_DESIGNED_IN`, `ROADMAP_DEPENDS_ON`, `ROADMAP_BLOCKED_BY`, `ROADMAP_SUPERSEDES`, `ROADMAP_SUBSUMES`, `ROADMAP_RELATED_TO` |
 | Format-specific | `LINKS_TO_FILE`, `LINKS_TO_SECTION`, `DESCRIBES`, `ON_PAGE`, `FIGURE_OF`, `TABLE_OF` |
 | Tool-call | `EDITED_FILE`, `EDITED_BY_SESSION`, `READ_FILE`, `RAN_BASH` |
+
+`bbox_describe_schema`'s edge catalog is currently narrower than this
+table (no Roadmap family; Knowledge limited to `SUPERSEDES`,
+`DERIVED_FROM`, `Contradicts`, `KNOWLEDGE_FROM_SESSION`,
+`KNOWLEDGE_FROM_BOARD`), so its output can omit families listed here.
 
 The EdgeIndex is built from per-project JSONL sidecars plus live
 knowledge, thread, note, and roadmap stores, with virtual edges for
@@ -150,7 +157,7 @@ result-shaping passes.
 | Lane | Source | Why it exists |
 |---|---|---|
 | BM25 chunk | Tantivy fields such as `content`, `code_content`, `symbol`, `commit_author_name`, `path_tokens` | Precise lexical recall |
-| BM25 file | Chunk scores summed per `(project_id, rel_path_hash)` over the full BM25 fetch | Lifts files with many sparse mentions |
+| BM25 file | Chunk scores summed per `(project_id, rel_path_hash)` over the full BM25 fetch, ranked by `sum * sqrt(count)` | Lifts files with many sparse mentions |
 | Knowledge | Authorized knowledge search, resolved outside the static index | Joins fusion only when it has hits, under session visibility policy |
 | Vector | HNSW over per-route embeddings | Catches paraphrases and concept matches |
 
@@ -162,14 +169,18 @@ passing textual mentions.
 
 The BM25 chunk list is truncated to the fusion fetch window, but the
 file-level aggregation sums scores over the full (deeper) BM25 fetch, so
-a file whose mentions are spread across many chunks still surfaces. The
-knowledge lane is searched separately because provisional-visibility
-policy must be resolved against the caller's session before fusion.
+a file whose mentions are spread across many chunks still surfaces; the
+lane contributes nothing when the BM25 fetch spans fewer than two
+distinct files. The knowledge lane is searched separately because
+provisional-visibility policy must be resolved against the caller's
+session before fusion.
 
-Vector lanes are per route: the router walks the configured text buckets
-(`code`, `docs`, `knowledge`, `transcripts`, `git_message`, `notes`,
-`threads`, `agent_manifest`) plus any configured visual routes, and each
-active partition contributes its own ranked list.
+Vector lanes are per route: hybrid search iterates on-disk vector
+partitions with a nonzero active count and maps each back to a
+configured text bucket (`code`, `docs`, `knowledge`, `transcripts`,
+`git_message`, `notes`, `threads`, `agent_manifest`) or visual route,
+and each contributing partition becomes its own ranked list. Unmapped
+partitions are skipped and reported in `degraded.skipped_partitions`.
 
 ### RRF fusion
 
@@ -187,11 +198,14 @@ BM25-family lanes carry `1.0 - vector_weight`, so `0.0` is BM25-only and
 
 After fusion, candidates pass through one of three rerank modes:
 
-- `model` (default): the fused top-k are re-scored by the configured
-  Voyage cross-encoder (`rerank-2.5-lite` by default); model-scored
-  candidates land in a strictly higher score band than the unsent tail.
+- `model` (default): the fused top-k (cross-encoder default `top_k` of
+  64) are re-scored by the configured Voyage cross-encoder
+  (`rerank-2.5-lite` by default); model-scored candidates land in a
+  strictly higher score band than the unsent tail, then pass through the
+  same heuristic type/temporal multipliers and cap as the heuristic path.
 - `heuristic`: type and temporal multipliers only (confirmed knowledge
-  `1.35`, imported `0.85`, doc sections `1.20`; temporal decay clamped
+  `1.35`, imported `0.85`, doc sections `1.20`, commits `1.05`,
+  transcript role user `1.10` / assistant `0.95`; temporal decay clamped
   to `[0.50, 1.25]`), capped at `1.75` over the fused score.
 - `none`: raw fusion order.
 
@@ -222,14 +236,13 @@ reachable only through exact-ref inspection and traversal, not
 
 ## Provider behavior
 
-Provider reliability depends on whether the CLI reads rendered guidance
-and uses MCP tools.
-
-| Provider | Honors imports | Uses bbox tools | Notes |
-|---|---|---|---|
-| `claude` | yes | yes | Strongest cold-start grounding |
-| `codex` | yes | yes | Good quality, usually higher latency |
-| `gemini` | yes | expected | Renders to `GEMINI.md` |
+The dispatch plane contains zero provider CLIs; providers dispatch
+through the standalone `bro-harness` binary. The code-owned catalog in
+`crates/bro-core/src/provider.rs` is the authority: `claude` survives
+only as a serde alias to `glm`, `codex` as an alias to `brodex`, and
+the Gemini lane is removed. See
+[Provider & Agent Surfaces](../PROJECT.md) rather than re-inventorying
+providers here.
 
 ## System memories
 
