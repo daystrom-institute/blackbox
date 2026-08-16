@@ -121,12 +121,20 @@ pub struct CycleOutcome {
     /// a smaller `sweep.window_secs`, not a bigger page budget.
     pub windows_deferred: u64,
     pub backfill_windows: u64,
+    /// Enrolled channels whose backfill lane has NOT reached its floor: the
+    /// horizon is still being walked for them. Zero with backfill off.
+    pub channels_backfilling: u64,
+    /// The oldest backfill mark across enrolled channels, as an RFC3339
+    /// timestamp. `None` when no channel has walked a window yet.
+    pub oldest_backfilled_to: Option<String>,
     pub normalization_skips: BTreeMap<String, u64>,
     /// Whether the reconciliation pass ran this cycle (it runs on a slower
     /// cadence than steady state).
     pub reconciled: bool,
-    /// The worst per-channel lag the corpus reported, which is where a
-    /// throttled producer shows up (design 5.5).
+    /// The MAX per-channel staleness the corpus reported: now minus the
+    /// newest landed message of the QUIETEST channel, not backfill depth.
+    /// A throttled producer shows up here (design 5.5); a deep backfill does
+    /// not, which is exactly why the two must not share a log key.
     pub max_lag_seconds: Option<i64>,
 }
 
@@ -311,6 +319,7 @@ pub async fn run_publication_cycle_with_shutdown(
 
     let mut skips = SkipCounters::default();
     let mut enrolled: BTreeMap<String, ChannelObservationV1> = BTreeMap::new();
+    let mut created_by_channel: BTreeMap<String, Option<i64>> = BTreeMap::new();
     for channel in &roster.channels {
         match policy.decide(channel) {
             ChannelDecision::Skip { reason } => skips.record(reason),
@@ -334,6 +343,7 @@ pub async fn run_publication_cycle_with_shutdown(
                         observed_at: observed_at.clone(),
                     },
                 );
+                created_by_channel.insert(channel.id.clone(), channel.created);
             }
         }
     }
@@ -410,6 +420,13 @@ pub async fn run_publication_cycle_with_shutdown(
             now_secs,
             now_ts: &now_ts,
         };
+        // Every cycle the roster is re-read, so every cycle re-observes
+        // `created` while the channel stays enrolled. The journal keeps the
+        // last known value rather than clearing it on a None, so a roster read
+        // that omits the field cannot reopen a finished backfill lane.
+        journal
+            .channel_mut(channel_id)
+            .observe_created(created_by_channel.get(channel_id).copied().flatten());
 
         // Lane one: steady state.
         let steady = sweep_steady_state(slack, sink, config, &mut journal, &context, &cursor)
@@ -474,6 +491,33 @@ pub async fn run_publication_cycle_with_shutdown(
     }
 
     // -- report --------------------------------------------------------------
+    // Backfill honesty: count the lanes still walking and the oldest point any
+    // of them has reached, so a deep horizon reads as progress rather than as
+    // absence. `max_lag_seconds` (reported below) is a DIFFERENT quantity: the
+    // staleness of the corpus's newest record for the quietest channel, which
+    // is where a throttled or stopped producer shows up. Deep backfill moves
+    // these counters; it must never move that one.
+    if config.backfill.enabled()
+        && let Some(horizon_floor) = horizon_floor_secs(&config.backfill.horizon, now_secs)
+    {
+        let mut oldest: Option<&str> = None;
+        for channel_id in enrolled.keys() {
+            let Some(channel) = journal.channel(channel_id) else {
+                outcome.channels_backfilling += 1;
+                continue;
+            };
+            let floor_secs = channel.backfill_floor_secs(horizon_floor);
+            if !channel.backfill_lane_complete(floor_secs) {
+                outcome.channels_backfilling += 1;
+            }
+            if let Some(mark) = channel.backfilled_to_ts.as_deref()
+                && oldest.is_none_or(|current| message_ts_is_after(current, mark))
+            {
+                oldest = Some(mark);
+            }
+        }
+        outcome.oldest_backfilled_to = oldest.map(str::to_string);
+    }
     let status = sink
         .status(&scope)
         .await
@@ -538,6 +582,46 @@ impl CycleOutcome {
         self.duplicates += threads.duplicates;
         self.threads_swept += threads.swept;
         merge_counts(&mut self.normalization_skips, &threads.skips);
+    }
+}
+
+/// What watch mode should say about the observed credential grant this cycle.
+///
+/// The one-app posture cannot refuse a write scope, so the compensating control
+/// is SEEING the grant: state it in full at startup and again the moment it
+/// moves between cycles, and stay quiet while it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeObservation {
+    /// First observation after startup.
+    Initial,
+    /// The granted set or its write subset moved since the previous cycle.
+    Changed,
+    /// Same grant, same subset.
+    Unchanged,
+}
+
+/// Compare this cycle's observed grant against the previous cycle's, as sets:
+/// the header's ordering carries no meaning, so a pure reorder is not a
+/// change worth paging anyone about.
+pub fn scope_observation(
+    previous: Option<(&[String], &[String])>,
+    granted: &[String],
+    write_scopes: &[String],
+) -> ScopeObservation {
+    let Some((previous_granted, previous_writes)) = previous else {
+        return ScopeObservation::Initial;
+    };
+    let as_set = |scopes: &[String]| {
+        let mut sorted = scopes.to_vec();
+        sorted.sort();
+        sorted
+    };
+    if as_set(previous_granted) == as_set(granted)
+        && as_set(previous_writes) == as_set(write_scopes)
+    {
+        ScopeObservation::Unchanged
+    } else {
+        ScopeObservation::Changed
     }
 }
 
@@ -947,6 +1031,13 @@ async fn reconcile(
 }
 
 /// Lane three: bounded backward walk toward the operator's horizon.
+///
+/// The walk's floor is the DEEPER of two bounds: the horizon and the channel's
+/// creation (less one day of clock-skew slack), because no history can predate
+/// the channel. A lane that reaches its floor is marked complete in the journal
+/// and skipped thereafter; completion is recorded against the floor it was
+/// earned at, so deepening the horizon (or observing an earlier `created`)
+/// re-arms the lane instead of trusting a stale finish.
 async fn backfill(
     slack: &dyn SlackRead,
     sink: &dyn ConversationSink,
@@ -956,9 +1047,19 @@ async fn backfill(
     cursor: &ChannelCursorV1,
 ) -> Result<SweepResult> {
     let mut result = SweepResult::default();
-    let Some(floor_secs) = horizon_floor_secs(&config.backfill.horizon, context.now_secs) else {
+    let Some(horizon_floor) = horizon_floor_secs(&config.backfill.horizon, context.now_secs) else {
         return Ok(result);
     };
+    let floor_secs = journal
+        .channel(context.channel_id)
+        .map(|channel| channel.backfill_floor_secs(horizon_floor))
+        .unwrap_or(horizon_floor);
+    if journal
+        .channel(context.channel_id)
+        .is_some_and(|channel| channel.backfill_lane_complete(floor_secs))
+    {
+        return Ok(result);
+    }
     let window = config.sweep.window_secs.max(1) as i64;
 
     // Walk down from whichever is older: the corpus's oldest landed record or
@@ -1041,6 +1142,15 @@ async fn backfill(
             .channel_mut(context.channel_id)
             .lower_backfill_mark(&start_ts);
         end_ts = start_ts;
+    }
+    // The walk stops at the floor either by clamping its last window's start
+    // to it or by finding the next window already below it; only then is the
+    // lane complete. A deferred (incomplete) window leaves end_ts above the
+    // floor, so a rate-limit deferral never records a false completion.
+    if secs_from_ts(&end_ts).is_some_and(|end_secs| end_secs <= floor_secs) {
+        journal
+            .channel_mut(context.channel_id)
+            .mark_backfill_complete(floor_secs);
     }
     Ok(result)
 }
@@ -1206,6 +1316,51 @@ mod tests {
     fn an_unverifiable_scope_list_is_reported_rather_than_refused() {
         let granted = identity(&[]);
         check_read_scopes(&granted, &required_read_scopes(true)).unwrap();
+    }
+
+    fn scopes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|scope| scope.to_string()).collect()
+    }
+
+    #[test]
+    fn the_first_observed_grant_is_initial_and_a_reorder_is_not_a_change() {
+        let granted = scopes(&["channels:read", "channels:history", "chat:write"]);
+        let writes = scopes(&["chat:write"]);
+        assert_eq!(
+            scope_observation(None, &granted, &writes),
+            ScopeObservation::Initial
+        );
+        // Same sets, header order shuffled: still unchanged, because the order
+        // of an x-oauth-scopes header carries no meaning.
+        let reordered = scopes(&["chat:write", "channels:history", "channels:read"]);
+        assert_eq!(
+            scope_observation(Some((&reordered, &writes)), &granted, &writes),
+            ScopeObservation::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_grant_or_write_subset_that_moves_is_a_change() {
+        let granted = scopes(&["channels:read", "channels:history", "chat:write"]);
+        let writes = scopes(&["chat:write"]);
+        let deeper = scopes(&[
+            "channels:read",
+            "channels:history",
+            "chat:write",
+            "reactions:write",
+        ]);
+        let deeper_writes = scopes(&["chat:write", "reactions:write"]);
+        assert_eq!(
+            scope_observation(Some((&granted, &writes)), &deeper, &deeper_writes),
+            ScopeObservation::Changed
+        );
+        // The granted set alone is not the whole story: a write scope revoked
+        // out from under a running satellite is a change too.
+        let revoked = scopes(&["channels:read", "channels:history"]);
+        assert_eq!(
+            scope_observation(Some((&granted, &writes)), &revoked, &[]),
+            ScopeObservation::Changed
+        );
     }
 
     #[test]

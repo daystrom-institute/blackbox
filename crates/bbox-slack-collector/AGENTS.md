@@ -87,6 +87,20 @@ minority consumer (default 20 rpm against a ~50 rpm band) is the whole strategy.
 file lane, where empty means "everything the other rules allow". Design section 8
 is explicit that there is no index-everything posture here.
 
+**A backfill lane ends at its floor, and the floor is per-channel.** The floor is
+the DEEPER of the operator horizon and the channel's Slack `created` less one day
+of clock-skew slack: no history can predate the channel, so walking past that
+point is wasted calls. Reaching the floor records completion against that exact
+floor, and completion re-arms itself when the floor moves earlier (a deeper
+horizon, or an earlier observed `created`) rather than being trusted forever.
+
+**Backfill depth and producer staleness are different axes.** The corpus's worst
+newest-record staleness (the quietest channel) is where a throttled or stopped
+producer shows up; a deep backfill moves the backfill counters, never that one.
+Log keys must not conflate them: the staleness field is named
+`max_channel_staleness_seconds`, and the backfill surface is
+`backfill_windows` / `channels_backfilling` / `oldest_backfilled_to`.
+
 ## Testing
 
 `cargo nextest run --workspace -E 'package(bbox-slack-collector)'`.

@@ -146,6 +146,10 @@ pub struct FakeChannel {
     pub is_private: bool,
     pub is_member: bool,
     pub is_archived: bool,
+    /// Epoch-seconds creation, as both roster methods report it. `None` keeps
+    /// the field absent, which is the shape a vendor change or a partial
+    /// payload would present.
+    pub created: Option<i64>,
 }
 
 impl FakeChannel {
@@ -156,18 +160,28 @@ impl FakeChannel {
             is_private: false,
             is_member: true,
             is_archived: false,
+            created: None,
         }
     }
 
+    pub fn created_at(mut self, epoch_secs: i64) -> Self {
+        self.created = Some(epoch_secs);
+        self
+    }
+
     fn to_json(&self) -> Value {
-        json!({
+        let mut channel = json!({
             "id": self.id,
             "name": self.name,
             "is_channel": true,
             "is_private": self.is_private,
             "is_member": self.is_member,
             "is_archived": self.is_archived,
-        })
+        });
+        if let Some(created) = self.created {
+            channel["created"] = json!(created);
+        }
+        channel
     }
 }
 

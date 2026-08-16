@@ -123,6 +123,12 @@ async fn main() -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .context("installing the SIGTERM listener")?;
             let shutdown = Shutdown::default();
+            // The one-app posture cannot refuse a write scope, so watch mode
+            // states the whole grant at startup and re-states it whenever the
+            // observed set moves between cycles: a scope granted or revoked
+            // under a running satellite is exactly the change an operator
+            // must see without going looking for it.
+            let mut observed_scopes: Option<(Vec<String>, Vec<String>)> = None;
             loop {
                 let mut cycle = std::pin::pin!(run_publication_cycle_with_shutdown(
                     &slack,
@@ -147,17 +153,47 @@ async fn main() -> Result<()> {
                     }
                 };
                 match outcome {
-                    Ok(outcome) => tracing::info!(
-                        channels = outcome.channels_enrolled,
-                        landed = outcome.messages_landed,
-                        duplicates = outcome.duplicates,
-                        thread_replies = outcome.thread_replies_landed,
-                        revisions = outcome.revisions_emitted,
-                        tombstones = outcome.tombstones_emitted,
-                        deferred = outcome.windows_deferred,
-                        lag_seconds = outcome.max_lag_seconds,
-                        "publication cycle completed"
-                    ),
+                    Ok(outcome) => {
+                        let snapshot =
+                            (outcome.granted_scopes.clone(), outcome.write_scopes.clone());
+                        match bbox_slack_collector::scope_observation(
+                            observed_scopes
+                                .as_ref()
+                                .map(|(granted, writes)| (granted.as_slice(), writes.as_slice())),
+                            &snapshot.0,
+                            &snapshot.1,
+                        ) {
+                            bbox_slack_collector::ScopeObservation::Initial => tracing::info!(
+                                granted = snapshot.0.join(", "),
+                                writes = snapshot.1.join(", "),
+                                "granted scopes observed"
+                            ),
+                            bbox_slack_collector::ScopeObservation::Changed => tracing::info!(
+                                granted = snapshot.0.join(", "),
+                                writes = snapshot.1.join(", "),
+                                "granted scopes changed between cycles"
+                            ),
+                            bbox_slack_collector::ScopeObservation::Unchanged => {}
+                        }
+                        observed_scopes = Some(snapshot);
+                        tracing::info!(
+                            channels = outcome.channels_enrolled,
+                            landed = outcome.messages_landed,
+                            duplicates = outcome.duplicates,
+                            thread_replies = outcome.thread_replies_landed,
+                            revisions = outcome.revisions_emitted,
+                            tombstones = outcome.tombstones_emitted,
+                            deferred = outcome.windows_deferred,
+                            // Honest key: this is the corpus's worst NEWEST-record
+                            // staleness (the quietest channel), not backfill depth.
+                            // Backfill progress is the fields below it.
+                            max_channel_staleness_seconds = outcome.max_lag_seconds,
+                            backfill_windows = outcome.backfill_windows,
+                            channels_backfilling = outcome.channels_backfilling,
+                            oldest_backfilled_to = outcome.oldest_backfilled_to,
+                            "publication cycle completed"
+                        )
+                    }
                     // A cycle failure is not fatal. A corpus restart, a
                     // transient network fault, and a workspace throttle all
                     // resolve on a later cycle, and exiting here would turn
@@ -210,8 +246,9 @@ fn report(outcome: &bbox_slack_collector::CycleOutcome, slack: &SlackClient) {
     let stats = slack.stats();
     println!(
         "workspace {} channels={} landed={} duplicates={} thread_replies={} revisions={} \
-         tombstones={} deferred_windows={} backfill_windows={} reconciled={} requests={} \
-         throttled={} lag_seconds={}",
+         tombstones={} deferred_windows={} backfill_windows={} channels_backfilling={} \
+         oldest_backfilled_to={} reconciled={} requests={} throttled={} \
+         max_channel_staleness_seconds={}",
         outcome.workspace_id,
         outcome.channels_enrolled,
         outcome.messages_landed,
@@ -221,6 +258,8 @@ fn report(outcome: &bbox_slack_collector::CycleOutcome, slack: &SlackClient) {
         outcome.tombstones_emitted,
         outcome.windows_deferred,
         outcome.backfill_windows,
+        outcome.channels_backfilling,
+        outcome.oldest_backfilled_to.as_deref().unwrap_or("none"),
         outcome.reconciled,
         stats.requests,
         stats.throttled,

@@ -253,6 +253,7 @@ mod tests {
             is_member: true,
             is_im: false,
             is_mpim: false,
+            created: None,
         }
     }
 

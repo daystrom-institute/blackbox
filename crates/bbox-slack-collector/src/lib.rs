@@ -76,8 +76,9 @@ pub use config::{
     BackfillHorizon, BackfillPolicy, ReconciliationPolicy, SatelliteConfig, SweepPolicy,
 };
 pub use cycle::{
-    ConversationSink, CycleOutcome, Shutdown, check_read_scopes, required_read_scopes,
-    run_onboarding, run_publication_cycle, run_publication_cycle_with_shutdown,
+    ConversationSink, CycleOutcome, ScopeObservation, Shutdown, check_read_scopes,
+    required_read_scopes, run_onboarding, run_publication_cycle,
+    run_publication_cycle_with_shutdown, scope_observation,
 };
 pub use journal::{ChannelJournal, Journal, MessageBaseline, ThreadMark};
 pub use policy::{

@@ -36,6 +36,12 @@ use serde::{Deserialize, Serialize};
 
 const JOURNAL_VERSION: u32 = 1;
 
+/// Slack's `created` is server clock against a client-derived horizon, so the
+/// created term of the backfill floor keeps one day of slack: a channel whose
+/// recorded creation lands slightly after the horizon floor must still stop,
+/// not oscillate around the boundary every cycle.
+pub(crate) const BACKFILL_CREATED_SLACK_SECS: i64 = 86_400;
+
 /// What this producer last observed about one landed message.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageBaseline {
@@ -102,6 +108,23 @@ pub struct ChannelJournal {
     /// be re-walked every cycle forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfilled_to_ts: Option<String>,
+    /// Epoch seconds of the channel's creation, as the roster last observed it.
+    ///
+    /// The backfill floor's second term: no history can predate the channel, so
+    /// a walk that reaches this point minus the clock-skew slack is done. Never
+    /// cleared once set, so a roster read that omits the field for a cycle does
+    /// not reopen a finished lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_epoch_secs: Option<i64>,
+    /// Whether the backfill lane reached this channel's floor and may be
+    /// skipped. Re-armed automatically whenever the floor moves further back
+    /// (a deeper horizon, or an earlier observed `created`).
+    #[serde(default)]
+    pub backfill_complete: bool,
+    /// The floor that was current when `backfill_complete` was set, so a later
+    /// floor below it re-arms the lane instead of trusting a stale finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_floor_epoch_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,6 +284,48 @@ impl ChannelJournal {
         if lower {
             self.backfilled_to_ts = Some(ts.to_string());
         }
+    }
+
+    /// The channel's effective backfill floor: the deeper of the operator's
+    /// horizon floor and creation-less-slack. No history can predate the
+    /// channel, so a walk that reaches this point is done even when the
+    /// horizon reaches further back. An unknown `created` adds NO bound: the
+    /// horizon stays the floor, rather than a missing roster field silently
+    /// declaring the lane finished.
+    pub fn backfill_floor_secs(&self, horizon_floor_secs: i64) -> i64 {
+        horizon_floor_secs.max(
+            self.created_epoch_secs
+                .unwrap_or(i64::MIN)
+                .saturating_sub(BACKFILL_CREATED_SLACK_SECS),
+        )
+    }
+
+    /// Record the channel's creation time as the roster last observed it.
+    ///
+    /// Sticky by design: `Some` overwrites, `None` never clears, so a roster
+    /// read that omits the field does not reopen a finished backfill lane.
+    pub fn observe_created(&mut self, created_epoch_secs: Option<i64>) {
+        if let Some(created) = created_epoch_secs {
+            self.created_epoch_secs = Some(created);
+        }
+    }
+
+    /// Whether the backfill lane for this channel may be skipped.
+    ///
+    /// Complete is only trustworthy for the floor it was earned against: a
+    /// horizon that now reaches further back (or a `created` that moved
+    /// earlier) lowers the floor below the recorded one and re-arms the lane.
+    pub fn backfill_lane_complete(&self, floor_epoch_secs: i64) -> bool {
+        self.backfill_complete
+            && self
+                .backfill_floor_epoch_secs
+                .is_none_or(|completed_at| completed_at <= floor_epoch_secs)
+    }
+
+    /// Mark the backfill lane finished against this floor.
+    pub fn mark_backfill_complete(&mut self, floor_epoch_secs: i64) {
+        self.backfill_complete = true;
+        self.backfill_floor_epoch_secs = Some(floor_epoch_secs);
     }
 
     /// Drop baseline rows below the reconciliation window.

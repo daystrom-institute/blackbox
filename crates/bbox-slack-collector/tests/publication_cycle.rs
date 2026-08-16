@@ -20,8 +20,8 @@ use bbox_conversation_source::{
 };
 use bbox_corpus_core::project_catalog::ConnectorScope;
 use bbox_slack_collector::{
-    ConversationSink, Journal, SatelliteConfig, Shutdown, SlackClient, run_publication_cycle,
-    run_publication_cycle_with_shutdown,
+    BackfillHorizon, ConversationSink, Journal, SatelliteConfig, Shutdown, SlackClient,
+    run_publication_cycle, run_publication_cycle_with_shutdown,
 };
 use support::{
     FakeChannel, FakeMessage, FakeSlack, FakeSlackState, ModelSink, RefusingSink, fast_rate_policy,
@@ -578,4 +578,137 @@ async fn a_shutdown_raised_before_the_channel_loop_publishes_the_roster_and_land
     assert_eq!(outcome.messages_landed, 0);
     assert_eq!(harness.slack.channel_read_count(CHANNEL), 0);
     assert_eq!(harness.sink.batches(), 0);
+}
+
+/// One day, the only window size these backfill tests use, so every walk is a
+/// countable number of day windows.
+const DAY: i64 = 86_400;
+
+fn expected_floor_ts(days_before_pinned_now: i64) -> String {
+    format!(
+        "{}.000000",
+        support::PINNED_NOW_SECS - days_before_pinned_now * DAY
+    )
+}
+
+#[tokio::test]
+async fn a_backfill_lane_stops_at_channel_creation_and_is_reported_complete() {
+    let old_message = ts_before(2 * DAY + DAY / 2, 2);
+    let mut state = workspace(vec![
+        FakeMessage::new(&ts_before(90, 1), "U0HUMAN", "recent"),
+        FakeMessage::new(&old_message, "U0HUMAN", "old"),
+    ]);
+    // Created two days ago, so with a one-day skew allowance the creation floor
+    // (three days back) is DEEPER than the six-day horizon: creation wins.
+    state.channels[0] =
+        FakeChannel::public(CHANNEL, "engineering").created_at(support::PINNED_NOW_SECS - 2 * DAY);
+    let mut harness = Harness::start(state).await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 6 };
+    harness.config.backfill.windows_per_cycle = 8;
+
+    let outcome = harness.cycle(0).await;
+
+    // Three windows: [now-1d-90s..now-90s], [now-2d-90s..now-1d-90s], and the
+    // last clamped to [creation-1d..now-2d-90s], which holds the old message.
+    assert_eq!(outcome.backfill_windows, 3);
+    assert_eq!(outcome.channels_backfilling, 0);
+    assert_eq!(
+        outcome.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(3).as_str())
+    );
+    assert!(harness.sink.record(CHANNEL, &old_message).is_some());
+    let journal = Journal::load(&harness.journal_path);
+    let channel = journal
+        .channel(CHANNEL)
+        .expect("enrolled channels are journaled");
+    assert!(channel.backfill_complete);
+    assert_eq!(
+        channel.created_epoch_secs,
+        Some(support::PINNED_NOW_SECS - 2 * DAY)
+    );
+
+    // The finished lane is skipped, not re-walked: same state, no windows.
+    let outcome = harness.cycle(0).await;
+    assert_eq!(outcome.backfill_windows, 0);
+    assert_eq!(outcome.channels_backfilling, 0);
+    assert_eq!(
+        outcome.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(3).as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_deeper_horizon_rearms_a_completed_backfill_lane() {
+    // No `created` on the fixture channel, which must impose NO bound: the
+    // first cycle walks the whole four-day horizon rather than declaring
+    // itself finished for want of a roster field.
+    let mut harness = Harness::start(workspace(vec![FakeMessage::new(
+        &ts_before(90, 1),
+        "U0HUMAN",
+        "recent",
+    )]))
+    .await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 4 };
+    harness.config.backfill.windows_per_cycle = 8;
+
+    let first = harness.cycle(0).await;
+    assert_eq!(first.backfill_windows, 4);
+    assert_eq!(first.channels_backfilling, 0);
+    assert_eq!(
+        first.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(4).as_str())
+    );
+
+    // The horizon now reaches further back than the floor the completion was
+    // earned against, so the lane re-arms and walks only the difference.
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 6 };
+    let second = harness.cycle(0).await;
+    assert_eq!(second.backfill_windows, 2);
+    assert_eq!(second.channels_backfilling, 0);
+    assert_eq!(
+        second.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(6).as_str())
+    );
+}
+
+#[tokio::test]
+async fn an_earlier_created_rearms_a_lane_and_an_absent_created_does_not() {
+    let mut state = workspace(vec![FakeMessage::new(
+        &ts_before(90, 1),
+        "U0HUMAN",
+        "recent",
+    )]);
+    state.channels[0] =
+        FakeChannel::public(CHANNEL, "engineering").created_at(support::PINNED_NOW_SECS - 2 * DAY);
+    let mut harness = Harness::start(state).await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 6 };
+    harness.config.backfill.windows_per_cycle = 8;
+
+    let first = harness.cycle(0).await;
+    assert_eq!(first.backfill_windows, 3);
+    assert_eq!(first.channels_backfilling, 0);
+
+    // The roster now reports an EARLIER creation, moving the floor under the
+    // recorded completion: the lane re-arms and walks to the new floor.
+    harness.slack.with(|state| {
+        state.channels[0].created = Some(support::PINNED_NOW_SECS - 5 * DAY);
+    });
+    let second = harness.cycle(0).await;
+    assert_eq!(second.backfill_windows, 3);
+    assert_eq!(
+        second.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(6).as_str())
+    );
+
+    // A roster read that omits `created` entirely is sticky-none: the journal
+    // keeps the last known creation and the finished lane stays skipped.
+    harness.slack.with(|state| {
+        state.channels[0].created = None;
+    });
+    let third = harness.cycle(0).await;
+    assert_eq!(third.backfill_windows, 0);
+    assert_eq!(third.channels_backfilling, 0);
 }
