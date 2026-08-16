@@ -680,14 +680,17 @@ impl super::BlackboxServer {
         .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         let graphs =
             bbox_indexing::project_graph_view::build_provisional_graph_overlay(&source, verified)?;
+        let published =
+            bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
+        // One write guard for both halves of the install: converging the word
+        // lanes first, then swapping published and provisional together, so no
+        // reader can see the new published view beside the old or missing
+        // provisional overlay.
+        super::knowledge_view::converge_published_graph_word_lanes(&self.state, &published);
         {
-            let published =
-                bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
-            super::knowledge_view::install_published_graph_view(&self.state, published);
-            self.state
-                .project_graph_views
-                .write()
-                .install_provisional(graphs.clone());
+            let mut views = self.state.project_graph_views.write();
+            views.install_published(published);
+            views.install_provisional(graphs);
         }
 
         Ok(RemoteProvisionalOverlayPair { knowledge, gaps })
@@ -789,13 +792,20 @@ fn refresh_provisional_graph_views(state: &SharedState, authority: &ProvisionalA
             );
             None
         });
+    // Same one-guard contract as the remote overlay path: the word lanes
+    // converge first, then the published and provisional views swap together
+    // under a single write acquisition.
     if let Some(published) = published {
-        super::knowledge_view::install_published_graph_view(state, published);
+        super::knowledge_view::converge_published_graph_word_lanes(state, &published);
+        let mut views = state.project_graph_views.write();
+        views.install_published(published);
+        views.install_provisional(overlay);
+    } else {
+        state
+            .project_graph_views
+            .write()
+            .install_provisional(overlay);
     }
-    state
-        .project_graph_views
-        .write()
-        .install_provisional(overlay);
 }
 
 fn provisional_file_map(

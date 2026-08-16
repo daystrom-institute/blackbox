@@ -1655,6 +1655,25 @@ impl BlackboxServer {
 /// Install one published project-graph view and converge the project's
 /// published graph word lanes to it (unified-retrieval design 7.1).
 ///
+/// Delegates to [`converge_published_graph_word_lanes`] for the durable side,
+/// then swaps the catalog view under its own write guard. Callers that also
+/// install a provisional overlay in the same step must use
+/// [`converge_published_graph_word_lanes`] plus one shared write guard
+/// instead, so a reader can never observe the new published view with the old
+/// (or missing) provisional overlay.
+pub(crate) fn install_published_graph_view(
+    state: &SharedState,
+    view: bbox_indexing::project_graph_view::PublishedProjectGraphView,
+) {
+    converge_published_graph_word_lanes(state, &view);
+    state.project_graph_views.write().install_published(view);
+}
+
+/// Converge the published graph word lanes to one view WITHOUT touching the
+/// in-memory catalog: the lane replacements and purges are computed and
+/// enqueued here, and the caller performs the catalog swap under whatever
+/// guard it needs (alone, or shared with a provisional install).
+///
 /// Every graph in the view gets a whole-lane replacement keyed on its
 /// generation stamp: same generation no-ops, a new generation rewrites the
 /// lane, and a graph whose policy now disables text retrieval (or that left
@@ -1662,9 +1681,9 @@ impl BlackboxServer {
 /// ABSENT from the index, not merely filtered out of one result list. M9a
 /// indexes the published plane only; provisional and connector planes do not
 /// reach the word index yet and must not piggyback on this path.
-pub(crate) fn install_published_graph_view(
+pub(crate) fn converge_published_graph_word_lanes(
     state: &SharedState,
-    view: bbox_indexing::project_graph_view::PublishedProjectGraphView,
+    view: &bbox_indexing::project_graph_view::PublishedProjectGraphView,
 ) {
     use bbox_indexing::index::{
         GRAPH_SOURCE_PUBLISHED as PUBLISHED, published_graph_vertex_documents,
@@ -1702,7 +1721,6 @@ pub(crate) fn install_published_graph_view(
             documents,
         );
     }
-    state.project_graph_views.write().install_published(view);
     for graph_id in indexed_lanes.keys() {
         if !planned.contains(graph_id) {
             state
