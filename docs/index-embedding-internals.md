@@ -29,6 +29,9 @@ Indexed sources include:
 
 - transcript blocks from supported providers;
 - project source and docs from registered repos;
+- landed conversations from the connector conversation lane (Slack),
+  projected through the transcript adapter with source, author,
+  channel, and permalink fields;
 - git commit messages;
 - knowledge entries;
 - notes and threads;
@@ -50,11 +53,25 @@ Incremental reindex uses file metadata and source-specific fingerprints
 to avoid rewriting unchanged content. Full reindex rebuilds the corpus
 projection from scratch.
 
+A sibling lane is implementing
+[Unified Retrieval For Reflective Graph Vertices](../design/connectors/unified-retrieval.md),
+milestone M9 of the graph-native connector campaign: project-graph
+vertices will join the word index as ordinary documents, with optional
+embedding participation under per-graph policy. That design is in
+progress; this page does not yet describe its schema or indexing
+changes.
+
 ## Schema versioning
 
-`INDEX_SCHEMA_VERSION` in `src/index/mod.rs` gates index compatibility.
-On daemon startup, the stored marker is compared with the binary's
-version. A mismatch drops the old index directory and rebuilds it.
+`INDEX_SCHEMA_VERSION` in `crates/bbox-corpus-index/src/index/mod.rs`
+gates index compatibility. On daemon startup, the stored marker is
+compared with the binary's version. A mismatch no longer drops the index
+unconditionally: replacement goes through a fail-closed guard boundary.
+An absent guard refuses the reset, a guard error aborts it leaving the
+last-good lexical and vector views selected, and a commit-carryover
+bridge carries commit documents across the reset so projects whose
+checkouts are unavailable do not lose history at every bump. Migration
+inventory and history generations record what was replaced.
 
 Marker path:
 
@@ -62,13 +79,7 @@ Marker path:
 ~/.local/share/blackbox/index/schema_version.txt
 ```
 
-Expected migration log:
-
-```text
-dropping transcript index for schema migration
-```
-
-Recent schema tags:
+Schema history:
 
 | Tag | Change |
 |---|---|
@@ -77,6 +88,13 @@ Recent schema tags:
 | `agentic-corpus-g3-commit-subject-tokens` | Commit subjects contribute path-style tokens |
 | `agentic-corpus-g4-elixir-symbols` | Elixir symbol extraction |
 | `agentic-corpus-g5-symbol-tokenized` | Symbol field uses code tokenizer |
+| `agentic-corpus-g6-symbol-kind-and-ranges` | Symbol kind and range fields for code nav |
+| `agentic-corpus-g7-transcript-tool-calls` | Transcript tool-call documents |
+| `agentic-corpus-g8-base-project-id` | Transcript and tool-call docs stamped with resolved base project |
+| `agentic-corpus-g9-knowledge-visibility` | Session provisional visibility enforcement |
+| `agentic-corpus-g10-code-source-selectors` | Active code-source selectors for collected code |
+| `agentic-corpus-g11-path-free-project-files` | Path-free project-file keys behind the guarded replacement (P3-E) |
+| `agentic-corpus-g12-conversation-projection` | Conversation-lane fields: source, author, channel, permalink |
 
 ## Project file indexing
 
@@ -117,13 +135,20 @@ Common routes:
 | `git_message` | Commit subjects and bodies |
 | `knowledge` | Knowledge entries |
 | `notes` | Side-channel notes |
+| `threads` | Thread records |
 | `transcripts` | Transcript blocks |
+| `agent_manifest` | Agent manifest documents |
+
+Text routes are bucket-keyed; `[embed.routes.per_project]` can override
+any bucket per project, so one checkout can embed `code` with a
+different alias than the global default without invalidating other
+projects' partitions.
 
 Each route is keyed by provider alias, document model, dimension, and
 output dtype (float is omitted from the partition id for backward
 compatibility). A dimension mismatch is a hard error because old vectors
 cannot be mixed with new vectors safely, and vectors are only comparable
-within one compatibility family (model family + dimension + dtype —
+within one compatibility family (model family + dimension + dtype;
 equal dimensions across different models prove nothing).
 
 Operator tools:
@@ -216,15 +241,21 @@ backfill existing corpus with `bbox_reembed`.
 The daemon runs route-specific workers. Reindexing enqueues source docs;
 workers batch, send, retry, and persist vectors.
 
-Queue batch cap:
+Queue batch caps:
 
 ```text
-128 documents or 100 KiB of input text per request
+text:   128 documents or 100 KiB of input text per request
+visual: 8 documents or 64 MiB per request
 ```
 
-The cap is intentionally below provider limits so a large restart does
-not create one oversized request, retry it repeatedly, and drop the
-whole batch.
+At the route level, a queue holds at most 10,000 pending documents or
+128 MiB.
+
+The text cap is intentionally below provider limits so a large restart
+does not create one oversized request, retry it repeatedly, and drop the
+whole batch; the byte guard is the worst-case-token guard for providers
+that tokenize raw text. Visual items are heavy per document, so they
+pack shallower batches. A single text document is capped at 64 KiB.
 
 `bbox_embed_status` exposes the operational shape:
 
@@ -238,6 +269,7 @@ whole batch.
 | `queue_depth` | Pending source docs |
 | `retried_count` | Retry pressure |
 | `last_error` | Last route-level failure |
+| `health_reason` | Why a route is not usable (e.g. `not_configured` for an unrouted visual kind) |
 
 ## Vector storage and compaction
 
@@ -266,7 +298,7 @@ vector partition compaction failed; will retry
 EdgeIndex combines:
 
 - per-project sidecars from project indexing;
-- live edges from knowledge, thread, and note stores;
+- live edges from knowledge, thread, note, and roadmap stores;
 - virtual edges for tasks and tool calls.
 
 The watcher rebuilds EdgeIndex when Tantivy's document count grows.
