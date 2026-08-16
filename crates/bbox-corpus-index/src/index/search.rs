@@ -4236,4 +4236,190 @@ mod graph_word_lane_tests {
         let bare = GraphWordAuthority::from_parts(None, None, BTreeSet::new(), None);
         assert!(bare.is_empty());
     }
+
+    fn write_ranking_transcripts(writer: &mut IndexWriter, fields: &crate::index::FieldHandles) {
+        let transcripts = [
+            (
+                "transcript:claude:sess-r1:0:0",
+                "quarterly settlement record for the alpha account plus quarterly settlement adjustments",
+            ),
+            (
+                "transcript:claude:sess-r2:0:0",
+                "quarterly settlement notes for the beta ledger",
+            ),
+            (
+                "transcript:claude:sess-r3:0:0",
+                "monthly settlement record for the gamma account",
+            ),
+            (
+                "transcript:claude:sess-r4:0:0",
+                "unrelated release notes for the depot tooling",
+            ),
+        ];
+        for (entity_id, content) in transcripts {
+            writer
+                .add_document(plain_doc(fields, entity_id, content))
+                .unwrap();
+        }
+    }
+
+    fn write_ranking_graph_documents(
+        writer: &mut IndexWriter,
+        fields: &crate::index::FieldHandles,
+    ) {
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                PROJECT,
+                "domain-alpha",
+                "repo:Record",
+                "Alpha settlement record",
+                "quarterly settlement record for the alpha account",
+                GENERATION,
+            ))
+            .unwrap();
+        writer
+            .add_document(graph_vertex_doc(
+                fields,
+                PROJECT,
+                "domain-disabled",
+                "repo:Record",
+                "Hidden settlement record",
+                "quarterly settlement record for the alpha account",
+                "generation-disabled",
+            ))
+            .unwrap();
+    }
+
+    fn transcript_hits_for_query(
+        index: &TranscriptIndex,
+        authority: Option<&GraphWordAuthority>,
+        query: &str,
+    ) -> Vec<String> {
+        let searcher = index.searcher();
+        index
+            .hybrid_bm25_hits_with_graph_authority_and_searcher(
+                query,
+                10,
+                None,
+                true,
+                &BTreeMap::new(),
+                &searcher,
+                authority,
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|hit| hit.entity_id.starts_with("transcript:"))
+            .map(|hit| hit.entity_id)
+            .collect()
+    }
+
+    /// Exit gate (e): the graph lane must be additive content, not a ranking
+    /// perturbation. Adding graph vertex documents to the word index leaves
+    /// the non-graph corpus's ranking byte-identical: same transcript hits,
+    /// same relative order, measured with the shared ranking metrics so the
+    /// comparison is the same one eval sweeps use. Graph documents occupy
+    /// their own ranks in the treatment corpus (the growth is real), but the
+    /// transcript subsequence is unchanged.
+    #[test]
+    fn graph_documents_do_not_perturb_non_graph_corpus_ranking() {
+        let control_dir = tempfile::tempdir().unwrap();
+        let control_root = control_dir.path().canonicalize().unwrap();
+        let control = open_index(&control_root);
+        {
+            let fields = control.field_handles();
+            let handle = control.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_ranking_transcripts(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        control.reader_reload_for_test();
+
+        let treatment_dir = tempfile::tempdir().unwrap();
+        let treatment_root = treatment_dir.path().canonicalize().unwrap();
+        let treatment = open_index(&treatment_root);
+        {
+            let fields = treatment.field_handles();
+            let handle = treatment.index_handle();
+            let mut writer: IndexWriter = handle.writer(50_000_000).unwrap();
+            write_ranking_transcripts(&mut writer, &fields);
+            write_ranking_graph_documents(&mut writer, &fields);
+            writer.commit().unwrap();
+        }
+        treatment.reader_reload_for_test();
+
+        // Sanity: the graph lane really did join the treatment corpus, and
+        // the authority filter keeps only the readable lane visible.
+        let quarterly_searcher = treatment.searcher();
+        let quarterly = treatment
+            .hybrid_bm25_hits_with_graph_authority_and_searcher(
+                "quarterly settlement",
+                10,
+                None,
+                true,
+                &BTreeMap::new(),
+                &quarterly_searcher,
+                Some(&authority()),
+            )
+            .unwrap();
+        assert!(
+            quarterly
+                .iter()
+                .any(|hit| hit.entity_id.contains(":domain-alpha:")),
+            "treatment corpus must contain the readable graph lane: {quarterly:?}"
+        );
+        assert!(
+            !quarterly
+                .iter()
+                .any(|hit| hit.entity_id.contains(":domain-disabled:")),
+            "disabled graph lane must be filtered before ranking: {quarterly:?}"
+        );
+
+        // The authority clause is anchored by a zero-boost AllQuery so it can
+        // only subtract documents, never perturb scores: on the same index,
+        // the filtered and unfiltered scores of every surviving non-graph
+        // hit are bit-identical.
+        let unfiltered_searcher = treatment.searcher();
+        let unfiltered = treatment
+            .hybrid_bm25_hits_with_graph_authority_and_searcher(
+                "quarterly settlement",
+                10,
+                None,
+                true,
+                &BTreeMap::new(),
+                &unfiltered_searcher,
+                None,
+            )
+            .unwrap();
+        for filtered_hit in &quarterly {
+            if !filtered_hit.entity_id.starts_with("transcript:") {
+                continue;
+            }
+            let unfiltered_score = unfiltered
+                .iter()
+                .find(|hit| hit.entity_id == filtered_hit.entity_id)
+                .map(|hit| hit.score)
+                .expect("filter must not drop readable non-graph hits");
+            assert_eq!(
+                filtered_hit.score, unfiltered_score,
+                "authority clause must not perturb non-graph scores"
+            );
+        }
+
+        let mut per_query: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for query in ["quarterly settlement", "monthly settlement"] {
+            let control_order = transcript_hits_for_query(&control, None, query);
+            let treatment_order = transcript_hits_for_query(&treatment, Some(&authority()), query);
+            assert_eq!(
+                treatment_order, control_order,
+                "graph documents must not reorder the non-graph corpus for {query:?}"
+            );
+            per_query.push((treatment_order, control_order));
+        }
+
+        let report = bbox_corpus_core::search::metrics::aggregate(&per_query, &[3]);
+        assert_eq!(report.queries, 2);
+        assert_eq!(report.mrr, 1.0);
+        assert_eq!(report.recall_at.get(&3), Some(&1.0));
+    }
 }
