@@ -1,0 +1,24 @@
+{
+  "id": "gap-aa2baeb3",
+  "title": "shell_run leaves stdin an open pipe: pathless rg/grep-style commands block forever",
+  "gap_kind": "tooling",
+  "domain": "bro-harness-shell",
+  "wanted_capability": "shell_run should spawn commands with stdin connected to /dev/null (or an immediately closed pipe) unless a caller explicitly supplies stdin, so tools that read stdin when it is not a tty (ripgrep with no path argument, grep, cat, jq without files, and the rtk rewrites of them) fail fast or search the cwd instead of blocking indefinitely; and supervision should surface a long-running tool as a hang candidate to the orchestrator (idle_seconds already exists, a threshold nudge or auto-timeout on the shell tool would close the loop). Observed 2026-08-16: a glm-5.3 bro dispatched with a lane cwd ran `rtk rg -n --no-heading '<pat>' --type rust | head -80` (no path); the host-side rg process sat asleep at 0 CPU on fd 0 for 15 minutes until the orchestrator killed it by hand.",
+  "missing_primitive": "stdin=/dev/null default (or explicit stdin control) on shell_run; hang detection/timeout on shell tools",
+  "fallback_used": "Orchestrator killed the rg process on the host, then bro_steer'd the worker to always pass an explicit path or `< /dev/null` and prefer code.* / file tools for repo search.",
+  "evidence": [
+    "bro task df7a62ef-1183-4b8d-8f67-c37c9f177b8f (session 99c1b23d-da8a-4edf-9e8e-8bf07ca943ef), seq 1894",
+    "file:crates/bro-tools/src/shell.rs",
+    "thread-a2062843"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness-shell/stdin-open-pipe-hang",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "task_id": "df7a62ef-1183-4b8d-8f67-c37c9f177b8f",
+  "provider": "glm",
+  "thread_id": "thread-a2062843",
+  "created_at": "2026-08-16T16:43:33Z",
+  "updated_at": "2026-08-16T16:43:33Z"
+}

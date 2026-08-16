@@ -1,0 +1,23 @@
+{
+  "id": "gap-9c2b0bf8",
+  "title": "bbox_describe_schema edge catalog is hand-maintained and narrower than what EdgeIndex projects",
+  "gap_kind": "mcp_surface",
+  "domain": "agentic-corpus/describe-schema",
+  "wanted_capability": "bbox_describe_schema should derive its edge families and per-family kind lists from the same source EdgeIndex projects (or from an observed-kinds pass over the live edge sidecar), so the catalog agents orient on in step 1 of the opening sequence cannot drift behind the graph. Today the tool hand-lists families in crates/bbox-mcp-tools/src/mcp_tools/describe_schema.rs (~199-280): it advertises no Roadmap family at all although EdgeIndex reads roadmap stores and emits an eight-kind Roadmap family, and its Knowledge family lists only SUPERSEDES, DERIVED_FROM, Contradicts, KNOWLEDGE_FROM_SESSION, KNOWLEDGE_FROM_BOARD while KnowledgeEdgeKind::edge_kind() (crates/bbox-knowledge/src/knowledge.rs ~1073-1081) also emits RelatesTo, TensionWith, Supports, DependsOn, REFERENCES; thread structural edges (THREAD_SPAWNED_FROM/BLOCKED_BY/RELATES_TO/SUBSUMES) are likewise projected but not advertised. Found 2026-08-16 by the opus reviewer of the docs/retrieval-internals-refresh lane while re-grounding docs/graph-retrieval-internals.md against code; the doc now carries a one-sentence caveat about the mismatch, which is the workaround, not the fix.",
+  "missing_primitive": "single-source edge-family catalog shared by EdgeIndex projection and describe_schema (or an observed-kinds enumeration)",
+  "fallback_used": "docs/graph-retrieval-internals.md documents the full projected edge table and notes that describe_schema is narrower.",
+  "evidence": [
+    "crates/bbox-mcp-tools/src/mcp_tools/describe_schema.rs:229",
+    "crates/bbox-edge-index/src/edge_index.rs:508",
+    "crates/bbox-knowledge/src/knowledge.rs:1080",
+    "thread-a2062843"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/describe-schema/edge-catalog-lags-edge-index",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-a2062843",
+  "created_at": "2026-08-16T17:49:16Z",
+  "updated_at": "2026-08-16T17:49:16Z"
+}
