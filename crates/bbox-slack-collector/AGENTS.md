@@ -108,6 +108,18 @@ end is not ours to trust), and a public IP-literal corpus host is refused even
 under it. Default-off is load-bearing: both wires carry a bearer, and the
 default is what keeps it out of clear text.
 
+**Shutdown granularity is between channels, not between calls.** A signal
+raises the flag and the current channel finishes (journal saved, exit 0), but a
+signal that lands DURING a corpus call waits out that call's retry ladder
+before the flag is even observed. Do not add an unbounded corpus call shape
+here: shutdown latency inherits its worst case.
+
+**The retry ladder's cost is wall clock, not just count.** A hard-down corpus
+costs 4 requests (initial + 3 retries), the 5+15+30s backoff ladder, and up to
+30s per request (10s of it connect) before the cycle gives up. Sizing any
+deadline that wraps a cycle (container stop grace, cron overlap) must count
+that whole tail.
+
 ## Testing
 
 `cargo nextest run --workspace -E 'package(bbox-slack-collector)'`.

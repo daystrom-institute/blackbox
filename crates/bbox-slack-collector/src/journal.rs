@@ -530,4 +530,132 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(Journal::load(&path), Journal::default());
     }
+
+    /// The v1 document on disk BEFORE this branch's backfill fields existed:
+    /// a hand-written literal, not a serialization of the current type, so the
+    /// defaults are proven rather than assumed. It must LOAD (version matches,
+    /// so there is no reseed) with the new fields defaulted, because a
+    /// satellite upgrading in place must not discard its forward marks.
+    #[test]
+    fn a_v1_journal_without_the_backfill_fields_loads_with_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("journal.json");
+        let document = format!(
+            r#"{{"version":1,"cycles":3,"channels":{{"{CHANNEL}":{{"swept_through_ts":"1755000000.000100"}}}}}}"#
+        );
+        std::fs::write(&path, document).unwrap();
+
+        let journal = Journal::load(&path);
+        assert_eq!(journal.version, 1, "same major version: no reseed");
+        assert_eq!(journal.cycles, 3);
+        let channel = journal
+            .channel(CHANNEL)
+            .expect("the v1 channel and its forward mark survive the upgrade");
+        assert_eq!(
+            channel.swept_through_ts.as_deref(),
+            Some("1755000000.000100")
+        );
+        assert_eq!(channel.created_epoch_secs, None);
+        assert!(!channel.backfill_complete);
+        assert_eq!(channel.backfill_floor_epoch_secs, None);
+        assert_eq!(channel.backfilled_to_ts, None);
+    }
+
+    /// The floor is the FIRST bound a backwards walk reaches: the
+    /// later-in-time (larger epoch) of the horizon and creation-less-slack.
+    /// An unknown `created` imposes NO bound at all, so a missing roster field
+    /// cannot silently declare a lane finished.
+    #[test]
+    fn the_backfill_floor_is_the_first_bound_reached_and_unknown_created_binds_nothing() {
+        let mut journal = Journal::default();
+        let unknown_created = journal.channel_mut(CHANNEL);
+        assert_eq!(
+            unknown_created.backfill_floor_secs(1_000),
+            1_000,
+            "no created: the horizon is the floor"
+        );
+
+        // Created at 200_000 with one day of slack: the creation bound
+        // (113_600) is later than the horizon (1_000), so the walk reaches it
+        // first and the channel's beginning is the floor.
+        let channel = journal.channel_mut(CHANNEL);
+        channel.observe_created(Some(200_000));
+        assert_eq!(
+            channel.backfill_floor_secs(1_000),
+            200_000 - BACKFILL_CREATED_SLACK_SECS
+        );
+
+        // A horizon later than the creation bound is reached first instead:
+        // the walk stops where the operator told it to, not at the channel's
+        // beginning.
+        channel.observe_created(Some(10_000));
+        assert_eq!(
+            channel.backfill_floor_secs(1_000),
+            1_000,
+            "the creation bound lies deeper than the horizon; the horizon is the floor"
+        );
+    }
+
+    /// `observe_created` is sticky for Some and immune to None: a roster read
+    /// that omits the field must not reopen a finished lane, and a roster that
+    /// revises the creation must be able to move it (the re-arm path).
+    #[test]
+    fn created_observations_are_sticky_for_some_and_immune_to_none() {
+        let mut journal = Journal::default();
+        let channel = journal.channel_mut(CHANNEL);
+        channel.observe_created(None);
+        assert_eq!(channel.created_epoch_secs, None);
+        channel.observe_created(Some(10_000));
+        assert_eq!(channel.created_epoch_secs, Some(10_000));
+        channel.observe_created(None);
+        assert_eq!(
+            channel.created_epoch_secs,
+            Some(10_000),
+            "an omitted roster field never clears a known creation"
+        );
+        channel.observe_created(Some(5_000));
+        assert_eq!(
+            channel.created_epoch_secs,
+            Some(5_000),
+            "a revised creation overwrites, which is the re-arm trigger"
+        );
+    }
+
+    /// Completion is only trustworthy for the floor it was earned against: a
+    /// floor that moved DEEPER (smaller epoch) re-arms the lane, and
+    /// re-completing records the new floor so the state is not trusted
+    /// forever.
+    #[test]
+    fn backfill_completion_rearms_when_the_floor_moves_deeper() {
+        let mut journal = Journal::default();
+        let channel = journal.channel_mut(CHANNEL);
+        assert!(
+            !channel.backfill_lane_complete(100),
+            "a lane that never walked is not complete"
+        );
+
+        channel.mark_backfill_complete(100);
+        assert!(channel.backfill_complete);
+        assert_eq!(channel.backfill_floor_epoch_secs, Some(100));
+        assert!(
+            channel.backfill_lane_complete(100),
+            "the floor it was earned against"
+        );
+        assert!(
+            channel.backfill_lane_complete(150),
+            "a shallower floor does not reopen finished history"
+        );
+        assert!(
+            !channel.backfill_lane_complete(50),
+            "a deeper floor re-arms the lane"
+        );
+
+        channel.mark_backfill_complete(50);
+        assert!(
+            channel.backfill_lane_complete(50),
+            "re-earned against the deeper floor"
+        );
+        assert_eq!(channel.backfill_floor_epoch_secs, Some(50));
+    }
 }

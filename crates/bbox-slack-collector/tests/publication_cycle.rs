@@ -638,6 +638,47 @@ async fn a_backfill_lane_stops_at_channel_creation_and_is_reported_complete() {
     );
 }
 
+/// A one-window backfill budget must report the lane as IN PROGRESS while it
+/// is still walking: `channels_backfilling == 1` on every cycle before the
+/// floor, and 0 only on the cycle that completes the walk. That distinction is
+/// the whole point of the counter: "deep horizon, healthy progress" must read
+/// differently from "no backfill at all".
+#[tokio::test]
+async fn a_one_window_backfill_budget_reports_the_lane_in_progress_until_it_finishes() {
+    let mut harness = Harness::start(workspace(vec![FakeMessage::new(
+        &ts_before(90, 1),
+        "U0HUMAN",
+        "recent",
+    )]))
+    .await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 4 };
+    harness.config.backfill.windows_per_cycle = 1;
+
+    for cycle in 1..=3 {
+        let outcome = harness.cycle(0).await;
+        assert_eq!(
+            outcome.backfill_windows, 1,
+            "cycle {cycle}: the budget is one window per cycle"
+        );
+        assert_eq!(
+            outcome.channels_backfilling, 1,
+            "cycle {cycle}: the lane is mid-walk, not missing"
+        );
+    }
+
+    let done = harness.cycle(0).await;
+    assert_eq!(done.backfill_windows, 1);
+    assert_eq!(
+        done.channels_backfilling, 0,
+        "the cycle that completes the walk reports the lane finished"
+    );
+    assert_eq!(
+        done.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(4).as_str())
+    );
+}
+
 #[tokio::test]
 async fn a_deeper_horizon_rearms_a_completed_backfill_lane() {
     // No `created` on the fixture channel, which must impose NO bound: the
