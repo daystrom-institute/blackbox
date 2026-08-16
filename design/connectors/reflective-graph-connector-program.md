@@ -55,7 +55,9 @@ owned by [API-Dataset Connector](api-dataset-connector.md)
 (`gap-0378c305`). M9 unified retrieval is designed and under active
 implementation by a sibling lane
 ([Unified retrieval for reflective graph vertices](unified-retrieval.md),
-`gap-5d57d2bb`); treat neither as shipped. The pre-locality
+`gap-5d57d2bb`); treat neither as shipped. Milestones without an
+explicit `Status:` line below (M5, M6, M7, M8, M10) remain proposed.
+The pre-locality
 `campaign/reflective-graph-r2-projection` implementation is history: it
 was ported milestone by milestone against current contracts, never
 merged wholesale. Reverify contract names against code before building.
