@@ -1,4 +1,4 @@
-# bbox-config — config loader, env override allowlist, producer grants
+# bbox-config: config loader, env override allowlist, producer grants
 
 ## `[source_connectors]` grants
 
