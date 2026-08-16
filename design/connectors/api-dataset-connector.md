@@ -895,10 +895,13 @@ discovering:
   keeps the lease alive across the refusal: the producer retries the same post
   rather than re-executing. It is also a second reason v1 actions are
   read-shaped.
-- **Recommendation.** Do not enable actions on a producer whose token rotation
-  policy is frequent until overlap-tolerant grants land. Where actions are
-  enabled first, the rotation runbook must name the action queue explicitly:
-  drain to zero leased actions before cutover.
+- **Ruling (operator, 2026-08-16).** Overlap-tolerant grants have landed
+  (`token_files` on both grant families), so this is a validator rule, not a
+  runbook caveat: an `api_dataset` grant that declares actions must carry
+  `token_files`; declared actions with a single `token_file` refuse at config
+  validation. The rotation runbook still names the action queue (drain to
+  zero leased actions is the tidy cutover), but correctness no longer depends
+  on it.
 
 The gap's fix is additive to this design and needs nothing from it.
 
@@ -1011,6 +1014,15 @@ is. A5 onward is one adapter plus its auth flow.
 
 ## 12. Open questions
 
+**Operator ruling, 2026-08-16.** Items 1, 3, 4, 5, 6, and 7 were put to
+the operator and each was ratified as its standing recommendation, with
+item 6 tightened: because overlap-tolerant grants (`token_files`, the
+`gap-bb84c77f` fix) landed on both grant families in the same fold as this
+design, an `api_dataset` grant that declares actions and carries a single
+`token_file` is a config validation refusal, not a runbook caveat. Items 2,
+8, and 9 are design-internal rules and were not put to the operator. Each
+ruled item carries a *Decided* line.
+
 1. **One `connector_source_id` per profile, or `(id, profile)` pairs.**
    Placing bytes from an action today requires minting a second connector
    source with `profile = file` (section 7.5). *Recommendation:* keep the
@@ -1019,6 +1031,7 @@ is. A5 onward is one adapter plus its auth flow.
    dataset source, and relaxing catalog uniqueness is the kind of invariant
    change that is cheap to make and expensive to unmake. Revisit when a second
    integration hits the same friction, not before.
+   *Decided 2026-08-16: keep one id per profile; a dataset source that places bytes uses a separately minted file-profile scope.*
 2. **Mapping-vocabulary creep.** The declarative mapping (section 6.2) will be
    asked for conditionals the first time a vendor's shape does not fit.
    *Recommendation:* refuse, and push the computation into producer-side
@@ -1033,19 +1046,23 @@ is. A5 onward is one adapter plus its auth flow.
    batch, or drop the edge) are both worse: refusing makes an ordinary
    multi-cadence dataset unpublishable, and dropping makes the graph quietly
    wrong.
+   *Decided 2026-08-16: hold and report; additive snapshot field and store version bump taken in A3.*
 4. **Checkpoint epoch home.** The degradation epoch rides telemetry rather
    than the checkpoint value (section 5.2). *Recommendation:* keep it on
    telemetry. A checkpoint value is a vendor token, and corpus bookkeeping
    inside it would make an opaque field partly ours, which is the mistake the
    file lane avoided by keeping `remote_watermark` explicitly non-authoritative.
+   *Decided 2026-08-16: telemetry.*
 5. **Action latency versus poll interval.** *Recommendation:* bounded
    long-poll on the claims route, and measure before adding anything
    push-shaped. Every push mechanism proposed so far reintroduces a
    corpus-initiated leg or an inbound listener on the producer.
+   *Decided 2026-08-16: bounded long-poll on the claims route; measure before anything push-shaped.*
 6. **Rotation ordering with actions enabled** (`gap-bb84c77f`, section 9.1).
    *Recommendation:* gate actions behind overlap-tolerant grants where
    rotation is frequent; otherwise name the action-queue drain explicitly in
    the rotation runbook.
+   *Decided 2026-08-16: actions require overlap-tolerant grants; declared actions plus a single `token_file` refuse at config validation.*
 7. **Multiple source graphs per source.** The wire carries `graph_id`, so one
    dataset source can hold several graphs (for example a slow-moving reference
    graph and a fast-moving transaction graph with different retention).
@@ -1053,6 +1070,7 @@ is. A5 onward is one adapter plus its auth flow.
    ship one graph per source until a real second graph appears, because
    per-graph checkpoint set partitioning is a question best answered by a case
    rather than by a guess.
+   *Decided 2026-08-16: `graph_id` on the wire from v1; one graph per source until a real second graph appears.*
 8. **Whether an observation payload should ever be searchable.** Retained
    batches are content addressed and referenced from facts; they are not
    indexed. *Recommendation:* keep them unindexed. The schema's property

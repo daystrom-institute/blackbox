@@ -932,7 +932,11 @@ The shippable slice. Scope:
 - authority filtering composed before ranking in the word lane;
 - graph-selection gating and the fan-out cap before traversal expansion;
 - result identity fields and `graph_logical_ref`;
-- `bbox_project_graph_describe` participation reporting.
+- `bbox_project_graph_describe` participation reporting;
+- the `project_id` field on every graph vertex document (Q6 ruling), so the
+  provisional lane in M9c is a filter change and not a schema bump;
+- the `provisional` spelling with `visibility` as a deprecated alias on the
+  `bbox_project_graph_*` family (Q10 ruling).
 
 Explicitly out: vectors, the provisional and connector planes, evidence
 expansion, placed-chunk back-pointers.
@@ -1086,6 +1090,18 @@ surfaces should correct them rather than adding to a stale account.
 Triaged in the program doc's style: each carries a standing recommendation
 so the absence of a decision does not block the slice that needs it.
 
+**Operator ruling, 2026-08-16.** Q6 was flagged as wanting an early call
+because it shapes the graph vertex document schema before M9a lays it
+down; the operator ruled for the recommendation (stamp `project_id` at
+index time). Q1, Q3, Q4, Q8, and Q10 were put to the operator in the same
+pass and each was ratified as its standing recommendation. Q2, Q5, Q7, and
+Q9 remain design-internal (their recommendations are the design; no
+operator input was sought). Each ruled item carries a *Decided* line below.
+Consequence for phasing: M9a writes the `project_id` field on every graph
+vertex document, published and provisional alike, even though nothing
+filters on it until M9c, so the provisional lane does not need a schema
+bump.
+
 **Q1. Do graph vertices need reserved slots in the top-k?**
 A query whose answer is one record vertex can be swamped by file chunks that
 share vocabulary. *Recommendation: no reservation in v1.* Modal
@@ -1094,6 +1110,7 @@ adding a second unswept constant before measuring is how ranking chains rot.
 Decide from M9a's metrics, not from feel. If it is needed, the cheapest form
 is adding `project_graph_vertex` to `diversify_by_chunk_kind`'s
 `TARGET_KINDS` rather than a new mechanism.
+*Decided 2026-08-16: no reservation in v1; revisit only from M9a metrics.*
 
 **Q2. One document per vertex, or per (vertex, text property)?**
 *Recommendation: per vertex,* for the reasons in section 4.1. Revisit only
@@ -1106,6 +1123,7 @@ partitions are the thing whose compatibility family (model plus dimension
 plus dtype) has to be managed. A graph that genuinely needs a different
 model is a real signal, and the route config is already per-route, so the
 extension is available when a case exists.
+*Decided 2026-08-16: one route in v1.*
 
 **Q4. Should connector graphs be word-indexed by default?**
 *Recommendation: yes for labels, per decision `b1a11d7cf59f2545`, with
@@ -1113,6 +1131,7 @@ extension is available when a case exists.
 requiring per-graph opt-in for the connector plane, makes the common case
 ("I connected a source and now I want to search it") require an edit to a
 vendor-shipped artifact.
+*Decided 2026-08-16: yes for labels; `retrieval_excluded_types` is the tenant's recourse.*
 
 **Q5. What pins the graph view during a query?**
 *Recommendation: the graph view pin travels with the searcher pin, resolved
@@ -1132,6 +1151,7 @@ installer knows the project id; deriving it at query time would mean a
 catalog lookup inside the filter, which is both a lock-ordering hazard and a
 per-hit cost. This is the same shape as the existing
 `knowledge_scope_hash` / `knowledge_checkout_id` fields.
+*Decided 2026-08-16: stamp `project_id` into the graph vertex document at index time (published and provisional forms) and filter on the field; M9a lays the field down.*
 
 **Q7. Where does authorization input come from before M10?**
 *Recommendation: v1 authorization is project scope plus provisional
@@ -1145,6 +1165,7 @@ indistinguishable from a bypass when it is finally replaced.
 seeds are graph vertices. The campaign's own concern is not dumping whole
 source graphs into model context, and a default-on expansion is that failure
 mode with extra steps.
+*Decided 2026-08-16: off by default; `next_steps` pulls toward it.*
 
 **Q9. What happens to a search hit whose graph generation advances between
 ranking and result shaping?**
@@ -1160,6 +1181,7 @@ as a deprecated alias on the `bbox_project_graph_*` family.* It is a small
 correction, it is cheapest while that family is being touched for
 participation reporting, and a third spelling arriving with M9 would make it
 permanent.
+*Decided 2026-08-16: align on `provisional`; `visibility` stays as a deprecated alias on the `bbox_project_graph_*` family, done in M9a.*
 
 ## 10. Relationship
 
