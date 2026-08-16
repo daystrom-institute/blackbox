@@ -118,10 +118,14 @@ rather than corpus completeness. It survives in a strictly subordinate role
 
 ### 3.1 Sibling binary, shared credential host
 
-The producer is `bbox-slack-collector`: a read-only satellite that runs on a
-producer host, holds the Slack read credential, and publishes to the corpus
-host over the authenticated internal wire. It is **a sibling of the `bro-slack`
-bridge, not an extension of it**, deployed on the same credential host.
+The producer is `bbox-slack-collector`: a read-only satellite that holds the
+Slack read credential and publishes to the corpus host over the authenticated
+internal wire. It is **a sibling of the `bro-slack` bridge, not an extension
+of it**. Because it reads nothing local to a checkout host, its home is the
+cluster beside the daemon it feeds (its own Deployment from the shared runtime
+image, journal on a small volume, credentials as owner-only files delivered by
+the cluster's secrets plane); a laptop launchd agent was the first deployment
+and was retired for laptop-class failure modes (2026-08-16).
 
 Folding ingestion into the bridge process (one process, one app, one reconnect
 loop) was considered and rejected:
