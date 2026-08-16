@@ -135,7 +135,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_hybrid_search",
-        description = "Hybrid BM25+vector search over typed entities. vector_weight=0.6 by default; set 0.0 for BM25-only behavior, 1.0 for vector-only."
+        description = "Hybrid BM25+vector search over typed entities + graph vertices; vector_weight=0.6 default, 0.0 BM25-only, 1.0 vector-only."
     )]
     pub(crate) async fn bbox_hybrid_search(
         &self,
@@ -183,7 +183,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_discover_seed_entities",
-        description = "Find seed entities with notable_edges; inspect before answering."
+        description = "Find seeds with notable_edges; inspect before answering; graph vertices: graph_source/graph_ids."
     )]
     pub(crate) async fn bbox_discover_seed_entities(
         &self,

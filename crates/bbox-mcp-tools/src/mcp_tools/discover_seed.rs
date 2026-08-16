@@ -31,9 +31,9 @@ pub struct DiscoverSeedParams {
     pub vector_weight: Option<f32>,
     #[serde(default)]
     pub query_vector: Option<Vec<f32>>,
-    /// Restrict project_file results to a specific project (path or
-    /// project_id). Identical semantics to `bbox_hybrid_search`'s `project`
-    /// parameter — see that tool's docs.
+    /// Restrict project_file and project graph vertex results to a specific
+    /// project (path or project_id). Identical semantics to
+    /// `bbox_hybrid_search`'s `project` parameter: see that tool's docs.
     #[serde(default)]
     pub project: Option<String>,
     /// Pre-resolved project filter id installed by the daemon boundary

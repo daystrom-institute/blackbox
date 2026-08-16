@@ -44,10 +44,11 @@ pub struct HybridSearchParams {
     /// Restrict results to entities scoped to a specific project. Accepts
     /// an absolute project path (e.g. `/home/user/repos/my-app`), a
     /// project_id (8-hex), or a registered project alias (declared in the
-    /// repo's `.bbox/config.toml` `[project] aliases`). When set, only project_file entries from that
-    /// project and thread entries whose stored project resolves to that id
-    /// are kept; commits, knowledge, transcripts, and other project-agnostic
-    /// entity types pass through unfiltered. Use this to scope queries to
+    /// repo's `.bbox/config.toml` `[project] aliases`). When set, only
+    /// project_file entries from that project, thread entries whose stored
+    /// project resolves to that id, and project graph vertices stamped with
+    /// that project id are kept; commits, knowledge, transcripts, and other
+    /// project-agnostic entity types pass through unfiltered. Use this to
     /// your current repo when cross-project keyword pollution would otherwise
     /// dominate the top-N (a common case when multiple registered repos share
     /// vocabulary like "voyage" or "embed").
