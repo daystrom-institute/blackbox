@@ -14,9 +14,11 @@ use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
 // Bumped for the graph vertex document lane (graph identity fields,
-// unified-retrieval design 4.1). A schema bump drops the index at the next
-// open and the reindex IS the backfill, which is the deliberate migration
-// pattern for this crate.
+// unified-retrieval design 4.1). A marker mismatch does not drop the index
+// blindly: it routes through the guarded schema replacement boundary below,
+// which refuses unguarded resets, honors a surviving manifest for
+// interrupted replacements, and rebuilds from the migration inventory's
+// history generations.
 pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g13-graph-vertex-docs";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
@@ -2648,8 +2650,8 @@ pub mod tool_edges;
 
 pub use helpers::find_session_file;
 pub use search::{
-    CiteParams, ContextParams, GraphLaneIndexStats, GraphWordAuthority, HybridBm25Hit,
-    MessagesParams, ProjectFilterInput, ReindexParams, SearchParams, SessionParams,
+    CiteParams, ContextParams, GraphLaneIndexStats, GraphWordAuthority, GraphWordPolicySnapshot,
+    HybridBm25Hit, MessagesParams, ProjectFilterInput, ReindexParams, SearchParams, SessionParams,
     SessionsListParams, TopicsParams, graph_lane_stats_for_searcher,
     graph_lanes_for_project_searcher,
 };
