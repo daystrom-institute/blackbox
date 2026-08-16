@@ -13,10 +13,11 @@ use tantivy::schema::*;
 use tantivy::tokenizer::TextAnalyzer;
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 
-// Bumped for the conversation-lane fields (source / author / channel /
-// permalink). A schema bump drops the index at the next open and the reindex
-// IS the backfill, which is the deliberate migration pattern for this crate.
-pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g12-conversation-projection";
+// Bumped for the graph vertex document lane (graph identity fields,
+// unified-retrieval design 4.1). A schema bump drops the index at the next
+// open and the reindex IS the backfill, which is the deliberate migration
+// pattern for this crate.
+pub const INDEX_SCHEMA_VERSION: &str = "agentic-corpus-g13-graph-vertex-docs";
 const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 
 /// Metadata about an indexed file, for incremental updates.
@@ -189,6 +190,21 @@ pub struct FieldHandles {
     pub conversation_thread_ts: Field,
     /// Derived at index time from workspace, channel, and ts.
     pub permalink: Field,
+    /// Graph vertex retrieval identity (unified-retrieval design 4.1). All
+    /// five are `STRING | STORED`: filter terms for the pre-ranking authority
+    /// conjunct, and stored values for the result identity fields and the
+    /// describe participation report.
+    pub graph_vertex_type: Field,
+    pub graph_id: Field,
+    /// Read-surface authority plane label: `published` / `provisional` /
+    /// `connector`. Carries the plane so `doc_type` stays one value
+    /// (`project_graph_vertex`) across planes.
+    pub graph_source: Field,
+    /// Connector plane only: the connector that manages the source graph.
+    pub graph_source_connector: Field,
+    /// `ProjectGraphGenerationIdentity.content_hash`, stamped at write time
+    /// so a result can be checked for staleness against the accepted view.
+    pub graph_generation: Field,
 }
 
 /// Config needed by the background reindex thread.
@@ -1172,6 +1188,14 @@ impl TranscriptIndex {
             ("task_id", self.fields.task_id),
             ("tool_use_id", self.fields.tool_use_id),
             ("role", self.fields.role),
+            // Graph vertex identity fields (unified-retrieval design 4.1):
+            // the whole graph layer reads them through this projection, so
+            // leaving them out makes them invisible to inspect and search.
+            ("graph_vertex_type", self.fields.graph_vertex_type),
+            ("graph_id", self.fields.graph_id),
+            ("graph_source", self.fields.graph_source),
+            ("graph_source_connector", self.fields.graph_source_connector),
+            ("graph_generation", self.fields.graph_generation),
         ] {
             if let Some(value) = optional_text(doc, field).filter(|value| !value.is_empty()) {
                 properties.insert(name.to_string(), value);
@@ -1360,6 +1384,11 @@ pub fn build_schema() -> (Schema, FieldHandles) {
         conversation_message_ts: builder.add_text_field("conversation_message_ts", STRING | STORED),
         conversation_thread_ts: builder.add_text_field("conversation_thread_ts", STRING | STORED),
         permalink: builder.add_text_field("permalink", STRING | STORED),
+        graph_vertex_type: builder.add_text_field("graph_vertex_type", STRING | STORED),
+        graph_id: builder.add_text_field("graph_id", STRING | STORED),
+        graph_source: builder.add_text_field("graph_source", STRING | STORED),
+        graph_source_connector: builder.add_text_field("graph_source_connector", STRING | STORED),
+        graph_generation: builder.add_text_field("graph_generation", STRING | STORED),
     };
     (builder.build(), fields)
 }
