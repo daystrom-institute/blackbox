@@ -217,10 +217,14 @@ fn path_terminal_file_key(entity: &EntityRef) -> Option<String> {
     }
 }
 
-/// A vertex whose neighborhood exceeded the per-hop fan-out cap, with the
-/// full edge count the traversal refused to enumerate past the cap. Reported
-/// in the response so a truncated expansion is never mistaken for the whole
-/// neighborhood.
+/// A vertex whose ADMITTED neighborhood exceeded the per-hop fan-out cap,
+/// with the count of admitted edges the traversal refused to enumerate past
+/// the cap. Reported in the response so a truncated expansion is never
+/// mistaken for the whole neighborhood. The count is post-admission by
+/// construction: unreadable edges never reach the budget and are never
+/// counted, so the disclosure the record makes is bounded by what the caller
+/// may already read.
+#[derive(Debug)]
 struct FanoutTruncation {
     vertex: EntityRef,
     edge_count: usize,
@@ -247,6 +251,7 @@ fn bfs(
     });
     let mut found = Vec::new();
     let mut truncated_expansions = Vec::new();
+    let mut truncated_vertices = HashSet::new();
     while let Some(entry) = queue.pop_front() {
         // Graph selection precedes neighbor enumeration: a vertex whose lane
         // the caller may not read is absent, including the root, so the walk
@@ -259,10 +264,17 @@ fn bfs(
             continue;
         }
         let node_expansions = expansions(ctx, edge_index, &entry.current, edge_filter);
-        if node_expansions.len() > max_fanout {
+        // Admission also owns the budget and the count: unreadable neighbors
+        // never consume fan-out and never appear in edge_count, so a capped
+        // answer cannot imply an excluded lane exists.
+        let admitted: Vec<Expansion> = node_expansions
+            .into_iter()
+            .filter(|expansion| ctx.graph_lane_admitted(&expansion.next))
+            .collect();
+        if admitted.len() > max_fanout && truncated_vertices.insert(entry.current.clone()) {
             truncated_expansions.push(FanoutTruncation {
                 vertex: entry.current.clone(),
-                edge_count: node_expansions.len(),
+                edge_count: admitted.len(),
             });
         }
         for Expansion {
@@ -270,16 +282,9 @@ fn bfs(
             direction,
             next,
             metadata,
-        } in node_expansions.into_iter().take(max_fanout)
+        } in admitted.into_iter().take(max_fanout)
         {
             if entry.visited.contains(&next) {
-                continue;
-            }
-            // Same gate, one layer out: an edge may name a vertex in a lane
-            // the caller may not read. The hop is dropped before the target
-            // test, before the frontier, and before any count, so the answer
-            // cannot imply the excluded graph exists.
-            if !ctx.graph_lane_admitted(&next) {
                 continue;
             }
             let mut steps = entry.steps.clone();
@@ -847,6 +852,61 @@ mod tests {
             16,
         );
         assert!(rooted_in_excluded.0.is_empty());
+    }
+
+    /// The admission filter owns the fan-out budget, not just the output: a
+    /// hub with a neighborhood beyond the cap still reads as untruncated when
+    /// the unreadable edges are what pushed it over, and the readable
+    /// neighbors all survive. Unreadable edges consuming budget (or showing
+    /// up in edge_count) would disclose the excluded lane's existence.
+    #[test]
+    fn unreadable_neighbors_neither_consume_fanout_nor_count() {
+        let from = EntityRef::parse("knowledge:hub").unwrap();
+        let readable: Vec<EntityRef> = (1..=10)
+            .map(|idx| EntityRef::parse(&format!("knowledge:leaf-{idx}")).unwrap())
+            .collect();
+        let excluded: Vec<EntityRef> = (1..=10)
+            .map(|idx| {
+                EntityRef::parse(&format!("project_graph_vertex:proj1:graph-disabled:v{idx}"))
+                    .unwrap()
+            })
+            .collect();
+        let edges = readable
+            .iter()
+            .chain(excluded.iter())
+            .cloned()
+            .map(|target| Edge {
+                source: from.clone(),
+                kind: "SUPERSEDES".into(),
+                target,
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+                project_id: None,
+            })
+            .collect();
+        let index = EdgeIndex::from_edges_for_tests(edges);
+        let resolver = DenyingResolver {
+            denied: excluded.into_iter().collect(),
+        };
+        let ctx = ProviderContext::empty_for_tests().with_project_graph_resolver(&resolver, None);
+
+        let (paths, truncated) = bfs(
+            &ctx,
+            &index,
+            from,
+            None,
+            Some(TargetTypeFilter::new(EntityType::Knowledge, None)),
+            None,
+            1,
+            30,
+            16,
+        );
+        assert_eq!(paths.len(), 10, "every readable neighbor survives: {paths:?}");
+        assert!(
+            truncated.is_empty(),
+            "admitted count is 10, so a 16 cap must not truncate: {truncated:?}"
+        );
     }
 
     /// Unified-retrieval 5.2: the per-hop fan-out cap bounds expansion, and a

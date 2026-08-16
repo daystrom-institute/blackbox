@@ -66,4 +66,5 @@
   the vertex and the full edge count beside the rendered bullets, so a
   capped prefix never masquerades as the neighborhood. Truncation or
   exclusion must never disclose the existence or size of unreadable
-  vertices — unreadable graph is absent everywhere, not labeled hidden.
+  vertices: unreadable graph is absent everywhere, not labeled hidden. The
+  fan-out budget and edge_count are computed on the admitted list only.
