@@ -69,7 +69,7 @@ compared with the binary's version. A mismatch no longer drops the index
 unconditionally: replacement goes through a fail-closed guard boundary.
 An absent guard refuses the reset, a guard error aborts it leaving the
 last-good lexical and vector views selected, and a commit-carryover
-bridge spills commit documents across the reset so projects whose
+bridge carries commit documents across the reset so projects whose
 checkouts are unavailable do not lose history at every bump. Migration
 inventory and history generations record what was replaced.
 
@@ -248,6 +248,9 @@ text:   128 documents or 100 KiB of input text per request
 visual: 8 documents or 64 MiB per request
 ```
 
+At the route level, a queue holds at most 10,000 pending documents or
+128 MiB.
+
 The text cap is intentionally below provider limits so a large restart
 does not create one oversized request, retry it repeatedly, and drop the
 whole batch; the byte guard is the worst-case-token guard for providers
@@ -266,6 +269,7 @@ pack shallower batches. A single text document is capped at 64 KiB.
 | `queue_depth` | Pending source docs |
 | `retried_count` | Retry pressure |
 | `last_error` | Last route-level failure |
+| `health_reason` | Why a route is not usable (e.g. `not_configured` for an unrouted visual kind) |
 
 ## Vector storage and compaction
 
