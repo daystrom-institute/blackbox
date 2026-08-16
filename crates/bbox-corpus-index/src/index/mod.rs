@@ -2652,7 +2652,7 @@ pub use helpers::find_session_file;
 pub use search::{
     CiteParams, ContextParams, GraphLaneIndexStats, GraphWordAuthority, GraphWordPolicySnapshot,
     HybridBm25Hit, MessagesParams, ProjectFilterInput, ReindexParams, SearchParams, SessionParams,
-    SessionsListParams, TopicsParams, graph_lane_stats_for_searcher,
+    SessionsListParams, TopicsParams, graph_lane_boolean_query, graph_lane_stats_for_searcher,
     graph_lanes_for_project_searcher,
 };
 

@@ -256,8 +256,7 @@ pub struct IndexWriterActor {
     /// [`IndexWriterActor::replace_project_graph_lane`]. The queue is the
     /// authority on supersession: an A -> B -> A activation sequence must not
     /// skip the final A just because B has been queued but not committed.
-    enqueued_graph_generations:
-        Arc<parking_lot::Mutex<BTreeMap<(String, String, String), String>>>,
+    enqueued_graph_generations: Arc<parking_lot::Mutex<BTreeMap<(String, String, String), String>>>,
     config: ReindexConfig,
 }
 
@@ -4438,8 +4437,9 @@ mod tests {
         let alpha = |generation: &str| {
             graph_lane_test_doc(PROJECT, GRAPH, "Alpha settlement record", generation)
         };
-        let beta =
-            |generation: &str| graph_lane_test_doc(PROJECT, GRAPH, "Beta settlement record", generation);
+        let beta = |generation: &str| {
+            graph_lane_test_doc(PROJECT, GRAPH, "Beta settlement record", generation)
+        };
 
         // A: committed and visible.
         actor.replace_project_graph_lane(

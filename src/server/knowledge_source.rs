@@ -680,8 +680,7 @@ impl super::BlackboxServer {
         .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         let graphs =
             bbox_indexing::project_graph_view::build_provisional_graph_overlay(&source, verified)?;
-        let published =
-            bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
+        let published = bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
         // One write guard for both halves of the install: converging the word
         // lanes first, then swapping published and provisional together, so no
         // reader can see the new published view beside the old or missing

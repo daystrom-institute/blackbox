@@ -11,12 +11,13 @@
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::TermQuery;
 use tantivy::schema::{IndexRecordOption, Term};
 use tantivy::{IndexReader, IndexWriter, Searcher, TantivyDocument};
 
 use super::{
-    FieldHandles, GRAPH_SOURCE_PUBLISHED, GRAPH_VERTEX_DOC_TYPE, graph_lane_stats_for_searcher,
+    FieldHandles, GRAPH_SOURCE_PUBLISHED, GRAPH_VERTEX_DOC_TYPE, graph_lane_boolean_query,
+    graph_lane_stats_for_searcher,
 };
 use bbox_corpus_core::entity_ref::{EntityRef, PARSER_VERSION};
 use bbox_project_graph::{
@@ -196,39 +197,6 @@ pub fn build_graph_vertex_doc(
     doc
 }
 
-fn graph_lane_query(fields: FieldHandles, source: &GraphVertexIndexDocument) -> BooleanQuery {
-    BooleanQuery::new(vec![
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.doc_type, GRAPH_VERTEX_DOC_TYPE),
-                IndexRecordOption::Basic,
-            )) as Box<dyn Query>,
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.project_id, &source.project_id),
-                IndexRecordOption::Basic,
-            )),
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.graph_id, &source.graph_id),
-                IndexRecordOption::Basic,
-            )),
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.graph_source, &source.graph_source),
-                IndexRecordOption::Basic,
-            )),
-        ),
-    ])
-}
-
 /// Replace one graph's whole word lane: every document under
 /// `(project_id, graph_id, graph_source)` is deleted, then the supplied
 /// documents are re-emitted. An empty `documents` purges the lane, which is
@@ -242,7 +210,12 @@ pub fn apply_graph_lane_replace(
     let Some(key_document) = documents.first() else {
         anyhow::bail!("graph lane replace requires at least one document; purge explicitly");
     };
-    let query = graph_lane_query(fields, key_document);
+    let query = graph_lane_boolean_query(
+        fields,
+        &key_document.project_id,
+        Some(&key_document.graph_id),
+        &key_document.graph_source,
+    );
     writer.delete_query(Box::new(query))?;
     for document in documents {
         writer.add_document(build_graph_vertex_doc(document, fields))?;
@@ -260,36 +233,7 @@ pub fn apply_graph_lane_purge(
     graph_id: &str,
     graph_source: &str,
 ) -> Result<()> {
-    let query = BooleanQuery::new(vec![
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.doc_type, GRAPH_VERTEX_DOC_TYPE),
-                IndexRecordOption::Basic,
-            )) as Box<dyn Query>,
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.project_id, project_id),
-                IndexRecordOption::Basic,
-            )),
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.graph_id, graph_id),
-                IndexRecordOption::Basic,
-            )),
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.graph_source, graph_source),
-                IndexRecordOption::Basic,
-            )),
-        ),
-    ]);
+    let query = graph_lane_boolean_query(fields, project_id, Some(graph_id), graph_source);
     writer.delete_query(Box::new(query))?;
     Ok(())
 }
@@ -322,36 +266,7 @@ pub fn graph_lane_count(
     graph_id: &str,
     graph_source: &str,
 ) -> Result<usize> {
-    let query = BooleanQuery::new(vec![
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.doc_type, GRAPH_VERTEX_DOC_TYPE),
-                IndexRecordOption::Basic,
-            )) as Box<dyn Query>,
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.project_id, project_id),
-                IndexRecordOption::Basic,
-            )),
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.graph_id, graph_id),
-                IndexRecordOption::Basic,
-            )),
-        ),
-        (
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(fields.graph_source, graph_source),
-                IndexRecordOption::Basic,
-            )),
-        ),
-    ]);
+    let query = graph_lane_boolean_query(fields, project_id, Some(graph_id), graph_source);
     Ok(searcher.search(&query, &Count)?)
 }
 
@@ -359,6 +274,12 @@ pub fn graph_lane_count(
 /// document address. The reindex pass preserves graph lanes this way: like
 /// provisional knowledge, graph documents have no durable store the pass
 /// walks, so the pass carries them across `delete_all_documents`.
+///
+/// This is the REINDEX path only, and it is intentionally a full
+/// stored-document walk (O(all graph vertices) doc-store reads): a rebuild
+/// must re-emit every document verbatim. View installs and lane inventories
+/// must not call this; they use the term-dictionary lane enumeration in
+/// `bbox_corpus_index` instead.
 pub fn collect_graph_lane_documents(
     searcher: &Searcher,
     fields: FieldHandles,

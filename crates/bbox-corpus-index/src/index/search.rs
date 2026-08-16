@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
@@ -147,7 +147,7 @@ pub fn graph_lane_stats_for_searcher(
     graph_id: &str,
     graph_source: &str,
 ) -> Result<GraphLaneIndexStats> {
-    let query = graph_lane_query(fields, project_id, Some(graph_id), graph_source);
+    let query = graph_lane_boolean_query(fields, project_id, Some(graph_id), graph_source);
     let (top, count) = searcher.search(&query, &(TopDocs::with_limit(1), Count))?;
     let indexed_generation = if count == 0 {
         None
@@ -177,41 +177,54 @@ pub fn graph_lanes_for_project_searcher(
     project_id: &str,
     graph_source: &str,
 ) -> Result<BTreeMap<String, GraphLaneIndexStats>> {
-    let query = graph_lane_query(fields, project_id, None, graph_source);
-    let count = searcher.search(&query, &Count)?;
-    if count == 0 {
-        return Ok(BTreeMap::new());
+    // Distinct graph ids come from the graph_id term dictionaries, not from
+    // a stored-document walk: this inventory runs under the caller's idx
+    // read lock on every view install, and vertex counts dwarf lane counts.
+    // One Count per candidate lane plus a single stored fetch for the
+    // generation stamp keeps the walk O(lanes), not O(vertices).
+    let mut candidates = BTreeSet::new();
+    for reader in searcher.segment_readers() {
+        let inverted_index = reader.inverted_index(fields.graph_id)?;
+        let mut stream = inverted_index.terms().stream()?;
+        while let Some((bytes, _)) = stream.next() {
+            if let Ok(value) = std::str::from_utf8(bytes) {
+                if !value.is_empty() {
+                    candidates.insert(value.to_string());
+                }
+            }
+        }
     }
     let mut lanes = BTreeMap::<String, GraphLaneIndexStats>::new();
-    for (_, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
-        let doc: TantivyDocument = searcher.doc(address)?;
-        let graph_id = doc
-            .get_first(fields.graph_id)
-            .and_then(|value| match value {
-                OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        if graph_id.is_empty() {
+    for graph_id in candidates {
+        let query = graph_lane_boolean_query(fields, project_id, Some(&graph_id), graph_source);
+        let indexed_vertex_count = searcher.search(&query, &Count)?;
+        if indexed_vertex_count == 0 {
             continue;
         }
-        let generation = doc
-            .get_first(fields.graph_generation)
-            .and_then(|value| match value {
-                OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let lane = lanes.entry(graph_id).or_insert(GraphLaneIndexStats {
-            indexed_vertex_count: 0,
-            indexed_generation: (!generation.is_empty()).then_some(generation),
-        });
-        lane.indexed_vertex_count += 1;
+        let indexed_generation = searcher
+            .search(&query, &TopDocs::with_limit(1))?
+            .first()
+            .map(|(_, address)| searcher.doc::<TantivyDocument>(*address))
+            .transpose()?
+            .and_then(|doc| {
+                doc.get_first(fields.graph_generation)
+                    .and_then(|value| match value {
+                        OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
+                        _ => None,
+                    })
+            });
+        lanes.insert(
+            graph_id,
+            GraphLaneIndexStats {
+                indexed_vertex_count: indexed_vertex_count as usize,
+                indexed_generation,
+            },
+        );
     }
     Ok(lanes)
 }
 
-fn graph_lane_query(
+pub fn graph_lane_boolean_query(
     fields: FieldHandles,
     project_id: &str,
     graph_id: Option<&str>,
