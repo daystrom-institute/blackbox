@@ -20,7 +20,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bbox_slack_collector::{
-    ConversationSourceClient, SatelliteConfig, SlackClient, run_onboarding, run_publication_cycle,
+    ConversationSourceClient, SatelliteConfig, Shutdown, SlackClient, run_onboarding,
+    run_publication_cycle, run_publication_cycle_with_shutdown,
 };
 use clap::{Parser, Subcommand};
 
@@ -113,16 +114,39 @@ async fn main() -> Result<()> {
             let interval = std::time::Duration::from_secs(
                 interval_secs.unwrap_or(config.poll_interval_secs).max(1),
             );
+            // Kubernetes sends SIGTERM on pod stop, and the container runtime's
+            // kill escalates on a deadline. Watching for it here is what turns
+            // "the process dies mid-cycle" into "the cycle finishes the current
+            // channel, the journal is saved, and the process exits 0".
+            #[cfg(unix)]
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .context("installing the SIGTERM listener")?;
+            let shutdown = Shutdown::default();
             loop {
-                match run_publication_cycle(
+                let mut cycle = std::pin::pin!(run_publication_cycle_with_shutdown(
                     &slack,
                     &sink,
                     &config,
                     &config.journal_path,
                     chrono::Utc::now(),
-                )
-                .await
-                {
+                    &shutdown,
+                ));
+                // A signal during a cycle does NOT cancel it: the select arm
+                // raises the flag, then awaits the cycle to completion, so the
+                // current channel's journal save happens before exit.
+                let outcome = tokio::select! {
+                    outcome = &mut cycle => outcome,
+                    signal = interrupt(&mut sigterm) => {
+                        shutdown.request();
+                        tracing::info!(
+                            signal,
+                            "terminating; finishing current channel"
+                        );
+                        cycle.await
+                    }
+                };
+                match outcome {
                     Ok(outcome) => tracing::info!(
                         channels = outcome.channels_enrolled,
                         landed = outcome.messages_landed,
@@ -137,13 +161,19 @@ async fn main() -> Result<()> {
                     // A cycle failure is not fatal. A corpus restart, a
                     // transient network fault, and a workspace throttle all
                     // resolve on a later cycle, and exiting here would turn
-                    // every one of them into an operator page.
-                    Err(error) => tracing::error!(error = %error, "publication cycle failed"),
+                    // every one of them into an operator page. The Debug
+                    // rendering is deliberate: it carries the whole anyhow
+                    // chain, and the cause was the part the log used to drop.
+                    Err(error) => tracing::error!(error = ?error, "publication cycle failed"),
+                }
+                if shutdown.is_requested() {
+                    tracing::info!("interrupted; stopping the satellite");
+                    break;
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("interrupted; stopping the satellite");
+                    signal = interrupt(&mut sigterm) => {
+                        tracing::info!(signal, "interrupted; stopping the satellite");
                         break;
                     }
                 }
@@ -151,6 +181,24 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Wait for whichever interrupt this platform offers, returning its name.
+///
+/// On unix both Ctrl-C and SIGTERM count; anywhere else only Ctrl-C does,
+/// because `signal::unix` does not exist there.
+#[cfg(unix)]
+async fn interrupt(sigterm: &mut tokio::signal::unix::Signal) -> &'static str {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "ctrl_c",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn interrupt() -> &'static str {
+    tokio::signal::ctrl_c().await.ok();
+    "ctrl_c"
 }
 
 /// Print what one cycle did, including what the shared credential can do.

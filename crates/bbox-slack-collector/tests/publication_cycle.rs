@@ -10,7 +10,19 @@ mod support;
 
 use std::path::PathBuf;
 
-use bbox_slack_collector::{Journal, SatelliteConfig, SlackClient, run_publication_cycle};
+use anyhow::Result;
+use async_trait::async_trait;
+use bbox_conversation_source::{
+    ChannelRosterReceiptV1, ChannelRosterRequestV1, ConversationBatchReceiptV1,
+    ConversationBatchV1, ConversationCatalogOnboardRequestV1, ConversationCatalogOnboardResponseV1,
+    ConversationCursorsResponseV1, ConversationRevisionsReceiptV1, ConversationRevisionsRequestV1,
+    ConversationStatusResponseV1,
+};
+use bbox_corpus_core::project_catalog::ConnectorScope;
+use bbox_slack_collector::{
+    ConversationSink, Journal, SatelliteConfig, Shutdown, SlackClient, run_publication_cycle,
+    run_publication_cycle_with_shutdown,
+};
 use support::{
     FakeChannel, FakeMessage, FakeSlack, FakeSlackState, ModelSink, RefusingSink, fast_rate_policy,
     one_app_scopes, pinned_now, test_config, ts_before,
@@ -435,4 +447,135 @@ async fn membership_mode_posts_a_complete_roster_and_explicit_mode_does_not() {
         Some(false),
         "explicit mode's policy-narrowed enrolled set is not a proven full sweep"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/// A sink that requests shutdown when the FIRST batch lands, standing in for
+/// the watch loop's signal arriving mid-cycle.
+struct StopOnFirstBatch {
+    inner: ModelSink,
+    shutdown: Shutdown,
+    batches: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl ConversationSink for StopOnFirstBatch {
+    async fn onboard(
+        &self,
+        request: &ConversationCatalogOnboardRequestV1,
+    ) -> Result<ConversationCatalogOnboardResponseV1> {
+        self.inner.onboard(request).await
+    }
+    async fn post_channels(
+        &self,
+        request: &ChannelRosterRequestV1,
+    ) -> Result<ChannelRosterReceiptV1> {
+        self.inner.post_channels(request).await
+    }
+    async fn cursors(&self, scope: &ConnectorScope) -> Result<ConversationCursorsResponseV1> {
+        self.inner.cursors(scope).await
+    }
+    async fn post_batch(&self, batch: &ConversationBatchV1) -> Result<ConversationBatchReceiptV1> {
+        let seen = self
+            .batches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if seen == 0 {
+            self.shutdown.request();
+        }
+        self.inner.post_batch(batch).await
+    }
+    async fn post_revisions(
+        &self,
+        request: &ConversationRevisionsRequestV1,
+    ) -> Result<ConversationRevisionsReceiptV1> {
+        self.inner.post_revisions(request).await
+    }
+    async fn status(&self, scope: &ConnectorScope) -> Result<ConversationStatusResponseV1> {
+        self.inner.status(scope).await
+    }
+}
+
+#[tokio::test]
+async fn a_shutdown_raised_mid_cycle_finishes_the_current_channel_and_skips_the_rest() {
+    let state = FakeSlackState {
+        granted_scopes: one_app_scopes(),
+        channels: vec![
+            FakeChannel::public(CHANNEL, "engineering"),
+            FakeChannel::public(OTHER_CHANNEL, "other"),
+        ],
+        history: [
+            (CHANNEL.to_string(), three_messages()),
+            (OTHER_CHANNEL.to_string(), three_messages()),
+        ]
+        .into_iter()
+        .collect(),
+        page_size: 50,
+        ..FakeSlackState::default()
+    };
+    let mut harness = Harness::start(state).await;
+    harness.config.channels.include = vec!["engineering".into(), "other".into()];
+    let shutdown = Shutdown::default();
+    let sink = StopOnFirstBatch {
+        inner: ModelSink::new(),
+        shutdown: shutdown.clone(),
+        batches: std::sync::atomic::AtomicU32::new(0),
+    };
+
+    let outcome = run_publication_cycle_with_shutdown(
+        &harness.client,
+        &sink,
+        &harness.config,
+        &harness.journal_path,
+        pinned_now(0),
+        &shutdown,
+    )
+    .await
+    .unwrap();
+
+    // Both channels enrolled (the roster ran), but only the in-flight channel
+    // was swept: the flag went up during the FIRST channel's batch post, that
+    // channel finished through its journal save, and the loop stopped before
+    // ever asking Slack about the second one.
+    assert_eq!(outcome.channels_enrolled, 2);
+    assert_eq!(outcome.messages_landed, 3);
+    assert!(harness.slack.channel_read_count(CHANNEL) > 0);
+    assert_eq!(
+        harness.slack.channel_read_count(OTHER_CHANNEL),
+        0,
+        "a channel the cycle never started must not be asked about at all"
+    );
+    let journal = Journal::load(&harness.journal_path);
+    assert!(journal.channel(CHANNEL).is_some());
+    assert!(
+        journal.channel(OTHER_CHANNEL).is_none(),
+        "the skipped channel costs no journal state either"
+    );
+}
+
+#[tokio::test]
+async fn a_shutdown_raised_before_the_channel_loop_publishes_the_roster_and_lands_nothing() {
+    let harness = Harness::start(workspace(three_messages())).await;
+    let shutdown = Shutdown::default();
+    shutdown.request();
+
+    let outcome = run_publication_cycle_with_shutdown(
+        &harness.client,
+        &harness.sink,
+        &harness.config,
+        &harness.journal_path,
+        pinned_now(0),
+        &shutdown,
+    )
+    .await
+    .unwrap();
+
+    // The roster and cursor reads are cycle bookkeeping and still happen; the
+    // per-channel lanes are the part a shutdown may skip.
+    assert_eq!(outcome.channels_enrolled, 1);
+    assert_eq!(outcome.messages_landed, 0);
+    assert_eq!(harness.slack.channel_read_count(CHANNEL), 0);
+    assert_eq!(harness.sink.batches(), 0);
 }

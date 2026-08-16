@@ -43,6 +43,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -126,6 +128,27 @@ pub struct CycleOutcome {
     /// The worst per-channel lag the corpus reported, which is where a
     /// throttled producer shows up (design 5.5).
     pub max_lag_seconds: Option<i64>,
+}
+
+/// A cooperative shutdown signal the watch loop raises on SIGTERM or Ctrl-C.
+///
+/// The cycle checks it BETWEEN channels, after the current channel's journal
+/// save, so a signal costs at most one channel's redundant resweep on restart
+/// and never a torn cycle or a lost journal publish. A signal that arrives
+/// between cycles costs nothing at all.
+#[derive(Clone, Default)]
+pub struct Shutdown {
+    requested: Arc<AtomicBool>,
+}
+
+impl Shutdown {
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
 }
 
 /// The read scopes the collector cannot run without.
@@ -216,6 +239,31 @@ pub async fn run_publication_cycle(
     config: &SatelliteConfig,
     journal_path: &Path,
     now: DateTime<Utc>,
+) -> Result<CycleOutcome> {
+    run_publication_cycle_with_shutdown(
+        slack,
+        sink,
+        config,
+        journal_path,
+        now,
+        &Shutdown::default(),
+    )
+    .await
+}
+
+/// [`run_publication_cycle`], with a cooperative shutdown flag.
+///
+/// The flag is consulted between channels only: a signal that arrives
+/// mid-channel lets that channel finish, including its journal save, because a
+/// mark that advanced without its journal publish is exactly the torn state
+/// the journal's write discipline exists to avoid.
+pub async fn run_publication_cycle_with_shutdown(
+    slack: &dyn SlackRead,
+    sink: &dyn ConversationSink,
+    config: &SatelliteConfig,
+    journal_path: &Path,
+    now: DateTime<Utc>,
+    shutdown: &Shutdown,
 ) -> Result<CycleOutcome> {
     let scope = config.scope()?;
     let observed_at = now.to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -346,6 +394,13 @@ pub async fn run_publication_cycle(
     outcome.reconciled = reconcile_now;
 
     for (channel_id, observation) in &enrolled {
+        if shutdown.is_requested() {
+            tracing::info!(
+                channel = channel_id,
+                "shutdown requested; stopping between channels with the journal saved"
+            );
+            break;
+        }
         let cursor = cursors.get(channel_id).cloned().unwrap_or_default();
         let context = ChannelContext {
             channel_id,
