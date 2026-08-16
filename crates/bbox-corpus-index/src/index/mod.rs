@@ -1304,6 +1304,16 @@ fn load_active_code_selectors(
     Ok(selectors)
 }
 
+/// `doc_type` of every graph vertex document in the word index, across all
+/// read planes. The plane itself lives in `graph_source` so the type stays a
+/// single filterable value.
+pub const GRAPH_VERTEX_DOC_TYPE: &str = "project_graph_vertex";
+
+/// Read-plane labels stamped on `graph_source`.
+pub const GRAPH_SOURCE_PUBLISHED: &str = "published";
+pub const GRAPH_SOURCE_PROVISIONAL: &str = "provisional";
+pub const GRAPH_SOURCE_CONNECTOR: &str = "connector";
+
 pub fn build_schema() -> (Schema, FieldHandles) {
     let mut builder = Schema::builder();
     let code_options = TextOptions::default()
@@ -2638,8 +2648,10 @@ pub mod tool_edges;
 
 pub use helpers::find_session_file;
 pub use search::{
-    CiteParams, ContextParams, HybridBm25Hit, MessagesParams, ProjectFilterInput, ReindexParams,
-    SearchParams, SessionParams, SessionsListParams, TopicsParams,
+    CiteParams, ContextParams, GraphLaneIndexStats, GraphWordAuthority, HybridBm25Hit,
+    MessagesParams, ProjectFilterInput, ReindexParams, SearchParams, SessionParams,
+    SessionsListParams, TopicsParams, graph_lane_stats_for_searcher,
+    graph_lanes_for_project_searcher,
 };
 
 pub fn resolve_current_project_chunk_entity(

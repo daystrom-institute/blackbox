@@ -85,6 +85,24 @@ pub enum IndexWriteOp {
         scope_hash: String,
         documents: Vec<KnowledgeIndexDocument>,
     },
+    /// Replace one graph's whole word lane (unified-retrieval design 7.1):
+    /// every document under `(project_id, graph_id, graph_source)` is
+    /// deleted, then the carried documents are re-emitted. The op carries
+    /// prepared documents rather than a `GraphGeneration` so the queue owns
+    /// no graph store borrows. An intentionally EMPTY lane is expressed as
+    /// [`IndexWriteOp::PurgeProjectGraphLane`], which keeps an empty vec
+    /// from silently meaning "delete everything".
+    ReplaceProjectGraphLane {
+        documents: Vec<super::graph_docs::GraphVertexIndexDocument>,
+    },
+    /// Delete one graph's whole word lane with no replacement: how a graph
+    /// removed from an accepted view and a graph whose policy turned text
+    /// retrieval off both leave the index, not just the result list.
+    PurgeProjectGraphLane {
+        project_id: String,
+        graph_id: String,
+        graph_source: String,
+    },
     UpsertRoadmap(Box<RoadmapItem>),
     DeleteRoadmap(String),
     UpsertThread(Box<Thread>),
@@ -1116,6 +1134,55 @@ impl IndexWriterActor {
         if self.tx.send(op).is_err() {
             tracing::error!("index writer actor unavailable; dropping index write op");
         }
+    }
+
+    /// Queue a whole-lane graph word-index replacement, keyed on the lane's
+    /// generation stamp: an activation whose `content_hash` already matches
+    /// the indexed lane no-ops, so re-accepting identical content rewrites
+    /// nothing. The check reads the committed reader, so it can only SKIP
+    /// when the previous op already committed; a queued-but-unapplied op
+    /// falls through to a second (harmless, idempotent) replacement.
+    pub fn replace_project_graph_lane(
+        &self,
+        project_id: &str,
+        graph_id: &str,
+        graph_source: &str,
+        generation: &str,
+        documents: Vec<super::graph_docs::GraphVertexIndexDocument>,
+    ) {
+        if !generation.is_empty() {
+            let indexed = super::graph_docs::graph_lane_generation(
+                &self.reader,
+                self.fields,
+                project_id,
+                graph_id,
+                graph_source,
+            );
+            if matches!(indexed, Ok(Some(ref indexed)) if indexed == generation) {
+                tracing::debug!(
+                    project_id,
+                    graph_id,
+                    graph_source,
+                    "graph word lane already carries this generation; skipping replace"
+                );
+                return;
+            }
+        }
+        if documents.is_empty() {
+            self.purge_project_graph_lane(project_id, graph_id, graph_source);
+            return;
+        }
+        self.enqueue(IndexWriteOp::ReplaceProjectGraphLane { documents });
+    }
+
+    /// Queue a whole-lane graph word-index purge with no generation check:
+    /// the caller already knows the lane must go.
+    pub fn purge_project_graph_lane(&self, project_id: &str, graph_id: &str, graph_source: &str) {
+        self.enqueue(IndexWriteOp::PurgeProjectGraphLane {
+            project_id: project_id.to_string(),
+            graph_id: graph_id.to_string(),
+            graph_source: graph_source.to_string(),
+        });
     }
 
     /// Run a reindex pass on the actor thread and wait for its outcome.
@@ -2634,6 +2701,24 @@ fn apply_small_op(ctx: &ActorCtx, writer: &mut IndexWriter, op: IndexWriteOp) {
                 &documents,
             ),
         ),
+        IndexWriteOp::ReplaceProjectGraphLane { documents } => (
+            "replace_project_graph_lane",
+            super::graph_docs::apply_graph_lane_replace(writer, ctx.fields, &documents),
+        ),
+        IndexWriteOp::PurgeProjectGraphLane {
+            project_id,
+            graph_id,
+            graph_source,
+        } => (
+            "purge_project_graph_lane",
+            super::graph_docs::apply_graph_lane_purge(
+                writer,
+                ctx.fields,
+                &project_id,
+                &graph_id,
+                &graph_source,
+            ),
+        ),
         IndexWriteOp::UpsertRoadmap(item) => (
             "upsert_roadmap",
             super::roadmap_docs::apply_roadmap_upsert(
@@ -2775,6 +2860,30 @@ mod tests {
     use super::*;
     use crate::index::{SearchParams, TranscriptIndex};
     use std::process::Command;
+
+    fn graph_lane_test_doc(
+        project_id: &str,
+        graph_id: &str,
+        label: &str,
+        generation: &str,
+    ) -> crate::index::graph_docs::GraphVertexIndexDocument {
+        let entity_id = format!("project_graph_vertex:{project_id}:{graph_id}:vertex/{label}");
+        crate::index::graph_docs::GraphVertexIndexDocument {
+            project_id: project_id.into(),
+            graph_id: graph_id.into(),
+            graph_source: crate::index::GRAPH_SOURCE_PUBLISHED.into(),
+            graph_source_connector: None,
+            graph_generation: generation.into(),
+            vertex_id: format!("vertex/{label}"),
+            vertex_type: "record:Record".into(),
+            label: format!("{label} governance label"),
+            word_properties: Vec::new(),
+            text_properties: Vec::new(),
+            logical_ref: entity_id.clone(),
+            entity_id,
+            source_path: format!("/tmp/checkout/.bbox/graphs/{graph_id}/vertices.jsonl"),
+        }
+    }
 
     fn test_entry(id: &str, content: &str) -> KnowledgeEntry {
         KnowledgeEntry {
@@ -4180,6 +4289,99 @@ mod tests {
     }
 
     #[test]
+    fn graph_lane_replacement_is_generation_gated_and_policy_flip_purges() {
+        use crate::index::GRAPH_SOURCE_PUBLISHED;
+        use crate::index::graph_docs::GraphVertexIndexDocument;
+
+        const PROJECT: &str = "p_00000000000000000000000000000f71";
+        const GRAPH: &str = "governance-record";
+
+        fn doc(label: &str, generation: &str) -> GraphVertexIndexDocument {
+            let entity_id = format!("project_graph_vertex:{PROJECT}:{GRAPH}:vertex/{label}");
+            GraphVertexIndexDocument {
+                project_id: PROJECT.into(),
+                graph_id: GRAPH.into(),
+                graph_source: GRAPH_SOURCE_PUBLISHED.into(),
+                graph_source_connector: None,
+                graph_generation: generation.into(),
+                vertex_id: format!("vertex/{label}"),
+                vertex_type: "record:Record".into(),
+                label: label.into(),
+                word_properties: Vec::new(),
+                text_properties: Vec::new(),
+                logical_ref: entity_id.clone(),
+                entity_id,
+                source_path: "/tmp/checkout/.bbox/graphs/governance-record/vertices.jsonl".into(),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let actor = IndexWriterActor::spawn_for(&index);
+
+        actor.replace_project_graph_lane(
+            PROJECT,
+            GRAPH,
+            GRAPH_SOURCE_PUBLISHED,
+            "generation-one",
+            vec![doc("Alpha settlement record", "generation-one")],
+        );
+        actor.flush_blocking().unwrap();
+        assert!(search(&index, "Alpha settlement record").contains("Alpha"));
+        let stats = index
+            .graph_lane_stats(PROJECT, GRAPH, GRAPH_SOURCE_PUBLISHED)
+            .unwrap();
+        assert_eq!(stats.indexed_vertex_count, 1);
+        assert_eq!(stats.indexed_generation.as_deref(), Some("generation-one"));
+
+        // Same generation stamp: the enqueue no-ops, even if the caller
+        // rebuilt different documents, because the stamp is the authority.
+        // The actor's check reads the shared reader, which reloads on commit
+        // with a delay; force it so the skip is observable immediately.
+        index.reader_handle().reload().unwrap();
+        actor.replace_project_graph_lane(
+            PROJECT,
+            GRAPH,
+            GRAPH_SOURCE_PUBLISHED,
+            "generation-one",
+            vec![doc("Alpha settlement rewritten", "generation-one")],
+        );
+        actor.flush_blocking().unwrap();
+        assert!(!search(&index, "Alpha settlement rewritten").contains("rewritten"));
+
+        // New generation: whole lane replacement, not an additive upsert.
+        actor.replace_project_graph_lane(
+            PROJECT,
+            GRAPH,
+            GRAPH_SOURCE_PUBLISHED,
+            "generation-two",
+            vec![doc("Beta settlement record", "generation-two")],
+        );
+        actor.flush_blocking().unwrap();
+        assert!(!search(&index, "Alpha settlement record").contains("Alpha"));
+        assert!(search(&index, "Beta settlement record").contains("Beta"));
+
+        // Policy flip to text_retrieval_enabled = false builds zero
+        // documents: the lane is purged, not filtered at query time.
+        actor.replace_project_graph_lane(
+            PROJECT,
+            GRAPH,
+            GRAPH_SOURCE_PUBLISHED,
+            "generation-three",
+            Vec::new(),
+        );
+        actor.flush_blocking().unwrap();
+        assert!(!search(&index, "Beta settlement record").contains("Beta"));
+        assert_eq!(
+            index
+                .graph_lane_stats(PROJECT, GRAPH, GRAPH_SOURCE_PUBLISHED)
+                .unwrap()
+                .indexed_vertex_count,
+            0
+        );
+    }
+
+    #[test]
     fn ops_enqueued_around_a_reindex_pass_all_land() {
         let dir = tempfile::tempdir().unwrap();
         let index = test_index(dir.path());
@@ -4227,14 +4429,44 @@ mod tests {
         persist_kb_entries(&kb_path, &[entry.clone()]);
 
         actor.enqueue(IndexWriteOp::UpsertKnowledge(Box::new(entry)));
+        // Graph word lanes have no store the pass walks: they must ride the
+        // rebuild the same way provisional knowledge does.
+        actor.replace_project_graph_lane(
+            "p_00000000000000000000000000000f71",
+            "governance-record",
+            crate::index::GRAPH_SOURCE_PUBLISHED,
+            "generation-one",
+            vec![graph_lane_test_doc(
+                "p_00000000000000000000000000000f71",
+                "governance-record",
+                "Alpha",
+                "generation-one",
+            )],
+        );
         actor.flush_blocking().unwrap();
         assert!(search(&index, "florp").contains("florp"));
+        assert!(search(&index, "Alpha governance label").contains("Alpha"));
 
         let summary = actor.run_reindex_pass(true, true).unwrap();
         assert!(summary.starts_with("auto-reindex:"), "{summary}");
         assert!(
             search(&index, "florp").contains("florp"),
             "full rebuild must re-add store-backed docs"
+        );
+        assert!(
+            search(&index, "Alpha governance label").contains("Alpha"),
+            "full rebuild must preserve graph word lanes"
+        );
+        assert_eq!(
+            index
+                .graph_lane_stats(
+                    "p_00000000000000000000000000000f71",
+                    "governance-record",
+                    crate::index::GRAPH_SOURCE_PUBLISHED
+                )
+                .unwrap()
+                .indexed_vertex_count,
+            1
         );
     }
 

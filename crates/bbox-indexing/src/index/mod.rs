@@ -12,6 +12,7 @@
 pub use bbox_corpus_index::index::*;
 
 pub mod consolidated_history;
+mod graph_docs;
 pub mod history_gc;
 pub mod history_health;
 pub mod history_materializer;
@@ -26,6 +27,11 @@ mod store_integration_tests;
 mod thread_docs;
 pub mod writer_actor;
 
+pub use graph_docs::{
+    GraphVertexIndexDocument, apply_graph_lane_purge, apply_graph_lane_replace,
+    build_graph_vertex_doc, collect_graph_lane_documents, graph_lane_count, graph_lane_generation,
+    is_meta_vertex, published_graph_vertex_documents,
+};
 pub use knowledge_docs::{
     KnowledgeIndexDocument, indexable_knowledge_entry, knowledge_chunk_hash, knowledge_entity_id,
 };

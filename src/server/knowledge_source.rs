@@ -683,9 +683,11 @@ impl super::BlackboxServer {
         {
             let published =
                 bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
-            let mut views = self.state.project_graph_views.write();
-            views.install_published(published);
-            views.install_provisional(graphs.clone());
+            super::knowledge_view::install_published_graph_view(&self.state, published);
+            self.state
+                .project_graph_views
+                .write()
+                .install_provisional(graphs.clone());
         }
 
         Ok(RemoteProvisionalOverlayPair { knowledge, gaps })
@@ -787,11 +789,13 @@ fn refresh_provisional_graph_views(state: &SharedState, authority: &ProvisionalA
             );
             None
         });
-    let mut views = state.project_graph_views.write();
     if let Some(published) = published {
-        views.install_published(published);
+        super::knowledge_view::install_published_graph_view(state, published);
     }
-    views.install_provisional(overlay);
+    state
+        .project_graph_views
+        .write()
+        .install_provisional(overlay);
 }
 
 fn provisional_file_map(

@@ -32,7 +32,7 @@ use bbox_knowledge::overlay::{
     recompute_catalog_overlay_result,
 };
 
-use super::BlackboxServer;
+use super::{BlackboxServer, SharedState};
 
 #[derive(Clone)]
 pub(crate) struct PublishedKnowledgeCacheEntry {
@@ -1585,10 +1585,7 @@ impl BlackboxServer {
         };
         match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
             Ok(view) => {
-                self.state
-                    .project_graph_views
-                    .write()
-                    .install_published(view);
+                install_published_graph_view(&self.state, view);
             }
             Err(error) => {
                 tracing::warn!(
@@ -1652,6 +1649,66 @@ impl BlackboxServer {
             Ok(())
         })?;
         Ok(hydrated)
+    }
+}
+
+/// Install one published project-graph view and converge the project's
+/// published graph word lanes to it (unified-retrieval design 7.1).
+///
+/// Every graph in the view gets a whole-lane replacement keyed on its
+/// generation stamp: same generation no-ops, a new generation rewrites the
+/// lane, and a graph whose policy now disables text retrieval (or that left
+/// the accepted view entirely) has its lane purged so its documents are
+/// ABSENT from the index, not merely filtered out of one result list. M9a
+/// indexes the published plane only; provisional and connector planes do not
+/// reach the word index yet and must not piggyback on this path.
+pub(crate) fn install_published_graph_view(
+    state: &SharedState,
+    view: bbox_indexing::project_graph_view::PublishedProjectGraphView,
+) {
+    use bbox_indexing::index::{
+        GRAPH_SOURCE_PUBLISHED as PUBLISHED, published_graph_vertex_documents,
+    };
+
+    let project_id = view.project_id.as_str().to_string();
+    let indexed_lanes = state
+        .idx
+        .read()
+        .graph_lanes_for_project(&project_id, PUBLISHED)
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "published graph word lane inventory failed during view install"
+            );
+            BTreeMap::new()
+        });
+    let mut planned = BTreeSet::new();
+    for (graph_id, entry) in &view.graphs {
+        planned.insert(graph_id.clone());
+        let Some(graph) = entry.graph() else {
+            state
+                .index_writer
+                .purge_project_graph_lane(&project_id, graph_id, PUBLISHED);
+            continue;
+        };
+        let documents =
+            published_graph_vertex_documents(&project_id, graph, &entry.generation.content_hash);
+        state.index_writer.replace_project_graph_lane(
+            &project_id,
+            graph_id,
+            PUBLISHED,
+            &entry.generation.content_hash,
+            documents,
+        );
+    }
+    state.project_graph_views.write().install_published(view);
+    for graph_id in indexed_lanes.keys() {
+        if !planned.contains(graph_id) {
+            state
+                .index_writer
+                .purge_project_graph_lane(&project_id, graph_id, PUBLISHED);
+        }
     }
 }
 

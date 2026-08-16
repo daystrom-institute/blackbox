@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 use super::helpers::*;
 use super::passes::*;
 use super::project_files;
-use super::{FileMeta, TranscriptIndex};
+use super::{FieldHandles, FileMeta, TranscriptIndex};
 use bbox_corpus_core::query::smart_query_to_tantivy;
 use bro_transcript as parser;
 
@@ -66,6 +66,121 @@ impl GraphWordAuthority {
 pub struct GraphLaneIndexStats {
     pub indexed_vertex_count: usize,
     pub indexed_generation: Option<String>,
+}
+
+/// Free-function form of [`TranscriptIndex::graph_lane_stats`] over any
+/// searcher, so the daemon-side writer actor can run the same
+/// fingerprint no-op check without owning a `TranscriptIndex`.
+pub fn graph_lane_stats_for_searcher(
+    searcher: &tantivy::Searcher,
+    fields: FieldHandles,
+    project_id: &str,
+    graph_id: &str,
+    graph_source: &str,
+) -> Result<GraphLaneIndexStats> {
+    let query = graph_lane_query(fields, project_id, Some(graph_id), graph_source);
+    let (top, count) = searcher.search(&query, &(TopDocs::with_limit(1), Count))?;
+    let indexed_generation = if count == 0 {
+        None
+    } else {
+        let doc: TantivyDocument = searcher.doc(top[0].1)?;
+        let generation = doc
+            .get_first(fields.graph_generation)
+            .and_then(|value| match value {
+                OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        (!generation.is_empty()).then_some(generation)
+    };
+    Ok(GraphLaneIndexStats {
+        indexed_vertex_count: count,
+        indexed_generation,
+    })
+}
+
+/// Every indexed graph lane of one project + plane, keyed by graph id. The
+/// inventory the activation path diffs against so a graph REMOVED from a new
+/// accepted view gets its lane purged instead of serving stale documents.
+pub fn graph_lanes_for_project_searcher(
+    searcher: &tantivy::Searcher,
+    fields: FieldHandles,
+    project_id: &str,
+    graph_source: &str,
+) -> Result<BTreeMap<String, GraphLaneIndexStats>> {
+    let query = graph_lane_query(fields, project_id, None, graph_source);
+    let count = searcher.search(&query, &Count)?;
+    if count == 0 {
+        return Ok(BTreeMap::new());
+    }
+    let mut lanes = BTreeMap::<String, GraphLaneIndexStats>::new();
+    for (_, address) in searcher.search(&query, &TopDocs::with_limit(count))? {
+        let doc: TantivyDocument = searcher.doc(address)?;
+        let graph_id = doc
+            .get_first(fields.graph_id)
+            .and_then(|value| match value {
+                OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if graph_id.is_empty() {
+            continue;
+        }
+        let generation = doc
+            .get_first(fields.graph_generation)
+            .and_then(|value| match value {
+                OwnedValue::Str(value) if !value.is_empty() => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let lane = lanes.entry(graph_id).or_insert(GraphLaneIndexStats {
+            indexed_vertex_count: 0,
+            indexed_generation: (!generation.is_empty()).then_some(generation),
+        });
+        lane.indexed_vertex_count += 1;
+    }
+    Ok(lanes)
+}
+
+fn graph_lane_query(
+    fields: FieldHandles,
+    project_id: &str,
+    graph_id: Option<&str>,
+    graph_source: &str,
+) -> BooleanQuery {
+    let mut clauses = vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.doc_type, super::GRAPH_VERTEX_DOC_TYPE),
+                IndexRecordOption::Basic,
+            )) as Box<dyn tantivy::query::Query>,
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.project_id, project_id),
+                IndexRecordOption::Basic,
+            )),
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.graph_source, graph_source),
+                IndexRecordOption::Basic,
+            )),
+        ),
+    ];
+    if let Some(graph_id) = graph_id {
+        clauses.push((
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.graph_id, graph_id),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+    BooleanQuery::new(clauses)
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1012,7 +1127,7 @@ impl TranscriptIndex {
                 (Occur::Must, Box::new(tantivy::query::AllQuery)),
                 (
                     Occur::MustNot,
-                    self.graph_term(self.fields.doc_type, "project_graph_vertex"),
+                    self.graph_term(self.fields.doc_type, super::GRAPH_VERTEX_DOC_TYPE),
                 ),
             ]);
             let graph_in_project = BooleanQuery::new(vec![(
@@ -1048,34 +1163,27 @@ impl TranscriptIndex {
         graph_id: &str,
         graph_source: &str,
     ) -> Result<GraphLaneIndexStats> {
-        let searcher = self.reader.searcher();
-        let query = BooleanQuery::new(vec![
-            (
-                Occur::Must,
-                self.graph_term(self.fields.doc_type, "project_graph_vertex"),
-            ),
-            (
-                Occur::Must,
-                self.graph_term(self.fields.project_id, project_id),
-            ),
-            (Occur::Must, self.graph_term(self.fields.graph_id, graph_id)),
-            (
-                Occur::Must,
-                self.graph_term(self.fields.graph_source, graph_source),
-            ),
-        ]);
-        let (top, count) = searcher.search(&query, &(TopDocs::with_limit(1), Count))?;
-        let indexed_generation = if count == 0 {
-            None
-        } else {
-            let doc: TantivyDocument = searcher.doc(top[0].1)?;
-            let generation = self.doc_text(&doc, self.fields.graph_generation);
-            (!generation.is_empty()).then_some(generation)
-        };
-        Ok(GraphLaneIndexStats {
-            indexed_vertex_count: count,
-            indexed_generation,
-        })
+        graph_lane_stats_for_searcher(
+            &self.reader.searcher(),
+            self.fields,
+            project_id,
+            graph_id,
+            graph_source,
+        )
+    }
+
+    /// Every indexed graph lane of one project + plane, keyed by graph id.
+    pub fn graph_lanes_for_project(
+        &self,
+        project_id: &str,
+        graph_source: &str,
+    ) -> Result<BTreeMap<String, GraphLaneIndexStats>> {
+        graph_lanes_for_project_searcher(
+            &self.reader.searcher(),
+            self.fields,
+            project_id,
+            graph_source,
+        )
     }
 
     fn hybrid_entity_id(&self, doc: &TantivyDocument) -> String {
@@ -1117,7 +1225,7 @@ impl TranscriptIndex {
         // 4.1): the label is prose-tokenized into `content` as its first
         // line, and none of the file/commit/session fields below can exist
         // on a graph document.
-        if self.doc_text(doc, self.fields.doc_type) == "project_graph_vertex" {
+        if self.doc_text(doc, self.fields.doc_type) == super::GRAPH_VERTEX_DOC_TYPE {
             let content = self.doc_text(doc, self.fields.content);
             let label = content.split('\n').next().unwrap_or_default();
             if !label.is_empty() {
