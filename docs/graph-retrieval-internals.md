@@ -241,8 +241,8 @@ through the standalone `bro-harness` binary. The code-owned catalog in
 `crates/bro-core/src/provider.rs` is the authority: `claude` survives
 only as a serde alias to `glm`, `codex` as an alias to `brodex`, and
 the Gemini lane is removed. See
-[Provider & Agent Surfaces](../PROJECT.md) rather than re-inventorying
-providers here.
+[Provider & Agent Surfaces](../PROJECT.md#provider--agent-surfaces)
+rather than re-inventorying providers here.
 
 ## System memories
 

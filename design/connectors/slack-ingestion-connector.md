@@ -25,7 +25,10 @@ Status (2026-08-16): partial. The corpus lane is landed on
 `bbox-conversation-source`, `bbox-conversation-source-store`, and
 `bbox-slack-collector` project Slack messages into the word index
 through the transcript adapter. The rest of this connector design
-remains proposed, including the `bro-slack` interaction bridge.
+remains proposed. The `bro-slack` Socket Mode sidecar is separate
+shipped code (`crates/bro-slack`); its v1 design is archived
+(`../integrations/slack/bro-slack.md`) and only the next iteration
+(`../integrations/slack/bro-slack-next.md`) is proposed.
 Reverify contract names against code before building on them.
 
 ## 1. What this connector observes
