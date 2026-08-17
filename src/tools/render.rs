@@ -1074,10 +1074,37 @@ mod catalog_render_tests {
             .await;
 
         assert!(is_error(&result), "{result:?}");
+        let rendered = format!("{result:?}");
         assert!(
-            format!("{result:?}").contains("error.global_render_authority"),
-            "{result:?}"
+            rendered.contains("error.global_render_authority"),
+            "{rendered}"
         );
+        // The refusal must name the daemon's real knowledge store. The
+        // session view is detached from that store, so an unbound view would
+        // report an empty source and refuse even the host-default store.
+        let store_path = server.state.kb.read().store_path().display().to_string();
+        assert!(!store_path.is_empty());
+        assert!(
+            rendered.contains(&store_path),
+            "refusal must name the durable store {store_path}: {rendered}"
+        );
+    }
+
+    /// The session knowledge view answers for the daemon's durable store:
+    /// global render authority compares that store's path against the host
+    /// default, so the detached view must carry it rather than the empty
+    /// placeholder path.
+    #[tokio::test]
+    async fn session_knowledge_view_carries_durable_store_authority() {
+        let fixture = CatalogFixture::new();
+        let server = fixture.server();
+        let expected = server.state.kb.read().store_path().to_path_buf();
+        assert!(!expected.as_os_str().is_empty());
+
+        let view = server
+            .session_knowledge_view(None, None)
+            .expect("session knowledge view");
+        assert_eq!(view.knowledge.store_path(), expected.as_path());
     }
 
     /// Authority is preflighted across the complete selected target set. A

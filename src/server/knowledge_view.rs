@@ -665,8 +665,13 @@ impl BlackboxServer {
                 entry
             })
             .collect();
+        // The detached view answers for the daemon's durable store: global
+        // render authority judges that store's path, so an unbound (empty)
+        // path would refuse every host-default global render.
+        let source_store_path = self.state.kb.read().store_path().to_path_buf();
         Ok(SessionKnowledgeView {
-            knowledge: Knowledge::detached_view(entries, metadata),
+            knowledge: Knowledge::detached_view(entries, metadata)
+                .with_source_store_path(&source_store_path),
             items,
             built_from,
             diagnostics,

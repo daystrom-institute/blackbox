@@ -250,6 +250,16 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- `bbox_render(scope=global)` no longer refuses every daemon with
+  `error.global_render_authority` naming an empty knowledge source. The
+  render tool projects a detached session knowledge view, and that view
+  carried an empty store path, so the source-authority check compared
+  nothing against the host-default store and refused even a daemon whose
+  store is at the default location. The session view now carries the
+  durable store's path as its source authority: host-default stores render
+  again, and a relocated store's refusal names the real store path so the
+  operator can bind `BLACKBOX_GLOBAL_*_MD` deliberately.
+
 - `bbox_context` and `bbox_messages` now serve Slack locators instead of
   handing them to the filesystem reader (gap-2d4d17da): a slack hit's
   `file_path` (`slack:<workspace>/<channel>`) resolves against the

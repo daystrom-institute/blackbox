@@ -4638,6 +4638,24 @@ impl Knowledge {
         }
     }
 
+    /// The durable store this value answers for. Empty on a detached view
+    /// that has not been bound to a source with
+    /// [`Knowledge::with_source_store_path`].
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+
+    /// Bind a detached view to the durable store it was projected from.
+    ///
+    /// The view stays read-only; nothing here enables persistence. The path
+    /// is provenance for source-authority checks such as global render
+    /// authority, which must judge the daemon's real knowledge store rather
+    /// than the empty placeholder a detached view carries by default.
+    pub fn with_source_store_path(mut self, store_path: &Path) -> Self {
+        self.store_path = store_path.to_path_buf();
+        self
+    }
+
     /// Bootstrap: scan a project for existing instruction files and return their
     /// contents for the agent to decompose into PROJECT.md + knowledge entries.
     pub fn bootstrap(&self, p: &BootstrapParams) -> Result<String> {
