@@ -1616,7 +1616,11 @@ impl BlackboxServer {
         }
         match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
             Ok(view) => {
-                install_published_graph_view(&self.state, view);
+                install_published_graph_view(
+                    &self.state,
+                    view,
+                    PublishedGraphViewInstaller::AcceptRefresh,
+                );
             }
             Err(error) => {
                 tracing::warn!(
@@ -1689,15 +1693,140 @@ impl BlackboxServer {
 /// Delegates to [`converge_published_graph_word_lanes`] for the durable side,
 /// then swaps the catalog view under its own write guard. Callers that also
 /// install a provisional overlay in the same step must use
+/// [`published_graph_view_install_admitted`] plus
 /// [`converge_published_graph_word_lanes`] plus one shared write guard
 /// instead, so a reader can never observe the new published view with the old
 /// (or missing) provisional overlay.
+///
+/// `caller` names the install path in the refusal log. It is a fixed label,
+/// never caller-supplied text.
 pub(crate) fn install_published_graph_view(
     state: &SharedState,
     view: bbox_indexing::project_graph_view::PublishedProjectGraphView,
+    caller: PublishedGraphViewInstaller,
 ) {
+    if !published_graph_view_install_admitted(state, &view, caller) {
+        return;
+    }
     converge_published_graph_word_lanes(state, &view);
     state.project_graph_views.write().install_published(view);
+}
+
+/// Which path is installing a published graph view. Fixed labels, so a
+/// refusal in the log says which trigger produced the losing view without
+/// carrying caller-authored text into a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishedGraphViewInstaller {
+    /// The convergence that follows an accepted-publication pointer move.
+    AcceptRefresh,
+    /// The boot pass over every published catalog project.
+    BootReconcile,
+    /// A remote workspace's overlay recomputation, which installs the
+    /// published view its own accepted read produced.
+    RemoteProvisionalOverlay,
+    /// A provisional capture that found no published view installed.
+    ProvisionalCapture,
+    #[cfg(test)]
+    Test,
+}
+
+impl PublishedGraphViewInstaller {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptRefresh => "accept_refresh",
+            Self::BootReconcile => "boot_reconcile",
+            Self::RemoteProvisionalOverlay => "remote_provisional_overlay",
+            Self::ProvisionalCapture => "provisional_capture",
+            #[cfg(test)]
+            Self::Test => "test",
+        }
+    }
+}
+
+/// The monotonic gate every published graph-view install passes through.
+///
+/// A published view is a projection of exactly ONE accepted generation, and
+/// the read surface has no rebuild-on-read: whatever is installed keeps
+/// answering. So an install that carries a generation the pointer no longer
+/// names must not replace one that is serving, no matter which path built
+/// it. The observed failure is a read that resolved accepted content, spent
+/// real time recomputing overlays while an acceptance landed, and then
+/// installed its now-superseded view on top of the fresh one, leaving graph
+/// reads answering from the previous generation until a restart.
+///
+/// The authority is the accepted publication POINTER, never the two views
+/// being compared: generation ids are content digests with no ordering, so
+/// "newer" can only mean "the generation the pointer currently names". That
+/// also keeps the gate from latching: once a refresh arrives for the
+/// pointer's generation it is admitted, even when the installed view is
+/// stale.
+///
+/// Two degradations are admitted rather than refused, both loudly: nothing
+/// is installed yet (the boot case, where prior-arm or superseded content
+/// still beats no graphs at all), and an unreadable pointer with nothing
+/// installed. An unreadable pointer with a view already serving keeps the
+/// serving view: a gate that cannot prove supersession must not perform it.
+pub(crate) fn published_graph_view_install_admitted(
+    state: &SharedState,
+    view: &bbox_indexing::project_graph_view::PublishedProjectGraphView,
+    caller: PublishedGraphViewInstaller,
+) -> bool {
+    let project_id = &view.project_id;
+    // Read the pointer BEFORE taking any view lock: this is file IO under
+    // the publication lock, and the catalog view guard must never be held
+    // across it.
+    let accepted_generation = match &state.accepted_publications {
+        Some(runtime) => match runtime.advance_tokens(project_id) {
+            Ok(Some((generation, _pointer_sha256))) => Some(generation),
+            // No pointer at all: nothing published, so there is no
+            // authority to compare against and nothing to protect.
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    caller = caller.as_str(),
+                    code = error.code(),
+                    "published graph view install could not read the accepted pointer"
+                );
+                None
+            }
+        },
+        // Bridge mode has no accepted-publication runtime and no accepted
+        // pointer to be superseded by.
+        None => return true,
+    };
+    if accepted_generation
+        .as_deref()
+        .is_some_and(|accepted| accepted == view.accepted_generation)
+    {
+        return true;
+    }
+    let installed = state
+        .project_graph_views
+        .read()
+        .published_view(project_id)
+        .map(|installed| installed.accepted_generation.clone());
+    let Some(installed) = installed else {
+        tracing::warn!(
+            project_id = %project_id,
+            caller = caller.as_str(),
+            view_generation = %view.accepted_generation,
+            accepted_generation = accepted_generation.as_deref().unwrap_or("<unreadable>"),
+            "installing a published graph view the accepted pointer does not name, because no \
+             view is serving yet"
+        );
+        return true;
+    };
+    tracing::warn!(
+        project_id = %project_id,
+        caller = caller.as_str(),
+        view_generation = %view.accepted_generation,
+        installed_generation = %installed,
+        accepted_generation = accepted_generation.as_deref().unwrap_or("<unreadable>"),
+        "published graph view install refused: it projects a generation the accepted pointer \
+         does not name and a view is already serving"
+    );
+    false
 }
 
 /// Converge the published graph word lanes to one view WITHOUT touching the
@@ -1817,7 +1946,11 @@ pub(crate) fn reconcile_published_graph_word_lanes_at_boot(
         }
         match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
             Ok(view) => {
-                install_published_graph_view(state, view);
+                install_published_graph_view(
+                    state,
+                    view,
+                    PublishedGraphViewInstaller::BootReconcile,
+                );
                 installed += 1;
             }
             Err(error) => {

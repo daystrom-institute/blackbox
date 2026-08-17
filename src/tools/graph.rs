@@ -1699,6 +1699,7 @@ mod tests {
             bbox_indexing::project_graph_view::PublishedProjectGraphView {
                 project_id,
                 scope,
+                accepted_generation: "test-accepted-generation".into(),
                 graphs: std::collections::BTreeMap::from([(
                     graph_id.to_string(),
                     bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
@@ -2026,6 +2027,7 @@ mod tests {
             bbox_indexing::project_graph_view::PublishedProjectGraphView {
                 project_id,
                 scope,
+                accepted_generation: "test-accepted-generation".into(),
                 graphs: std::collections::BTreeMap::from([
                     ("records".to_string(), graph_entry(records)),
                     ("source".to_string(), graph_entry(source)),
@@ -2351,6 +2353,7 @@ mod tests {
             bbox_indexing::project_graph_view::PublishedProjectGraphView {
                 project_id,
                 scope,
+                accepted_generation: "test-accepted-generation".into(),
                 graphs: std::collections::BTreeMap::from([("fan".to_string(), graph_entry(graph))]),
                 evidence: bbox_project_graph::EvidenceBindingSet::default(),
             },

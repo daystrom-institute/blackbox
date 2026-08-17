@@ -238,6 +238,21 @@ back to the pointer's prior arm whenever the current generation does not
 verify, and latching that fallback into the graph read surface is
 indistinguishable, to a reader, from an accept that never happened.
 
+Converging on this path is necessary and not sufficient, because the
+accept is not the only writer of that view. Overlay recomputation, a
+provisional capture, and the boot pass all install published views too,
+each from accepted content IT resolved, and each spends real time between
+resolving and installing. With collectors cycling every couple of minutes
+across a dozen projects, an acceptance lands inside one of those windows
+routinely, and the slower caller then reinstalls the superseded view on
+top of the fresh one. So the ordering rule lives at the install site
+rather than on this path: a view whose accepted generation is not the one
+the pointer currently names may not replace a view that is already
+serving, whichever caller built it. The pointer is the authority because
+generation ids are content digests with no order, and keying the gate on
+the pointer is also what keeps it from latching a stale view forever: the
+next install for the pointer's own generation is admitted.
+
 ## 7. Observability, and one honest gap
 
 `bbox_project_publisher_status` reports an `auto_advance` object:

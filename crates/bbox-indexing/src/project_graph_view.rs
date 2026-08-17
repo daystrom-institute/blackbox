@@ -100,6 +100,14 @@ pub enum EvidenceOverlayValue {
 pub struct PublishedProjectGraphView {
     pub project_id: ProjectId,
     pub scope: PublishedScope,
+    /// The accepted generation this view projects.
+    ///
+    /// It rides the view rather than being read back off an entry because
+    /// the install admission gate needs it for EVERY view, and a project
+    /// whose graphs lane is empty has no entry to read it from. An empty
+    /// view for the current generation and an empty view left over from an
+    /// older one are the same bytes and opposite answers.
+    pub accepted_generation: String,
     pub graphs: BTreeMap<String, ProjectGraphViewEntry>,
     /// The project's accepted binding set. Empty for a publication written
     /// before the evidence lane existed, which is indistinguishable from a
@@ -484,6 +492,7 @@ pub fn build_published_graph_view(
     Ok(PublishedProjectGraphView {
         project_id,
         scope,
+        accepted_generation: stamp.generation_id().to_string(),
         graphs,
         evidence,
     })
@@ -984,6 +993,7 @@ mod tests {
         catalog.install_published(PublishedProjectGraphView {
             project_id: project_id.clone(),
             scope: scope.clone(),
+            accepted_generation: "test-accepted-generation".into(),
             graphs: BTreeMap::from([(
                 "records".into(),
                 valid_entry("records", "published", false),
@@ -1016,6 +1026,7 @@ mod tests {
         catalog.install_published(PublishedProjectGraphView {
             project_id: project_id.clone(),
             scope,
+            accepted_generation: "test-accepted-generation".into(),
             graphs: BTreeMap::from([(
                 "records".into(),
                 valid_entry("records", "published", false),
@@ -1086,6 +1097,7 @@ mod tests {
         PublishedProjectGraphView {
             project_id: project_id.clone(),
             scope: scope.clone(),
+            accepted_generation: "test-accepted-generation".into(),
             graphs: BTreeMap::new(),
             evidence,
         }
@@ -1255,6 +1267,7 @@ mod tests {
         catalog.install_published(PublishedProjectGraphView {
             project_id: project_id.clone(),
             scope: scope.clone(),
+            accepted_generation: "test-accepted-generation".into(),
             graphs: BTreeMap::from([
                 ("records".into(), valid_entry("records", "published", false)),
                 ("other".into(), valid_entry("other", "other", false)),
@@ -1295,6 +1308,7 @@ mod tests {
         catalog.install_published(PublishedProjectGraphView {
             project_id: project_id.clone(),
             scope: scope.clone(),
+            accepted_generation: "test-accepted-generation".into(),
             graphs: BTreeMap::from([
                 ("records".into(), valid_entry("records", "published", false)),
                 ("other".into(), valid_entry("other", "other", false)),
@@ -1336,6 +1350,7 @@ mod tests {
         catalog.install_published(PublishedProjectGraphView {
             project_id: project_id.clone(),
             scope: scope.clone(),
+            accepted_generation: "test-accepted-generation".into(),
             graphs: BTreeMap::from([
                 ("records".into(), valid_entry("records", "published", false)),
                 ("other".into(), valid_entry("other", "other", false)),

@@ -681,14 +681,35 @@ impl super::BlackboxServer {
         let graphs =
             bbox_indexing::project_graph_view::build_provisional_graph_overlay(&source, verified)?;
         let published = bbox_indexing::project_graph_view::build_published_graph_view(verified)?;
+        // `verified` is the caller's snapshot, and this path is exactly where
+        // it goes stale: the overlay recomputation above reads the checkout
+        // and materializes a generation, which takes long enough for an
+        // acceptance to land in the middle of it. It is NOT re-read from the
+        // pointer here, because the knowledge and gap halves of this pair are
+        // computed against that same snapshot and the provisional source was
+        // validated against it; swapping snapshots for the graph half alone
+        // would publish a pair whose members disagree about the baseline.
+        // Instead the published half passes the install gate, which refuses a
+        // view the pointer no longer names. The overlay half is unaffected:
+        // it is keyed by workspace and positioned against the snapshot it was
+        // built from.
+        let publish_admitted = super::knowledge_view::published_graph_view_install_admitted(
+            &self.state,
+            &published,
+            super::knowledge_view::PublishedGraphViewInstaller::RemoteProvisionalOverlay,
+        );
         // One write guard for both halves of the install: converging the word
         // lanes first, then swapping published and provisional together, so no
         // reader can see the new published view beside the old or missing
         // provisional overlay.
-        super::knowledge_view::converge_published_graph_word_lanes(&self.state, &published);
+        if publish_admitted {
+            super::knowledge_view::converge_published_graph_word_lanes(&self.state, &published);
+        }
         {
             let mut views = self.state.project_graph_views.write();
-            views.install_published(published);
+            if publish_admitted {
+                views.install_published(published);
+            }
             views.install_provisional(graphs);
         }
 
@@ -793,7 +814,16 @@ fn refresh_provisional_graph_views(state: &SharedState, authority: &ProvisionalA
         });
     // Same one-guard contract as the remote overlay path: the word lanes
     // converge first, then the published and provisional views swap together
-    // under a single write acquisition.
+    // under a single write acquisition. The published half still passes the
+    // install gate: "no view was installed when this capture started" is not
+    // proof that none is installed now.
+    let published = published.filter(|published| {
+        super::knowledge_view::published_graph_view_install_admitted(
+            state,
+            published,
+            super::knowledge_view::PublishedGraphViewInstaller::ProvisionalCapture,
+        )
+    });
     if let Some(published) = published {
         super::knowledge_view::converge_published_graph_word_lanes(state, &published);
         let mut views = state.project_graph_views.write();

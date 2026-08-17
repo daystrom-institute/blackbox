@@ -4041,6 +4041,67 @@ mod tests {
         );
     }
 
+    /// An install that lost the race never wins it afterwards.
+    ///
+    /// Every published-view install path resolves accepted content, spends
+    /// real time building a view from it, and only then installs. A
+    /// collector cycle landing an acceptance inside that window leaves the
+    /// slower caller holding a view of the previous generation, and the
+    /// read surface has no rebuild-on-read to correct it. This is the
+    /// ordering the live daemon hit with code and Slack collectors cycling
+    /// every two minutes across a dozen projects: the accept-path refresh
+    /// ran clean, and an overlay recomputation reinstalled the older view
+    /// behind it.
+    #[tokio::test]
+    async fn an_in_flight_older_view_never_replaces_the_accepted_one() {
+        use crate::server::knowledge_view::{
+            PublishedGraphViewInstaller, install_published_graph_view,
+        };
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+        use bbox_corpus_core::project_catalog::ProjectId;
+
+        let fixture = AutoAdvanceFixture::new("p_policy_inflight");
+        let project_id = ProjectId::parse("p_policy_inflight".to_string()).unwrap();
+        let first = fixture.stage_graph_candidate("knowledge-a", "first", COMMIT_ONE);
+        fixture
+            .establish_from(&first, Some(true), "operator grants auto-advance")
+            .await;
+        // Exactly what a slow caller is holding: the view it built from the
+        // accepted content it resolved before the acceptance landed.
+        let in_flight = fixture
+            .server
+            .state
+            .project_graph_views
+            .read()
+            .published_view(&project_id)
+            .cloned()
+            .expect("the establish installed a published view");
+
+        let second = fixture.stage_graph_candidate("knowledge-a", "second", COMMIT_TWO);
+        assert!(
+            fixture
+                .server
+                .attempt_publisher_auto_advance("p_policy_inflight", &second)
+                .accepted()
+        );
+        let accepted = fixture.served_graph_generation();
+        assert_eq!(accepted["accepted_commit"], COMMIT_TWO);
+
+        // The slow caller finishes and installs, after the acceptance.
+        install_published_graph_view(
+            &fixture.server.state,
+            in_flight,
+            PublishedGraphViewInstaller::Test,
+        );
+
+        assert_eq!(
+            fixture.served_graph_generation(),
+            accepted,
+            "an install carrying a generation the pointer no longer names loses to the view \
+             already serving"
+        );
+    }
+
     /// A prior-arm read is an availability degradation, not a new view.
     ///
     /// When the CURRENT accepted generation does not verify, a verified
