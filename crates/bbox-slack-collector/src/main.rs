@@ -20,7 +20,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bbox_slack_collector::{
-    ConversationSourceClient, SatelliteConfig, SlackClient, run_onboarding, run_publication_cycle,
+    ConversationSourceClient, SatelliteConfig, Shutdown, SlackClient, run_onboarding,
+    run_publication_cycle, run_publication_cycle_with_shutdown,
 };
 use clap::{Parser, Subcommand};
 
@@ -77,7 +78,11 @@ async fn main() -> Result<()> {
         .await
         .context("resolving the Slack bot token")?;
 
-    let sink = ConversationSourceClient::new(config.corpus_url.clone(), producer_bearer)?;
+    let sink = ConversationSourceClient::new(
+        config.corpus_url.clone(),
+        producer_bearer,
+        config.corpus_url_allow_plaintext,
+    )?;
     let slack = SlackClient::new(
         config.slack_api_base_url.clone(),
         slack_token,
@@ -113,37 +118,107 @@ async fn main() -> Result<()> {
             let interval = std::time::Duration::from_secs(
                 interval_secs.unwrap_or(config.poll_interval_secs).max(1),
             );
+            // Kubernetes sends SIGTERM on pod stop, and the container runtime's
+            // kill escalates on a deadline. Watching for it here is what turns
+            // "the process dies mid-cycle" into "the cycle finishes the current
+            // channel, the journal is saved, and the process exits 0".
+            #[cfg(unix)]
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .context("installing the SIGTERM listener")?;
+            // The non-unix arm keeps the same shape so both `interrupt` call
+            // sites below compile everywhere: there is no SIGTERM to hold, so
+            // the placeholder carries nothing.
+            #[cfg(not(unix))]
+            let mut sigterm = ();
+            let shutdown = Shutdown::default();
+            // The one-app posture cannot refuse a write scope, so watch mode
+            // states the whole grant at startup and re-states it whenever the
+            // observed set moves between cycles: a scope granted or revoked
+            // under a running satellite is exactly the change an operator
+            // must see without going looking for it.
+            let mut observed_scopes: Option<(Vec<String>, Vec<String>)> = None;
             loop {
-                match run_publication_cycle(
+                let mut cycle = std::pin::pin!(run_publication_cycle_with_shutdown(
                     &slack,
                     &sink,
                     &config,
                     &config.journal_path,
                     chrono::Utc::now(),
-                )
-                .await
-                {
-                    Ok(outcome) => tracing::info!(
-                        channels = outcome.channels_enrolled,
-                        landed = outcome.messages_landed,
-                        duplicates = outcome.duplicates,
-                        thread_replies = outcome.thread_replies_landed,
-                        revisions = outcome.revisions_emitted,
-                        tombstones = outcome.tombstones_emitted,
-                        deferred = outcome.windows_deferred,
-                        lag_seconds = outcome.max_lag_seconds,
-                        "publication cycle completed"
-                    ),
+                    &shutdown,
+                ));
+                // A signal during a cycle does NOT cancel it: the select arm
+                // raises the flag, then awaits the cycle to completion, so the
+                // current channel's journal save happens before exit.
+                let outcome = tokio::select! {
+                    outcome = &mut cycle => outcome,
+                    signal = interrupt(&mut sigterm) => {
+                        shutdown.request();
+                        tracing::info!(
+                            signal,
+                            "terminating; finishing current channel"
+                        );
+                        cycle.await
+                    }
+                };
+                match outcome {
+                    Ok(outcome) => {
+                        let snapshot =
+                            (outcome.granted_scopes.clone(), outcome.write_scopes.clone());
+                        match bbox_slack_collector::scope_observation(
+                            observed_scopes
+                                .as_ref()
+                                .map(|(granted, writes)| (granted.as_slice(), writes.as_slice())),
+                            &snapshot.0,
+                            &snapshot.1,
+                        ) {
+                            bbox_slack_collector::ScopeObservation::Initial => tracing::info!(
+                                granted = snapshot.0.join(", "),
+                                writes = snapshot.1.join(", "),
+                                "granted scopes observed"
+                            ),
+                            bbox_slack_collector::ScopeObservation::Changed => tracing::info!(
+                                granted = snapshot.0.join(", "),
+                                writes = snapshot.1.join(", "),
+                                "granted scopes changed between cycles"
+                            ),
+                            bbox_slack_collector::ScopeObservation::Unchanged => {}
+                        }
+                        observed_scopes = Some(snapshot);
+                        tracing::info!(
+                            channels = outcome.channels_enrolled,
+                            landed = outcome.messages_landed,
+                            duplicates = outcome.duplicates,
+                            thread_replies = outcome.thread_replies_landed,
+                            revisions = outcome.revisions_emitted,
+                            tombstones = outcome.tombstones_emitted,
+                            deferred = outcome.windows_deferred,
+                            // Honest key: this is the corpus's worst NEWEST-record
+                            // staleness (the quietest channel), not backfill depth.
+                            // Backfill progress is the fields below it.
+                            max_channel_staleness_seconds = outcome.max_lag_seconds,
+                            backfill_windows = outcome.backfill_windows,
+                            channels_backfilling = outcome.channels_backfilling,
+                            oldest_backfilled_to = outcome.oldest_backfilled_to,
+                            "publication cycle completed"
+                        )
+                    }
                     // A cycle failure is not fatal. A corpus restart, a
                     // transient network fault, and a workspace throttle all
                     // resolve on a later cycle, and exiting here would turn
-                    // every one of them into an operator page.
-                    Err(error) => tracing::error!(error = %error, "publication cycle failed"),
+                    // every one of them into an operator page. The Debug
+                    // rendering is deliberate: it carries the whole anyhow
+                    // chain, and the cause was the part the log used to drop.
+                    Err(error) => tracing::error!(error = ?error, "publication cycle failed"),
+                }
+                if shutdown.is_requested() {
+                    tracing::info!("interrupted; stopping the satellite");
+                    break;
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("interrupted; stopping the satellite");
+                    signal = interrupt(&mut sigterm) => {
+                        tracing::info!(signal, "interrupted; stopping the satellite");
                         break;
                     }
                 }
@@ -153,34 +228,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Wait for whichever interrupt this platform offers, returning its name.
+///
+/// On unix both Ctrl-C and SIGTERM count; anywhere else only Ctrl-C does,
+/// because `signal::unix` does not exist there.
+#[cfg(unix)]
+async fn interrupt(sigterm: &mut tokio::signal::unix::Signal) -> &'static str {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "ctrl_c",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn interrupt(_sigterm: &mut ()) -> &'static str {
+    tokio::signal::ctrl_c().await.ok();
+    "ctrl_c"
+}
+
 /// Print what one cycle did, including what the shared credential can do.
 ///
 /// The granted-scope line is not decoration. Under the one-app posture the
 /// collector cannot refuse a write scope, so the operator's compensating
 /// control is SEEING the whole grant on every run.
 fn report(outcome: &bbox_slack_collector::CycleOutcome, slack: &SlackClient) {
-    let stats = slack.stats();
-    println!(
-        "workspace {} channels={} landed={} duplicates={} thread_replies={} revisions={} \
-         tombstones={} deferred_windows={} backfill_windows={} reconciled={} requests={} \
-         throttled={} lag_seconds={}",
-        outcome.workspace_id,
-        outcome.channels_enrolled,
-        outcome.messages_landed,
-        outcome.duplicates,
-        outcome.thread_replies_landed,
-        outcome.revisions_emitted,
-        outcome.tombstones_emitted,
-        outcome.windows_deferred,
-        outcome.backfill_windows,
-        outcome.reconciled,
-        stats.requests,
-        stats.throttled,
-        outcome
-            .max_lag_seconds
-            .map(|lag| lag.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-    );
+    println!("{}", report_summary_line(outcome, &slack.stats()));
     println!("granted scopes: {}", outcome.granted_scopes.join(", "));
     if !outcome.write_scopes.is_empty() {
         println!(
@@ -193,5 +265,71 @@ fn report(outcome: &bbox_slack_collector::CycleOutcome, slack: &SlackClient) {
     }
     if !outcome.normalization_skips.is_empty() {
         println!("messages not recorded: {:?}", outcome.normalization_skips);
+    }
+}
+
+/// The one-line summary `report` prints, split out so its keys are testable.
+///
+/// Key names are load-bearing: staleness is `max_channel_staleness_seconds`
+/// because backfill depth and producer staleness are different axes (design
+/// 5.5), and a key like `lag_seconds=` would re-conflate them the moment
+/// somebody grepped for it.
+fn report_summary_line(
+    outcome: &bbox_slack_collector::CycleOutcome,
+    stats: &bbox_slack_collector::slack::ClientStats,
+) -> String {
+    format!(
+        "workspace {} channels={} landed={} duplicates={} thread_replies={} revisions={} \
+         tombstones={} deferred_windows={} backfill_windows={} channels_backfilling={} \
+         oldest_backfilled_to={} reconciled={} requests={} throttled={} \
+         max_channel_staleness_seconds={}",
+        outcome.workspace_id,
+        outcome.channels_enrolled,
+        outcome.messages_landed,
+        outcome.duplicates,
+        outcome.thread_replies_landed,
+        outcome.revisions_emitted,
+        outcome.tombstones_emitted,
+        outcome.windows_deferred,
+        outcome.backfill_windows,
+        outcome.channels_backfilling,
+        outcome.oldest_backfilled_to.as_deref().unwrap_or("none"),
+        outcome.reconciled,
+        stats.requests,
+        stats.throttled,
+        outcome
+            .max_lag_seconds
+            .map(|lag| lag.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_report_line_names_staleness_and_never_lag() {
+        let line = report_summary_line(
+            &bbox_slack_collector::CycleOutcome {
+                workspace_id: "T0FIXTURE".into(),
+                max_lag_seconds: Some(42),
+                ..bbox_slack_collector::CycleOutcome::default()
+            },
+            &bbox_slack_collector::slack::ClientStats {
+                requests: 7,
+                throttled: 1,
+                ..Default::default()
+            },
+        );
+        assert!(line.contains("max_channel_staleness_seconds=42"), "{line}");
+        assert!(
+            !line.contains("lag_seconds="),
+            "lag_seconds would re-conflate staleness with backfill depth: {line}"
+        );
+        assert!(
+            line.contains("requests=7") && line.contains("throttled=1"),
+            "{line}"
+        );
     }
 }

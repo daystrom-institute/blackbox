@@ -200,6 +200,7 @@ impl BlackboxServer {
             let failed_rows = collect_failed_tasks(&task_store);
             let vector_alerts = collect_vector_connectivity_alerts();
             let cron_alerts = collect_cron_schedule_alerts(&server.state);
+            let conversation_silence = collect_conversation_producer_silence(&server.state);
             let inbox = append_overlay_diagnostics(
                 inbox::compute_inbox(
                     &knowledge_view.knowledge,
@@ -209,6 +210,7 @@ impl BlackboxServer {
                     &failed_rows,
                     &vector_alerts,
                     &cron_alerts,
+                    &conversation_silence,
                     &server.state.whiteboards,
                     &p,
                 )?,
@@ -475,6 +477,66 @@ mod tests {
                 if cron_name == "daily-compaction" && domain == "cron-routing/daily-compaction"
         ));
     }
+
+    /// The silence boundary with a synthetic clock, boot instant, and
+    /// threshold: strictly more than the threshold alerts, a contact exactly
+    /// at it does not, a fresh contact stays quiet, a just-crossed row rounds
+    /// its minutes UP so the number agrees with the threshold being exceeded,
+    /// and a never-seen scope waits out the boot grace before it earns a row,
+    /// because "the daemon just restarted" is not "the satellite never ran".
+    #[test]
+    fn conversation_silence_rows_use_one_clock_and_a_strict_threshold() {
+        use crate::inbox::ConversationProducerSilence;
+        use crate::server::conversation_source::ProducerContact;
+        use bbox_corpus_core::project_catalog::ConnectorScope;
+
+        let scope = |id: &str| ConnectorScope::try_new(id, "slack").unwrap();
+        let contact = |secs_ago: i64| ProducerContact {
+            last_seen_epoch_secs: 1_755_000_000 - secs_ago,
+            user_agent: "bbox-slack-collector/0.0.0".into(),
+        };
+        let fresh = scope("csrc_0000000000000001");
+        let at_edge = scope("csrc_0000000000000002");
+        let past_edge = scope("csrc_0000000000000003");
+        let never = scope("csrc_0000000000000004");
+        let contacts = [
+            (&fresh, Some(contact(60))),
+            (&at_edge, Some(contact(1_800))),
+            (&past_edge, Some(contact(1_801))),
+            (&never, None),
+        ];
+        let now = 1_755_000_000;
+
+        // A daemon booted well before now: the never-seen scope is past its
+        // grace and reports.
+        let rows = super::conversation_silence_rows(&contacts, now, now - 3_600, 1_800);
+        assert_eq!(rows.len(), 2, "fresh and exactly-at-threshold stay quiet");
+        assert!(matches!(
+            &rows[0],
+            ConversationProducerSilence::Stale {
+                scope,
+                last_seen_at,
+                silent_minutes
+            } if scope == "slack/csrc_0000000000000003"
+                && last_seen_at.ends_with('Z')
+                && *silent_minutes == 31
+        ));
+        assert!(matches!(
+            &rows[1],
+            ConversationProducerSilence::NeverSeen { scope }
+                if scope == "slack/csrc_0000000000000004"
+        ));
+
+        // The same never-seen map one minute after boot: no row, because the
+        // satellite is still inside its boot grace. (A genuinely stale
+        // contact is NOT grace-suppressed: that producer did run and stop.)
+        let grace_contacts = [(&fresh, Some(contact(60))), (&never, None)];
+        let rows = super::conversation_silence_rows(&grace_contacts, now, now - 60, 1_800);
+        assert!(
+            rows.is_empty(),
+            "a restart must not page one row per granted scope: {rows:?}"
+        );
+    }
 }
 
 /// HNSW connectivity breaches for the inbox (gap-1168b0bd b). Caller-side
@@ -618,4 +680,93 @@ fn collect_failed_tasks(
             }
         })
         .collect()
+}
+
+/// How long a conversation scope's producer may stay quiet before the inbox
+/// says so. Thirty minutes is several full satellite cycles at the default
+/// poll interval, so a healthy producer never trips it.
+const CONVERSATION_PRODUCER_SILENCE_THRESHOLD_SECS: i64 = 30 * 60;
+
+/// Conversation scopes whose producer has gone silent, for the inbox.
+///
+/// The expected set is every scope granted on the conversation LANE, including
+/// pending-onboard ones: a scope the operator granted is a scope a satellite is
+/// expected to arrive for. The observed set is the boot-scoped contact map the
+/// route layer keeps, so "never since boot" is honest rather than pretending
+/// the daemon knows the past. "Never" also waits out one silence threshold of
+/// boot grace: a daemon restart must not page a row per granted scope for
+/// satellites that simply have not polled yet.
+fn collect_conversation_producer_silence(
+    state: &crate::server::state::SharedState,
+) -> Vec<inbox::ConversationProducerSilence> {
+    let connectors = state.code_sources.producer_auth().connectors().clone();
+    let expected: BTreeSet<&bbox_corpus_core::project_catalog::ConnectorScope> = connectors
+        .grants()
+        .iter()
+        .filter(|expectation| {
+            connectors.profile_for(expectation.scope.connector_source_id())
+                == Some(crate::config::ConnectorProfile::Conversation)
+        })
+        .map(|expectation| &expectation.scope)
+        .collect();
+    let contacts: Vec<(
+        &bbox_corpus_core::project_catalog::ConnectorScope,
+        Option<crate::server::conversation_source::ProducerContact>,
+    )> = expected
+        .into_iter()
+        .map(|scope| {
+            let contact = state.conversation_sources.producer_contact(scope);
+            (scope, contact)
+        })
+        .collect();
+    conversation_silence_rows(
+        &contacts,
+        chrono::Utc::now().timestamp(),
+        state.conversation_sources.producer_boot_epoch_secs(),
+        CONVERSATION_PRODUCER_SILENCE_THRESHOLD_SECS,
+    )
+}
+
+/// The silence rows as a pure function of the granted scopes, their last
+/// contacts, one clock, the daemon's boot instant, and one threshold. Split
+/// out so the boundary is testable with a synthetic clock rather than a sleep:
+/// "more than" is strictly more, a contact exactly at the threshold is not
+/// silent yet, and a never-seen scope waits out the same threshold of boot
+/// grace before earning its own row, because it names a different fix (the
+/// satellite never ran, or the daemon just restarted) than a stale one (it
+/// stopped).
+fn conversation_silence_rows(
+    contacts: &[(
+        &bbox_corpus_core::project_catalog::ConnectorScope,
+        Option<crate::server::conversation_source::ProducerContact>,
+    )],
+    now_epoch_secs: i64,
+    boot_epoch_secs: i64,
+    threshold_secs: i64,
+) -> Vec<inbox::ConversationProducerSilence> {
+    let mut alerts = Vec::new();
+    for (scope, contact) in contacts {
+        let Some(contact) = contact else {
+            if (now_epoch_secs - boot_epoch_secs).max(0) > threshold_secs {
+                alerts.push(inbox::ConversationProducerSilence::NeverSeen {
+                    scope: scope.to_string(),
+                });
+            }
+            continue;
+        };
+        let silent_secs = (now_epoch_secs - contact.last_seen_epoch_secs).max(0);
+        if silent_secs > threshold_secs {
+            alerts.push(inbox::ConversationProducerSilence::Stale {
+                scope: scope.to_string(),
+                last_seen_at: crate::server::conversation_source::contact_rfc3339(
+                    contact.last_seen_epoch_secs,
+                ),
+                // Rounded UP, so a row that just crossed a "30m" threshold
+                // never renders as exactly "30m": the number must agree with
+                // the fact that the threshold was exceeded.
+                silent_minutes: u64::try_from((silent_secs + 59) / 60).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    alerts
 }

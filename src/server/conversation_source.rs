@@ -64,6 +64,77 @@ use super::producer_auth::ConnectorGrant;
 /// retention story are all this lane's own.
 const CONVERSATION_SOURCE_DIR: &str = "conversation-sources";
 
+/// One authenticated producer contact, held in memory only.
+#[derive(Clone)]
+pub(crate) struct ProducerContact {
+    pub(crate) last_seen_epoch_secs: i64,
+    pub(crate) user_agent: String,
+}
+
+/// Last authenticated contact per conversation scope.
+///
+/// Boot-scoped by design: the question this answers is "is the satellite
+/// alive NOW", not "when did it ever run", and a durable answer would outlive
+/// the daemon it describes. Recording happens only on the INGEST verbs
+/// (/batches, /channels, /revisions, /cursors) and only after the grant check
+/// passes, so the map never names a scope an unauthorized caller asked about
+/// and no bearer-holding poller can refresh a stale satellite into looking
+/// alive: the status read renders the map without touching it.
+pub(crate) struct ProducerPresence {
+    contacts: std::sync::Mutex<std::collections::BTreeMap<ConnectorScope, ProducerContact>>,
+    /// When this daemon started, so "never seen" can wait out a boot grace
+    /// before it is reported: a restart must not page one row per granted
+    /// scope for scopes whose satellites simply have not polled yet.
+    boot_epoch_secs: i64,
+}
+
+impl Default for ProducerPresence {
+    fn default() -> Self {
+        Self {
+            contacts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            boot_epoch_secs: chrono::Utc::now().timestamp(),
+        }
+    }
+}
+
+impl ProducerPresence {
+    /// Record a contact and hand back what was recorded, so the caller can
+    /// log or assert it without taking the lock a second time.
+    fn note(
+        &self,
+        scope: &ConnectorScope,
+        user_agent: &str,
+        now_epoch_secs: i64,
+    ) -> ProducerContact {
+        let contact = ProducerContact {
+            last_seen_epoch_secs: now_epoch_secs,
+            user_agent: user_agent.to_string(),
+        };
+        self.contacts
+            .lock()
+            .unwrap()
+            .insert(scope.clone(), contact.clone());
+        contact
+    }
+
+    fn contact(&self, scope: &ConnectorScope) -> Option<ProducerContact> {
+        self.contacts.lock().unwrap().get(scope).cloned()
+    }
+
+    fn boot_epoch_secs(&self) -> i64 {
+        self.boot_epoch_secs
+    }
+}
+
+/// Render a contact stamp the way the wire and the operators read it: RFC3339,
+/// whole seconds. Unrepresentable epochs (a far-future client clock, say)
+/// render as the epoch, never as a panic.
+pub(crate) fn contact_rfc3339(epoch_secs: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch_secs, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// Runtime holder for the conversation landing store.
 ///
 /// One field, like [`super::file_source::FileSourceRuntime`], and for the same
@@ -72,6 +143,7 @@ const CONVERSATION_SOURCE_DIR: &str = "conversation-sources";
 /// or cutback machinery here at all.
 pub(crate) struct ConversationSourceRuntime {
     store: Arc<ConversationSourceStore>,
+    presence: ProducerPresence,
 }
 
 impl ConversationSourceRuntime {
@@ -80,11 +152,34 @@ impl ConversationSourceRuntime {
             ConversationSourceStore::open(config.paths.state_dir.join(CONVERSATION_SOURCE_DIR))?;
         Ok(Self {
             store: Arc::new(store),
+            presence: ProducerPresence::default(),
         })
     }
 
     pub(crate) fn store(&self) -> Arc<ConversationSourceStore> {
         self.store.clone()
+    }
+
+    /// Record an authenticated contact for the status surface and the
+    /// silence signal. Handlers call this after the grant check on the ingest
+    /// verbs only; the status route reads and never records, so a poller can
+    /// never refresh staleness. The presence tests age contacts through
+    /// `ProducerPresence::note`'s injected clock, not through this wrapper.
+    pub(crate) fn note_producer_contact(&self, scope: &ConnectorScope, user_agent: &str) {
+        self.presence
+            .note(scope, user_agent, chrono::Utc::now().timestamp());
+    }
+
+    /// Last contact for one scope, as the silence signal needs it: raw epoch
+    /// seconds, so the threshold comparison happens against one clock.
+    pub(crate) fn producer_contact(&self, scope: &ConnectorScope) -> Option<ProducerContact> {
+        self.presence.contact(scope)
+    }
+
+    /// When this daemon booted, so "never seen since boot" can wait out a
+    /// grace period instead of firing on every restart.
+    pub(crate) fn producer_boot_epoch_secs(&self) -> i64 {
+        self.presence.boot_epoch_secs()
     }
 
     #[cfg(test)]
@@ -93,6 +188,7 @@ impl ConversationSourceRuntime {
             store: Arc::new(
                 ConversationSourceStore::open(root.join(CONVERSATION_SOURCE_DIR)).unwrap(),
             ),
+            presence: ProducerPresence::default(),
         }
     }
 }
@@ -226,9 +322,25 @@ impl ScopeQuery {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// The producer's own name for itself, verbatim up to a bound. Empty when
+/// absent: presence is the fact being recorded, and a producer that sends no
+/// User-Agent is still present. The bound keeps a misbehaving or hostile
+/// header from turning an in-memory map entry (and every status response and
+/// inbox row that renders it) into unbounded storage.
+fn user_agent(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .chars()
+        .take(256)
+        .collect()
+}
+
 async fn post_channels(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<ConnectorGrant>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChannelRosterRequestV1>,
 ) -> Result<impl IntoResponse, HttpError> {
     // Contract validation FIRST, before the grant check touches the scope: a
@@ -236,6 +348,9 @@ async fn post_channels(
     // reporting it as 403 would send an operator hunting a grant that is fine.
     request.validate().map_err(HttpError::from_contract)?;
     require_ingest_scope(&connectors(&state), &grant, &request.scope)?;
+    state
+        .conversation_sources
+        .note_producer_contact(&request.scope, &user_agent(&headers));
 
     let store = state.conversation_sources.store();
     let workspace_id = request.workspace_id.clone();
@@ -265,10 +380,14 @@ async fn post_channels(
 async fn post_batch(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<ConnectorGrant>,
+    headers: axum::http::HeaderMap,
     Json(batch): Json<ConversationBatchV1>,
 ) -> Result<Json<ConversationBatchReceiptV1>, HttpError> {
     batch.validate().map_err(HttpError::from_contract)?;
     require_ingest_scope(&connectors(&state), &grant, &batch.scope)?;
+    state
+        .conversation_sources
+        .note_producer_contact(&batch.scope, &user_agent(&headers));
 
     let store = state.conversation_sources.store();
     // The store re-validates and, crucially, checks the batch's workspace
@@ -282,10 +401,14 @@ async fn post_batch(
 async fn post_revisions(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<ConnectorGrant>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ConversationRevisionsRequestV1>,
 ) -> Result<Json<ConversationRevisionsReceiptV1>, HttpError> {
     request.validate().map_err(HttpError::from_contract)?;
     require_ingest_scope(&connectors(&state), &grant, &request.scope)?;
+    state
+        .conversation_sources
+        .note_producer_contact(&request.scope, &user_agent(&headers));
 
     let store = state.conversation_sources.store();
     let receipt = blocking(move || store.land_revisions(&request.scope, &request)).await?;
@@ -295,10 +418,14 @@ async fn post_revisions(
 async fn get_cursors(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<ConnectorGrant>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<ScopeQuery>,
 ) -> Result<Json<ConversationCursorsResponseV1>, HttpError> {
     let scope = query.scope()?;
     require_ingest_scope(&connectors(&state), &grant, &scope)?;
+    state
+        .conversation_sources
+        .note_producer_contact(&scope, &user_agent(&headers));
 
     let store = state.conversation_sources.store();
     let owned = scope.clone();
@@ -325,6 +452,18 @@ async fn get_status(
     let scope = query.scope()?;
     require_ingest_scope(&connectors(&state), &grant, &scope)?;
 
+    // Render WITHOUT recording: the status read is a read. If it refreshed
+    // presence, last_seen_at would always be "now" and any bearer-holding
+    // poller could suppress the inbox silence row for a satellite that is
+    // actually down. Only the ingest verbs are contacts.
+    let producer = state
+        .conversation_sources
+        .producer_contact(&scope)
+        .map(|contact| bbox_conversation_source::ProducerContactV1 {
+            last_seen_at: contact_rfc3339(contact.last_seen_epoch_secs),
+            user_agent: contact.user_agent,
+        });
+
     let store = state.conversation_sources.store();
     let owned = scope.clone();
     // The clock is read HERE and passed in, so the store holds no time
@@ -342,6 +481,7 @@ async fn get_status(
         scope,
         workspace_id,
         channels,
+        producer,
     }))
 }
 
@@ -888,6 +1028,57 @@ mod tests {
         token_secret
     }
 
+    /// Two producers: `producer-a` holds SOURCE_A on the conversation lane,
+    /// `producer-files` holds SOURCE_C on the file lane. Returns the
+    /// conversation bearer and the OTHER producer's bearer, so a test can
+    /// authenticate as a producer that does not hold the scope it asks about.
+    fn install_two_producer_connectors(
+        state: &Arc<SharedState>,
+        root: &StdPath,
+    ) -> (String, String) {
+        let conversation_secret = "c".repeat(64);
+        let other_secret = "d".repeat(64);
+        let config = crate::config::SourceConnectorsConfig {
+            enabled: true,
+            producers: vec![
+                crate::config::ConnectorProducerConfig {
+                    producer_id: "producer-a".into(),
+                    token_file: token_file(root, "token-a", &conversation_secret),
+                    token_files: Vec::new(),
+                    scopes: vec![grant(
+                        SOURCE_A,
+                        crate::config::ConnectorProfile::Conversation,
+                    )],
+                },
+                crate::config::ConnectorProducerConfig {
+                    producer_id: "producer-files".into(),
+                    token_file: token_file(root, "token-other", &other_secret),
+                    token_files: Vec::new(),
+                    scopes: vec![grant(SOURCE_C, crate::config::ConnectorProfile::File)],
+                },
+            ],
+        };
+        state.config.write().source_connectors = config.clone();
+        // The runtime refuses to build without catalog authority; the empty
+        // catalog `pending_state` already initialized is exactly the table
+        // this fixture wants (membership fails before any catalog lookup).
+        let pinned = state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let connectors = ConnectorGrantRuntime::build(&config, Some(pinned.catalog())).unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(std::sync::Arc::new(
+                crate::server::producer_auth::ProducerAuthRuntime::for_test_connectors(Arc::new(
+                    connectors,
+                )),
+            ));
+        (conversation_secret, other_secret)
+    }
+
     /// A catalog-backed daemon whose only producer authority is a granted but
     /// uncataloged conversation scope: the one state the onboard route admits
     /// and every ingest route refuses.
@@ -919,12 +1110,14 @@ mod tests {
         uri: &str,
         token: &str,
         body: axum::body::Body,
+        user_agent: &str,
     ) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
             .method(method)
             .uri(uri)
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(axum::http::header::USER_AGENT, user_agent)
             .body(body)
             .unwrap()
     }
@@ -996,6 +1189,7 @@ mod tests {
                 "/internal/conversation-source/v1/batches",
                 &token,
                 axum::body::Body::from(serde_json::to_vec(&one_message_batch()).unwrap()),
+                "",
             ))
             .await
             .unwrap();
@@ -1015,6 +1209,7 @@ mod tests {
                 "/internal/conversation-source/v1/catalog/onboard",
                 &token,
                 axum::body::Body::from(serde_json::to_vec(&onboard_request()).unwrap()),
+                "",
             ))
             .await
             .unwrap();
@@ -1054,6 +1249,7 @@ mod tests {
                 "/internal/conversation-source/v1/catalog/onboard",
                 &token,
                 axum::body::Body::from(serde_json::to_vec(&onboard_request()).unwrap()),
+                "",
             ))
             .await
             .unwrap();
@@ -1081,6 +1277,176 @@ mod tests {
         );
     }
 
+    /// Presence is boot-scoped memory fed by the INGEST verbs only: a batch
+    /// records the User-Agent its process actually sent, and the status read
+    /// renders that contact verbatim without refreshing it, so staleness is
+    /// observable and no unrelated poller can hide a silent satellite.
+    #[tokio::test]
+    async fn an_authenticated_contact_is_visible_on_the_status_surface() {
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (state, token) = pending_state(&root);
+        let app = router(state.clone()).with_state(state.clone());
+        const ONBOARD_AGENT: &str = "onboard-probe/1";
+        const BATCH_AGENT: &str = "bbox-slack-collector/9.9.9-distinct";
+        const STATUS_AGENT: &str = "an-unrelated-poller/0";
+
+        let response = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/internal/conversation-source/v1/catalog/onboard",
+                &token,
+                axum::body::Body::from(serde_json::to_vec(&onboard_request()).unwrap()),
+                ONBOARD_AGENT,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(
+            state
+                .conversation_sources
+                .producer_contact(&scope(SOURCE_A))
+                .is_none(),
+            "onboard is not an ingest verb; it records no contact"
+        );
+
+        // Stand in for the daemon's post-onboard promotion by rebuilding the
+        // auth table against the catalog the onboard just wrote: the fixture's
+        // records provider does not observe the new project, so without this
+        // the scope would stay pending and every ingest route would refuse it.
+        let pinned = state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        install_conversation_connectors(&state, &root, Some(pinned.catalog()));
+        let app = router(state.clone()).with_state(state.clone());
+
+        // The batch is the contact that matters: it is the call a live
+        // satellite makes every cycle.
+        let response = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/internal/conversation-source/v1/batches",
+                &token,
+                axum::body::Body::from(serde_json::to_vec(&one_message_batch()).unwrap()),
+                BATCH_AGENT,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // BEFORE any status read: the map itself holds the batch's contact,
+        // with the User-Agent that process sent.
+        let recorded = state
+            .conversation_sources
+            .producer_contact(&scope(SOURCE_A))
+            .expect("an authenticated batch records a contact");
+        assert_eq!(recorded.user_agent, BATCH_AGENT);
+
+        // A DIFFERENT caller polls status...
+        let response = app
+            .oneshot(http_request(
+                "GET",
+                &format!(
+                    "/internal/conversation-source/v1/status?connector_source_id={SOURCE_A}\
+                     &connector_kind=fixture"
+                ),
+                &token,
+                axum::body::Body::empty(),
+                STATUS_AGENT,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: ConversationStatusResponseV1 = json_body(response).await;
+        let producer = status
+            .producer
+            .expect("an authenticated contact renders on the status surface");
+        // ...and is shown the BATCH's contact, never its own header.
+        assert_eq!(producer.user_agent, BATCH_AGENT);
+        assert_eq!(
+            producer.last_seen_at,
+            contact_rfc3339(recorded.last_seen_epoch_secs)
+        );
+        // The poll refreshed nothing: the map still holds the batch's stamp.
+        let after = state
+            .conversation_sources
+            .producer_contact(&scope(SOURCE_A))
+            .expect("the status read does not clear presence");
+        assert_eq!(after.user_agent, BATCH_AGENT);
+        assert_eq!(after.last_seen_epoch_secs, recorded.last_seen_epoch_secs);
+    }
+
+    /// The map only ever names scopes an authorized ingest reached. A request
+    /// that fails the bearer check records nothing.
+    #[tokio::test]
+    async fn an_unauthenticated_request_records_no_contact() {
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (state, _token) = pending_state(&root);
+        let app = router(state.clone()).with_state(state.clone());
+
+        let response = app
+            .oneshot(http_request(
+                "POST",
+                "/internal/conversation-source/v1/batches",
+                "a-bearer-nobody-installed",
+                axum::body::Body::from(serde_json::to_vec(&one_message_batch()).unwrap()),
+                "ghost/1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            state
+                .conversation_sources
+                .producer_contact(&scope(SOURCE_A))
+                .is_none(),
+            "a request that fails the bearer check is not a contact"
+        );
+    }
+
+    /// Same rule for a VALID bearer held by the wrong producer: the grant
+    /// check runs before the map is touched, so a scope another producer
+    /// asked about never appears.
+    #[tokio::test]
+    async fn a_scope_the_bearer_does_not_hold_records_no_contact() {
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (state, _token) = pending_state(&root);
+        let (_, other_token) = install_two_producer_connectors(&state, &root);
+        let app = router(state.clone()).with_state(state.clone());
+
+        let response = app
+            .oneshot(http_request(
+                "POST",
+                "/internal/conversation-source/v1/batches",
+                &other_token,
+                axum::body::Body::from(serde_json::to_vec(&one_message_batch()).unwrap()),
+                "wrong-producer/1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .conversation_sources
+                .producer_contact(&scope(SOURCE_A))
+                .is_none(),
+            "a scope the bearer does not hold is not a contact"
+        );
+    }
+
     #[test]
     fn the_wire_error_body_is_bounded() {
         let error = HttpError::new(StatusCode::BAD_REQUEST, "code", "x".repeat(4096));
@@ -1088,6 +1454,21 @@ mod tests {
             error.body.message.chars().count(),
             512,
             "an unbounded echo of store context is how a wire error becomes a leak"
+        );
+    }
+
+    #[test]
+    fn a_hostile_user_agent_is_truncated_before_it_is_stored() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_str(&"x".repeat(10_000)).unwrap(),
+        );
+        let stored = user_agent(&headers);
+        assert_eq!(
+            stored.chars().count(),
+            256,
+            "the presence map must stay bounded against hostile headers"
         );
     }
 }

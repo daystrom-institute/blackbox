@@ -87,6 +87,39 @@ minority consumer (default 20 rpm against a ~50 rpm band) is the whole strategy.
 file lane, where empty means "everything the other rules allow". Design section 8
 is explicit that there is no index-everything posture here.
 
+**A backfill lane ends at its floor, and the floor is per-channel.** The floor is
+the DEEPER of the operator horizon and the channel's Slack `created` less one day
+of clock-skew slack: no history can predate the channel, so walking past that
+point is wasted calls. Reaching the floor records completion against that exact
+floor, and completion re-arms itself when the floor moves earlier (a deeper
+horizon, or an earlier observed `created`) rather than being trusted forever.
+
+**Backfill depth and producer staleness are different axes.** The corpus's worst
+newest-record staleness (the quietest channel) is where a throttled or stopped
+producer shows up; a deep backfill moves the backfill counters, never that one.
+Log keys must not conflate them: the staleness field is named
+`max_channel_staleness_seconds`, and the backfill surface is
+`backfill_windows` / `channels_backfilling` / `oldest_backfilled_to`.
+
+**The plaintext opt-in is corpus-only and licenses only private hops.**
+`corpus_url_allow_plaintext` exists for the same-cluster hop where TLS is
+terminated inside the cluster. It must never apply to the Slack wire (that far
+end is not ours to trust), and a public IP-literal corpus host is refused even
+under it. Default-off is load-bearing: both wires carry a bearer, and the
+default is what keeps it out of clear text.
+
+**Shutdown granularity is between channels, not between calls.** A signal
+raises the flag and the current channel finishes (journal saved, exit 0), but a
+signal that lands DURING a corpus call waits out that call's retry ladder
+before the flag is even observed. Do not add an unbounded corpus call shape
+here: shutdown latency inherits its worst case.
+
+**The retry ladder's cost is wall clock, not just count.** A hard-down corpus
+costs 4 requests (initial + 3 retries), the 5+15+30s backoff ladder, and up to
+30s per request (10s of it connect) before the cycle gives up. Sizing any
+deadline that wraps a cycle (container stop grace, cron overlap) must count
+that whole tail.
+
 ## Testing
 
 `cargo nextest run --workspace -E 'package(bbox-slack-collector)'`.

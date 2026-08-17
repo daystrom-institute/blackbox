@@ -79,6 +79,14 @@ pub struct RawChannel {
     pub is_archived: bool,
     #[serde(default)]
     pub is_member: bool,
+    /// Epoch seconds of the channel's creation. `conversations.list` and
+    /// `users.conversations` both return it, and it is the FLOOR below which
+    /// the channel's history cannot exist: a backfill that walks past it is
+    /// issuing empty windows toward 1970 forever. Optional because a fixture
+    /// or a future vendor shape may omit it, in which case the horizon alone
+    /// still bounds the walk.
+    #[serde(default)]
+    pub created: Option<i64>,
     /// Present and true on a direct message. The deployed posture has none
     /// (design 3.1 ruling, and [`bbox_conversation_source::ChannelClassV1`] is
     /// closed to channel classes), so these exist here ONLY so the enrollment

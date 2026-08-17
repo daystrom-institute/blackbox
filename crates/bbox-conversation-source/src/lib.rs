@@ -1027,6 +1027,25 @@ pub struct ConversationStatusResponseV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     pub channels: Vec<ChannelStatusV1>,
+    /// The last authenticated producer contact the corpus host saw for this
+    /// scope. Additive and absent for old producers and fresh boots, so
+    /// nothing incompatible moves: a producer that never sends a User-Agent
+    /// still gets a contact record with an empty string rather than a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<ProducerContactV1>,
+}
+
+/// When the corpus host last heard from the satellite for a scope.
+///
+/// Presence, not health: this says the producer process reached the wire, which
+/// is the fact a stopped satellite hides. Depth and freshness of the data are
+/// the `channels` array's job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProducerContactV1 {
+    /// RFC3339, whole seconds.
+    pub last_seen_at: String,
+    /// The User-Agent the producer sent, verbatim. Empty when absent.
+    pub user_agent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -227,7 +227,12 @@ bounded body is parsed; the body's scope must be an exact member of that
 producer's server-side allowlist before any request data enters durable state;
 tokens never appear in query strings, bodies, environment variables, MCP
 arguments, logs, or metrics; non-loopback plain HTTP is refused producer-side
-and redirect following is off.
+(the one carve-out, `corpus_url_allow_plaintext`: the corpus hop alone may be
+plain HTTP when the host is a private v4 address, a unique-local IPv6 address,
+or an operator-asserted cluster-internal hostname, admitted as the operator's
+assertion that the name resolves inside the cluster; a public IP literal is
+refused even under the opt-in; the Slack wire keeps the strict rule
+unconditionally) and redirect following is off.
 
 ### 4.2 Identity, and the inherited open question
 

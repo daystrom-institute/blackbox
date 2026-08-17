@@ -10,7 +10,19 @@ mod support;
 
 use std::path::PathBuf;
 
-use bbox_slack_collector::{Journal, SatelliteConfig, SlackClient, run_publication_cycle};
+use anyhow::Result;
+use async_trait::async_trait;
+use bbox_conversation_source::{
+    ChannelRosterReceiptV1, ChannelRosterRequestV1, ConversationBatchReceiptV1,
+    ConversationBatchV1, ConversationCatalogOnboardRequestV1, ConversationCatalogOnboardResponseV1,
+    ConversationCursorsResponseV1, ConversationRevisionsReceiptV1, ConversationRevisionsRequestV1,
+    ConversationStatusResponseV1,
+};
+use bbox_corpus_core::project_catalog::ConnectorScope;
+use bbox_slack_collector::{
+    BackfillHorizon, ConversationSink, Journal, SatelliteConfig, Shutdown, SlackClient,
+    run_publication_cycle, run_publication_cycle_with_shutdown,
+};
 use support::{
     FakeChannel, FakeMessage, FakeSlack, FakeSlackState, ModelSink, RefusingSink, fast_rate_policy,
     one_app_scopes, pinned_now, test_config, ts_before,
@@ -435,4 +447,309 @@ async fn membership_mode_posts_a_complete_roster_and_explicit_mode_does_not() {
         Some(false),
         "explicit mode's policy-narrowed enrolled set is not a proven full sweep"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/// A sink that requests shutdown when the FIRST batch lands, standing in for
+/// the watch loop's signal arriving mid-cycle.
+struct StopOnFirstBatch {
+    inner: ModelSink,
+    shutdown: Shutdown,
+    batches: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl ConversationSink for StopOnFirstBatch {
+    async fn onboard(
+        &self,
+        request: &ConversationCatalogOnboardRequestV1,
+    ) -> Result<ConversationCatalogOnboardResponseV1> {
+        self.inner.onboard(request).await
+    }
+    async fn post_channels(
+        &self,
+        request: &ChannelRosterRequestV1,
+    ) -> Result<ChannelRosterReceiptV1> {
+        self.inner.post_channels(request).await
+    }
+    async fn cursors(&self, scope: &ConnectorScope) -> Result<ConversationCursorsResponseV1> {
+        self.inner.cursors(scope).await
+    }
+    async fn post_batch(&self, batch: &ConversationBatchV1) -> Result<ConversationBatchReceiptV1> {
+        let seen = self
+            .batches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if seen == 0 {
+            self.shutdown.request();
+        }
+        self.inner.post_batch(batch).await
+    }
+    async fn post_revisions(
+        &self,
+        request: &ConversationRevisionsRequestV1,
+    ) -> Result<ConversationRevisionsReceiptV1> {
+        self.inner.post_revisions(request).await
+    }
+    async fn status(&self, scope: &ConnectorScope) -> Result<ConversationStatusResponseV1> {
+        self.inner.status(scope).await
+    }
+}
+
+#[tokio::test]
+async fn a_shutdown_raised_mid_cycle_finishes_the_current_channel_and_skips_the_rest() {
+    let state = FakeSlackState {
+        granted_scopes: one_app_scopes(),
+        channels: vec![
+            FakeChannel::public(CHANNEL, "engineering"),
+            FakeChannel::public(OTHER_CHANNEL, "other"),
+        ],
+        history: [
+            (CHANNEL.to_string(), three_messages()),
+            (OTHER_CHANNEL.to_string(), three_messages()),
+        ]
+        .into_iter()
+        .collect(),
+        page_size: 50,
+        ..FakeSlackState::default()
+    };
+    let mut harness = Harness::start(state).await;
+    harness.config.channels.include = vec!["engineering".into(), "other".into()];
+    let shutdown = Shutdown::default();
+    let sink = StopOnFirstBatch {
+        inner: ModelSink::new(),
+        shutdown: shutdown.clone(),
+        batches: std::sync::atomic::AtomicU32::new(0),
+    };
+
+    let outcome = run_publication_cycle_with_shutdown(
+        &harness.client,
+        &sink,
+        &harness.config,
+        &harness.journal_path,
+        pinned_now(0),
+        &shutdown,
+    )
+    .await
+    .unwrap();
+
+    // Both channels enrolled (the roster ran), but only the in-flight channel
+    // was swept: the flag went up during the FIRST channel's batch post, that
+    // channel finished through its journal save, and the loop stopped before
+    // ever asking Slack about the second one.
+    assert_eq!(outcome.channels_enrolled, 2);
+    assert_eq!(outcome.messages_landed, 3);
+    assert!(harness.slack.channel_read_count(CHANNEL) > 0);
+    assert_eq!(
+        harness.slack.channel_read_count(OTHER_CHANNEL),
+        0,
+        "a channel the cycle never started must not be asked about at all"
+    );
+    let journal = Journal::load(&harness.journal_path);
+    assert!(journal.channel(CHANNEL).is_some());
+    assert!(
+        journal.channel(OTHER_CHANNEL).is_none(),
+        "the skipped channel costs no journal state either"
+    );
+}
+
+#[tokio::test]
+async fn a_shutdown_raised_before_the_channel_loop_publishes_the_roster_and_lands_nothing() {
+    let harness = Harness::start(workspace(three_messages())).await;
+    let shutdown = Shutdown::default();
+    shutdown.request();
+
+    let outcome = run_publication_cycle_with_shutdown(
+        &harness.client,
+        &harness.sink,
+        &harness.config,
+        &harness.journal_path,
+        pinned_now(0),
+        &shutdown,
+    )
+    .await
+    .unwrap();
+
+    // The roster and cursor reads are cycle bookkeeping and still happen; the
+    // per-channel lanes are the part a shutdown may skip.
+    assert_eq!(outcome.channels_enrolled, 1);
+    assert_eq!(outcome.messages_landed, 0);
+    assert_eq!(harness.slack.channel_read_count(CHANNEL), 0);
+    assert_eq!(harness.sink.batches(), 0);
+}
+
+/// One day, the only window size these backfill tests use, so every walk is a
+/// countable number of day windows.
+const DAY: i64 = 86_400;
+
+fn expected_floor_ts(days_before_pinned_now: i64) -> String {
+    format!(
+        "{}.000000",
+        support::PINNED_NOW_SECS - days_before_pinned_now * DAY
+    )
+}
+
+#[tokio::test]
+async fn a_backfill_lane_stops_at_channel_creation_and_is_reported_complete() {
+    let old_message = ts_before(2 * DAY + DAY / 2, 2);
+    let mut state = workspace(vec![
+        FakeMessage::new(&ts_before(90, 1), "U0HUMAN", "recent"),
+        FakeMessage::new(&old_message, "U0HUMAN", "old"),
+    ]);
+    // Created two days ago, so with a one-day skew allowance the creation floor
+    // (three days back) is DEEPER than the six-day horizon: creation wins.
+    state.channels[0] =
+        FakeChannel::public(CHANNEL, "engineering").created_at(support::PINNED_NOW_SECS - 2 * DAY);
+    let mut harness = Harness::start(state).await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 6 };
+    harness.config.backfill.windows_per_cycle = 8;
+
+    let outcome = harness.cycle(0).await;
+
+    // Three windows: [now-1d-90s..now-90s], [now-2d-90s..now-1d-90s], and the
+    // last clamped to [creation-1d..now-2d-90s], which holds the old message.
+    assert_eq!(outcome.backfill_windows, 3);
+    assert_eq!(outcome.channels_backfilling, 0);
+    assert_eq!(
+        outcome.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(3).as_str())
+    );
+    assert!(harness.sink.record(CHANNEL, &old_message).is_some());
+    let journal = Journal::load(&harness.journal_path);
+    let channel = journal
+        .channel(CHANNEL)
+        .expect("enrolled channels are journaled");
+    assert!(channel.backfill_complete);
+    assert_eq!(
+        channel.created_epoch_secs,
+        Some(support::PINNED_NOW_SECS - 2 * DAY)
+    );
+
+    // The finished lane is skipped, not re-walked: same state, no windows.
+    let outcome = harness.cycle(0).await;
+    assert_eq!(outcome.backfill_windows, 0);
+    assert_eq!(outcome.channels_backfilling, 0);
+    assert_eq!(
+        outcome.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(3).as_str())
+    );
+}
+
+/// A one-window backfill budget must report the lane as IN PROGRESS while it
+/// is still walking: `channels_backfilling == 1` on every cycle before the
+/// floor, and 0 only on the cycle that completes the walk. That distinction is
+/// the whole point of the counter: "deep horizon, healthy progress" must read
+/// differently from "no backfill at all".
+#[tokio::test]
+async fn a_one_window_backfill_budget_reports_the_lane_in_progress_until_it_finishes() {
+    let mut harness = Harness::start(workspace(vec![FakeMessage::new(
+        &ts_before(90, 1),
+        "U0HUMAN",
+        "recent",
+    )]))
+    .await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 4 };
+    harness.config.backfill.windows_per_cycle = 1;
+
+    for cycle in 1..=3 {
+        let outcome = harness.cycle(0).await;
+        assert_eq!(
+            outcome.backfill_windows, 1,
+            "cycle {cycle}: the budget is one window per cycle"
+        );
+        assert_eq!(
+            outcome.channels_backfilling, 1,
+            "cycle {cycle}: the lane is mid-walk, not missing"
+        );
+    }
+
+    let done = harness.cycle(0).await;
+    assert_eq!(done.backfill_windows, 1);
+    assert_eq!(
+        done.channels_backfilling, 0,
+        "the cycle that completes the walk reports the lane finished"
+    );
+    assert_eq!(
+        done.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(4).as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_deeper_horizon_rearms_a_completed_backfill_lane() {
+    // No `created` on the fixture channel, which must impose NO bound: the
+    // first cycle walks the whole four-day horizon rather than declaring
+    // itself finished for want of a roster field.
+    let mut harness = Harness::start(workspace(vec![FakeMessage::new(
+        &ts_before(90, 1),
+        "U0HUMAN",
+        "recent",
+    )]))
+    .await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 4 };
+    harness.config.backfill.windows_per_cycle = 8;
+
+    let first = harness.cycle(0).await;
+    assert_eq!(first.backfill_windows, 4);
+    assert_eq!(first.channels_backfilling, 0);
+    assert_eq!(
+        first.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(4).as_str())
+    );
+
+    // The horizon now reaches further back than the floor the completion was
+    // earned against, so the lane re-arms and walks only the difference.
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 6 };
+    let second = harness.cycle(0).await;
+    assert_eq!(second.backfill_windows, 2);
+    assert_eq!(second.channels_backfilling, 0);
+    assert_eq!(
+        second.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(6).as_str())
+    );
+}
+
+#[tokio::test]
+async fn an_earlier_created_rearms_a_lane_and_an_absent_created_does_not() {
+    let mut state = workspace(vec![FakeMessage::new(
+        &ts_before(90, 1),
+        "U0HUMAN",
+        "recent",
+    )]);
+    state.channels[0] =
+        FakeChannel::public(CHANNEL, "engineering").created_at(support::PINNED_NOW_SECS - 2 * DAY);
+    let mut harness = Harness::start(state).await;
+    harness.config.sweep.window_secs = DAY as u64;
+    harness.config.backfill.horizon = BackfillHorizon::Days { days: 6 };
+    harness.config.backfill.windows_per_cycle = 8;
+
+    let first = harness.cycle(0).await;
+    assert_eq!(first.backfill_windows, 3);
+    assert_eq!(first.channels_backfilling, 0);
+
+    // The roster now reports an EARLIER creation, moving the floor under the
+    // recorded completion: the lane re-arms and walks to the new floor.
+    harness.slack.with(|state| {
+        state.channels[0].created = Some(support::PINNED_NOW_SECS - 5 * DAY);
+    });
+    let second = harness.cycle(0).await;
+    assert_eq!(second.backfill_windows, 3);
+    assert_eq!(
+        second.oldest_backfilled_to.as_deref(),
+        Some(expected_floor_ts(6).as_str())
+    );
+
+    // A roster read that omits `created` entirely is sticky-none: the journal
+    // keeps the last known creation and the finished lane stays skipped.
+    harness.slack.with(|state| {
+        state.channels[0].created = None;
+    });
+    let third = harness.cycle(0).await;
+    assert_eq!(third.backfill_windows, 0);
+    assert_eq!(third.channels_backfilling, 0);
 }

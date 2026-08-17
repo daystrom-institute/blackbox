@@ -190,7 +190,9 @@ impl SlackClient {
         policy: RatePolicy,
     ) -> Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        crate::config::require_safe_transport(&base_url, "slack_api_base_url")?;
+        // No opt-in on this wire: the plaintext allowance is corpus-only, and
+        // the Slack client never inherits it.
+        crate::config::require_safe_transport(&base_url, "slack_api_base_url", false)?;
         let token = token.into();
         if token.trim().is_empty() {
             bail!("the Slack client needs a bot token");

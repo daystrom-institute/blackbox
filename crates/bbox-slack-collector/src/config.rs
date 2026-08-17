@@ -26,6 +26,19 @@ use crate::slack::{DEFAULT_API_BASE_URL, DEFAULT_PAGE_LIMIT, RatePolicy};
 pub struct SatelliteConfig {
     /// Base URL of the corpus host, e.g. `http://127.0.0.1:7264`.
     pub corpus_url: String,
+    /// Opt-in for plain HTTP to a non-loopback corpus host: the same-cluster
+    /// private hop where TLS is already terminated inside the cluster.
+    ///
+    /// Default false, and the default is load-bearing: the corpus wire carries
+    /// the producer bearer, and on any other network path that credential
+    /// crosses the network in clear text. The flag licenses exactly ONE wire:
+    /// [`Self::slack_api_base_url`] stays under the transport rule regardless.
+    /// It also licenses only a private destination: a public IP-literal host
+    /// is refused even with the flag set, because no cluster-internal hop
+    /// looks like one. A named host is the operator's assertion that the name
+    /// resolves inside the cluster.
+    #[serde(default)]
+    pub corpus_url_allow_plaintext: bool,
     /// The producer bearer that authenticates to the corpus host.
     pub producer_token: SecretRef,
     /// The Slack bot token. Under the ruled one-app posture this is the
@@ -297,13 +310,35 @@ impl SatelliteConfig {
     /// before it has touched a credential or opened a socket.
     pub fn validate(&self) -> Result<()> {
         self.scope()?;
-        require_safe_transport(&self.corpus_url, "corpus_url")?;
-        require_safe_transport(&self.slack_api_base_url, "slack_api_base_url")?;
+        require_safe_transport(
+            &self.corpus_url,
+            "corpus_url",
+            self.corpus_url_allow_plaintext,
+        )?;
+        // The opt-in licenses the corpus wire only. The Slack wire carries a
+        // credential the OPERATOR does not control the far end of, so it keeps
+        // the strict rule no matter what the corpus hop is allowed to do.
+        require_safe_transport(&self.slack_api_base_url, "slack_api_base_url", false)?;
         self.producer_token.validate("producer_token")?;
         self.slack_token.validate("slack_token")?;
         self.channels.validate()?;
         if self.sweep.window_secs == 0 {
             bail!("sweep.window_secs must be greater than zero");
+        }
+        // An unparseable Since horizon must fail HERE, at startup: the cycle
+        // turns it into "backfill disabled" (no floor), which would otherwise
+        // report a complete, healthy backfill that never runs.
+        if let BackfillHorizon::Since { ts } = &self.backfill.horizon
+            && ts
+                .split('.')
+                .next()
+                .and_then(|secs| secs.parse::<i64>().ok())
+                .is_none()
+        {
+            bail!(
+                "backfill.horizon ts must be a Slack message timestamp like \
+                 \"1750000000.000000\", got \"{ts}\""
+            );
         }
         if self.sweep.page_limit == 0 || self.sweep.page_limit > 1_000 {
             bail!("sweep.page_limit must be in 1..=1000");
@@ -338,12 +373,18 @@ impl SatelliteConfig {
 
 /// Refuse a plain-HTTP URL that is not loopback.
 ///
-/// Both wires carry a bearer, so both wires get the same rule (design 4.1:
-/// non-loopback plain HTTP is refused producer-side). Loopback is permitted
-/// because that is the deployed corpus posture and the fixture-test posture,
-/// and refusing it would mean the tests exercised a transport the product does
-/// not use.
-pub fn require_safe_transport(url: &str, field: &str) -> Result<()> {
+/// Both wires carry a bearer, so both wires get the same base rule (design
+/// 4.1: non-loopback plain HTTP is refused producer-side). Loopback is
+/// permitted because that is the deployed corpus posture and the fixture-test
+/// posture, and refusing it would mean the tests exercised a transport the
+/// product does not use.
+///
+/// `allow_private_plaintext` is the corpus-only opt-in: it additionally
+/// admits a PRIVATE non-loopback destination, which is the same-cluster hop
+/// where TLS is terminated elsewhere. A public IP literal is refused even
+/// under the opt-in, and a hostname is admitted as the operator's assertion
+/// that the name is cluster-internal.
+pub fn require_safe_transport(url: &str, field: &str, allow_private_plaintext: bool) -> Result<()> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|error| anyhow::anyhow!("{field}: {url} is not a URL: {error}"))?;
     match parsed.scheme() {
@@ -352,6 +393,13 @@ pub fn require_safe_transport(url: &str, field: &str) -> Result<()> {
             let host = parsed.host_str().unwrap_or_default();
             if is_loopback(host) {
                 Ok(())
+            } else if allow_private_plaintext && is_private_hop(host) {
+                Ok(())
+            } else if allow_private_plaintext {
+                bail!(
+                    "{field}: plain HTTP to {host} is not a private hop; \
+                     corpus_url_allow_plaintext licenses same-cluster private hops only"
+                )
             } else {
                 bail!(
                     "{field}: refusing plain HTTP to non-loopback host {host}; a bearer would \
@@ -360,6 +408,23 @@ pub fn require_safe_transport(url: &str, field: &str) -> Result<()> {
             }
         }
         scheme => bail!("{field}: unsupported URL scheme {scheme}"),
+    }
+}
+
+/// Whether a non-loopback host may sit at the plaintext opt-in's far end.
+///
+/// Private address space and unique-local IPv6 are decidable syntactically. A
+/// hostname is admitted on the operator's say-so: cluster service discovery is
+/// a name, and no client-side rule can tell it from a public name. Everything
+/// else -- a public IP literal above all -- is refused.
+fn is_private_hop(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => {
+            address.is_private() || address.is_link_local() || address.is_loopback()
+        }
+        Ok(std::net::IpAddr::V6(address)) => address.is_unique_local() || address.is_loopback(),
+        Err(_) => true,
     }
 }
 
@@ -428,8 +493,40 @@ token_secret_ref = "op://producer/slack-bot/token"
 
     #[test]
     fn loopback_ipv6_is_loopback() {
-        require_safe_transport("http://[::1]:7264", "corpus_url").unwrap();
-        require_safe_transport("http://localhost:7264", "corpus_url").unwrap();
+        require_safe_transport("http://[::1]:7264", "corpus_url", false).unwrap();
+        require_safe_transport("http://localhost:7264", "corpus_url", false).unwrap();
+    }
+
+    #[test]
+    fn the_plaintext_opt_in_is_off_by_default_and_licenses_only_the_corpus_wire() {
+        let config = parse(MINIMAL).unwrap();
+        assert!(!config.corpus_url_allow_plaintext);
+
+        // A private corpus hop, admitted only under the flag.
+        let text = MINIMAL.replace("http://127.0.0.1:7264", "http://10.4.5.6:7264");
+        let refused = parse(&text).unwrap_err().to_string();
+        assert!(refused.contains("clear text"), "{refused}");
+        let allowed = parse(&format!("corpus_url_allow_plaintext = true\n{text}")).unwrap();
+        assert!(allowed.corpus_url_allow_plaintext);
+
+        // The Slack wire keeps the strict rule even under the flag. Top-level
+        // keys go before the first table header, or TOML reads them as part of
+        // it.
+        let slack = format!(
+            "corpus_url_allow_plaintext = true\n\
+             slack_api_base_url = \"http://slack.internal.example\"\n{MINIMAL}"
+        );
+        let error = parse(&slack).unwrap_err().to_string();
+        assert!(error.contains("slack_api_base_url"), "{error}");
+        assert!(error.contains("clear text"), "{error}");
+    }
+
+    #[test]
+    fn a_public_ip_is_not_a_licensed_private_hop_even_under_the_opt_in() {
+        let text = MINIMAL.replace("http://127.0.0.1:7264", "http://203.0.113.10:7264");
+        let text = format!("corpus_url_allow_plaintext = true\n{text}");
+        let error = parse(&text).unwrap_err().to_string();
+        assert!(error.contains("not a private hop"), "{error}");
     }
 
     #[test]
@@ -444,6 +541,22 @@ token_secret_ref = "op://producer/slack-bot/token"
         let config = parse(&text).unwrap();
         assert!(config.backfill.enabled());
         assert_eq!(config.backfill.horizon, BackfillHorizon::Days { days: 30 });
+    }
+
+    #[test]
+    fn an_unparseable_since_horizon_fails_at_startup() {
+        // The cycle would silently treat this as "backfill off"; validate must
+        // say so instead, because the report block would otherwise claim a
+        // complete healthy backfill that never runs.
+        let text = format!("{MINIMAL}\n[backfill.horizon]\nmode = \"since\"\nts = \"yesterday\"\n");
+        let error = parse(&text).unwrap_err().to_string();
+        assert!(error.contains("backfill.horizon"), "{error}");
+        assert!(error.contains("Slack message timestamp"), "{error}");
+
+        let text = format!(
+            "{MINIMAL}\n[backfill.horizon]\nmode = \"since\"\nts = \"1750000000.000000\"\n"
+        );
+        parse(&text).expect("a Slack epoch ts is a valid since horizon");
     }
 
     #[test]
