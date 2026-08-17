@@ -10,6 +10,20 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Slack conversation-source satellite hardening: corpus calls retry
+  transport failures and 5xx on a bounded ladder (3 retries, 5/15/30 s,
+  30 s request timeout) and never retry 4xx; cycle failures log the full
+  error chain with HTTP status; SIGTERM ends the watch loop between channels;
+  the backfill lane floors at the Slack channel's creation time (captured
+  from the roster) and records per-channel completion instead of walking
+  toward epoch 0; granted scopes are logged at startup and on change in
+  watch mode; an explicit `corpus_url_allow_plaintext` opt-in permits a
+  same-cluster plain-HTTP corpus hop (default remains refuse). The daemon
+  records the last authenticated producer contact per conversation scope
+  (User-Agent `bbox-slack-collector/<version>`), exposes it as an additive
+  `producer` object on `/internal/conversation-source/v1/status`, and
+  `bbox_inbox` lists conversation scopes whose producer has been silent for
+  more than 30 minutes (with a boot grace).
 - Reflective project-graph vertices now participate in word retrieval
   (milestone M9a of the graph-native connector campaign,
   design/connectors/unified-retrieval.md). Every authored vertex of a
@@ -82,6 +96,11 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- The Slack satellite's watch-mode cycle log names `max_channel_staleness_seconds`
+  (the quietest enrolled channel's age) instead of the misleading `lag_seconds`,
+  and reports `backfill_windows`, `channels_backfilling`, and
+  `oldest_backfilled_to`. The wire field `lag_seconds` on channel status is
+  unchanged.
 - Index schema bumps to `agentic-corpus-g13-graph-vertex-docs`; the first
   daemon open after upgrade drops and rebuilds the index through the guarded
   replacement boundary, and boot now runs a published-graph-view install per
