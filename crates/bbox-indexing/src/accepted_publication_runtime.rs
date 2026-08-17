@@ -985,6 +985,16 @@ impl PublishError {
         self.may_have_swapped = may_have_swapped;
         self
     }
+
+    /// Test-only: stamp swap uncertainty onto a refusal, so a caller's
+    /// post-swap convergence contract can be exercised without driving a
+    /// fault injection through the whole publish transaction. Production
+    /// code never sets this flag itself: only `commit_publish` knows
+    /// whether the swap was reached.
+    #[doc(hidden)]
+    pub fn with_swap_uncertainty_for_test(self, may_have_swapped: bool) -> Self {
+        self.with_swap_uncertainty(may_have_swapped)
+    }
 }
 
 impl fmt::Display for PublishError {

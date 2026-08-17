@@ -206,19 +206,37 @@ unserved candidate the daemon was already accepting.
   `already_attempted`.
 - **No retry, ever.** A refusal logs once at warn and stops. The operator
   advances manually after a refusal.
-- **The prior accepted generation keeps serving.** The policy only ever
-  calls the ordinary acceptance path, which swaps a pointer or refuses;
-  there is no partial state between them.
+- **The prior accepted generation keeps serving, unless the refusal
+  reached the swap.** The policy only ever calls the ordinary acceptance
+  path, which swaps a pointer or refuses. The one case with no clean
+  either/or is a failure raised at or after the atomic pointer
+  replacement: the new pointer is durably installed and the attempt still
+  reports an error, which is what `PublishError::may_have_swapped()`
+  names. The policy carries that flag through its refusal outcome and
+  converges on it, exactly as the operator tool does.
 - **A refusal never fails the upload.** The producer's finalize succeeded
   regardless.
 - **Every exit records a reason.** A candidate sitting unserved with
   nothing said anywhere is the failure this design exists to end;
   replacing it with an unexplained skip would reproduce it.
 
-On success the policy performs the same post-swap convergence the operator
-tool does: invalidate the projected caches, converge the published
-knowledge index, refresh published graph views, and record the accepted
-publication mutation observation.
+Whenever the pointer moved (an acceptance, or a refusal that reached the
+swap) the policy performs the same post-swap convergence the operator tool
+does: invalidate the projected caches, converge the published knowledge
+index, and refresh published graph views. An acceptance additionally
+records the accepted publication mutation observation. Converging is not a
+retry: it touches projections only and never re-enters the acceptance
+path, so the no-storm rule above is unaffected.
+
+Graph views are the projection with no second chance. Knowledge and gaps
+rebuild on read, so a missed convergence heals itself on the next request;
+`project_graph_views` serves whatever was last installed, so a missed (or
+degraded) refresh keeps serving the previous generation until the next
+accept or a daemon restart. That is also why the refresh refuses to
+install a prior-arm read over an installed view: a verified read falls
+back to the pointer's prior arm whenever the current generation does not
+verify, and latching that fallback into the graph read surface is
+indistinguishable, to a reader, from an accept that never happened.
 
 ## 7. Observability, and one honest gap
 

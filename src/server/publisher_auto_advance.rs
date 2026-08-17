@@ -230,9 +230,16 @@ pub(crate) enum AutoAdvanceOutcome {
     /// This candidate was already attempted in this daemon lifetime. At
     /// most one attempt per uploaded candidate, always.
     AlreadyAttempted,
-    /// The acceptance path refused. The prior accepted generation keeps
-    /// serving; there is no retry.
-    Refused { code: String, detail: String },
+    /// The acceptance path refused. There is no retry. The prior accepted
+    /// generation keeps serving UNLESS the refusal was raised at or after
+    /// the pointer swap, which `may_have_swapped` reports: the same signal
+    /// `bbox_project_publisher_advance` uses to decide whether it still has
+    /// to reconverge after a failure.
+    Refused {
+        code: String,
+        detail: String,
+        may_have_swapped: bool,
+    },
 }
 
 impl AutoAdvanceOutcome {
@@ -244,12 +251,34 @@ impl AutoAdvanceOutcome {
         matches!(self, Self::Accepted { .. })
     }
 
+    /// Whether this outcome moved (or may have moved) the accepted
+    /// pointer, and therefore obliges the caller to reconverge every
+    /// projection built from accepted content.
+    ///
+    /// Acceptance is the obvious case. The other one is the reason this
+    /// predicate exists: a refusal raised at or after the swap leaves the
+    /// new pointer installed while reporting an error, so treating every
+    /// refusal as "nothing moved" would leave the knowledge index, the
+    /// catalog caches, and the graph views projecting a generation the
+    /// pointer no longer names.
+    pub(crate) fn requires_convergence(&self) -> bool {
+        match self {
+            Self::Accepted { .. } => true,
+            Self::Refused {
+                may_have_swapped, ..
+            } => *may_have_swapped,
+            _ => false,
+        }
+    }
+
     /// A refusal from the acceptance path keeps the refusing layer's own
-    /// code verbatim, exactly as the operator tool reports it.
+    /// code verbatim, exactly as the operator tool reports it, and carries
+    /// its swap uncertainty rather than flattening it away.
     fn from_publish_error(error: &PublishError) -> Self {
         Self::Refused {
             code: error.code().to_string(),
             detail: bounded_detail(error.detail().to_string()),
+            may_have_swapped: error.may_have_swapped(),
         }
     }
 
@@ -270,6 +299,10 @@ impl AutoAdvanceOutcome {
         Self::Refused {
             code,
             detail: bounded_detail(detail),
+            // A refusal built from a plain error never reached the
+            // acceptance path's swap: these are the policy's own
+            // pre-checks, which run before any pointer is touched.
+            may_have_swapped: false,
         }
     }
 }
@@ -404,16 +437,25 @@ impl super::BlackboxServer {
                 at_unix_secs: now_unix_secs(),
             },
         );
+        // The same convergence the operator tool performs after a real
+        // (non dry-run) swap, on the same trigger it uses: acceptance OR a
+        // refusal that reached the swap. A refusal raised at or after the
+        // pointer replacement leaves the new pointer durably installed,
+        // and skipping convergence there leaves every projection built
+        // from accepted content serving a generation no pointer names.
+        // Graph views are the sticky case: they have no rebuild-on-read,
+        // so they stay stale until the next accept or a daemon restart.
+        // Converging is not a retry: it touches projections only and never
+        // re-enters the acceptance path, so the no-storm rule holds.
+        if outcome.requires_convergence()
+            && let Ok(parsed) = ProjectId::parse(project_id.to_string())
+        {
+            self.invalidate_catalog_published_content(&parsed);
+            self.converge_published_knowledge_index(&parsed);
+            self.refresh_published_graph_views(&parsed);
+        }
         match &outcome {
             AutoAdvanceOutcome::Accepted { generation_id } => {
-                // The same convergence the operator tool performs after a
-                // real (non dry-run) swap. Skipping it would leave the
-                // published index serving a generation no pointer names.
-                if let Ok(parsed) = ProjectId::parse(project_id.to_string()) {
-                    self.invalidate_catalog_published_content(&parsed);
-                    self.converge_published_knowledge_index(&parsed);
-                    self.refresh_published_graph_views(&parsed);
-                }
                 self.observe_knowledge_transport_operation(
                     project_id,
                     bbox_indexing::knowledge_transport_observations::KnowledgeTransportOperationV1::AcceptedPublicationMutation,
@@ -428,16 +470,25 @@ impl super::BlackboxServer {
                     "catalog administration mutation"
                 );
             }
-            AutoAdvanceOutcome::Refused { code, detail } => {
+            AutoAdvanceOutcome::Refused {
+                code,
+                detail,
+                may_have_swapped,
+            } => {
                 // Loud, once, and then done. A retry loop here would turn
                 // one bad candidate into a storm against the publication
                 // lock; the operator advances manually after a refusal.
+                // `may_have_swapped` says which generation is serving after
+                // this refusal, so the log answers that without a pointer
+                // read.
                 tracing::warn!(
                     project_id,
                     source_generation_id,
                     code = %code,
                     detail = %detail,
-                    "publisher auto-advance refused; the prior accepted generation keeps serving"
+                    may_have_swapped,
+                    "publisher auto-advance refused; the prior accepted generation keeps serving \
+                     unless the refusal reached the pointer swap"
                 );
             }
             skipped => {
@@ -650,6 +701,7 @@ mod tests {
             AutoAdvanceOutcome::Refused {
                 code: "error.project_catalog_stale_epoch".into(),
                 detail: "the catalog changed".into(),
+                may_have_swapped: false,
             }
         );
         assert!(!outcome.accepted());
@@ -658,11 +710,39 @@ mod tests {
     #[test]
     fn an_uncoded_failure_still_reports_a_stable_code() {
         let outcome = AutoAdvanceOutcome::refused(&anyhow::anyhow!("something unstructured"));
-        let AutoAdvanceOutcome::Refused { code, detail } = outcome else {
+        let AutoAdvanceOutcome::Refused { code, detail, .. } = outcome else {
             panic!("expected a refusal");
         };
         assert_eq!(code, "error.accepted_publication_auto_advance_failed");
         assert_eq!(detail, "something unstructured");
+    }
+
+    /// The convergence trigger is the operator tool's, not "accepted only".
+    /// A refusal raised at or after the swap left the new pointer
+    /// installed, so every projection built from accepted content has to
+    /// be reconverged even though the attempt reported an error.
+    #[test]
+    fn a_refusal_that_reached_the_swap_still_obliges_convergence() {
+        let swapped = AutoAdvanceOutcome::from_publish_error(
+            &PublishError::refusal("error.accepted_publication_invalid_generation", "read-back")
+                .with_swap_uncertainty_for_test(true),
+        );
+        assert!(
+            swapped.requires_convergence(),
+            "a swap-uncertain refusal moves the pointer and must reconverge"
+        );
+        let refused_before_the_swap = AutoAdvanceOutcome::from_publish_error(
+            &PublishError::refusal("error.project_catalog_stale_epoch", "epoch moved"),
+        );
+        assert!(!refused_before_the_swap.requires_convergence());
+        assert!(
+            AutoAdvanceOutcome::Accepted {
+                generation_id: "apg_x".into(),
+            }
+            .requires_convergence()
+        );
+        assert!(!AutoAdvanceOutcome::PolicyDisabled.requires_convergence());
+        assert!(!AutoAdvanceOutcome::AlreadyAttempted.requires_convergence());
     }
 
     #[test]

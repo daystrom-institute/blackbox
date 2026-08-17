@@ -3656,6 +3656,195 @@ mod tests {
                 .source_generation_id
         }
 
+        /// One Ready candidate carrying a graphs lane beside its knowledge
+        /// lane, which is the shape a real checkout producer uploads for a
+        /// project with `.bbox/graphs`. The graph bytes are identical
+        /// across generations on purpose: what distinguishes the views a
+        /// test compares is the accepted generation identity, not the
+        /// graph content, which is exactly the case a content-only
+        /// assertion would miss.
+        fn stage_graph_candidate(&self, entry_id: &str, content: &str, commit: &str) -> String {
+            use std::collections::BTreeMap;
+            use std::io::Cursor;
+
+            use crate::server::state::catalog_fixture::knowledge_entry;
+            use bbox_knowledge_source::{
+                GitObjectFormatV1, PublicationCandidateDescriptorV1, SCHEMA_VERSION,
+                SourceFileManifestEntryV1, SourceLaneV1, SourceManifestDescriptorV1,
+                SourceManifestPageV1, source_file_blob_sha256, source_manifest_sha256,
+            };
+            use bbox_knowledge_source_store::PublicationAuthorityV1;
+
+            let store = self.server.state.knowledge_sources.store();
+            let knowledge_bytes = serde_json::to_vec(&knowledge_entry(entry_id, content)).unwrap();
+            let knowledge_entry_manifest = SourceFileManifestEntryV1 {
+                repository_relative_filename: format!(".bbox/knowledge/{entry_id}.json"),
+                encoded_bytes: knowledge_bytes.len() as u64,
+                content_sha256: source_file_blob_sha256(&knowledge_bytes),
+            };
+            let knowledge_manifest = vec![knowledge_entry_manifest.clone()];
+            let graph_sources = [
+                (
+                    "edges.jsonl",
+                    include_bytes!(
+                        "../../crates/bbox-project-graph/tests/fixtures/governance-record/edges.jsonl"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "graph.json",
+                    include_bytes!(
+                        "../../crates/bbox-project-graph/tests/fixtures/governance-record/graph.json"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "schema.json",
+                    include_bytes!(
+                        "../../crates/bbox-project-graph/tests/fixtures/governance-record/schema.json"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "vertices.jsonl",
+                    include_bytes!(
+                        "../../crates/bbox-project-graph/tests/fixtures/governance-record/vertices.jsonl"
+                    )
+                    .as_slice(),
+                ),
+            ];
+            let graph_manifest = graph_sources
+                .iter()
+                .map(|(filename, bytes)| SourceFileManifestEntryV1 {
+                    repository_relative_filename: format!(
+                        ".bbox/graphs/governance-record/{filename}"
+                    ),
+                    encoded_bytes: bytes.len() as u64,
+                    content_sha256: source_file_blob_sha256(bytes),
+                })
+                .collect::<Vec<_>>();
+            let mut blobs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            blobs.insert(
+                knowledge_entry_manifest.content_sha256.clone(),
+                knowledge_bytes,
+            );
+            for ((_, bytes), entry) in graph_sources.iter().zip(&graph_manifest) {
+                blobs.insert(entry.content_sha256.clone(), bytes.to_vec());
+            }
+            let descriptor = PublicationCandidateDescriptorV1 {
+                schema_version: SCHEMA_VERSION,
+                scope: self.scope.clone(),
+                full_ref: "refs/heads/main".into(),
+                publisher_commit: commit.into(),
+                object_format: GitObjectFormatV1::Sha1,
+                knowledge: SourceManifestDescriptorV1 {
+                    manifest_sha256: source_manifest_sha256(
+                        SourceLaneV1::Knowledge,
+                        &knowledge_manifest,
+                    ),
+                    file_count: knowledge_manifest.len() as u64,
+                    logical_bytes: knowledge_manifest
+                        .iter()
+                        .map(|entry| entry.encoded_bytes)
+                        .sum(),
+                    page_count: 1,
+                },
+                gaps: SourceManifestDescriptorV1 {
+                    manifest_sha256: source_manifest_sha256(SourceLaneV1::Gaps, &[]),
+                    file_count: 0,
+                    logical_bytes: 0,
+                    page_count: 0,
+                },
+                graphs: SourceManifestDescriptorV1 {
+                    manifest_sha256: source_manifest_sha256(SourceLaneV1::Graphs, &graph_manifest),
+                    file_count: graph_manifest.len() as u64,
+                    logical_bytes: graph_manifest.iter().map(|entry| entry.encoded_bytes).sum(),
+                    page_count: 1,
+                },
+                evidence: SourceManifestDescriptorV1 {
+                    manifest_sha256: source_manifest_sha256(SourceLaneV1::Evidence, &[]),
+                    file_count: 0,
+                    logical_bytes: 0,
+                    page_count: 0,
+                },
+            };
+            let authority = PublicationAuthorityV1 {
+                producer_id: "producer-a".into(),
+                project_id: self.project_id.clone(),
+                scope: self.scope.clone(),
+            };
+            let upload = store
+                .begin_publication_upload(&authority, descriptor)
+                .unwrap();
+            store
+                .put_publication_manifest_page(
+                    &authority,
+                    &upload.upload_id,
+                    SourceLaneV1::Knowledge,
+                    0,
+                    &SourceManifestPageV1 {
+                        page_index: 0,
+                        entries: knowledge_manifest,
+                    },
+                )
+                .unwrap();
+            store
+                .put_publication_manifest_page(
+                    &authority,
+                    &upload.upload_id,
+                    SourceLaneV1::Graphs,
+                    0,
+                    &SourceManifestPageV1 {
+                        page_index: 0,
+                        entries: graph_manifest,
+                    },
+                )
+                .unwrap();
+            // Seals the manifest and names what this upload still owes, so
+            // a blob the store already holds from an earlier generation is
+            // not re-uploaded here.
+            let missing = store
+                .missing_publication_blobs(&authority, &upload.upload_id, None)
+                .unwrap();
+            for hash in &missing.hashes {
+                let bytes = blobs.get(hash).expect("missing blob must be one of ours");
+                store
+                    .install_publication_blob(
+                        &authority,
+                        &upload.upload_id,
+                        hash,
+                        bytes.len() as u64,
+                        Cursor::new(bytes.clone()),
+                    )
+                    .unwrap();
+            }
+            store
+                .finalize_publication_upload(&authority, &upload.upload_id)
+                .unwrap()
+                .source_generation_id
+        }
+
+        /// The accepted generation identity the published graph view is
+        /// currently serving for this project's one graph.
+        fn served_graph_generation(&self) -> serde_json::Value {
+            let described = self
+                .server
+                .project_graph_describe_domain(
+                    &self.project_id,
+                    "governance-record",
+                    Some("published"),
+                )
+                .unwrap();
+            serde_json::to_value(
+                described
+                    .first()
+                    .expect("the published view carries the accepted graph")
+                    .generation
+                    .clone(),
+            )
+            .unwrap()
+        }
+
         async fn establish_from(
             &self,
             source_generation_id: &str,
@@ -3816,6 +4005,91 @@ mod tests {
         );
         let unchanged = fixture.status().await;
         assert_eq!(unchanged["generation_id"], after["generation_id"]);
+    }
+
+    /// A policy acceptance leaves the published graph view naming the
+    /// generation it just accepted.
+    ///
+    /// Graph reads have no rebuild-on-read, so this is the only moment the
+    /// view can be corrected without a restart. The regression this pins
+    /// is a policy acceptance whose pointer moved while the read surface
+    /// kept answering from the previous generation.
+    #[tokio::test]
+    async fn policy_acceptance_moves_the_published_graph_view_with_the_pointer() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+
+        let fixture = AutoAdvanceFixture::new("p_policy_graphview");
+        let first = fixture.stage_graph_candidate("knowledge-a", "first", COMMIT_ONE);
+        fixture
+            .establish_from(&first, Some(true), "operator grants auto-advance")
+            .await;
+        let established = fixture.served_graph_generation();
+        assert_eq!(established["accepted_commit"], COMMIT_ONE);
+
+        let second = fixture.stage_graph_candidate("knowledge-a", "second", COMMIT_TWO);
+        let outcome = fixture
+            .server
+            .attempt_publisher_auto_advance("p_policy_graphview", &second);
+        assert!(outcome.accepted(), "{outcome:?}");
+
+        let status = fixture.status().await;
+        let served = fixture.served_graph_generation();
+        assert_eq!(served["accepted_commit"], COMMIT_TWO);
+        assert_eq!(
+            served["accepted_generation"], status["generation_id"],
+            "the served graph view names the generation the pointer names"
+        );
+    }
+
+    /// A prior-arm read is an availability degradation, not a new view.
+    ///
+    /// When the CURRENT accepted generation does not verify, a verified
+    /// read silently falls back to the pointer's prior arm. Knowledge and
+    /// gaps survive that because they re-read per request; a graph view
+    /// installed from prior-arm content would latch the older generation
+    /// into the read surface until the next accept or a restart, with
+    /// nothing in the response saying so.
+    #[tokio::test]
+    async fn a_prior_arm_read_does_not_replace_the_installed_graph_view() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, COMMIT_TWO};
+        use bbox_corpus_core::project_catalog::ProjectId;
+
+        let fixture = AutoAdvanceFixture::new("p_policy_priorarm");
+        let first = fixture.stage_graph_candidate("knowledge-a", "first", COMMIT_ONE);
+        fixture
+            .establish_from(&first, Some(true), "operator grants auto-advance")
+            .await;
+        let second = fixture.stage_graph_candidate("knowledge-a", "second", COMMIT_TWO);
+        assert!(
+            fixture
+                .server
+                .attempt_publisher_auto_advance("p_policy_priorarm", &second)
+                .accepted()
+        );
+        let accepted = fixture.served_graph_generation();
+        assert_eq!(accepted["accepted_commit"], COMMIT_TWO);
+
+        // Damage the current arm and drop the cached read, so the next
+        // verified read is the prior-arm fallback the pointer allows.
+        let generation = fixture.status().await["generation_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fixture
+            .fixture
+            .corrupt_generation("p_policy_priorarm", &generation);
+        let project_id = ProjectId::parse("p_policy_priorarm".to_string()).unwrap();
+        fixture
+            .server
+            .invalidate_catalog_published_content(&project_id);
+        fixture.server.refresh_published_graph_views(&project_id);
+
+        assert_eq!(
+            fixture.served_graph_generation(),
+            accepted,
+            "a prior-arm read leaves the installed view alone instead of replacing it with the \
+             previous generation"
+        );
     }
 
     /// The policy audit trail names the policy, the producer, and the

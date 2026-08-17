@@ -1568,6 +1568,17 @@ impl BlackboxServer {
     /// happens to install a fresh view. Failure degrades rather than
     /// propagates, matching `converge_published_knowledge_index`: the
     /// pointer is already correct, and the next accept reconciles the view.
+    ///
+    /// The prior-arm read is refused rather than installed over a view that
+    /// is already serving. A verified read falls back to the pointer's
+    /// prior arm whenever the CURRENT generation does not verify, and it
+    /// reports that only in its binding stamp: nothing about the value says
+    /// "this is not the accepted generation". Knowledge and gaps survive
+    /// that because they re-read on every request, so a transient
+    /// current-arm failure heals itself. A graph view does not: installing
+    /// prior-arm content latches the older generation into the read surface
+    /// until the next accept or a daemon restart, which is exactly the
+    /// silent staleness this path exists to prevent.
     pub(crate) fn refresh_published_graph_views(&self, project_id: &ProjectId) {
         let Some(runtime) = &self.state.accepted_publications else {
             return;
@@ -1583,6 +1594,26 @@ impl BlackboxServer {
                 return;
             }
         };
+        if verified.binding_stamp().selection() == AcceptedPublicationSelection::Prior
+            && self
+                .state
+                .project_graph_views
+                .read()
+                .published_view(project_id)
+                .is_some()
+        {
+            // A project with no view at all is the one case where prior-arm
+            // content is still an improvement, and the boot reconcile owns
+            // it; here a view is already installed, so the honest move is to
+            // leave it and say why.
+            tracing::warn!(
+                project_id = %project_id,
+                accepted_generation = %verified.content_stamp().generation_id(),
+                "published graph view refresh skipped: the current accepted generation did not \
+                 verify and only the prior arm is readable; the installed view keeps serving"
+            );
+            return;
+        }
         match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
             Ok(view) => {
                 install_published_graph_view(&self.state, view);
@@ -1771,6 +1802,19 @@ pub(crate) fn reconcile_published_graph_word_lanes_at_boot(
                 continue;
             }
         };
+        if verified.binding_stamp().selection() == AcceptedPublicationSelection::Prior {
+            // Boot is the one place prior-arm content is still worth
+            // installing: no view exists yet, so the choice is the prior
+            // generation or no graphs at all. It is a degradation either
+            // way, and it stays installed until an accept refreshes it, so
+            // it is said out loud rather than counted as a clean install.
+            tracing::warn!(
+                project_id = %project_id,
+                accepted_generation = %verified.content_stamp().generation_id(),
+                "boot graph view reconcile is serving the prior arm: the current accepted \
+                 generation did not verify"
+            );
+        }
         match bbox_indexing::project_graph_view::build_published_graph_view(&verified) {
             Ok(view) => {
                 install_published_graph_view(state, view);
