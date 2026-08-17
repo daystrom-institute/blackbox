@@ -86,6 +86,7 @@ fn workspace_project_render_plan(
             project: None,
             scope: Some("global".into()),
             dry_run: Some(plan.dry_run),
+            global_plan: None,
             provisional: None,
             scope_project: None,
             locality: None,
@@ -302,7 +303,17 @@ impl BlackboxServer {
                 let scope_project = p.scope_project.as_deref().or(p.project.as_deref());
                 let view =
                     server.session_knowledge_view(scope_project, p.provisional.as_deref())?;
-                view.knowledge.render(&p)?
+                let rendered = view.knowledge.render(&p)?;
+                if p.global_plan.is_some() {
+                    // A host-applied global render plan is a JSON document the
+                    // `bro render global` applier decodes; diagnostics ride
+                    // inside it rather than as trailing text.
+                    let mut plan: bbox_util::global_render::GlobalRenderPlanV1 =
+                        serde_json::from_str(&rendered)?;
+                    plan.diagnostics = view.diagnostics;
+                    return Ok(serde_json::to_string_pretty(&plan)?);
+                }
+                rendered
             };
             let view = server.session_knowledge_view(
                 p.scope_project.as_deref().or(p.project.as_deref()),
@@ -749,6 +760,7 @@ mod tests {
                     project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
                     scope: Some("project".into()),
                     dry_run: Some(true),
+                    global_plan: None,
                     provisional: Some(view.into()),
                     scope_project: None,
                     locality: None,
@@ -1090,6 +1102,71 @@ mod catalog_render_tests {
         );
     }
 
+    /// The host-applied lane: a daemon that must not write host guidance
+    /// (isolated store, no env bindings, or a remote pod) still serves the
+    /// global managed bodies as a plan for the calling host to apply.
+    #[tokio::test]
+    async fn global_plan_serves_bodies_without_touching_daemon_targets() {
+        let fixture = CatalogFixture::new();
+        let mut env = crate::util::TestEnvGuard::new();
+        for key in [
+            "BLACKBOX_GLOBAL_COMMON_MD",
+            "BLACKBOX_GLOBAL_CLAUDE_MD",
+            "BLACKBOX_GLOBAL_CODEX_MD",
+            "BLACKBOX_GLOBAL_GEMINI_MD",
+        ] {
+            env.remove(key);
+        }
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let server = fixture.server();
+        let host_common = fixture.root().join("host-home/.blackbox/BLACKBOX.md");
+
+        let result = server
+            .bbox_render(Parameters(RenderParams {
+                scope: Some("global".into()),
+                global_plan: Some(bbox_knowledge::knowledge::GlobalRenderPlanRequestV1 {
+                    host_common_target: host_common.display().to_string(),
+                }),
+                ..Default::default()
+            }))
+            .await;
+        assert!(!is_error(&result), "{result:?}");
+        let plan: bbox_util::global_render::GlobalRenderPlanV1 =
+            serde_json::from_str(&text(&result)).expect("plan JSON");
+        plan.validate().expect("checksum");
+        assert_eq!(plan.host_common_target, host_common.display().to_string());
+        assert!(
+            plan.common_body.contains("bbox_gap"),
+            "core rules render into the common body"
+        );
+        let providers: Vec<&str> = plan.providers.iter().map(|p| p.provider.as_str()).collect();
+        assert_eq!(providers, ["claude", "agents", "gemini"]);
+        for provider in &plan.providers {
+            assert!(
+                provider.body.contains(&host_common.display().to_string()),
+                "{} body must include the host common target: {}",
+                provider.provider,
+                provider.body
+            );
+        }
+        assert!(
+            !host_common.exists(),
+            "the daemon must not write the plan's targets itself"
+        );
+
+        let rejected = server
+            .bbox_render(Parameters(RenderParams {
+                scope: Some("project".into()),
+                project: Some(PROJECT.into()),
+                global_plan: Some(bbox_knowledge::knowledge::GlobalRenderPlanRequestV1 {
+                    host_common_target: host_common.display().to_string(),
+                }),
+                ..Default::default()
+            }))
+            .await;
+        assert!(is_error(&rejected), "{rejected:?}");
+    }
+
     /// The session knowledge view answers for the daemon's durable store:
     /// global render authority compares that store's path against the host
     /// default, so the detached view must carry it rather than the empty
@@ -1234,6 +1311,7 @@ mod catalog_render_tests {
                 project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
                 scope: Some("project".into()),
                 dry_run: Some(false),
+                global_plan: None,
                 provisional: Some("published".into()),
                 scope_project: None,
                 locality: None,
@@ -1270,6 +1348,7 @@ mod catalog_render_tests {
                 project: Some(BOUND_WORKSPACE_RENDER_SELECTOR.into()),
                 scope: Some("project".into()),
                 dry_run: Some(false),
+                global_plan: None,
                 provisional: Some("published".into()),
                 scope_project: None,
                 locality: Some(ProjectRenderLocalityRequestV1::Complete {

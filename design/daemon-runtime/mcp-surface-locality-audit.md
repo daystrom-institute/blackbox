@@ -64,7 +64,7 @@ dispatch/orchestration plane (`bro_*`, `atom_*`, `badgey_*`, `consultant_*`,
 | `bbox_bootstrap` | hard error (reads checkout instruction files) | Read lane over the code-source transport, or treat as checkout-host-local convenience (agent reads the files itself) |
 | `bbox_project_attach`/`detach`/`promote`/`scope_migrate`/`default_attachment` | catalog is ACTIVE on the cage: these proceed to fs probes/identity proofs the pod cannot perform and fail structurally | Collector-side attach proposal carrying probe evidence (extend the onboard backchannel), or operator-run admin CLI on a host with both catalog and checkout access |
 | `bbox_project_publisher_bind` (non-covered projects) | needs the checkout object DB reachable | same bespoke family |
-| **`bbox_render` scope=global** | **silent wrong-target write**: renders into pod `$HOME` provider files no interactive host reads | Target-policy decision first (which hosts get global renders), then the backchannel could carry the managed-region writes |
+| **`bbox_render` scope=global** | RESOLVED: refuses on the cage (`error.global_render_authority`); operator hosts pull instead via `bro render global` -> `bbox_render(scope=global, global_plan)` -> host-local managed-region apply | Pull model: the host that runs the apply is the target policy; no push lane |
 | `bbox_roadmap action=render` with checkout write_path | fs error or silent default-config render | Backchannel write of the single ROADMAP.md; project config from the published snapshot |
 
 ## Class D — deliberately retired / non-goal
@@ -94,5 +94,5 @@ inbox spool, which nothing ingests on the estate.
    Anything needing multi-step sequencing (eject) or live fs proofs (catalog
    transactions) needs bespoke design.
 3. No silent wrong-target writes: a tool that cannot reach its configured
-   target must refuse, not succeed into the void (global render is the open
-   violation).
+   target must refuse, not succeed into the void (global render was the open
+   violation; it now refuses, and `bro render global` is the host-side lane).

@@ -194,6 +194,14 @@ pub struct RenderParams {
     /// Preview without writing (default: false)
     #[serde(default)]
     pub dry_run: Option<bool>,
+    /// Global render delivery for an operator host: instead of writing this
+    /// daemon's own global guidance files, compute the managed bodies for
+    /// the calling host and return them as a JSON global render plan. The
+    /// host applies the plan locally (`bro render global`), so the host that
+    /// runs the apply is the target policy. Only valid with scope "global";
+    /// dry_run is meaningless here because nothing is written daemon-side.
+    #[serde(default)]
+    pub global_plan: Option<GlobalRenderPlanRequestV1>,
     /// Provisional visibility policy: published, own, or all.
     #[serde(default)]
     pub provisional: Option<String>,
@@ -211,6 +219,15 @@ pub struct RenderParams {
     #[serde(default, rename = "_render_locality")]
     #[schemars(skip)]
     pub locality: Option<ProjectRenderLocalityRequestV1>,
+}
+
+/// Request half of the host-applied global render lane.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GlobalRenderPlanRequestV1 {
+    /// Absolute path of the applying host's shared include file
+    /// (`~/.blackbox/BLACKBOX.md` there). Provider bodies reference it by
+    /// this exact path, so it must be the host's own resolved common target.
+    pub host_common_target: String,
 }
 
 pub const PROJECT_RENDER_TRANSPORT_VERSION: u32 = 1;
@@ -698,6 +715,7 @@ pub fn execute_project_render_plan(
         project: Some(canonical_root.to_string_lossy().into_owned()),
         scope: Some("project".into()),
         dry_run: Some(plan.dry_run),
+        global_plan: None,
         provisional: None,
         scope_project: Some(PROJECT_RENDER_TRANSPORT_SCOPE.into()),
         locality: None,
@@ -3701,6 +3719,16 @@ impl Knowledge {
             "global"
         });
 
+        if let Some(request) = &p.global_plan {
+            if scope_arg != "global" {
+                anyhow::bail!(
+                    "error.bad_input: global_plan is only valid with scope \"global\" (got {scope_arg})"
+                );
+            }
+            let plan = self.global_render_plan(provider, request)?;
+            return serde_json::to_string_pretty(&plan).context("encoding global render plan");
+        }
+
         let do_global = matches!(scope_arg, "global" | "both");
         let do_project = matches!(scope_arg, "project" | "both") && project_dir.is_some();
 
@@ -3949,6 +3977,45 @@ impl Knowledge {
             render_global_common_include(provider, common_path, &mut md);
         }
         Ok(md)
+    }
+
+    /// Compute the global managed bodies for an operator host without
+    /// touching this daemon's own guidance files. The daemon stays the
+    /// source authority for the bytes; the host applies them through
+    /// `bbox_util::global_render::apply_global_render_plan`.
+    pub fn global_render_plan(
+        &self,
+        provider: Option<&str>,
+        request: &GlobalRenderPlanRequestV1,
+    ) -> Result<bbox_util::global_render::GlobalRenderPlanV1> {
+        let host_common_target = Path::new(&request.host_common_target);
+        if !host_common_target.is_absolute() {
+            anyhow::bail!(
+                "error.bad_input: global_plan.host_common_target must be an absolute path (got {})",
+                request.host_common_target
+            );
+        }
+        let providers: Vec<&str> = match provider {
+            Some(p) => vec![p],
+            None => vec!["claude", "agents", "gemini"],
+        };
+        let mut plans = Vec::new();
+        for prov in providers {
+            if crate::render::global_target_path(prov).is_none() {
+                anyhow::bail!(
+                    "error.bad_input: provider {prov} has no documented global-memory file"
+                );
+            }
+            plans.push(bbox_util::global_render::GlobalRenderProviderPlanV1 {
+                provider: prov.to_string(),
+                body: self.render_global_body(prov, host_common_target)?,
+            });
+        }
+        Ok(bbox_util::global_render::GlobalRenderPlanV1::new(
+            host_common_target,
+            self.render_global_common_body()?,
+            plans,
+        ))
     }
 
     /// Body for the shared global include: provider-neutral global entries only.
@@ -5301,6 +5368,7 @@ mod tests {
                 project: Some(worktree_root.to_string_lossy().into_owned()),
                 scope: Some("project".into()),
                 dry_run: Some(false),
+                global_plan: None,
                 provisional: None,
                 scope_project: Some("/registry/base".into()),
                 locality: None,

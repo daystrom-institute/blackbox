@@ -8,6 +8,8 @@ edition = "2024"
 
 [dependencies]
 dirs = "6"
+chrono = "0.4"
+sha2 = "0.10"
 anyhow = "1"
 # The legacy-migration source lock (R33F2) uses the same non-blocking flock
 # idiom as the daemon's instance lock.

@@ -92,7 +92,10 @@ selected render target still resolves implicitly to the host default. Move
 `BLACKBOX_GLOBAL_COMMON_MD`, `BLACKBOX_GLOBAL_CLAUDE_MD`,
 `BLACKBOX_GLOBAL_CODEX_MD`, and `BLACKBOX_GLOBAL_GEMINI_MD` with the isolated
 store. An explicit target binding is required if a non-default store is
-intentionally authoritative for a host-default target.
+intentionally authoritative for a host-default target. To render an isolated
+or remote daemon's global view onto a host deliberately, run `bro render
+global` on that host: it pulls a global render plan (`bbox_render` with
+`global_plan`) and applies it locally, so no daemon-side binding is needed.
 
 One path is deliberately NOT claimed, because it follows the platform home /
 state directory rather than config and macOS moves it only with `$HOME`: the

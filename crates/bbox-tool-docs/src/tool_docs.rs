@@ -559,7 +559,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_render",
         category: ToolCategory::Knowledge,
         summary: "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.",
-        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches host-wide memory files; `project` writes project-local provider files that include PROJECT.md by reference. Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to publish standing approved knowledge into managed files. `global` patches the DAEMON HOST's memory files; when the daemon is remote (cage) or its store is isolated it refuses with `error.global_render_authority` instead of writing files nobody reads. To refresh an operator host's global files from a remote daemon, run `bro render global` ON THAT HOST (`--check` previews): it requests `bbox_render(scope=\"global\", global_plan={host_common_target})` and applies the returned managed bodies locally with backups. `project` writes project-local provider files that include PROJECT.md by reference. Do not use render as a way to keep active-work guidance hot across turns — that is what `bbox_pin` is for. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: Some(r#"bbox_render(scope="project", project="/repo/x")"#),
     },
     ToolDoc {

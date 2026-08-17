@@ -10,6 +10,20 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `bro render global`: pull the daemon's global guidance render onto THIS
+  host. Since the corpus daemon moved off the operator's machine, nothing
+  could refresh `~/.blackbox/BLACKBOX.md`, `~/.claude/CLAUDE.md`,
+  `~/.codex/AGENTS.md`, or `~/.gemini/GEMINI.md` there: `bbox_render
+  (scope=global)` writes the daemon host's files, and on the cage that is a
+  pod `$HOME` no session reads (gap-b404ab83). `bbox_render` gains a
+  `global_plan={host_common_target}` request that returns the managed bodies
+  as a checksummed JSON plan instead of writing anything daemon-side, and
+  `bro render global [--check] [--provider P] [--json]` applies that plan
+  locally through the shared managed-region patcher (backups, marker
+  discipline, destructive-shrink guard). The host running the command is
+  the target policy. The patcher, global target resolution, and render
+  authority check moved from `bbox-knowledge` to `bbox_util::global_render`
+  (re-exported at the old paths) so the thin `bro` client can link them.
 - Project-graph schemas can declare per-vertex-type retrieval hints: a
   `hints` array of `{edge_type, direction, label}` entries, in priority
   order, on each vertex type. `bbox_inspect_entity` renders them as

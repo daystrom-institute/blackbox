@@ -22,6 +22,9 @@ bbox-corpus-core = { path = "../bbox-corpus-core" }
 # typed knowledge-source transport and links no daemon store, index, or server.
 bbox-knowledge-source-client = { path = "../bbox-knowledge-source-client" }
 bbox-provenance = { path = "../bbox-provenance" }
+# Managed-region patcher for `render global`: applies a daemon-computed global
+# guidance plan to this host's provider files. Links no knowledge store.
+bbox-util = { path = "../bbox-util" }
 bro-rpc = { path = "../bro-rpc" }
 bro-protocol = { path = "../bro-protocol" }
 bro-core = { path = "../bro-core" }

@@ -548,7 +548,7 @@ the transaction root as a whole.
 | Graph paths look sparse | `bbox_describe_schema`, EdgeIndex log lines | Reindex, then wait for EdgeIndex rebuild |
 | Disk grows under `vectors/` | journal compaction lines | Usually wait; re-embed only after provider/data issues |
 | Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
-| Provider markdown stale | `bbox_lint`, rendered files | `bbox_render(scope="global")` |
+| Provider markdown stale | `bbox_lint`, rendered files | `bbox_render(scope="global")` on the daemon host; `bro render global` on any other operator host (pulls the plan from a remote daemon) |
 | Reaction dead-lettered / no reaction ran / identity missing | `system_event_open` → `reaction_deliveries` → `reaction_replay dry_run` → `reaction_retry` | See [System events](system-events.md) — operational loops. |
 
 System events are journalled separately from the transcript index and have

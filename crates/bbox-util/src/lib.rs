@@ -2,5 +2,6 @@
 //! Modules move verbatim; the origin re-exports them under their original
 //! `crate::<module>` paths.
 
+pub mod global_render;
 pub mod legacy_migration;
 pub mod util;

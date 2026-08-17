@@ -39,6 +39,8 @@ This is the reconcile loop when the rendered files were edited outside the store
 
 Use when the guidance should land in the provider-level managed files and affect every project/session on the host.
 
+`bbox_render(scope="global")` writes the DAEMON host's files. When the daemon runs elsewhere (a remote/cage daemon) or its knowledge store is isolated, it refuses with `error.global_render_authority` rather than writing files no session reads. To refresh an operator host's global files from that daemon, run `bro render global` on the operator host (`--check` to preview, `--provider` for one file): it asks the daemon for a global render plan computed against the host's `~/.blackbox/BLACKBOX.md` path and applies the managed regions locally with the usual backups and shrink guard. The host running the command is the target policy; nothing pushes global renders to hosts.
+
 ### Project render
 
 Use when the guidance belongs only to the current repo and its project-local memory files.

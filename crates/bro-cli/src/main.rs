@@ -30,6 +30,7 @@ mod fleet_tui;
 mod logging;
 mod mcp_call;
 mod provenance;
+mod render_global;
 #[cfg(test)]
 mod test_backend;
 mod workspace_binding;
@@ -61,6 +62,8 @@ enum BroCommand {
     Orchestrate(OrchestrateArgs),
     /// MCP helpers - call daemon tools over streamable HTTP
     Mcp(mcp_call::McpArgs),
+    /// Guidance renders - pull the daemon's global render onto this host
+    Render(render_global::RenderArgs),
     /// Checkout-local provenance commands
     Provenance(provenance::ProvenanceArgs),
     /// Checkout-local Git blame with central corpus enrichment
@@ -695,6 +698,7 @@ fn main() -> anyhow::Result<()> {
         BroCommand::Tail(args) => rt.block_on(run_tail_stream_printer(TailSelectors::from(args))),
         BroCommand::Orchestrate(args) => rt.block_on(run_orchestrate(args)),
         BroCommand::Mcp(args) => rt.block_on(mcp_call::run(args)),
+        BroCommand::Render(args) => rt.block_on(render_global::run(args)),
         BroCommand::Provenance(args) => rt.block_on(provenance::run(args)),
         BroCommand::Blame(args) => rt.block_on(blame::run(args)),
         BroCommand::WorkspaceBinding(args) => rt.block_on(workspace_binding::run(args)),
