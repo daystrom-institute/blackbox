@@ -10,6 +10,21 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Knowledge-source wire compatibility: response bodies a client decodes
+  (probe, status, capture context, upload begin/finalize, missing-blob pages)
+  now tolerate unknown fields, so a `bro` or collector built before the
+  daemon keeps capturing when the daemon adds a response field (a strict
+  status embedded in the probe response used to fail every provisional
+  capture after the first for an older CLI, freezing the overlay). Request
+  bodies the daemon receives stay strict. The daemon stamps every
+  knowledge-source response with `x-bbox-daemon-build-id`; the capture client
+  records it, a landed upload whose readiness status the client cannot decode
+  is reported as captured with a diagnostic instead of as a failure, and
+  `bro workspace-binding capture` prints `cli_build_id` / `daemon_build_id`
+  and warns on skew. `bro` daemon-URL defaults now resolve
+  `$BLACKBOX_MCP_URL`'s origin, then config `[client].daemon_url`, then
+  loopback, so `bro workspace-binding mint` reaches a remote daemon without
+  `--daemon-url`.
 - Slack conversation-source satellite hardening: corpus calls retry
   transport failures and 5xx on a bounded ladder (3 retries, 5/15/30 s,
   30 s request timeout) and never retry 4xx; cycle failures log the full

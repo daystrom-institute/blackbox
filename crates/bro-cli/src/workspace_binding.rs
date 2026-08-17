@@ -51,7 +51,8 @@ struct MintArgs {
     /// Checkout project root. Defaults to the current directory.
     #[arg(long, value_name = "DIR")]
     project_root: Option<PathBuf>,
-    /// Daemon base URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
+    /// Daemon base URL. Defaults to the origin of $BLACKBOX_MCP_URL, else
+    /// config [client].daemon_url, else http://127.0.0.1:<[daemon].port>.
     #[arg(long, value_name = "URL")]
     daemon_url: Option<String>,
     /// Print the binding token to stdout once instead of writing the checkout
@@ -301,10 +302,25 @@ async fn capture(args: CaptureArgs) -> anyhow::Result<()> {
         bro_core::WorkspaceId::parse(workspace_id.clone())?,
         scope.clone(),
     )?;
-    let outcome = client
-        .sync_once()
-        .await
-        .context("capturing the bound workspace")?;
+    let outcome = match client.sync_once().await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A capture that failed against a daemon built differently from
+            // this CLI is most likely skew, not a broken checkout: say so next
+            // to the error so the operator rebuilds `bro` instead of chasing
+            // the binding.
+            if let Some(warning) = build_skew_warning(client.daemon_build_id().as_deref()) {
+                eprintln!("warning: {warning}");
+            }
+            return Err(error.context("capturing the bound workspace"));
+        }
+    };
+    if let Some(warning) = build_skew_warning(outcome.daemon_build_id.as_deref()) {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(diagnostic) = &outcome.diagnostic {
+        eprintln!("warning: {diagnostic}");
+    }
 
     println!(
         "{}",
@@ -319,9 +335,41 @@ async fn capture(args: CaptureArgs) -> anyhow::Result<()> {
                 "repo_id": scope.repo_id(),
                 "bbox_root_relpath": scope.bbox_root_relpath(),
             },
+            "cli_build_id": CLI_BUILD_ID,
+            "daemon_build_id": outcome.daemon_build_id,
+            "diagnostic": outcome.diagnostic,
         }))?
     );
     Ok(())
+}
+
+/// This binary's build identity (git short sha from `build.rs`, or the
+/// timestamp fallback when git was unavailable at build time).
+const CLI_BUILD_ID: &str = env!("BRO_CLI_BUILD_ID");
+
+/// A one-line skew warning when the daemon reported a build id that is not
+/// this CLI's, or none at all (a daemon older than the header). Both mean the
+/// two ends were built from different contracts; the response decoders are
+/// tolerant, so this is advisory, but it is the first thing to check when a
+/// capture misbehaves.
+fn build_skew_warning(daemon_build_id: Option<&str>) -> Option<String> {
+    build_skew_warning_for(CLI_BUILD_ID, daemon_build_id)
+}
+
+fn build_skew_warning_for(cli_build_id: &str, daemon_build_id: Option<&str>) -> Option<String> {
+    match daemon_build_id {
+        Some(daemon) if daemon == cli_build_id => None,
+        Some(daemon) => Some(format!(
+            "bro build {cli_build_id} is talking to daemon build {daemon}; the two were built \
+             from different sources. If a capture misbehaves, rebuild and reinstall bro before \
+             debugging the binding."
+        )),
+        None => Some(format!(
+            "bro build {cli_build_id} is talking to a daemon that sent no build id (older than \
+             this CLI). If a capture misbehaves, align the two builds before debugging the \
+             binding."
+        )),
+    }
 }
 
 struct CaptureOverrides {
@@ -459,6 +507,15 @@ fn write_binding_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_skew_warning_names_both_builds_and_is_silent_when_equal() {
+        assert_eq!(build_skew_warning_for("abc123", Some("abc123")), None);
+        let skew = build_skew_warning_for("abc123", Some("def456")).unwrap();
+        assert!(skew.contains("abc123") && skew.contains("def456"), "{skew}");
+        let missing = build_skew_warning_for("abc123", None).unwrap();
+        assert!(missing.contains("no build id"), "{missing}");
+    }
 
     fn minted() -> MintResponse {
         MintResponse {

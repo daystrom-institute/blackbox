@@ -1,4 +1,19 @@
 //! Dependency-clean contracts for remote knowledge and gap source transport.
+//!
+//! # Wire compatibility
+//!
+//! Strictness is asymmetric by direction. Request bodies the daemon RECEIVES
+//! stay `#[serde(deny_unknown_fields)]`: a misspelled or stale field from a
+//! client is a refusal, not a silently ignored intent. Response bodies a
+//! client DECODES (`*ResponseV1`, `*StatusV1`, `*PageV1`,
+//! `ProvisionalCaptureContextV1`) are tolerant of unknown fields, because a
+//! long-lived CLI or collector routinely predates the daemon it talks to and a
+//! daemon-side additive field must degrade to "ignored", never to "every older
+//! client bricks". Any field ADDED to a response type carries
+//! `#[serde(default)]` for the same reason in the other direction (a newer
+//! client against an older daemon). The daemon stamps every knowledge-source
+//! response with [`DAEMON_BUILD_ID_HEADER`] so a client can report skew when
+//! a decode does fail.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,6 +24,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: u32 = 1;
+/// Response header carrying the daemon's build identity (`BLACKBOX_BUILD_ID`)
+/// on every knowledge-source route, so clients can name a build skew when a
+/// response fails to decode.
+pub const DAEMON_BUILD_ID_HEADER: &str = "x-bbox-daemon-build-id";
 pub const MAX_SOURCE_FILES_PER_LANE: u64 = 100_000;
 pub const MAX_SOURCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_SOURCE_LANE_BYTES: u64 = 128 * 1024 * 1024;
@@ -433,7 +452,6 @@ pub enum SourceGenerationStateV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct BeginSourceUploadResponseV1 {
     pub upload_id: String,
     pub max_manifest_page_entries: u64,
@@ -453,7 +471,6 @@ pub struct PublicationProbeRequestV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PublicationProbeResponseV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<PublicationCandidateStatusV1>,
@@ -473,7 +490,6 @@ pub struct ProvisionalProbeRequestV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ProvisionalProbeResponseV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<ProvisionalWorkspaceStatusV1>,
@@ -487,7 +503,6 @@ pub struct ProvisionalProbeResponseV1 {
 /// workspace binding already selects it, while the source descriptor carries
 /// only the portable published scope and accepted content identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ProvisionalCaptureContextV1 {
     pub scope: PublishedScope,
     pub accepted_generation: String,
@@ -559,7 +574,6 @@ impl ProvisionalProbeResponseV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct MissingSourceBlobsPageV1 {
     pub source_generation_id: String,
     pub hashes: Vec<String>,
@@ -568,14 +582,12 @@ pub struct MissingSourceBlobsPageV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct FinalizeSourceUploadResponseV1 {
     pub source_generation_id: String,
     pub status_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PublicationCandidateStatusV1 {
     pub source_generation_id: String,
     pub state: SourceGenerationStateV1,
@@ -602,7 +614,6 @@ pub struct PublicationCandidateStatusV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ProvisionalWorkspaceStatusV1 {
     pub source_generation_id: String,
     pub state: SourceGenerationStateV1,
@@ -2744,5 +2755,114 @@ mod tests {
         let mut value = serde_json::to_value(&descriptor).unwrap();
         value["workspace_id"] = serde_json::json!("0123456789abcdef0123456789abcdeF");
         assert!(serde_json::from_value::<ProvisionalWorkspaceDescriptorV1>(value).is_err());
+    }
+
+    /// Wire-compat invariant (see the crate docs): every body a client decodes
+    /// tolerates fields it does not know, so a daemon-side additive change
+    /// never bricks an older CLI or collector. The probe response is the load
+    /// bearing case: it embeds the status type, and a strict status made every
+    /// capture after the first fail at the pre-upload probe.
+    #[test]
+    fn client_decoded_responses_tolerate_unknown_fields() {
+        fn with_extra<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+            let mut json = serde_json::to_value(value).unwrap();
+            json["field_from_a_newer_daemon"] = serde_json::json!("ignored");
+            serde_json::from_value(json).unwrap()
+        }
+        let status = ProvisionalWorkspaceStatusV1 {
+            source_generation_id: "kws_x".into(),
+            state: SourceGenerationStateV1::Ready,
+            workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            sequence: 1,
+            accepted_generation: "a".repeat(64),
+            checkout_head: "b".repeat(40),
+            observed_at_unix_secs: 1,
+            baseline_knowledge_manifest_sha256: "c".repeat(64),
+            baseline_gap_manifest_sha256: "d".repeat(64),
+            baseline_graph_manifest_sha256: "e".repeat(64),
+            baseline_evidence_manifest_sha256: "f".repeat(64),
+            working_knowledge_manifest_sha256: "0".repeat(64),
+            working_gap_manifest_sha256: "1".repeat(64),
+            working_graph_manifest_sha256: "2".repeat(64),
+            working_evidence_manifest_sha256: "3".repeat(64),
+            lease_expires_unix_secs: Some(2),
+            diagnostic: None,
+        };
+        assert_eq!(with_extra(&status), status);
+        let probe = ProvisionalProbeResponseV1 {
+            current: Some(status.clone()),
+            next_sequence: 2,
+        };
+        let mut nested = serde_json::to_value(&probe).unwrap();
+        nested["current"]["field_from_a_newer_daemon"] = serde_json::json!(true);
+        assert_eq!(
+            serde_json::from_value::<ProvisionalProbeResponseV1>(nested).unwrap(),
+            probe
+        );
+        assert_eq!(with_extra(&probe), probe);
+        let context = ProvisionalCaptureContextV1 {
+            scope: scope(),
+            accepted_generation: "a".repeat(64),
+            accepted_commit: "b".repeat(40),
+            lease_ttl_secs: 60,
+        };
+        assert_eq!(with_extra(&context), context);
+        let begin = BeginSourceUploadResponseV1 {
+            upload_id: "u".into(),
+            max_manifest_page_entries: 1,
+            max_manifest_page_bytes: 1,
+            max_ancestry_page_nodes: 1,
+            max_ancestry_page_bytes: 1,
+            max_blob_bytes: 1,
+        };
+        assert_eq!(with_extra(&begin), begin);
+        let missing = MissingSourceBlobsPageV1 {
+            source_generation_id: "g".into(),
+            hashes: vec![],
+            next_cursor: None,
+        };
+        assert_eq!(with_extra(&missing), missing);
+        let finalize = FinalizeSourceUploadResponseV1 {
+            source_generation_id: "g".into(),
+            status_url: "/s".into(),
+        };
+        assert_eq!(with_extra(&finalize), finalize);
+        let candidate = PublicationCandidateStatusV1 {
+            source_generation_id: "g".into(),
+            state: SourceGenerationStateV1::Ready,
+            producer_id: "p".into(),
+            full_ref: "refs/heads/main".into(),
+            publisher_commit: "b".repeat(40),
+            object_format: GitObjectFormatV1::Sha1,
+            observed_at_unix_secs: 1,
+            knowledge_manifest_sha256: "c".repeat(64),
+            gap_manifest_sha256: "d".repeat(64),
+            graph_manifest_sha256: "e".repeat(64),
+            evidence_manifest_sha256: "f".repeat(64),
+            knowledge_files: 0,
+            gap_files: 0,
+            graph_files: 0,
+            evidence_files: 0,
+            logical_bytes: 0,
+            diagnostic: None,
+        };
+        assert_eq!(with_extra(&candidate), candidate);
+        let publication_probe = PublicationProbeResponseV1 {
+            current: Some(candidate),
+        };
+        assert_eq!(with_extra(&publication_probe), publication_probe);
+    }
+
+    /// The other half of the asymmetry: request bodies the daemon receives
+    /// stay strict.
+    #[test]
+    fn daemon_received_requests_reject_unknown_fields() {
+        let request = ProvisionalProbeRequestV1 {
+            scope: scope(),
+            workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        };
+        let mut json = serde_json::to_value(&request).unwrap();
+        json["stale_field"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<ProvisionalProbeRequestV1>(json).is_err());
     }
 }

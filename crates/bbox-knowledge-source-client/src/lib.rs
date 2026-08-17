@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,6 +41,48 @@ pub struct CaptureOutcome {
     pub source_generation_id: String,
     pub sequence: u64,
     pub reused: bool,
+    /// The daemon's build identity as stamped on its responses
+    /// (`DAEMON_BUILD_ID_HEADER`), when it sent one. Callers compare it with
+    /// their own build id to report skew.
+    pub daemon_build_id: Option<String>,
+    /// Set when the capture landed (finalize succeeded) but the daemon's
+    /// readiness status could not be decoded by this client. The generation
+    /// is durable server-side; only this client's view of it is degraded.
+    pub diagnostic: Option<String>,
+}
+
+/// A 2xx knowledge-source response this client could not decode. Surfaced as
+/// its own type so callers can tell "the daemon refused" from "the daemon
+/// answered in a shape this build does not understand" (build skew), and so
+/// the capture path can keep a landed upload rather than reporting it lost.
+#[derive(Debug)]
+pub struct ResponseDecodeError {
+    pub daemon_build_id: Option<String>,
+    source: serde_json::Error,
+}
+
+impl std::fmt::Display for ResponseDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "decoding knowledge-source response: {}",
+            self.source
+        )?;
+        match &self.daemon_build_id {
+            Some(build) => write!(
+                formatter,
+                " (daemon build {build}; this client is built from a different contract, \
+                 rebuild it against the daemon)"
+            ),
+            None => write!(formatter, " (daemon sent no build id)"),
+        }
+    }
+}
+
+impl std::error::Error for ResponseDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[derive(Clone)]
@@ -47,6 +90,9 @@ pub struct WorkspaceCaptureClient {
     base_url: Url,
     token: WorkspaceBindingToken,
     client: Client,
+    /// Last daemon build id observed on any response, shared across clones so
+    /// a caller holding the original handle sees what a spawned sync saw.
+    daemon_build_id: Arc<Mutex<Option<String>>>,
     workspace_root: PathBuf,
     project_root: PathBuf,
     workspace_id: WorkspaceId,
@@ -157,6 +203,7 @@ impl WorkspaceCaptureClient {
             base_url,
             token,
             client,
+            daemon_build_id: Arc::new(Mutex::new(None)),
             workspace_root,
             project_root,
             workspace_id,
@@ -227,6 +274,8 @@ impl WorkspaceCaptureClient {
                 source_generation_id: renewed.source_generation_id,
                 sequence: renewed.sequence,
                 reused: true,
+                daemon_build_id: self.daemon_build_id(),
+                diagnostic: None,
             });
         }
 
@@ -234,7 +283,25 @@ impl WorkspaceCaptureClient {
             bail!("accepted publication changed during workspace capture");
         }
         let finalized = self.upload(&captured, context.lease_ttl_secs).await?;
-        let status = self.wait_ready(&finalized.source_generation_id).await?;
+        // The upload is durable once finalize returned. A readiness status this
+        // build cannot decode (daemon newer than this client) must not turn a
+        // landed capture into a reported failure: report it captured at the
+        // sequence the probe assigned, with the decode problem as a diagnostic.
+        let status = match self.wait_ready(&finalized.source_generation_id).await {
+            Ok(status) => status,
+            Err(error) if is_decode_error(&error) => {
+                return Ok(CaptureOutcome {
+                    source_generation_id: finalized.source_generation_id,
+                    sequence,
+                    reused: false,
+                    daemon_build_id: self.daemon_build_id(),
+                    diagnostic: Some(format!(
+                        "capture finalized, but its readiness status could not be decoded: {error:#}"
+                    )),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if self.capture_context().await? != context {
             self.retire_best_effort(&status.source_generation_id).await;
             bail!("accepted publication changed while provisional upload finalized");
@@ -243,7 +310,31 @@ impl WorkspaceCaptureClient {
             source_generation_id: status.source_generation_id,
             sequence: status.sequence,
             reused: false,
+            daemon_build_id: self.daemon_build_id(),
+            diagnostic: None,
         })
+    }
+
+    /// The daemon build id observed on the most recent response, if the daemon
+    /// stamped one.
+    pub fn daemon_build_id(&self) -> Option<String> {
+        self.daemon_build_id
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn observe_daemon_build_id(&self, response: &reqwest::Response) {
+        let observed = response
+            .headers()
+            .get(bbox_knowledge_source::DAEMON_BUILD_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let (Some(observed), Ok(mut guard)) = (observed, self.daemon_build_id.lock()) {
+            *guard = Some(observed);
+        }
     }
 
     async fn capture_context(&self) -> Result<ProvisionalCaptureContextV1> {
@@ -479,6 +570,7 @@ impl WorkspaceCaptureClient {
             .send()
             .await
             .context("sending knowledge-source request")?;
+        self.observe_daemon_build_id(&response);
         let status = response.status();
         let bytes = response
             .bytes()
@@ -487,7 +579,12 @@ impl WorkspaceCaptureClient {
         if !status.is_success() {
             return Err(http_error(status, &bytes));
         }
-        serde_json::from_slice(&bytes).context("decoding knowledge-source response")
+        serde_json::from_slice(&bytes).map_err(|source| {
+            anyhow::Error::new(ResponseDecodeError {
+                daemon_build_id: self.daemon_build_id(),
+                source,
+            })
+        })
     }
 
     async fn send_empty(&self, request: reqwest::RequestBuilder) -> Result<()> {
@@ -495,6 +592,7 @@ impl WorkspaceCaptureClient {
             .send()
             .await
             .context("sending knowledge-source request")?;
+        self.observe_daemon_build_id(&response);
         let status = response.status();
         let bytes = response
             .bytes()
@@ -1137,6 +1235,10 @@ fn validate_server_url(url: &Url, policy: ServerUrlPolicy) -> Result<()> {
     }
 }
 
+fn is_decode_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ResponseDecodeError>())
+}
+
 fn http_error(status: StatusCode, bytes: &[u8]) -> anyhow::Error {
     let bounded = &bytes[..bytes.len().min(MAX_ERROR_BYTES)];
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bounded) {
@@ -1162,7 +1264,6 @@ mod tests {
     use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use std::process::Command;
-    use std::sync::{Arc, Mutex};
 
     fn git(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -1569,6 +1670,25 @@ mod tests {
         next_sequence: u64,
         begin_calls: usize,
         renew_calls: usize,
+        /// Behave like a daemon built after this client: every status-shaped
+        /// body carries a field this client has never seen.
+        newer_daemon: bool,
+        /// Answer readiness polls with a status this client cannot decode at
+        /// all (an enum variant from the future).
+        undecodable_status: bool,
+    }
+
+    const MOCK_DAEMON_BUILD_ID: &str = "mockdaemon0001";
+
+    fn newer_daemon_status(state: &MockSourceState) -> serde_json::Value {
+        let mut status = serde_json::to_value(state.current.clone().unwrap()).unwrap();
+        if state.newer_daemon {
+            status["field_from_a_newer_daemon"] = serde_json::json!("ignored by older clients");
+        }
+        if state.undecodable_status {
+            status["state"] = serde_json::json!("from_the_future");
+        }
+        status
     }
 
     fn assert_mock_auth(headers: &HeaderMap, state: &MockSourceState) {
@@ -1594,13 +1714,17 @@ mod tests {
         State(state): State<Arc<Mutex<MockSourceState>>>,
         headers: HeaderMap,
         Json(_request): Json<ProvisionalProbeRequestV1>,
-    ) -> Json<ProvisionalProbeResponseV1> {
+    ) -> Json<serde_json::Value> {
         let state = state.lock().unwrap();
         assert_mock_auth(&headers, &state);
-        Json(ProvisionalProbeResponseV1 {
-            current: state.current.clone(),
-            next_sequence: state.next_sequence,
-        })
+        let mut probe = serde_json::json!({ "next_sequence": state.next_sequence });
+        if state.current.is_some() {
+            probe["current"] = newer_daemon_status(&state);
+        }
+        if state.newer_daemon {
+            probe["field_from_a_newer_daemon"] = serde_json::json!(1);
+        }
+        Json(probe)
     }
 
     async fn mock_begin(
@@ -1733,38 +1857,31 @@ mod tests {
     async fn mock_status(
         State(state): State<Arc<Mutex<MockSourceState>>>,
         headers: HeaderMap,
-    ) -> Json<ProvisionalWorkspaceStatusV1> {
+    ) -> Json<serde_json::Value> {
         let state = state.lock().unwrap();
         assert_mock_auth(&headers, &state);
-        Json(state.current.clone().unwrap())
+        Json(newer_daemon_status(&state))
     }
 
-    async fn mock_renew(
-        State(state): State<Arc<Mutex<MockSourceState>>>,
-        headers: HeaderMap,
-        Json(request): Json<RenewProvisionalGenerationRequestV1>,
-    ) -> Json<ProvisionalWorkspaceStatusV1> {
-        let mut state = state.lock().unwrap();
-        assert_mock_auth(&headers, &state);
-        assert_eq!(request.lease_ttl_secs, state.context.lease_ttl_secs);
-        state.renew_calls += 1;
-        Json(state.current.clone().unwrap())
+    async fn stamp_mock_build_id(
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let mut response = next.run(request).await;
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(bbox_knowledge_source::DAEMON_BUILD_ID_HEADER),
+            axum::http::HeaderValue::from_static(MOCK_DAEMON_BUILD_ID),
+        );
+        response
     }
 
-    #[tokio::test]
-    async fn client_uploads_complete_capture_then_reuses_and_renews_it() {
-        let (_directory, root, workspace_id, accepted_commit) = managed_repository();
-        fs::write(
-            root.join(".bbox/knowledge/base.json"),
-            b"{\"base\":false}\n",
-        )
-        .unwrap();
-        fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
-        fs::write(root.join(".bbox/gaps/gap-1234abcd.json"), b"{}\n").unwrap();
-        let scope = PublishedScope::try_new("client-upload-test", ".").unwrap();
-        let token = "d".repeat(64);
-        let state = Arc::new(Mutex::new(MockSourceState {
-            token: token.clone(),
+    fn mock_state(
+        scope: &PublishedScope,
+        token: &str,
+        accepted_commit: String,
+    ) -> Arc<Mutex<MockSourceState>> {
+        Arc::new(Mutex::new(MockSourceState {
+            token: token.to_string(),
             context: ProvisionalCaptureContextV1 {
                 scope: scope.clone(),
                 accepted_generation: "e".repeat(64),
@@ -1778,8 +1895,13 @@ mod tests {
             next_sequence: 9,
             begin_calls: 0,
             renew_calls: 0,
-        }));
-        let app = Router::new()
+            newer_daemon: false,
+            undecodable_status: false,
+        }))
+    }
+
+    fn mock_router(state: Arc<Mutex<MockSourceState>>) -> Router {
+        Router::new()
             .route(
                 "/internal/knowledge-source/v1/provisional/context",
                 get(mock_context),
@@ -1820,9 +1942,22 @@ mod tests {
                 "/internal/knowledge-source/v1/provisional/generations/{generation}/renew",
                 post(mock_renew),
             )
-            .with_state(state.clone());
+            .layer(axum::middleware::from_fn(stamp_mock_build_id))
+            .with_state(state)
+    }
+
+    /// Serve `state` on a loopback port and hand back a bound client for the
+    /// managed repository at `root`.
+    async fn serve_mock(
+        state: Arc<Mutex<MockSourceState>>,
+        root: PathBuf,
+        workspace_id: WorkspaceId,
+        scope: PublishedScope,
+        token: String,
+    ) -> (WorkspaceCaptureClient, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let app = mock_router(state);
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = WorkspaceCaptureClient::new(
             &format!("http://{address}"),
@@ -1833,19 +1968,126 @@ mod tests {
             scope,
         )
         .unwrap();
+        (client, server)
+    }
+
+    async fn mock_renew(
+        State(state): State<Arc<Mutex<MockSourceState>>>,
+        headers: HeaderMap,
+        Json(request): Json<RenewProvisionalGenerationRequestV1>,
+    ) -> Json<ProvisionalWorkspaceStatusV1> {
+        let mut state = state.lock().unwrap();
+        assert_mock_auth(&headers, &state);
+        assert_eq!(request.lease_ttl_secs, state.context.lease_ttl_secs);
+        state.renew_calls += 1;
+        Json(state.current.clone().unwrap())
+    }
+
+    fn seed_managed_repository(root: &Path) {
+        fs::write(
+            root.join(".bbox/knowledge/base.json"),
+            b"{\"base\":false}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".bbox/gaps")).unwrap();
+        fs::write(root.join(".bbox/gaps/gap-1234abcd.json"), b"{}\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_uploads_complete_capture_then_reuses_and_renews_it() {
+        let (_directory, root, workspace_id, accepted_commit) = managed_repository();
+        seed_managed_repository(&root);
+        let scope = PublishedScope::try_new("client-upload-test", ".").unwrap();
+        let token = "d".repeat(64);
+        let state = mock_state(&scope, &token, accepted_commit);
+        let (client, server) = serve_mock(state.clone(), root, workspace_id, scope, token).await;
 
         let first = client.sync_once().await.unwrap();
         assert!(!first.reused);
         assert_eq!(first.source_generation_id, "c".repeat(64));
         assert_eq!(first.sequence, 9);
+        assert_eq!(first.daemon_build_id.as_deref(), Some(MOCK_DAEMON_BUILD_ID));
+        assert_eq!(first.diagnostic, None);
         let second = client.sync_once().await.unwrap();
         assert!(second.reused);
         assert_eq!(second.source_generation_id, first.source_generation_id);
+        assert_eq!(
+            client.daemon_build_id().as_deref(),
+            Some(MOCK_DAEMON_BUILD_ID)
+        );
         let state = state.lock().unwrap();
         assert_eq!(state.begin_calls, 1);
         assert_eq!(state.renew_calls, 1);
         assert_eq!(state.installed_blobs, state.expected_blobs);
         drop(state);
+        server.abort();
+    }
+
+    /// The bug that froze provisional overlays for older CLIs: a daemon built
+    /// after the client adds a field to the status type, which the probe
+    /// response embeds once a generation exists. The first capture (probe with
+    /// no `current`) used to land and the second (probe with `current`) used
+    /// to fail before uploading anything. Both must succeed and the second
+    /// must reuse.
+    #[tokio::test]
+    async fn client_captures_against_a_newer_daemon_that_adds_response_fields() {
+        let (_directory, root, workspace_id, accepted_commit) = managed_repository();
+        seed_managed_repository(&root);
+        let scope = PublishedScope::try_new("client-newer-daemon-test", ".").unwrap();
+        let token = "d".repeat(64);
+        let state = mock_state(&scope, &token, accepted_commit);
+        state.lock().unwrap().newer_daemon = true;
+        let (client, server) = serve_mock(state.clone(), root, workspace_id, scope, token).await;
+
+        let first = client.sync_once().await.unwrap();
+        assert!(!first.reused);
+        assert_eq!(first.diagnostic, None);
+        let second = client.sync_once().await.unwrap();
+        assert!(
+            second.reused,
+            "second capture must reuse through a probe carrying unknown fields"
+        );
+        assert_eq!(second.source_generation_id, first.source_generation_id);
+        assert_eq!(state.lock().unwrap().begin_calls, 1);
+        server.abort();
+    }
+
+    /// A landed upload whose readiness status this client cannot decode is
+    /// still a landed upload: report it captured with a diagnostic and the
+    /// daemon's build id, never as a failure that hides a live generation.
+    #[tokio::test]
+    async fn client_reports_a_landed_capture_when_the_status_is_undecodable() {
+        let (_directory, root, workspace_id, accepted_commit) = managed_repository();
+        seed_managed_repository(&root);
+        let scope = PublishedScope::try_new("client-undecodable-status-test", ".").unwrap();
+        let token = "d".repeat(64);
+        let state = mock_state(&scope, &token, accepted_commit);
+        state.lock().unwrap().undecodable_status = true;
+        let (client, server) = serve_mock(state.clone(), root, workspace_id, scope, token).await;
+
+        let outcome = client.sync_once().await.unwrap();
+        assert!(!outcome.reused);
+        assert_eq!(outcome.source_generation_id, "c".repeat(64));
+        assert_eq!(outcome.sequence, 9);
+        assert_eq!(
+            outcome.daemon_build_id.as_deref(),
+            Some(MOCK_DAEMON_BUILD_ID)
+        );
+        let diagnostic = outcome
+            .diagnostic
+            .expect("undecodable status must surface a diagnostic");
+        assert!(diagnostic.contains("could not be decoded"), "{diagnostic}");
+        assert!(diagnostic.contains(MOCK_DAEMON_BUILD_ID), "{diagnostic}");
+        assert_eq!(state.lock().unwrap().begin_calls, 1);
+
+        // With a generation now present, the probe itself is undecodable, and
+        // that error names the daemon build so the operator can act on skew.
+        let error = client.sync_once().await.unwrap_err();
+        assert!(is_decode_error(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").contains(MOCK_DAEMON_BUILD_ID),
+            "{error:#}"
+        );
         server.abort();
     }
 }

@@ -41,7 +41,8 @@ struct McpCallArgs {
     /// JSON object passed as the tool arguments
     #[arg(value_name = "JSON_ARGS")]
     json_args: String,
-    /// Daemon base URL. Defaults to http://127.0.0.1:${BBOX_PORT:-7264}.
+    /// Daemon base URL. Defaults to the origin of $BLACKBOX_MCP_URL, else
+    /// config [client].daemon_url, else http://127.0.0.1:<[daemon].port>.
     #[arg(long, value_name = "URL")]
     daemon_url: Option<String>,
 }
@@ -276,8 +277,11 @@ fn validate_credentialed_base_url(base_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The daemon base URL when no `--daemon-url` is given: `BLACKBOX_MCP_URL`'s
+/// origin, else config `[client].daemon_url`, else loopback on the configured
+/// port. See `bro_fleet_client::daemon_url`.
 pub(crate) fn default_base_url() -> String {
-    format!("http://127.0.0.1:{}", bro_fleet_client::daemon_port())
+    bro_fleet_client::daemon_url()
 }
 
 fn parse_arguments(raw: &str) -> anyhow::Result<Value> {

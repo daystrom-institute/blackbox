@@ -879,7 +879,25 @@ fn checked_store_limits(config: &crate::config::Config) -> Result<StoreLimits> {
 }
 
 pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
-    publication_router(state.clone()).merge(provisional_router(state))
+    publication_router(state.clone())
+        .merge(provisional_router(state))
+        .layer(axum::middleware::from_fn(stamp_daemon_build_id))
+}
+
+/// Stamp every knowledge-source response, success or refusal, with this
+/// daemon's build identity. Clients (`bro workspace-binding`, the collectors)
+/// compare it against their own build id so a decode failure or a stuck
+/// capture can be named as build skew instead of guessed at. Same source as
+/// the roster's `daemon_build_id`.
+async fn stamp_daemon_build_id(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(value) = header::HeaderValue::from_str(env!("BLACKBOX_BUILD_ID")) {
+        response.headers_mut().insert(
+            header::HeaderName::from_static(bbox_knowledge_source::DAEMON_BUILD_ID_HEADER),
+            value,
+        );
+    }
+    response
 }
 
 fn publication_router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
@@ -2528,6 +2546,39 @@ mod tests {
             },
             nodes,
         )
+    }
+
+    #[tokio::test]
+    async fn every_knowledge_source_response_carries_the_daemon_build_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let fixture = enabled_state(&root);
+        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
+
+        // A refusal (unauthenticated) and a parse failure both carry it: the
+        // stamp sits outside the auth layer so skew is nameable even when the
+        // request never reaches a handler.
+        for (path, token) in [
+            ("/internal/knowledge-source/v1/publication/uploads", None),
+            (
+                "/internal/knowledge-source/v1/provisional/probe",
+                Some(fixture.other_producer_token.as_str()),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request("POST", path, token, Body::from("{")))
+                .await
+                .unwrap();
+            assert_eq!(
+                response
+                    .headers()
+                    .get(bbox_knowledge_source::DAEMON_BUILD_ID_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(env!("BLACKBOX_BUILD_ID")),
+                "{path} response must carry the daemon build id"
+            );
+        }
     }
 
     #[tokio::test]

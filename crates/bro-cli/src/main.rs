@@ -333,10 +333,7 @@ async fn run_orchestrate(args: OrchestrateArgs) -> anyhow::Result<()> {
 }
 
 fn default_base_url() -> anyhow::Result<String> {
-    Ok(format!(
-        "http://127.0.0.1:{}",
-        bro_fleet_client::daemon_port()
-    ))
+    Ok(bro_fleet_client::daemon_url())
 }
 
 async fn orchestrate_peek(args: OrchestratePeekArgs) -> anyhow::Result<()> {
