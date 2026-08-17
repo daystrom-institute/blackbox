@@ -14,8 +14,10 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/render/global-render-wrong-target",
   "notes": "2026-08-14 update: the silent-wrong-target half is fixed; bbox_render scope=global on the cage daemon now refuses loudly (error.global_render_authority naming /home/blackbox/.blackbox/BLACKBOX.md and the BLACKBOX_GLOBAL_COMMON_MD override). The delivery-lane half remains open and now has a concrete consumer: the 2026-08-14 tool-docs update (bbox_search channel filter stanzas) refreshed the daemon-side bb-tool-reference knowledge entry on restart, but the operator host's rendered ~/.blackbox/BLACKBOX.md still carries the pre-update stanza and nothing can render it. Interim posture: live MCP schemas are current (sessions see the new params), only the rendered markdown copy lags; hand-editing the managed region stays prohibited.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-12T04:22:11Z",
-  "updated_at": "2026-08-14T19:48:24Z"
+  "updated_at": "2026-08-17T22:13:34Z",
+  "resolved_at": "2026-08-17T22:13:34Z",
+  "resolution_note": "Delivery lane shipped and verified end to end 2026-08-17: cage converged on image e8c6e18a99a2 (bbox_render global_plan), bro bb08cbf5 installed on the operator host, `bro render global` refreshed ~/.blackbox/BLACKBOX.md (30649 -> 31816 chars) and ~/.claude/CLAUDE.md with backups under ~/.local/state/blackbox/backups/20260817T221040Z. Verify workflow bbox-verify-twbxp green (full profile). Target policy: the host that runs the pull."
 }
