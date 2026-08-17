@@ -319,6 +319,7 @@ impl GraphProjection for SyntheticDatasetProjection {
                     VertexTypeDefinition {
                         required: asset_required,
                         properties: asset_properties,
+                        hints: Vec::new(),
                     },
                 ),
                 (
@@ -329,6 +330,7 @@ impl GraphProjection for SyntheticDatasetProjection {
                             ("remote_id".to_string(), json!("string")),
                             ("name".to_string(), json!("string")),
                         ]),
+                        hints: Vec::new(),
                     },
                 ),
             ]),

@@ -313,6 +313,7 @@ mod tests {
                 VertexTypeDefinition {
                     required: Vec::new(),
                     properties,
+                    hints: Vec::new(),
                 },
             )]),
             edge_types: Vec::new(),
@@ -426,6 +427,7 @@ mod tests {
             VertexTypeDefinition {
                 required: Vec::new(),
                 properties: BTreeMap::new(),
+                hints: Vec::new(),
             },
         );
         let mut generation = generation(schema, &["Alpha"]);

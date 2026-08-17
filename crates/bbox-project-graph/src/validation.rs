@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{
     ANNOTATION_EMBED_KEY, ANNOTATION_INDEX_KEY, EdgeTypeDefinition, GraphAuthority,
-    GraphDescriptor, GraphSchema, GraphSource, ProjectGraphEdge, ProjectGraphVertex,
+    GraphDescriptor, GraphSchema, GraphSource, HintDirection, ProjectGraphEdge, ProjectGraphVertex,
     PropertyIndexMode, RetentionPolicy, VertexTypeDefinition, is_annotated_property_term,
     property_term_body,
 };
@@ -319,8 +319,76 @@ fn validate_schema(schema: &GraphSchema, errors: &mut Vec<ValidationError>) {
         validate_edge_property_definition(definition, &schema.index_policy, errors);
     }
 
+    // Hints are validated against the WHOLE edge-type set, so this runs after
+    // the edge loop rather than inside the vertex loop above.
+    validate_next_hop_hints(schema, errors);
+
     let declared_vertex_types = schema_vertex_ids;
     validate_retrieval_policy(schema, &declared_vertex_types, errors);
+}
+
+/// Validate the schema-declared next-hop hints on every vertex type.
+///
+/// A hint is a retrieval instruction, so a wrong one sends every consumer one
+/// hop into nothing. All three failures are schema errors, not silent drops:
+/// an edge type this schema never declared, a direction no declared endpoint
+/// pair supports, and the same (edge type, direction) hop declared twice on
+/// one vertex type.
+fn validate_next_hop_hints(schema: &GraphSchema, errors: &mut Vec<ValidationError>) {
+    for (type_name, definition) in &schema.vertex_types {
+        let mut seen_hops = BTreeSet::new();
+        for hint in &definition.hints {
+            if !seen_hops.insert((&hint.edge_type, hint.direction)) {
+                errors.push(ValidationError::new(
+                    "schema.duplicate_hint",
+                    "schema.json",
+                    None,
+                    format!(
+                        "vertex type `{type_name}` repeats next-hop hint (`{}`, {})",
+                        hint.edge_type,
+                        hint.direction.as_str()
+                    ),
+                ));
+                continue;
+            }
+            let Some(edge_type) = schema
+                .edge_types
+                .iter()
+                .find(|candidate| candidate.type_name == hint.edge_type)
+            else {
+                errors.push(ValidationError::new(
+                    "schema.hint_unknown_edge_type",
+                    "schema.json",
+                    None,
+                    format!(
+                        "vertex type `{type_name}` next-hop hint references edge type `{}` which is not declared in this schema",
+                        hint.edge_type
+                    ),
+                ));
+                continue;
+            };
+            let supported = edge_type.endpoints.iter().any(|endpoint| {
+                let endpoint_type = match hint.direction {
+                    HintDirection::Out => &endpoint.from_type,
+                    HintDirection::In => &endpoint.to_type,
+                };
+                endpoint_type == type_name
+            });
+            if !supported {
+                errors.push(ValidationError::new(
+                    "schema.hint_direction_mismatch",
+                    "schema.json",
+                    None,
+                    format!(
+                        "vertex type `{type_name}` next-hop hint declares edge type `{}` in direction {}, but no declared endpoint pair puts `{type_name}` on the `{}` side",
+                        hint.edge_type,
+                        hint.direction.as_str(),
+                        hint.direction.endpoint_role()
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Validate the per-graph retrieval policy block (unified-retrieval design
@@ -903,7 +971,7 @@ fn uses_reserved_namespace(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GraphAuthority, GraphScope};
+    use crate::{GraphAuthority, GraphScope, NextHopHint};
     use serde_json::json;
 
     fn descriptor() -> GraphDescriptor {
@@ -933,6 +1001,7 @@ mod tests {
                         "source".into(),
                         json!({"path": "string", "tags": ["string"]}),
                     )]),
+                    hints: Vec::new(),
                 },
             )]),
             edge_types: Vec::new(),
@@ -1401,5 +1470,153 @@ mod tests {
                 "{malformed:?} missing code in {errors:?}"
             );
         }
+    }
+
+    /// A schema carrying next-hop hints round-trips and validates clean when
+    /// every hint names a declared edge type in a direction its endpoints
+    /// support.
+    #[test]
+    fn authored_hints_round_trip_and_validate() {
+        let raw = r#"{
+            "version": 1,
+            "namespace": "repo",
+            "vertex_types": {
+                "repo:Claim": {
+                    "hints": [
+                        {"edge_type": "repo:CITES", "direction": "out", "label": "cited basis"},
+                        {"edge_type": "repo:CITES", "direction": "in", "label": "citing claims"}
+                    ]
+                }
+            },
+            "edge_types": [
+                {"type": "repo:CITES", "from_type": "repo:Claim", "to_type": "repo:Claim"}
+            ]
+        }"#;
+        let parsed: GraphSchema = serde_json::from_str(raw).unwrap();
+        let hints = &parsed.vertex_types["repo:Claim"].hints;
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].edge_type, "repo:CITES");
+        assert_eq!(hints[0].direction, HintDirection::Out);
+        assert_eq!(hints[0].label, "cited basis");
+        assert_eq!(hints[1].direction, HintDirection::In);
+
+        // Array order is priority order, so it must survive serialization.
+        let reserialized: GraphSchema =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reserialized.vertex_types["repo:Claim"].hints, *hints);
+
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &parsed,
+            &[],
+            &[],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn hint_naming_an_undeclared_edge_type_is_rejected() {
+        let mut schema = schema();
+        schema
+            .vertex_types
+            .get_mut("repo:Claim")
+            .unwrap()
+            .hints
+            .push(NextHopHint {
+                edge_type: "repo:GHOST".into(),
+                direction: HintDirection::Out,
+                label: "nowhere".into(),
+            });
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        let error = errors
+            .iter()
+            .find(|error| error.code == "schema.hint_unknown_edge_type")
+            .unwrap_or_else(|| panic!("{errors:?}"));
+        assert!(error.message.contains("repo:GHOST"), "{}", error.message);
+    }
+
+    #[test]
+    fn hint_direction_no_endpoint_pair_supports_is_rejected() {
+        let mut schema = schema();
+        schema.edge_types.push(EdgeTypeDefinition {
+            type_name: "repo:CITES".into(),
+            endpoints: vec![crate::EdgeEndpointDefinition {
+                from_type: "repo:Claim".into(),
+                to_type: "repo:Claim".into(),
+            }],
+            required: Vec::new(),
+            properties: BTreeMap::new(),
+        });
+        schema.vertex_types.insert(
+            "repo:Subject".into(),
+            VertexTypeDefinition {
+                required: Vec::new(),
+                properties: BTreeMap::new(),
+                // repo:CITES never touches repo:Subject on either end.
+                hints: vec![NextHopHint {
+                    edge_type: "repo:CITES".into(),
+                    direction: HintDirection::In,
+                    label: "citing claims".into(),
+                }],
+            },
+        );
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        let error = errors
+            .iter()
+            .find(|error| error.code == "schema.hint_direction_mismatch")
+            .unwrap_or_else(|| panic!("{errors:?}"));
+        assert!(error.message.contains("`to` side"), "{}", error.message);
+    }
+
+    #[test]
+    fn the_same_hop_declared_twice_on_one_vertex_type_is_rejected() {
+        let mut schema = schema();
+        schema.edge_types.push(EdgeTypeDefinition {
+            type_name: "repo:CITES".into(),
+            endpoints: vec![crate::EdgeEndpointDefinition {
+                from_type: "repo:Claim".into(),
+                to_type: "repo:Claim".into(),
+            }],
+            required: Vec::new(),
+            properties: BTreeMap::new(),
+        });
+        let hints = &mut schema.vertex_types.get_mut("repo:Claim").unwrap().hints;
+        for label in ["cited basis", "cited basis again"] {
+            hints.push(NextHopHint {
+                edge_type: "repo:CITES".into(),
+                direction: HintDirection::Out,
+                label: label.into(),
+            });
+        }
+        let errors = validate_graph(
+            "repo",
+            GraphSource::Committed,
+            &descriptor(),
+            &schema,
+            &[],
+            &[],
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.code == "schema.duplicate_hint"),
+            "{errors:?}"
+        );
     }
 }

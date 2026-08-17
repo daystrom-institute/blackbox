@@ -10,6 +10,22 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Project-graph schemas can declare per-vertex-type retrieval hints: a
+  `hints` array of `{edge_type, direction, label}` entries, in priority
+  order, on each vertex type. `bbox_inspect_entity` renders them as
+  labeled, direction-aware next hops carrying the exact
+  `edge_types` / `direction` arguments to pass back, keeps a declared hop
+  with no edges visible as `(none)`, and never truncates an authored hop
+  under the display cap; `bbox_discover_seed_entities` previews a
+  directional hop in that direction only. A vertex type that declares
+  nothing still gets a tier-0 derivation from every edge type whose
+  declared endpoints touch it, and a vertex type with no hints at all
+  renders exactly as before. Bad hints are schema errors
+  (`schema.hint_unknown_edge_type`, `schema.hint_direction_mismatch`,
+  `schema.duplicate_hint`). Compatibility: the schema type is
+  `deny_unknown_fields`, so a daemon older than this field refuses a
+  schema carrying `hints` at validate/publish time; deploy the daemon
+  before authoring hints.
 - Knowledge-source wire compatibility: response bodies a client decodes
   (probe, status, capture context, upload begin/finalize, missing-blob pages)
   now tolerate unknown fields, so a `bro` or collector built before the

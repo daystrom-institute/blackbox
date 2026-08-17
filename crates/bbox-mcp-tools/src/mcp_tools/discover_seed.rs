@@ -12,7 +12,7 @@ use bbox_edge_index::edge_index::{Edge, EdgeIndex};
 use bbox_indexing::index::TranscriptIndex;
 use bbox_knowledge::knowledge::Knowledge;
 use bbox_providers::entity_loader;
-use bbox_providers::providers::{self, Neighborhood, ProviderContext};
+use bbox_providers::providers::{self, Neighborhood, NextHopDirection, ProviderContext};
 
 const DEFAULT_LIMIT: u64 = 8;
 const MAX_LIMIT: u64 = 30;
@@ -187,31 +187,46 @@ fn notable_edges(
     let neighborhood = Neighborhood { forward, reverse };
     let entity = entity_loader::load(ctx, entity_ref)
         .unwrap_or_else(|_| providers::empty_neighborhood_view(entity_ref, Default::default()));
-    let priorities = providers::provider_for(entity_ref.entity_type())
+    let hops = providers::provider_for(entity_ref.entity_type())
         .recommended_next_hops(&entity, &neighborhood)
         .into_iter()
         .filter(|hop| hop.count > 0)
-        .map(|hop| hop.edge_family_name)
         .collect::<Vec<_>>();
-    if priorities.is_empty() {
+    if hops.is_empty() {
         return Vec::new();
     }
 
-    let priority_set = priorities.iter().collect::<BTreeSet<_>>();
+    // A hop that names a direction is previewed in THAT direction only:
+    // "governed scope, outbound" is a different hop from the same family read
+    // backwards, and showing the reverse edges under it would misrepresent the
+    // hint. Direction-blind hops still preview both ways.
+    let priorities_for = |direction: NextHopDirection| {
+        hops.iter()
+            .filter(|hop| {
+                hop.direction
+                    .is_none_or(|hop_direction| hop_direction == direction)
+            })
+            .map(|hop| hop.edge_family_name.clone())
+            .collect::<Vec<_>>()
+    };
+    let outbound = priorities_for(NextHopDirection::Out);
+    let inbound = priorities_for(NextHopDirection::In);
+    let outbound_set = outbound.iter().collect::<BTreeSet<_>>();
+    let inbound_set = inbound.iter().collect::<BTreeSet<_>>();
     let mut out = Vec::new();
     out.extend(select_notable_edges(
         ctx,
         &neighborhood.forward,
         "out",
-        &priorities,
-        &priority_set,
+        &outbound,
+        &outbound_set,
     ));
     out.extend(select_notable_edges(
         ctx,
         &neighborhood.reverse,
         "in",
-        &priorities,
-        &priority_set,
+        &inbound,
+        &inbound_set,
     ));
     out
 }

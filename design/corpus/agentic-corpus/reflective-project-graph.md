@@ -423,6 +423,70 @@ The edge `type` must be declared in `schema.json`. Its source and target types
 must match any declared endpoint pair. Edge properties use the same JSON shape
 rules as vertex properties.
 
+## Retrieval Hints
+
+A schema author knows which hop matters from a given vertex type. Nothing else
+does. The generic provider can only count edge families, direction-blind and
+alphabetical, which is exactly the shape that produces the "one hop short"
+retrieval failure: the agent sees `gov:CORRECTS (2)` and cannot tell whether
+those corrections point at this record or away from it, or whether they are the
+hop worth taking at all.
+
+So a vertex type may declare per-kind next-hop hints, in priority order:
+
+```json
+"gov:Claim": {
+  "required": ["status", "text"],
+  "properties": {"status": {"enum": ["draft", "active"]}, "text": "string"},
+  "hints": [
+    {"edge_type": "gov:CITES", "direction": "out", "label": "cited basis"},
+    {"edge_type": "gov:SUPPORTS", "direction": "in", "label": "supporting evidence"}
+  ]
+}
+```
+
+`hints` is optional and defaults to empty. Array order IS priority order.
+`direction` is `out` (this vertex type is the endpoint pair's `from`) or `in`
+(this vertex type is its `to`). `label` is what the hop means to a reader.
+
+Three validation codes, all schema errors rather than silent drops, because a
+wrong hint sends every consumer one hop into nothing:
+
+- `schema.hint_unknown_edge_type`: the hint names an edge type this schema does
+  not declare.
+- `schema.hint_direction_mismatch`: no declared endpoint pair puts this vertex
+  type on the side the direction requires.
+- `schema.duplicate_hint`: the same (edge type, direction) hop is declared twice
+  on one vertex type.
+
+### Tier-0 Derivation
+
+Authoring hints is optional, and the derivation floor is free: for any vertex
+type, every edge type whose declared endpoints touch it derives a hint. An edge
+type touching the vertex type on both endpoint roles derives TWO hints, one per
+direction, because those are two different hops. Derived hints carry no label
+because nobody wrote one.
+
+The resolved ordering is:
+
+1. Authored hints, in schema order, direction-aware, INCLUDING zero-count ones:
+   an author who says "open findings matter here" is asking for `(none)` to be
+   visible, because absence is the answer to the question the hint poses.
+2. Tier-0 derived hints that have edges, ranked by count then edge type name.
+3. Observed edge families no hint covers (the evidence-binding lane, and
+   anything a graph carries beyond its own schema). Direction-blind and
+   alphabetical, so a vertex whose type declares no hints renders exactly as it
+   did before hints existed.
+
+`bbox_inspect_entity` renders each direction-aware hop with its arrow, label,
+count, and the literal `edge_types` / `direction` arguments to pass back; the
+display cap that bounds the observed tail never truncates an authored hop.
+`bbox_discover_seed_entities` previews a directional hop in that direction only.
+
+Compatibility: `VertexTypeDefinition` is `deny_unknown_fields`, so a daemon
+older than this field REFUSES a schema carrying `hints` at validate and publish
+time. Deploy the daemon before authoring hints.
+
 ## Query Semantics
 
 The graph should participate in existing graph traversal once loaded.

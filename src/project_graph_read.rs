@@ -11,10 +11,11 @@ use bbox_indexing::project_graph_view::{
 use bbox_knowledge::overlay::ProvisionalMode;
 use bbox_project_graph::{
     EvidenceBinding, EvidenceEndpointObservation, EvidenceEndpointStatus, GraphAuthority,
-    GraphGeneration, ProjectGraphVertex, ValidationError,
+    GraphGeneration, HintDirection, ProjectGraphVertex, ValidationError,
 };
 use bbox_providers::providers::{
-    EntityView, Neighborhood, ProjectGraphEntityResolver, empty_neighborhood_view,
+    EntityView, Neighborhood, NextHopDirection, NextHopHint as ProviderNextHopHint,
+    ProjectGraphEntityResolver, empty_neighborhood_view,
 };
 use bro_core::WorkspaceId;
 use serde::Serialize;
@@ -565,6 +566,25 @@ impl ProjectGraphEntityResolver for BlackboxServer {
         };
         let canonical = resolved.canonical_ref.clone();
         let mut view = empty_neighborhood_view(&canonical, properties);
+        // Schema-declared retrieval hints for this vertex's TYPE, projected
+        // into the provider vocabulary. The schema is the substrate's answer to
+        // "which hop is worth taking from here"; without it a consumer only
+        // sees direction-blind family counts and lands one hop short.
+        view.next_hop_hints = resolved
+            .graph
+            .schema
+            .next_hop_hints_for(&resolved.vertex.type_name)
+            .into_iter()
+            .map(|hint| ProviderNextHopHint {
+                edge_family_name: hint.edge_type,
+                direction: match hint.direction {
+                    HintDirection::Out => NextHopDirection::Out,
+                    HintDirection::In => NextHopDirection::In,
+                },
+                label: hint.label,
+                authored: hint.authored,
+            })
+            .collect();
         view.neighborhood = Neighborhood {
             forward: forward
                 .into_iter()

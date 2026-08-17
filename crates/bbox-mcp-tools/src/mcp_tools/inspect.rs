@@ -78,6 +78,15 @@ struct RenderedEdge {
 struct RenderedNextHop {
     edge_family: String,
     count: usize,
+    /// `out` / `in` when the substrate knows which way the hop goes. Absent for
+    /// direction-blind family counts, so the payload does not grow for
+    /// providers that have no schema to read a direction from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
+    /// What the hop MEANS, from a schema-authored hint. Absent when nobody
+    /// wrote one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -433,14 +442,63 @@ pub fn compact_label(
     entity_loader::compact_label(ctx, r, loaded)
 }
 
+const NEXT_HOP_DISPLAY_CAP: usize = 5;
+
+/// Render the provider's recommended hops under a display cap that authored
+/// hints are exempt from.
+///
+/// The cap exists to stop a long observed-family tail from burying the useful
+/// hops. An authored schema hint is the opposite of that tail: the author
+/// declared it worth following, so truncating one would drop exactly the signal
+/// the cap is meant to protect. Everything else fills up to the cap.
 fn render_next_hops(hops: Vec<NextHop>) -> Vec<RenderedNextHop> {
-    hops.into_iter()
-        .take(5)
-        .map(|hop| RenderedNextHop {
+    let authored_count = hops.iter().filter(|hop| hop.authored).count();
+    let budget = NEXT_HOP_DISPLAY_CAP.max(authored_count);
+    let mut rendered = Vec::new();
+    for hop in hops {
+        if !hop.authored && rendered.len() >= budget {
+            continue;
+        }
+        rendered.push(RenderedNextHop {
             edge_family: hop.edge_family_name,
             count: hop.count,
-        })
-        .collect()
+            direction: hop
+                .direction
+                .map(|direction| direction.as_str().to_string()),
+            label: hop.label,
+        });
+    }
+    rendered
+}
+
+/// One line of the human "Recommended next hops" section.
+///
+/// A direction-aware hop renders the arrow, the label, and the exact
+/// `edge_types` / `direction` arguments to pass straight back into
+/// `bbox_inspect_entity`: the point of the hint is that the reader does not
+/// have to assemble the follow-up call. A zero-count authored hint renders
+/// `(none)` rather than `(0)`, because "there are no open findings" is the
+/// answer, not a missing number. A direction-blind hop keeps the older
+/// `family (count)` shape.
+fn next_hop_line(hop: &RenderedNextHop) -> String {
+    let Some(direction) = hop.direction.as_deref() else {
+        return format!("  {} ({})\n", hop.edge_family, hop.count);
+    };
+    let arrow = if direction == "out" { "-->" } else { "<--" };
+    let label = hop
+        .label
+        .as_deref()
+        .map(|label| format!(" {label}"))
+        .unwrap_or_default();
+    let count = if hop.count == 0 {
+        "none".to_string()
+    } else {
+        hop.count.to_string()
+    };
+    format!(
+        "  {arrow}[{}]{label} ({count})  inspect: edge_types=\"{}\" direction=\"{direction}\"\n",
+        hop.edge_family, hop.edge_family
+    )
 }
 
 fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeMap<String, String> {
@@ -526,7 +584,7 @@ fn render_text(input: InspectText<'_>) -> String {
         text.push_str("  (none)\n");
     } else {
         for hop in recommended {
-            text.push_str(&format!("  {} ({})\n", hop.edge_family, hop.count));
+            text.push_str(&next_hop_line(hop));
         }
     }
     text.push_str("\n### Edge family coverage\n");
@@ -563,6 +621,95 @@ fn labeled_ref(entity_ref: &str, label: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hop(
+        family: &str,
+        count: usize,
+        direction: Option<providers::NextHopDirection>,
+        label: Option<&str>,
+    ) -> NextHop {
+        NextHop {
+            edge_family_name: family.to_string(),
+            count,
+            direction,
+            label: label.map(str::to_string),
+            authored: label.is_some(),
+        }
+    }
+
+    #[test]
+    fn a_directed_labeled_hop_renders_the_call_it_wants_you_to_make() {
+        let rendered = render_next_hops(vec![hop(
+            "pgc:LICENSED_BY",
+            1,
+            Some(providers::NextHopDirection::Out),
+            Some("licensing"),
+        )]);
+        assert_eq!(
+            next_hop_line(&rendered[0]),
+            "  -->[pgc:LICENSED_BY] licensing (1)  inspect: edge_types=\"pgc:LICENSED_BY\" direction=\"out\"\n"
+        );
+    }
+
+    #[test]
+    fn a_zero_count_authored_hop_says_none_rather_than_zero() {
+        let rendered = render_next_hops(vec![hop(
+            "pgc:DIAGNOSES",
+            0,
+            Some(providers::NextHopDirection::In),
+            Some("open findings"),
+        )]);
+        assert_eq!(
+            next_hop_line(&rendered[0]),
+            "  <--[pgc:DIAGNOSES] open findings (none)  inspect: edge_types=\"pgc:DIAGNOSES\" direction=\"in\"\n"
+        );
+    }
+
+    #[test]
+    fn a_direction_blind_hop_keeps_the_bare_family_count_line() {
+        let rendered = render_next_hops(vec![hop("DERIVED_FROM", 3, None, None)]);
+        assert_eq!(next_hop_line(&rendered[0]), "  DERIVED_FROM (3)\n");
+        let value = serde_json::to_value(&rendered[0]).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"edge_family": "DERIVED_FROM", "count": 3}),
+            "direction and label are omitted, not emitted as null"
+        );
+    }
+
+    #[test]
+    fn the_display_cap_never_truncates_an_authored_hop() {
+        let mut hops = (0..7)
+            .map(|idx| {
+                hop(
+                    &format!("gov:AUTHORED_{idx}"),
+                    idx,
+                    Some(providers::NextHopDirection::Out),
+                    Some("authored"),
+                )
+            })
+            .collect::<Vec<_>>();
+        hops.extend((0..4).map(|idx| hop(&format!("observed:{idx}"), 1, None, None)));
+        let rendered = render_next_hops(hops);
+        assert_eq!(
+            rendered.len(),
+            7,
+            "all 7 authored hops survive and the observed tail is squeezed out"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|hop| hop.edge_family.starts_with("gov:AUTHORED_"))
+        );
+    }
+
+    #[test]
+    fn the_display_cap_still_bounds_an_unauthored_tail() {
+        let hops = (0..9)
+            .map(|idx| hop(&format!("observed:{idx}"), 1, None, None))
+            .collect::<Vec<_>>();
+        assert_eq!(render_next_hops(hops).len(), 5);
+    }
 
     #[test]
     fn bad_input_uses_design_error_shape() {

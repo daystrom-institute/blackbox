@@ -40,6 +40,11 @@ pub struct EntityView {
     pub entity_type: EntityType,
     pub properties: BTreeMap<String, String>,
     pub neighborhood: Neighborhood,
+    /// Schema-declared and schema-derived next-hop hints for this entity's
+    /// type, filled by providers whose entities have a declared schema to read
+    /// them from (today: project graph vertices). Empty everywhere else, so a
+    /// provider that only counts edge families keeps its existing behavior.
+    pub next_hop_hints: Vec<NextHopHint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,10 +61,51 @@ pub struct Neighborhood {
     pub reverse: Vec<Edge>,
 }
 
+/// Which way a recommended hop is followed. `None` on a `NextHop` means the
+/// recommendation is direction-blind: the count spans both directions and the
+/// consumer has nothing better to suggest than "look at this family".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NextHopDirection {
+    Out,
+    In,
+}
+
+impl NextHopDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Out => "out",
+            Self::In => "in",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextHop {
     pub edge_family_name: String,
     pub count: usize,
+    /// Set when the hop is direction-aware, so a consumer can render (and a
+    /// caller can pass back) `direction=out` / `direction=in` instead of
+    /// re-deriving it.
+    pub direction: Option<NextHopDirection>,
+    /// Human-meaningful name for the hop, when the substrate has one. Only
+    /// authored schema hints carry a label.
+    pub label: Option<String>,
+    /// Whether this hop came from an AUTHORED hint rather than being derived or
+    /// observed. Authored hops are never dropped by a consumer's display cap:
+    /// the author said they matter.
+    pub authored: bool,
+}
+
+/// One next-hop hint attached to an [`EntityView`], projected from whatever
+/// schema the owning provider reads. Deliberately provider-local rather than
+/// re-exported from the graph crate: the provider layer sits below the graph
+/// store in the crate DAG.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextHopHint {
+    pub edge_family_name: String,
+    pub direction: NextHopDirection,
+    pub label: Option<String>,
+    pub authored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,6 +461,7 @@ pub fn empty_neighborhood_view(r: &EntityRef, properties: BTreeMap<String, Strin
         entity_type: r.entity_type(),
         properties,
         neighborhood: Neighborhood::default(),
+        next_hop_hints: Vec::new(),
     }
 }
 
@@ -463,6 +510,9 @@ pub fn next_hops(neighborhood: &Neighborhood, families: &[&str]) -> Vec<NextHop>
             NextHop {
                 edge_family_name: (*family).to_string(),
                 count,
+                direction: None,
+                label: None,
+                authored: false,
             }
         })
         .collect()

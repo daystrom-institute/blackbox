@@ -42,7 +42,12 @@
         "status": {"enum": ["draft", "active", "retired"]},
         "version": "number",
         "text": "string"
-      }
+      },
+      "hints": [
+        {"edge_type": "gov:CITES", "direction": "out", "label": "cited basis"},
+        {"edge_type": "gov:SUPPORTS", "direction": "in", "label": "supporting evidence"},
+        {"edge_type": "gov:CORRECTS", "direction": "in", "label": "pending corrections"}
+      ]
     },
     "gov:Evidence": {
       "required": ["kind", "version", "locator"],
@@ -81,7 +86,11 @@
         "status": {"enum": ["draft", "active", "retired"]},
         "version": "number",
         "text": "string"
-      }
+      },
+      "hints": [
+        {"edge_type": "gov:GOVERNS", "direction": "out", "label": "governed agreements"},
+        {"edge_type": "gov:AUTHORIZED_BY", "direction": "out", "label": "authority basis"}
+      ]
     },
     "gov:Approval": {
       "required": ["status", "version"],

@@ -215,6 +215,61 @@ pub fn property_annotations(term: &Value) -> PropertyAnnotations {
     }
 }
 
+/// Which way a next-hop hint points, read from the perspective of the vertex
+/// type that declares it: `out` follows an edge whose `from` endpoint is this
+/// type, `in` follows one whose `to` endpoint is this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HintDirection {
+    Out,
+    In,
+}
+
+impl HintDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Out => "out",
+            Self::In => "in",
+        }
+    }
+
+    /// The endpoint role this direction reads: an `out` hint matches on the
+    /// endpoint pair's `from` type, an `in` hint on its `to` type.
+    pub fn endpoint_role(self) -> &'static str {
+        match self {
+            Self::Out => "from",
+            Self::In => "to",
+        }
+    }
+}
+
+/// One schema-declared retrieval hint on a vertex type: which edge to follow,
+/// which way to follow it, and what the hop means to a reader.
+///
+/// The hint exists so a retrieval consumer does not have to reconstruct
+/// direction and intent from a direction-blind edge-family count. Array order
+/// on the vertex type is PRIORITY order: the author says which hop matters
+/// most, and consumers preserve it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NextHopHint {
+    pub edge_type: String,
+    pub direction: HintDirection,
+    pub label: String,
+}
+
+/// A next-hop hint resolved for one vertex type: an authored hint, or a tier-0
+/// hint derived from the schema's endpoint declarations. `authored` is the
+/// discriminator consumers rank on; a derived hint carries no label because
+/// nobody wrote one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedNextHopHint {
+    pub edge_type: String,
+    pub direction: HintDirection,
+    pub label: Option<String>,
+    pub authored: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VertexTypeDefinition {
@@ -222,6 +277,81 @@ pub struct VertexTypeDefinition {
     pub required: Vec<String>,
     #[serde(default)]
     pub properties: BTreeMap<String, Value>,
+    /// Schema-declared next-hop hints, in priority order. Optional: a vertex
+    /// type that declares none still gets the tier-0 hints derived from the
+    /// schema's endpoint declarations (see
+    /// [`GraphSchema::next_hop_hints_for`]).
+    ///
+    /// Compatibility note: this struct is `deny_unknown_fields`, so a daemon
+    /// older than this field REFUSES a schema that carries `hints`. Deploy
+    /// before authoring.
+    #[serde(default)]
+    pub hints: Vec<NextHopHint>,
+}
+
+impl GraphSchema {
+    /// The next-hop hints for one vertex type: authored hints first in schema
+    /// order, then tier-0 hints derived from every edge type whose declared
+    /// endpoints touch this vertex type.
+    ///
+    /// An edge type touching the vertex type on both endpoint roles derives
+    /// TWO hints, one per direction, because those are two different hops.
+    /// Derived hints are deduped against the authored ones on
+    /// (edge_type, direction) and sorted by edge type name, so the derived
+    /// tail is stable while the authored head stays author-ordered.
+    pub fn next_hop_hints_for(&self, vertex_type: &str) -> Vec<ResolvedNextHopHint> {
+        let mut resolved = Vec::new();
+        let mut seen = BTreeSet::new();
+        if let Some(definition) = self.vertex_types.get(vertex_type) {
+            for hint in &definition.hints {
+                if !seen.insert((hint.edge_type.clone(), hint.direction)) {
+                    continue;
+                }
+                resolved.push(ResolvedNextHopHint {
+                    edge_type: hint.edge_type.clone(),
+                    direction: hint.direction,
+                    label: Some(hint.label.clone()),
+                    authored: true,
+                });
+            }
+        }
+        let mut derived = Vec::new();
+        for definition in &self.edge_types {
+            for direction in [HintDirection::Out, HintDirection::In] {
+                let touches = definition.endpoints.iter().any(|endpoint| {
+                    let endpoint_type = match direction {
+                        HintDirection::Out => &endpoint.from_type,
+                        HintDirection::In => &endpoint.to_type,
+                    };
+                    endpoint_type == vertex_type
+                });
+                if !touches {
+                    continue;
+                }
+                let key = (definition.type_name.clone(), direction);
+                if seen.contains(&key) {
+                    continue;
+                }
+                if !derived.iter().any(|candidate: &(String, HintDirection)| {
+                    candidate.0 == key.0 && candidate.1 == key.1
+                }) {
+                    derived.push(key);
+                }
+            }
+        }
+        derived.sort();
+        resolved.extend(
+            derived
+                .into_iter()
+                .map(|(edge_type, direction)| ResolvedNextHopHint {
+                    edge_type,
+                    direction,
+                    label: None,
+                    authored: false,
+                }),
+        );
+        resolved
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -457,17 +587,24 @@ pub fn build_generation(
     let authored_edge_count = fact_edges.len();
     let mut vertices = fixed_meta_vertices();
     for (type_name, definition) in &schema.vertex_types {
+        let mut properties = BTreeMap::from([
+            ("required".into(), json!(definition.required)),
+            ("properties".into(), json!(definition.properties)),
+            ("schema_definition".into(), Value::Bool(true)),
+        ]);
+        // Only reflected when authored: an empty `hints` array on every
+        // reflected vertex type would be pure padding, and its absence already
+        // means "no authored hints, tier-0 derivation only".
+        if !definition.hints.is_empty() {
+            properties.insert("hints".into(), json!(definition.hints));
+        }
         vertices.insert(
             type_name.clone(),
             ProjectGraphVertex {
                 id: type_name.clone(),
                 type_name: META_VERTEX_TYPE.to_string(),
                 label: type_name.clone(),
-                properties: BTreeMap::from([
-                    ("required".into(), json!(definition.required)),
-                    ("properties".into(), json!(definition.properties)),
-                    ("schema_definition".into(), Value::Bool(true)),
-                ]),
+                properties,
             },
         );
     }
@@ -816,5 +953,132 @@ impl ProjectGraphCatalog {
             })
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema() -> GraphSchema {
+        serde_json::from_str(
+            r#"{
+                "version": 1,
+                "namespace": "gov",
+                "vertex_types": {
+                    "gov:Claim": {
+                        "hints": [
+                            {"edge_type": "gov:CORRECTS", "direction": "in", "label": "pending corrections"},
+                            {"edge_type": "gov:CITES", "direction": "out", "label": "cited basis"}
+                        ]
+                    },
+                    "gov:Evidence": {},
+                    "gov:Correction": {}
+                },
+                "edge_types": [
+                    {"type": "gov:CITES", "from_type": "gov:Claim", "to_type": "gov:Evidence"},
+                    {"type": "gov:SUPERSEDES", "from_type": "gov:Claim", "to_type": "gov:Claim"},
+                    {"type": "gov:CORRECTS", "from_type": "gov:Correction", "to_type": "gov:Claim"}
+                ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn authored_hints_lead_in_schema_order_then_derived_hints_sorted_by_edge_type() {
+        let resolved = schema().next_hop_hints_for("gov:Claim");
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|hint| (
+                    hint.edge_type.as_str(),
+                    hint.direction,
+                    hint.label.as_deref(),
+                    hint.authored
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                // Authored, in the order the author wrote them.
+                (
+                    "gov:CORRECTS",
+                    HintDirection::In,
+                    Some("pending corrections"),
+                    true
+                ),
+                ("gov:CITES", HintDirection::Out, Some("cited basis"), true),
+                // Derived tail, sorted by edge type name. gov:SUPERSEDES
+                // touches gov:Claim on BOTH endpoint roles, so it derives two
+                // hints: they are two different hops.
+                ("gov:SUPERSEDES", HintDirection::Out, None, false),
+                ("gov:SUPERSEDES", HintDirection::In, None, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vertex_type_with_no_authored_hints_still_gets_the_tier_zero_derivation() {
+        let resolved = schema().next_hop_hints_for("gov:Evidence");
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|hint| (hint.edge_type.as_str(), hint.direction, hint.authored))
+                .collect::<Vec<_>>(),
+            vec![("gov:CITES", HintDirection::In, false)]
+        );
+    }
+
+    #[test]
+    fn an_authored_hop_is_never_repeated_by_the_derived_tail() {
+        let resolved = schema().next_hop_hints_for("gov:Claim");
+        let corrects_in = resolved
+            .iter()
+            .filter(|hint| hint.edge_type == "gov:CORRECTS" && hint.direction == HintDirection::In)
+            .count();
+        assert_eq!(corrects_in, 1);
+    }
+
+    #[test]
+    fn an_unknown_vertex_type_derives_nothing() {
+        assert!(schema().next_hop_hints_for("gov:Absent").is_empty());
+    }
+
+    #[test]
+    fn authored_hints_reflect_onto_the_meta_vertex_only_when_present() {
+        let generation = build_generation(
+            GraphKey {
+                scope_id: "scope".into(),
+                graph_id: "governance".into(),
+                source: GraphSource::Committed,
+            },
+            GraphDescriptor {
+                descriptor_version: DESCRIPTOR_VERSION,
+                scope: GraphScope::Project,
+                graph_id: "governance".into(),
+                authority: GraphAuthority::Project,
+                schema_id: "gov:schema".into(),
+                schema_version: 1,
+                projection_version: None,
+                source_connector: None,
+                retention_policy: RetentionPolicy::ProjectOwned,
+                generation: 1,
+            },
+            schema(),
+            Vec::new(),
+            Vec::new(),
+            "a".repeat(64),
+            PathBuf::from("/store"),
+        );
+        let claim = &generation.vertices["gov:Claim"];
+        let hints = claim.properties["hints"].as_array().unwrap();
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0]["edge_type"], "gov:CORRECTS");
+        assert_eq!(hints[0]["direction"], "in");
+        assert!(
+            !generation.vertices["gov:Evidence"]
+                .properties
+                .contains_key("hints"),
+            "an unhinted vertex type reflects no empty hints array"
+        );
     }
 }

@@ -234,6 +234,26 @@ That design is in progress; until it lands, graph vertices remain
 reachable only through exact-ref inspection and traversal, not
 `bbox_hybrid_search`.
 
+## Schema-declared next hops
+
+Most providers answer `recommended_next_hops` with a direction-blind
+count per edge family, which tells an agent a family exists but not
+which way to follow it. Project-graph vertices do better, because their
+schema knows: a vertex type in `schema.json` may declare a `hints` array
+of `{edge_type, direction, label}` entries in priority order, and any
+vertex type also gets a tier-0 derivation from every edge type whose
+declared endpoints touch it. `bbox_inspect_entity` renders the resolved
+list authored-first, then derived hops that have edges by count, then
+whatever families no hint covers; each direction-aware hop prints its
+label and the literal `edge_types` / `direction` arguments to pass into
+the next call, and an authored hop with zero edges prints `(none)` so an
+absent answer stays visible instead of vanishing. The five-hop display
+cap bounds only the unauthored tail. `bbox_discover_seed_entities`
+reuses the same list as its notable-edge priorities and previews a
+directional hop in that direction only. Shape, validation codes, and the
+ordering rule live in
+`design/corpus/agentic-corpus/reflective-project-graph.md`.
+
 ## Provider behavior
 
 The dispatch plane contains zero provider CLIs; providers dispatch
