@@ -45,6 +45,10 @@ struct McpCallArgs {
     /// config [client].daemon_url, else http://127.0.0.1:<[daemon].port>.
     #[arg(long, value_name = "URL")]
     daemon_url: Option<String>,
+    /// MCP surface name (`/mcp?surface=<name>`); default: the daemon's
+    /// anonymous `default` surface
+    #[arg(long, value_name = "SURFACE")]
+    surface: Option<String>,
 }
 
 pub(crate) async fn run(args: McpArgs) -> anyhow::Result<()> {
@@ -56,7 +60,10 @@ pub(crate) async fn run(args: McpArgs) -> anyhow::Result<()> {
 async fn call(args: McpCallArgs) -> anyhow::Result<()> {
     let arguments = parse_arguments(&args.json_args)?;
     let base_url = args.daemon_url.unwrap_or_else(default_base_url);
-    let mut client = McpClient::connect(&base_url, None).await?;
+    let mut client = match args.surface.as_deref() {
+        Some(surface) => McpClient::connect_surface(&base_url, surface).await?,
+        None => McpClient::connect(&base_url, None).await?,
+    };
     let call_response = client
         .call_tool_response(&args.tool_name, arguments)
         .await?;
@@ -104,7 +111,16 @@ impl McpClient {
         base_url: &str,
         project_root: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        Self::connect_with_initialization_headers(base_url, project_root, HeaderMap::new()).await
+        Self::connect_with_initialization_headers(base_url, project_root, None, HeaderMap::new())
+            .await
+    }
+
+    /// Connect to a named MCP surface (`/mcp?surface=<name>`). The daemon
+    /// projects a filtered tool catalog per surface; the anonymous `default`
+    /// surface hides operator tools such as `bbox_render`.
+    pub(crate) async fn connect_surface(base_url: &str, surface: &str) -> anyhow::Result<Self> {
+        Self::connect_with_initialization_headers(base_url, None, Some(surface), HeaderMap::new())
+            .await
     }
 
     pub(crate) async fn connect_with_operator_blame(
@@ -141,7 +157,7 @@ impl McpClient {
                 .parse()
                 .context("encoding operator blame workspace id")?,
         );
-        Self::connect_with_initialization_headers(base_url, None, headers).await
+        Self::connect_with_initialization_headers(base_url, None, None, headers).await
     }
 
     pub(crate) async fn connect_with_operator_provenance(
@@ -171,12 +187,13 @@ impl McpClient {
                 .parse()
                 .context("encoding operator provenance root relative path")?,
         );
-        Self::connect_with_initialization_headers(base_url, None, headers).await
+        Self::connect_with_initialization_headers(base_url, None, None, headers).await
     }
 
     async fn connect_with_initialization_headers(
         base_url: &str,
         project_root: Option<&Path>,
+        surface: Option<&str>,
         initialization_headers: HeaderMap,
     ) -> anyhow::Result<Self> {
         let raw_url = format!("{}/mcp", base_url.trim_end_matches('/'));
@@ -185,6 +202,9 @@ impl McpClient {
         if let Some(root) = project_root {
             let root = root.to_str().context("project root is not valid UTF-8")?;
             mcp_url.query_pairs_mut().append_pair("project", root);
+        }
+        if let Some(surface) = surface.filter(|s| !s.is_empty()) {
+            mcp_url.query_pairs_mut().append_pair("surface", surface);
         }
         let mcp_url = mcp_url.to_string();
         let client = if initialization_headers.is_empty() {

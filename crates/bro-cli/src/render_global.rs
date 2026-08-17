@@ -51,6 +51,10 @@ struct RenderGlobalArgs {
     /// config [client].daemon_url, else http://127.0.0.1:<[daemon].port>.
     #[arg(long, value_name = "URL")]
     daemon_url: Option<String>,
+    /// MCP surface to call `bbox_render` on. The anonymous `default` surface
+    /// hides operator tools, so this defaults to the operator surface.
+    #[arg(long, value_name = "SURFACE", default_value = "interactive")]
+    surface: String,
 }
 
 pub(crate) async fn run(args: RenderArgs) -> anyhow::Result<()> {
@@ -62,7 +66,7 @@ pub(crate) async fn run(args: RenderArgs) -> anyhow::Result<()> {
 async fn global(args: RenderGlobalArgs) -> anyhow::Result<()> {
     let host_common_target = global_common_target_path()?;
     let base_url = args.daemon_url.unwrap_or_else(default_base_url);
-    let mut client = McpClient::connect(&base_url, None).await?;
+    let mut client = McpClient::connect_surface(&base_url, &args.surface).await?;
     let mut arguments = json!({
         "scope": "global",
         "global_plan": { "host_common_target": host_common_target.display().to_string() },
