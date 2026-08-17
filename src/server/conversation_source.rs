@@ -161,21 +161,13 @@ impl ConversationSourceRuntime {
     }
 
     /// Record an authenticated contact for the status surface and the
-    /// silence signal. The clock is passed by the caller (the handlers read
-    /// it where they already read it for their own stamps), which is what
-    /// lets the presence tests age a contact without sleeping.
-    pub(crate) fn note_producer_contact(
-        &self,
-        scope: &ConnectorScope,
-        user_agent: &str,
-    ) -> bbox_conversation_source::ProducerContactV1 {
-        let contact = self
-            .presence
+    /// silence signal. Handlers call this after the grant check on the ingest
+    /// verbs only; the status route reads and never records, so a poller can
+    /// never refresh staleness. The presence tests age contacts through
+    /// `ProducerPresence::note`'s injected clock, not through this wrapper.
+    pub(crate) fn note_producer_contact(&self, scope: &ConnectorScope, user_agent: &str) {
+        self.presence
             .note(scope, user_agent, chrono::Utc::now().timestamp());
-        bbox_conversation_source::ProducerContactV1 {
-            last_seen_at: contact_rfc3339(contact.last_seen_epoch_secs),
-            user_agent: contact.user_agent,
-        }
     }
 
     /// Last contact for one scope, as the silence signal needs it: raw epoch
