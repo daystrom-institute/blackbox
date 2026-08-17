@@ -9,7 +9,7 @@ use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -35,7 +35,7 @@ use bbox_knowledge_source_store::{
 use bro_core::WorkspaceId;
 use bro_rpc::ServiceToken;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +45,54 @@ use super::producer_auth::{ProducerGrant, RepoTransportGrantError};
 const UPLOAD_BODY_TEMP_PREFIX: &str = ".knowledge-source-upload-body-";
 const UPLOAD_BODY_TEMP_SUFFIX: &str = ".tmp";
 const WORKSPACE_BINDING_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Prefix for the synthetic task/session id an operator-minted binding
+/// carries (`bro workspace-binding mint`). The managed spawn path keys
+/// bindings by a real `(task_id, session_id)`; an operator lease has neither,
+/// so it keys by workspace identity under this reserved prefix. The prefix is
+/// also what selects the durable lane: operator bindings outlive the daemon
+/// process (persisted as token hashes, restored at boot), while spawn bindings
+/// stay process-lifetime because their task dies with the daemon anyway.
+pub(crate) const OPERATOR_LEASE_PREFIX: &str = "operator-workspace-binding";
+
+/// On-disk record of the operator-minted bindings under the knowledge-source
+/// store root. Holds token HASHES only: the secret itself is returned once at
+/// mint and never persisted in recoverable form. No expiry is recorded; an
+/// operator binding lives until it is superseded (`replace`) or revoked, and
+/// the boot restore re-arms the in-memory TTL and renewal loop.
+const OPERATOR_BINDINGS_FILENAME: &str = "operator-workspace-bindings.json";
+const OPERATOR_BINDINGS_VERSION: u32 = 1;
+
+fn workspace_binding_token_sha256(secret: &str) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(secret.as_bytes()).into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (l, r)| acc | (l ^ r))
+        == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedOperatorBindingsV1 {
+    version: u32,
+    bindings: Vec<PersistedOperatorBindingV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedOperatorBindingV1 {
+    token_sha256: String,
+    task_id: String,
+    session_id: String,
+    project_id: String,
+    scope: bbox_corpus_core::identity::PublishedScope,
+    workspace_id: WorkspaceId,
+}
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceBindingGrant {
@@ -63,8 +111,20 @@ impl WorkspaceBindingGrant {
 }
 
 struct WorkspaceBindingEntry {
-    token: ServiceToken,
+    /// SHA-256 of the 64-hex binding secret. Only the hash is held, in memory
+    /// and (for operator bindings) on disk, so nothing daemon-side can
+    /// reconstruct a token.
+    token_sha256: [u8; 32],
     grant: WorkspaceBindingGrant,
+}
+
+impl WorkspaceBindingEntry {
+    fn verify(&self, candidate: &str) -> bool {
+        constant_time_eq(
+            &self.token_sha256,
+            &workspace_binding_token_sha256(candidate),
+        )
+    }
 }
 
 pub(crate) struct KnowledgeSourceRuntime {
@@ -176,11 +236,20 @@ impl KnowledgeSourceRuntime {
     ) -> Option<WorkspaceBindingGrant> {
         let mut matched = None;
         for entry in self.workspace_bindings.read().iter() {
-            if entry.token.verify(candidate) && entry.grant.expires_unix_secs > now {
+            if entry.verify(candidate) && entry.grant.expires_unix_secs > now {
                 matched = Some(entry.grant.clone());
             }
         }
         matched
+    }
+
+    /// Whether a live binding is currently installed under `task_id`. The
+    /// operator mint uses this to refuse a silent supersession.
+    pub(crate) fn has_live_workspace_binding_for_task(&self, task_id: &str, now: u64) -> bool {
+        self.workspace_bindings
+            .read()
+            .iter()
+            .any(|entry| entry.grant.task_id == task_id && entry.grant.expires_unix_secs > now)
     }
 
     pub(crate) fn authenticate_workspace_binding_now(
@@ -190,21 +259,115 @@ impl KnowledgeSourceRuntime {
         self.authenticate_workspace_binding(candidate, now_unix_secs())
     }
 
-    fn install_workspace_binding(
+    fn install_workspace_binding_hashed(
         &self,
-        token: ServiceToken,
+        token_sha256: [u8; 32],
         grant: WorkspaceBindingGrant,
         now: u64,
     ) {
-        let candidate = token.expose_secret();
         let mut bindings = self.workspace_bindings.write();
         bindings.retain(|entry| {
             entry.grant.expires_unix_secs > now
                 && entry.grant.task_id != grant.task_id
                 && entry.grant.session_id != grant.session_id
-                && !entry.token.verify(candidate)
+                && !constant_time_eq(&entry.token_sha256, &token_sha256)
         });
-        bindings.push(WorkspaceBindingEntry { token, grant });
+        bindings.push(WorkspaceBindingEntry {
+            token_sha256,
+            grant,
+        });
+    }
+
+    fn operator_bindings_path(&self) -> std::path::PathBuf {
+        self.store.root().join(OPERATOR_BINDINGS_FILENAME)
+    }
+
+    /// Read the persisted operator bindings. A missing file is an empty set; a
+    /// corrupt or foreign-version file is an error the caller logs and treats
+    /// as empty rather than a boot failure (the operator re-mints).
+    fn load_persisted_operator_bindings(&self) -> Result<Vec<PersistedOperatorBindingV1>> {
+        let path = self.operator_bindings_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(
+                    anyhow::Error::new(error).context(format!("reading {}", path.display()))
+                );
+            }
+        };
+        let file: PersistedOperatorBindingsV1 = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decoding {}", path.display()))?;
+        if file.version != OPERATOR_BINDINGS_VERSION {
+            bail!(
+                "{} is version {}, this daemon reads version {}",
+                path.display(),
+                file.version,
+                OPERATOR_BINDINGS_VERSION
+            );
+        }
+        Ok(file.bindings)
+    }
+
+    /// Rewrite the persisted operator bindings from a modified list. Owner-only
+    /// permissions, written to a sibling temp file and renamed into place.
+    fn write_persisted_operator_bindings(
+        &self,
+        bindings: Vec<PersistedOperatorBindingV1>,
+    ) -> Result<()> {
+        let path = self.operator_bindings_path();
+        let file = PersistedOperatorBindingsV1 {
+            version: OPERATOR_BINDINGS_VERSION,
+            bindings,
+        };
+        let bytes = serde_json::to_vec_pretty(&file)?;
+        let temp = path.with_extension("json.tmp");
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut handle = options
+                .open(&temp)
+                .with_context(|| format!("creating {}", temp.display()))?;
+            use std::io::Write as _;
+            handle.write_all(&bytes)?;
+            handle.sync_all()?;
+        }
+        std::fs::rename(&temp, &path).with_context(|| format!("installing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Record (or replace, keyed by task id) one operator binding on disk.
+    fn persist_operator_binding(
+        &self,
+        token_sha256: [u8; 32],
+        grant: &WorkspaceBindingGrant,
+    ) -> Result<()> {
+        let mut bindings = self.load_persisted_operator_bindings().unwrap_or_default();
+        bindings.retain(|entry| entry.task_id != grant.task_id);
+        bindings.push(PersistedOperatorBindingV1 {
+            token_sha256: hex::encode(token_sha256),
+            task_id: grant.task_id.clone(),
+            session_id: grant.session_id.clone(),
+            project_id: grant.project_id.clone(),
+            scope: grant.scope.clone(),
+            workspace_id: grant.workspace_id.clone(),
+        });
+        self.write_persisted_operator_bindings(bindings)
+    }
+
+    fn forget_persisted_operator_binding(&self, task_id: &str) -> Result<()> {
+        let mut bindings = self.load_persisted_operator_bindings()?;
+        let before = bindings.len();
+        bindings.retain(|entry| entry.task_id != task_id);
+        if bindings.len() == before {
+            return Ok(());
+        }
+        self.write_persisted_operator_bindings(bindings)
     }
 
     #[cfg(test)]
@@ -232,7 +395,26 @@ impl KnowledgeSourceRuntime {
                 true
             }
         });
+        if task_id.starts_with(OPERATOR_LEASE_PREFIX)
+            && let Err(error) = self.forget_persisted_operator_binding(task_id)
+        {
+            tracing::warn!(task_id, error = %error, "failed to drop persisted operator binding");
+        }
         revoked
+    }
+
+    #[cfg(test)]
+    fn install_workspace_binding(
+        &self,
+        token: ServiceToken,
+        grant: WorkspaceBindingGrant,
+        now: u64,
+    ) {
+        self.install_workspace_binding_hashed(
+            workspace_binding_token_sha256(token.expose_secret()),
+            grant,
+            now,
+        );
     }
 
     #[cfg(test)]
@@ -371,16 +553,82 @@ pub(crate) fn install_workspace_binding(
     grant: WorkspaceBindingGrant,
     token: &bro_protocol::WorkspaceBindingToken,
 ) -> Result<()> {
+    let token = ServiceToken::parse(token.expose_secret().to_string())?;
+    install_workspace_binding_hashed(
+        state,
+        grant,
+        workspace_binding_token_sha256(token.expose_secret()),
+    )
+}
+
+/// Restore the operator bindings persisted under the knowledge-source store
+/// root: re-arm each one's TTL and renewal loop as if freshly minted. Runs at
+/// boot so a checkout's `bro workspace-binding` capability survives daemon
+/// restarts and deploys instead of dying with the process. Failures are
+/// logged, not fatal: the remedy is a re-mint, never a daemon that will not
+/// start.
+pub(crate) fn restore_operator_workspace_bindings(state: &Arc<SharedState>) {
+    let persisted = match state.knowledge_sources.load_persisted_operator_bindings() {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            tracing::warn!(error = %error, "operator workspace bindings not restored");
+            return;
+        }
+    };
+    let mut restored = 0usize;
+    for record in persisted {
+        let Some(token_sha256) = hex::decode(&record.token_sha256)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        else {
+            tracing::warn!(task_id = %record.task_id, "persisted operator binding has a malformed token hash; skipped");
+            continue;
+        };
+        let grant = WorkspaceBindingGrant {
+            task_id: record.task_id,
+            session_id: record.session_id,
+            project_id: record.project_id,
+            scope: record.scope,
+            workspace_id: record.workspace_id,
+            expires_unix_secs: now_unix_secs().saturating_add(WORKSPACE_BINDING_TTL_SECS),
+        };
+        match install_workspace_binding_hashed(state, grant.clone(), token_sha256) {
+            Ok(()) => restored += 1,
+            Err(error) => tracing::warn!(
+                task_id = %grant.task_id,
+                workspace_id = %grant.workspace_id,
+                error = %error,
+                "persisted operator binding not restored"
+            ),
+        }
+    }
+    if restored > 0 {
+        tracing::info!(restored, "restored operator workspace bindings");
+    }
+}
+
+fn install_workspace_binding_hashed(
+    state: &Arc<SharedState>,
+    grant: WorkspaceBindingGrant,
+    token_sha256: [u8; 32],
+) -> Result<()> {
     let interval_secs = state
         .knowledge_sources
         .store()
         .provisional_renew_interval_secs()?;
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| anyhow::anyhow!("workspace binding requires an async runtime"))?;
-    let token = ServiceToken::parse(token.expose_secret().to_string())?;
-    state
-        .knowledge_sources
-        .install_workspace_binding(token, grant.clone(), now_unix_secs());
+    state.knowledge_sources.install_workspace_binding_hashed(
+        token_sha256,
+        grant.clone(),
+        now_unix_secs(),
+    );
+    if grant.task_id.starts_with(OPERATOR_LEASE_PREFIX) {
+        state
+            .knowledge_sources
+            .persist_operator_binding(token_sha256, &grant)
+            .context("persisting operator workspace binding")?;
+    }
     let cancellation = CancellationToken::new();
     if let Some(prior) = state
         .knowledge_sources
@@ -1505,7 +1753,21 @@ async fn authenticate_workspace_source_request(
             .knowledge_sources
             .authenticate_workspace_binding(candidate, now_unix_secs())
     }) else {
-        return error_response(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized");
+        // A well-formed binding token this daemon does not know is a
+        // different situation from no credential at all: the binding was
+        // superseded, revoked, or expired, and the fix is a re-mint. Say so;
+        // a bare 401 sent operators chasing the checkout instead.
+        let well_formed = candidate.is_some_and(|candidate| ServiceToken::parse(candidate).is_ok());
+        return if well_formed {
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "workspace_binding_unknown",
+                "workspace binding is not known to this daemon (superseded by a later mint, \
+                 revoked, or expired); mint again with `bro workspace-binding mint --replace`",
+            )
+        } else {
+            error_response(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized")
+        };
     };
     request.extensions_mut().insert(grant);
     next.run(request).await
@@ -1723,7 +1985,7 @@ fn reap_upload_body_tempfiles(store_root: &std::path::Path) -> Result<u64> {
     Ok(reaped)
 }
 
-fn now_unix_secs() -> u64 {
+pub(crate) fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2546,6 +2808,112 @@ mod tests {
             },
             nodes,
         )
+    }
+
+    /// A well-formed binding token the daemon does not know names itself
+    /// (superseded / revoked / expired, remedy: re-mint) instead of the bare
+    /// `unauthorized` a missing or malformed credential gets.
+    #[tokio::test]
+    async fn unknown_but_well_formed_binding_gets_a_typed_401_with_the_remint_hint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let fixture = enabled_state(&root);
+        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
+        let probe = |token: Option<&'static str>| {
+            app.clone().oneshot(request(
+                "GET",
+                "/internal/knowledge-source/v1/provisional/context",
+                token,
+                Body::empty(),
+            ))
+        };
+        let unknown = "f".repeat(64);
+        let unknown: &'static str = Box::leak(unknown.into_boxed_str());
+        for (token, code) in [
+            (None, "unauthorized"),
+            (Some("not-a-token"), "unauthorized"),
+            (Some(unknown), "workspace_binding_unknown"),
+        ] {
+            let response = probe(token).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["code"], code, "{body}");
+            if code == "workspace_binding_unknown" {
+                assert!(
+                    body["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("bro workspace-binding mint"),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    /// Bindings are held as token hashes; installing, authenticating, and the
+    /// persisted operator record all round-trip through the hash and the
+    /// secret itself never lands on disk.
+    #[test]
+    fn operator_binding_records_persist_hashes_and_round_trip() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let runtime = KnowledgeSourceRuntime::for_test(&root);
+        let secret = "a".repeat(64);
+        let token = ServiceToken::parse(secret.clone()).unwrap();
+        let grant = WorkspaceBindingGrant {
+            task_id: format!("{OPERATOR_LEASE_PREFIX}:0123456789abcdef0123456789abcdef"),
+            session_id: format!("{OPERATOR_LEASE_PREFIX}:0123456789abcdef0123456789abcdef"),
+            project_id: "p_test".into(),
+            scope: bbox_corpus_core::identity::PublishedScope::try_new("repo", ".").unwrap(),
+            workspace_id: WorkspaceId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            expires_unix_secs: 10,
+        };
+        runtime.install_workspace_binding_for_test(token, grant.clone());
+        assert!(runtime.authenticate_workspace_binding(&secret, 5).is_some());
+        assert!(
+            runtime
+                .authenticate_workspace_binding(&"b".repeat(64), 5)
+                .is_none()
+        );
+        assert!(runtime.has_live_workspace_binding_for_task(&grant.task_id, 5));
+        assert!(!runtime.has_live_workspace_binding_for_task(&grant.task_id, 10));
+
+        runtime
+            .persist_operator_binding(workspace_binding_token_sha256(&secret), &grant)
+            .unwrap();
+        let contents = std::fs::read_to_string(runtime.operator_bindings_path()).unwrap();
+        assert!(!contents.contains(&secret));
+        let loaded = runtime.load_persisted_operator_bindings().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].task_id, grant.task_id);
+        assert_eq!(
+            hex::decode(&loaded[0].token_sha256).unwrap(),
+            workspace_binding_token_sha256(&secret)
+        );
+        // Re-persisting the same task id replaces, never accumulates.
+        runtime
+            .persist_operator_binding(workspace_binding_token_sha256(&"c".repeat(64)), &grant)
+            .unwrap();
+        assert_eq!(runtime.load_persisted_operator_bindings().unwrap().len(), 1);
+        // Revoking an operator task drops the record from disk too.
+        assert_eq!(runtime.revoke_workspace_bindings(&grant.task_id).len(), 1);
+        assert!(
+            runtime
+                .load_persisted_operator_bindings()
+                .unwrap()
+                .is_empty()
+        );
+        // A missing file is an empty set, not an error.
+        std::fs::remove_file(runtime.operator_bindings_path()).unwrap();
+        assert!(
+            runtime
+                .load_persisted_operator_bindings()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

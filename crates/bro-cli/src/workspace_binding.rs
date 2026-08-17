@@ -59,6 +59,13 @@ struct MintArgs {
     /// environment file. Use when the checkout is not writable.
     #[arg(long)]
     print: bool,
+    /// Supersede a live binding for this checkout. Minting again invalidates
+    /// the token the earlier binding holds (the installed env file, an agent's
+    /// environment), so the daemon refuses without this flag. Operator bindings
+    /// survive daemon restarts; reach for this only when the token is lost or
+    /// must be rotated.
+    #[arg(long)]
+    replace: bool,
 }
 
 #[derive(Debug, Args)]
@@ -86,6 +93,7 @@ struct MintRequest<'a> {
     checkout_path: &'a str,
     scope: MintScope,
     workspace_id: &'a str,
+    replace: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +176,7 @@ async fn mint(args: MintArgs) -> anyhow::Result<()> {
                 bbox_root_relpath: scope.bbox_root_relpath().to_string(),
             },
             workspace_id: &workspace_id,
+            replace: args.replace,
         })
         .send()
         .await

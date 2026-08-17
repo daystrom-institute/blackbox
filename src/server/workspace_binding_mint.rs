@@ -64,6 +64,22 @@
 //! managed spawn path calls, so the token shape (64 lowercase hex), the grant
 //! fields, the fixed TTL, the replacement semantics, and the provisional-lease
 //! renewal loop are identical.
+//!
+//! # Lifetime: a checkout capability, not a task capability
+//!
+//! Managed spawn bindings die with the daemon process, which is fine because
+//! the task they serve does too. An operator binding serves a checkout that
+//! outlives many daemon restarts and deploys, so it is durable: the daemon
+//! persists the token HASH and grant under the knowledge-source store
+//! (`operator-workspace-bindings.json`, owner-only) and re-arms it at boot
+//! (`super::knowledge_source::restore_operator_workspace_bindings`). The
+//! secret itself is still returned once and never stored. An operator binding
+//! ends only by explicit supersession (`replace: true`, `bro
+//! workspace-binding mint --replace`) or revocation; minting again without
+//! `replace` is refused with `error.workspace_binding_exists` because the
+//! earlier token (an installed env file, an agent's environment) would go
+//! dead silently. A capture presenting a token the daemon no longer knows gets
+//! `workspace_binding_unknown` with the re-mint hint, not a bare 401.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,12 +95,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SharedState;
 
-/// Prefix for the synthetic task/session id an operator lease carries. The
-/// managed path keys bindings by `(task_id, session_id)`; an operator lease has
-/// neither, so it keys by workspace identity under a reserved prefix. Minting
-/// twice for one checkout therefore replaces the earlier binding rather than
-/// accumulating live tokens.
-const OPERATOR_LEASE_PREFIX: &str = "operator-workspace-binding";
+use super::knowledge_source::OPERATOR_LEASE_PREFIX;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +109,12 @@ pub(crate) struct MintWorkspaceBindingRequest {
     /// this identity for a live attachment of the claimed scope. This, not the
     /// path, is what the binding binds.
     pub workspace_id: String,
+    /// Operator bindings key by workspace identity, so minting twice for one
+    /// checkout supersedes the earlier token. That is a destructive act for
+    /// whoever holds the earlier token (an installed binding file, an agent's
+    /// environment), so it is refused unless the caller says so.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +155,7 @@ pub(crate) enum MintRefusal {
     AttachmentUnknown,
     WorkspaceIdentityMismatch,
     WorkspaceIdentityInvalid,
+    BindingExists,
     MintFailed,
 }
 
@@ -152,6 +170,7 @@ impl MintRefusal {
             Self::AttachmentUnknown => "error.workspace_binding_attachment_unknown",
             Self::WorkspaceIdentityMismatch => "error.workspace_binding_workspace_id_mismatch",
             Self::WorkspaceIdentityInvalid => "error.workspace_binding_workspace_id_invalid",
+            Self::BindingExists => "error.workspace_binding_exists",
             Self::MintFailed => "error.workspace_binding_mint_failed",
         }
     }
@@ -163,9 +182,10 @@ impl MintRefusal {
             }
             Self::ScopeUnknown => StatusCode::NOT_FOUND,
             Self::WorkspaceIdentityMismatch => StatusCode::FORBIDDEN,
-            Self::ScopeAmbiguous | Self::AttachmentUnknown | Self::CatalogUnavailable => {
-                StatusCode::CONFLICT
-            }
+            Self::ScopeAmbiguous
+            | Self::AttachmentUnknown
+            | Self::CatalogUnavailable
+            | Self::BindingExists => StatusCode::CONFLICT,
             Self::MintFailed => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -187,6 +207,11 @@ impl MintRefusal {
                 "no live attachment for the claimed scope records this workspace identity"
             }
             Self::WorkspaceIdentityInvalid => "workspace identity is malformed",
+            Self::BindingExists => {
+                "a live workspace binding already exists for this checkout; minting again would \
+                 invalidate the token it holds. Pass replace=true (bro workspace-binding mint \
+                 --replace) to supersede it deliberately"
+            }
             Self::MintFailed => "workspace binding could not be minted",
         }
     }
@@ -288,6 +313,14 @@ pub(crate) fn mint_operator_workspace_binding(
         .map_err(|_| MintRefusal::ScopeInvalid)?,
     };
     let lease_id = format!("{OPERATOR_LEASE_PREFIX}:{workspace_id}");
+    if !request.replace
+        && state.knowledge_sources.has_live_workspace_binding_for_task(
+            &lease_id,
+            super::knowledge_source::now_unix_secs(),
+        )
+    {
+        return Err(MintRefusal::BindingExists);
+    }
     let minted =
         super::knowledge_source::mint_workspace_binding(state, &lease_id, &lease_id, &identity)
             .map_err(|error| {
@@ -548,10 +581,24 @@ mod tests {
         assert_eq!(grant.workspace_id.as_str(), CHECKOUT_ID);
         assert!(grant.is_live_now());
 
-        // Re-minting for the same checkout replaces rather than accumulates,
-        // matching the managed replacement rule keyed on task/session id.
-        let (status, second) =
+        // Re-minting for the same checkout would supersede the live token, so
+        // it is refused unless the caller opts in; with `replace` it replaces
+        // rather than accumulates, matching the managed replacement rule keyed
+        // on task/session id.
+        let (status, refused) =
             post_mint(&state, mint_request(&checkout.to_string_lossy(), &scope)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["code"], "error.workspace_binding_exists");
+        assert!(
+            state
+                .knowledge_sources
+                .authenticate_workspace_binding_now(&token)
+                .is_some(),
+            "a refused mint must leave the live binding untouched"
+        );
+        let mut replace = mint_request(&checkout.to_string_lossy(), &scope);
+        replace["replace"] = serde_json::json!(true);
+        let (status, second) = post_mint(&state, replace).await;
         assert_eq!(status, StatusCode::OK);
         let replacement = second["token"].as_str().unwrap();
         assert_ne!(replacement, token);
@@ -566,6 +613,91 @@ mod tests {
             state
                 .knowledge_sources
                 .authenticate_workspace_binding_now(replacement)
+                .is_some()
+        );
+    }
+
+    /// An operator binding is a checkout capability, not a task capability:
+    /// it must survive the daemon process. The mint persists the token hash
+    /// under the knowledge-source store; a fresh daemon over the same state
+    /// dir restores it at boot and the installed token authenticates again.
+    /// Revocation and supersession drop the persisted record.
+    #[tokio::test]
+    async fn operator_binding_survives_a_daemon_restart_via_persisted_hash() {
+        let (fixture, scope, checkout) = attached_fixture();
+        let state = fixture.server().state.clone();
+        let (status, body) =
+            post_mint(&state, mint_request(&checkout.to_string_lossy(), &scope)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let token = body["token"].as_str().unwrap().to_string();
+
+        // Only a hash reaches disk, owner-only.
+        let persisted = fixture
+            .root()
+            .join("knowledge-sources")
+            .join("operator-workspace-bindings.json");
+        let contents = std::fs::read_to_string(&persisted).unwrap();
+        assert!(
+            !contents.contains(&token),
+            "the binding secret must never be persisted"
+        );
+        assert!(contents.contains(CHECKOUT_ID));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&persisted).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "persisted bindings must be owner-only");
+        }
+
+        // A new daemon over the same state dir: unknown until restored, then
+        // the same token authenticates with the same grant.
+        let restarted = fixture.server().state.clone();
+        assert!(
+            restarted
+                .knowledge_sources
+                .authenticate_workspace_binding_now(&token)
+                .is_none()
+        );
+        crate::server::knowledge_source::restore_operator_workspace_bindings(&restarted);
+        let grant = restarted
+            .knowledge_sources
+            .authenticate_workspace_binding_now(&token)
+            .expect("restored operator binding authenticates after restart");
+        assert_eq!(grant.project_id, PROJECT);
+        assert_eq!(grant.scope, scope);
+        assert_eq!(grant.workspace_id.as_str(), CHECKOUT_ID);
+        assert!(grant.is_live_now());
+        assert_eq!(
+            grant.task_id,
+            format!("operator-workspace-binding:{CHECKOUT_ID}")
+        );
+
+        // A restart is not a mint: the restored binding still refuses a
+        // silent supersession, and an explicit replace rewrites the record.
+        let (status, _) = post_mint(
+            &restarted,
+            mint_request(&checkout.to_string_lossy(), &scope),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let mut replace = mint_request(&checkout.to_string_lossy(), &scope);
+        replace["replace"] = serde_json::json!(true);
+        let (status, replaced) = post_mint(&restarted, replace).await;
+        assert_eq!(status, StatusCode::OK);
+        let replacement = replaced["token"].as_str().unwrap().to_string();
+        let third = fixture.server().state.clone();
+        crate::server::knowledge_source::restore_operator_workspace_bindings(&third);
+        assert!(
+            third
+                .knowledge_sources
+                .authenticate_workspace_binding_now(&token)
+                .is_none(),
+            "a superseded binding must not come back from disk"
+        );
+        assert!(
+            third
+                .knowledge_sources
+                .authenticate_workspace_binding_now(&replacement)
                 .is_some()
         );
     }

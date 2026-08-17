@@ -26,6 +26,17 @@ out explicitly under `Changed` or `Removed`.
   `deny_unknown_fields`, so a daemon older than this field refuses a
   schema carrying `hints` at validate/publish time; deploy the daemon
   before authoring hints.
+- Operator workspace bindings are durable and explicit: `bro
+  workspace-binding mint` bindings now persist as token hashes under the
+  knowledge-source store and are restored at daemon boot, so a checkout's
+  provisional capture capability survives daemon restarts and deploys
+  instead of dying with the process (managed spawn bindings remain
+  process-lifetime). Minting again for a checkout that already holds a live
+  binding is refused with `error.workspace_binding_exists` unless
+  `--replace` is passed, because it would silently invalidate the earlier
+  token. A capture presenting a well-formed token the daemon does not know
+  gets `workspace_binding_unknown` with a re-mint hint instead of a bare
+  `unauthorized`.
 - Knowledge-source wire compatibility: response bodies a client decodes
   (probe, status, capture context, upload begin/finalize, missing-blob pages)
   now tolerate unknown fields, so a `bro` or collector built before the
