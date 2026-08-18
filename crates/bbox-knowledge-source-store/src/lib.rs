@@ -993,6 +993,56 @@ impl std::fmt::Display for StoreRequestError {
     }
 }
 
+/// What already holds a provisional sequence when a begin or finalize is
+/// refused with [`StoreRequestError::Conflict`]. Attached as anyhow context on
+/// top of the `Conflict` so callers that only know the coarse code keep
+/// working, while the HTTP layer can name the offending state instead of
+/// leaving the author to guess which generation it is converging against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionalSequenceHolder {
+    /// An open upload from the same workspace and project at this sequence
+    /// whose finalize is journaled but not yet committed; it will land, so a
+    /// begin must not supersede it.
+    FinalizingUpload { upload_id: String },
+    /// The workspace's selected provisional pointer.
+    SelectedPointer,
+    /// A finalized (durable) generation recorded at this sequence.
+    FinalizedSequence,
+}
+
+/// Detail for a provisional sequence conflict. See [`ProvisionalSequenceHolder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionalSequenceConflict {
+    pub sequence: u64,
+    pub requested_generation_id: String,
+    pub existing_generation_id: String,
+    pub holder: ProvisionalSequenceHolder,
+}
+
+impl std::fmt::Display for ProvisionalSequenceConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let holder = match &self.holder {
+            ProvisionalSequenceHolder::FinalizingUpload { upload_id } => {
+                format!("open upload {upload_id} that is finalizing")
+            }
+            ProvisionalSequenceHolder::SelectedPointer => "the selected provisional pointer".into(),
+            ProvisionalSequenceHolder::FinalizedSequence => "a finalized generation".into(),
+        };
+        write!(
+            formatter,
+            "provisional sequence {} is held by {holder} at generation {}; the requested \
+             descriptor hashes to generation {}",
+            self.sequence, self.existing_generation_id, self.requested_generation_id
+        )
+    }
+}
+
+impl std::error::Error for ProvisionalSequenceConflict {}
+
+fn sequence_conflict(detail: ProvisionalSequenceConflict) -> anyhow::Error {
+    anyhow::Error::new(StoreRequestError::Conflict).context(detail)
+}
+
 impl std::error::Error for StoreRequestError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1734,6 +1784,7 @@ impl KnowledgeSourceStore {
         let _guard = self.lock_mutation()?;
         self.refuse_stale_or_conflicting_sequence(authority, &descriptor, &generation_id)?;
         let workspace_root = self.provisional_upload_authority_root(&authority.workspace_id)?;
+        let finalizing = self.unfinished_journal_uploads()?;
         let mut open = 0_usize;
         for path in read_child_directories(&workspace_root, &[])? {
             let Some(mut record) = read_json::<ProvisionalUploadV1>(
@@ -1746,21 +1797,40 @@ impl KnowledgeSourceStore {
                 continue;
             };
             validate_provisional_upload(&mut record)?;
-            if record.project_id == authority.project_id
-                && record.descriptor == descriptor
-                && is_open(record.state)
-            {
+            if !is_open(record.state) {
+                continue;
+            }
+            if record.project_id == authority.project_id && record.descriptor == descriptor {
                 return Ok(begin_response(record.upload_id, limits.contract));
             }
-            if record.descriptor.sequence == descriptor.sequence
+            // Sequences are per (project, workspace) and only advance on
+            // finalize, so an open upload from this same authority at the
+            // requested sequence (or an earlier one) with a different
+            // generation is a capture this checkout has moved past: the
+            // workspace binding is one writer, and its newest descriptor is
+            // the current truth. Abandon the stale upload rather than
+            // refusing every capture until the idle TTL expires it. The one
+            // upload that must survive is one whose finalize is journaled but
+            // not yet committed; that generation will land, so it is a real
+            // conflict.
+            if record.project_id == authority.project_id
+                && record.descriptor.sequence <= descriptor.sequence
                 && record.source_generation_id != generation_id
-                && is_open(record.state)
             {
-                bail!(StoreRequestError::Conflict);
+                if finalizing.contains(&(FinalizeKindV1::Provisional, record.upload_id.clone())) {
+                    return Err(sequence_conflict(ProvisionalSequenceConflict {
+                        sequence: descriptor.sequence,
+                        requested_generation_id: generation_id,
+                        existing_generation_id: record.source_generation_id,
+                        holder: ProvisionalSequenceHolder::FinalizingUpload {
+                            upload_id: record.upload_id,
+                        },
+                    }));
+                }
+                remove_upload_directory(&path, true)?;
+                continue;
             }
-            if is_open(record.state) {
-                open += 1;
-            }
+            open += 1;
         }
         if self
             .load_provisional_sequence(authority, descriptor.sequence)?
@@ -1823,6 +1893,38 @@ impl KnowledgeSourceStore {
             },
         )?;
         Ok(begin_response(upload_id, limits.contract))
+    }
+
+    /// Abandon an open provisional upload this authority began. Idempotent:
+    /// an upload that no longer exists is already gone. An upload that has
+    /// finalized (or whose finalize is journaled and will land) is not open
+    /// and refuses with `InvalidState`; retire the generation instead.
+    pub fn abort_provisional_upload(
+        &self,
+        authority: &ProvisionalAuthorityV1,
+        upload_id: &str,
+    ) -> Result<()> {
+        validate_provisional_authority(authority)?;
+        let _guard = self.lock_mutation()?;
+        let path = self.provisional_upload_path(&authority.workspace_id, upload_id)?;
+        let record = match self.load_provisional_upload(&path, authority, upload_id) {
+            Ok(record) => record,
+            Err(error)
+                if error.downcast_ref::<StoreRequestError>()
+                    == Some(&StoreRequestError::NotFound) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if !is_open(record.state)
+            || self
+                .unfinished_journal_uploads()?
+                .contains(&(FinalizeKindV1::Provisional, record.upload_id))
+        {
+            bail!(StoreRequestError::InvalidState);
+        }
+        remove_upload_directory(&path, true)
     }
 
     pub fn put_provisional_ancestry_page(
@@ -3066,13 +3168,23 @@ impl KnowledgeSourceStore {
             if pointer.sequence == descriptor.sequence
                 && pointer.source_generation_id != generation_id
             {
-                bail!(StoreRequestError::Conflict);
+                return Err(sequence_conflict(ProvisionalSequenceConflict {
+                    sequence: descriptor.sequence,
+                    requested_generation_id: generation_id.to_string(),
+                    existing_generation_id: pointer.source_generation_id,
+                    holder: ProvisionalSequenceHolder::SelectedPointer,
+                }));
             }
         }
         if let Some(sequence) = self.load_provisional_sequence(authority, descriptor.sequence)?
             && sequence.source_generation_id != generation_id
         {
-            bail!(StoreRequestError::Conflict);
+            return Err(sequence_conflict(ProvisionalSequenceConflict {
+                sequence: descriptor.sequence,
+                requested_generation_id: generation_id.to_string(),
+                existing_generation_id: sequence.source_generation_id,
+                holder: ProvisionalSequenceHolder::FinalizedSequence,
+            }));
         }
         Ok(())
     }
@@ -7038,5 +7150,287 @@ mod tests {
             ".bbox/evidence/bindings.json",
             EVIDENCE_FIXTURE_BYTES,
         )]
+    }
+
+    fn sequence_conflict_detail(error: &anyhow::Error) -> ProvisionalSequenceConflict {
+        assert_eq!(
+            error.downcast_ref::<StoreRequestError>(),
+            Some(&StoreRequestError::Conflict)
+        );
+        error
+            .downcast_ref::<ProvisionalSequenceConflict>()
+            .cloned()
+            .expect("conflict carries sequence detail")
+    }
+
+    #[test]
+    fn begin_supersedes_stale_open_upload_from_same_authority_at_same_sequence() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (stale_descriptor, nodes, knowledge, gaps) = provisional_fixture(1);
+        let stale = store
+            .begin_provisional_upload(&authority, stale_descriptor.clone())
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &authority,
+            &stale.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        // Leave it open at missing_blobs, the shape a capture that failed
+        // validation after its manifests landed leaves behind.
+        store
+            .missing_provisional_blobs(&authority, &stale.upload_id, None)
+            .unwrap();
+        assert!(
+            root.join("provisional/uploads")
+                .join(authority.workspace_id.as_str())
+                .join(&stale.upload_id)
+                .is_dir()
+        );
+
+        // The checkout moved on: same sequence, different descriptor.
+        let mut moved = stale_descriptor.clone();
+        moved.accepted_generation = "b".repeat(64);
+        let fresh = store
+            .begin_provisional_upload(&authority, moved.clone())
+            .unwrap();
+        assert_ne!(fresh.upload_id, stale.upload_id);
+        assert!(
+            !root
+                .join("provisional/uploads")
+                .join(authority.workspace_id.as_str())
+                .join(&stale.upload_id)
+                .exists()
+        );
+        assert_store_error(
+            store.missing_provisional_blobs(&authority, &stale.upload_id, None),
+            StoreRequestError::NotFound,
+        );
+        // The superseding upload runs to a durable generation.
+        put_provisional_pages(
+            &store,
+            &authority,
+            &fresh.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        store
+            .missing_provisional_blobs(&authority, &fresh.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_provisional(&store, &authority, &fresh.upload_id);
+        let generation = store
+            .finalize_provisional_upload(&authority, &fresh.upload_id, 60)
+            .unwrap()
+            .source_generation_id;
+        assert_eq!(
+            store
+                .provisional_status(&authority, &generation)
+                .unwrap()
+                .state,
+            SourceGenerationStateV1::Ready
+        );
+        assert_eq!(
+            store
+                .probe_provisional(&authority, now_unix_secs())
+                .unwrap()
+                .next_sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn begin_leaves_another_projects_open_upload_alone_at_the_same_sequence() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let mut other = authority.clone();
+        other.project_id = "project-b".to_string();
+        let (descriptor, _, _, _) = provisional_fixture(1);
+        let first = store
+            .begin_provisional_upload(&authority, descriptor.clone())
+            .unwrap();
+        let mut second_descriptor = descriptor;
+        second_descriptor.checkout_head = "4".repeat(40);
+        let second = store
+            .begin_provisional_upload(&other, second_descriptor)
+            .unwrap();
+        assert_ne!(first.upload_id, second.upload_id);
+        // Neither project's sequence 1 disturbed the other's open upload.
+        store
+            .missing_provisional_blobs(&authority, &first.upload_id, None)
+            .unwrap_err();
+        assert!(
+            store
+                .put_provisional_ancestry_page(
+                    &authority,
+                    &first.upload_id,
+                    0,
+                    &AncestryPageV1 {
+                        page_index: 0,
+                        nodes: provisional_fixture(1).1,
+                    },
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn begin_refuses_to_supersede_an_upload_whose_finalize_is_journaled() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, _, _, _) = provisional_fixture(1);
+        let landing = store
+            .begin_provisional_upload(&authority, descriptor.clone())
+            .unwrap();
+        let landing_generation = provisional_workspace_generation_id(&descriptor).unwrap();
+        store
+            .write_finalize_journal(FinalizeJournalV1 {
+                version: STORE_VERSION,
+                kind: FinalizeKindV1::Provisional,
+                stage: FinalizeStageV1::Prepared,
+                upload_id: landing.upload_id.clone(),
+                source_generation_id: landing_generation.clone(),
+                authority_key: authority.workspace_id.to_string(),
+                project_id: authority.project_id.clone(),
+                created_unix_secs: now_unix_secs(),
+                created_unix_nanos: now_unix_nanos(),
+                lease_expires_unix_secs: Some(now_unix_secs() + 60),
+                prior_generation_id: None,
+                provisional_sequence: Some(1),
+                checksum_sha256: String::new(),
+            })
+            .unwrap();
+        let mut moved = descriptor;
+        moved.checkout_head = "4".repeat(40);
+        let requested_generation = provisional_workspace_generation_id(&moved).unwrap();
+        let error = store
+            .begin_provisional_upload(&authority, moved)
+            .unwrap_err();
+        let detail = sequence_conflict_detail(&error);
+        assert_eq!(
+            detail,
+            ProvisionalSequenceConflict {
+                sequence: 1,
+                requested_generation_id: requested_generation,
+                existing_generation_id: landing_generation,
+                holder: ProvisionalSequenceHolder::FinalizingUpload {
+                    upload_id: landing.upload_id.clone(),
+                },
+            }
+        );
+        assert!(error.to_string().contains(&landing.upload_id));
+        // Aborting it is likewise refused: it is going to land.
+        assert_store_error(
+            store.abort_provisional_upload(&authority, &landing.upload_id),
+            StoreRequestError::InvalidState,
+        );
+    }
+
+    #[test]
+    fn finalized_sequence_conflict_names_the_holder_and_generations() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, nodes, knowledge, gaps) = provisional_fixture(1);
+        let upload = store
+            .begin_provisional_upload(&authority, descriptor.clone())
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &authority,
+            &upload.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        store
+            .missing_provisional_blobs(&authority, &upload.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_provisional(&store, &authority, &upload.upload_id);
+        let landed = store
+            .finalize_provisional_upload(&authority, &upload.upload_id, 60)
+            .unwrap()
+            .source_generation_id;
+        let mut conflicting = descriptor;
+        conflicting.checkout_head = "4".repeat(40);
+        let requested = provisional_workspace_generation_id(&conflicting).unwrap();
+        let error = store
+            .begin_provisional_upload(&authority, conflicting)
+            .unwrap_err();
+        let detail = sequence_conflict_detail(&error);
+        assert_eq!(detail.sequence, 1);
+        assert_eq!(detail.requested_generation_id, requested);
+        assert_eq!(detail.existing_generation_id, landed);
+        assert_eq!(detail.holder, ProvisionalSequenceHolder::SelectedPointer);
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("sequence 1"), "{rendered}");
+        assert!(rendered.contains(&landed), "{rendered}");
+    }
+
+    #[test]
+    fn abort_provisional_upload_removes_open_uploads_and_is_idempotent() {
+        let (_temporary, root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (descriptor, nodes, knowledge, gaps) = provisional_fixture(1);
+        let upload = store
+            .begin_provisional_upload(&authority, descriptor.clone())
+            .unwrap();
+        let mut other = authority.clone();
+        other.project_id = "project-b".to_string();
+        // Another project's authority sees no such upload; that is a no-op,
+        // not a cross-project delete.
+        store
+            .abort_provisional_upload(&other, &upload.upload_id)
+            .unwrap();
+        assert!(
+            root.join("provisional/uploads")
+                .join(authority.workspace_id.as_str())
+                .join(&upload.upload_id)
+                .is_dir()
+        );
+        store
+            .abort_provisional_upload(&authority, &upload.upload_id)
+            .unwrap();
+        assert!(
+            !root
+                .join("provisional/uploads")
+                .join(authority.workspace_id.as_str())
+                .join(&upload.upload_id)
+                .exists()
+        );
+        store
+            .abort_provisional_upload(&authority, &upload.upload_id)
+            .unwrap();
+        assert_store_error(
+            store.missing_provisional_blobs(&authority, &upload.upload_id, None),
+            StoreRequestError::NotFound,
+        );
+        // The same descriptor begins fresh afterwards and lands.
+        let again = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+        assert_ne!(again.upload_id, upload.upload_id);
+        put_provisional_pages(
+            &store,
+            &authority,
+            &again.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        store
+            .missing_provisional_blobs(&authority, &again.upload_id, None)
+            .unwrap();
+        install_fixture_blobs_provisional(&store, &authority, &again.upload_id);
+        store
+            .finalize_provisional_upload(&authority, &again.upload_id, 60)
+            .unwrap();
+        // A finalized upload is not open any more.
+        assert_store_error(
+            store.abort_provisional_upload(&authority, &again.upload_id),
+            StoreRequestError::InvalidState,
+        );
     }
 }

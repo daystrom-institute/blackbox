@@ -364,6 +364,29 @@ impl WorkspaceCaptureClient {
                 }),
             )
             .await?;
+        // Every capture re-derives its descriptor from the checkout, so an
+        // upload that fails after begin has no resume value: abandon it so
+        // it does not sit open at this sequence (the daemon supersedes such
+        // uploads on the next begin, but a stale one still counts against
+        // the authority's open-upload allowance until then).
+        match self
+            .upload_pages_and_finalize(captured, &begin, lease_ttl_secs)
+            .await
+        {
+            Ok(finalized) => Ok(finalized),
+            Err(error) => {
+                self.abort_best_effort(&begin.upload_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn upload_pages_and_finalize(
+        &self,
+        captured: &CapturedWorkspace,
+        begin: &BeginSourceUploadResponseV1,
+        lease_ttl_secs: u64,
+    ) -> Result<FinalizeSourceUploadResponseV1> {
         for page in pack_ancestry_pages(
             &captured.ancestry,
             begin.max_ancestry_page_nodes as usize,
@@ -537,6 +560,16 @@ impl WorkspaceCaptureClient {
         })
         .await
         .map_err(|_| anyhow!("provisional generation status timed out"))?
+    }
+
+    async fn abort_best_effort(&self, upload_id: &str) {
+        let Ok(request) = self.request(
+            Method::POST,
+            &format!("internal/knowledge-source/v1/provisional/uploads/{upload_id}/abort"),
+        ) else {
+            return;
+        };
+        let _ = self.send_empty(request).await;
     }
 
     async fn retire_best_effort(&self, generation: &str) {
@@ -1676,6 +1709,10 @@ mod tests {
         /// Answer readiness polls with a status this client cannot decode at
         /// all (an enum variant from the future).
         undecodable_status: bool,
+        /// Refuse finalize with a 422, the shape of a capture that fails
+        /// after its upload was begun.
+        fail_finalize: bool,
+        aborted_uploads: Vec<String>,
     }
 
     const MOCK_DAEMON_BUILD_ID: &str = "mockdaemon0001";
@@ -1818,11 +1855,23 @@ mod tests {
         State(state): State<Arc<Mutex<MockSourceState>>>,
         headers: HeaderMap,
         Json(request): Json<FinalizeProvisionalUploadRequestV1>,
-    ) -> (StatusCode, Json<FinalizeSourceUploadResponseV1>) {
+    ) -> Result<
+        (StatusCode, Json<FinalizeSourceUploadResponseV1>),
+        (StatusCode, Json<serde_json::Value>),
+    > {
         let mut state = state.lock().unwrap();
         assert_mock_auth(&headers, &state);
         assert_eq!(request.lease_ttl_secs, state.context.lease_ttl_secs);
         assert_eq!(state.installed_blobs, state.expected_blobs);
+        if state.fail_finalize {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "code": "knowledge_source_manifest_invalid",
+                    "message": "knowledge-source manifest is invalid",
+                })),
+            ));
+        }
         let descriptor = state.descriptor.clone().unwrap();
         let generation = "c".repeat(64);
         state.next_sequence = descriptor.sequence.checked_add(1).unwrap();
@@ -1845,13 +1894,24 @@ mod tests {
             lease_expires_unix_secs: Some(61),
             diagnostic: None,
         });
-        (
+        Ok((
             StatusCode::ACCEPTED,
             Json(FinalizeSourceUploadResponseV1 {
                 source_generation_id: generation,
                 status_url: "/status".into(),
             }),
-        )
+        ))
+    }
+
+    async fn mock_abort(
+        State(state): State<Arc<Mutex<MockSourceState>>>,
+        headers: HeaderMap,
+        AxumPath(upload): AxumPath<String>,
+    ) -> StatusCode {
+        let mut state = state.lock().unwrap();
+        assert_mock_auth(&headers, &state);
+        state.aborted_uploads.push(upload);
+        StatusCode::NO_CONTENT
     }
 
     async fn mock_status(
@@ -1897,6 +1957,8 @@ mod tests {
             renew_calls: 0,
             newer_daemon: false,
             undecodable_status: false,
+            fail_finalize: false,
+            aborted_uploads: Vec::new(),
         }))
     }
 
@@ -1933,6 +1995,10 @@ mod tests {
             .route(
                 "/internal/knowledge-source/v1/provisional/uploads/{upload}/finalize",
                 post(mock_finalize),
+            )
+            .route(
+                "/internal/knowledge-source/v1/provisional/uploads/{upload}/abort",
+                post(mock_abort),
             )
             .route(
                 "/internal/knowledge-source/v1/provisional/generations/{generation}/status",
@@ -2019,6 +2085,40 @@ mod tests {
         assert_eq!(state.begin_calls, 1);
         assert_eq!(state.renew_calls, 1);
         assert_eq!(state.installed_blobs, state.expected_blobs);
+        drop(state);
+        server.abort();
+    }
+
+    /// An upload that fails after `begin` is abandoned on the way out, so it
+    /// does not sit open at its sequence for the idle TTL. The failure itself
+    /// still surfaces to the caller.
+    #[tokio::test]
+    async fn client_aborts_its_upload_when_the_capture_fails_after_begin() {
+        let (_directory, root, workspace_id, accepted_commit) = managed_repository();
+        seed_managed_repository(&root);
+        let scope = PublishedScope::try_new("client-abort-test", ".").unwrap();
+        let token = "d".repeat(64);
+        let state = mock_state(&scope, &token, accepted_commit);
+        state.lock().unwrap().fail_finalize = true;
+        let (client, server) = serve_mock(state.clone(), root, workspace_id, scope, token).await;
+
+        let error = client.sync_once().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("knowledge_source_manifest_invalid"),
+            "{error:#}"
+        );
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.begin_calls, 1);
+            assert_eq!(state.aborted_uploads, vec!["upload-one".to_string()]);
+        }
+        // With the daemon healthy again the next capture begins fresh and lands.
+        state.lock().unwrap().fail_finalize = false;
+        let outcome = client.sync_once().await.unwrap();
+        assert!(!outcome.reused);
+        let state = state.lock().unwrap();
+        assert_eq!(state.begin_calls, 2);
+        assert_eq!(state.aborted_uploads.len(), 1);
         drop(state);
         server.abort();
     }

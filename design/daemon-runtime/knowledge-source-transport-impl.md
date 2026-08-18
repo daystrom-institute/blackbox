@@ -274,6 +274,21 @@ one. A finalized sequence is single-use: an exact open upload remains
 resumable, but a new upload cannot reuse an already-assigned sequence or an
 installed generation identity.
 
+Open uploads do not hold a sequence against their own workspace. The workspace
+binding is one writer, and every capture re-derives its descriptor from the
+checkout, so an open upload from the same project and workspace at the
+requested (or an earlier) sequence with a different generation identity is a
+capture the checkout has moved past: begin abandons it and proceeds instead of
+answering 409 until the idle-upload TTL expires it. The one open upload that
+does hold its sequence is one whose finalize is journaled but not yet
+committed; that generation will land, so a different descriptor at that
+sequence is a real generation conflict. Another project's open uploads under
+the same workspace are neither superseded nor a conflict. A client that fails
+after begin abandons its own upload through the abort endpoint (best effort,
+idempotent; a finalized or finalizing upload refuses with a state conflict). A
+generation conflict answer names the holder (selected pointer, finalized
+sequence, or finalizing upload), the sequence, and both generation identities.
+
 The store may persist ready payloads under the corpus state root so daemon
 restart does not create a false empty interval, but it is a transport cache,
 not canonical knowledge. Startup drops expired, corrupt, grant-revoked,
@@ -404,6 +419,7 @@ POST provisional/uploads/{id}/manifest/{class}/{lane}/{page}
 GET  provisional/uploads/{id}/missing
 PUT  provisional/uploads/{id}/blobs/{sha256}
 POST provisional/uploads/{id}/finalize
+POST provisional/uploads/{id}/abort
 POST provisional/generations/{id}/renew
 POST provisional/generations/{id}/retire
 GET  provisional/generations/{id}/status

@@ -29,8 +29,9 @@ use bbox_knowledge_source::{
     SourceManifestPageV1,
 };
 use bbox_knowledge_source_store::{
-    KnowledgeSourceStore, ProvisionalAuthorityV1, PublicationAuthorityV1,
-    ReadyProvisionalWorkspace, ReadyPublicationFile, StoreLimits, StoreRequestError,
+    KnowledgeSourceStore, ProvisionalAuthorityV1, ProvisionalSequenceConflict,
+    PublicationAuthorityV1, ReadyProvisionalWorkspace, ReadyPublicationFile, StoreLimits,
+    StoreRequestError,
 };
 use bro_core::WorkspaceId;
 use bro_rpc::ServiceToken;
@@ -1223,6 +1224,10 @@ fn provisional_router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
             post(finalize_provisional_upload).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
+            "/internal/knowledge-source/v1/provisional/uploads/{upload_id}/abort",
+            post(abort_provisional_upload).layer(DefaultBodyLimit::max(1)),
+        )
+        .route(
             "/internal/knowledge-source/v1/provisional/generations/{generation}/renew",
             post(renew_provisional_generation).layer(DefaultBodyLimit::max(16 * 1024)),
         )
@@ -1704,6 +1709,17 @@ async fn renew_provisional_generation(
     ))
 }
 
+async fn abort_provisional_upload(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<WorkspaceBindingGrant>,
+    Path(upload_id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    let authority = provisional_authority(&grant);
+    let store = state.knowledge_sources.store();
+    blocking(move || store.abort_provisional_upload(&authority, &upload_id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn retire_provisional_generation(
     State(state): State<Arc<SharedState>>,
     Extension(grant): Extension<WorkspaceBindingGrant>,
@@ -2131,11 +2147,23 @@ impl HttpError {
                     "knowledge_source_input_invalid",
                     "knowledge-source input is invalid",
                 ),
-                StoreRequestError::Conflict => Self::new(
-                    StatusCode::CONFLICT,
-                    "knowledge_source_generation_conflict",
-                    "knowledge-source evidence conflicts with durable state",
-                ),
+                StoreRequestError::Conflict => {
+                    // Name the holder when the store knows it: a bare
+                    // "conflicts with durable state" left capture authors
+                    // guessing which sequence and generation they were
+                    // converging against.
+                    let message = error
+                        .downcast_ref::<ProvisionalSequenceConflict>()
+                        .map_or_else(
+                            || "knowledge-source evidence conflicts with durable state".to_string(),
+                            |detail| format!("knowledge-source evidence conflicts with durable state: {detail}"),
+                        );
+                    Self::new(
+                        StatusCode::CONFLICT,
+                        "knowledge_source_generation_conflict",
+                        message,
+                    )
+                }
                 StoreRequestError::NotFound => {
                     Self::new(StatusCode::NOT_FOUND, "not_found", "resource not found")
                 }
@@ -3375,6 +3403,173 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stale_finalize.status(), StatusCode::CONFLICT);
+    }
+
+    /// A capture that fails after `begin` (the graph-manifest 422 that
+    /// motivated this) used to leave an open upload holding the sequence, and
+    /// every later capture at that sequence answered 409 until the idle TTL
+    /// expired it. The workspace binding is one writer: its newest descriptor
+    /// supersedes the stale upload, and the abort route lets the client
+    /// abandon its own failed upload explicitly.
+    #[tokio::test]
+    async fn stale_open_upload_is_superseded_and_abort_abandons_uploads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let fixture = enabled_state(&root);
+        let app = router(fixture.state.clone()).with_state(fixture.state.clone());
+        let begin = |descriptor: bbox_knowledge_source::ProvisionalWorkspaceDescriptorV1| {
+            request(
+                "POST",
+                "/internal/knowledge-source/v1/provisional/uploads",
+                Some(&fixture.workspace_token),
+                Body::from(
+                    serde_json::to_vec(&BeginProvisionalUploadRequestV1 { descriptor }).unwrap(),
+                ),
+            )
+        };
+        let missing = |upload_id: &str, token: &str| {
+            request(
+                "GET",
+                &format!("/internal/knowledge-source/v1/provisional/uploads/{upload_id}/missing"),
+                Some(token),
+                Body::empty(),
+            )
+        };
+        let abort = |upload_id: &str, token: &str| {
+            request(
+                "POST",
+                &format!("/internal/knowledge-source/v1/provisional/uploads/{upload_id}/abort"),
+                Some(token),
+                Body::empty(),
+            )
+        };
+
+        let (descriptor, nodes) = provisional_descriptor(
+            fixture.scope.clone(),
+            fixture.workspace_id.clone(),
+            fixture.accepted_generation.clone(),
+            fixture.accepted_commit.clone(),
+        );
+        let stale = app
+            .clone()
+            .oneshot(begin(descriptor.clone()))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CREATED);
+        let stale: BeginSourceUploadResponseV1 =
+            serde_json::from_slice(&to_bytes(stale.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let ancestry = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!(
+                    "/internal/knowledge-source/v1/provisional/uploads/{}/ancestry/0",
+                    stale.upload_id
+                ),
+                Some(&fixture.workspace_token),
+                Body::from(
+                    serde_json::to_vec(&AncestryPageV1 {
+                        page_index: 0,
+                        nodes,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ancestry.status(), StatusCode::NO_CONTENT);
+
+        // The checkout moved on at the same sequence: superseded, not 409.
+        let mut moved = descriptor.clone();
+        moved.checkout_head = "2".repeat(40);
+        let fresh = app.clone().oneshot(begin(moved)).await.unwrap();
+        assert_eq!(fresh.status(), StatusCode::CREATED);
+        let fresh: BeginSourceUploadResponseV1 =
+            serde_json::from_slice(&to_bytes(fresh.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_ne!(fresh.upload_id, stale.upload_id);
+        assert_eq!(
+            app.clone()
+                .oneshot(missing(&stale.upload_id, &fixture.workspace_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Abort is authority-bound: another workspace's token is a no-op.
+        assert_eq!(
+            app.clone()
+                .oneshot(abort(&fresh.upload_id, &fixture.other_workspace_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_ne!(
+            app.clone()
+                .oneshot(missing(&fresh.upload_id, &fixture.workspace_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                app.clone()
+                    .oneshot(abort(&fresh.upload_id, &fixture.workspace_token))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(missing(&fresh.upload_id, &fixture.workspace_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        // And the same descriptor begins clean afterwards.
+        let again = app.oneshot(begin(descriptor)).await.unwrap();
+        assert_eq!(again.status(), StatusCode::CREATED);
+    }
+
+    /// The 409 names what holds the sequence when the store knows, so a
+    /// capture author converges instead of guessing.
+    #[test]
+    fn generation_conflict_message_names_the_holder() {
+        let detail = bbox_knowledge_source_store::ProvisionalSequenceConflict {
+            sequence: 7,
+            requested_generation_id: format!("kws_{}", "a".repeat(64)),
+            existing_generation_id: format!("kws_{}", "b".repeat(64)),
+            holder: bbox_knowledge_source_store::ProvisionalSequenceHolder::FinalizedSequence,
+        };
+        let error = HttpError::from_store(
+            anyhow::Error::new(StoreRequestError::Conflict).context(detail.clone()),
+        );
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.code, "knowledge_source_generation_conflict");
+        assert!(
+            error.body.message.contains("sequence 7"),
+            "{}",
+            error.body.message
+        );
+        assert!(
+            error.body.message.contains(&detail.existing_generation_id),
+            "{}",
+            error.body.message
+        );
+        assert!(
+            error.body.message.contains(&detail.requested_generation_id),
+            "{}",
+            error.body.message
+        );
+        // A bare Conflict keeps the coarse message.
+        let bare = HttpError::from_store(anyhow::Error::new(StoreRequestError::Conflict));
+        assert_eq!(bare.body.code, "knowledge_source_generation_conflict");
+        assert!(!bare.body.message.contains("sequence"));
     }
 
     /// The 2026-08-13 ingest starvation, reduced to its smallest form.
