@@ -25,14 +25,19 @@ The graph holds STATE; the design docs hold STORY.
 
 ## The authoring loop
 
-1. Mutate through the verb script (`create` / `update` / `edge` / `edge-rm`);
+1. Once per checkout: `bro workspace-binding mint --daemon-url
+   https://blackbox.daystrom.app` (the estate daemon is remote; the localhost
+   default is wrong here). Capture after edits with
+   `bro workspace-binding capture` to push the working state.
+2. Mutate through the verb script (`create` / `update` / `edge` / `edge-rm`);
    the staged `check` is the gate.
-2. Run `check` (structural mirror of the daemon validator; the daemon's
+3. Run `check` (structural mirror of the daemon validator; the daemon's
    `bbox_project_graph_validate` stays authoritative) and `lint` (instance
    invariants: graph lifecycle must equal doc frontmatter lifecycle).
-3. Commit to publish. Provenance is git: every mutation lands as a commit
-   that names what moved.
-4. Re-render affected state blocks (`render-state <doc-id> --write`) in the
+4. Commit to publish. Provenance is git: every mutation lands as a commit
+   that names what moved; the committed generation is what other checkouts
+   and dispatched agents read.
+5. Re-render affected state blocks (`render-state <doc-id> --write`) in the
    same commit.
 
 ## Entity selection
@@ -110,6 +115,12 @@ never these views.
   daemon-side.
 - `lint` checks lifecycle agreement only; topic-list agreement with frontmatter
   is TODO.
+- Search-lane participation: the published graph validates and is fully
+  inspectable/traversable (`bbox_inspect_entity`, `bbox_find_paths`,
+  `bbox_project_graph_*`), but its vertices had not surfaced through
+  `bbox_hybrid_search` after incremental reindexes on first publication;
+  tracked as `gap-7bc434bf`. Until it resolves, start from exact refs or the
+  file lane and walk edges.
 - Miners (`mine-design-frontmatter`) and transactional `apply` are phase A.
 - The eval suite (30 questions over the seed cluster) is phase A; see the
   design doc's evaluation gate and `retrieval-eval-harness.md`.
