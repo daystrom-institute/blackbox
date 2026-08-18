@@ -33,7 +33,9 @@ The graph holds STATE; the design docs hold STORY.
    the staged `check` is the gate.
 3. Run `check` (structural mirror of the daemon validator; the daemon's
    `bbox_project_graph_validate` stays authoritative) and `lint` (instance
-   invariants: graph lifecycle must equal doc frontmatter lifecycle).
+   invariants: graph lifecycle must equal doc frontmatter lifecycle; GapRef
+   gap ids well-formed and resolving to a record; Campaign slug agrees with
+   id; a concluded Inquiry carries an outcome).
 4. Commit to publish. Provenance is git: every mutation lands as a commit
    that names what moved; the committed generation is what other checkouts
    and dispatched agents read.
@@ -52,11 +54,19 @@ The graph holds STATE; the design docs hold STORY.
 | An invariant or preference the tree must satisfy | `dsg:Constraint` | `constraint/<slug>@N` |
 | The durable idea behind one or more docs (mint lazily) | `dsg:Concept` | `concept/<slug>` |
 | A Resolved Choices entry | `dsg:Choice` | `choice/<slug>` |
+| A durable initiative grouping related work | `dsg:Campaign` | `campaign/<slug>` |
+| A question or concept pulled from the gap log | `dsg:Inquiry` | `inquiry/<slug>` |
+| A mirror of one gap-log record (target of `SOURCED_FROM`) | `dsg:GapRef` | `gap/<gap-id>` |
 
 If it is about agent behavior or cross-project operating rules, it belongs in
 knowledge (`bbox_learn` / `bbox_decide`), not here. If it is prospective work,
 it belongs in roadmap/threads. If it is normative clause content, it belongs
 in `specs/`. The graph links to those stores by ref, never absorbs them.
+The one traversable exception is the gap log: a `dsg:GapRef` mirrors a gap
+record so `dsg:SOURCED_FROM` stays vertex-to-vertex; the gap itself (status,
+resolution) stays in `.bbox/gaps/`. Group inquiries, concepts, and open
+questions under a campaign with `dsg:PART_OF`; the migration plan is
+`design/corpus/agentic-corpus/gap-campaign-migration.md`.
 
 Phase gating: phase A mints Design/Hub/Module/OpenQuestion. Decision,
 Constraint, Concept, and Choice minting begins in phase B (harvest on new and
@@ -113,8 +123,8 @@ never these views.
 - `check` mirrors the daemon validator's load-bearing rules; nested object
   property terms are only key-presence checked, and enum member sanity is
   daemon-side.
-- `lint` checks lifecycle agreement only; topic-list agreement with frontmatter
-  is TODO.
+- `lint` checks lifecycle agreement plus the campaign-layer invariants (schema
+  v2); topic-list agreement with frontmatter is TODO.
 - Search-lane convergence semantics (learned the hard way, gap-7bc434bf,
   resolved as misdiagnosed): graph word lanes activate on published-view
   INSTALL (accept-advance of the pushed commit, boot reconcile, or capture

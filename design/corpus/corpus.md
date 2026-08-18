@@ -17,6 +17,7 @@ edges, storage, and corpus-facing assistants.
 
 - [Agentic Corpus](agentic-corpus/agentic-corpus-platform.md)
 - [Design Graph](agentic-corpus/design-graph.md)
+- [Gap-to-Campaign Migration Plan](agentic-corpus/gap-campaign-migration.md)
 - [Reflective Project Graph](agentic-corpus/reflective-project-graph.md)
 - [Badgey](badgey.md)
 - [Badgey - Implementation Skeleton](badgey-impl.md)

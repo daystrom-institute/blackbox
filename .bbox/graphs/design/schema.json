@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "namespace": "dsg",
   "vertex_types": {
     "dsg:Design": {
@@ -50,7 +50,8 @@
       },
       "hints": [
         {"edge_type": "dsg:RAISES", "direction": "in", "label": "raised by"},
-        {"edge_type": "dsg:RESOLVES", "direction": "in", "label": "resolved by"}
+        {"edge_type": "dsg:RESOLVES", "direction": "in", "label": "resolved by"},
+        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"}
       ]
     },
     "dsg:Decision": {
@@ -93,7 +94,8 @@
       "hints": [
         {"edge_type": "dsg:ARTICULATES", "direction": "in", "label": "articulated by"},
         {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
-        {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "related concepts"}
+        {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "related concepts"},
+        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"}
       ]
     },
     "dsg:Choice": {
@@ -105,6 +107,45 @@
       },
       "hints": [
         {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"}
+      ]
+    },
+    "dsg:Campaign": {
+      "required": ["slug", "summary", "status"],
+      "properties": {
+        "slug": "string",
+        "summary": {"type": "string", "index": "text"},
+        "status": {"enum": ["proposed", "active", "parked", "done"]},
+        "outcome": "string"
+      },
+      "hints": [
+        {"edge_type": "dsg:PART_OF", "direction": "in", "label": "member inquiries, concepts, and questions"},
+        {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "anchoring designs"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
+      ]
+    },
+    "dsg:Inquiry": {
+      "required": ["summary", "status"],
+      "properties": {
+        "kind": {"enum": ["question", "concept"]},
+        "summary": {"type": "string", "index": "text"},
+        "status": {"enum": ["open", "concluded"]},
+        "outcome": {"type": "string", "index": "text"}
+      },
+      "hints": [
+        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"},
+        {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "related concepts and designs"}
+      ]
+    },
+    "dsg:GapRef": {
+      "required": ["gap_id"],
+      "properties": {
+        "gap_id": "string",
+        "dedupe_key": "string",
+        "title": {"type": "string", "index": "text"}
+      },
+      "hints": [
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "in", "label": "vertices sourced from this gap"}
       ]
     }
   },
@@ -119,7 +160,10 @@
       "endpoints": [
         {"from": "dsg:Design", "to": "dsg:Design"},
         {"from": "dsg:Concept", "to": "dsg:Concept"},
-        {"from": "dsg:Design", "to": "dsg:Concept"}
+        {"from": "dsg:Design", "to": "dsg:Concept"},
+        {"from": "dsg:Campaign", "to": "dsg:Design"},
+        {"from": "dsg:Inquiry", "to": "dsg:Concept"},
+        {"from": "dsg:Inquiry", "to": "dsg:Design"}
       ],
       "properties": {
         "note": "string"
@@ -194,6 +238,35 @@
       "type": "dsg:ARTICULATES",
       "from_type": "dsg:Design",
       "to_type": "dsg:Concept"
+    },
+    {
+      "type": "dsg:PART_OF",
+      "endpoints": [
+        {"from": "dsg:Concept", "to": "dsg:Campaign"},
+        {"from": "dsg:Inquiry", "to": "dsg:Campaign"},
+        {"from": "dsg:OpenQuestion", "to": "dsg:Campaign"}
+      ],
+      "properties": {
+        "note": "string"
+      }
+    },
+    {
+      "type": "dsg:SOURCED_FROM",
+      "endpoints": [
+        {"from": "dsg:Design", "to": "dsg:GapRef"},
+        {"from": "dsg:Hub", "to": "dsg:GapRef"},
+        {"from": "dsg:Module", "to": "dsg:GapRef"},
+        {"from": "dsg:OpenQuestion", "to": "dsg:GapRef"},
+        {"from": "dsg:Decision", "to": "dsg:GapRef"},
+        {"from": "dsg:Constraint", "to": "dsg:GapRef"},
+        {"from": "dsg:Concept", "to": "dsg:GapRef"},
+        {"from": "dsg:Choice", "to": "dsg:GapRef"},
+        {"from": "dsg:Campaign", "to": "dsg:GapRef"},
+        {"from": "dsg:Inquiry", "to": "dsg:GapRef"}
+      ],
+      "properties": {
+        "note": "string"
+      }
     }
   ],
   "index_policy": {

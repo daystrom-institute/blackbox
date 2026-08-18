@@ -4,7 +4,7 @@
   "graph_id": "design",
   "authority": "project",
   "schema_id": "dsg-schema",
-  "schema_version": 1,
+  "schema_version": 2,
   "retention_policy": "project_owned",
-  "generation": 7
+  "generation": 19
 }

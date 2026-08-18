@@ -14,7 +14,8 @@
 #   edge <from> <type> <to> [--set k=v | --set-json k=JSON]...
 #   edge-rm <from> <type> <to>
 #   check                          structural validation (daemon mirror)
-#   lint                           instance invariants (frontmatter agreement)
+#   lint                           instance invariants (frontmatter agreement,
+#                                  gap-ref provenance, campaign/inquiry shape)
 #   render-preamble                consumer preamble generated from schema.json
 #   render-state <id> [--write]    minted state block for a design doc
 #
@@ -196,6 +197,10 @@ build_props() { # emits merged JSON object from --set/--set-json flags
 
 vertex_exists() { jq -r --arg id "$1" 'select(.id == $id) | .id' "$VFILE" | grep -q .; }
 vertex_type() { jq -r --arg id "$1" 'select(.id == $id) | .type' "$VFILE" | head -n 1; }
+# Gap ids are gap-<8 hex> (the gap log's canonical form); a GapRef mirrors one
+# gap as vertex gap/<gap-id> so SOURCED_FROM edges stay vertex-to-vertex.
+gap_id_ok() { printf '%s' "$1" | grep -Eq '^gap-[0-9a-f]{8}$'; }
+gapref_id_ok() { case "$1" in gap/*) gap_id_ok "${1#gap/}" ;; *) return 1 ;; esac; }
 
 cmd_create() { # create <type> <id> --label L [flags...]
   [ $# -ge 3 ] || die "usage: create <type> <id> --label L [--set k=v | --set-json k=JSON]..."
@@ -218,9 +223,24 @@ cmd_create() { # create <type> <id> --label L [flags...]
     dsg:Constraint) case "$id" in constraint/*) ;; *) echo "WARN: Constraint ids conventionally start with constraint/ (got $id)" >&2 ;; esac ;;
     dsg:Concept) case "$id" in concept/*) ;; *) echo "WARN: Concept ids conventionally start with concept/ (got $id)" >&2 ;; esac ;;
     dsg:Choice) case "$id" in choice/*) ;; *) echo "WARN: Choice ids conventionally start with choice/ (got $id)" >&2 ;; esac ;;
+    dsg:Campaign) case "$id" in campaign/*) ;; *) echo "WARN: Campaign ids conventionally start with campaign/ (got $id)" >&2 ;; esac ;;
+    dsg:Inquiry) case "$id" in inquiry/*) ;; *) echo "WARN: Inquiry ids conventionally start with inquiry/ (got $id)" >&2 ;; esac ;;
+    dsg:GapRef) gapref_id_ok "$id" || die "create: GapRef ids must be gap/<gap-id> with a well-formed gap id (gap-XXXXXXXX, 8 hex chars); got $id" ;;
   esac
   vertex_exists "$id" && die "create: vertex id already exists: $id"
   props="$(build_props "$@")"
+  if [ "$type" = "dsg:GapRef" ]; then
+    # gap_id is derived from the id when omitted and must agree when given:
+    # the mirror vertex is the provenance anchor for SOURCED_FROM, so its
+    # identity and its gap id are one fact.
+    local gap_id
+    gap_id="$(jq -r '.gap_id // empty' <<<"$props")"
+    if [ -z "$gap_id" ]; then
+      props="$(jq -c --arg g "${id#gap/}" '. + {gap_id: $g}' <<<"$props")"
+    elif [ "$gap_id" != "${id#gap/}" ]; then
+      die "create: GapRef gap_id $gap_id does not match id $id (expected ${id#gap/})"
+    fi
+  fi
   new_stage
   jq -c -n --arg id "$id" --arg t "$type" --arg label "$label" --argjson props "$props" \
     '{id: $id, type: $t, label: $label, properties: $props}' >>"$stage_dir/vertices.jsonl"
@@ -276,6 +296,17 @@ cmd_edge() { # edge <from> <type> <to> [flags...]
   jq -r --arg f "$from" --arg t "$type" --arg to "$to" \
     'select(.from == $f and .type == $t and .to == $to) | .to' "$EFILE" | grep -q . \
     && die "edge: already exists: $from -[$type]-> $to"
+  # The staged check would refuse these too (undeclared endpoint pair); the
+  # early die names the intent instead of the pair.
+  case "$type" in
+    dsg:PART_OF)
+      [ "$(vertex_type "$to")" = "dsg:Campaign" ] \
+        || die "edge: PART_OF must target a dsg:Campaign (got $(vertex_type "$to") $to)" ;;
+    dsg:SOURCED_FROM)
+      [ "$(vertex_type "$to")" = "dsg:GapRef" ] \
+        || die "edge: SOURCED_FROM must target a dsg:GapRef gap/<gap-id> vertex (got $(vertex_type "$to") $to); create the GapRef first"
+      gapref_id_ok "$to" || die "edge: SOURCED_FROM target $to does not carry a well-formed gap id" ;;
+  esac
   local props
   props="$(build_props "$@")"
   new_stage
@@ -344,9 +375,43 @@ cmd_show() {
 # ---------------------------------------------------------------------------
 # lint: instance invariants beyond structure.
 # L1: graph lifecycle must equal doc frontmatter lifecycle (mined projection).
+# L2: a GapRef's gap_id is well-formed, agrees with its id, and names a gap
+#     record under .bbox/gaps/ (provenance must resolve).
+# L3: a Campaign's slug agrees with its id (campaign/<slug>).
+# L4: a concluded Inquiry carries an outcome.
 # ---------------------------------------------------------------------------
 cmd_lint() {
   local failed=0 vid file fm g
+  local gap_id slug status outcome
+  while read -r vid gap_id || [ -n "$vid" ]; do
+    [ -n "$vid" ] || continue
+    if ! gap_id_ok "$gap_id"; then
+      echo "lint: $vid: gap_id '$gap_id' is not a well-formed gap id (gap-XXXXXXXX)"
+      failed=1
+    fi
+    if [ "$vid" != "gap/$gap_id" ]; then
+      echo "lint: $vid: id does not agree with gap_id '$gap_id' (expected gap/$gap_id)"
+      failed=1
+    fi
+    if gap_id_ok "$gap_id" && [ ! -f "$ROOT/.bbox/gaps/$gap_id.json" ]; then
+      echo "lint: $vid: no gap record at .bbox/gaps/$gap_id.json"
+      failed=1
+    fi
+  done < <(jq -r 'select(.type == "dsg:GapRef") | "\(.id) \(.properties.gap_id // "")"' "$VFILE")
+  while read -r vid slug || [ -n "$vid" ]; do
+    [ -n "$vid" ] || continue
+    if [ "$vid" != "campaign/$slug" ]; then
+      echo "lint: $vid: slug '$slug' does not agree with id (expected campaign/$slug)"
+      failed=1
+    fi
+  done < <(jq -r 'select(.type == "dsg:Campaign") | "\(.id) \(.properties.slug // "")"' "$VFILE")
+  while read -r vid status outcome || [ -n "$vid" ]; do
+    [ -n "$vid" ] || continue
+    if [ "$status" = "concluded" ] && [ -z "$outcome" ]; then
+      echo "lint: $vid: concluded Inquiry has no outcome"
+      failed=1
+    fi
+  done < <(jq -r 'select(.type == "dsg:Inquiry") | "\(.id) \(.properties.status // "") \(.properties.outcome // "" | gsub("\\s+"; " "))"' "$VFILE")
   while read -r vid || [ -n "$vid" ]; do
     [ -n "$vid" ] || continue
     file="$ROOT/${vid#doc/}"
@@ -378,7 +443,8 @@ cmd_render_preamble() {
     "tools. Entity refs are project_graph_vertex:<project>:design:<vertex-id>.",
     "Vertex ids are typed slugs: doc/<repo-relative-path>.md (Design/Hub),",
     "module/<path>, question/<slug>, decision/<slug>@N, constraint/<slug>@N,",
-    "concept/<slug>, choice/<slug>.",
+    "concept/<slug>, choice/<slug>, campaign/<slug>, inquiry/<slug>, gap/<gap-id>",
+    "(a dsg:GapRef mirrors one gap-log record; dsg:SOURCED_FROM edges point at it).",
     "",
     "Kinds and authored next-hop hints (direction is from the vertex named first):",
     ($S[0].vertex_types | to_entries | sort_by(.key)[] |
@@ -396,7 +462,10 @@ cmd_render_preamble() {
     "- STATE questions: resolve dsg:SUPERSEDES chains to the live endpoint before",
     "  answering in the present tense; superseded designs answer historical questions only.",
     "- BINDING questions: include each constraint kind (invariant vs preference), scope,",
-    "  and status; an in-transition constraint names its licensed_by authority."'
+    "  and status; an in-transition constraint names its licensed_by authority.",
+    "- CAMPAIGN questions (what work groups under an initiative, where a concept or",
+    "  inquiry came from): follow inbound dsg:PART_OF on the Campaign, then outbound",
+    "  dsg:SOURCED_FROM to the gap-log record (GapRef gap_id) for provenance."'
 }
 
 # ---------------------------------------------------------------------------
