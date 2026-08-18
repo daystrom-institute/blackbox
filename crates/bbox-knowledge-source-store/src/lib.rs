@@ -2889,8 +2889,17 @@ impl KnowledgeSourceStore {
             .by_ref()
             .take(expected_size.saturating_add(1))
             .read_to_end(&mut bytes)?;
+        // The manifests already admitted this entry, including whether a
+        // zero-byte body is legal for its path (graph vertices/edges files
+        // may be empty). Validate the body against a name that carries the
+        // same emptiness rule rather than a synthetic knowledge-record name,
+        // which would refuse every legitimately empty graph blob.
         let entry = SourceFileManifestEntryV1 {
-            repository_relative_filename: "blob-validation.json".to_string(),
+            repository_relative_filename: if expected_size == 0 {
+                ".bbox/graphs/blob-validation/vertices.jsonl".to_string()
+            } else {
+                "blob-validation.json".to_string()
+            },
             encoded_bytes: expected_size,
             content_sha256: hash.to_string(),
         };
@@ -7431,6 +7440,96 @@ mod tests {
         assert_store_error(
             store.abort_provisional_upload(&authority, &again.upload_id),
             StoreRequestError::InvalidState,
+        );
+    }
+
+    /// A hand-authored graph starts with empty `vertices.jsonl` / `edges.jsonl`.
+    /// The manifest admits those, so the blob install must too: it used to
+    /// validate every body under a synthetic knowledge-record name and refuse
+    /// the zero-byte graph blobs with 422 manifest_invalid (gap-8a5d8a9f).
+    #[test]
+    fn provisional_capture_installs_empty_graph_source_blobs() {
+        let (_temporary, _root, store) = test_store(StoreLimits::default());
+        let authority = provisional_authority();
+        let (mut descriptor, nodes, knowledge, gaps) = provisional_fixture(1);
+        let graph_files: [(&str, &[u8]); 4] = [
+            ("edges.jsonl", b""),
+            ("graph.json", br#"{"graph_id":"flr"}"#),
+            ("schema.json", br#"{"version":1}"#),
+            ("vertices.jsonl", b""),
+        ];
+        let graphs = graph_files
+            .iter()
+            .map(|(name, bytes)| entry(&format!(".bbox/graphs/flr/{name}"), bytes))
+            .collect::<Vec<_>>();
+        descriptor.working_graphs = manifest(SourceLaneV1::Graphs, &graphs);
+        let working_pair = working_pair_sha256(
+            &descriptor.working_knowledge,
+            &descriptor.working_gaps,
+            &descriptor.working_graphs,
+            &descriptor.working_evidence,
+        );
+        descriptor.capture.first_working_pair_sha256 = working_pair.clone();
+        descriptor.capture.second_working_pair_sha256 = working_pair;
+
+        let upload = store
+            .begin_provisional_upload(&authority, descriptor)
+            .unwrap();
+        put_provisional_pages(
+            &store,
+            &authority,
+            &upload.upload_id,
+            &nodes,
+            &knowledge,
+            &gaps,
+        );
+        store
+            .put_provisional_manifest_page(
+                &authority,
+                &upload.upload_id,
+                SnapshotClassV1::Working,
+                SourceLaneV1::Graphs,
+                0,
+                &SourceManifestPageV1 {
+                    page_index: 0,
+                    entries: graphs.clone(),
+                },
+            )
+            .unwrap();
+        let missing = store
+            .missing_provisional_blobs(&authority, &upload.upload_id, None)
+            .unwrap();
+        let empty_hash = source_file_blob_sha256(b"");
+        assert!(missing.hashes.contains(&empty_hash));
+        install_fixture_blobs_provisional(&store, &authority, &upload.upload_id);
+        for (_, bytes) in graph_files {
+            store
+                .install_provisional_blob(
+                    &authority,
+                    &upload.upload_id,
+                    &source_file_blob_sha256(bytes),
+                    bytes.len() as u64,
+                    Cursor::new(bytes),
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .missing_provisional_blobs(&authority, &upload.upload_id, None)
+                .unwrap()
+                .hashes
+                .is_empty()
+        );
+        let generation = store
+            .finalize_provisional_upload(&authority, &upload.upload_id, 60)
+            .unwrap()
+            .source_generation_id;
+        assert_eq!(
+            store
+                .provisional_status(&authority, &generation)
+                .unwrap()
+                .state,
+            SourceGenerationStateV1::Ready
         );
     }
 }
