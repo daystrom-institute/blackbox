@@ -12,10 +12,12 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/mcp-tool-dispatch/boolean-param-stringified",
+  "supersedes": "gap-451335b6",
   "superseded_by": "gap-451335b6",
   "resolution": "acknowledged",
+  "project_id": "89bd722f",
   "created_at": "2026-06-12T05:50:19Z",
-  "updated_at": "2026-06-12T17:11:59Z",
+  "updated_at": "2026-08-18T22:20:37Z",
   "resolved_at": "2026-06-12T17:11:59Z",
   "resolution_note": "Duplicate filing: gap-451335b6 (filed 3 minutes later, same dedupe_key mcp_surface/.../boolean-param-stringified) covers the same chat-harness stringification bug and additionally documents the array/sequence variant. Dedupe-by-key should have caught this second filing — plausibly defeated by the very boolean/JSON-type stringification the gap describes."
 }

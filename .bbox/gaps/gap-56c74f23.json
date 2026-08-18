@@ -1,0 +1,21 @@
+{
+  "id": "gap-56c74f23",
+  "title": "Retire the bbox_roadmap surface: unused rendering artifact superseded by graph-native concept/inquiry tracking",
+  "gap_kind": "mcp_surface",
+  "domain": "roadmap",
+  "wanted_capability": "Remove (or formally deprecate) the bbox_roadmap tool family and its store. Operator direction 2026-08-18: prospective concepts and inquiries pulled out of the gap log should live as vertices in the project reflective graph (a campaign-layer extension of the design graph, a pattern already proven in operator prior art elsewhere), tied to campaign initiatives and sourced designs, not in a separate roadmap store. Roadmap today is a web-facing rendering artifact that nothing uses: the store holds a single stale proposed item (roadmap-41532f5f, 2026-07-22), and project-scoped writes fail from non-checkout sessions (attachment_inactive: checkout authority root cannot be canonicalized) with no collector backchannel like the gap store has. Wanted: a deprecation path that (1) removes or gates the roadmap MCP surface, (2) migrates or retires surviving items, (3) drops the EdgeIndex Roadmap family or re-points it at graph vertices.",
+  "missing_primitive": "graph-native prospective-work tracking (campaign/inquiry vertices) replacing the roadmap store",
+  "fallback_used": "Abandoned a gap-to-roadmap migration mid-flight (2026-08-18 grounding pass, Blackbox Janny session); the 19 candidate gaps stay open in the gap store until a campaign-layer graph extension exists in this repo.",
+  "evidence": [
+    "bbox_roadmap create failures: attachment_inactive: checkout authority root cannot be canonicalized (2026-08-18)",
+    "roadmap store contents: single stale item roadmap-41532f5f",
+    "gap-9c2b0bf8 (describe_schema advertises no Roadmap family though EdgeIndex emits one)"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "mcp_surface/roadmap/retire-roadmap-surface",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-18T22:27:22Z",
+  "updated_at": "2026-08-18T22:27:22Z"
+}

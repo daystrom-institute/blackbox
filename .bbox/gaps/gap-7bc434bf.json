@@ -16,8 +16,10 @@
   "blocking_level": "blocks_task",
   "dedupe_key": "graph-text-index/agentic-corpus/published-generation-not-incrementally-indexed",
   "notes": "RESOLVED-AS-MISDIAGNOSED, same session. Premise was wrong; no substrate defect. Graph word lanes activate on published-view INSTALL (accept-advance via publisher_auto_advance -> refresh_published_graph_views -> converge_published_graph_word_lanes; boot reconcile; capture when no published view is installed), never on incremental bbox_reindex, which by design only PRESERVES existing lanes across its delete-all (reindex.rs collect_graph_lane_documents). The observed absence was the convergence window between pushing the commit and the daemon's accept refresh plus writer-queue settle (minutes; the queue was additionally busy with an edge-index rebuild and a code-route embedding backlog). Confirmed empirically: bbox_project_graph_describe's retrieval block reported indexed_generation == accepted_generation with indexed_vertex_count 3, and hybrid search then surfaced the vertices as project_graph_vertex docs. The diagnostic existed all along and should have been the first probe. Residual idea, not a defect: an operator-triggered reindex could nudge lane convergence for pushed-but-not-yet-accepted graphs as a convenience.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-18T05:23:33Z",
-  "updated_at": "2026-08-18T05:58:00Z"
+  "updated_at": "2026-08-18T22:20:35Z",
+  "resolved_at": "2026-08-18T22:20:35Z",
+  "resolution_note": "rejected: misdiagnosed per the gap's own investigation notes (RESOLVED-AS-MISDIAGNOSED, same session); graph word lanes activate on published-view install by design, no substrate defect. Closed in operator-approved grounding pass 2026-08-18."
 }
