@@ -655,6 +655,67 @@ async fn run_history_lane(runtime: &Runtime, config: &CollectorConfig) {
     }
 }
 
+/// Per-project outcome of one lane pass. Lanes iterate every configured
+/// project and must not let one unadoptable repo (no committed `.bbox`
+/// identity, a vanished root, a scope mismatch) starve the rest: each project
+/// is attempted, each failure is logged with its root, and the pass reports
+/// the tally.
+#[derive(Debug, Default)]
+struct LanePassOutcome {
+    succeeded: usize,
+    failures: Vec<String>,
+}
+
+impl LanePassOutcome {
+    fn record(&mut self, lane: &str, root: &Path, result: Result<()>) {
+        match result {
+            Ok(()) => self.succeeded += 1,
+            Err(error) => {
+                tracing::error!(
+                    lane,
+                    root = %root.display(),
+                    error = %format!("{error:#}"),
+                    "lane pass failed for project; continuing with the rest"
+                );
+                self.failures.push(format!("{}: {error:#}", root.display()));
+            }
+        }
+    }
+
+    /// Continuous-lane verdict. A pass where at least one project published
+    /// keeps the lane on its normal cadence (the failures were already
+    /// reported per project); only a pass where every attempted project
+    /// failed is a lane error, which drives the backoff.
+    fn into_lane_result(self, lane: &str) -> Result<()> {
+        if self.failures.is_empty() {
+            return Ok(());
+        }
+        if self.succeeded > 0 {
+            tracing::warn!(
+                lane,
+                succeeded = self.succeeded,
+                failed = self.failures.len(),
+                "lane pass completed with per-project failures"
+            );
+            return Ok(());
+        }
+        bail!(
+            "every project failed ({}): {}",
+            self.failures.len(),
+            self.failures.join("; ")
+        )
+    }
+
+    /// One-shot verdict (`publish_all`): any failure is reported.
+    fn into_strict_result(self) -> Result<()> {
+        if self.failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(self.failures.join("; "))
+        }
+    }
+}
+
 async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
     if config.projects.is_empty() {
         bail!("collector config must contain at least one project");
@@ -662,11 +723,19 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
     if config.status_timeout_secs == 0 {
         bail!("collector status_timeout_secs must be greater than zero");
     }
-    let code = publish_code_projects(runtime, config).await;
-    let history = publish_history_repositories(runtime, config).await;
-    let provenance = publish_provenance_projects(runtime, config).await;
+    let code = publish_code_projects_pass(runtime, config)
+        .await
+        .into_strict_result();
+    let history = publish_history_repositories_pass(runtime, config)
+        .await
+        .into_strict_result();
+    let provenance = publish_provenance_projects_pass(runtime, config)
+        .await
+        .into_strict_result();
     let mutations = apply_checkout_mutations(runtime, config).await;
-    let published_knowledge = publish_knowledge_projects(runtime, config).await;
+    let published_knowledge = publish_knowledge_projects_pass(runtime, config)
+        .await
+        .into_strict_result();
     let onboard = onboard_projects(runtime, config).await;
     let mut failures = Vec::new();
     if let Err(error) = code {
@@ -695,20 +764,34 @@ async fn publish_all(runtime: &Runtime, config: &CollectorConfig) -> Result<()> 
 }
 
 async fn publish_knowledge_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    publish_knowledge_projects_pass(runtime, config)
+        .await
+        .into_lane_result("published-knowledge")
+}
+
+async fn publish_knowledge_projects_pass(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+) -> LanePassOutcome {
+    let mut outcome = LanePassOutcome::default();
     for project in config
         .projects
         .iter()
         .filter(|project| project.published_knowledge.is_some())
     {
-        let captured = capture_publication_candidate(project)?;
-        publish_publication_candidate(
-            runtime,
-            captured,
-            Duration::from_secs(config.status_timeout_secs),
-        )
-        .await?;
+        let result = async {
+            let captured = capture_publication_candidate(project)?;
+            publish_publication_candidate(
+                runtime,
+                captured,
+                Duration::from_secs(config.status_timeout_secs),
+            )
+            .await
+        }
+        .await;
+        outcome.record("published-knowledge", &project.root, result);
     }
-    Ok(())
+    outcome
 }
 
 fn capture_publication_candidate(config: &ProjectConfig) -> Result<CapturedPublicationCandidate> {
@@ -1133,15 +1216,26 @@ const MAX_PROVENANCE_STALE_RESTARTS: usize = 3;
 const MAX_PROVENANCE_PAGE_RESPONSE_BYTES: usize = 128 * 1024;
 
 async fn publish_provenance_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    publish_provenance_projects_pass(runtime, config)
+        .await
+        .into_lane_result("provenance")
+}
+
+async fn publish_provenance_projects_pass(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+) -> LanePassOutcome {
+    let mut outcome = LanePassOutcome::default();
     for project in config.projects.iter().filter(|project| project.provenance) {
-        publish_project_provenance(
+        let result = publish_project_provenance(
             runtime,
             project,
             Duration::from_secs(config.status_timeout_secs),
         )
-        .await?;
+        .await;
+        outcome.record("provenance", &project.root, result);
     }
-    Ok(())
+    outcome
 }
 
 async fn publish_project_provenance(
@@ -1622,38 +1716,68 @@ fn pack_provenance_manifest_pages(
 }
 
 async fn publish_code_projects(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    publish_code_projects_pass(runtime, config)
+        .await
+        .into_lane_result("code-source")
+}
+
+async fn publish_code_projects_pass(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+) -> LanePassOutcome {
+    let mut outcome = LanePassOutcome::default();
     for project in &config.projects {
-        let scanned = scan_project(project)?;
-        publish_project(
-            runtime,
-            scanned,
-            Duration::from_secs(config.status_timeout_secs),
-        )
-        .await?;
+        let result = async {
+            let scanned = scan_project(project)?;
+            publish_project(
+                runtime,
+                scanned,
+                Duration::from_secs(config.status_timeout_secs),
+            )
+            .await
+        }
+        .await;
+        outcome.record("code-source", &project.root, result);
     }
-    Ok(())
+    outcome
 }
 
 async fn publish_history_repositories(runtime: &Runtime, config: &CollectorConfig) -> Result<()> {
+    publish_history_repositories_pass(runtime, config)
+        .await
+        .into_lane_result("git-history")
+}
+
+async fn publish_history_repositories_pass(
+    runtime: &Runtime,
+    config: &CollectorConfig,
+) -> LanePassOutcome {
+    let mut outcome = LanePassOutcome::default();
     let mut published_history_repositories = HashSet::new();
     for project in config.projects.iter().filter(|project| project.git_history) {
-        let root = project
-            .root
-            .canonicalize()
-            .with_context(|| format!("canonicalizing history root {}", project.root.display()))?;
-        let common_dir = bbox_corpus_core::git::git_common_dir(&root)
-            .ok_or_else(|| anyhow!("Git common directory is unavailable"))?;
-        if published_history_repositories.insert(common_dir) {
+        let result = async {
+            let root = project.root.canonicalize().with_context(|| {
+                format!("canonicalizing history root {}", project.root.display())
+            })?;
+            let common_dir = bbox_corpus_core::git::git_common_dir(&root)
+                .ok_or_else(|| anyhow!("Git common directory is unavailable"))?;
+            if !published_history_repositories.insert(common_dir) {
+                // Another configured project already published this
+                // repository's history this pass.
+                return Ok(());
+            }
             let captured = capture_git_history(project)?;
             publish_git_history(
                 runtime,
                 captured,
                 Duration::from_secs(config.status_timeout_secs),
             )
-            .await?;
+            .await
         }
+        .await;
+        outcome.record("git-history", &project.root, result);
     }
-    Ok(())
+    outcome
 }
 
 async fn publish_git_history(
@@ -3529,5 +3653,49 @@ mod tests {
             b"12345"
         );
         assert!(read_regular_file_confined(&root, Path::new("source.rs"), 4).is_err());
+    }
+
+    /// One unadoptable project must not take the lane down with it: a pass
+    /// where other projects published stays on cadence, a pass where every
+    /// project failed is a lane error, and the one-shot verdict reports any
+    /// failure (gap-3f112ee0).
+    #[test]
+    fn lane_pass_isolates_per_project_failures() {
+        let healthy = Path::new("/repos/healthy");
+        let broken = Path::new("/repos/no-committed-bbox");
+
+        let mut partial = LanePassOutcome::default();
+        partial.record("code-source", healthy, Ok(()));
+        partial.record(
+            "code-source",
+            broken,
+            Err(anyhow!(
+                "committed project config has no recorded repo authority"
+            )),
+        );
+        assert_eq!(partial.succeeded, 1);
+        assert_eq!(partial.failures.len(), 1);
+        assert!(partial.failures[0].starts_with("/repos/no-committed-bbox: "));
+        let strict = LanePassOutcome {
+            succeeded: partial.succeeded,
+            failures: partial.failures.clone(),
+        };
+        partial
+            .into_lane_result("code-source")
+            .expect("a partial pass keeps the lane on cadence");
+        let error = strict.into_strict_result().unwrap_err();
+        assert!(error.to_string().contains("no-committed-bbox"), "{error}");
+
+        let mut all_failed = LanePassOutcome::default();
+        all_failed.record("code-source", broken, Err(anyhow!("boom")));
+        let error = all_failed.into_lane_result("code-source").unwrap_err();
+        assert!(
+            error.to_string().starts_with("every project failed (1)"),
+            "{error}"
+        );
+
+        LanePassOutcome::default()
+            .into_lane_result("code-source")
+            .expect("an empty pass is not an error");
     }
 }

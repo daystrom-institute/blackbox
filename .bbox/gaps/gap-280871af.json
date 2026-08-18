@@ -13,8 +13,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/project-graph/accept-refresh-serves-stale-view",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-16T23:46:00Z",
-  "updated_at": "2026-08-16T23:46:00Z"
+  "updated_at": "2026-08-18T19:47:59Z",
+  "resolved_at": "2026-08-18T19:47:59Z",
+  "resolution_note": "Addressed by c3c62bab (auto-advance policy converges the published graph view on every pointer move, including may_have_swapped refusals; refuses latching prior-arm content) and a8b45279 (every published-view install is gated on the accepted pointer, so a slower in-flight builder cannot reinstall a superseded view over the fresh one), both on beta/blackbox-v2 and deployed to blackbox.daystrom.app in build ba6c00a18878. Design: design/daemon-runtime/publisher-auto-advance.md."
 }
