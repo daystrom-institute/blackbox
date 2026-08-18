@@ -60,6 +60,17 @@
   is no durable store the pass walks for them. The schema-migration rebuild
   starts empty and lanes re-activate at the next accepted view install,
   mirroring the in-memory view catalog's own lifecycle.
+- Lane activation is install-driven, never reindex-driven: a newly published
+  generation reaches the word index only when a published view INSTALLS
+  (accept-advance of the pushed commit, boot reconcile, or a capture with no
+  published view installed). Between the push and that install there is a
+  real convergence window, minutes wide, during which the graph validates and
+  inspects fine but its vertices do not surface in hybrid search. Diagnose
+  "published but not searchable" with the describe retrieval block
+  (`indexed_generation` vs `accepted_generation`, `indexed_vertex_count`)
+  before suspecting the indexer; an incremental reindex proves nothing here
+  and must not be filed as the missing trigger (gap-7bc434bf was exactly that
+  misdiagnosis).
 
 ## Aliases fail closed at every layer
 
