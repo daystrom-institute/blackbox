@@ -202,9 +202,12 @@ first.
   throwaway vertices and reverted; the committed graph still holds only the
   phase 0 seed.
 - Resolve, update, or re-key any gap. Gap status stays in the gap log.
-- Enable embeddings. `summary` and `outcome` are text-indexed like `brief`
-  and `statement`; `embed: true` needs `index_policy.embeddings_enabled`,
-  which is a graph-wide operator decision, not a per-kind one.
+- Change retrieval policy further. Embeddings are enabled graph-wide
+  (operator decision, 2026-08-18): every statement-bearing text-indexed
+  property (`brief`, `statement`, `synthesis`, `rationale`, `decision`,
+  Module and Campaign `summary`, Inquiry `summary` and `outcome`) embeds;
+  `GapRef.title` stays index-only because the gap log owns that record's
+  retrieval and the mirror should not compete with it.
 - Decide campaign status. Everything lands `proposed`/`open`; ratification
   is the operator's.
 

@@ -7,7 +7,7 @@
       "properties": {
         "lifecycle": {"enum": ["proposed", "partial", "archived", "superseded"]},
         "topic": ["string"],
-        "brief": {"type": "string", "index": "text"},
+        "brief": {"type": "string", "index": "text", "embed": true},
         "tags": ["string"],
         "verified_against": "string",
         "verified_at": "string"
@@ -23,7 +23,7 @@
     "dsg:Hub": {
       "required": ["brief"],
       "properties": {
-        "brief": {"type": "string", "index": "text"}
+        "brief": {"type": "string", "index": "text", "embed": true}
       },
       "hints": [
         {"edge_type": "dsg:UNDER", "direction": "in", "label": "designs under this topic"}
@@ -33,7 +33,7 @@
       "required": ["path"],
       "properties": {
         "path": "string",
-        "summary": {"type": "string", "index": "text"}
+        "summary": {"type": "string", "index": "text", "embed": true}
       },
       "hints": [
         {"edge_type": "dsg:CONSTRAINS", "direction": "in", "label": "binding decisions and constraints"}
@@ -42,11 +42,11 @@
     "dsg:OpenQuestion": {
       "required": ["statement", "status", "depth"],
       "properties": {
-        "statement": {"type": "string", "index": "text"},
+        "statement": {"type": "string", "index": "text", "embed": true},
         "status": {"enum": ["open", "concluded", "withdrawn"]},
         "depth": {"enum": ["quick-check", "analysis", "deep-investigation"]},
         "outcome": "string",
-        "synthesis": {"type": "string", "index": "text"}
+        "synthesis": {"type": "string", "index": "text", "embed": true}
       },
       "hints": [
         {"edge_type": "dsg:RAISES", "direction": "in", "label": "raised by"},
@@ -58,7 +58,7 @@
       "required": ["status", "rationale"],
       "properties": {
         "status": {"enum": ["proposed", "active", "superseded", "reversed"]},
-        "rationale": {"type": "string", "index": "text"},
+        "rationale": {"type": "string", "index": "text", "embed": true},
         "alternatives": "string",
         "enacted_by": "string",
         "decided_at": "string"
@@ -74,7 +74,7 @@
       "properties": {
         "kind": {"enum": ["invariant", "preference"]},
         "status": {"enum": ["proposed", "declared", "in-transition", "retired"]},
-        "statement": {"type": "string", "index": "text"},
+        "statement": {"type": "string", "index": "text", "embed": true},
         "scope": "string",
         "check_rule": "string",
         "licensed_by": "string"
@@ -89,7 +89,7 @@
       "required": ["status", "statement"],
       "properties": {
         "status": {"enum": ["proposed", "active", "superseded", "absorbed", "deferred", "dismissed"]},
-        "statement": {"type": "string", "index": "text"}
+        "statement": {"type": "string", "index": "text", "embed": true}
       },
       "hints": [
         {"edge_type": "dsg:ARTICULATES", "direction": "in", "label": "articulated by"},
@@ -101,7 +101,7 @@
     "dsg:Choice": {
       "required": ["decision", "rationale"],
       "properties": {
-        "decision": {"type": "string", "index": "text"},
+        "decision": {"type": "string", "index": "text", "embed": true},
         "rationale": "string",
         "alternatives": "string"
       },
@@ -113,7 +113,7 @@
       "required": ["slug", "summary", "status"],
       "properties": {
         "slug": "string",
-        "summary": {"type": "string", "index": "text"},
+        "summary": {"type": "string", "index": "text", "embed": true},
         "status": {"enum": ["proposed", "active", "parked", "done"]},
         "outcome": "string"
       },
@@ -127,9 +127,9 @@
       "required": ["summary", "status"],
       "properties": {
         "kind": {"enum": ["question", "concept"]},
-        "summary": {"type": "string", "index": "text"},
+        "summary": {"type": "string", "index": "text", "embed": true},
         "status": {"enum": ["open", "concluded"]},
-        "outcome": {"type": "string", "index": "text"}
+        "outcome": {"type": "string", "index": "text", "embed": true}
       },
       "hints": [
         {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"},
@@ -270,7 +270,7 @@
     }
   ],
   "index_policy": {
-    "embeddings_enabled": false,
+    "embeddings_enabled": true,
     "text_retrieval_enabled": true,
     "retrieval_excluded_types": []
   }
