@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "namespace": "dsg",
+  "vertex_types": {
+    "dsg:Design": {
+      "required": ["lifecycle", "topic", "brief"],
+      "properties": {
+        "lifecycle": {"enum": ["proposed", "partial", "archived", "superseded"]},
+        "topic": ["string"],
+        "brief": {"type": "string", "index": "text"},
+        "tags": ["string"],
+        "verified_against": "string",
+        "verified_at": "string"
+      },
+      "hints": [
+        {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
+        {"edge_type": "dsg:DEPENDS_ON", "direction": "out", "label": "depends on"},
+        {"edge_type": "dsg:DEPENDS_ON", "direction": "in", "label": "unblocks"},
+        {"edge_type": "dsg:RAISES", "direction": "out", "label": "open questions"},
+        {"edge_type": "dsg:UNDER", "direction": "out", "label": "topic home"}
+      ]
+    },
+    "dsg:Hub": {
+      "required": ["brief"],
+      "properties": {
+        "brief": {"type": "string", "index": "text"}
+      },
+      "hints": [
+        {"edge_type": "dsg:UNDER", "direction": "in", "label": "designs under this topic"}
+      ]
+    },
+    "dsg:Module": {
+      "required": ["path"],
+      "properties": {
+        "path": "string",
+        "summary": {"type": "string", "index": "text"}
+      },
+      "hints": [
+        {"edge_type": "dsg:CONSTRAINS", "direction": "in", "label": "binding decisions and constraints"}
+      ]
+    },
+    "dsg:OpenQuestion": {
+      "required": ["statement", "status", "depth"],
+      "properties": {
+        "statement": {"type": "string", "index": "text"},
+        "status": {"enum": ["open", "concluded", "withdrawn"]},
+        "depth": {"enum": ["quick-check", "analysis", "deep-investigation"]},
+        "outcome": "string",
+        "synthesis": {"type": "string", "index": "text"}
+      },
+      "hints": [
+        {"edge_type": "dsg:RAISES", "direction": "in", "label": "raised by"},
+        {"edge_type": "dsg:RESOLVES", "direction": "in", "label": "resolved by"}
+      ]
+    },
+    "dsg:Decision": {
+      "required": ["status", "rationale"],
+      "properties": {
+        "status": {"enum": ["proposed", "active", "superseded", "reversed"]},
+        "rationale": {"type": "string", "index": "text"},
+        "alternatives": "string",
+        "enacted_by": "string",
+        "decided_at": "string"
+      },
+      "hints": [
+        {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
+        {"edge_type": "dsg:CONSTRAINS", "direction": "out", "label": "constrains"},
+        {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"}
+      ]
+    },
+    "dsg:Constraint": {
+      "required": ["kind", "status", "statement", "scope"],
+      "properties": {
+        "kind": {"enum": ["invariant", "preference"]},
+        "status": {"enum": ["proposed", "declared", "in-transition", "retired"]},
+        "statement": {"type": "string", "index": "text"},
+        "scope": "string",
+        "check_rule": "string",
+        "licensed_by": "string"
+      },
+      "hints": [
+        {"edge_type": "dsg:CONSTRAINS", "direction": "out", "label": "constrains"},
+        {"edge_type": "dsg:RELAXED_BY", "direction": "out", "label": "relaxation history"},
+        {"edge_type": "dsg:SCOPED_BY", "direction": "out", "label": "scoped exceptions"}
+      ]
+    },
+    "dsg:Concept": {
+      "required": ["status", "statement"],
+      "properties": {
+        "status": {"enum": ["proposed", "active", "superseded", "absorbed", "deferred", "dismissed"]},
+        "statement": {"type": "string", "index": "text"}
+      },
+      "hints": [
+        {"edge_type": "dsg:ARTICULATES", "direction": "in", "label": "articulated by"},
+        {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
+        {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "related concepts"}
+      ]
+    },
+    "dsg:Choice": {
+      "required": ["decision", "rationale"],
+      "properties": {
+        "decision": {"type": "string", "index": "text"},
+        "rationale": "string",
+        "alternatives": "string"
+      },
+      "hints": [
+        {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"}
+      ]
+    }
+  },
+  "edge_types": [
+    {
+      "type": "dsg:UNDER",
+      "from_type": "dsg:Design",
+      "to_type": "dsg:Hub"
+    },
+    {
+      "type": "dsg:RELATES_TO",
+      "endpoints": [
+        {"from": "dsg:Design", "to": "dsg:Design"},
+        {"from": "dsg:Concept", "to": "dsg:Concept"},
+        {"from": "dsg:Design", "to": "dsg:Concept"}
+      ],
+      "properties": {
+        "note": "string"
+      }
+    },
+    {
+      "type": "dsg:SUPERSEDES",
+      "endpoints": [
+        {"from": "dsg:Design", "to": "dsg:Design"},
+        {"from": "dsg:Hub", "to": "dsg:Hub"},
+        {"from": "dsg:Decision", "to": "dsg:Decision"},
+        {"from": "dsg:Constraint", "to": "dsg:Constraint"},
+        {"from": "dsg:Concept", "to": "dsg:Concept"}
+      ],
+      "properties": {
+        "note": "string"
+      }
+    },
+    {
+      "type": "dsg:DEPENDS_ON",
+      "from_type": "dsg:Design",
+      "to_type": "dsg:Design",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["hard", "crosslink"]},
+        "note": "string"
+      }
+    },
+    {
+      "type": "dsg:RAISES",
+      "endpoints": [
+        {"from": "dsg:Design", "to": "dsg:OpenQuestion"},
+        {"from": "dsg:Concept", "to": "dsg:OpenQuestion"}
+      ]
+    },
+    {
+      "type": "dsg:RESOLVES",
+      "endpoints": [
+        {"from": "dsg:Design", "to": "dsg:OpenQuestion"},
+        {"from": "dsg:Choice", "to": "dsg:OpenQuestion"},
+        {"from": "dsg:Decision", "to": "dsg:OpenQuestion"}
+      ]
+    },
+    {
+      "type": "dsg:CONSTRAINS",
+      "endpoints": [
+        {"from": "dsg:Decision", "to": "dsg:Module"},
+        {"from": "dsg:Decision", "to": "dsg:Design"},
+        {"from": "dsg:Constraint", "to": "dsg:Module"},
+        {"from": "dsg:Constraint", "to": "dsg:Design"}
+      ]
+    },
+    {
+      "type": "dsg:RELAXED_BY",
+      "from_type": "dsg:Constraint",
+      "to_type": "dsg:Design",
+      "required": ["justification"],
+      "properties": {
+        "justification": "string"
+      }
+    },
+    {
+      "type": "dsg:SCOPED_BY",
+      "from_type": "dsg:Constraint",
+      "to_type": "dsg:Constraint",
+      "required": ["exception"],
+      "properties": {
+        "exception": "string"
+      }
+    },
+    {
+      "type": "dsg:ARTICULATES",
+      "from_type": "dsg:Design",
+      "to_type": "dsg:Concept"
+    }
+  ],
+  "index_policy": {
+    "embeddings_enabled": false,
+    "text_retrieval_enabled": true,
+    "retrieval_excluded_types": []
+  }
+}

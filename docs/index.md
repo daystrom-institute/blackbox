@@ -38,6 +38,7 @@ The workspace produces five operator-facing binaries:
 | [Refactor Tools And Atoms](refactor.md) | Structural refactor primitives plus shipped Java/Rust refactor atoms |
 | [Bro Runtime](bro-runtime.md) | Direct dispatch, resume, wait, teams, brofiles, and provider runtime controls |
 | [Knowledge Store](knowledge-store.md) | Learn, decide, remember, pin, render, review, notes, and inbox |
+| [Design Graph](design-graph.md) | Operate this repo's `design` project graph: verbs, authority, reads, state blocks |
 | [Transcript Retrieval](transcript-retrieval.md) | Search, cite, context, sessions, messages, topics, and freshness checks |
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |
 | [Code Source Collector](code-source-collector.md) | Publish checkout-owned current files to a corpus daemon and operate source transitions |

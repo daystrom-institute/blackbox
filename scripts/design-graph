@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+# design-graph - the only sanctioned author of the `design` project graph.
+#
+# .bbox/graphs/design/ holds the design corpus's STATE layer (see
+# design/corpus/agentic-corpus/design-graph.md). Hand-editing vertices.jsonl
+# or edges.jsonl is banned: this verb surface is the integrity contract.
+# Provenance is git; every mutation lands as a commit.
+#
+# Verbs:
+#   list [kind]                    list vertices, optionally one kind
+#   show <id>                      vertex + directed edges + hint breadcrumbs
+#   create <type> <id> --label L [--set k=v | --set-json k=JSON]...
+#   update <id> [--set k=v | --set-json k=JSON | --unset k]...
+#   edge <from> <type> <to> [--set k=v | --set-json k=JSON]...
+#   edge-rm <from> <type> <to>
+#   check                          structural validation (daemon mirror)
+#   lint                           instance invariants (frontmatter agreement)
+#   render-preamble                consumer preamble generated from schema.json
+#   render-state <id> [--write]    minted state block for a design doc
+#
+# Mutations are staged and validated before landing: a mutation that breaks
+# check is refused, and graph.json's generation is bumped on every landing.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+GDIR="$ROOT/.bbox/graphs/design"
+SCHEMA="$GDIR/schema.json"
+GRAPHJSON="$GDIR/graph.json"
+VFILE="$GDIR/vertices.jsonl"
+EFILE="$GDIR/edges.jsonl"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required"
+[ -f "$SCHEMA" ] || die "no design graph at $GDIR (schema.json missing)"
+[ -f "$GRAPHJSON" ] || die "graph.json missing"
+[ -f "$VFILE" ] || echo -n "" >"$VFILE"
+[ -f "$EFILE" ] || echo -n "" >"$EFILE"
+
+# ---------------------------------------------------------------------------
+# Structural check. Mirrors the daemon validator's load-bearing rules; the
+# daemon (bbox_project_graph_validate) remains authoritative. Known deltas:
+# nested object property terms are only checked for key presence, and enum
+# member sanity (non-empty, unique) is left to the daemon.
+# ---------------------------------------------------------------------------
+read -r -d '' CHECK_JQ <<'JQEOF' || true
+def annotated(t):
+  (t | type) == "object" and (t | has("type"))
+  and ((t | has("index")) or (t | has("embed")))
+  and (((t | keys) - ["type", "index", "embed"]) | length == 0);
+def body(t): if annotated(t) then t.type else t end;
+def valok(t; v):
+  body(t) as $b |
+  if ($b | type) == "string" then
+    (($b == "string" and (v | type) == "string")
+      or ($b == "number" and (v | type) == "number")
+      or ($b == "boolean" and (v | type) == "boolean"))
+  elif ($b | type) == "object" and ($b | has("enum")) then
+    (v | IN($b.enum[]))
+  elif ($b | type) == "object" then
+    ((v | type) == "object" and ([($b | keys[]) as $k | v | has($k)] | all))
+  elif ($b | type) == "array" then (v | type) == "array"
+  else false end;
+def etpairs(et):
+  (if (et | has("endpoints")) then [et.endpoints[] | {from_type: .from, to_type: .to}]
+   elif (et | has("from_type")) then [{from_type: et.from_type, to_type: et.to_type}]
+   else [] end);
+($S[0].vertex_types) as $vt |
+[$S[0].edge_types[]] as $ets |
+[$V[]] as $vs |
+[$E[]] as $es |
+(
+  ([$vs[].id] | group_by(.) | map(select(length > 1)) | .[]
+    | "duplicate vertex id \(.)"),
+  ($vs[] | . as $v | ($vt[$v.type] // null) as $d |
+    (if $d == null then "vertex \($v.id): undeclared type \($v.type)" else empty end),
+    (if $d != null then
+      ($d.required[] as $r | select(($v.properties // {}) | has($r) | not)
+        | "vertex \($v.id): missing required property \($r)")
+    else empty end),
+    (if $d != null then
+      (($d.properties // {}) | to_entries[] as $en
+        | select(($v.properties // {}) | has($en.key))
+        | select(valok($en.value; ($v.properties // {})[$en.key]) | not)
+        | "vertex \($v.id): property \($en.key) shape mismatch")
+    else empty end)),
+  ([$es[] | "\(.from) -[\(.type)]-> \(.to)"] | group_by(.) | map(select(length > 1)) | .[]
+    | "duplicate edge key \(.)"),
+  ($es[] | . as $e |
+    (if ([$ets[].type] | index($e.type) | not)
+      then "edge \($e.from) -[\($e.type)]-> \($e.to): undeclared edge type"
+      else empty end),
+    (if ([$vs[].id] | index($e.from) | not)
+      then "edge \($e.from) -[\($e.type)]-> \($e.to): missing from-vertex"
+      else empty end),
+    (if ([$vs[].id] | index($e.to) | not)
+      then "edge \($e.from) -[\($e.type)]-> \($e.to): missing to-vertex"
+      else empty end),
+    ([$vs[] | select(.id == $e.from) | .type][0] as $ft |
+      [$vs[] | select(.id == $e.to) | .type][0] as $tt |
+      [$ets[] | select(.type == $e.type)][0] as $et |
+      if $ft != null and $tt != null and $et != null then
+        (if (etpairs($et) | map(select(.from_type == $ft and .to_type == $tt)) | length) == 0
+          then "edge \($e.from) -[\($e.type)]-> \($e.to): endpoint pair \($ft) -> \($tt) not declared"
+          else empty end)
+      else empty end),
+    ([$ets[] | select(.type == $e.type)][0] as $et |
+      if $et != null then
+        (($et.required // [])[] as $r | select(($e.properties // {}) | has($r) | not)
+          | "edge \($e.from) -[\($e.type)]-> \($e.to): missing required property \($r)"),
+        (($et.properties // {}) | to_entries[] as $en
+          | select(($e.properties // {}) | has($en.key))
+          | select(valok($en.value; ($e.properties // {})[$en.key]) | not)
+          | "edge \($e.from) -[\($e.type)]-> \($e.to): property \($en.key) shape mismatch")
+      else empty end)),
+  ($vt | to_entries[] | .key as $k | (.value.hints // []) as $hs |
+    (($hs[] as $h | select([$ets[].type] | index($h.edge_type) | not)
+      | "schema: hint on \($k) names undeclared edge type \($h.edge_type)"),
+     ($hs[] | . as $h | [$ets[] | select(.type == $h.edge_type)][0] as $et |
+       select($et != null) |
+       select((etpairs($et)
+         | map(select((.from_type == $k and $h.direction == "out")
+           or (.to_type == $k and $h.direction == "in"))) | length) == 0) |
+       "schema: hint on \($k) direction mismatch for \($h.edge_type)"),
+     ($hs | map("\(.edge_type)/\(.direction)") | group_by(.) | map(select(length > 1)) | .[]
+       | "schema: duplicate hint \(.) on \($k)")))
+)
+JQEOF
+
+check_core() { # check_core <dir>
+  local dir="$1"
+  jq -e . "$dir/schema.json" >/dev/null 2>&1 || { echo "check: schema.json is not valid JSON"; return 1; }
+  jq -e . "$dir/graph.json" >/dev/null 2>&1 || { echo "check: graph.json is not valid JSON"; return 1; }
+  jq -r -n --slurpfile S "$dir/schema.json" \
+    --slurpfile V "$dir/vertices.jsonl" --slurpfile E "$dir/edges.jsonl" \
+    "$CHECK_JQ" 2>&1 | sed 's/^/check: /'
+}
+
+cmd_check() {
+  local errors
+  errors="$(check_core "$GDIR" || true)"
+  if [ -n "$errors" ]; then
+    echo "$errors"
+    die "check FAILED"
+  fi
+  echo "check: ok ($(wc -l <"$VFILE" | tr -d ' ') vertices, $(wc -l <"$EFILE" | tr -d ' ') edges)"
+}
+
+# ---------------------------------------------------------------------------
+# Mutations: stage, validate, land, bump generation.
+# ---------------------------------------------------------------------------
+stage_dir=""
+cleanup_stage() { if [ -n "$stage_dir" ]; then rm -rf "$stage_dir"; fi; }
+trap cleanup_stage EXIT
+
+new_stage() {
+  stage_dir="$(mktemp -d)"
+  cp "$SCHEMA" "$GRAPHJSON" "$stage_dir/"
+  cp "$VFILE" "$EFILE" "$stage_dir/" 2>/dev/null || true
+}
+
+land_stage() {
+  local errors
+  errors="$(check_core "$stage_dir" || true)"
+  if [ -n "$errors" ]; then
+    echo "$errors"
+    die "mutation refused: staged graph fails check (nothing landed)"
+  fi
+  cp "$stage_dir/vertices.jsonl" "$VFILE"
+  cp "$stage_dir/edges.jsonl" "$EFILE"
+  jq '.generation += 1' "$GRAPHJSON" >"$GRAPHJSON.tmp" && mv "$GRAPHJSON.tmp" "$GRAPHJSON"
+  rm -rf "$stage_dir"; stage_dir=""
+}
+
+build_props() { # emits merged JSON object from --set/--set-json flags
+  local out="{}" k v
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set)
+        case "$2" in
+          *=*) k="${2%%=*}"; v="${2#*=}"; shift 2 ;;
+          *) k="$2"; v="$3"; shift 3 ;;
+        esac
+        out="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$out")" ;;
+      --set-json)
+        case "$2" in
+          *=*) k="${2%%=*}"; v="${2#*=}"; shift 2 ;;
+          *) k="$2"; v="$3"; shift 3 ;;
+        esac
+        out="$(jq -c --arg k "$k" --argjson v "$v" '. + {($k): $v}' <<<"$out")" || die "invalid JSON for $k" ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+vertex_exists() { jq -r --arg id "$1" 'select(.id == $id) | .id' "$VFILE" | grep -q .; }
+vertex_type() { jq -r --arg id "$1" 'select(.id == $id) | .type' "$VFILE" | head -n 1; }
+
+cmd_create() { # create <type> <id> --label L [flags...]
+  [ $# -ge 3 ] || die "usage: create <type> <id> --label L [--set k=v | --set-json k=JSON]..."
+  local type="$1" id="$2" label="" props
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) label="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$label" ] || die "create: --label is required"
+  jq -e --arg t "$type" '(.vertex_types | has($t))' "$SCHEMA" >/dev/null \
+    || die "create: type $type is not declared in schema.json"
+  case "$type" in
+    dsg:Design|dsg:Hub) case "$id" in doc/*) ;; *) echo "WARN: $type ids conventionally start with doc/ (got $id)" >&2 ;; esac ;;
+    dsg:Module) case "$id" in module/*) ;; *) echo "WARN: Module ids conventionally start with module/ (got $id)" >&2 ;; esac ;;
+    dsg:OpenQuestion) case "$id" in question/*) ;; *) echo "WARN: OpenQuestion ids conventionally start with question/ (got $id)" >&2 ;; esac ;;
+    dsg:Decision) case "$id" in decision/*) ;; *) echo "WARN: Decision ids conventionally start with decision/ (got $id)" >&2 ;; esac ;;
+    dsg:Constraint) case "$id" in constraint/*) ;; *) echo "WARN: Constraint ids conventionally start with constraint/ (got $id)" >&2 ;; esac ;;
+    dsg:Concept) case "$id" in concept/*) ;; *) echo "WARN: Concept ids conventionally start with concept/ (got $id)" >&2 ;; esac ;;
+    dsg:Choice) case "$id" in choice/*) ;; *) echo "WARN: Choice ids conventionally start with choice/ (got $id)" >&2 ;; esac ;;
+  esac
+  vertex_exists "$id" && die "create: vertex id already exists: $id"
+  props="$(build_props "$@")"
+  new_stage
+  jq -c -n --arg id "$id" --arg t "$type" --arg label "$label" --argjson props "$props" \
+    '{id: $id, type: $t, label: $label, properties: $props}' >>"$stage_dir/vertices.jsonl"
+  land_stage
+  echo "created $type $id"
+}
+
+cmd_update() { # update <id> [flags...]
+  [ $# -ge 1 ] || die "usage: update <id> [--set k=v | --set-json k=JSON | --unset k]..."
+  local id="$1"
+  shift
+  vertex_exists "$id" || die "update: no such vertex: $id"
+  local props="{}" k v unsets=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --set)
+        case "$2" in
+          *=*) k="${2%%=*}"; v="${2#*=}"; shift 2 ;;
+          *) k="$2"; v="$3"; shift 3 ;;
+        esac
+        props="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$props")" ;;
+      --set-json)
+        case "$2" in
+          *=*) k="${2%%=*}"; v="${2#*=}"; shift 2 ;;
+          *) k="$2"; v="$3"; shift 3 ;;
+        esac
+        props="$(jq -c --arg k "$k" --argjson v "$v" '. + {($k): $v}' <<<"$props")" || die "invalid JSON for $k" ;;
+      --unset) unsets+=("$2"); shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  new_stage
+  local sv="$stage_dir/vertices.jsonl"
+  jq -c --arg id "$id" --argjson props "$props" \
+    'if .id == $id then .properties = (.properties + $props) else . end' "$sv" >"$sv.tmp" && mv "$sv.tmp" "$sv"
+  for k in "${unsets[@]:-}"; do
+    [ -n "$k" ] || continue
+    jq -c --arg id "$id" --arg k "$k" \
+      'if .id == $id then .properties |= del(.[$k]) else . end' "$sv" >"$sv.tmp" && mv "$sv.tmp" "$sv"
+  done
+  land_stage
+  echo "updated $id"
+}
+
+cmd_edge() { # edge <from> <type> <to> [flags...]
+  [ $# -ge 3 ] || die "usage: edge <from> <type> <to> [--set k=v | --set-json k=JSON]..."
+  local from="$1" type="$2" to="$3"
+  shift 3
+  vertex_exists "$from" || die "edge: no such from-vertex: $from"
+  vertex_exists "$to" || die "edge: no such to-vertex: $to"
+  jq -e --arg t "$type" 'any(.edge_types[]; .type == $t)' "$SCHEMA" >/dev/null \
+    || die "edge: type $type is not declared in schema.json"
+  jq -r --arg f "$from" --arg t "$type" --arg to "$to" \
+    'select(.from == $f and .type == $t and .to == $to) | .to' "$EFILE" | grep -q . \
+    && die "edge: already exists: $from -[$type]-> $to"
+  local props
+  props="$(build_props "$@")"
+  new_stage
+  jq -c -n --arg f "$from" --arg t "$type" --arg to "$to" --argjson props "$props" \
+    '{from: $f, type: $t, to: $to, properties: $props}' >>"$stage_dir/edges.jsonl"
+  land_stage
+  echo "edge $from -[$type]-> $to"
+}
+
+cmd_edge_rm() { # edge-rm <from> <type> <to>
+  [ $# -eq 3 ] || die "usage: edge-rm <from> <type> <to>"
+  local from="$1" type="$2" to="$3"
+  jq -r --arg f "$from" --arg t "$type" --arg to "$to" \
+    'select(.from == $f and .type == $t and .to == $to) | .to' "$EFILE" | grep -q . \
+    || die "edge-rm: no such edge: $from -[$type]-> $to"
+  new_stage
+  local se="$stage_dir/edges.jsonl"
+  jq -c --arg f "$from" --arg t "$type" --arg to "$to" \
+    'select((.from == $f) and (.type == $t) and (.to == $to) | not)' "$se" >"$se.tmp" && mv "$se.tmp" "$se"
+  land_stage
+  echo "removed edge $from -[$type]-> $to"
+}
+
+# ---------------------------------------------------------------------------
+# Reads.
+# ---------------------------------------------------------------------------
+cmd_list() {
+  local kind="${1:-}"
+  if [ -n "$kind" ]; then
+    jq -r --arg k "$kind" 'select(.type == $k) | "\(.type)\t\(.id)\t\(.label)"' "$VFILE" | sort -k2
+  else
+    jq -r '"\(.type)\t\(.id)\t\(.label)"' "$VFILE" | sort -k2
+  fi
+}
+
+cmd_show() {
+  [ $# -eq 1 ] || die "usage: show <id>"
+  local id="$1" type
+  vertex_exists "$id" || die "show: no such vertex: $id"
+  type="$(vertex_type "$id")"
+  jq --arg id "$id" 'select(.id == $id)' "$VFILE"
+  echo "Edges:"
+  local n
+  n="$(jq -r --arg id "$id" 'select(.from == $id or .to == $id) | .to' "$EFILE" | wc -l | tr -d ' ')"
+  if [ "$n" -eq 0 ]; then
+    echo "  (no edges)"
+  else
+    jq -r --arg id "$id" 'select(.from == $id) | "  --[\(.type)]--> \(.to)"' "$EFILE" | sort
+    jq -r --arg id "$id" 'select(.to == $id) | "  <-[\(.type)]-- \(.from)"' "$EFILE" | sort
+  fi
+  echo "Recommended next hops (authored):"
+  jq -n -r --slurpfile S "$SCHEMA" --slurpfile E "$EFILE" --arg id "$id" --arg t "$type" '
+    ($S[0].vertex_types[$t].hints // [])[] as $h |
+    ([$E[] | select(.type == $h.edge_type)
+      | select((.from == $id and $h.direction == "out") or (.to == $id and $h.direction == "in"))]
+      | length) as $n |
+    "  \($h.direction)\t\($h.edge_type)\t\($h.label)\t(\($n))"' | column -t -s $'\t' 2>/dev/null \
+    || jq -n -r --slurpfile S "$SCHEMA" --slurpfile E "$EFILE" --arg id "$id" --arg t "$type" '
+      ($S[0].vertex_types[$t].hints // [])[] as $h |
+      ([$E[] | select(.type == $h.edge_type)
+        | select((.from == $id and $h.direction == "out") or (.to == $id and $h.direction == "in"))]
+        | length) as $n |
+      "  \($h.direction) \($h.edge_type) \($h.label) (\($n))"'
+}
+
+# ---------------------------------------------------------------------------
+# lint: instance invariants beyond structure.
+# L1: graph lifecycle must equal doc frontmatter lifecycle (mined projection).
+# ---------------------------------------------------------------------------
+cmd_lint() {
+  local failed=0 vid file fm g
+  while read -r vid || [ -n "$vid" ]; do
+    [ -n "$vid" ] || continue
+    file="$ROOT/${vid#doc/}"
+    if [ ! -f "$file" ]; then
+      echo "lint: $vid: no doc at $file"
+      failed=1
+      continue
+    fi
+    fm="$(awk '/^lifecycle:/{sub(/^lifecycle:[ \t]*/, ""); gsub(/[\"'"'"']/, ""); print; exit}' "$file")"
+    g="$(jq -r --arg id "$vid" 'select(.id == $id) | .properties.lifecycle' "$VFILE")"
+    if [ "$fm" != "$g" ]; then
+      echo "lint: $vid: graph lifecycle '$g' != frontmatter lifecycle '$fm'"
+      failed=1
+    fi
+  done < <(jq -r 'select(.type == "dsg:Design") | .id' "$VFILE")
+  [ "$failed" -eq 0 ] && echo "lint: ok"
+  return "$failed"
+}
+
+# ---------------------------------------------------------------------------
+# render-preamble: consumer preamble generated from schema.json so prompt text
+# cannot drift from (or hallucinate) the schema's kinds, hints, and edges.
+# ---------------------------------------------------------------------------
+cmd_render_preamble() {
+  jq -n -r --slurpfile S "$SCHEMA" '
+    "# design graph consumer preamble (GENERATED by scripts/design-graph render-preamble)",
+    "",
+    "You can query the design graph (the design corpus STATE layer) via blackbox MCP",
+    "tools. Entity refs are project_graph_vertex:<project>:design:<vertex-id>.",
+    "Vertex ids are typed slugs: doc/<repo-relative-path>.md (Design/Hub),",
+    "module/<path>, question/<slug>, decision/<slug>@N, constraint/<slug>@N,",
+    "concept/<slug>, choice/<slug>.",
+    "",
+    "Kinds and authored next-hop hints (direction is from the vertex named first):",
+    ($S[0].vertex_types | to_entries | sort_by(.key)[] |
+      "  \(.key)",
+      ((.value.hints // [])[] | "    \(.direction) \(.edge_type): \(.label)")),
+    "",
+    "IMPORTANT:",
+    "- Start from a known id or bbox_hybrid_search; use returned ids verbatim.",
+    "- bbox_inspect_entity returns properties AND edges in one call; prefer edge_types +",
+    "  direction filters over broad sweeps; follow the recommended-next-hops lines.",
+    "- Statement-bearing properties (brief, statement, rationale, decision) truncate by",
+    "  default: pass property_mode full when the payload matters.",
+    "- Never restate multi-hop chains from memory: get them from bbox_find_paths and cite",
+    "  its path ids via bbox_bundle_evidence.",
+    "- STATE questions: resolve dsg:SUPERSEDES chains to the live endpoint before",
+    "  answering in the present tense; superseded designs answer historical questions only.",
+    "- BINDING questions: include each constraint kind (invariant vs preference), scope,",
+    "  and status; an in-transition constraint names its licensed_by authority."'
+}
+
+# ---------------------------------------------------------------------------
+# render-state: the minted state block for a design doc.
+# ---------------------------------------------------------------------------
+cmd_render_state() { # render-state <id> [--write]
+  [ $# -ge 1 ] || die "usage: render-state <id> [--write]"
+  local id="$1" write=0
+  [ "${2:-}" = "--write" ] && write=1
+  vertex_exists "$id" || die "render-state: no such vertex: $id"
+  local block
+  block="$(jq -n -r --slurpfile V "$VFILE" --slurpfile E "$EFILE" --arg id "$id" '
+    ([$V[] | select(.id == $id)][0]) as $v |
+    ([$E[] | select(.type == "dsg:SUPERSEDES" and .to == $id) | .from]) as $sup |
+    ([$E[] | select(.type == "dsg:DEPENDS_ON" and .from == $id)
+      | "\(.to) (\(.properties.kind // "?"))"]) as $dep |
+    ([$E[] | select(.type == "dsg:RAISES" and .from == $id) | .to]
+      | map(. as $q | ([$V[] | select(.id == $q) | .properties.status][0] // "?") as $s
+        | "\($q) [\($s)]")) as $oq |
+    ([$E[] | select(.type == "dsg:RESOLVES" and .from == $id) | .to]) as $res |
+    "**dsg state** (generated by scripts/design-graph render-state; edit the graph, not this block)",
+    "",
+    "- lifecycle: \($v.properties.lifecycle)",
+    "- verified: \(if $v.properties.verified_at then "\($v.properties.verified_at) against \($v.properties.verified_against // "?")" else "unverified" end)",
+    "- superseded by: \(if ($sup | length) == 0 then "(none)" else $sup | join(", ") end)",
+    "- depends on: \(if ($dep | length) == 0 then "(none)" else $dep | join("; ") end)",
+    "- open questions: \(if ($oq | length) == 0 then "(none)" else $oq | join("; ") end)",
+    "- resolves: \(if ($res | length) == 0 then "(none)" else $res | join(", ") end)"')"
+  if [ "$write" -eq 0 ]; then
+    printf '<!-- dsg:state -->\n%s\n<!-- /dsg:state -->\n' "$block"
+    return
+  fi
+  local file="$ROOT/${id#doc/}"
+  [ -f "$file" ] || die "render-state --write: no doc at $file"
+  local blktmp
+  blktmp="$(mktemp)"
+  printf '%s\n' "$block" >"$blktmp"
+  if grep -q '^<!-- dsg:state -->$' "$file"; then
+    awk -v blk="$blktmp" '
+      /^<!-- dsg:state -->$/ { print; while ((getline line < blk) > 0) print line; close(blk); skip = 1; next }
+      /^<!-- \/dsg:state -->$/ { print; skip = 0; next }
+      skip == 0 { print }
+    ' "$file" >"$file.tmp" && mv "$file.tmp" "$file"
+  else
+    awk -v blk="$blktmp" '
+      BEGIN { n = 0 }
+      /^---[ ]*$/ { n++; print; if (n == 2) { print ""; print "<!-- dsg:state -->"; while ((getline line < blk) > 0) print line; close(blk); print "<!-- /dsg:state -->"; print "" } ; next }
+      { print }
+    ' "$file" >"$file.tmp" && mv "$file.tmp" "$file"
+  fi
+  rm -f "$blktmp"
+  echo "state block written to $file"
+}
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  list) shift; cmd_list "$@" ;;
+  show) shift; cmd_show "$@" ;;
+  create) shift; cmd_create "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  edge) shift; cmd_edge "$@" ;;
+  edge-rm) shift; cmd_edge_rm "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  lint) shift; cmd_lint "$@" ;;
+  render-preamble) shift; cmd_render_preamble "$@" ;;
+  render-state) shift; cmd_render_state "$@" ;;
+  *) usage; exit 1 ;;
+esac
