@@ -13,6 +13,12 @@
 #   update <id> [--set k=v | --set-json k=JSON | --unset k]...
 #   edge <from> <type> <to> [--set k=v | --set-json k=JSON]...
 #   edge-rm <from> <type> <to>
+#   supersede --new <id> --old <id>  SUPERSEDES edge + implied status flip, atomic
+#   apply <plan.jsonl> [--dry-run] transactional batch of ops (idempotent,
+#                                  conflict-refusing, one generation bump)
+#   current <id>                   live endpoint of a SUPERSEDES chain
+#   blockers <campaign-id>         unmet prerequisites and open members
+#   frontier                       campaigns, ready-to-start work first
 #   check                          structural validation (daemon mirror)
 #   lint                           instance invariants (frontmatter agreement,
 #                                  gap-ref provenance, campaign/inquiry shape)
@@ -20,7 +26,8 @@
 #   render-state <id> [--write]    minted state block for a design doc
 #
 # Mutations are staged and validated before landing: a mutation that breaks
-# check is refused, and graph.json's generation is bumped on every landing.
+# check is refused, and graph.json's generation is bumped on every landing
+# (once per apply batch).
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -149,6 +156,12 @@ cmd_check() {
 
 # ---------------------------------------------------------------------------
 # Mutations: stage, validate, land, bump generation.
+#
+# Every mutation is an op_* function acting on the STAGE copy of the graph
+# (never on the live files), so the CLI verbs and `apply` share one code path.
+# Op result codes: 0 applied, 2 no-op (the stage already holds exactly this),
+# 1 conflict (message on stderr; nothing written). CLI verbs land on 0 and die
+# on 1 or 2; `apply` skips 2 and aborts the whole batch on any 1.
 # ---------------------------------------------------------------------------
 stage_dir=""
 cleanup_stage() { if [ -n "$stage_dir" ]; then rm -rf "$stage_dir"; fi; }
@@ -173,6 +186,24 @@ land_stage() {
   rm -rf "$stage_dir"; stage_dir=""
 }
 
+conflict() { echo "conflict: $*" >&2; return 1; }
+
+# Stage-side lookups (the stage is the truth while a mutation is in flight).
+s_vertex_exists() { jq -r --arg id "$1" 'select(.id == $id) | .id' "$stage_dir/vertices.jsonl" | grep -q .; }
+s_vertex_type() { jq -r --arg id "$1" 'select(.id == $id) | .type' "$stage_dir/vertices.jsonl" | head -n 1; }
+s_vertex_json() { jq -c --arg id "$1" 'select(.id == $id)' "$stage_dir/vertices.jsonl" | head -n 1; }
+s_edge_json() { # s_edge_json <from> <type> <to>
+  jq -c --arg f "$1" --arg t "$2" --arg to "$3" \
+    'select(.from == $f and .type == $t and .to == $to)' "$stage_dir/edges.jsonl" | head -n 1
+}
+# Live-graph lookups for reads.
+vertex_exists() { jq -r --arg id "$1" 'select(.id == $id) | .id' "$VFILE" | grep -q .; }
+vertex_type() { jq -r --arg id "$1" 'select(.id == $id) | .type' "$VFILE" | head -n 1; }
+# Gap ids are gap-<8 hex> (the gap log's canonical form); a GapRef mirrors one
+# gap as vertex gap/<gap-id> so SOURCED_FROM edges stay vertex-to-vertex.
+gap_id_ok() { printf '%s' "$1" | grep -Eq '^gap-[0-9a-f]{8}$'; }
+gapref_id_ok() { case "$1" in gap/*) gap_id_ok "${1#gap/}" ;; *) return 1 ;; esac; }
+
 build_props() { # emits merged JSON object from --set/--set-json flags
   local out="{}" k v
   while [ $# -gt 0 ]; do
@@ -195,26 +226,11 @@ build_props() { # emits merged JSON object from --set/--set-json flags
   printf '%s' "$out"
 }
 
-vertex_exists() { jq -r --arg id "$1" 'select(.id == $id) | .id' "$VFILE" | grep -q .; }
-vertex_type() { jq -r --arg id "$1" 'select(.id == $id) | .type' "$VFILE" | head -n 1; }
-# Gap ids are gap-<8 hex> (the gap log's canonical form); a GapRef mirrors one
-# gap as vertex gap/<gap-id> so SOURCED_FROM edges stay vertex-to-vertex.
-gap_id_ok() { printf '%s' "$1" | grep -Eq '^gap-[0-9a-f]{8}$'; }
-gapref_id_ok() { case "$1" in gap/*) gap_id_ok "${1#gap/}" ;; *) return 1 ;; esac; }
-
-cmd_create() { # create <type> <id> --label L [flags...]
-  [ $# -ge 3 ] || die "usage: create <type> <id> --label L [--set k=v | --set-json k=JSON]..."
-  local type="$1" id="$2" label="" props
-  shift 2
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --label) label="$2"; shift 2 ;;
-      *) break ;;
-    esac
-  done
-  [ -n "$label" ] || die "create: --label is required"
+op_create() { # op_create <type> <id> <label> <props-json>
+  local type="$1" id="$2" label="$3" props="$4" existing want
+  [ -n "$label" ] || { conflict "create $id: label is required"; return 1; }
   jq -e --arg t "$type" '(.vertex_types | has($t))' "$SCHEMA" >/dev/null \
-    || die "create: type $type is not declared in schema.json"
+    || { conflict "create $id: type $type is not declared in schema.json"; return 1; }
   case "$type" in
     dsg:Design|dsg:Hub) case "$id" in doc/*) ;; *) echo "WARN: $type ids conventionally start with doc/ (got $id)" >&2 ;; esac ;;
     dsg:Module) case "$id" in module/*) ;; *) echo "WARN: Module ids conventionally start with module/ (got $id)" >&2 ;; esac ;;
@@ -225,10 +241,9 @@ cmd_create() { # create <type> <id> --label L [flags...]
     dsg:Choice) case "$id" in choice/*) ;; *) echo "WARN: Choice ids conventionally start with choice/ (got $id)" >&2 ;; esac ;;
     dsg:Campaign) case "$id" in campaign/*) ;; *) echo "WARN: Campaign ids conventionally start with campaign/ (got $id)" >&2 ;; esac ;;
     dsg:Inquiry) case "$id" in inquiry/*) ;; *) echo "WARN: Inquiry ids conventionally start with inquiry/ (got $id)" >&2 ;; esac ;;
-    dsg:GapRef) gapref_id_ok "$id" || die "create: GapRef ids must be gap/<gap-id> with a well-formed gap id (gap-XXXXXXXX, 8 hex chars); got $id" ;;
+    dsg:GapRef) gapref_id_ok "$id" \
+      || { conflict "create $id: GapRef ids must be gap/<gap-id> with a well-formed gap id (gap-XXXXXXXX, 8 hex chars)"; return 1; } ;;
   esac
-  vertex_exists "$id" && die "create: vertex id already exists: $id"
-  props="$(build_props "$@")"
   if [ "$type" = "dsg:GapRef" ]; then
     # gap_id is derived from the id when omitted and must agree when given:
     # the mirror vertex is the provenance anchor for SOURCED_FROM, so its
@@ -238,22 +253,132 @@ cmd_create() { # create <type> <id> --label L [flags...]
     if [ -z "$gap_id" ]; then
       props="$(jq -c --arg g "${id#gap/}" '. + {gap_id: $g}' <<<"$props")"
     elif [ "$gap_id" != "${id#gap/}" ]; then
-      die "create: GapRef gap_id $gap_id does not match id $id (expected ${id#gap/})"
+      conflict "create $id: GapRef gap_id $gap_id does not match id (expected ${id#gap/})"; return 1
     fi
   fi
+  want="$(jq -c -n --arg id "$id" --arg t "$type" --arg label "$label" --argjson props "$props" \
+    '{id: $id, type: $t, label: $label, properties: $props}')"
+  existing="$(s_vertex_json "$id")"
+  if [ -n "$existing" ]; then
+    # Idempotency is identity-based: same type and label means "already
+    # created" even if properties moved on since (a landed plan re-applies as
+    # a no-op and never reverts later state); a different type or label is a
+    # colliding id.
+    [ "$existing" = "$want" ] && return 2
+    if [ "$(jq -r '[.type, .label] | @tsv' <<<"$existing")" = "$(jq -r '[.type, .label] | @tsv' <<<"$want")" ]; then
+      echo "WARN: create $id: exists with different properties; left as-is" >&2
+      return 2
+    fi
+    conflict "create $id: vertex id already exists with a different type or label"; return 1
+  fi
+  printf '%s\n' "$want" >>"$stage_dir/vertices.jsonl"
+}
+
+op_update() { # op_update <id> <set-json-object> <unset-json-array>
+  local id="$1" props="$2" unsets="$3" before after sv="$stage_dir/vertices.jsonl"
+  before="$(s_vertex_json "$id")"
+  [ -n "$before" ] || { conflict "update $id: no such vertex"; return 1; }
+  after="$(jq -c --argjson props "$props" --argjson un "$unsets" \
+    '.properties = ((.properties + $props) | with_entries(select(.key as $k | $un | index($k) | not)))' <<<"$before")"
+  [ "$after" = "$before" ] && return 2
+  jq -c --arg id "$id" --argjson v "$after" 'if .id == $id then $v else . end' "$sv" >"$sv.tmp" && mv "$sv.tmp" "$sv"
+}
+
+op_edge() { # op_edge <from> <type> <to> <props-json>
+  local from="$1" type="$2" to="$3" props="$4" existing want tt
+  s_vertex_exists "$from" || { conflict "edge: no such from-vertex: $from"; return 1; }
+  s_vertex_exists "$to" || { conflict "edge: no such to-vertex: $to"; return 1; }
+  jq -e --arg t "$type" 'any(.edge_types[]; .type == $t)' "$SCHEMA" >/dev/null \
+    || { conflict "edge: type $type is not declared in schema.json"; return 1; }
+  # The staged check would refuse these too (undeclared endpoint pair); the
+  # early conflict names the intent instead of the pair.
+  tt="$(s_vertex_type "$to")"
+  case "$type" in
+    dsg:PART_OF)
+      [ "$tt" = "dsg:Campaign" ] || { conflict "edge: PART_OF must target a dsg:Campaign (got $tt $to)"; return 1; } ;;
+    dsg:SOURCED_FROM)
+      [ "$tt" = "dsg:GapRef" ] \
+        || { conflict "edge: SOURCED_FROM must target a dsg:GapRef gap/<gap-id> vertex (got $tt $to); create the GapRef first"; return 1; }
+      gapref_id_ok "$to" || { conflict "edge: SOURCED_FROM target $to does not carry a well-formed gap id"; return 1; } ;;
+  esac
+  want="$(jq -c -n --arg f "$from" --arg t "$type" --arg to "$to" --argjson props "$props" \
+    '{from: $f, type: $t, to: $to, properties: $props}')"
+  existing="$(s_edge_json "$from" "$type" "$to")"
+  if [ -n "$existing" ]; then
+    # An edge's identity is its (from, type, to) key; properties are annotation.
+    [ "$existing" = "$want" ] || echo "WARN: edge $from -[$type]-> $to exists with different properties; left as-is" >&2
+    return 2
+  fi
+  printf '%s\n' "$want" >>"$stage_dir/edges.jsonl"
+}
+
+op_edge_rm() { # op_edge_rm <from> <type> <to>
+  local from="$1" type="$2" to="$3" se="$stage_dir/edges.jsonl"
+  [ -n "$(s_edge_json "$from" "$type" "$to")" ] || return 2
+  jq -c --arg f "$from" --arg t "$type" --arg to "$to" \
+    'select((.from == $f) and (.type == $t) and (.to == $to) | not)' "$se" >"$se.tmp" && mv "$se.tmp" "$se"
+}
+
+# supersede: <new> -[SUPERSEDES]-> <old> plus the status flip the schema
+# implies. Only kinds whose status enum contains "superseded" flip (Decision,
+# Concept). A Design's lifecycle is a mined projection of frontmatter and is
+# never flipped here: the doc's frontmatter moves to superseded and lint
+# holds graph == frontmatter. Hub and Constraint have no such status.
+op_supersede() { # op_supersede <new> <old>
+  local new="$1" old="$2" nt ot rc=2 r
+  [ "$new" != "$old" ] || { conflict "supersede: new and old are the same vertex: $new"; return 1; }
+  s_vertex_exists "$new" || { conflict "supersede: no such vertex: $new"; return 1; }
+  s_vertex_exists "$old" || { conflict "supersede: no such vertex: $old"; return 1; }
+  nt="$(s_vertex_type "$new")"; ot="$(s_vertex_type "$old")"
+  [ "$nt" = "$ot" ] || { conflict "supersede: cross-kind supersession refused ($nt $new over $ot $old)"; return 1; }
+  jq -e --arg t "$nt" '[.edge_types[] | select(.type == "dsg:SUPERSEDES") | .endpoints[]
+      | select(.from == $t and .to == $t)] | length > 0' "$SCHEMA" >/dev/null \
+    || { conflict "supersede: schema declares no SUPERSEDES edge for $nt"; return 1; }
+  op_edge "$new" "dsg:SUPERSEDES" "$old" "{}"; r=$?
+  [ "$r" -eq 1 ] && return 1
+  [ "$r" -eq 0 ] && rc=0
+  if jq -e --arg t "$nt" '.vertex_types[$t].properties.status.enum // [] | index("superseded")' "$SCHEMA" >/dev/null 2>&1; then
+    op_update "$old" '{"status":"superseded"}' '[]'; r=$?
+    [ "$r" -eq 1 ] && return 1
+    [ "$r" -eq 0 ] && rc=0
+  elif [ "$nt" = "dsg:Design" ]; then
+    echo "NOTE: $old lifecycle is a mined projection; set the doc's frontmatter lifecycle to superseded (lint holds graph == frontmatter)" >&2
+  fi
+  return "$rc"
+}
+
+# CLI wrappers: one op on a fresh stage; land on 0, die otherwise.
+finish_single() { # finish_single <rc> <applied-msg> <noop-msg>
+  case "$1" in
+    0) land_stage; echo "$2" ;;
+    2) die "$3" ;;
+    *) die "mutation refused (nothing landed)" ;;
+  esac
+}
+
+cmd_create() { # create <type> <id> --label L [flags...]
+  [ $# -ge 3 ] || die "usage: create <type> <id> --label L [--set k=v | --set-json k=JSON]..."
+  local type="$1" id="$2" label="" props rc=0
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) label="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [ -n "$label" ] || die "create: --label is required"
+  props="$(build_props "$@")"
   new_stage
-  jq -c -n --arg id "$id" --arg t "$type" --arg label "$label" --argjson props "$props" \
-    '{id: $id, type: $t, label: $label, properties: $props}' >>"$stage_dir/vertices.jsonl"
-  land_stage
-  echo "created $type $id"
+  op_create "$type" "$id" "$label" "$props" || rc=$?
+  finish_single "$rc" "created $type $id" "create: vertex id already exists: $id"
 }
 
 cmd_update() { # update <id> [flags...]
   [ $# -ge 1 ] || die "usage: update <id> [--set k=v | --set-json k=JSON | --unset k]..."
-  local id="$1"
+  local id="$1" rc=0
   shift
   vertex_exists "$id" || die "update: no such vertex: $id"
-  local props="{}" k v unsets=()
+  local props="{}" k v unsets="[]"
   while [ $# -gt 0 ]; do
     case "$1" in
       --set)
@@ -268,66 +393,116 @@ cmd_update() { # update <id> [flags...]
           *) k="$2"; v="$3"; shift 3 ;;
         esac
         props="$(jq -c --arg k "$k" --argjson v "$v" '. + {($k): $v}' <<<"$props")" || die "invalid JSON for $k" ;;
-      --unset) unsets+=("$2"); shift 2 ;;
+      --unset) unsets="$(jq -c --arg k "$2" '. + [$k]' <<<"$unsets")"; shift 2 ;;
       *) die "unknown flag: $1" ;;
     esac
   done
   new_stage
-  local sv="$stage_dir/vertices.jsonl"
-  jq -c --arg id "$id" --argjson props "$props" \
-    'if .id == $id then .properties = (.properties + $props) else . end' "$sv" >"$sv.tmp" && mv "$sv.tmp" "$sv"
-  for k in "${unsets[@]:-}"; do
-    [ -n "$k" ] || continue
-    jq -c --arg id "$id" --arg k "$k" \
-      'if .id == $id then .properties |= del(.[$k]) else . end' "$sv" >"$sv.tmp" && mv "$sv.tmp" "$sv"
-  done
-  land_stage
-  echo "updated $id"
+  op_update "$id" "$props" "$unsets" || rc=$?
+  finish_single "$rc" "updated $id" "update: $id unchanged (already holds these values)"
 }
 
 cmd_edge() { # edge <from> <type> <to> [flags...]
   [ $# -ge 3 ] || die "usage: edge <from> <type> <to> [--set k=v | --set-json k=JSON]..."
-  local from="$1" type="$2" to="$3"
+  local from="$1" type="$2" to="$3" props rc=0
   shift 3
-  vertex_exists "$from" || die "edge: no such from-vertex: $from"
-  vertex_exists "$to" || die "edge: no such to-vertex: $to"
-  jq -e --arg t "$type" 'any(.edge_types[]; .type == $t)' "$SCHEMA" >/dev/null \
-    || die "edge: type $type is not declared in schema.json"
-  jq -r --arg f "$from" --arg t "$type" --arg to "$to" \
-    'select(.from == $f and .type == $t and .to == $to) | .to' "$EFILE" | grep -q . \
-    && die "edge: already exists: $from -[$type]-> $to"
-  # The staged check would refuse these too (undeclared endpoint pair); the
-  # early die names the intent instead of the pair.
-  case "$type" in
-    dsg:PART_OF)
-      [ "$(vertex_type "$to")" = "dsg:Campaign" ] \
-        || die "edge: PART_OF must target a dsg:Campaign (got $(vertex_type "$to") $to)" ;;
-    dsg:SOURCED_FROM)
-      [ "$(vertex_type "$to")" = "dsg:GapRef" ] \
-        || die "edge: SOURCED_FROM must target a dsg:GapRef gap/<gap-id> vertex (got $(vertex_type "$to") $to); create the GapRef first"
-      gapref_id_ok "$to" || die "edge: SOURCED_FROM target $to does not carry a well-formed gap id" ;;
-  esac
-  local props
   props="$(build_props "$@")"
   new_stage
-  jq -c -n --arg f "$from" --arg t "$type" --arg to "$to" --argjson props "$props" \
-    '{from: $f, type: $t, to: $to, properties: $props}' >>"$stage_dir/edges.jsonl"
-  land_stage
-  echo "edge $from -[$type]-> $to"
+  op_edge "$from" "$type" "$to" "$props" || rc=$?
+  finish_single "$rc" "edge $from -[$type]-> $to" "edge: already exists: $from -[$type]-> $to"
 }
 
 cmd_edge_rm() { # edge-rm <from> <type> <to>
   [ $# -eq 3 ] || die "usage: edge-rm <from> <type> <to>"
-  local from="$1" type="$2" to="$3"
-  jq -r --arg f "$from" --arg t "$type" --arg to "$to" \
-    'select(.from == $f and .type == $t and .to == $to) | .to' "$EFILE" | grep -q . \
-    || die "edge-rm: no such edge: $from -[$type]-> $to"
+  local from="$1" type="$2" to="$3" rc=0
   new_stage
-  local se="$stage_dir/edges.jsonl"
-  jq -c --arg f "$from" --arg t "$type" --arg to "$to" \
-    'select((.from == $f) and (.type == $t) and (.to == $to) | not)' "$se" >"$se.tmp" && mv "$se.tmp" "$se"
+  op_edge_rm "$from" "$type" "$to" || rc=$?
+  finish_single "$rc" "removed edge $from -[$type]-> $to" "edge-rm: no such edge: $from -[$type]-> $to"
+}
+
+cmd_supersede() { # supersede --new <id> --old <id>
+  local new="" old="" rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --new) new="$2"; shift 2 ;;
+      --old) old="$2"; shift 2 ;;
+      *) die "usage: supersede --new <id> --old <id>" ;;
+    esac
+  done
+  [ -n "$new" ] && [ -n "$old" ] || die "usage: supersede --new <id> --old <id>"
+  new_stage
+  op_supersede "$new" "$old" || rc=$?
+  finish_single "$rc" "superseded $old by $new" "supersede: $old is already superseded by $new"
+}
+
+# ---------------------------------------------------------------------------
+# apply: transactional batch from a plan file (one JSON op per line):
+#   {"op":"create","type":T,"id":I,"label":L,"properties":{...}}
+#   {"op":"update","id":I,"set":{...},"unset":[...]}
+#   {"op":"edge","from":F,"type":T,"to":O,"properties":{...}}
+#   {"op":"edge-rm","from":F,"type":T,"to":O}
+#   {"op":"supersede","new":N,"old":O}
+# Ops run in order against one stage. Idempotent: an op the stage already
+# satisfies is a no-op (create/edge by identity: same id+type+label, same edge
+# key; properties that moved on since landing are left alone), so a landed
+# plan re-applies as a no-op without bumping the generation and never reverts
+# later state. Conflict-refusing: any op that would fail (colliding id, bad
+# endpoint, unknown op, ...) aborts the whole batch before anything lands. The
+# staged graph must pass check.
+# --dry-run prints the per-op verdicts and lands nothing.
+# ---------------------------------------------------------------------------
+cmd_apply() { # apply <plan.jsonl> [--dry-run]
+  [ $# -ge 1 ] || die "usage: apply <plan.jsonl> [--dry-run]"
+  local plan="$1" dry=0 line n=0 applied=0 noops=0 conflicts=0 op rc verdict errors
+  [ "${2:-}" = "--dry-run" ] && dry=1
+  [ -f "$plan" ] || die "apply: no such plan file: $plan"
+  jq -e -c . "$plan" >/dev/null 2>&1 || die "apply: $plan is not valid JSONL"
+  new_stage
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "${line//[[:space:]]/}" ] || continue
+    n=$((n + 1))
+    op="$(jq -r '.op // empty' <<<"$line")"
+    rc=0
+    case "$op" in
+      create)
+        op_create "$(jq -r '.type // ""' <<<"$line")" "$(jq -r '.id // ""' <<<"$line")" \
+          "$(jq -r '.label // ""' <<<"$line")" "$(jq -c '.properties // {}' <<<"$line")" || rc=$? ;;
+      update)
+        op_update "$(jq -r '.id // ""' <<<"$line")" "$(jq -c '.set // {}' <<<"$line")" \
+          "$(jq -c '.unset // []' <<<"$line")" || rc=$? ;;
+      edge)
+        op_edge "$(jq -r '.from // ""' <<<"$line")" "$(jq -r '.type // ""' <<<"$line")" \
+          "$(jq -r '.to // ""' <<<"$line")" "$(jq -c '.properties // {}' <<<"$line")" || rc=$? ;;
+      edge-rm)
+        op_edge_rm "$(jq -r '.from // ""' <<<"$line")" "$(jq -r '.type // ""' <<<"$line")" \
+          "$(jq -r '.to // ""' <<<"$line")" || rc=$? ;;
+      supersede)
+        op_supersede "$(jq -r '.new // ""' <<<"$line")" "$(jq -r '.old // ""' <<<"$line")" || rc=$? ;;
+      *) echo "conflict: op $n: unknown op '$op'" >&2; rc=1 ;;
+    esac
+    case "$rc" in
+      0) verdict="apply"; applied=$((applied + 1)) ;;
+      2) verdict="no-op"; noops=$((noops + 1)) ;;
+      *) verdict="CONFLICT"; conflicts=$((conflicts + 1)) ;;
+    esac
+    printf 'apply: op %d %-9s %s\n' "$n" "$verdict" "$(jq -r '[.op, (.type // ""), (.id // .from // .new // ""), (.to // .old // "")] | map(select(. != "")) | join(" ")' <<<"$line")"
+  done <"$plan"
+  errors="$(check_core "$stage_dir" || true)"
+  [ -n "$errors" ] && echo "$errors"
+  echo "apply: $n ops: $applied would apply, $noops no-op, $conflicts conflict$( [ -n "$errors" ] && echo '; staged graph FAILS check' )"
+  if [ "$conflicts" -gt 0 ] || [ -n "$errors" ]; then
+    die "apply: batch refused (nothing landed)"
+  fi
+  if [ "$dry" -eq 1 ]; then
+    echo "apply: dry-run, nothing landed"
+    return 0
+  fi
+  if [ "$applied" -eq 0 ]; then
+    echo "apply: plan already landed, nothing to do (generation unchanged)"
+    return 0
+  fi
   land_stage
-  echo "removed edge $from -[$type]-> $to"
+  echo "apply: landed $applied ops (generation $(jq -r .generation "$GRAPHJSON"))"
 }
 
 # ---------------------------------------------------------------------------
@@ -370,6 +545,94 @@ cmd_show() {
         | select((.from == $id and $h.direction == "out") or (.to == $id and $h.direction == "in"))]
         | length) as $n |
       "  \($h.direction) \($h.edge_type) \($h.label) (\($n))"'
+}
+
+# current: resolve a SUPERSEDES chain to its live endpoint. Cycle-safe (a
+# revisited id stops the walk and is reported); a fork (two supersessors of
+# one vertex) follows the first by id and reports the others.
+cmd_current() {
+  [ $# -eq 1 ] || die "usage: current <id>"
+  local id="$1" cur next others seen=" " hops=0
+  vertex_exists "$id" || die "current: no such vertex: $id"
+  cur="$id"
+  while :; do
+    case "$seen" in *" $cur "*) echo "current: cycle detected at $cur; stopping"; break ;; esac
+    seen="$seen$cur "
+    next="$(jq -r --arg id "$cur" 'select(.type == "dsg:SUPERSEDES" and .to == $id) | .from' "$EFILE" | sort)"
+    [ -n "$next" ] || break
+    if [ "$(printf '%s\n' "$next" | wc -l | tr -d ' ')" -gt 1 ]; then
+      others="$(printf '%s\n' "$next" | tail -n +2 | tr '\n' ' ')"
+      echo "current: $cur is superseded by more than one vertex; following the first, others: $others"
+    fi
+    next="$(printf '%s\n' "$next" | head -n 1)"
+    echo "  $cur  <-[dsg:SUPERSEDES]-- $next"
+    cur="$next"; hops=$((hops + 1))
+  done
+  if [ "$hops" -eq 0 ]; then
+    echo "current: $id (not superseded)"
+  else
+    echo "current: $cur ($hops hop$([ "$hops" -ne 1 ] && echo s) from $id)"
+  fi
+  jq -r --arg id "$cur" 'select(.id == $id) | "  \(.type)\t\(.label)\t\(.properties.status // .properties.lifecycle // "-")"' "$VFILE"
+}
+
+# blockers: what stands between a campaign and "done". Unmet DEPENDS_ON
+# prerequisites (target campaign not done), open member Inquiries and
+# OpenQuestions, and unconcluded (proposed) member Decisions via PART_OF.
+blockers_jq='
+  ([$V[] | select(.id == $id)][0]) as $c |
+  ([$E[] | select(.type == "dsg:DEPENDS_ON" and .from == $id) | . as $e
+    | ([$V[] | select(.id == $e.to)][0]) as $t
+    | select(($t.properties.status // "?") != "done")
+    | "prerequisite\t\($e.to)\t[\($t.properties.status // "?")]\t(\($e.properties.kind // "?"))"]) as $deps |
+  ([$E[] | select(.type == "dsg:PART_OF" and .to == $id) | .from] | unique
+    | map(. as $m | ([$V[] | select(.id == $m)][0]) as $v
+      | select($v != null)
+      | if $v.type == "dsg:Inquiry" and $v.properties.status == "open" then "inquiry\t\($m)\t[open]"
+        elif $v.type == "dsg:OpenQuestion" and $v.properties.status == "open" then "question\t\($m)\t[open]"
+        elif $v.type == "dsg:Decision" and $v.properties.status == "proposed" then "decision\t\($m)\t[proposed]"
+        else empty end)) as $open |
+  ($deps + $open)'
+
+cmd_blockers() {
+  [ $# -eq 1 ] || die "usage: blockers <campaign-id>"
+  local id="$1" t lines n
+  vertex_exists "$id" || die "blockers: no such vertex: $id"
+  t="$(vertex_type "$id")"
+  [ "$t" = "dsg:Campaign" ] || die "blockers: $id is a $t, not a dsg:Campaign"
+  lines="$(jq -n -r --slurpfile V "$VFILE" --slurpfile E "$EFILE" --arg id "$id" "$blockers_jq | .[]")"
+  if [ -z "$lines" ]; then
+    echo "blockers: 0 (ready)"
+    return 0
+  fi
+  n="$(printf '%s\n' "$lines" | wc -l | tr -d ' ')"
+  printf '%s\n' "$lines" | sed 's/^/  /' | column -t -s $'\t' 2>/dev/null || printf '%s\n' "$lines" | sed 's/^/  /'
+  echo "blockers: $n"
+}
+
+# frontier: campaigns with status and open-member counts, ready work first
+# (no unmet prerequisites, then status active > proposed > parked > done).
+cmd_frontier() {
+  local rows
+  rows="$(jq -n -r --slurpfile V "$VFILE" --slurpfile E "$EFILE" '
+    def rank: {"active": 0, "proposed": 1, "parked": 2, "done": 3}[.] // 9;
+    [$V[] | select(.type == "dsg:Campaign") | .id as $id |
+      ([$E[] | select(.type == "dsg:DEPENDS_ON" and .from == $id) | .to] | unique
+        | map(. as $d | [$V[] | select(.id == $d)][0] | select((.properties.status // "?") != "done")) | length) as $unmet |
+      ([$E[] | select(.type == "dsg:PART_OF" and .to == $id) | .from] | unique
+        | map(. as $m | [$V[] | select(.id == $m)][0] | select(. != null)
+          | select((.type == "dsg:Inquiry" and .properties.status == "open")
+            or (.type == "dsg:OpenQuestion" and .properties.status == "open")
+            or (.type == "dsg:Decision" and .properties.status == "proposed"))) | length) as $open |
+      {id: $id, status: (.properties.status // "?"), unmet: $unmet, open: $open,
+       state: (if .properties.status == "done" then "done" elif $unmet > 0 then "blocked" else "ready" end)}]
+    | sort_by([.unmet, (.status | rank), .id])[]
+    | "\(.id)\t\(.status)\topen=\(.open)\tunmet=\(.unmet)\t\(.state)"')"
+  if [ -z "$rows" ]; then
+    echo "frontier: no campaigns"
+    return 0
+  fi
+  printf '%s\n' "$rows" | column -t -s $'\t' 2>/dev/null || printf '%s\n' "$rows"
 }
 
 # ---------------------------------------------------------------------------
@@ -460,12 +723,15 @@ cmd_render_preamble() {
     "- Never restate multi-hop chains from memory: get them from bbox_find_paths and cite",
     "  its path ids via bbox_bundle_evidence.",
     "- STATE questions: resolve dsg:SUPERSEDES chains to the live endpoint before",
-    "  answering in the present tense; superseded designs answer historical questions only.",
+    "  answering in the present tense; superseded designs answer historical questions only",
+    "  (offline mirror: scripts/design-graph current <id>).",
     "- BINDING questions: include each constraint kind (invariant vs preference), scope,",
     "  and status; an in-transition constraint names its licensed_by authority.",
     "- CAMPAIGN questions (what work groups under an initiative, where a concept or",
-    "  inquiry came from): follow inbound dsg:PART_OF on the Campaign, then outbound",
-    "  dsg:SOURCED_FROM to the gap-log record (GapRef gap_id) for provenance."'
+    "  inquiry came from, what blocks it): follow inbound dsg:PART_OF on the Campaign,",
+    "  outbound dsg:DEPENDS_ON for prerequisite campaigns, then outbound dsg:SOURCED_FROM",
+    "  to the gap-log record (GapRef gap_id) for provenance (offline mirrors:",
+    "  scripts/design-graph blockers <campaign-id>, frontier)."'
 }
 
 # ---------------------------------------------------------------------------
@@ -521,7 +787,7 @@ cmd_render_state() { # render-state <id> [--write]
 }
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -531,6 +797,11 @@ case "${1:-}" in
   update) shift; cmd_update "$@" ;;
   edge) shift; cmd_edge "$@" ;;
   edge-rm) shift; cmd_edge_rm "$@" ;;
+  supersede) shift; cmd_supersede "$@" ;;
+  apply) shift; cmd_apply "$@" ;;
+  current) shift; cmd_current "$@" ;;
+  blockers) shift; cmd_blockers "$@" ;;
+  frontier) shift; cmd_frontier "$@" ;;
   check) shift; cmd_check "$@" ;;
   lint) shift; cmd_lint "$@" ;;
   render-preamble) shift; cmd_render_preamble "$@" ;;

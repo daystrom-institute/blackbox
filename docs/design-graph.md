@@ -29,8 +29,10 @@ The graph holds STATE; the design docs hold STORY.
    https://blackbox.daystrom.app` (the estate daemon is remote; the localhost
    default is wrong here). Capture after edits with
    `bro workspace-binding capture` to push the working state.
-2. Mutate through the verb script (`create` / `update` / `edge` / `edge-rm`);
-   the staged `check` is the gate.
+2. Mutate through the verb script (`create` / `update` / `edge` / `edge-rm` /
+   `supersede`, or a batch via `apply <plan.jsonl>`); the staged `check` is
+   the gate. Every mutation is staged, checked, and lands as one generation
+   bump (one per `apply` batch).
 3. Run `check` (structural mirror of the daemon validator; the daemon's
    `bbox_project_graph_validate` stays authoritative) and `lint` (instance
    invariants: graph lifecycle must equal doc frontmatter lifecycle; GapRef
@@ -75,18 +77,78 @@ edited docs; Concepts only when a second articulation shows up).
 ## Write authority (the commitment gate)
 
 - **Anyone (agents included) may FILE**: OpenQuestion vertices, edge
-  proposals (DEPENDS_ON, RELATES_TO, RAISES, RESOLVES), Module seeds,
-  Decision/Constraint vertices at `status: proposed`.
+  proposals (DEPENDS_ON, RELATES_TO, RAISES, RESOLVES, PART_OF,
+  SOURCED_FROM), Module seeds, GapRef mirrors, Campaign vertices at
+  `status: proposed`, Inquiry vertices at `status: open`, Decision/Constraint
+  vertices at `status: proposed`, and `apply` plan files for review.
 - **Operator-ratified sync only may BIND**: lifecycle flips, SUPERSEDES
-  ratification, Decision/Constraint status changes, schema edits.
+  ratification (`supersede`), Decision/Constraint status changes, Campaign
+  status flips, schema edits.
 - The substrate enforces none of this; the verb script, this doc, and review
   carry it. Say so honestly when it matters.
+
+## Batch mutations: `apply`
+
+`apply <plan.jsonl> [--dry-run]` runs a plan file (one JSON op per line)
+transactionally against one stage: every op is checked in order, the staged
+graph runs `check`, and only then does the batch land as a single generation
+bump. Ops mirror the CLI verbs:
+
+```
+{"op":"create","type":"dsg:Campaign","id":"campaign/x","label":"X","properties":{...}}
+{"op":"update","id":"campaign/x","set":{"status":"active"},"unset":["outcome"]}
+{"op":"edge","from":"inquiry/y","type":"dsg:PART_OF","to":"campaign/x","properties":{}}
+{"op":"edge-rm","from":"inquiry/y","type":"dsg:PART_OF","to":"campaign/x"}
+{"op":"supersede","new":"decision/d@2","old":"decision/d@1"}
+```
+
+- Idempotent: an op the stage already satisfies is a no-op, and a landed plan
+  re-applies as a no-op (no generation bump). Identity is what is checked:
+  `create` on an existing id with the same type and label is a no-op even if
+  properties moved on since (a re-apply never reverts later state); an edge
+  with the same key is a no-op. A different type or label on the same id is
+  a colliding id.
+- Conflict-refusing: any op that would fail (colliding id, missing endpoint,
+  wrong PART_OF / SOURCED_FROM target, cross-kind supersession, unknown op)
+  or a staged graph that fails `check` aborts the WHOLE batch; nothing lands.
+- `--dry-run` prints the per-op verdicts (`apply` / `no-op` / `CONFLICT`)
+  and lands nothing. Run it, read it, then apply. Blank lines are skipped;
+  a plan file is committed alongside the landing so provenance reads per
+  batch.
+
+## Supersession
+
+`supersede --new <id> --old <id>` wires `<new> -[SUPERSEDES]-> <old>` and the
+status flip the schema implies, atomically (one landing). Cross-kind
+supersession is refused, as is a kind with no declared SUPERSEDES edge. Only
+kinds whose `status` enum contains `superseded` flip (Decision, Concept). A
+Design's `lifecycle` is a mined projection of frontmatter and is never
+flipped by the script: move the doc's frontmatter to `superseded` and `lint`
+holds graph == frontmatter. Hub and Constraint have no such status.
+`current <id>` resolves the chain to its live endpoint (cycle-safe; a fork
+follows the first supersessor by id and reports the rest).
+
+## Campaign planning reads
+
+- `blockers <campaign-id>`: unmet `DEPENDS_ON` prerequisite campaigns (target
+  not `done`, with its status and dependency kind), open member Inquiries and
+  OpenQuestions, and unconcluded (`proposed`) member Decisions via inbound
+  `PART_OF`; one line per blocker plus a count, `blockers: 0 (ready)` when
+  clear.
+- `frontier`: every Campaign with status, open-member count, unmet-prerequisite
+  count, and a `ready` / `blocked` / `done` state, ordered so ready-to-start
+  work surfaces first (no unmet prerequisites, then active > proposed >
+  parked > done).
+
+These are planning conveniences and the offline mirror of the same state the
+daemon serves; agent recall rides the bbox primitives plus the preamble.
 
 ## Reading
 
 - `scripts/design-graph show <id>` prints the vertex, its directed edges, and
   the authored hint breadcrumbs with counts; a zero-count hop prints `(0)`
-  because absence is an answer.
+  because absence is an answer. Breadcrumbs are computed from `schema.json`
+  hints, so `show` and the daemon's recommended next hops cannot drift.
 - Statement-bearing properties (`brief`, `statement`, `rationale`,
   `decision`) truncate by default under the daemon's smart property mode:
   pass `property_mode: full` when the payload matters.
@@ -102,10 +164,10 @@ edited docs; Concepts only when a second articulation shows up).
 
 ## Computed views (phase A backlog)
 
-`current`, `binding`, `stale`, and `blast` are planned deterministic views
-over the same state (see the design doc). They are planning conveniences and
-the offline mirror; agent recall rides the bbox primitives plus the preamble,
-never these views.
+`current`, `blockers`, and `frontier` exist (above). `binding`, `stale`, and
+`blast` are planned deterministic views over the same state (see the design
+doc). All are planning conveniences and the offline mirror; agent recall
+rides the bbox primitives plus the preamble, never these views.
 
 ## Anti-patterns
 

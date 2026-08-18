@@ -14,10 +14,17 @@
       },
       "hints": [
         {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
+        {"edge_type": "dsg:SUPERSEDES", "direction": "out", "label": "supersedes"},
         {"edge_type": "dsg:DEPENDS_ON", "direction": "out", "label": "depends on"},
         {"edge_type": "dsg:DEPENDS_ON", "direction": "in", "label": "unblocks"},
         {"edge_type": "dsg:RAISES", "direction": "out", "label": "open questions"},
-        {"edge_type": "dsg:UNDER", "direction": "out", "label": "topic home"}
+        {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"},
+        {"edge_type": "dsg:ARTICULATES", "direction": "out", "label": "articulates concepts"},
+        {"edge_type": "dsg:CONSTRAINS", "direction": "in", "label": "binding decisions and constraints"},
+        {"edge_type": "dsg:RELAXED_BY", "direction": "in", "label": "relaxations granted here"},
+        {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "related designs and concepts"},
+        {"edge_type": "dsg:UNDER", "direction": "out", "label": "topic home"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:Hub": {
@@ -26,7 +33,9 @@
         "brief": {"type": "string", "index": "text", "embed": true}
       },
       "hints": [
-        {"edge_type": "dsg:UNDER", "direction": "in", "label": "designs under this topic"}
+        {"edge_type": "dsg:UNDER", "direction": "in", "label": "designs under this topic"},
+        {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:Module": {
@@ -36,7 +45,8 @@
         "summary": {"type": "string", "index": "text", "embed": true}
       },
       "hints": [
-        {"edge_type": "dsg:CONSTRAINS", "direction": "in", "label": "binding decisions and constraints"}
+        {"edge_type": "dsg:CONSTRAINS", "direction": "in", "label": "binding decisions and constraints"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:OpenQuestion": {
@@ -51,7 +61,8 @@
       "hints": [
         {"edge_type": "dsg:RAISES", "direction": "in", "label": "raised by"},
         {"edge_type": "dsg:RESOLVES", "direction": "in", "label": "resolved by"},
-        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"}
+        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:Decision": {
@@ -65,8 +76,11 @@
       },
       "hints": [
         {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
+        {"edge_type": "dsg:SUPERSEDES", "direction": "out", "label": "supersedes"},
         {"edge_type": "dsg:CONSTRAINS", "direction": "out", "label": "constrains"},
-        {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"}
+        {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"},
+        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:Constraint": {
@@ -80,9 +94,12 @@
         "licensed_by": "string"
       },
       "hints": [
+        {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
         {"edge_type": "dsg:CONSTRAINS", "direction": "out", "label": "constrains"},
         {"edge_type": "dsg:RELAXED_BY", "direction": "out", "label": "relaxation history"},
-        {"edge_type": "dsg:SCOPED_BY", "direction": "out", "label": "scoped exceptions"}
+        {"edge_type": "dsg:SCOPED_BY", "direction": "out", "label": "scoped exceptions"},
+        {"edge_type": "dsg:SCOPED_BY", "direction": "in", "label": "exception to"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:Concept": {
@@ -94,8 +111,11 @@
       "hints": [
         {"edge_type": "dsg:ARTICULATES", "direction": "in", "label": "articulated by"},
         {"edge_type": "dsg:SUPERSEDES", "direction": "in", "label": "superseded by"},
+        {"edge_type": "dsg:RAISES", "direction": "out", "label": "open questions"},
         {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "related concepts"},
-        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"}
+        {"edge_type": "dsg:RELATES_TO", "direction": "in", "label": "referenced by"},
+        {"edge_type": "dsg:PART_OF", "direction": "out", "label": "campaign"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:Choice": {
@@ -106,7 +126,8 @@
         "alternatives": "string"
       },
       "hints": [
-        {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"}
+        {"edge_type": "dsg:RESOLVES", "direction": "out", "label": "resolves"},
+        {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
     },
     "dsg:Campaign": {
@@ -118,7 +139,9 @@
         "outcome": "string"
       },
       "hints": [
-        {"edge_type": "dsg:PART_OF", "direction": "in", "label": "member inquiries, concepts, and questions"},
+        {"edge_type": "dsg:PART_OF", "direction": "in", "label": "member inquiries, concepts, questions, and decisions"},
+        {"edge_type": "dsg:DEPENDS_ON", "direction": "out", "label": "prerequisite campaigns"},
+        {"edge_type": "dsg:DEPENDS_ON", "direction": "in", "label": "unblocks campaigns"},
         {"edge_type": "dsg:RELATES_TO", "direction": "out", "label": "anchoring designs"},
         {"edge_type": "dsg:SOURCED_FROM", "direction": "out", "label": "sourced from gaps"}
       ]
@@ -184,8 +207,10 @@
     },
     {
       "type": "dsg:DEPENDS_ON",
-      "from_type": "dsg:Design",
-      "to_type": "dsg:Design",
+      "endpoints": [
+        {"from": "dsg:Design", "to": "dsg:Design"},
+        {"from": "dsg:Campaign", "to": "dsg:Campaign"}
+      ],
       "required": ["kind"],
       "properties": {
         "kind": {"enum": ["hard", "crosslink"]},
@@ -244,7 +269,8 @@
       "endpoints": [
         {"from": "dsg:Concept", "to": "dsg:Campaign"},
         {"from": "dsg:Inquiry", "to": "dsg:Campaign"},
-        {"from": "dsg:OpenQuestion", "to": "dsg:Campaign"}
+        {"from": "dsg:OpenQuestion", "to": "dsg:Campaign"},
+        {"from": "dsg:Decision", "to": "dsg:Campaign"}
       ],
       "properties": {
         "note": "string"

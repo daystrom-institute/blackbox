@@ -53,10 +53,11 @@ Schema v2 of the design graph adds a campaign layer for exactly this:
   `SOURCED_FROM` traversable in both directions and gives a later gap closure
   a vertex to cite. `lint` refuses a GapRef whose `gap_id` is malformed,
   disagrees with its id, or names no record under `.bbox/gaps/`.
-- `dsg:PART_OF` (Concept, Inquiry, OpenQuestion -> Campaign) and
+- `dsg:PART_OF` (Concept, Inquiry, OpenQuestion, Decision -> Campaign) and
   `dsg:SOURCED_FROM` (any vertex -> GapRef, optional `note`).
 - `dsg:RELATES_TO` gains `Campaign -> Design` (anchoring designs) and
-  `Inquiry -> Concept | Design` endpoints.
+  `Inquiry -> Concept | Design` endpoints; `dsg:DEPENDS_ON` gains
+  `Campaign -> Campaign` so `blockers` and `frontier` can read prerequisites.
 
 A `dsg:Finding` kind was considered and left out. Schema-wise it is cheap (one
 more vertex block), but nothing would author it yet: an Inquiry's `outcome`
@@ -171,9 +172,13 @@ out to be prose-only to an Inquiry with `kind: concept`.
 
 ## Execution recipe (for the pass that runs after review)
 
-All through `scripts/design-graph`; nothing hand-edited. Order matters because
-`SOURCED_FROM` requires the GapRef first and `PART_OF` requires the Campaign
-first.
+All through `scripts/design-graph`; nothing hand-edited. The pass is authored
+as one `apply` plan file (`.bbox/graphs/design/plans/<date>-gap-campaigns.jsonl`,
+one JSON op per line, committed with the landing), dry-run first
+(`apply <plan> --dry-run`) and reviewed, then applied: the batch is idempotent
+and conflict-refusing, and lands as one generation bump. Op order inside the
+plan matters because `SOURCED_FROM` requires the GapRef first and `PART_OF`
+requires the Campaign first. The verb-by-verb equivalent:
 
 1. GapRefs, one per gap:
    `create dsg:GapRef gap/<gap-id> --label "gap: <title>" --set title="<title>" --set dedupe_key="<dedupe_key>"`
@@ -190,8 +195,9 @@ first.
    or `create dsg:Concept concept/<slug> --label "<title>" --set statement="<statement>" --set status=proposed`,
    then `edge <stub> dsg:PART_OF campaign/<slug>` and
    `edge <stub> dsg:SOURCED_FROM gap/<gap-id> --set note="pulled from the gap log"`.
-4. `check` and `lint` clean; commit as one landing per campaign (five commits)
-   so provenance reads per initiative; the generation bumps per landing.
+4. `check` and `lint` clean; commit the plan file with the landing (one
+   batch, one generation bump; or one plan per campaign if the operator
+   prefers per-initiative provenance).
 5. Do not touch the gap records. When a gap later closes, the closing pass
    cites the Inquiry or Concept ref in the resolution and flips the Inquiry to
    `concluded` with an `outcome`.
