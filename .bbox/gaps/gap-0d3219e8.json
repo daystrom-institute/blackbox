@@ -1,0 +1,24 @@
+{
+  "id": "gap-0d3219e8",
+  "title": "Primary corpus inputs and resident graph state have no bounded retention policy",
+  "gap_kind": "tooling",
+  "domain": "corpus/retention",
+  "wanted_capability": "One coherent retention policy that bounds transcript documents, transcript-derived resident edges, vector records, and Git-history projections by age and/or byte budget while preserving an explicit cold-history or deliberate-drop contract. Ingest, boot hydration, reindex, and background eviction must agree on the same policy.",
+  "missing_primitive": "Configurable primary-corpus retention and coordinated eviction across Tantivy documents, EdgeIndex hydration, vector partitions, and Git-history projections.",
+  "fallback_used": "Operational memory limits, allocator tuning, and secondary-store GC bound symptoms but do not bound primary corpus growth.",
+  "evidence": [
+    "RETENTION_PROBLEMS.md",
+    "crates/bbox-edge-index/src/edge_index.rs",
+    "src/config.rs",
+    "src/server/open.rs",
+    "crates/bbox-vectors/src/lib.rs"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/corpus-retention/unbounded-primary-inputs",
+  "notes": "The root design-request document is being normalized into design/corpus/storage/corpus-retention-and-residency.md. Keep process-memory diagnostics separate under gap-bcced6fb; snapshot count/byte retention was separately addressed by gap-efd270dd.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-18T22:13:22Z",
+  "updated_at": "2026-08-18T22:13:22Z"
+}

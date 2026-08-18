@@ -1,0 +1,22 @@
+{
+  "id": "gap-3569d211",
+  "title": "Transport-governed projects cannot build the Git current-file overlay",
+  "gap_kind": "tooling",
+  "domain": "corpus/git-overlay",
+  "wanted_capability": "Build and validate the Git current-file overlay for transport-governed projects from authenticated published checkout data, without requiring the daemon to open a local Git checkout.",
+  "missing_primitive": "A transport-backed source and validation contract for the current-file overlay in the remote-daemon topology.",
+  "fallback_used": "Expose the overlay as unavailable and retain the honest health warning for transport-governed projects.",
+  "evidence": [
+    "LOCALITY_STATUS.md",
+    "design/daemon-runtime/distributed-code-source-collector-impl.md",
+    "crates/bbox-corpus-index/src/index/git_history.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/corpus-git-overlay/transport-backed-current-files",
+  "notes": "Extracted from the temporary locality program status ledger before deleting that ledger.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-18T22:13:22Z",
+  "updated_at": "2026-08-18T22:13:22Z"
+}

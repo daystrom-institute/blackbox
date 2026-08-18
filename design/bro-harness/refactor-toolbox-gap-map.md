@@ -99,8 +99,8 @@ recon predates the fanout campaigns; it is now the highest-leverage single gap.
 
 ## 4. Exists vs gap: the C1-C12 recon against the shipped 57
 
-The original recon (`scratch/REFACTOR_V2_RECON.md`) proposed twelve constructs in
-a build order. Status against the shipped surface:
+The original recon proposed twelve constructs in a build order. Its durable
+result is the status table below, evaluated against the shipped surface:
 
 | # | Construct | Status | Evidence / gap |
 |---|---|---|---|

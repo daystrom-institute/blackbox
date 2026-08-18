@@ -467,7 +467,7 @@ out explicitly under `Changed` or `Removed`.
 ### Changed
 
 - File tools no longer pretend to confine to the session worktree
-  (gap-e0ae3e7d, friction/2026-June-13-0840pm-worktree-containment-issues.md):
+  (`gap-e0ae3e7d`):
   `file_read` / `file_edit` / `file_write` / `code.*` bindings / `apply_patch`
   accept absolute paths; relative paths still join against the effective
   worktree root. The `path escapes worktree root` denial is gone. The

@@ -20,8 +20,7 @@ install set is frozen at first setup (2026-05-30 on the estate daemon) while
 the repo moves: the embed-compaction arc and its policy packet drifted two
 versions behind, and because v1 lacked the connectivity gate, the nightly
 maintenance cron silently no-opped for weeks while a vector partition
-degraded (LOCALITY_STATUS.md, 2026-08-12 closeout). With a handful of
-operators, manual upkeep is not a lane.
+degraded. With a handful of operators, manual upkeep is not a lane.
 
 ## Decision
 

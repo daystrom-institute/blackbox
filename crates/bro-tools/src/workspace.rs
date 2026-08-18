@@ -294,8 +294,7 @@ fn is_sensitive_env_key(key: &str) -> bool {
 /// `git -C`, absolute paths, `find`, `sed -i`, `tee`, etc. The pretense of
 /// confining the structured file tools to `cx.root` was a speed bump on
 /// `file_read`/`file_edit`/`file_write`/`code.*` that the agent routinely
-/// bypassed via shell in two or three calls per file (gap-e0ae3e7d,
-/// friction/2026-June-13-0840pm-worktree-containment-issues.md). Callers that
+/// bypassed via shell in two or three calls per file (`gap-e0ae3e7d`). Callers that
 /// need a real containment boundary must layer one below the file tools
 /// (process-level sandbox), not in them.
 pub fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
