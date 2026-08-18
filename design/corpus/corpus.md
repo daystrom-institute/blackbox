@@ -16,6 +16,7 @@ edges, storage, and corpus-facing assistants.
 ## Core Corpus
 
 - [Agentic Corpus](agentic-corpus/agentic-corpus-platform.md)
+- [Design Graph](agentic-corpus/design-graph.md)
 - [Reflective Project Graph](agentic-corpus/reflective-project-graph.md)
 - [Badgey](badgey.md)
 - [Badgey - Implementation Skeleton](badgey-impl.md)
