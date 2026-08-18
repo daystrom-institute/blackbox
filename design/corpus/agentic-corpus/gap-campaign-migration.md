@@ -161,7 +161,7 @@ doc id).
 | gap-fdacb6ed | Per-turn MCP tool-call budget for agentic actor | Inquiry | `inquiry/per-turn-tool-call-budget` | question | What primitive budgets tool calls per LLM turn (not per workflow node), and does the eval show the runaway-loop failure the soft prompt budget was meant to hold off? |
 | gap-a02e5c7d | VectorStore singleton refactor | Concept | `concept/vector-store-explicit-passing` | - | Thread `&VectorStore` through call sites instead of the module-level singleton so tests inject isolated stores. |
 
-Counts: 6 + 4 + 4 + 3 + 2 = 19 gaps; 13 Inquiry stubs, 6 Concept stubs.
+Counts: 6 + 4 + 4 + 3 + 2 = 19 gaps; 14 Inquiry stubs, 5 Concept stubs.
 
 Note on the Concept stubs: `dsg:Concept` requires `status` and `statement`,
 and the design-graph rule mints Concepts lazily (second articulation). Each

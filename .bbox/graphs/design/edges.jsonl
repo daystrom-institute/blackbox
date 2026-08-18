@@ -1,3 +1,60 @@
 {"from":"doc/design/corpus/agentic-corpus/design-graph.md","type":"dsg:UNDER","to":"doc/design/corpus/corpus.md","properties":{}}
 {"from":"doc/design/corpus/agentic-corpus/reflective-project-graph.md","type":"dsg:UNDER","to":"doc/design/corpus/corpus.md","properties":{}}
 {"from":"doc/design/corpus/agentic-corpus/design-graph.md","type":"dsg:DEPENDS_ON","to":"doc/design/corpus/agentic-corpus/reflective-project-graph.md","properties":{"kind":"hard","note":"builds on the reflective graph floor"}}
+{"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-d5bd0c66","properties":{}}
+{"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-94916a57","properties":{}}
+{"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-3c03bc64","properties":{}}
+{"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-99e7a909","properties":{}}
+{"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-ab3ef97f","properties":{}}
+{"from":"campaign/corpus-multimodal-depth","type":"dsg:SOURCED_FROM","to":"gap/gap-85c45849","properties":{}}
+{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-ef78d005","properties":{}}
+{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-718d5b26","properties":{}}
+{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-f9f68f7c","properties":{}}
+{"from":"campaign/provenance-completion","type":"dsg:SOURCED_FROM","to":"gap/gap-311023fd","properties":{}}
+{"from":"campaign/eval-coverage","type":"dsg:SOURCED_FROM","to":"gap/gap-5ec87592","properties":{}}
+{"from":"campaign/eval-coverage","type":"dsg:SOURCED_FROM","to":"gap/gap-9d84f24f","properties":{}}
+{"from":"campaign/eval-coverage","type":"dsg:SOURCED_FROM","to":"gap/gap-9d0f9159","properties":{}}
+{"from":"campaign/eval-coverage","type":"dsg:SOURCED_FROM","to":"gap/gap-b45dc2d0","properties":{}}
+{"from":"campaign/pipeline-wiring","type":"dsg:SOURCED_FROM","to":"gap/gap-7606edc2","properties":{}}
+{"from":"campaign/pipeline-wiring","type":"dsg:SOURCED_FROM","to":"gap/gap-bfe61876","properties":{}}
+{"from":"campaign/pipeline-wiring","type":"dsg:SOURCED_FROM","to":"gap/gap-17d65325","properties":{}}
+{"from":"campaign/structural-guardrails","type":"dsg:SOURCED_FROM","to":"gap/gap-fdacb6ed","properties":{}}
+{"from":"campaign/structural-guardrails","type":"dsg:SOURCED_FROM","to":"gap/gap-a02e5c7d","properties":{}}
+{"from":"inquiry/multimodal-x-markers-after-routing-layer-0","type":"dsg:PART_OF","to":"campaign/corpus-multimodal-depth","properties":{}}
+{"from":"inquiry/multimodal-x-markers-after-routing-layer-0","type":"dsg:SOURCED_FROM","to":"gap/gap-d5bd0c66","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/lsp-depth-remaining-languages","type":"dsg:PART_OF","to":"campaign/corpus-multimodal-depth","properties":{}}
+{"from":"inquiry/lsp-depth-remaining-languages","type":"dsg:SOURCED_FROM","to":"gap/gap-94916a57","properties":{"note":"pulled from the gap log"}}
+{"from":"concept/chunk-kind-img-av","type":"dsg:PART_OF","to":"campaign/corpus-multimodal-depth","properties":{}}
+{"from":"concept/chunk-kind-img-av","type":"dsg:SOURCED_FROM","to":"gap/gap-3c03bc64","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/markdown-link-target-resolution","type":"dsg:PART_OF","to":"campaign/corpus-multimodal-depth","properties":{}}
+{"from":"inquiry/markdown-link-target-resolution","type":"dsg:SOURCED_FROM","to":"gap/gap-99e7a909","properties":{"note":"pulled from the gap log"}}
+{"from":"concept/file-virtual-entity","type":"dsg:PART_OF","to":"campaign/corpus-multimodal-depth","properties":{}}
+{"from":"concept/file-virtual-entity","type":"dsg:SOURCED_FROM","to":"gap/gap-ab3ef97f","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/rerank-stage-vs-per-turn-scoring","type":"dsg:PART_OF","to":"campaign/corpus-multimodal-depth","properties":{}}
+{"from":"inquiry/rerank-stage-vs-per-turn-scoring","type":"dsg:SOURCED_FROM","to":"gap/gap-85c45849","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/provenance-backfill-on-reindex","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
+{"from":"inquiry/provenance-backfill-on-reindex","type":"dsg:SOURCED_FROM","to":"gap/gap-ef78d005","properties":{"note":"pulled from the gap log"}}
+{"from":"concept/arc-produced-commit-edge","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
+{"from":"concept/arc-produced-commit-edge","type":"dsg:SOURCED_FROM","to":"gap/gap-718d5b26","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/git-notes-sync-automation","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
+{"from":"inquiry/git-notes-sync-automation","type":"dsg:SOURCED_FROM","to":"gap/gap-f9f68f7c","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/generic-anchor-index","type":"dsg:PART_OF","to":"campaign/provenance-completion","properties":{}}
+{"from":"inquiry/generic-anchor-index","type":"dsg:SOURCED_FROM","to":"gap/gap-311023fd","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/audit-sets-as-ci-gate","type":"dsg:PART_OF","to":"campaign/eval-coverage","properties":{}}
+{"from":"inquiry/audit-sets-as-ci-gate","type":"dsg:SOURCED_FROM","to":"gap/gap-5ec87592","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/probe-team-remaining-shapes","type":"dsg:PART_OF","to":"campaign/eval-coverage","properties":{}}
+{"from":"inquiry/probe-team-remaining-shapes","type":"dsg:SOURCED_FROM","to":"gap/gap-9d84f24f","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/pathology-ensemble-live-proof","type":"dsg:PART_OF","to":"campaign/eval-coverage","properties":{}}
+{"from":"inquiry/pathology-ensemble-live-proof","type":"dsg:SOURCED_FROM","to":"gap/gap-9d0f9159","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/per-class-checker-semantics","type":"dsg:PART_OF","to":"campaign/eval-coverage","properties":{}}
+{"from":"inquiry/per-class-checker-semantics","type":"dsg:SOURCED_FROM","to":"gap/gap-b45dc2d0","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/ensemble-output-boundaries","type":"dsg:PART_OF","to":"campaign/pipeline-wiring","properties":{}}
+{"from":"inquiry/ensemble-output-boundaries","type":"dsg:SOURCED_FROM","to":"gap/gap-7606edc2","properties":{"note":"pulled from the gap log"}}
+{"from":"concept/compaction-all-stale-partitions-per-tick","type":"dsg:PART_OF","to":"campaign/pipeline-wiring","properties":{}}
+{"from":"concept/compaction-all-stale-partitions-per-tick","type":"dsg:SOURCED_FROM","to":"gap/gap-bfe61876","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/task-completed-carries-source-query","type":"dsg:PART_OF","to":"campaign/pipeline-wiring","properties":{}}
+{"from":"inquiry/task-completed-carries-source-query","type":"dsg:SOURCED_FROM","to":"gap/gap-17d65325","properties":{"note":"pulled from the gap log"}}
+{"from":"inquiry/per-turn-tool-call-budget","type":"dsg:PART_OF","to":"campaign/structural-guardrails","properties":{}}
+{"from":"inquiry/per-turn-tool-call-budget","type":"dsg:SOURCED_FROM","to":"gap/gap-fdacb6ed","properties":{"note":"pulled from the gap log"}}
+{"from":"concept/vector-store-explicit-passing","type":"dsg:PART_OF","to":"campaign/structural-guardrails","properties":{}}
+{"from":"concept/vector-store-explicit-passing","type":"dsg:SOURCED_FROM","to":"gap/gap-a02e5c7d","properties":{"note":"pulled from the gap log"}}
