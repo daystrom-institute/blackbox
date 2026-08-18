@@ -1280,9 +1280,12 @@ impl WhiteboardRegistry {
     }
 
     /// Archive the board. Normally legal only from the `resolve` phase.
-    /// `force=true` archives from ANY phase — the abandon path for boards
-    /// stranded mid-phase by a failed arc (gap-0301dc75) — and requires a
-    /// facilitator/operator role since it is a phase transition in effect.
+    /// `force=true` archives from ANY phase, the abandon path for boards
+    /// stranded mid-phase by a failed arc (gap-0301dc75). Archiving is a
+    /// phase transition in effect (`resolve -> archived`), so BOTH paths
+    /// require a facilitator/operator role, mirroring `transition()`
+    /// (gap-2ed75162); `force` only relaxes the phase precondition, never
+    /// the authority check.
     pub fn archive(&self, id: &str, agent_name: &str, force: bool) -> Result<ArchiveSummary> {
         let board_arc = self
             .boards
@@ -1296,14 +1299,14 @@ impl WhiteboardRegistry {
             .get(agent_name)
             .ok_or_else(|| anyhow!("agent '{agent_name}' is not registered on board '{id}'"))?;
         let from_phase = board.phase;
-        if force {
-            if !agent.role.can_transition() {
-                bail!(
-                    "agent '{agent_name}' has role {:?} — only facilitator or operator can force-archive",
-                    agent.role
-                );
-            }
-        } else if from_phase != Phase::Resolve {
+        if !agent.role.can_transition() {
+            let verb = if force { "force-archive" } else { "archive" };
+            bail!(
+                "agent '{agent_name}' has role {:?}: only facilitator or operator can {verb}",
+                agent.role
+            );
+        }
+        if !force && from_phase != Phase::Resolve {
             bail!(
                 "cannot archive: phase is '{}', archive only allowed in 'resolve' (pass force=true to abandon a stranded board)",
                 from_phase.as_str()
@@ -2001,6 +2004,33 @@ mod tests {
         // A normal resolve-phase archive carries no force annotation.
         let board = arc.read();
         assert_eq!(board.phase_history.last().unwrap().summary, None);
+    }
+
+    #[test]
+    fn archive_from_resolve_refuses_specialist_without_force() {
+        // gap-2ed75162: the non-force Resolve-phase path must enforce the
+        // same Role::can_transition() authority as transition() and the
+        // force path; a registered specialist cannot archive a board.
+        let r = fresh_registry();
+        r.open("b1", "topic", "/proj", None, None, "alice").unwrap();
+        r.register("b1", "alice", Role::Facilitator, "ops").unwrap();
+        r.register("b1", "bob", Role::Specialist, "security")
+            .unwrap();
+        r.transition("b1", "alice", Phase::Read, None).unwrap();
+        r.transition("b1", "alice", Phase::Validate, None).unwrap();
+        r.transition("b1", "alice", Phase::Resolve, None).unwrap();
+        let err = r.archive("b1", "bob", false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only facilitator or operator can archive"),
+            "unexpected error: {err}"
+        );
+        // Board is untouched: still live, still in resolve.
+        let arc = r.get("b1").expect("board must remain live");
+        assert_eq!(arc.read().phase, Phase::Resolve);
+        // The facilitator can still archive it normally.
+        r.archive("b1", "alice", false).unwrap();
+        assert!(r.get("b1").is_none());
     }
 
     #[test]
