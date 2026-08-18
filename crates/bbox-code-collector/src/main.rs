@@ -2418,11 +2418,23 @@ fn resolve_committed_scope(root: &Path, head_commit: &str) -> Result<PublishedSc
     } else {
         format!("{bbox_root_relpath}/.bbox/config.toml")
     };
-    let source = bbox_corpus_core::git::read_verified_committed_file_bytes_bounded(
+    // Distinguish "the checkout carries no committed identity here" from a
+    // genuine object-store fault: a project whose .bbox moved (or was never
+    // adopted) is a configuration mismatch the operator fixes in the
+    // collector config or the repo, and the message must say so.
+    let source = bbox_corpus_core::git::read_verified_committed_file_bytes_optional_bounded(
         &commit,
         &config_relpath,
         1024 * 1024,
-    )?;
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "no committed {config_relpath} at {head_commit}: the checkout carries no committed \
+             .bbox identity under the configured bbox_root_relpath {bbox_root_relpath:?} (the \
+             .bbox directory moved or was never adopted); fix the collector project entry or \
+             restore the committed identity"
+        )
+    })?;
     let source = std::str::from_utf8(&source).context("committed project config is not UTF-8")?;
     let project = toml::from_str::<CommittedProjectConfig>(source)
         .context("parsing committed project identity")?
