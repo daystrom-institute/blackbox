@@ -12,10 +12,11 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/fleet-tui/roster-dispatch-shell-guard",
   "notes": "D1 from thread-4719ad45. LIVE-CONFIRMED on POST-campaign HEAD build (2c68365) 2026-06-11 via tmux MCP probe: typed `ls -la` into the roster composer, Enter → dispatched verbatim as a brodex agent (twice across two probe rounds: agents 24cc2d4b, 806d0c4d). Survived the 2026-06-10 fleet TUI fix campaign — still unguarded at fleet_tui.rs:3181-3183.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "thread_id": "thread-4719ad45",
   "created_at": "2026-06-11T17:08:10Z",
-  "updated_at": "2026-06-12T04:16:29Z",
-  "resolved_at": "2026-06-12T04:16:29Z",
-  "resolution_note": "Premise rejected. The \"LIVE-CONFIRMED\" evidence is a probe typing `ls -la` into the dispatch composer and observing a dispatch — that confirms the composer's designed behavior, not an incident; the originating thread is pruned and no operator harm is on record. The proposed shell-shape heuristic/confirm violates the crate's documented UX invariant (bro-cli CLAUDE.md: one Enter submits, no arm/confirm in the chat flow) and has irreducible false positives on terse expert prompts (`cargo build` is a plausible deliberate dispatch). The affordance half already exists: the roster composer renders a bold \" dispatch — <provider tuple> \" title (roster_dispatch_title, fleet_tui.rs:4493). Surviving kernel, deliberately not carried forward: no one-keystroke undo for a just-dispatched agent — rare, costs cents, recoverable via cancel+forget."
+  "updated_at": "2026-08-18T23:21:18Z",
+  "resolved_at": "2026-08-18T23:21:18Z",
+  "resolution_note": "rejected: by design. One-Enter roster dispatch is a documented invariant in the fleet TUI orientation docs; 17 subsequent commits added no guard, and arm-confirm exists deliberately only for prune/resume. An opt-in dispatch confirm would be a feature request, not a bug. Verified against HEAD 075a0077, Batch C sweep, operator-approved closure 2026-08-18."
 }

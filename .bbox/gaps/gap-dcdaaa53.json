@@ -1,0 +1,21 @@
+{
+  "id": "gap-dcdaaa53",
+  "title": "code.items batch path lacks the aggregate payload cap that code.query got",
+  "gap_kind": "tooling",
+  "domain": "refactor-tools",
+  "wanted_capability": "The aggregate-payload invariant enforced for code.query multi-file fan-out (MAX_AGGREGATE_QUERY_CAPTURES=20000 with pre-file check, truncation flag, and files_scanned/files_total telemetry) should be mechanically generalized. The code.items({files}) batch path collects per-file payloads with no aggregate cap, so a repo-wide items sweep can still balloon the isolate heap the same way the original code.query OOM did. Wanted: an aggregate cap (shared constant or per-binding) on every multi-file collection path in the code bindings, with the same truncated/telemetry contract.",
+  "missing_primitive": "aggregate payload cap on code.items batch collection",
+  "fallback_used": "Callers narrow file sets manually; code.query itself is capped.",
+  "evidence": [
+    "crates/bro-harness/src/bindings/code_facts.rs:236-242 (uncapped batch collect)",
+    "crates/bbox-refactor/src/facts.rs:189 (existing cap constant)",
+    "gap-fb7a1f99 (closed parent, cap landed for code.query in 947843f6)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/refactor-tools/code-items-aggregate-cap",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-18T23:21:45Z",
+  "updated_at": "2026-08-18T23:21:45Z"
+}

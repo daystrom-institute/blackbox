@@ -14,8 +14,11 @@
   "impact": "high",
   "blocking_level": "blocks_task",
   "dedupe_key": "tooling/refactor-tools/multi-file-payload-cap",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "thread_id": "thread-370679a5",
   "created_at": "2026-06-12T22:49:53Z",
-  "updated_at": "2026-06-12T22:49:53Z"
+  "updated_at": "2026-08-18T23:21:07Z",
+  "resolved_at": "2026-08-18T23:21:07Z",
+  "resolution_note": "implemented in commit 947843f6: MAX_AGGREGATE_QUERY_CAPTURES=20000 enforced on the multi-file path with truncation telemetry and a regression test; invariant documented in the bindings orientation doc. Residual (code.items batch path uncapped) refiled separately. Verified against HEAD 075a0077, Batch C sweep, operator-approved closure 2026-08-18."
 }

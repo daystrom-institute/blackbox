@@ -1,9 +1,9 @@
 {
   "id": "gap-496fe07f",
-  "title": "symbol entities invisible to hybrid_search and inspect_entity despite live edges — exact-symbol eval queries cannot pass",
+  "title": "hybrid_search cannot return symbol-type entities: no symbol doc emission and no edge-sidecar search lane",
   "gap_kind": "tooling",
   "domain": "corpus-index/symbol-entities",
-  "wanted_capability": "Symbol entities resolvable on the retrieval surfaces. Schema reports ~110k symbol vertices and the edge sidecar serves DEFINED_IN/CONTAINS_SYMBOL edges naming them, but (1) bbox_hybrid_search returns zero symbol-type results even BM25-only with doc_type=symbol for exact names (KnowledgeStore, EntityRef, resolve_project_context), and (2) bbox_inspect_entity returns error.not_found for the exact symbol ref the edge sidecar itself emits (SymbolProvider::get_entity requires idx.entity_properties, which misses). Consequence: the eval suite's exact-symbol queries can never surface their expected symbol refs through search (R@k ceiling visibly depressed on the refreshed suite), and graph hops landing on a symbol vertex cannot be inspected. Wanted: symbol entity docs present in the entity index (backfilled on reindex after the g8 schema bump, if that is the cause) or an inspect/search path that resolves symbols from the edge sidecar.",
+  "wanted_capability": "Exact-symbol queries should surface symbol-typed entities through bbox_hybrid_search. The resolution half landed (commit 08b49f4a: inspect/find_paths/bundle_evidence/ref_size/blame resolve symbol refs via edge-index fallback with source=edge_projection), but the retrieval half remains: no indexer emits symbol entity docs (doc_type inventory has project_file, transcript, commit, knowledge, thread, roadmap, tool_call, code_source_activation, project_graph_vertex; zero symbol), and hybrid_search has no symbol lane or search-time edge-sidecar resolution - exact-name queries hit the containing project_file chunk instead of a symbol entity. Corpus-design decision pending: emit symbol docs at index time vs a search-time edge-sidecar lane.",
   "fallback_used": "Derived current symbol refs mechanically via bbox_refactor_project_refs (defn_hash == defining chunk_hash) and verified existence through the chunk's DEFINED_IN in-edge instead of inspect/search.",
   "evidence": [
     "crates/bbox-providers/src/providers/symbol.rs:140 (entity_properties not_found path)",
@@ -14,9 +14,10 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/corpus-index/symbol-entities-unsearchable",
-  "notes": "PARTIAL (commit 08b49f4a, worktree-search-arc-residuals): inspect/find_paths/bundle_evidence/ref_size/blame now resolve edge-projected symbol vertices — ProviderContext carries an optional edge-index ref and the symbol/symbol_v2 providers fall back to edge-participation existence (source=edge_projection), keeping not_found for refs nothing points at. REMAINING: symbols still absent from hybrid_search (no entity docs in the search index) — exact-symbol eval queries cannot pass via the search-only strategy. Fix requires a corpus-design decision: emit ~110k symbol entity docs (index size + delete lifecycle) vs. a search-time symbol lane over the edge sidecar.",
+  "notes": "Narrowed 2026-08-18 after Batch C verification at HEAD 075a0077: partial fix (edge-projection resolution) confirmed landed; remainder restated above. Original broader text claimed symbols wholly invisible to inspect_entity, which is no longer true.",
   "resolution": "unresolved",
+  "project_id": "89bd722f",
   "thread_id": "thread-098387b3",
   "created_at": "2026-06-12T23:43:18Z",
-  "updated_at": "2026-06-13T00:01:18Z"
+  "updated_at": "2026-08-18T23:21:29Z"
 }

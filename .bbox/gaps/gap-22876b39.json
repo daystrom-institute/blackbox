@@ -19,10 +19,11 @@
   "dedupe_key": "mcp_surface/sandbox-observability/project-file-index-empty-for-grounding",
   "notes": "Diagnosis session 2026-06-10: vector-route degradation in the original probe was a red herring for the zero counts (degraded vectors only affect ranking, never entity-type counts). Fix is script/flow-level: seed the debug daemon's grounding before dispatching sandbox probes — register project, run one reindex pass, optionally enable edge_index boot rebuild for the sandbox-audit path. project_file_v2=0 everywhere is separate, expected (BBOX_PROJECT_REFS_V2 gate, src/index/project_files.rs:48-51).",
   "supersedes": "gap-00eb2e18",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "task_id": "8243248d-e643-4681-8d7d-0b2411d731e9",
   "created_at": "2026-06-05T18:59:29Z",
-  "updated_at": "2026-06-10T23:24:31Z",
-  "resolved_at": "2026-06-10T23:24:31Z",
-  "resolution_note": "By design, not a missing capability. The isolated debug daemon's empty agentic corpus is intentional (fast throwaway state, no prod contamination); the sandbox-audit probe's deliverable never needed project_file entities — only the rendered opening-sequence ritual did, and describe_schema's population_count=0 is itself the correct \"skip grounding, use filesystem tools\" signal, which both probe occurrences (this + superseded gap-00eb2e18) followed successfully. Auto-seeding (register 277k-LOC repo + full reindex per probe) is cost with no consumer and immediate index drift. Tests that genuinely need the corpus surface on the debug daemon should register a small fixture project per-test. Mitigation shipped instead: sandbox_prompt() in scripts/mcp_debug.sh now tells probes the corpus is intentionally empty, preventing wasted grounding turns and a third refile."
+  "updated_at": "2026-08-18T23:21:06Z",
+  "resolved_at": "2026-08-18T23:21:06Z",
+  "resolution_note": "by design plus mitigation landed: the debug daemon intentionally ships an empty corpus; sandbox_prompt (commit abbec35c) tells probes the corpus is intentionally empty and to skip grounding. Verified against HEAD 075a0077, Batch C sweep, operator-approved closure 2026-08-18."
 }

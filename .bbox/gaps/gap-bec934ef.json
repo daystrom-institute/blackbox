@@ -1,0 +1,22 @@
+{
+  "id": "gap-bec934ef",
+  "title": "Project render for out-of-tree unmanaged worktrees fails closed instead of aliasing to base repo_id",
+  "gap_kind": "tooling",
+  "domain": "knowledge-render",
+  "wanted_capability": "Decide-me carried out of closed gap-8c25a414: an arbitrary out-of-tree user worktree (git worktree add ../sibling) resolves Read to the base project but Write to None, so project render falls to raw-path passthrough with zero entries and the destructive-shrink guard refuses the write. This fail-closed behavior is deliberate (documented in the resolver) and safe, but it means renders in such worktrees silently do nothing useful. Wanted: a decision whether render should use the Read-gate scope for entry filtering while writing into the checkout (making out-of-tree worktrees first-class), or whether fail-closed stays and gets a clearer operator-facing message explaining why the render was refused.",
+  "missing_primitive": "write-scope aliasing (or explicit refusal messaging) for out-of-tree unmanaged worktrees in project render",
+  "fallback_used": "Run renders from the base checkout or a managed worktree; the shrink guard prevents damage meanwhile.",
+  "evidence": [
+    "crates/bbox-indexing/src/projects.rs:518-524 (deliberate residual documented)",
+    "projects.rs:1508-1519 (test pinning Read=base, Write=None)",
+    "src/tools/scope.rs:100-115 (raw-path passthrough)",
+    "gap-8c25a414 (closed parent)"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/knowledge-render/out-of-tree-worktree-write-scope",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-18T23:21:53Z",
+  "updated_at": "2026-08-18T23:21:53Z"
+}

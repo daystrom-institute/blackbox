@@ -1,9 +1,9 @@
 {
   "id": "gap-5d57d2bb",
-  "title": "Reflective graph vertices do not participate in unified retrieval",
+  "title": "Unified retrieval M9b-M9e outstanding: connector plane, provisional lane emission, evidence expansion, graph embeddings",
   "gap_kind": "ontology",
   "domain": "agentic-corpus/retrieval",
-  "wanted_capability": "Reflective project-graph vertices participating in exact and text retrieval (bbox_hybrid_search and the graph tools) according to per-graph policy: source and record results retaining graph and authority identity, evidence-path expansion accompanying search results, materialized file chunks linking back to remote source vertices, and authorization filters applied before ranking and traversal expansion. Vector indexing optional and schema-directed. The reflective graph v1 deliberately ships exact-ref inspection and traversal only; this gap tracks the retrieval integration the connector program needs for its unified-retrieval milestone. Tracked by design/connectors/reflective-graph-connector-program.md.",
+  "wanted_capability": "Complete the remaining unified-retrieval milestones for reflective graph vertices. M9a is landed and verified (g13 project_graph_vertex docs with replace/purge write lane, GraphWordAuthority pre-ranking filter, graph identity on hybrid_search hits, find_paths traversal gates). Outstanding: M9b connector plane (search accepts graph_source=connector but the only prod doc builder hardcodes published); M9c provisional lane emission (provisional_project_graph_vertex ref type and find_paths filter exist, but no provisional docs are written outside tests); M9d evidence expansion and placed-chunk back-pointers (no expand_evidence implementation; EvidenceBindingSet only default() in tests); M9e schema-directed graph embeddings (no graph bucket, no vector retention). design/connectors/unified-retrieval.md still lifecycle: proposed.",
   "fallback_used": "Exact-ref inspection and traversal of graph vertices; text search over the materialized files only.",
   "evidence": [
     "design/connectors/reflective-graph-connector-program.md",
@@ -13,9 +13,9 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "ontology/agentic-corpus/graph-retrieval-participation",
   "suggested_owner": "blackbox",
-  "notes": "Re-filed 2026-08-11 for the modernized connector campaign; replaces a pre-locality gap reference that was never present in any surviving store. PARTIAL 2026-08-16: M9a (word-index participation, pre-ranking authority filter, traversal gate + fan-out cap, describe participation, Q6 project_id stamp, Q10 provisional alias) folded to beta/blackbox-v2 at dff4faf6 (branch feat/m9a-graph-word-index @ 765707ca, cluster verify green, opus-reviewed through three rounds). Schema g12->g13. REMAINING per design/connectors/unified-retrieval.md section 7: M9b connector plane (gated on M4), M9c provisional lanes, M9d evidence expansion + placed-chunk back-pointers, M9e schema-directed embeddings. Not yet deployed as of the fold.",
+  "notes": "Narrowed 2026-08-18 after Batch C verification at HEAD 075a0077: M9a confirmed landed (dff4faf6, 765707ca); original text claiming vertices wholly absent from retrieval is stale.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "created_at": "2026-08-11T00:00:00Z",
-  "updated_at": "2026-08-16T20:26:53Z"
+  "updated_at": "2026-08-18T23:21:34Z"
 }
