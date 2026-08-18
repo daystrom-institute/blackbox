@@ -1,0 +1,23 @@
+{
+  "id": "gap-7bc434bf",
+  "title": "Newly published project graph generations do not reach the text index via incremental reindex",
+  "gap_kind": "tooling",
+  "domain": "agentic-corpus",
+  "wanted_capability": "Published reflective project graph vertices searchable through bbox_hybrid_search after an incremental reindex",
+  "missing_primitive": "A routine incremental bbox_reindex that ingests newly published project graph generations into the tantivy text index (labels + schema-annotated text properties), without requiring a full reindex or daemon restart",
+  "fallback_used": "Exact-ref bbox_inspect_entity and scripts/design-graph show work; doc-level discovery still surfaces via the project_file lane.",
+  "evidence": [
+    "session 2026-08-17: design graph on project 89bd722f published and valid (accepted_commit 955c5020, bbox_project_graph_validate ok)",
+    "three accepted incremental bbox_reindex passes (~30s apart; first attempt collided with an in-flight edge-index sidecar rebuild)",
+    "docs embedding queue drained to depth 0 between probes",
+    "bbox_hybrid_search returns zero graph-vertex results for label-exact queries (e.g. Corpus hub) while the vertex indexing machinery exists (crates/bbox-indexing/src/index/graph_docs.rs, graph_vertex_doc in crates/bbox-corpus-index)"
+  ],
+  "impact": "medium",
+  "blocking_level": "blocks_task",
+  "dedupe_key": "graph-text-index/agentic-corpus/published-generation-not-incrementally-indexed",
+  "notes": "RESOLVED-AS-MISDIAGNOSED, same session. Premise was wrong; no substrate defect. Graph word lanes activate on published-view INSTALL (accept-advance via publisher_auto_advance -> refresh_published_graph_views -> converge_published_graph_word_lanes; boot reconcile; capture when no published view is installed), never on incremental bbox_reindex, which by design only PRESERVES existing lanes across its delete-all (reindex.rs collect_graph_lane_documents). The observed absence was the convergence window between pushing the commit and the daemon's accept refresh plus writer-queue settle (minutes; the queue was additionally busy with an edge-index rebuild and a code-route embedding backlog). Confirmed empirically: bbox_project_graph_describe's retrieval block reported indexed_generation == accepted_generation with indexed_vertex_count 3, and hybrid search then surfaced the vertices as project_graph_vertex docs. The diagnostic existed all along and should have been the first probe. Residual idea, not a defect: an operator-triggered reindex could nudge lane convergence for pushed-but-not-yet-accepted graphs as a convenience.",
+  "resolution": "acknowledged",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-18T05:23:33Z",
+  "updated_at": "2026-08-18T05:58:00Z"
+}

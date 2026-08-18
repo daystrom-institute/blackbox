@@ -115,12 +115,14 @@ never these views.
   daemon-side.
 - `lint` checks lifecycle agreement only; topic-list agreement with frontmatter
   is TODO.
-- Search-lane participation: the published graph validates and is fully
-  inspectable/traversable (`bbox_inspect_entity`, `bbox_find_paths`,
-  `bbox_project_graph_*`), but its vertices had not surfaced through
-  `bbox_hybrid_search` after incremental reindexes on first publication;
-  tracked as `gap-7bc434bf`. Until it resolves, start from exact refs or the
-  file lane and walk edges.
+- Search-lane convergence semantics (learned the hard way, gap-7bc434bf,
+  resolved as misdiagnosed): graph word lanes activate on published-view
+  INSTALL (accept-advance of the pushed commit, boot reconcile, or capture
+  when no published view is installed). Incremental `bbox_reindex` is NOT the
+  trigger; it only preserves existing lanes. Expect minutes of lag between
+  push and searchability (collector + accept refresh + writer queue). Diagnose
+  with `bbox_project_graph_describe`'s retrieval block:
+  `indexed_generation` vs `accepted_generation`, `indexed_vertex_count`.
 - Miners (`mine-design-frontmatter`) and transactional `apply` are phase A.
 - The eval suite (30 questions over the seed cluster) is phase A; see the
   design doc's evaluation gate and `retrieval-eval-harness.md`.
