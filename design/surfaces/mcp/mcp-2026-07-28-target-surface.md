@@ -42,11 +42,12 @@ is the largest protocol break since Streamable HTTP:
   Logging deprecated. `structuredContent` relaxed to any JSON value;
   schemas loosened to full JSON Schema 2020-12 (SEP-2106).
 
-### Client landscape (verified 2026-08-04, Claude Code 2.1.221)
+### Client landscape (verified 2026-08-04, Claude Code 2.1.221; re-verified 2026-08-14, 2.1.233 - posture unchanged)
 
 Anthropic authored the spec revision, and Claude Code support has now
 shipped in part. Strings probe against
-`~/.local/share/claude/versions/2.1.221`:
+`~/.local/share/claude/versions/2.1.221` (all findings re-confirmed
+against 2.1.233 on 2026-08-14 with near-identical counts):
 
 - **Modern core present**: `2026-07-28` (25 hits), `server/discover` (28),
   `subscriptions/listen` (27), `input_required`/`resultType` (43/23, MRTR),
@@ -83,10 +84,14 @@ Consequences:
 proving ground for the tasks extension specifically, since no client we
 consume declares it yet.
 
-### Codex (OpenAI) as second data point (verified 2026-08-04)
+### Codex (OpenAI) as second data point (verified 2026-08-04; re-verified 2026-08-14 at HEAD 233739e76a - posture unchanged)
 
 Source-level probe of the codex-rs workspace (local checkout, HEAD
-78306a32af):
+78306a32af; ~180 commits later at 233739e76a nothing below has moved —
+still rmcp =3.0.0, feature still default-OFF UnderDevelopment, still no
+tasks/listen. Their new MCP work is OAuth hardening plus a bespoke
+non-spec `events/list`/`events/stream` CustomRequest surface for the
+hosted Plugin Runtime, built beside SEP-2575 listen rather than on it):
 
 - Pins `rmcp = "=3.0.0"` exactly, with a dedicated `codex-rmcp-client`
   crate and a full 2026 test suite (discovery, MRTR, message limits,

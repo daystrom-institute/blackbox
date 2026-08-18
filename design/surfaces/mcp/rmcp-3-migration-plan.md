@@ -242,14 +242,38 @@ This plan interlocks at two points:
 ## Client-support tripwire
 
 Before flipping the prod version gate (Q2) or relying on any modern shape
-from Claude Code, re-probe the installed binary:
+from Claude Code, re-probe the installed binary. The probe is structural,
+not single-literal: it enumerates vocabulary classes rather than grepping
+one string each, because (a) a constructed/concatenated key literal would
+read as a false "still legacy" forever, (b) substring hits lie - a grep
+for `notifications/tasks` matches the LEGACY `notifications/tasks/status`
+(this bit the 2026-08-14 probe before enumeration corrected it), and
+(c) `grep -c` counts lines, and a minified bundle is a few enormous
+lines, so raw counts are unstable across builds - the signal is which
+vocabulary items exist, not how many times.
 
 ```bash
 BIN=~/.local/share/claude/versions/$(claude --version | awk '{print $1}')
-for s in 2026-07-28 io.modelcontextprotocol/tasks subscriptions/listen server/discover; do
-  echo -n "$s: "; strings -a "$BIN" | grep -c "$s"
-done
+echo '--- extension keys bundled (catches new/renamed keys) ---'
+strings -a "$BIN" | grep -o 'io\.modelcontextprotocol[A-Za-z0-9/._-]*' | sort -u
+echo '--- tasks method set: legacy={get,result,list,cancel}; SEP-2663={get,cancel,update} ---'
+strings -a "$BIN" | grep -o 'tasks/[a-z]*' | sort -u
+echo '--- notification classes: legacy tasks=notifications/tasks/status; extension=bare notifications/tasks ---'
+strings -a "$BIN" | grep -o 'notifications/[a-z/]*' | sort -u
+echo '--- protocol versions bundled ---'
+for v in 2024-11-05 2025-03-26 2025-06-18 2025-11-25 2026-07-28; do
+  printf '%s: ' "$v"; strings -a "$BIN" | grep -c -- "$v"; done
+echo '--- legacy bridge markers: disappearance starts the clock on our legacy mode ---'
+for s in Mcp-Session-Id Last-Event-ID resources/subscribe subscriptions/listen server/discover; do
+  printf '%s: ' "$s"; strings -a "$BIN" | grep -c -- "$s"; done
 ```
+
+Verdict rules: tasks flavor flips to SEP-2663 when `tasks/update` appears
+and/or `tasks/result`+`tasks/list` disappear, and the extension capability
+key `io.modelcontextprotocol/tasks` shows in the key enumeration -
+structural signature first, key literal as confirmation. Legacy-bridge
+removal (session/SSE-resume/subscribe markers going to zero) is the
+deadline signal for retiring our own legacy session mode (Decision 2).
 
 Probe history:
 
@@ -266,6 +290,40 @@ Probe history:
   Auto lifecycle) behind `Feature::Mcp20260728`, default OFF; no tasks
   extension or listen consumption; their MCP server has no 2026-07-28
   surface.
+- 2026-08-14, v2.1.233: posture unchanged from 2.1.221. Modern core
+  strings all present at near-identical counts (`server/discover` 30,
+  `subscriptions/listen` 28, `2026-07-28` 25); tasks still LEGACY
+  experimental (`tasks/result` 16, `tasks/list` 14 present;
+  `tasks/update` 0, extension key 0); legacy dual-stack strings retained
+  (`Mcp-Session-Id`, `Last-Event-ID`, `resources/subscribe`). MRTR retry
+  strings (`inputResponses` 11, `requestState` 23) present.
+- 2026-08-14, v2.1.233 structural re-probe (the enumeration probe above,
+  run same day): tasks method set is exactly the legacy quadruple
+  {`tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`} - no
+  `tasks/update`. The task notification bundled is the LEGACY
+  `notifications/tasks/status`, not the extension's bare
+  `notifications/tasks` (an earlier same-day literal grep for
+  `notifications/tasks` hit 15 times purely as substrings of the legacy
+  name - the incident that motivated the structural probe). Extension
+  keys actually bundled: the SEP-2575 `_meta` set (`protocolVersion`,
+  `clientCapabilities`, `clientInfo`, `serverInfo`, `subscriptionId`,
+  `logLevel`), `io.modelcontextprotocol/related-task` (shared legacy/
+  extension tasks vocabulary), and `io.modelcontextprotocol/skills` -
+  the `io.modelcontextprotocol/tasks` capability key is absent. All five
+  protocol versions 2024-11-05 through 2026-07-28 bundled.
+  `notifications/subscriptions/acknowledged` and
+  `notifications/elicitation/complete` present (listen ack + async
+  elicitation). Verdict unchanged: modern core yes, tasks legacy.
+- 2026-08-14, codex-rs HEAD 233739e76a (source probe, ~180 commits past
+  78306a32af): posture unchanged. Still `rmcp = "=3.0.0"`;
+  `Feature::Mcp20260728` still `Stage::UnderDevelopment`,
+  `default_enabled: false` (Legacy mode default); still zero hits for
+  the tasks extension key or `subscriptions/listen`. MCP investment went
+  elsewhere: OAuth hardening (CIMD registration, per-login client
+  selection, credential contention), dynamic HTTP header helpers, and a
+  NON-SPEC `events/list` + `events/stream` CustomRequest surface for
+  their hosted Plugin Runtime (#37494) - bespoke event subscriptions
+  built beside, not on, SEP-2575 listen.
 
 Flip criteria, split by surface:
 
