@@ -11,7 +11,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/provenance/git-notes-sync-hooks",
   "notes": "Push-notes-on-commit + pull-notes-on-fetch automation. Today: operator runs `bbox_provenance_export` / `bbox_provenance_import` manually + `git push refs/notes/bbox/*`.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:04:51Z",
-  "updated_at": "2026-06-11T18:04:51Z"
+  "updated_at": "2026-08-18T22:58:59Z",
+  "resolved_at": "2026-08-18T22:58:59Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/git-notes-sync-automation (campaign/provenance-completion), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

@@ -11,7 +11,10 @@
   "blocking_level": "none",
   "dedupe_key": "eval_coverage/audit/ci-integration",
   "notes": "`eval/audit/<domain>/*.json` exist; need `cargo test` task or CI step that runs `bbox_audit` on each as a regression gate.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:06:02Z",
-  "updated_at": "2026-06-11T18:06:02Z"
+  "updated_at": "2026-08-18T22:59:08Z",
+  "resolved_at": "2026-08-18T22:59:08Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/audit-sets-as-ci-gate (campaign/eval-coverage), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

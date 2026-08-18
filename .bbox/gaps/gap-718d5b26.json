@@ -12,7 +12,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/provenance/arc-commit-wiring",
   "notes": "Design called for arcs to record their producing commit SHA in `on_arc_exit`; not yet wired. M2-M5 arcs could populate.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:04:48Z",
-  "updated_at": "2026-06-11T18:04:48Z"
+  "updated_at": "2026-08-18T22:58:57Z",
+  "resolved_at": "2026-08-18T22:58:57Z",
+  "resolution_note": "superseded by design-graph vertex concept/arc-produced-commit-edge (campaign/provenance-completion), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

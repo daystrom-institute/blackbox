@@ -11,7 +11,10 @@
   "blocking_level": "none",
   "dedupe_key": "refactor_primitive/ranker/learned-weights",
   "notes": "2026-06-12: re-pointed at rerank-2.5-lite cross-encoder stage per design/corpus/agentic-corpus/multimodal-embedding-routing.md Layer 3 / migration Phase 4.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:06:35Z",
-  "updated_at": "2026-06-12T20:08:02Z"
+  "updated_at": "2026-08-18T22:58:54Z",
+  "resolved_at": "2026-08-18T22:58:54Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/rerank-stage-vs-per-turn-scoring (campaign/corpus-multimodal-depth), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

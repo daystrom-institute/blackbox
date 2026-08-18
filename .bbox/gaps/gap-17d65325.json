@@ -11,7 +11,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/auto-digest/source-query-field",
   "notes": "Codex's M3 fix relaxed the rule (reject only when ALL three sources absent), but the trigger plumbing for `source_query` is still missing. When task-completed signal lands, populate it.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:05:32Z",
-  "updated_at": "2026-06-11T18:05:32Z"
+  "updated_at": "2026-08-18T22:59:22Z",
+  "resolved_at": "2026-08-18T22:59:22Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/task-completed-carries-source-query (campaign/pipeline-wiring), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

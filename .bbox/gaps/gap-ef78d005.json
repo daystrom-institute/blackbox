@@ -12,7 +12,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/provenance/backfill-tool-call-edges",
   "notes": "Only future tool calls produce edges; reindex-time backfill against historical transcripts is the gap.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:04:46Z",
-  "updated_at": "2026-06-11T18:04:46Z"
+  "updated_at": "2026-08-18T22:58:55Z",
+  "resolved_at": "2026-08-18T22:58:55Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/provenance-backfill-on-reindex (campaign/provenance-completion), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

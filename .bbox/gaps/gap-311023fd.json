@@ -11,7 +11,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/provenance/anchor-indexed-lookups",
   "notes": "Codex's P2 fixes added per-commit and per-session indices, but they only cover the specific anchor lookups in `bbox_blame`. Future provenance walks might need similar.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:05:09Z",
-  "updated_at": "2026-06-11T18:05:09Z"
+  "updated_at": "2026-08-18T22:59:01Z",
+  "resolved_at": "2026-08-18T22:59:01Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/generic-anchor-index (campaign/provenance-completion), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

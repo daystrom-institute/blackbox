@@ -11,7 +11,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/auto-edge/ensemble-parse",
   "notes": "3 ensemble outputs concatenate; `parse_json` on concatenation either needs ensemble-aware parser OR per-member output API.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:05:22Z",
-  "updated_at": "2026-06-11T18:05:22Z"
+  "updated_at": "2026-08-18T22:59:14Z",
+  "resolved_at": "2026-08-18T22:59:14Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/ensemble-output-boundaries (campaign/pipeline-wiring), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

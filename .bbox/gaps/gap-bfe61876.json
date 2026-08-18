@@ -11,7 +11,10 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/compaction/multi-partition-per-tick",
   "notes": "Picks worst partition only; others wait for next cron. Now unblocked by foreach primitive (0530ba27) but wiring deferred.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:05:30Z",
-  "updated_at": "2026-06-11T18:05:30Z"
+  "updated_at": "2026-08-18T22:59:20Z",
+  "resolved_at": "2026-08-18T22:59:20Z",
+  "resolution_note": "superseded by design-graph vertex concept/compaction-all-stale-partitions-per-tick (campaign/pipeline-wiring), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }

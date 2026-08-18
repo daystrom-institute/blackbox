@@ -12,7 +12,10 @@
   "blocking_level": "none",
   "dedupe_key": "refactor_primitive/multimodal/x-markers",
   "notes": "2026-06-12: embedding model selection answered by the routing-design rewrite; gap now blocks on Layer 0/Phase 6 implementation, not on model choice.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "created_at": "2026-06-11T18:06:14Z",
-  "updated_at": "2026-06-12T20:07:58Z"
+  "updated_at": "2026-08-18T22:58:38Z",
+  "resolved_at": "2026-08-18T22:58:38Z",
+  "resolution_note": "superseded by design-graph vertex inquiry/multimodal-x-markers-after-routing-layer-0 (campaign/corpus-multimodal-depth), commit 906c3ef5; full record retained (include_addressed=true). Operator-approved graph migration 2026-08-18."
 }
