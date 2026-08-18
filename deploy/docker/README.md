@@ -46,6 +46,12 @@ The pod must also set `BLACKBOX_MCP_URL` to the daemon's tailnet ingress MCP
 URL. A bind-derived `127.0.0.1` URL points back at the agent host when the
 harness consumes it and is therefore invalid for off-host execution.
 
-The image defaults to loopback HTTP. Kubernetes must set `BBOX_BIND=0.0.0.0`
-and `BBOX_ALLOW_NONLOOPBACK_BIND=1` together, then use `/readyz` and `/healthz`
-on port 7264 for readiness and liveness.
+The image defaults to loopback HTTP. Kubernetes sets `BBOX_BIND=0.0.0.0` to
+expose the daemon inside the pod network, then uses `/readyz` and `/healthz`
+on port 7264 for readiness and liveness. There is no code-side grant for a
+non-loopback bind: `BBOX_BIND` alone decides exposure, and the loopback check
+in the daemon gates only the unsigned-webhook escape hatch. Network posture
+(NetworkPolicy, Service type, ingress auth) is what keeps a non-loopback daemon
+private; do not read any environment variable as a safety gate for it.
+(`BBOX_ALLOW_NONLOOPBACK_BIND` was documented here earlier; nothing reads it.
+fleetd has its own, real grant: `BLACKBOX_FLEETD_ALLOW_NONLOOPBACK_TCP`.)

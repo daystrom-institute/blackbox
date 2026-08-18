@@ -69,7 +69,18 @@ repos. Don't waste backup space on them.
 ~/.local/bin/bro
 ```
 
-Built from source: `cargo build --release && install -m 755 target/release/{blackbox,blackboxd,bro} ~/.local/bin/ && install -d ~/.local/share/blackbox/memories && cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/`.
+Built from source. The workspace declares no `default-members`, so a bare
+`cargo build --release` builds only the root `blackbox` package (`blackboxd`,
+`blackbox`); the `bro` CLI lives in `crates/bro-cli` and must be selected
+explicitly:
+
+```bash
+cargo build --release                       # blackboxd, blackbox (root package)
+cargo build --release -p bro-cli --bin bro  # bro (crates/bro-cli)
+install -m 755 target/release/{blackbox,blackboxd,bro} ~/.local/bin/
+install -d ~/.local/share/blackbox/memories
+cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
+```
 
 ## Configuration
 

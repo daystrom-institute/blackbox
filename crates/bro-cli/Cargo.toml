@@ -17,6 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 bro-fleet-client = { path = "../bro-fleet-client" }
+# SIGPIPE reset in main: a CLI whose stdout reader closes early exits quietly.
+libc = "0.2"
 bbox-corpus-core = { path = "../bbox-corpus-core" }
 # Checkout-owner capture client for `workspace-binding capture`. It speaks the
 # typed knowledge-source transport and links no daemon store, index, or server.

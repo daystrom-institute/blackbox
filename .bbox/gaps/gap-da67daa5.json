@@ -14,8 +14,10 @@
   "impact": "medium",
   "blocking_level": "none",
   "dedupe_key": "docs_runbook/deploy-docs/phantom-nonloopback-bind-env",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-16T18:29:15Z",
-  "updated_at": "2026-08-16T18:29:15Z"
+  "updated_at": "2026-08-18T19:47:04Z",
+  "resolved_at": "2026-08-18T19:47:04Z",
+  "resolution_note": "deploy/docker/README.md no longer presents BBOX_ALLOW_NONLOOPBACK_BIND as a gate: it states BBOX_BIND alone decides exposure, the daemon's loopback check gates only the unsigned-webhook escape, network posture is the control, and names fleetd's real BLACKBOX_FLEETD_ALLOW_NONLOOPBACK_TCP grant. Implementing a daemon-side grant was considered and deferred: it would refuse startup on any host binding a tailnet address without the new variable."
 }

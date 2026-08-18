@@ -691,6 +691,7 @@ fn default_fleet_harness_tee() {
 }
 
 fn main() -> anyhow::Result<()> {
+    restore_default_sigpipe();
     let cli = BroCli::parse();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -723,6 +724,24 @@ fn main() -> anyhow::Result<()> {
     drop(rt);
     result
 }
+
+/// Rust ignores SIGPIPE at startup so writes to a closed pipe surface as
+/// `EPIPE` errors, which `println!` turns into a panic ("failed printing to
+/// stdout: Broken pipe"). For a CLI that is routinely piped into `jq`, `head`,
+/// or a script that exits early, the Unix-conventional behavior is to die
+/// quietly with SIGPIPE, so restore the default disposition before printing
+/// anything.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: called once at process start before any threads exist; setting a
+    // signal disposition has no memory-safety preconditions.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
 
 /// Convert a `ratatui_core` Line from tui-markdown output into a `'static`
 /// ratatui Line that the fleet widgets consume.

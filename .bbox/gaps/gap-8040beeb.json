@@ -12,8 +12,10 @@
   "impact": "low",
   "blocking_level": "none",
   "dedupe_key": "tooling/bro-cli/epipe-panic-on-closed-stdout",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "created_at": "2026-08-16T21:22:54Z",
-  "updated_at": "2026-08-16T21:22:54Z"
+  "updated_at": "2026-08-18T19:47:04Z",
+  "resolved_at": "2026-08-18T19:47:04Z",
+  "resolution_note": "bro restores the default SIGPIPE disposition at the top of main (crates/bro-cli/src/main.rs restore_default_sigpipe, unix only), so a closed stdout reader ends the process quietly with SIGPIPE (exit 141) instead of the Rust EPIPE panic. Verified: `bro mcp call bbox_stats '{}' | false` went from exit 101 with a panic message to exit 141 silent."
 }
