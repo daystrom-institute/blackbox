@@ -87,7 +87,7 @@ consume declares it yet.
 ### Codex (OpenAI) as second data point (verified 2026-08-04; re-verified 2026-08-14 at HEAD 233739e76a - posture unchanged)
 
 Source-level probe of the codex-rs workspace (local checkout, HEAD
-78306a32af; ~180 commits later at 233739e76a nothing below has moved —
+78306a32af; ~180 commits later at 233739e76a nothing below has moved -
 still rmcp =3.0.0, feature still default-OFF UnderDevelopment, still no
 tasks/listen. Their new MCP work is OAuth hardening plus a bespoke
 non-spec `events/list`/`events/stream` CustomRequest surface for the
