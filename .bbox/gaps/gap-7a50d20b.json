@@ -1,0 +1,21 @@
+{
+  "id": "gap-7a50d20b",
+  "title": "docs/operations.md build line claims bare cargo build produces bro",
+  "gap_kind": "docs_runbook",
+  "domain": "build-docs",
+  "wanted_capability": "An accurate operations build instruction: the workspace has no default-members, so plain `cargo build --release` builds only the root blackbox package (blackboxd + blackbox); target/release/bro requires `cargo build --release -p bro-cli --bin bro`. docs/operations.md:72 claims the bare invocation yields {blackbox,blackboxd,bro}, which misleads downstream image builds packaging the CLI set.",
+  "fallback_used": "Downstream Dockerfile invokes cargo build with explicit -p bro-cli --bin bro package selection.",
+  "evidence": [
+    "docs/operations.md:72",
+    "Cargo.toml:1-52 (no default-members)",
+    "crates/bro-cli/Cargo.toml:14-16",
+    "scripts/catalog-smoke.sh:26-27"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/build-docs/operations-bare-build-bro-claim",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-16T18:29:10Z",
+  "updated_at": "2026-08-16T18:29:10Z"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "gap-3f112ee0",
+  "title": "code collector lane aborts wholesale on one unresolvable project",
+  "gap_kind": "tooling",
+  "domain": "code-collector",
+  "wanted_capability": "Per-project error isolation in the code-source and published-knowledge lanes: with several [[projects]] configured, one project whose committed identity cannot resolve (resolve_committed_scope: no committed .bbox/config.toml at HEAD) fails the entire lane run, so healthy projects behind it never publish. Wanted: skip-and-report per project (like pending-onboard scopes on the daemon side) so one unadoptable repo cannot starve the rest of the fleet.",
+  "fallback_used": "Producer-side config renderer gates the [[projects]] set on committed .bbox identity, so unresolvable repos never enter the lane.",
+  "evidence": [
+    "crates/bbox-code-collector/src/main.rs:2281-2305 (resolve_committed_scope, non-optional committed config read)",
+    "crates/bbox-corpus-core/src/git.rs:1137",
+    "observed 2026-08-16: 12-project config, 11 without committed .bbox, lane error starved the 1 healthy project"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/code-collector/lane-abort-on-single-project-failure",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-16T19:06:24Z",
+  "updated_at": "2026-08-16T19:06:24Z"
+}

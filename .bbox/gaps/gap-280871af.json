@@ -1,0 +1,20 @@
+{
+  "id": "gap-280871af",
+  "title": "auto-advance acceptance does not refresh the published graph view",
+  "gap_kind": "tooling",
+  "domain": "project-graph",
+  "wanted_capability": "A graph-carrying publication accepted by the auto-advance policy should serve its graphs immediately. Observed at 18585c6e: candidate accepted (publisher status shows the new generation and commit), yet bbox_project_graph_list/_validate kept serving the PRIOR accepted generation (stale accepted_generation and accepted_commit in the validate report), with no \"published graph view refresh failed\" warning logged, until a daemon restart's boot reconcile installed the correct view. Either publisher_auto_advance's refresh_published_graph_views call reads the pre-swap pointer (race) or its install does not reach the read path; the operator-advance path may share it. Boot reconcile (efca7a75) masks it only across restarts.",
+  "fallback_used": "Pod roll after graph-carrying merges; boot reconcile installs the accepted view.",
+  "evidence": [
+    "src/server/publisher_auto_advance.rs:415 (refresh call site)",
+    "src/server/knowledge_view.rs:1571-1599 (refresh loads runtime.load_verified; failure would warn, none logged)",
+    "live 2026-08-16: accepted 67f5ee06 at 063430d4; validate served 4115bb64 at f3c84a45 until restart; post-restart boot reconcile served the accepted 148-vertex graph"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-graph/accept-refresh-serves-stale-view",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-16T23:46:00Z",
+  "updated_at": "2026-08-16T23:46:00Z"
+}

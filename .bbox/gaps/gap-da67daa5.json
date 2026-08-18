@@ -1,0 +1,21 @@
+{
+  "id": "gap-da67daa5",
+  "title": "deploy README documents BBOX_ALLOW_NONLOOPBACK_BIND which no code reads",
+  "gap_kind": "docs_runbook",
+  "domain": "deploy-docs",
+  "wanted_capability": "deploy/docker/README.md:40 instructs setting BBOX_ALLOW_NONLOOPBACK_BIND for Kubernetes exposure, but the variable appears nowhere in code (whole-tree grep); BBOX_BIND=0.0.0.0 needs no grant and is_loopback_bind gates only the webhook no-signature escape. Either implement the guard the README implies or delete the line so operators do not treat an inert variable as a safety gate.",
+  "fallback_used": "Downstream deployment treats the variable as inert and relies on network posture for bind exposure decisions.",
+  "evidence": [
+    "deploy/docker/README.md:40",
+    "src/server/open.rs:925-945",
+    "src/server/routes.rs:480-493",
+    "src/webhooks.rs:206-210"
+  ],
+  "impact": "medium",
+  "blocking_level": "none",
+  "dedupe_key": "docs_runbook/deploy-docs/phantom-nonloopback-bind-env",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-16T18:29:15Z",
+  "updated_at": "2026-08-16T18:29:15Z"
+}

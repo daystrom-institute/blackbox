@@ -1,0 +1,23 @@
+{
+  "id": "gap-8070dc3b",
+  "title": "zero-byte graph source blobs refused at install despite contract allowance",
+  "gap_kind": "tooling",
+  "domain": "knowledge-source",
+  "wanted_capability": "Publishing a committed project graph with empty vertices.jsonl/edges.jsonl (the scaffold state of a freshly adopted graph). The contract explicitly allows zero-byte graph sources (graph_source_may_be_empty; manifest validation admits them), and the missing-blobs endpoint requests the empty-content sha, but install_upload_blob validates the incoming blob against a synthetic entry named \"blob-validation.json\", which can never satisfy the graphs-lane allowance, so the zero-byte PUT always fails validate_source_blob (ManifestCountMismatch -> 422 knowledge_source_manifest_invalid). Consequence: the whole publication candidate fails, and the session left open in missing_blobs 409-poisons every retry (begin resumes it) until the 24h idle TTL. Wanted: carry the real manifest filename (or at least the may-be-empty bit) into blob-install validation, and preferably let a failed upload abandon its session.",
+  "fallback_used": "Scaffold graphs ship a single newline in vertices.jsonl/edges.jsonl (loader skips blank lines, so still zero rows) until the install path honors the allowance.",
+  "evidence": [
+    "crates/bbox-knowledge-source-store/src/lib.rs install_upload_blob (synthetic blob-validation.json entry)",
+    "crates/bbox-knowledge-source/src/lib.rs:799-807 validate_source_blob with graph_source_may_be_empty",
+    "crates/bbox-knowledge-source/src/lib.rs:1580-1583",
+    "repro: examples/graph-live-exercise.sh with fixture vertices.jsonl/edges.jsonl truncated to 0 bytes fails committed-candidate publication; manual PUT of e3b0c442... blob returns 422; live hit 2026-08-16 on a downstream deployment publishing a scaffold graph"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/knowledge-source/zero-byte-graph-blob-install-refused",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-16T19:46:26Z",
+  "updated_at": "2026-08-18T19:42:03Z",
+  "resolved_at": "2026-08-18T19:42:03Z",
+  "resolution_note": "Fixed in ba6c00a1 (beta/blackbox-v2, deployed to blackbox.daystrom.app as build ba6c00a18878): install_upload_blob validates a zero-byte body under a graph-lane name so the manifest's emptiness rule applies at blob install; regression test provisional_capture_installs_empty_graph_source_blobs. Same defect independently hit as the 422 half of gap-8a5d8a9f."
+}
