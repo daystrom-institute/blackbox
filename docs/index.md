@@ -52,6 +52,7 @@ The workspace produces five operator-facing binaries:
 | [System Events](system-events.md) | Durable event model used by workflows and external inlets |
 | [Slack Bridge](slack-bridge.md) | Sidecar architecture, channel binding, triage workflow, proposal lifecycle |
 | [Whiteboards](whiteboards.md) | Structured multi-agent deliberation (phased boards) |
+| [Convergence Drain Gate](converge-gate.md) | Probe live orchestration state and drain admission before converging or cycling the daemon |
 
 ## Quick links
 

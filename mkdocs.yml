@@ -43,6 +43,7 @@ nav:
     - Graph And Retrieval Internals: graph-retrieval-internals.md
     - Index And Embedding Internals: index-embedding-internals.md
     - Operations: operations.md
+    - Convergence Drain Gate: converge-gate.md
   - Toolbelt:
     - Workflow Engine: workflows.md
     - Atoms: atoms.md

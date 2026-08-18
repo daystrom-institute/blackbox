@@ -238,6 +238,11 @@ async fn run_workflow_streaming_with_vars_inner(
     event_sink: tokio::sync::mpsc::UnboundedSender<Value>,
     arc_id_override: Option<String>,
 ) -> WorkflowRunResult {
+    // Top-level arc start: refused while admission is drained. Rehydrated
+    // arcs bypass this entry (they rebuild the runner from a checkpoint).
+    if let Some(refusal) = drain_refusal_result(server, "workflow arc start") {
+        return refusal;
+    }
     let actor_session_seeds = extract_actor_session_seeds(&mut initial_vars);
     let mut runner = WorkflowRunner::new(
         server,
@@ -327,6 +332,28 @@ pub async fn run_workflow_at_depth(
     .await
 }
 
+/// Admission-drain check for fresh top-level arcs. `None` when admission is
+/// open; otherwise an error-status result carrying the retryable
+/// `error.maintenance_pending` text (no runner is built, so no cancel token
+/// or arc thread is created for the refused start).
+fn drain_refusal_result(server: &BlackboxServer, what: &str) -> Option<WorkflowRunResult> {
+    let refusal = server.state.drain.admission_refusal(what)?;
+    Some(WorkflowRunResult {
+        status: format!("error: {refusal}"),
+        events: vec![json!({
+            "kind": "error",
+            "data": {"message": refusal},
+        })],
+        node_outputs: HashMap::new(),
+        vars: Map::new(),
+        structured_exit: None,
+        arc_id: String::new(),
+        plan: None,
+        arc_thread_id: None,
+        actor_sessions: HashMap::new(),
+    })
+}
+
 /// Internal nested-runner entry point that can chain the new arc's
 /// cancellation token to a parent arc or fanout group token.
 async fn run_workflow_at_depth_with_cancel(
@@ -341,6 +368,14 @@ async fn run_workflow_at_depth_with_cancel(
     parent_cancel_token: Option<CancellationToken>,
     arc_id_override: Option<String>,
 ) -> WorkflowRunResult {
+    // Only a genuinely fresh top-level arc is new work; nested
+    // sub-workflows and fanout children (depth > 0 or a parent token) are
+    // part of an in-flight arc and must keep running through a drain.
+    if composition_depth == 0 && parent_cancel_token.is_none() {
+        if let Some(refusal) = drain_refusal_result(server, "workflow arc start") {
+            return refusal;
+        }
+    }
     let actor_session_seeds = extract_actor_session_seeds(&mut initial_vars);
     if composition_depth > MAX_COMPOSITION_DEPTH {
         return WorkflowRunResult {

@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# converge-gate: refuse to converge or cycle a blackbox daemon while it is
+# carrying live orchestration state.
+#
+# The protected resource is live orchestration state (running bro tasks,
+# bro_wait / bro_when_* long-polls, workflow arcs in flight, sessions still
+# writing threads / notes / knowledge), not build capacity. The daemon
+# exposes a cheap JSON probe plus an operator-togglable admission drain
+# (src/server/drain.rs); this script turns them into a gate an external
+# converge path can call.
+#
+# INTENDED CALL ORDER (external converge path):
+#
+#   1. scripts/converge-gate --drain --timeout 900     # gate: set maintenance
+#                                                      # pending, wait bounded
+#                                                      # for in-flight work,
+#                                                      # exit 0 only when quiet
+#   2. <converge / restart / redeploy the daemon>      # only if step 1 exited 0
+#   3. scripts/converge-gate --clear                   # clear drain: the marker
+#                                                      # persists across restart
+#                                                      # by design, so the new
+#                                                      # daemon boots draining
+#                                                      # until this runs
+#
+# A plain `scripts/converge-gate` (no flags) is the read-only check: it probes,
+# prints who would be sandbagged, and exits nonzero if orchestration is
+# active. It never toggles drain.
+#
+# MODES
+#   (default)          probe once; exit 0 iff quiescent
+#   --drain            set drain (fresh dispatches refused with the retryable
+#                      error.maintenance_pending; in-flight work continues,
+#                      bro_resume stays allowed), then poll until quiescent or
+#                      --timeout. Exit 0 only when quiescent. Drain is LEFT SET
+#                      on success (the converge step follows); on timeout the
+#                      drain is also left set unless --release-on-timeout.
+#   --clear            clear drain and exit 0 (idempotent)
+#   --status           print drain + probe JSON and exit 0
+#
+# OPTIONS
+#   --timeout SECS         --drain wait budget (default 900)
+#   --interval SECS        --drain poll interval (default 10)
+#   --writes-window MIN    treat thread/note/knowledge writes in the last MIN
+#                          minutes as activity (default 10; 0 disables). The
+#                          daemon reports write recency but deliberately does
+#                          NOT fold it into `quiescent`; this wrapper does.
+#   --reason TEXT          reason recorded on the drain marker
+#   --release-on-timeout   clear drain if --drain times out
+#   --json                 print the raw probe JSON instead of the summary
+#   --url URL              daemon base URL (default $BBOX_URL, else
+#                          http://127.0.0.1:${BBOX_PORT:-7264})
+#
+# EXIT CODES
+#   0  quiescent (safe to converge)             2  daemon unreachable / bad probe
+#   1  orchestration active (would sandbag)     3  --drain timed out still active
+#
+# Dependencies: bash, curl, python3 (no jq).
+
+set -euo pipefail
+
+MODE=probe
+TIMEOUT=900
+INTERVAL=10
+WRITES_WINDOW=10
+REASON=""
+RELEASE_ON_TIMEOUT=0
+RAW_JSON=0
+URL="${BBOX_URL:-http://127.0.0.1:${BBOX_PORT:-7264}}"
+
+usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --drain) MODE=drain ;;
+        --clear) MODE=clear ;;
+        --status) MODE=status ;;
+        --timeout) TIMEOUT="$2"; shift ;;
+        --interval) INTERVAL="$2"; shift ;;
+        --writes-window) WRITES_WINDOW="$2"; shift ;;
+        --reason) REASON="$2"; shift ;;
+        --release-on-timeout) RELEASE_ON_TIMEOUT=1 ;;
+        --json) RAW_JSON=1 ;;
+        --url) URL="$2"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "converge-gate: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+URL="${URL%/}"
+
+probe() {
+    curl -fsS --max-time 10 \
+        "$URL/admin/orchestration-activity?writes_window_minutes=$WRITES_WINDOW"
+}
+
+drain_post() {
+    # $1 = true|false
+    python3 - "$1" "$REASON" <<'PY' | curl -fsS --max-time 10 -X POST \
+        -H 'content-type: application/json' --data-binary @- "$URL/admin/drain"
+import json, sys
+draining = sys.argv[1] == "true"
+body = {"draining": draining, "set_by": "converge-gate"}
+if draining and sys.argv[2]:
+    body["reason"] = sys.argv[2]
+print(json.dumps(body))
+PY
+}
+
+# Evaluate one probe payload (passed on stdin). Prints a human summary to
+# stdout and returns 0 when quiescent (per this wrapper's policy, writes
+# included), 1 otherwise. The python source travels in a variable so stdin
+# stays free for the payload.
+PY_EVAL=$(cat <<'PY'
+import json, sys
+window = int(sys.argv[1]); raw = sys.argv[2] == "1"
+snap = json.load(sys.stdin)
+if raw:
+    print(json.dumps(snap, indent=2))
+tasks = snap["running_tasks"]; arcs = snap["workflows_in_flight"]
+waiters = snap["long_poll_waiters"]; writes = snap["recent_writes"]
+drain = snap.get("drain", {})
+blocking = []
+if tasks["count"]:
+    blocking.append(f"{tasks['count']} running bro task(s)")
+if arcs["count"]:
+    blocking.append(f"{arcs['count']} workflow arc(s) in flight")
+if waiters["count"]:
+    blocking.append(f"{waiters['count']} long-poll waiter(s)")
+if window > 0 and writes["total"]:
+    blocking.append(f"{writes['total']} orchestration write(s) in the last {window} min")
+if not raw:
+    print(f"daemon quiescent(tasks,arcs,waiters)={snap['quiescent']} "
+          f"drain={'ON' if drain.get('draining') else 'off'} sampled_at={snap.get('sampled_at')}")
+    if blocking:
+        print("ACTIVE, converging now would sandbag:")
+        for t in tasks["tasks"]:
+            who = t.get("bro") or t.get("agent") or t.get("name") or "-"
+            print(f"  task {t['task_id']}  {t.get('provider')}  origin={t.get('origin')}  "
+                  f"who={who}  age={t.get('age_secs')}s  cwd={t.get('cwd') or '-'}")
+        for a in arcs["arcs"]:
+            print(f"  arc  {a['arc_id']}  workflow={a.get('workflow','?')}  status={a.get('status')}  "
+                  f"node={a.get('current_node')}  age={a.get('age_secs')}s")
+        for w in waiters["waiters"]:
+            print(f"  wait {w['tool']}  tasks={','.join(w['task_ids'])}  age={w['age_secs']}s")
+        if window > 0 and writes["total"]:
+            for t in writes["threads"]:
+                print(f"  thread {t['id']}  {t.get('status')}  last_activity={t['last_activity']}  {t.get('topic','')[:60]}")
+            for n in writes["notes"]:
+                print(f"  note   {n['id']}  {n.get('kind')}  updated_at={n['updated_at']}")
+            for k in writes["knowledge"]:
+                print(f"  kb     {k['id']}  updated_at={k['updated_at']}  {k.get('title','')[:60]}")
+        print("blocking: " + "; ".join(blocking))
+    else:
+        print("QUIESCENT: no running tasks, arcs, waiters"
+              + (f", or writes in the last {window} min" if window > 0 else " (write recency ignored)"))
+sys.exit(1 if blocking else 0)
+PY
+)
+
+evaluate() {
+    python3 -c "$PY_EVAL" "$WRITES_WINDOW" "$RAW_JSON"
+}
+
+fetch_probe() {
+    local out
+    if ! out=$(probe); then
+        echo "converge-gate: daemon probe failed at $URL/admin/orchestration-activity (is blackboxd up?)" >&2
+        exit 2
+    fi
+    printf '%s' "$out"
+}
+
+case "$MODE" in
+    status)
+        fetch_probe | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))'
+        exit 0
+        ;;
+    clear)
+        if ! drain_post false >/dev/null; then
+            echo "converge-gate: failed to clear drain at $URL/admin/drain" >&2
+            exit 2
+        fi
+        echo "converge-gate: drain cleared; admission open."
+        exit 0
+        ;;
+    probe)
+        snapshot=$(fetch_probe)
+        if printf '%s' "$snapshot" | evaluate; then exit 0; else exit 1; fi
+        ;;
+    drain)
+        if ! drain_post true >/dev/null; then
+            echo "converge-gate: failed to set drain at $URL/admin/drain" >&2
+            exit 2
+        fi
+        echo "converge-gate: drain SET (fresh dispatches now refused with error.maintenance_pending); waiting up to ${TIMEOUT}s for in-flight work..."
+        start=$(date +%s)
+        while :; do
+            snapshot=$(fetch_probe)
+            if printf '%s' "$snapshot" | evaluate; then
+                echo "converge-gate: quiescent after $(( $(date +%s) - start ))s; drain left SET. Converge now, then run: $0 --clear"
+                exit 0
+            fi
+            elapsed=$(( $(date +%s) - start ))
+            if [ "$elapsed" -ge "$TIMEOUT" ]; then
+                echo "converge-gate: TIMEOUT after ${elapsed}s, orchestration still active." >&2
+                if [ "$RELEASE_ON_TIMEOUT" = 1 ]; then
+                    drain_post false >/dev/null && echo "converge-gate: drain released (--release-on-timeout)." >&2
+                else
+                    echo "converge-gate: drain left SET; run '$0 --clear' to reopen admission or retry --drain." >&2
+                fi
+                exit 3
+            fi
+            echo "converge-gate: still active (${elapsed}s/${TIMEOUT}s), next check in ${INTERVAL}s"
+            sleep "$INTERVAL"
+        done
+        ;;
+esac

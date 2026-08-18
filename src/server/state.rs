@@ -366,6 +366,12 @@ pub(crate) struct SharedState {
     /// state. Concurrent resumes on the same provider session race
     /// transcript writes and can fork/corrupt the session.
     pub(crate) resume_leases: Arc<orchestration::resume_lease::ResumeLeaseRegistry>,
+    /// Admission drain mode for maintenance windows (persisted marker under
+    /// `store_dir`). Consulted by every fresh dispatch; see `server::drain`.
+    pub(crate) drain: super::drain::DrainState,
+    /// In-flight `bro_wait` / `bro_when_*` long-poll waiters, so the
+    /// activity probe can name who a daemon cycle would sandbag.
+    pub(crate) long_polls: Arc<super::drain::LongPollRegistry>,
     /// Agent dispatch adapter registry. Initialized before artifact
     /// catalog opens so AS-I1 validation can check dispatch_adapter
     /// membership against the live registry.
@@ -1166,6 +1172,8 @@ impl SharedState {
             webhook_delivery_log: RwLock::new(VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
             arc_cancel_tokens: RwLock::new(HashMap::new()),
             resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+            drain: super::drain::DrainState::in_memory(store_dir),
+            long_polls: Arc::new(super::drain::LongPollRegistry::new()),
             agent_adapter_registry: Arc::new(RwLock::new(
                 orchestration::agents::adapter::AgentAdapterRegistry::new(),
             )),

@@ -273,6 +273,19 @@ impl BlackboxServer {
         &self,
         mut request: FreshDispatchRequest,
     ) -> Result<FreshDispatchResult, String> {
+        // Admission drain (maintenance window): refuse NEW work while
+        // letting in-flight work continue. Workflow-origin dispatches are an
+        // already-running arc's nodes and atom-origin dispatches are either
+        // gated at the `atom_invoke` tool (external) or belong to in-flight
+        // work (workflow atom nodes, auto-supervision); both pass here.
+        if !matches!(
+            request.origin,
+            bro_core::Origin::Workflow | bro_core::Origin::Atom
+        ) {
+            if let Some(refusal) = self.state.drain.admission_refusal("fresh dispatch") {
+                return Err(refusal);
+            }
+        }
         let store_dir = self.state.store_dir.clone();
         let allocation_guard = if request.allocation_request.is_some() {
             Some(orchestration::allocator::acquire_allocation_lock().await)
@@ -1055,6 +1068,10 @@ impl BlackboxServer {
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         };
 
+        let _long_poll = self
+            .state
+            .long_polls
+            .register("bro_wait", vec![p.task_id.clone()]);
         let caller_token = context.meta.get_progress_token();
         tracing::info!(target: "blackbox::progress", tool = "bro_wait", has_token = caller_token.is_some(), token = ?caller_token, "entry");
         let progress_handle = caller_token.map(|token| {
@@ -1110,6 +1127,10 @@ impl BlackboxServer {
             let store = self.state.task_store.read();
             task_ids.iter().filter_map(|id| store.get(id)).collect()
         };
+        let _long_poll = self
+            .state
+            .long_polls
+            .register("bro_when_all", task_ids.clone());
 
         let progress_handle = context.meta.get_progress_token().map(|token| {
             spawn_progress_notifier(
@@ -1186,6 +1207,10 @@ impl BlackboxServer {
             let store = self.state.task_store.read();
             task_ids.iter().filter_map(|id| store.get(id)).collect()
         };
+        let _long_poll = self
+            .state
+            .long_polls
+            .register("bro_when_any", task_ids.clone());
 
         // Check if any already done
         let any_done = tasks.iter().any(|t| t.inner.lock().status.is_terminal());
@@ -2731,6 +2756,188 @@ mod tests {
             origin_override: None,
             display_name: None,
         }
+    }
+
+    fn drain_test_request(origin: bro_core::Origin) -> FreshDispatchRequest {
+        FreshDispatchRequest {
+            prompt: "drain probe".into(),
+            provider: Provider::Glm,
+            lens: None,
+            exec_opts: None,
+            env_overrides: None,
+            cwd: None,
+            brofile_filters: None,
+            coerce_workspace: false,
+            allow_recursion: false,
+            allow_tools: None,
+            disallow_tools: None,
+            tool_placement: None,
+            brofile_tool_defaults: None,
+            tool_defaults: None,
+            allocation_request: None,
+            project_dir_for_lease: None,
+            ambient_bro_name: None,
+            spawn_bro_label: None,
+            spawn_agent_label: None,
+            display_name: None,
+            record_to_bro: None,
+            origin,
+            brofile_context: None,
+            code_mode: None,
+            service_tier: None,
+            output_schema: None,
+        }
+    }
+
+    fn call_result_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn drain_refuses_fresh_dispatch_before_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server
+            .state
+            .drain
+            .set(Some("converge window".into()), Some("test".into()))
+            .unwrap();
+        for origin in [
+            bro_core::Origin::AgentDispatch,
+            bro_core::Origin::Cockpit,
+            bro_core::Origin::Cron,
+            bro_core::Origin::Webhook,
+            bro_core::Origin::Unknown,
+        ] {
+            let err = server
+                .dispatch_fresh_bro_task(drain_test_request(origin))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{origin} dispatch must be refused while draining"));
+            assert!(
+                err.starts_with(crate::server::drain::MAINTENANCE_PENDING_CODE),
+                "{origin}: {err}"
+            );
+            assert!(err.contains("retryable=true"), "{origin}: {err}");
+            assert!(err.contains("converge window"), "{origin}: {err}");
+        }
+        // Nothing was registered: the refusal happens before any task
+        // reservation or spawn.
+        assert!(server.state.task_store.read().all_tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_gate_is_bypassed_for_in_flight_origins() {
+        // Workflow-origin (an in-flight arc's node) and atom-origin (workflow
+        // atom nodes / auto-supervision) dispatches must not hit the drain
+        // refusal. They may fail later for unrelated reasons in this
+        // harness-less test box; the assertion is only that the error, if
+        // any, is not the maintenance refusal.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server.state.drain.set(None, None).unwrap();
+        for origin in [bro_core::Origin::Workflow, bro_core::Origin::Atom] {
+            let mut req = drain_test_request(origin);
+            // Route through the allocator with an impossible pin so the
+            // call returns deterministically (allocation error) without
+            // trying to spawn a harness child.
+            req.allocation_request = Some(orchestration::allocator::RuntimeRequest {
+                pin: Some(orchestration::allocator::RuntimePin {
+                    provider: Some(Provider::Glm),
+                    account: Some("no-such-account-for-drain-test".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            match server.dispatch_fresh_bro_task(req).await {
+                Ok(_) => {}
+                Err(err) => assert!(
+                    !err.starts_with(crate::server::drain::MAINTENANCE_PENDING_CODE),
+                    "{origin} must bypass the drain gate, got: {err}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_refuses_bro_exec_tool_and_clears_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server.state.drain.set(Some("cycle".into()), None).unwrap();
+        let mut p = params();
+        p.provider = Some("glm".into());
+        let result = server.bro_exec(Parameters(p)).await;
+        assert_eq!(result.is_error, Some(true));
+        let text = call_result_text(&result);
+        assert!(
+            text.contains(crate::server::drain::MAINTENANCE_PENDING_CODE),
+            "{text}"
+        );
+        assert!(server.state.task_store.read().all_tasks().is_empty());
+
+        // Clearing reopens admission: the same call now proceeds past the
+        // gate (and fails, if at all, for a different reason).
+        server.state.drain.clear().unwrap();
+        assert!(!server.state.drain.is_draining());
+        let mut p = params();
+        p.provider = Some("glm".into());
+        let result = server.bro_exec(Parameters(p)).await;
+        let text = call_result_text(&result);
+        assert!(
+            !text.contains(crate::server::drain::MAINTENANCE_PENDING_CODE),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_leaves_bro_resume_ungated() {
+        // Resumes continue existing sessions and are exempt by design. With
+        // drain set, a resume of an unknown bro fails on the lookup, never
+        // on the maintenance gate.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server.state.drain.set(None, None).unwrap();
+        let p: ResumeParams = serde_json::from_value(json!({
+            "prompt": "continue",
+            "bro": "ghost-bro-for-drain-test",
+        }))
+        .unwrap();
+        let result = server.bro_resume(Parameters(p)).await;
+        let text = call_result_text(&result);
+        assert!(text.contains("Unknown bro"), "{text}");
+        assert!(
+            !text.contains(crate::server::drain::MAINTENANCE_PENDING_CODE),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_marker_survives_restart_and_still_refuses() {
+        // Simulate a daemon crash / restart between set and clear: a fresh
+        // SharedState opened on the same store dir must boot draining.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("bro");
+        {
+            let server = BlackboxServer::new(Arc::new(SharedState::for_test(&store_dir)));
+            server
+                .state
+                .drain
+                .set(Some("converge".into()), Some("converge-gate".into()))
+                .unwrap();
+        }
+        let reopened = crate::server::drain::DrainState::open(&store_dir);
+        assert!(reopened.is_draining());
+        let rec = reopened.current().unwrap();
+        assert_eq!(rec.reason.as_deref(), Some("converge"));
+        assert_eq!(rec.set_by.as_deref(), Some("converge-gate"));
+        let refusal = reopened.admission_refusal("fresh dispatch").unwrap();
+        assert!(refusal.starts_with(crate::server::drain::MAINTENANCE_PENDING_CODE));
+        assert!(refusal.contains("converge"));
     }
 
     #[test]

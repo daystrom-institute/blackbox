@@ -138,6 +138,14 @@ pub(super) fn build_http_app(
             axum::routing::get(admin_runtime_metrics),
         )
         .route(
+            "/admin/orchestration-activity",
+            axum::routing::get(admin_orchestration_activity),
+        )
+        .route(
+            "/admin/drain",
+            axum::routing::get(admin_drain_status).post(admin_drain_set),
+        )
+        .route(
             "/admin/artifact/supersede",
             axum::routing::post(admin_artifact_supersede),
         )
