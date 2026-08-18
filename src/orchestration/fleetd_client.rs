@@ -81,6 +81,13 @@ const AUTOSTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SPAWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Worker inspection executes a handful of local Git and filesystem reads.
 const WORKSPACE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for fleetd's `Sessions` answer when proving whether a
+/// colliding supervision key is still live, and during re-adoption.
+const LIST_SESSIONS_TIMEOUT: Duration = Duration::from_secs(10);
+/// fleetd's error code for a spawn whose session id its registry still holds.
+/// A terminal entry nobody acked keeps the key occupied on fleetd's side even
+/// after the daemon has released its own slot.
+const FLEETD_DUPLICATE_SESSION_CODE: &str = "session.duplicate";
 
 /// The one fleetd this daemon owns. Multi-fleet routing is deliberately not
 /// hidden in this type: v1 has one endpoint and therefore one owner/fencing
@@ -556,66 +563,107 @@ impl HarnessExecutor for FleetdExecutor {
         let commands = self.commands().await?;
         let session_id = spec.session_id.clone();
 
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
-        let (started_tx, started_rx) = oneshot::channel();
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        {
-            let mut sessions = self.shared.sessions.lock();
-            if sessions.contains_key(&session_id) {
-                anyhow::bail!(
-                    "fleetd session id `{session_id}` is already live; refusing to \
-                     multiplex two dispatches onto one supervision key"
-                );
+        // A supervision key may be released at most once per dispatch: if a
+        // stale slot (or a stale fleetd registry entry) is cleared and the
+        // key STILL collides afterwards, something genuinely live owns it.
+        let mut released_stale_key = false;
+        loop {
+            let (events_tx, events_rx) = mpsc::unbounded_channel::<String>();
+            let (started_tx, started_rx) = oneshot::channel();
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            let claimed = {
+                let mut sessions = self.shared.sessions.lock();
+                if sessions.contains_key(&session_id) {
+                    false
+                } else {
+                    sessions.insert(
+                        session_id.clone(),
+                        SessionSlot {
+                            events: events_tx,
+                            started: Some(started_tx),
+                            outcome: Some(outcome_tx),
+                            exit_after_replay: None,
+                            last_seq: 0,
+                            commands: commands.clone(),
+                        },
+                    );
+                    true
+                }
+            };
+            if !claimed {
+                if released_stale_key {
+                    anyhow::bail!(
+                        "fleetd session id `{session_id}` was claimed again while its stale \
+                         key was being released; refusing to multiplex two dispatches onto \
+                         one supervision key"
+                    );
+                }
+                match release_stale_supervision_key(&self.shared, &commands, &session_id).await {
+                    Ok(true) => {
+                        released_stale_key = true;
+                        continue;
+                    }
+                    Ok(false) => anyhow::bail!(
+                        "fleetd session id `{session_id}` is genuinely live (fleetd reports a \
+                         running worker under this supervision key); refusing to multiplex \
+                         two dispatches onto one supervision key"
+                    ),
+                    Err(error) => anyhow::bail!(
+                        "fleetd session id `{session_id}` is registered as live and fleetd \
+                         could not confirm whether its worker is still running ({error}); \
+                         refusing to multiplex two dispatches onto one supervision key"
+                    ),
+                }
             }
-            sessions.insert(
-                session_id.clone(),
-                SessionSlot {
-                    events: events_tx,
-                    started: Some(started_tx),
-                    outcome: Some(outcome_tx),
-                    exit_after_replay: None,
-                    last_seq: 0,
-                    commands: commands.clone(),
-                },
-            );
+
+            if commands
+                .send(DaemonToFleetd::Spawn {
+                    spec: Box::new(spec.clone()),
+                })
+                .is_err()
+            {
+                self.shared.sessions.lock().remove(&session_id);
+                anyhow::bail!("fleetd connection dropped before the spawn was sent");
+            }
+
+            let pid = match tokio::time::timeout(SPAWN_ACK_TIMEOUT, started_rx).await {
+                Ok(Ok(Ok(pid))) => pid,
+                Ok(Ok(Err(message))) => {
+                    self.shared.sessions.lock().remove(&session_id);
+                    // fleetd still holds a terminal entry under this key
+                    // (an exited session nobody acked). Prove it is not
+                    // live, release it, and try once more.
+                    if message.starts_with(FLEETD_DUPLICATE_SESSION_CODE)
+                        && !released_stale_key
+                        && release_stale_supervision_key(&self.shared, &commands, &session_id)
+                            .await?
+                    {
+                        released_stale_key = true;
+                        continue;
+                    }
+                    anyhow::bail!("fleetd refused the spawn: {message}");
+                }
+                Ok(Err(_)) => {
+                    self.shared.sessions.lock().remove(&session_id);
+                    anyhow::bail!("fleetd connection dropped before the session started");
+                }
+                Err(_) => {
+                    self.shared.sessions.lock().remove(&session_id);
+                    anyhow::bail!(
+                        "fleetd did not acknowledge the spawn within {}s",
+                        SPAWN_ACK_TIMEOUT.as_secs()
+                    );
+                }
+            };
+
+            return Ok(WorkerHandle {
+                control: control_lane(session_id.clone(), commands.clone()),
+                events: events_rx,
+                pid,
+                killer: WorkerKill::via_fleetd(session_id, commands),
+                outcome: outcome_rx,
+            });
         }
-
-        if commands
-            .send(DaemonToFleetd::Spawn {
-                spec: Box::new(spec),
-            })
-            .is_err()
-        {
-            self.shared.sessions.lock().remove(&session_id);
-            anyhow::bail!("fleetd connection dropped before the spawn was sent");
-        }
-
-        let pid = match tokio::time::timeout(SPAWN_ACK_TIMEOUT, started_rx).await {
-            Ok(Ok(Ok(pid))) => pid,
-            Ok(Ok(Err(message))) => {
-                self.shared.sessions.lock().remove(&session_id);
-                anyhow::bail!("fleetd refused the spawn: {message}");
-            }
-            Ok(Err(_)) => {
-                self.shared.sessions.lock().remove(&session_id);
-                anyhow::bail!("fleetd connection dropped before the session started");
-            }
-            Err(_) => {
-                self.shared.sessions.lock().remove(&session_id);
-                anyhow::bail!(
-                    "fleetd did not acknowledge the spawn within {}s",
-                    SPAWN_ACK_TIMEOUT.as_secs()
-                );
-            }
-        };
-
-        Ok(WorkerHandle {
-            control: control_lane(session_id.clone(), commands.clone()),
-            events: events_rx,
-            pid,
-            killer: WorkerKill::via_fleetd(session_id, commands),
-            outcome: outcome_rx,
-        })
     }
 }
 
@@ -819,6 +867,11 @@ fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon) {
                 latest_available,
                 "fleetd replay window does not reach our cursor; resuming with a gap"
             );
+            // A dead session gets no `ReplayComplete` after this, and nothing
+            // else will ever come for it: publish its terminal state now,
+            // acking through the end of fleetd's window so it can GC. Leaving
+            // the slot would register a dead supervision key as live.
+            finish_dead_session_slot(shared, &session_id, Some(latest_available));
         }
         FleetdToDaemon::Error {
             session_id,
@@ -832,6 +885,12 @@ fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon) {
                 {
                     let _ = started.send(Err(format!("{code}: {message}")));
                 }
+                drop(sessions);
+                // A replay that failed, or a session fleetd does not know,
+                // will never terminate a dead session's slot on its own.
+                if code == "replay.failed" || code == "session.unknown" {
+                    finish_dead_session_slot(shared, session_id, None);
+                }
             }
             tracing::warn!(?session_id, %code, %message, "fleetd reported an error");
         }
@@ -844,21 +903,223 @@ fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon) {
     }
 }
 
-/// Ask fleetd what it is holding, reattach everything the task store knows
-/// about, and replay each from the daemon's own durable cursor.
-async fn readopt_live_sessions(
+/// Publish terminal state for a slot that was re-adopted as already exited
+/// (or reconciled to that state) but whose replay terminator will not arrive.
+/// A live slot is left untouched: its terminal state still arrives on the wire.
+fn finish_dead_session_slot(shared: &Arc<Shared>, session_id: &str, through_seq: Option<u64>) {
+    let slot = {
+        let mut sessions = shared.sessions.lock();
+        match sessions.get(session_id) {
+            Some(slot) if slot.exit_after_replay.is_some() => sessions.remove(session_id),
+            _ => None,
+        }
+    };
+    let Some(mut slot) = slot else {
+        return;
+    };
+    if let Some(through_seq) = through_seq {
+        slot.last_seq = slot.last_seq.max(through_seq);
+    }
+    let exit_code = slot.exit_after_replay.flatten();
+    tracing::info!(
+        %session_id,
+        ?exit_code,
+        last_seq = slot.last_seq,
+        "replay will not terminate for an already-exited session; publishing terminal state"
+    );
+    slot.finish(session_id, exit_code, String::new());
+}
+
+/// One `ListSessions` round trip.
+async fn list_sessions(
     shared: &Arc<Shared>,
     commands: &mpsc::UnboundedSender<DaemonToFleetd>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<SessionSummary>> {
     let (tx, rx) = oneshot::channel();
     shared.list_waiters.lock().push(tx);
     commands
         .send(DaemonToFleetd::ListSessions)
         .map_err(|_| anyhow::anyhow!("connection dropped before ListSessions"))?;
-    let summaries = tokio::time::timeout(Duration::from_secs(10), rx)
+    tokio::time::timeout(LIST_SESSIONS_TIMEOUT, rx)
         .await
         .map_err(|_| anyhow::anyhow!("fleetd did not answer ListSessions in time"))?
-        .map_err(|_| anyhow::anyhow!("connection dropped awaiting ListSessions"))?;
+        .map_err(|_| anyhow::anyhow!("connection dropped awaiting ListSessions"))
+}
+
+/// Prove whether the supervision key `session_id` is still owned by a live
+/// child, and if it is not, release it on both sides of the seam.
+///
+/// This is the restart-orphan repair. After a daemon restart the client
+/// re-adopts sessions fleetd reports as already `Exited` and expects their
+/// replay terminator to publish terminal state and free the slot; when that
+/// terminator never comes (the cursor fell outside fleetd's log window, the
+/// replay failed, the connection dropped mid-replay) the slot leaks and every
+/// `bro_resume` on the same provider session id collides with a dead key. The
+/// task record meanwhile advertises exactly that resume as the recovery path.
+///
+/// fleetd is the authority on liveness, so this asks it rather than trusting
+/// the slot: a slot fleetd reports `Running` is genuinely live and stays
+/// refused (that is the real double-dispatch protection); a slot fleetd
+/// reports `Exited` or does not know at all is dead. Releasing means
+/// publishing the dead slot's terminal outcome (so its task leaves `Running`)
+/// and acking fleetd through the highest seq either side saw, which lets
+/// fleetd GC its own terminal entry so the follow-up `Spawn` is not refused
+/// as a duplicate.
+///
+/// A slot still awaiting its own `SessionStarted` is an in-flight dispatch,
+/// live by definition, and is never released.
+///
+/// Returns `Ok(true)` when the key was released and the caller may retry.
+async fn release_stale_supervision_key(
+    shared: &Arc<Shared>,
+    commands: &mpsc::UnboundedSender<DaemonToFleetd>,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let in_flight = shared
+        .sessions
+        .lock()
+        .get(session_id)
+        .is_some_and(|slot| slot.started.is_some());
+    if in_flight {
+        return Ok(false);
+    }
+
+    let summaries = list_sessions(shared, commands).await?;
+    let summary = summaries
+        .into_iter()
+        .find(|summary| summary.session_id == session_id);
+    if let Some(summary) = summary.as_ref()
+        && summary.state == SessionState::Running
+    {
+        return Ok(false);
+    }
+    let fleetd_last_seq = summary.as_ref().and_then(|summary| summary.last_seq);
+    let fleetd_exit_code = summary.as_ref().and_then(|summary| summary.exit_code);
+
+    let slot = {
+        let mut sessions = shared.sessions.lock();
+        // Re-check under the lock: a spawn may have claimed the key while
+        // ListSessions was in flight. That slot is live; leave it.
+        match sessions.get(session_id) {
+            Some(slot) if slot.started.is_some() => return Ok(false),
+            _ => sessions.remove(session_id),
+        }
+    };
+    match slot {
+        Some(mut slot) => {
+            tracing::warn!(
+                %session_id,
+                fleetd_state = ?summary.as_ref().map(|summary| summary.state),
+                slot_last_seq = slot.last_seq,
+                ?fleetd_last_seq,
+                "releasing a stale supervision key: fleetd no longer holds a live \
+                 session under it; publishing the dead session's terminal state"
+            );
+            slot.commands = commands.clone();
+            slot.last_seq = slot.last_seq.max(fleetd_last_seq.unwrap_or(0));
+            let exit_code = slot.exit_after_replay.flatten().or(fleetd_exit_code);
+            slot.finish(
+                session_id,
+                exit_code,
+                "\n[blackbox] supervision key released: fleetd no longer holds a live \
+                 session for this task; the worker is gone."
+                    .to_string(),
+            );
+        }
+        None => {
+            if summary.is_some() {
+                tracing::info!(
+                    %session_id,
+                    ?fleetd_last_seq,
+                    "acking a terminal fleetd session nobody claimed so its key is freed"
+                );
+                let _ = commands.send(DaemonToFleetd::EventAck {
+                    session_id: session_id.to_string(),
+                    through_seq: fleetd_last_seq.unwrap_or(0),
+                });
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Ask fleetd what it is holding, reattach everything the task store knows
+/// about, and replay each from the daemon's own durable cursor.
+///
+/// Slots that survived the previous connection are reconciled against
+/// fleetd's answer rather than trusted: their command sender is refreshed
+/// (a terminal ack on the old, closed sender would be lost and fleetd would
+/// keep the key forever), a session fleetd no longer holds is dead and its
+/// slot is finished, a session fleetd now reports `Exited` whose exit we
+/// never saw is marked terminal-after-replay, and an interrupted replay is
+/// re-issued from the slot's cursor. Without this a daemon reconnect leaves
+/// dead keys registered as live.
+async fn readopt_live_sessions(
+    shared: &Arc<Shared>,
+    commands: &mpsc::UnboundedSender<DaemonToFleetd>,
+) -> anyhow::Result<()> {
+    let summaries = list_sessions(shared, commands).await?;
+
+    let mut replays: Vec<(String, u64)> = Vec::new();
+    let mut finished: Vec<(String, SessionSlot)> = Vec::new();
+    {
+        let mut sessions = shared.sessions.lock();
+        let reported: HashMap<&str, &SessionSummary> = summaries
+            .iter()
+            .map(|summary| (summary.session_id.as_str(), summary))
+            .collect();
+        let known: Vec<String> = sessions.keys().cloned().collect();
+        for session_id in known {
+            let Some(slot) = sessions.get_mut(&session_id) else {
+                continue;
+            };
+            slot.commands = commands.clone();
+            if slot.started.is_some() {
+                // An in-flight spawn on this connection; its own ack path
+                // owns the slot.
+                continue;
+            }
+            match reported.get(session_id.as_str()) {
+                None => {
+                    if let Some(slot) = sessions.remove(&session_id) {
+                        finished.push((session_id, slot));
+                    }
+                }
+                Some(summary) => {
+                    if summary.state == SessionState::Exited && slot.exit_after_replay.is_none() {
+                        slot.exit_after_replay = Some(summary.exit_code);
+                    }
+                    if slot.exit_after_replay.is_some() {
+                        replays.push((session_id, slot.last_seq));
+                    }
+                }
+            }
+        }
+    }
+    for (session_id, slot) in finished {
+        tracing::warn!(
+            %session_id,
+            "fleetd no longer holds this session; publishing terminal state for its slot"
+        );
+        slot.finish(
+            &session_id,
+            None,
+            "\n[blackbox] fleetd no longer holds this session (fleetd restarted or \
+             forgot it); the worker is gone."
+                .to_string(),
+        );
+    }
+    for (session_id, from_seq) in replays {
+        tracing::info!(
+            %session_id,
+            from_seq,
+            "re-issuing replay for an exited session whose terminal state is still pending"
+        );
+        let _ = commands.send(DaemonToFleetd::ReplayFrom {
+            session_id,
+            from_seq,
+        });
+    }
 
     for summary in summaries {
         // Already wired up (a reconnect where we never lost the slot, or our
@@ -1014,6 +1275,506 @@ fn resolve_fleetd_binary(config: &FleetdConfig) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::AtomicUsize;
+
+    use tokio::net::UnixListener;
+
+    /// How a scripted fleetd answers `ReplayFrom`.
+    #[derive(Debug, Clone, Copy)]
+    enum ReplayScript {
+        /// Never answer: the daemon must not depend on a terminator arriving.
+        Silent,
+        /// The log window does not reach the requested cursor.
+        Unavailable { earliest: u64, latest: u64 },
+    }
+
+    /// A scripted fleetd on a real Unix socket. It speaks the real wire
+    /// contract (handshake, bearer gate, generation-stamped envelopes) but
+    /// its registry is a plain list the test seeds, so every liveness answer
+    /// is exact. Ack-driven GC mirrors fleetd's own rule: an exited session
+    /// is forgotten once acked through its last seq.
+    struct FakeFleetd {
+        sessions: Arc<Mutex<Vec<SessionSummary>>>,
+        acks: Arc<Mutex<Vec<(String, u64)>>>,
+        spawns: Arc<Mutex<Vec<String>>>,
+        replays: Arc<Mutex<Vec<(String, u64)>>>,
+        lists: Arc<AtomicUsize>,
+        replay: ReplayScript,
+    }
+
+    impl FakeFleetd {
+        fn serve(
+            state_dir: &Path,
+            sessions: Vec<SessionSummary>,
+            replay: ReplayScript,
+        ) -> Arc<Self> {
+            let token = ServiceToken::load_or_create(&state_dir.join(TOKEN_FILE)).unwrap();
+            let listener = UnixListener::bind(state_dir.join(SOCKET_FILE)).unwrap();
+            let fake = Arc::new(Self {
+                sessions: Arc::new(Mutex::new(sessions)),
+                acks: Arc::new(Mutex::new(Vec::new())),
+                spawns: Arc::new(Mutex::new(Vec::new())),
+                replays: Arc::new(Mutex::new(Vec::new())),
+                lists: Arc::new(AtomicUsize::new(0)),
+                replay,
+            });
+            let served = fake.clone();
+            tokio::spawn(async move {
+                let mut generation = 0u64;
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    generation += 1;
+                    let fake = served.clone();
+                    let token = token.clone();
+                    tokio::spawn(async move {
+                        let _ = fake.serve_connection(stream, generation, token).await;
+                    });
+                }
+            });
+            fake
+        }
+
+        async fn serve_connection(
+            &self,
+            stream: UnixStream,
+            generation: u64,
+            token: ServiceToken,
+        ) -> anyhow::Result<()> {
+            let (mut io, _hello, _welcome) = bro_rpc::accept(
+                stream,
+                build_identity(),
+                vec![FLEETD_PROTOCOL_VERSION],
+                generation,
+                HandshakeOptions::default(),
+            )
+            .await?;
+            let binding = io.binding();
+            let mut counter = 0u64;
+            let first = io.read_envelope::<DaemonToFleetd>().await?.body;
+            let DaemonToFleetd::Authenticate { token: presented } = first else {
+                anyhow::bail!("first message must authenticate");
+            };
+            assert!(token.verify(presented.expose_secret()));
+            reply(
+                &mut io,
+                binding,
+                generation,
+                &mut counter,
+                FleetdToDaemon::Ready {
+                    connection_generation: generation,
+                },
+            )
+            .await?;
+
+            loop {
+                let body = io.read_envelope::<DaemonToFleetd>().await?.body;
+                match body {
+                    DaemonToFleetd::ListSessions => {
+                        self.lists.fetch_add(1, Ordering::SeqCst);
+                        let sessions = self.sessions.lock().clone();
+                        reply(
+                            &mut io,
+                            binding,
+                            generation,
+                            &mut counter,
+                            FleetdToDaemon::Sessions { sessions },
+                        )
+                        .await?;
+                    }
+                    DaemonToFleetd::Spawn { spec } => {
+                        self.spawns.lock().push(spec.session_id.clone());
+                        let duplicate = self
+                            .sessions
+                            .lock()
+                            .iter()
+                            .any(|summary| summary.session_id == spec.session_id);
+                        if duplicate {
+                            reply(
+                                &mut io,
+                                binding,
+                                generation,
+                                &mut counter,
+                                FleetdToDaemon::Error {
+                                    session_id: Some(spec.session_id.clone()),
+                                    code: FLEETD_DUPLICATE_SESSION_CODE.to_string(),
+                                    message: "a session with this id is already registered"
+                                        .to_string(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        self.sessions.lock().push(summary(
+                            &spec.session_id,
+                            SessionState::Running,
+                            None,
+                            None,
+                        ));
+                        reply(
+                            &mut io,
+                            binding,
+                            generation,
+                            &mut counter,
+                            FleetdToDaemon::SessionStarted {
+                                session_id: spec.session_id.clone(),
+                                task_id: spec.task_id.clone(),
+                                workspace_id: None,
+                                pid: Some(4242),
+                            },
+                        )
+                        .await?;
+                    }
+                    DaemonToFleetd::EventAck {
+                        session_id,
+                        through_seq,
+                    } => {
+                        self.acks.lock().push((session_id.clone(), through_seq));
+                        self.sessions.lock().retain(|summary| {
+                            !(summary.session_id == session_id
+                                && summary.state == SessionState::Exited
+                                && through_seq >= summary.last_seq.unwrap_or(0))
+                        });
+                    }
+                    DaemonToFleetd::ReplayFrom {
+                        session_id,
+                        from_seq,
+                    } => {
+                        self.replays.lock().push((session_id.clone(), from_seq));
+                        if let ReplayScript::Unavailable { earliest, latest } = self.replay {
+                            reply(
+                                &mut io,
+                                binding,
+                                generation,
+                                &mut counter,
+                                FleetdToDaemon::ReplayUnavailable {
+                                    session_id,
+                                    requested_from: from_seq,
+                                    earliest_available: earliest,
+                                    latest_available: latest,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    async fn reply(
+        io: &mut NegotiatedIo<UnixStream>,
+        binding: bro_rpc::ConnectionBinding,
+        generation: u64,
+        counter: &mut u64,
+        body: FleetdToDaemon,
+    ) -> Result<(), bro_rpc::RpcError> {
+        *counter += 1;
+        let envelope = Envelope {
+            protocol_version: binding.protocol_version,
+            connection_generation: binding.connection_generation,
+            message_id: format!("fake-{generation}-{}", *counter),
+            reply_to: None,
+            body,
+        };
+        io.write_envelope(&envelope).await
+    }
+
+    fn summary(
+        session_id: &str,
+        state: SessionState,
+        last_seq: Option<u64>,
+        exit_code: Option<i32>,
+    ) -> SessionSummary {
+        SessionSummary {
+            session_id: session_id.to_string(),
+            task_id: format!("task-{session_id}"),
+            workspace_id: None,
+            workspace_scope: None,
+            workspace_binding_token: None,
+            pid: Some(4242),
+            state,
+            last_seq,
+            event_log_path: PathBuf::from(format!("/nowhere/{session_id}.events.jsonl")),
+            exit_code,
+        }
+    }
+
+    fn spec(session_id: &str) -> WorkerSpawnSpec {
+        WorkerSpawnSpec {
+            task_id: format!("task-{session_id}"),
+            session_id: session_id.to_string(),
+            workspace_id: None,
+            workspace_scope: None,
+            provider: bro_core::Provider::Glm,
+            bin_override: None,
+            argv: vec![],
+            cwd: None,
+            env: Default::default(),
+            env_unset: vec![],
+            initial_messages: vec![],
+            bro_home: PathBuf::from("/nowhere"),
+            event_log_path: PathBuf::from(format!("/nowhere/{session_id}.events.jsonl")),
+        }
+    }
+
+    /// Plant a slot the way the client leaves one behind, returning the
+    /// outcome receiver its terminal waiter would be holding.
+    fn plant_slot(
+        executor: &FleetdExecutor,
+        session_id: &str,
+        exit_after_replay: Option<Option<i32>>,
+        last_seq: u64,
+        in_flight: bool,
+    ) -> oneshot::Receiver<WorkerOutcome> {
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<String>();
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        let (started_tx, _started_rx) = oneshot::channel();
+        // A sender from a connection that no longer exists, exactly what a
+        // slot that survived a reconnect holds.
+        let (dead_commands, _) = mpsc::unbounded_channel::<DaemonToFleetd>();
+        executor.shared.sessions.lock().insert(
+            session_id.to_string(),
+            SessionSlot {
+                events: events_tx,
+                started: in_flight.then_some(started_tx),
+                outcome: Some(outcome_tx),
+                exit_after_replay,
+                last_seq,
+                commands: dead_commands,
+            },
+        );
+        outcome_rx
+    }
+
+    fn slot_present(executor: &FleetdExecutor, session_id: &str) -> bool {
+        executor.shared.sessions.lock().contains_key(session_id)
+    }
+
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// The incident shape: a restart re-adopted a session fleetd reports as
+    /// already exited, its replay never terminated, and the slot stayed
+    /// registered as live. `bro_resume` on the same provider session id
+    /// (the same supervision key) must spawn, publishing the dead session's
+    /// terminal state and acking fleetd so it releases the key too.
+    #[tokio::test]
+    async fn restart_orphaned_key_allows_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(
+            dir.path(),
+            vec![summary(
+                "sess-orphan",
+                SessionState::Exited,
+                Some(40),
+                Some(1),
+            )],
+            ReplayScript::Silent,
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let outcome = plant_slot(&executor, "sess-orphan", Some(Some(1)), 10, false);
+
+        let handle = executor.spawn(spec("sess-orphan")).await.unwrap();
+        assert_eq!(handle.pid, Some(4242));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), outcome)
+            .await
+            .expect("dead session publishes terminal state")
+            .unwrap();
+        assert_eq!(outcome.exit_code, Some(1));
+        assert!(outcome.stderr.contains("supervision key released"));
+        assert!(
+            fake.acks.lock().contains(&("sess-orphan".to_string(), 40)),
+            "fleetd is acked through its own last seq so it can GC the key: {:?}",
+            fake.acks.lock()
+        );
+        assert_eq!(fake.spawns.lock().as_slice(), ["sess-orphan"]);
+        assert!(
+            slot_present(&executor, "sess-orphan"),
+            "the resume owns the key now"
+        );
+    }
+
+    /// The real double-dispatch protection: fleetd still reports a running
+    /// worker under the key, so a second dispatch is refused and the live
+    /// slot is untouched.
+    #[tokio::test]
+    async fn genuinely_live_key_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(
+            dir.path(),
+            vec![summary("sess-live", SessionState::Running, Some(40), None)],
+            ReplayScript::Silent,
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let mut outcome = plant_slot(&executor, "sess-live", None, 40, false);
+
+        let error = match executor.spawn(spec("sess-live")).await {
+            Ok(_) => panic!("a live key must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("genuinely live"), "{error}");
+        assert!(error.contains("refusing to multiplex"), "{error}");
+        assert!(fake.spawns.lock().is_empty(), "no spawn reaches fleetd");
+        assert!(
+            fake.acks.lock().is_empty(),
+            "a live session is never acked away"
+        );
+        assert!(slot_present(&executor, "sess-live"));
+        assert!(
+            outcome.try_recv().is_err(),
+            "the live slot's outcome is untouched"
+        );
+    }
+
+    /// A slot still awaiting its own `SessionStarted` is an in-flight
+    /// dispatch and is never released, whatever fleetd's list says.
+    #[tokio::test]
+    async fn in_flight_dispatch_key_refuses_without_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(dir.path(), vec![], ReplayScript::Silent);
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let _outcome = plant_slot(&executor, "sess-inflight", None, 0, true);
+
+        let error = match executor.spawn(spec("sess-inflight")).await {
+            Ok(_) => panic!("an in-flight key must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("refusing to multiplex"), "{error}");
+        assert!(fake.spawns.lock().is_empty());
+        assert!(slot_present(&executor, "sess-inflight"));
+    }
+
+    /// fleetd's own registry can hold the key after the daemon released its
+    /// slot (an exited session nobody acked). The duplicate refusal is
+    /// repaired by proving the entry is terminal, acking it, and retrying.
+    #[tokio::test]
+    async fn unacked_terminal_fleetd_entry_is_acked_and_spawn_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(
+            dir.path(),
+            vec![summary(
+                "sess-unacked",
+                SessionState::Exited,
+                Some(7),
+                Some(0),
+            )],
+            ReplayScript::Silent,
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+
+        let handle = executor.spawn(spec("sess-unacked")).await.unwrap();
+        assert_eq!(handle.pid, Some(4242));
+        assert_eq!(
+            fake.spawns.lock().as_slice(),
+            ["sess-unacked", "sess-unacked"],
+            "first attempt refused as duplicate, second succeeds"
+        );
+        assert!(fake.acks.lock().contains(&("sess-unacked".to_string(), 7)));
+    }
+
+    /// Reconnect reconciliation: a session fleetd no longer holds (fleetd
+    /// restarted, or forgot it) is dead, so its surviving slot is finished
+    /// instead of staying registered as live forever.
+    #[tokio::test]
+    async fn session_fleetd_no_longer_holds_is_finished_on_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let _fake = FakeFleetd::serve(dir.path(), vec![], ReplayScript::Silent);
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let outcome = plant_slot(&executor, "sess-forgotten", None, 12, false);
+
+        executor.commands().await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), outcome)
+            .await
+            .expect("terminal state published")
+            .unwrap();
+        assert_eq!(outcome.exit_code, None);
+        assert!(outcome.stderr.contains("fleetd no longer holds"));
+        assert!(!slot_present(&executor, "sess-forgotten"));
+    }
+
+    /// Reconnect reconciliation: an interrupted replay for a dead session is
+    /// re-issued on the NEW connection, and when fleetd's window does not
+    /// reach the cursor the slot is finished (acked through the end of the
+    /// window) rather than waiting for a `ReplayComplete` that never comes.
+    #[tokio::test]
+    async fn replay_unavailable_terminates_a_dead_session_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(
+            dir.path(),
+            vec![summary(
+                "sess-gap",
+                SessionState::Exited,
+                Some(120),
+                Some(2),
+            )],
+            ReplayScript::Unavailable {
+                earliest: 100,
+                latest: 120,
+            },
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let outcome = plant_slot(&executor, "sess-gap", Some(Some(2)), 10, false);
+
+        executor.commands().await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), outcome)
+            .await
+            .expect("terminal state published")
+            .unwrap();
+        assert_eq!(outcome.exit_code, Some(2));
+        settle().await;
+        assert_eq!(
+            fake.replays.lock().as_slice(),
+            [("sess-gap".to_string(), 10)]
+        );
+        assert!(fake.acks.lock().contains(&("sess-gap".to_string(), 120)));
+        assert!(!slot_present(&executor, "sess-gap"));
+    }
+
+    /// A slot re-adopted as live whose exit was lost across a disconnect is
+    /// reconciled from fleetd's answer: it becomes terminal-after-replay and
+    /// its replay is re-issued from the slot's cursor.
+    #[tokio::test]
+    async fn exit_lost_across_disconnect_is_reconciled_from_fleetd() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve(
+            dir.path(),
+            vec![summary(
+                "sess-late-exit",
+                SessionState::Exited,
+                Some(30),
+                Some(0),
+            )],
+            ReplayScript::Silent,
+        );
+        let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
+        let _outcome = plant_slot(&executor, "sess-late-exit", None, 25, false);
+
+        executor.commands().await.unwrap();
+        settle().await;
+
+        assert_eq!(
+            fake.replays.lock().as_slice(),
+            [("sess-late-exit".to_string(), 25)]
+        );
+        let exit_after_replay = executor
+            .shared
+            .sessions
+            .lock()
+            .get("sess-late-exit")
+            .map(|slot| slot.exit_after_replay);
+        assert_eq!(exit_after_replay, Some(Some(Some(0))));
+    }
 
     #[test]
     fn paths_hang_off_the_state_dir() {
