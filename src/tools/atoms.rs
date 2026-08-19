@@ -400,6 +400,12 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<AtomInvokeParams>,
     ) -> CallToolResult {
+        // External atom invocations are fresh work: refused while draining.
+        // Internal callers (workflow atom nodes, auto-supervision) use
+        // `atom_invoke_value` directly and are in-flight work.
+        if let Some(refusal) = self.state.drain.admission_refusal("atom_invoke") {
+            return Self::err_text(&refusal);
+        }
         match self.atom_invoke_value(p, None).await {
             Ok(value) => Self::ok_json(&value),
             Err(e) => Self::err_text(&e),

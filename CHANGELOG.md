@@ -10,6 +10,23 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Convergence drain gate (gap-4e0e30b8): converging or cycling the daemon
+  no longer has to run blind against live orchestration. `GET
+  /admin/orchestration-activity` is a cheap JSON probe of running bro tasks
+  (ids, ages), workflow arcs in flight, active `bro_wait` / `bro_when_*`
+  long-poll waiters, and recent thread/note/knowledge writes, with an
+  explicit `quiescent` verdict scoped to tasks, arcs, and waiters. `GET|POST
+  /admin/drain` toggles an operator-owned admission drain: fresh dispatches
+  (`bro_exec`, `bro_agent_dispatch`, `atom_invoke`, cron/webhook-originated
+  dispatches, top-level workflow arc starts) are refused with a retryable
+  `error.maintenance_pending` naming the window, while in-flight arcs,
+  supervision, and `bro_resume` continue. The flag is persisted as
+  `<BRO_HOME>/maintenance-drain.json`, survives restarts (the daemon boots
+  draining and warns until cleared; a corrupt marker fails closed).
+  `scripts/converge-gate` wraps it for the external converge path: probe and
+  refuse (nonzero, printing who would be sandbagged), `--drain` to set and
+  wait bounded for quiescence, `--clear` afterwards. Docs:
+  `docs/converge-gate.md`.
 - `bro render global`: pull the daemon's global guidance render onto THIS
   host. Since the corpus daemon moved off the operator's machine, nothing
   could refresh `~/.blackbox/BLACKBOX.md`, `~/.claude/CLAUDE.md`,

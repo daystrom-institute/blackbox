@@ -1431,3 +1431,81 @@ async fn admission_lease_drop_releases_the_key() {
         "drop released the key"
     );
 }
+
+#[tokio::test]
+async fn drain_refuses_top_level_arc_start_but_not_nested_arcs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let compiled = mini_compiled();
+    server
+        .state
+        .drain
+        .set(Some("converge".into()), None)
+        .unwrap();
+
+    // Top-level fresh arc: refused before any runner (and therefore any
+    // cancel token or arc thread) exists.
+    let refused = engine::run_workflow(&server, &compiled, None, Some(1)).await;
+    assert!(
+        refused
+            .status
+            .starts_with("error: error.maintenance_pending"),
+        "top-level arc start must be refused while draining; got: {}",
+        refused.status
+    );
+    assert!(refused.status.contains("retryable=true"));
+    assert!(refused.arc_id.is_empty());
+    assert!(refused.arc_thread_id.is_none());
+    assert!(server.state.arc_cancel_tokens.read().is_empty());
+
+    // Streaming entry (the bro_orchestrate_run path) is gated the same way.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let refused_stream = engine::run_workflow_streaming_with_vars_and_arc_id(
+        &server,
+        &compiled,
+        None,
+        Some(1),
+        serde_json::Map::new(),
+        tx,
+        "arc-drain-test".into(),
+    )
+    .await;
+    assert!(
+        refused_stream
+            .status
+            .starts_with("error: error.maintenance_pending"),
+        "{}",
+        refused_stream.status
+    );
+    assert!(rx.try_recv().is_err());
+    assert!(server.state.arc_cancel_tokens.read().is_empty());
+
+    // A nested arc (depth > 0, as a running parent would spawn) is in-flight
+    // work and passes the gate; it fails later for an unrelated reason (no
+    // brofile "b" on this test server), never on the maintenance gate.
+    let nested = engine::run_workflow_at_depth(
+        &server,
+        &compiled,
+        None,
+        Some(1),
+        1,
+        std::collections::HashMap::new(),
+        serde_json::Map::new(),
+        Some("arc-parent".into()),
+    )
+    .await;
+    assert!(
+        !nested.status.contains("error.maintenance_pending"),
+        "nested arc must bypass the drain gate; got: {}",
+        nested.status
+    );
+
+    // Clearing reopens admission.
+    server.state.drain.clear().unwrap();
+    let reopened = engine::run_workflow(&server, &compiled, None, Some(1)).await;
+    assert!(
+        !reopened.status.contains("error.maintenance_pending"),
+        "{}",
+        reopened.status
+    );
+}

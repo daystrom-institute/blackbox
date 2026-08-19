@@ -225,6 +225,8 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         )),
         arc_cancel_tokens: RwLock::new(HashMap::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+        drain: crate::server::drain::DrainState::in_memory(tmp.path()),
+        long_polls: Arc::new(crate::server::drain::LongPollRegistry::new()),
         agent_adapter_registry: Arc::new(RwLock::new(
             orchestration::agents::adapter::AgentAdapterRegistry::new(),
         )),

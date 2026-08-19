@@ -1499,6 +1499,90 @@ pub(crate) async fn admin_runtime_metrics() -> impl axum::response::IntoResponse
     .into_response()
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct OrchestrationActivityParams {
+    /// Look-back window (minutes) for the recent thread/note/knowledge
+    /// writes section. Default 10, clamped to 24h.
+    pub(crate) writes_window_minutes: Option<u64>,
+}
+
+/// `GET /admin/orchestration-activity`: the convergence gate's probe. Cheap
+/// (in-memory reads only) and machine-readable; see `server::drain`.
+pub(crate) async fn admin_orchestration_activity(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(query): Query<OrchestrationActivityParams>,
+) -> impl axum::response::IntoResponse {
+    let window = super::drain::clamp_writes_window_minutes(query.writes_window_minutes);
+    axum::Json(super::drain::orchestration_activity_snapshot(
+        &state, window,
+    ))
+    .into_response()
+}
+
+/// `GET /admin/drain`: current admission drain state.
+pub(crate) async fn admin_drain_status(
+    AxumState(state): AxumState<Arc<SharedState>>,
+) -> impl axum::response::IntoResponse {
+    axum::Json(json!({
+        "status": "ok",
+        "drain": state.drain.snapshot(),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DrainSetParams {
+    pub(crate) draining: bool,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) set_by: Option<String>,
+}
+
+/// `POST /admin/drain {"draining": true|false, "reason"?, "set_by"?}`:
+/// enter or leave admission drain. Persists the marker before answering so
+/// a crash after the 200 cannot lose the toggle. Idempotent both ways.
+pub(crate) async fn admin_drain_set(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<DrainSetParams>,
+) -> impl axum::response::IntoResponse {
+    let outcome = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            if req.draining {
+                state.drain.set(req.reason, req.set_by).map(|_| ())
+            } else {
+                state.drain.clear()
+            }
+        })
+        .await
+    };
+    match outcome {
+        Ok(Ok(())) => {
+            tracing::warn!(
+                target: "blackbox::drain",
+                draining = state.drain.is_draining(),
+                "admission drain toggled via /admin/drain"
+            );
+            axum::Json(json!({
+                "status": "ok",
+                "drain": state.drain.snapshot(),
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("drain marker write failed: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("drain toggle task failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn admin_packet_compile(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<Value>,

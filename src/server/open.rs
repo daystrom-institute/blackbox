@@ -1060,6 +1060,8 @@ pub(super) fn open_shared_state(
         )),
         arc_cancel_tokens: RwLock::new(HashMap::new()),
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
+        drain: super::drain::DrainState::open(&store_dir),
+        long_polls: Arc::new(super::drain::LongPollRegistry::new()),
         agent_adapter_registry,
         consultant_registry: Arc::new(orchestration::consultant::ConsultantRegistry::new()),
         consultant_proposals,
