@@ -1,0 +1,24 @@
+{
+  "id": "gap-bff2f439",
+  "title": "Published-knowledge lane rejects any extra file under .bbox/graphs/<id>/ (apply plans), stalling publication for the whole project",
+  "gap_kind": "tooling",
+  "domain": "knowledge-source/graphs-lane",
+  "wanted_capability": "A committed design-graph apply plan (the sanctioned provenance artifact under .bbox/graphs/design/plans/, per the design-graph operating conventions) must not make the project's published-knowledge lane fail. Today the host collector enumerates every file under .bbox/graphs/ into the Graphs-lane manifest and the knowledge-source contract validator admits only <graph-id>/{graph.json,schema.json,vertices.jsonl,edges.jsonl}; a third path component or any other filename raises InvalidGraphSourcePath, the whole lane pass for the project fails (\"lane pass failed for project; continuing with the rest\"), no kps candidate is produced, and the granted auto-advance never fires. Consequence observed 2026-08-18/19: the accepted publication pointer sat at 45606cdf while beta/blackbox-v2 advanced through 906c3ef5, 958c69ae, 075a0077, 7219e8aa; 24 gaps closed in those commits still render as open in the served view; bbox_gap_update on any post-45606cdf gap fails with Gap not found; the design graph migration itself (generation 32) is invisible to the daemon. Wanted: (1) collector-side manifest enumeration limited to the known graph files (or an explicit ignore for a plans/ subdirectory), (2) validator tolerance or a documented reserved location for plan provenance outside the graph directory, and (3) the per-project lane failure surfaced through publisher_status / inbox instead of a 60MB host log (that half is gap-0b3777f5).",
+  "missing_primitive": "Graphs-lane manifest enumeration that filters to the four known graph files (or a validator that tolerates non-graph provenance files under a graph directory) plus a loud per-project failure signal",
+  "fallback_used": "Diagnosed by hand from publisher_status plus a host log grep. Interim unblock proposed to the operator: relocate the committed plan file out of the graph directory (and amend the plans convention) so the next collector cycle produces a candidate; substrate fix to follow.",
+  "evidence": [
+    "crates/bbox-knowledge-source/src/lib.rs:1483-1503 (Graphs lane path validator, InvalidGraphSourcePath)",
+    "host collector log: repeated ERROR lane=published-knowledge root=<primary checkout> error=graph source path is not exactly <graph-id>/<known-file>, every ~2 min from 2026-08-18T22:57Z onward",
+    "bbox_project_publisher_status 89bd722f 2026-08-19T01:00Z: accepted 45606cdf, auto_advance grant enabled and eligible, last_attempt null",
+    ".bbox/graphs/design/plans/2026-08-18-gap-campaigns.jsonl committed in 906c3ef5",
+    "gap-0b3777f5 (silent staleness, the surfacing half)"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "tooling/knowledge-source/graphs-lane-rejects-nested-plan-files",
+  "notes": "Filed by the gap manager 2026-08-19 during the pulse survey; substrate-genuine (any project that keeps non-graph files under a graph directory hits it). Acknowledged at triage. Escalated to the operator in-session as blocks_class_of_work; not self-dispatched.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-19T01:03:33Z",
+  "updated_at": "2026-08-19T01:03:33Z"
+}
