@@ -173,7 +173,7 @@ out to be prose-only to an Inquiry with `kind: concept`.
 ## Execution recipe (for the pass that runs after review)
 
 All through `scripts/design-graph`; nothing hand-edited. The pass is authored
-as one `apply` plan file (`.bbox/graphs/design/plans/<date>-gap-campaigns.jsonl`,
+as one `apply` plan file (`.bbox/design/plans/<date>-gap-campaigns.jsonl`,
 one JSON op per line, committed with the landing), dry-run first
 (`apply <plan> --dry-run`) and reviewed, then applied: the batch is idempotent
 and conflict-refusing, and lands as one generation bump. Op order inside the
