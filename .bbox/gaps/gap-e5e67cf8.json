@@ -1,0 +1,22 @@
+{
+  "id": "gap-e5e67cf8",
+  "title": "Supervision idle_seconds should expose the running shell session list so orchestrators can self-serve hang diagnosis",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/supervision",
+  "wanted_capability": "When a bro sits idle, the orchestrator currently gets bare idle_seconds and must guess between wedged, thinking, and blocked-on-long-child. The fix child for gap-aa2baeb3 found that making the daemon classify hangs would flip two deliberate contracts: supervision.rs's neutral-idle design (idle_seconds asserts nothing by design) and shell.rs's no-low-cap yield contract. The sanctioned shape instead: annotate the supervision surface with the running shell session list (from shell_list) so the orchestrator can self-serve the diagnosis without the daemon asserting severity. Wanted: idle_seconds plus the active shell sessions (id, command head, age) in the supervision payload, or a documented probe composition that returns both in one call.",
+  "missing_primitive": "A supervision-surface field (or sibling probe) that annotates idle_seconds with the currently running shell sessions from shell_list.",
+  "fallback_used": "Orchestrators poll shell_list by hand when a bro goes quiet (as done for the 2026-08-16 rg incident in gap-aa2baeb3).",
+  "evidence": [
+    "deferred second half of gap-aa2baeb3",
+    "fix child report on branch fix/shell-run-stdin-open-pipe (d1f95d3c, 97fffd1f)",
+    "crates/bro-tools/src/shell.rs no-low-cap yield contract; supervision.rs neutral-idle design comment"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/bro-harness-shell/supervision-idle-shell-session-annotation",
+  "notes": "Filed by the gap manager 2026-08-19 as the deferred second half of gap-aa2baeb3. The stdin root cause is fixed; this is the residual observability half. Design-shaped: touches the supervision surface contract, so it wants a design decision before a diff.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-19T02:56:29Z",
+  "updated_at": "2026-08-19T02:56:29Z"
+}
