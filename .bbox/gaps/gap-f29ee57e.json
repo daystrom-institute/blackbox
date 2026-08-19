@@ -1,0 +1,23 @@
+{
+  "id": "gap-f29ee57e",
+  "title": "bbox_gaps list responses are chronically over-cap: no pagination, field projection, or summary mode",
+  "gap_kind": "mcp_surface",
+  "domain": "gap-store/listing",
+  "wanted_capability": "bbox_gaps should shape its output at the producer instead of relying on the blanket MCP response cap. Today a full survey (json=true, limit=500) returns every row with complete wanted_capability, notes, evidence, and fallback text: measured 193,029 and 172,780 characters on two consecutive 2026-08-19 calls against a ~100-row backlog, both over the cap and spilled to response-dumps. The gap backlog manager (and any agent triaging gaps) must then burn a turn reading the spill file with jq just to get counts or ids. Wanted: (1) a compact default projection (id, title, resolution, impact, blocking_level, domain, dedupe_key, updated_at) with full fields only on exact-id lookup or an explicit include_full flag, and (2) cursor or offset pagination so large stores page instead of spilling.",
+  "missing_primitive": "Compact default projection (id, title, resolution, impact, blocking_level, domain, dedupe_key, updated_at) with opt-in full-row expansion, plus cursor pagination over large result sets.",
+  "fallback_used": "Read the spill file with jq to extract counts and ids; every survey round burns a spill write plus shell reads to answer basic backlog questions.",
+  "evidence": [
+    "bbox_gaps(json=true, limit=500) -> 193,029 chars (spilled) at 2026-08-19T02:12Z",
+    "bbox_gaps(json=true, limit=500) -> 172,780 chars (spilled) at 2026-08-19T02:25Z",
+    "umbrella gap-ecff3899 (mcp_surface/response-cap/per-tool-oversized-producers)",
+    "sibling instance gap-55be3518 (bro_wait envelope), sibling compact-default gap-791d1497 (hybrid search)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/gap-store/bbox-gaps-over-cap-list-responses",
+  "notes": "Filed by the gap manager 2026-08-19 after the operator pointed out the obvious: the gap listing itself is unreadable at backlog scale. Substrate-genuine: any project with a triple-digit gap backlog hits the spill on every full survey. Instance of umbrella gap-ecff3899.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-19T02:29:47Z",
+  "updated_at": "2026-08-19T02:29:47Z"
+}
