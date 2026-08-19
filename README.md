@@ -159,7 +159,7 @@ Rewrite the provider instruction files from the canonical store so every agent s
 bbox_render(scope: "both", project: "/home/you/repos/my-app")
 ```
 
-- **`scope=global`** - writes the canonical shared doc to `~/.blackbox/BLACKBOX.md` and patches a small managed region (an `@.../BLACKBOX.md` import pointer plus any global provider-specific entries) into each provider's global memory file — `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` — between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. User-authored content outside the markers (including RTK `@imports`) is preserved. Originals snapshot to `~/.local/state/blackbox/backups/<ISO-ts>/` before every write.
+- **`scope=global`** - writes the canonical shared doc to `~/.blackbox/BLACKBOX.md` and patches a small managed region (an `@.../BLACKBOX.md` import pointer plus any global provider-specific entries) into each provider's global memory file — `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` — between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. User-authored content outside the markers (including user `@imports`) is preserved. Originals snapshot to `~/.local/state/blackbox/backups/<ISO-ts>/` before every write.
 - **`scope=project`** - writes `<repo>/{CLAUDE,AGENTS,GEMINI}.md` from the project's durable knowledge + verbatim `PROJECT.md` content. Global entries aren't duplicated per project. Project knowledge is **repo-owned**: it lives in committed `<repo>/.bbox/knowledge/` (see [Project knowledge is repo-owned](#project-knowledge-is-repo-owned)), so the render is a deterministic function of the committed tree — identical on every checkout.
 - **`scope=both`** - both. Useful on first install or for a forced re-sync.
 

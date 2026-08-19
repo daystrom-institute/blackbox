@@ -6068,7 +6068,7 @@ mod tests {
         std::fs::write(
             &claude_md,
             "\
-@/home/invidious/.claude/RTK.md
+@/home/invidious/.claude/EXTRA.md
 
 ## User-authored steerage outside the managed region
 
@@ -6222,7 +6222,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let tmpdir = tempfile::tempdir().unwrap();
         let claude_md = tmpdir.path().join("CLAUDE.md");
         // No markers — entire file is hand-authored. Should not absorb anything.
-        std::fs::write(&claude_md, "@RTK.md\n\n## Hand-authored only\n\nbody\n").unwrap();
+        std::fs::write(&claude_md, "@EXTRA.md\n\n## Hand-authored only\n\nbody\n").unwrap();
         unsafe {
             std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
         }

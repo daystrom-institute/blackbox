@@ -275,7 +275,7 @@ mod tests {
     fn normalized_role_and_kind_project_to_parsed_event() {
         let parsed = ParsedEvent {
             role: MessageRole::ToolUse,
-            content: "tool:Bash {\"command\":\"rtk true\"}".to_string(),
+            content: "tool:Bash {\"command\":\"true\"}".to_string(),
             session_id: "session-1".to_string(),
             timestamp: Some("2026-05-12T00:00:00Z".to_string()),
             git_branch: Some("main".to_string()),
@@ -286,7 +286,7 @@ mod tests {
                 kind: ToolCallKind::Bash,
                 name: "Bash".to_string(),
                 tool_use_id: Some("toolu-1".to_string()),
-                input: json!({"command": "rtk true"}),
+                input: json!({"command": "true"}),
             }),
         };
         let normalized = NormalizedTranscriptEvent::from_parsed_event(
@@ -333,7 +333,7 @@ mod tests {
     fn blackbox_work_tools_project_to_tool_call_docs() {
         let parsed = ParsedEvent {
             role: MessageRole::ToolUse,
-            content: "tool:work_bash {\"command\":\"rtk cargo test\"}".to_string(),
+            content: "tool:work_bash {\"command\":\"cargo test\"}".to_string(),
             session_id: "session-1".to_string(),
             timestamp: Some("2026-05-12T00:00:00Z".to_string()),
             git_branch: Some("main".to_string()),
@@ -344,7 +344,7 @@ mod tests {
                 kind: ToolCallKind::Bash,
                 name: "work_bash".to_string(),
                 tool_use_id: Some("toolu-1".to_string()),
-                input: json!({"command": "rtk cargo test", "cwd": "/repo", "task_id": "task-1"}),
+                input: json!({"command": "cargo test", "cwd": "/repo", "task_id": "task-1"}),
             }),
         };
         let normalized = NormalizedTranscriptEvent::from_parsed_event(

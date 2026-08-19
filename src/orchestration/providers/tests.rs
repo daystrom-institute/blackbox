@@ -697,7 +697,7 @@ fn resolve_bin_finds_executable_in_user_cargo_bin() {
 
     let cargo_bin = tmp.path().join(".cargo").join("bin");
     std::fs::create_dir_all(&cargo_bin).unwrap();
-    let exe = cargo_bin.join("fake-rtk");
+    let exe = cargo_bin.join("fake-helper");
     std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
     #[cfg(unix)]
     {
@@ -708,7 +708,7 @@ fn resolve_bin_finds_executable_in_user_cargo_bin() {
     }
 
     assert_eq!(
-        resolve_bin("fake-rtk").as_deref(),
+        resolve_bin("fake-helper").as_deref(),
         Some(exe.to_str().unwrap())
     );
 }

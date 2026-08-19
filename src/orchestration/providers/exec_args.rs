@@ -29,7 +29,7 @@ fn bin_with_env(provider: Provider) -> String {
 
 /// Extra path entries prepended for spawned provider processes and their child
 /// tools. Agents often follow rendered instructions to run operator-local
-/// helpers like `rtk`; those live outside launchd/systemd's narrow PATH on
+/// helpers (cargo-installed or `~/.local/bin` tools); those live outside launchd/systemd's narrow PATH on
 /// many hosts. Keep the fallback list small and user-local.
 pub fn dispatch_extra_path_entries() -> Vec<PathBuf> {
     let mut entries = Vec::new();

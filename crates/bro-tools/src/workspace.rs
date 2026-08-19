@@ -120,7 +120,7 @@ pub(crate) fn sandbox_status_manifest(
     let session_env = redact_env(&cx.session_env);
     let process_env = visible_process_env();
     let shell_path = shell_path_manifest();
-    let tool_resolution = tool_resolution_manifest(["rtk", "rg", "git", "cargo", "rustc"]);
+    let tool_resolution = tool_resolution_manifest(["rg", "git", "cargo", "rustc"]);
     Ok(json!({
         "launch_root": cx.root,
         "inspected_root": root,
@@ -366,13 +366,7 @@ fn is_allowed_external_instruction_doc(path: &Path) -> bool {
     };
     if matches!(
         name,
-        "AGENTS.md"
-            | "BLACKBOX.md"
-            | "CLAUDE.md"
-            | "GEMINI.md"
-            | "PROJECT.md"
-            | "RTK.md"
-            | "README.md"
+        "AGENTS.md" | "BLACKBOX.md" | "CLAUDE.md" | "GEMINI.md" | "PROJECT.md" | "README.md"
     ) {
         return true;
     }

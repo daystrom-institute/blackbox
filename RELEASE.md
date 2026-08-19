@@ -20,8 +20,8 @@ release markers, and GitHub Releases as the public release surface.
 ## Release Checklist
 
 ```bash
-rtk cargo test
-rtk git status --short
+cargo test
+git status --short
 ```
 
 Then:
@@ -33,7 +33,7 @@ Then:
 5. Create an annotated tag:
 
 ```bash
-rtk git tag -a vX.Y.Z -m "vX.Y.Z"
+git tag -a vX.Y.Z -m "vX.Y.Z"
 ```
 
 6. Push the commit and tag.

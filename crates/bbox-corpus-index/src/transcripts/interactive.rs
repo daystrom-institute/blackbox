@@ -690,7 +690,7 @@ mod tests {
             "message": {
                 "content": [
                     {"type": "text", "text": "hello"},
-                    {"type": "tool_use", "id": "toolu-1", "name": "Bash", "input": {"command": "rtk true"}}
+                    {"type": "tool_use", "id": "toolu-1", "name": "Bash", "input": {"command": "true"}}
                 ]
             }
         })
@@ -863,7 +863,7 @@ mod tests {
                     "toolCalls": [{
                         "id": "call-1",
                         "name": "Bash",
-                        "args": {"command": "rtk true"},
+                        "args": {"command": "true"},
                         "status": "success",
                         "result": [{
                             "functionResponse": {

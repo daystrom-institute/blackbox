@@ -65,8 +65,6 @@ brofile, install the corresponding packet or brofile first.
 Use `/orchestrate/by-id` or MCP `bro_orchestrate_run` with `initial_vars`.
 `bro orchestrate run <file>` validates a raw workflow file but does not seed the
 phase document variables.
-When running shell commands from this repository, keep the project convention
-and prefix them with `rtk`.
 
 For read-only validation:
 

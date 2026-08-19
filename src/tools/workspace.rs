@@ -1416,7 +1416,7 @@ mod tests {
 
         let local_bin = tmp.path().join(".local").join("bin");
         std::fs::create_dir_all(&local_bin).unwrap();
-        let fake = local_bin.join("fake-rtk");
+        let fake = local_bin.join("fake-helper");
         std::fs::write(&fake, "#!/bin/sh\necho fake-ok\n").unwrap();
         #[cfg(unix)]
         {
@@ -1427,7 +1427,7 @@ mod tests {
         }
 
         let (exit_code, stdout, stderr, _, _) =
-            run_with_timeout("fake-rtk", tmp.path(), 5, None).unwrap();
+            run_with_timeout("fake-helper", tmp.path(), 5, None).unwrap();
         assert_eq!(exit_code, 0, "{stderr}");
         assert_eq!(stdout, "fake-ok\n");
     }

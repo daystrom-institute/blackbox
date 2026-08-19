@@ -50,7 +50,7 @@ itself.
   that previous thing" references. What made collaboration easier? What was
   confusing or caused a false start?
 - **Local environment** - OS, shell, path layout, config directories, wrappers
-  such as `rtk`, Cargo target/cache behavior, tmux sockets, macOS vs Linux path
+  such as Cargo target/cache behavior, tmux sockets, macOS vs Linux path
   differences, and host-local state. What surprised the agent? What would
   future-you need documented to avoid the same trap?
 - **Interactive persistence and session boundaries** - what did and did not

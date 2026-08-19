@@ -311,13 +311,6 @@ impl ShellGrepHook {
     }
 }
 
-/// Operator command-proxy wrappers that this host requires in front of every
-/// shell command (see `dispatch_extra_path_entries` in the daemon's
-/// `providers::exec_args`). A wrapper doesn't change which underlying tool runs,
-/// so first-token matchers must peel it off — otherwise `rtk grep foo` hides the
-/// `grep` and the nudge never fires.
-const COMMAND_PROXY_WRAPPERS: &[&str] = &["rtk"];
-
 /// Leading no-op prefixes that delegate to the command that follows them,
 /// without consuming flag arguments of their own. Conservative on purpose:
 /// prefixes like `nice`/`nohup`/`env -i` take options that would make naive
@@ -341,9 +334,8 @@ fn is_env_assignment(tok: &str) -> bool {
 }
 
 /// Basename of the *effective* command after peeling shell prefixes that don't
-/// change which tool runs: leading `VAR=val` env assignments, passthrough
-/// prefixes (`time`/`command`/`exec`), and operator proxy wrappers (`rtk`, and
-/// the `rtk proxy <cmd>` escape-hatch form). Returns `None` for an empty or
+/// change which tool runs: leading `VAR=val` env assignments and passthrough
+/// prefixes (`time`/`command`/`exec`). Returns `None` for an empty or
 /// fully-consumed command. Conservative — anything unrecognized stops peeling,
 /// since a false-positive nudge is worse than a miss.
 fn effective_command_basename(command: &str) -> Option<&str> {
@@ -357,14 +349,6 @@ fn effective_command_basename(command: &str) -> Option<&str> {
         let base = token_basename(tok);
         if PASSTHROUGH_PREFIXES.contains(&base) {
             i += 1;
-            continue;
-        }
-        if COMMAND_PROXY_WRAPPERS.contains(&base) {
-            i += 1;
-            // `rtk proxy <cmd>` runs <cmd> raw; skip the `proxy` subcommand too.
-            if tokens.get(i).map(|t| token_basename(t)) == Some("proxy") {
-                i += 1;
-            }
             continue;
         }
         return Some(base);
@@ -548,13 +532,10 @@ mod tests {
             "rg foo",
             "find . -name '*.rs'",
             "/usr/bin/grep x",
-            // proxy-wrapped forms still fire (host prefixes commands with rtk)
-            "rtk grep -r foo .",
-            "rtk rg foo",
-            "rtk proxy grep x",
             // peel env assignments / passthrough prefixes too
-            "RUST_LOG=debug rtk rg foo",
+            "RUST_LOG=debug rg foo",
             "time grep foo",
+            "command grep foo",
         ] {
             assert_eq!(
                 h.on_tool_result(&shell_call(cmd), &ok_result()).len(),
@@ -566,10 +547,10 @@ mod tests {
             "cargo build",
             "ls -la",
             "echo grep",
-            // wrappers in front of a non-search command must NOT fire
-            "rtk cargo build",
-            "rtk proxy bash -lc 'sed -n 1,5p f'",
-            "rtk",
+            // prefixes in front of a non-search command must NOT fire
+            "time cargo build",
+            "RUST_LOG=debug bash -lc 'sed -n 1,5p f'",
+            "time",
         ] {
             assert!(
                 h.on_tool_result(&shell_call(cmd), &ok_result()).is_empty(),

@@ -752,11 +752,11 @@ mod tests {
     fn test_patch_plan_appends_when_no_markers() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("CLAUDE.md");
-        std::fs::write(&p, "user prose\n@RTK.md\n").unwrap();
+        std::fs::write(&p, "user prose\n@EXTRA.md\n").unwrap();
         let plan = plan_managed_patch(&p, "managed body").unwrap();
         match plan {
             PatchPlan::Append { existing_file, .. } => {
-                assert!(existing_file.contains("@RTK.md"));
+                assert!(existing_file.contains("@EXTRA.md"));
             }
             other => panic!("expected Append, got {other:?}"),
         }
@@ -815,7 +815,7 @@ mod tests {
         let p = dir.path().join("CLAUDE.md");
         std::fs::write(
             &p,
-            format!("@RTK.md\n\n{MANAGED_START}\nold\n{MANAGED_END}\n\n# user notes\n"),
+            format!("@EXTRA.md\n\n{MANAGED_START}\nold\n{MANAGED_END}\n\n# user notes\n"),
         )
         .unwrap();
 
@@ -824,7 +824,7 @@ mod tests {
         assert!(backup.is_some(), "backup should be taken when file existed");
 
         let result = std::fs::read_to_string(&p).unwrap();
-        assert!(result.starts_with("@RTK.md"), "RTK import preserved");
+        assert!(result.starts_with("@EXTRA.md"), "user import preserved");
         assert!(result.contains("# user notes"), "user content preserved");
         assert!(result.contains("fresh"), "new managed body present");
         assert!(!result.contains("\nold\n"), "old managed body replaced");

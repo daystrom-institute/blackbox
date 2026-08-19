@@ -57,7 +57,7 @@ safety gate rather than forcing past it.
 Survey every worktree, classify it, and prune only the safe ones.
 
 ```bash
-git worktree list                  # rtk may render compact: "<path> <sha> [branch]"
+git worktree list
 ```
 
 For each worktree **other than the main checkout** (`~/repos/transcript-search`):

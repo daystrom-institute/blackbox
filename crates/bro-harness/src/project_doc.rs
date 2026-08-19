@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 /// Large-overlay warning threshold. This never truncates instructions; it only
 /// catches unexpectedly huge project-doc chains. The default must stay above
-/// this repo's standard AGENTS/PROJECT/BLACKBOX/RTK hierarchy.
+/// this repo's standard AGENTS/PROJECT/BLACKBOX hierarchy.
 const DEFAULT_PROJECT_DOC_WARN_BYTES: usize = 256 * 1024;
 const MAX_INCLUDE_DEPTH: usize = 8;
 const AGENTS_FILE: &str = "AGENTS.md";
@@ -142,7 +142,6 @@ fn is_allowed_instruction_doc(path: &Path) -> bool {
             | "CLAUDE.md"
             | "GEMINI.md"
             | "PROJECT.md"
-            | "RTK.md"
             | "README.md"
     ) {
         return true;
