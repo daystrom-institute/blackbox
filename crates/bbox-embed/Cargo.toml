@@ -69,6 +69,7 @@ bbox-stores = { path = "../bbox-stores" }
 bbox-knowledge = { path = "../bbox-knowledge" }
 bbox-threads = { path = "../bbox-threads" }
 bbox-indexing = { path = "../bbox-indexing" }
+bbox-project-graph = { path = "../bbox-project-graph" }
 
 [features]
 # Exposes install_test_router to DOWNSTREAM crates' tests (cfg(test) does

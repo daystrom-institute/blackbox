@@ -235,10 +235,15 @@ pub enum Bucket {
     Notes,
     Threads,
     AgentManifest,
+    /// Project-graph vertices whose schema opts them into embedding
+    /// (unified-retrieval design 4.4; one route for every graph, Q3). The
+    /// embedding input is the composed label + `embed: true` property
+    /// projection from `bbox_project_graph::embed`, never raw vertex JSON.
+    Graph,
 }
 
 impl Bucket {
-    pub const ALL: [Bucket; 8] = [
+    pub const ALL: [Bucket; 9] = [
         Bucket::Knowledge,
         Bucket::Code,
         Bucket::Docs,
@@ -247,6 +252,7 @@ impl Bucket {
         Bucket::Notes,
         Bucket::Threads,
         Bucket::AgentManifest,
+        Bucket::Graph,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -259,6 +265,7 @@ impl Bucket {
             Self::Notes => "notes",
             Self::Threads => "threads",
             Self::AgentManifest => "agent_manifest",
+            Self::Graph => "graph",
         }
     }
 }
@@ -490,6 +497,7 @@ pub struct RoutesConfig {
     pub notes: Option<String>,
     pub threads: Option<String>,
     pub agent_manifest: Option<String>,
+    pub graph: Option<String>,
     #[serde(default)]
     pub per_project: BTreeMap<String, BucketRoutes>,
     /// `[embed.routes.visual]` — visual chunk kind (`pdf_figure`,
@@ -510,6 +518,7 @@ pub struct BucketRoutes {
     pub notes: Option<String>,
     pub threads: Option<String>,
     pub agent_manifest: Option<String>,
+    pub graph: Option<String>,
 }
 
 impl BucketRoutes {
@@ -523,6 +532,7 @@ impl BucketRoutes {
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
             Bucket::AgentManifest => self.agent_manifest.as_deref(),
+            Bucket::Graph => self.graph.as_deref(),
         }
     }
 }
@@ -538,6 +548,7 @@ impl RoutesConfig {
             Bucket::Notes => self.notes.as_deref(),
             Bucket::Threads => self.threads.as_deref(),
             Bucket::AgentManifest => self.agent_manifest.as_deref(),
+            Bucket::Graph => self.graph.as_deref(),
         }
     }
 }
@@ -1204,8 +1215,8 @@ threads = "ollama"
         )
         .unwrap();
         let routes = router.configured_routes();
-        // 8 global buckets + 8 per-project rows for proj1234.
-        assert_eq!(routes.len(), 16);
+        // 9 global buckets + 9 per-project rows for proj1234.
+        assert_eq!(routes.len(), 18);
         assert!(routes.iter().any(|route| {
             route.bucket == Bucket::Threads
                 && route.project_id.as_deref() == Some("proj1234")

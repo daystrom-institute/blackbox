@@ -51,10 +51,11 @@ pub(crate) struct GraphDescription {
     pub retrieval: GraphRetrievalParticipation,
 }
 
-/// Word-lane participation for one graph lane (unified-retrieval 6.5): the
+/// Retrieval participation for one graph lane (unified-retrieval 6.5): the
 /// surface that answers "why is my graph not showing up in search" without
-/// reading a schema artifact. `embedded_vertex_count` stays 0 until the
-/// optional vector lane lands; M9a indexes the published plane only.
+/// reading a schema artifact. Word-lane counts come from the index; the
+/// vector-lane counts come from the embed projection against the vector
+/// store (design 4.4). M9a indexes the published plane only.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GraphRetrievalParticipation {
     /// Authored policy flag: the per-graph kill switch for text retrieval.
@@ -72,8 +73,19 @@ pub(crate) struct GraphRetrievalParticipation {
     pub indexed_generation: Option<String>,
     /// Generation of the currently accepted view, for a one-place comparison.
     pub accepted_generation: String,
-    /// Placeholder until the optional vector lane lands (M9 scope split).
-    pub embedded_vertex_count: usize,
+    /// Authored policy flag: the per-graph gate over every `embed: true`
+    /// property annotation (`index_policy.embeddings_enabled`).
+    pub embeddings_enabled: bool,
+    /// Vertices of the accepted generation whose composed embed projection is
+    /// non-empty under the three-way gate (policy on, `embed: true` property
+    /// present, type not excluded). Zero with `embeddings_enabled` true means
+    /// no property opted in or none carries a value.
+    pub embed_eligible_vertex_count: usize,
+    /// Eligible vertices whose vector is active under the CURRENT envelope
+    /// hash. Less than `embed_eligible_vertex_count` means the embed queue is
+    /// still draining (or the route is unavailable: see `bbox_embed_status`).
+    /// `None` when no embed queue / vector store is installed to ask.
+    pub embedded_vertex_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +223,12 @@ impl BlackboxServer {
                 };
                 let lane = (project_id.as_str().to_string(), entry.graph_id.clone());
                 let never_indexable = matches!(graph.key.source, GraphSource::LocalScratch);
+                // The vector half (design 4.4): pin the accepted generation
+                // of every lane that embeds, so the per-hit re-check answers
+                // from the same generation the word lane ranked.
+                if bbox_project_graph::graph_embeds(graph) {
+                    snapshot.embed_lanes.insert(lane.clone(), graph.clone());
+                }
                 if never_indexable || !graph.schema.index_policy.text_retrieval_enabled {
                     snapshot.disabled_graph_lanes.insert(lane);
                 } else if !graph
@@ -834,6 +852,39 @@ fn graph_retrieval_participation(
     let never_indexable = graph
         .map(|graph| matches!(graph.key.source, GraphSource::LocalScratch))
         .unwrap_or(true);
+    let embeddings_enabled = graph
+        .map(|graph| graph.schema.index_policy.embeddings_enabled)
+        .unwrap_or(false);
+    // Published plane only: provisional overlays never embed in this
+    // milestone, so a provisional entry reports zero eligible rather than
+    // a phantom backlog.
+    let projections = graph
+        .filter(|_| entry.generation.workspace_id.is_none())
+        .map(|graph| bbox_project_graph::graph_embed_projections(graph))
+        .unwrap_or_default();
+    let mut embedded_vertex_count = Some(0usize);
+    for projection in &projections {
+        let entity_id = EntityRef::ProjectGraphVertex {
+            project_id: project_id.as_str().to_string(),
+            graph_id: entry.graph_id.clone(),
+            vertex_id: projection.vertex_id.clone(),
+        }
+        .to_string();
+        match crate::embed_queue::graph_vertex_vector_is_active(
+            project_id.as_str(),
+            &entity_id,
+            &projection.content_hash(),
+        ) {
+            Some(true) => {
+                embedded_vertex_count = embedded_vertex_count.map(|count| count + 1);
+            }
+            Some(false) => {}
+            None => {
+                embedded_vertex_count = None;
+                break;
+            }
+        }
+    }
     Ok(GraphRetrievalParticipation {
         text_retrieval_enabled,
         indexable: text_retrieval_enabled && !never_indexable,
@@ -851,7 +902,9 @@ fn graph_retrieval_participation(
         indexed_vertex_count: stats.indexed_vertex_count,
         indexed_generation: stats.indexed_generation,
         accepted_generation: entry.generation.content_hash.clone(),
-        embedded_vertex_count: 0,
+        embeddings_enabled,
+        embed_eligible_vertex_count: projections.len(),
+        embedded_vertex_count,
     })
 }
 

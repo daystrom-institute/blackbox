@@ -992,12 +992,24 @@ impl EmbedQueueHandle {
         entity_id: &str,
         content_hash: &str,
     ) -> Option<bool> {
+        self.vector_is_active_for_project(bucket, None, entity_id, content_hash)
+    }
+
+    /// [`Self::vector_is_active`] with the project-scoped route resolution a
+    /// per-project `[embed.routes.per_project]` override needs.
+    pub fn vector_is_active_for_project(
+        &self,
+        bucket: Bucket,
+        project_id: Option<&str>,
+        entity_id: &str,
+        content_hash: &str,
+    ) -> Option<bool> {
         let vector_store = self.inner.vector_store.as_ref()?;
         self.inner.router.as_ref()?;
         let resolved = self
             .resolve_route(&EmbedRequest {
                 bucket,
-                project_id: None,
+                project_id: project_id.map(str::to_string),
                 entity_id: entity_id.to_string(),
                 chunk_hash: content_hash.to_string(),
                 text: String::new(),

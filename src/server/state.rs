@@ -921,6 +921,7 @@ impl SharedState {
             packets: &self.packets,
             artifacts: &self.artifacts,
             whiteboards: self.whiteboards.as_ref(),
+            project_graph_views: &self.project_graph_views,
             store_dir: &self.store_dir,
         }
     }

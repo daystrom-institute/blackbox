@@ -410,6 +410,7 @@ pub fn hybrid_search_typed_with_active_selectors_and_searcher(
         for list in &mut vector_lists {
             retain_authorized_knowledge_vectors(list, knowledge);
             retain_active_code_vectors(list, index, active_selectors, searcher);
+            retain_authorized_graph_vectors(list, graph_policy, &graph_authority);
             list.hits.truncate(fetch);
         }
         vector_status.searched_partitions = vector_lists
@@ -613,6 +614,73 @@ fn retain_active_code_vectors(
 ) {
     list.hits.retain(|hit| {
         index.is_active_code_entity_for_with_searcher(&hit.entity_id, active_selectors, searcher)
+    });
+}
+
+/// The vector lane's graph authority (unified-retrieval design 5.1): the
+/// per-hit mirror of the clauses `GraphWordAuthority` composes into the BM25
+/// query, applied BEFORE fusion so an unreadable graph vector never consumes
+/// a rank position. Two halves, like the word lane: the pinned policy
+/// snapshot (does this lane embed at all, and is this vertex still
+/// embed-eligible on the accepted generation) and the per-call parameters
+/// (project scope, plane selection, named-graph selection). Non-graph hits
+/// pass untouched. With no snapshot at all (callers that never installed a
+/// graph catalog) every graph vector drops: a lane that cannot prove a vertex
+/// readable must not serve it.
+fn retain_authorized_graph_vectors(
+    list: &mut RankedList,
+    policy: Option<&bbox_indexing::index::GraphWordPolicySnapshot>,
+    authority: &bbox_indexing::index::GraphWordAuthority,
+) {
+    list.hits.retain(|hit| {
+        let Ok(EntityRef::ProjectGraphVertex {
+            project_id,
+            graph_id,
+            ..
+        }) = EntityRef::parse(&hit.entity_id)
+        else {
+            // Every non-graph ref passes; provisional graph refs and
+            // malformed graph-prefixed ids are dropped by the snapshot check
+            // (and by the no-snapshot arm) below.
+            return match policy {
+                Some(policy) => policy.admits_graph_vector(&hit.entity_id),
+                None => {
+                    !hit.entity_id.starts_with("project_graph_vertex:")
+                        && !hit
+                            .entity_id
+                            .starts_with("provisional_project_graph_vertex:")
+                }
+            };
+        };
+        let Some(policy) = policy else {
+            return false;
+        };
+        if !policy.admits_graph_vector(&hit.entity_id) {
+            return false;
+        }
+        if authority
+            .resolved_project_id
+            .as_deref()
+            .is_some_and(|scope| scope != project_id)
+        {
+            return false;
+        }
+        // Every embedded vertex is on the published plane in this milestone.
+        if !authority.graph_sources.is_empty()
+            && !authority
+                .graph_sources
+                .contains(bbox_indexing::index::GRAPH_SOURCE_PUBLISHED)
+        {
+            return false;
+        }
+        if authority
+            .selected_graph_ids
+            .as_ref()
+            .is_some_and(|selected| !selected.is_empty() && !selected.contains(&graph_id))
+        {
+            return false;
+        }
+        true
     });
 }
 
@@ -1294,7 +1362,18 @@ fn label_for_entity(
                 EntityRef::ProjectGraphVertex { .. }
                     | EntityRef::ProvisionalProjectGraphVertex { .. }
             ) {
-                return bm25_title.map(str::to_string);
+                // A vector-only graph hit has no BM25 twin; its stored
+                // document (enriched into `loaded`) still starts with the
+                // label, so fall back to the first line of the preview
+                // before the compact ref.
+                return bm25_title.map(str::to_string).or_else(|| {
+                    loaded
+                        .and_then(|properties| properties.get("content_preview"))
+                        .and_then(|preview| preview.lines().next())
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string)
+                });
             }
             entity_loader::compact_label(ctx, &r, loaded)
         })
@@ -2727,6 +2806,246 @@ mod graph_word_lane_pipeline {
                 .results
                 .iter()
                 .any(|hit| hit.entity_id.ends_with(":record-2"))
+        );
+    }
+}
+
+/// The vector lane's graph authority (unified-retrieval design 4.4 / 5.1,
+/// M9e exit gate): a vector hit for a graph the caller cannot read drops
+/// BEFORE fusion, non-graph hits pass untouched, and the per-call selectors
+/// (project scope, plane, named graphs) mirror the word lane per hit.
+#[cfg(test)]
+mod graph_vector_lane_authority {
+    use super::*;
+    use bbox_corpus_core::search::rrf::RankedHit;
+    use bbox_indexing::index::{GraphWordAuthority, GraphWordPolicySnapshot};
+    use bbox_project_graph::{
+        GraphAuthority, GraphDescriptor, GraphGeneration, GraphKey, GraphSchema, GraphScope,
+        GraphSource, ProjectGraphVertex, RetentionPolicy, VertexTypeDefinition,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+
+    const PROJECT: &str = "p_000000000000000000000000000000a1";
+    const OTHER_PROJECT: &str = "p_000000000000000000000000000000b2";
+    const GRAPH: &str = "pg-campaigns";
+
+    fn generation(embeddings_enabled: bool, excluded: &[&str]) -> Arc<GraphGeneration> {
+        let mut schema = GraphSchema {
+            version: 1,
+            namespace: "test".into(),
+            vertex_types: BTreeMap::from([(
+                "campaign:Idiom".into(),
+                VertexTypeDefinition {
+                    required: Vec::new(),
+                    properties: BTreeMap::from([(
+                        "statement".into(),
+                        json!({"type": "string", "embed": true}),
+                    )]),
+                    hints: Vec::new(),
+                },
+            )]),
+            edge_types: Vec::new(),
+            index_policy: Default::default(),
+        };
+        schema.index_policy.embeddings_enabled = embeddings_enabled;
+        schema.index_policy.retrieval_excluded_types =
+            excluded.iter().map(|value| value.to_string()).collect();
+        let vertex = |id: &str, with_statement: bool| ProjectGraphVertex {
+            id: id.into(),
+            type_name: "campaign:Idiom".into(),
+            label: id.into(),
+            properties: if with_statement {
+                BTreeMap::from([(
+                    "statement".into(),
+                    json!("replace rows by delete then insert"),
+                )])
+            } else {
+                BTreeMap::new()
+            },
+        };
+        Arc::new(GraphGeneration {
+            key: GraphKey {
+                scope_id: PROJECT.into(),
+                graph_id: GRAPH.into(),
+                source: GraphSource::Committed,
+            },
+            descriptor: GraphDescriptor {
+                descriptor_version: 1,
+                scope: GraphScope::Project,
+                graph_id: GRAPH.into(),
+                authority: GraphAuthority::Project,
+                schema_id: "schema".into(),
+                schema_version: 1,
+                projection_version: None,
+                source_connector: None,
+                retention_policy: RetentionPolicy::ProjectOwned,
+                generation: 1,
+            },
+            schema,
+            vertices: BTreeMap::from([
+                ("idiom/eligible".into(), vertex("idiom/eligible", true)),
+                ("idiom/label-only".into(), vertex("idiom/label-only", false)),
+            ]),
+            edges: Vec::new(),
+            fingerprint: "fp".into(),
+            source_root: std::path::PathBuf::from("/tmp/x"),
+            authored_vertex_count: 2,
+            authored_edge_count: 0,
+        })
+    }
+
+    fn hit(entity_id: &str) -> RankedHit {
+        RankedHit {
+            entity_id: entity_id.to_string(),
+            rank: 1,
+            score: 0.9,
+            source: "vector:test".into(),
+        }
+    }
+
+    fn vertex_ref(project: &str, graph: &str, vertex: &str) -> String {
+        format!("project_graph_vertex:{project}:{graph}:{vertex}")
+    }
+
+    fn list(ids: &[&str]) -> RankedList {
+        RankedList {
+            source: "vector:test".into(),
+            weight: 0.6,
+            hits: ids.iter().map(|id| hit(id)).collect(),
+        }
+    }
+
+    fn ids(list: &RankedList) -> Vec<&str> {
+        list.hits.iter().map(|hit| hit.entity_id.as_str()).collect()
+    }
+
+    fn snapshot(generation: Arc<GraphGeneration>) -> GraphWordPolicySnapshot {
+        GraphWordPolicySnapshot {
+            embed_lanes: BTreeMap::from([((PROJECT.to_string(), GRAPH.to_string()), generation)]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_snapshot_drops_every_graph_vector_and_keeps_the_rest() {
+        let mut list = list(&[
+            &vertex_ref(PROJECT, GRAPH, "idiom/eligible"),
+            "knowledge:abc12345",
+            "provisional_project_graph_vertex:scope:checkout:pg:v",
+        ]);
+        retain_authorized_graph_vectors(&mut list, None, &GraphWordAuthority::default());
+        assert_eq!(ids(&list), vec!["knowledge:abc12345"]);
+    }
+
+    #[test]
+    fn snapshot_admits_only_eligible_vertices_of_embedding_lanes() {
+        let policy = snapshot(generation(true, &[]));
+        let mut list = list(&[
+            &vertex_ref(PROJECT, GRAPH, "idiom/eligible"),
+            // Label-only vertex: no embed-eligible projection, a vector for
+            // it is stale by definition.
+            &vertex_ref(PROJECT, GRAPH, "idiom/label-only"),
+            // Removed from the accepted generation.
+            &vertex_ref(PROJECT, GRAPH, "idiom/vanished"),
+            // A lane the catalog never pinned.
+            &vertex_ref(PROJECT, "unknown-graph", "idiom/eligible"),
+            "commit:deadbeef",
+        ]);
+        retain_authorized_graph_vectors(&mut list, Some(&policy), &GraphWordAuthority::default());
+        assert_eq!(
+            ids(&list),
+            vec![
+                vertex_ref(PROJECT, GRAPH, "idiom/eligible").as_str(),
+                "commit:deadbeef"
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_off_or_excluded_type_drops_before_fusion() {
+        let mut list = list(&[&vertex_ref(PROJECT, GRAPH, "idiom/eligible")]);
+        retain_authorized_graph_vectors(
+            &mut list,
+            Some(&snapshot(generation(false, &[]))),
+            &GraphWordAuthority::default(),
+        );
+        assert!(
+            ids(&list).is_empty(),
+            "embeddings_enabled=false lane must drop"
+        );
+
+        let mut list = list_one();
+        retain_authorized_graph_vectors(
+            &mut list,
+            Some(&snapshot(generation(true, &["campaign:Idiom"]))),
+            &GraphWordAuthority::default(),
+        );
+        assert!(ids(&list).is_empty(), "excluded vertex type must drop");
+    }
+
+    fn list_one() -> RankedList {
+        list(&[&vertex_ref(PROJECT, GRAPH, "idiom/eligible")])
+    }
+
+    #[test]
+    fn per_call_selectors_mirror_the_word_lane() {
+        let policy = snapshot(generation(true, &[]));
+        let admitted = |authority: &GraphWordAuthority| {
+            let mut list = list_one();
+            retain_authorized_graph_vectors(&mut list, Some(&policy), authority);
+            !list.hits.is_empty()
+        };
+        assert!(admitted(&GraphWordAuthority::default()));
+        assert!(admitted(&GraphWordAuthority {
+            resolved_project_id: Some(PROJECT.into()),
+            ..Default::default()
+        }));
+        assert!(!admitted(&GraphWordAuthority {
+            resolved_project_id: Some(OTHER_PROJECT.into()),
+            ..Default::default()
+        }));
+        assert!(admitted(&GraphWordAuthority {
+            graph_sources: BTreeSet::from(["published".to_string()]),
+            ..Default::default()
+        }));
+        assert!(!admitted(&GraphWordAuthority {
+            graph_sources: BTreeSet::from(["provisional".to_string()]),
+            ..Default::default()
+        }));
+        assert!(admitted(&GraphWordAuthority {
+            selected_graph_ids: Some(BTreeSet::from([GRAPH.to_string()])),
+            ..Default::default()
+        }));
+        assert!(admitted(&GraphWordAuthority {
+            selected_graph_ids: Some(BTreeSet::new()),
+            ..Default::default()
+        }));
+        assert!(!admitted(&GraphWordAuthority {
+            selected_graph_ids: Some(BTreeSet::from(["other-graph".to_string()])),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn vector_only_graph_hit_labels_from_the_stored_preview() {
+        let ctx = ProviderContext::empty_for_tests();
+        let entity_id = vertex_ref(PROJECT, GRAPH, "idiom/eligible");
+        let loaded = BTreeMap::from([(
+            "content_preview".to_string(),
+            "Delete then insert\nreplace rows by delete then insert".to_string(),
+        )]);
+        assert_eq!(
+            label_for_entity(&ctx, &entity_id, Some(&loaded), None),
+            "Delete then insert"
+        );
+        assert_eq!(
+            label_for_entity(&ctx, &entity_id, Some(&loaded), Some("BM25 title")),
+            "BM25 title"
+        );
+        assert_eq!(
+            label_for_entity(&ctx, &entity_id, None, None),
+            compact_entity_label(&entity_id)
         );
     }
 }

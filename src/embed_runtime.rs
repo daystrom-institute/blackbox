@@ -517,6 +517,32 @@ pub(crate) fn route_coverage(
     if buckets.contains(&Bucket::AgentManifest) {
         record_agent_manifest_coverage(stores, &router, &mut coverage, &mut active_by_route)?;
     }
+    if buckets.contains(&Bucket::Graph) {
+        let views = stores.project_graph_views.read();
+        for (project_id, view) in views.iter_published() {
+            for (graph_id, entry) in &view.graphs {
+                let Some(graph) = entry.graph() else {
+                    continue;
+                };
+                for projection in bbox_project_graph::graph_embed_projections(graph) {
+                    record_coverage(
+                        &router,
+                        &mut coverage,
+                        &mut active_by_route,
+                        Bucket::Graph,
+                        Some(project_id.as_str()),
+                        &EntityRef::ProjectGraphVertex {
+                            project_id: project_id.as_str().to_string(),
+                            graph_id: graph_id.clone(),
+                            vertex_id: projection.vertex_id.clone(),
+                        }
+                        .to_string(),
+                        &projection.content_hash(),
+                    )?;
+                }
+            }
+        }
+    }
     let doc_types = reembed_index_doc_types(buckets);
     if !doc_types.is_empty() {
         stores
@@ -697,7 +723,11 @@ fn record_index_doc_coverage(
                 chunk_hash,
             )
         }
-        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => Ok(()),
+        Bucket::Knowledge
+        | Bucket::Notes
+        | Bucket::Threads
+        | Bucket::AgentManifest
+        | Bucket::Graph => Ok(()),
     }
 }
 
@@ -836,6 +866,13 @@ fn enqueue_reembed_routes(
     if buckets.contains(&Bucket::AgentManifest) {
         let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
         enqueued += enqueue_agent_manifest_artifacts(state, remaining)?;
+        if limit_reached(max_entities, enqueued) {
+            return Ok(enqueued);
+        }
+    }
+    if buckets.contains(&Bucket::Graph) {
+        let remaining = max_entities.map(|max| max.saturating_sub(enqueued));
+        enqueued += enqueue_graph_vertices(state, remaining)?;
         if limit_reached(max_entities, enqueued) {
             return Ok(enqueued);
         }
@@ -1273,8 +1310,87 @@ fn enqueue_reembed_index_doc(buckets: &[Bucket], doc: &EmbeddingSourceDoc) -> bo
             };
             crate::embed_queue::enqueue_git_message(entity_id, chunk_hash, &doc.content)
         }
-        Bucket::Knowledge | Bucket::Notes | Bucket::Threads | Bucket::AgentManifest => false,
+        Bucket::Knowledge
+        | Bucket::Notes
+        | Bucket::Threads
+        | Bucket::AgentManifest
+        | Bucket::Graph => false,
     }
+}
+
+/// The graph route's backfill (unified-retrieval design 4.4): walk every
+/// installed published graph view and enqueue each embed-eligible vertex's
+/// composed projection. Graph vertices are NOT sourced from the word index:
+/// the indexed document carries only the label and `index: text` values, so
+/// the `embed: true` projection can only be rebuilt from the in-memory
+/// accepted generation, the same source the install-time converge walks.
+///
+/// Also the exact reconciliation the install-time converge cannot do at
+/// boot: every active graph vector on the route whose vertex is no longer
+/// embed-eligible (removed while the daemon was down, graph unpublished,
+/// annotation withdrawn) is tombstoned, so the partition converges to the
+/// eligible set rather than merely hiding stale vectors at query time.
+fn enqueue_graph_vertices(state: &Arc<SharedState>, max_entities: Option<usize>) -> Result<usize> {
+    let router = EmbeddingRouter::load_default()?;
+    let mut enqueued = 0usize;
+    let mut eligible: HashSet<String> = HashSet::new();
+    let mut vector_routes: std::collections::BTreeSet<String> = Default::default();
+    let views = state.project_graph_views.read();
+    for (project_id, view) in views.iter_published() {
+        let project_id = project_id.as_str();
+        for (graph_id, entry) in &view.graphs {
+            let Some(graph) = entry.graph() else {
+                continue;
+            };
+            let projections = bbox_project_graph::graph_embed_projections(graph);
+            if projections.is_empty() {
+                continue;
+            }
+            if let Ok((_, vector_route)) =
+                router.queue_and_vector_route(Bucket::Graph, Some(project_id))
+            {
+                vector_routes.insert(vector_route);
+            }
+            for projection in projections {
+                let entity_id = EntityRef::ProjectGraphVertex {
+                    project_id: project_id.to_string(),
+                    graph_id: graph_id.clone(),
+                    vertex_id: projection.vertex_id.clone(),
+                }
+                .to_string();
+                if !limit_reached(max_entities, enqueued)
+                    && crate::embed_queue::enqueue_graph_vertex(project_id, &entity_id, &projection)
+                {
+                    enqueued += 1;
+                }
+                eligible.insert(entity_id);
+            }
+        }
+    }
+    drop(views);
+    // Orphan sweep: only ids of this entity family, only on routes the graph
+    // bucket actually maps to, so a partition shared with another bucket is
+    // never touched beyond its graph rows.
+    let mut orphans = Vec::new();
+    for vector_route in &vector_routes {
+        for entry in crate::vectors::iter_active(vector_route, None)? {
+            if entry.entity_id.starts_with("project_graph_vertex:")
+                && !eligible.contains(&entry.entity_id)
+            {
+                orphans.push(entry.entity_id);
+            }
+        }
+    }
+    orphans.sort();
+    orphans.dedup();
+    if !orphans.is_empty() {
+        tracing::info!(
+            orphans = orphans.len(),
+            "graph embedding backfill tombstoning vectors whose vertices are no longer embed-eligible"
+        );
+        crate::embed_queue::tombstone_graph_vertices(&orphans);
+    }
+    Ok(enqueued)
 }
 
 fn limit_reached(max_entities: Option<usize>, enqueued: usize) -> bool {
@@ -1543,6 +1659,7 @@ pub(crate) fn status_response_for_state(
         Bucket::Notes,
         Bucket::Threads,
         Bucket::AgentManifest,
+        Bucket::Graph,
     ];
     let mut response =
         status_response_for_buckets(&state.corpus_stores(), STATUS_COVERAGE_BUCKETS)?;

@@ -21,8 +21,7 @@ use super::{
 };
 use bbox_corpus_core::entity_ref::{EntityRef, PARSER_VERSION};
 use bbox_project_graph::{
-    FIXED_META_VERTICES, GraphGeneration, META_EDGE_TYPE, META_VERTEX_TYPE, ProjectGraphVertex,
-    PropertyIndexMode, property_annotations, property_value_string,
+    GraphGeneration, PropertyIndexMode, property_annotations, property_value_string,
 };
 
 /// One vertex prepared for the word index. Plain data so the writer actor
@@ -54,15 +53,10 @@ pub struct GraphVertexIndexDocument {
     pub logical_ref: String,
 }
 
-/// Whether a projected vertex is schema-as-data rather than an authored fact.
-/// The fixed meta floor, the per-type definition vertices, and anything else
-/// typed as a meta vertex are never word-indexed: authors search their facts,
-/// not the shape of their schema.
-pub fn is_meta_vertex(vertex: &ProjectGraphVertex) -> bool {
-    FIXED_META_VERTICES.contains(&vertex.id.as_str())
-        || vertex.type_name == META_VERTEX_TYPE
-        || vertex.type_name == META_EDGE_TYPE
-}
+// The meta-vertex predicate lives with the graph kernel so the word lane
+// and the vector lane (`bbox_project_graph::embed`) agree on it; re-exported
+// here for the existing callers.
+pub use bbox_project_graph::is_meta_vertex;
 
 /// Build the word-index documents for one published graph generation under
 /// its policy. A graph whose `index_policy` disables text retrieval yields
@@ -294,7 +288,8 @@ pub fn collect_graph_lane_documents(
 mod tests {
     use super::*;
     use bbox_project_graph::{
-        GraphDescriptor, GraphKey, GraphSchema, GraphSource, VertexTypeDefinition,
+        GraphDescriptor, GraphKey, GraphSchema, GraphSource, ProjectGraphVertex,
+        VertexTypeDefinition,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};

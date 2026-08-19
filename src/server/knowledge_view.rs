@@ -1893,6 +1893,84 @@ pub(crate) fn converge_published_graph_word_lanes(
                 .purge_project_graph_lane(&project_id, graph_id, PUBLISHED);
         }
     }
+    converge_published_graph_vector_lane(state, view);
+}
+
+/// Converge the published graph VECTOR lane to one view (unified-retrieval
+/// design 4.4): enqueue the composed embed projection of every
+/// embed-eligible vertex (the queue dedups unchanged projections on the
+/// versioned envelope hash, so a generation flip re-embeds only what
+/// changed), and tombstone the vectors of vertices that were eligible under
+/// the currently installed view but are not under this one: removed by the
+/// flip, excluded by a policy change, their annotation withdrawn, or their
+/// graph gone from the accepted view. Runs BEFORE the catalog swap so the
+/// installed view is still the previous one. A boot install has no previous
+/// view and tombstones nothing; the query-time authority hides any vector
+/// that went stale while the daemon was down, and `bbox_reembed(route=graph)`
+/// reconciles the partition exactly.
+pub(crate) fn converge_published_graph_vector_lane(
+    state: &SharedState,
+    view: &bbox_indexing::project_graph_view::PublishedProjectGraphView,
+) {
+    let project_id = view.project_id.as_str().to_string();
+    let previous: BTreeSet<String> = state
+        .project_graph_views
+        .read()
+        .published_view(&view.project_id)
+        .map(|installed| published_graph_embed_entity_ids(&project_id, installed).collect())
+        .unwrap_or_default();
+    let mut next = BTreeSet::new();
+    let mut enqueued = 0usize;
+    for (graph_id, entry) in &view.graphs {
+        let Some(graph) = entry.graph() else {
+            continue;
+        };
+        for projection in bbox_project_graph::graph_embed_projections(graph) {
+            let entity_id = graph_vertex_entity_id(&project_id, graph_id, &projection.vertex_id);
+            if crate::embed_queue::enqueue_graph_vertex(&project_id, &entity_id, &projection) {
+                enqueued += 1;
+            }
+            next.insert(entity_id);
+        }
+    }
+    let stale: Vec<String> = previous.difference(&next).cloned().collect();
+    if !stale.is_empty() {
+        crate::embed_queue::tombstone_graph_vertices(&stale);
+    }
+    if enqueued > 0 || !stale.is_empty() {
+        tracing::debug!(
+            project_id = %project_id,
+            enqueued,
+            tombstoned = stale.len(),
+            "published graph vector lane converged"
+        );
+    }
+}
+
+/// Every embed-eligible vertex entity id of one published view.
+pub(crate) fn published_graph_embed_entity_ids<'a>(
+    project_id: &'a str,
+    view: &'a bbox_indexing::project_graph_view::PublishedProjectGraphView,
+) -> impl Iterator<Item = String> + 'a {
+    view.graphs.iter().flat_map(move |(graph_id, entry)| {
+        entry
+            .graph()
+            .map(|graph| bbox_project_graph::graph_embed_projections(graph))
+            .unwrap_or_default()
+            .into_iter()
+            .map(move |projection| {
+                graph_vertex_entity_id(project_id, graph_id, &projection.vertex_id)
+            })
+    })
+}
+
+fn graph_vertex_entity_id(project_id: &str, graph_id: &str, vertex_id: &str) -> String {
+    bbox_corpus_core::entity_ref::EntityRef::ProjectGraphVertex {
+        project_id: project_id.to_string(),
+        graph_id: graph_id.to_string(),
+        vertex_id: vertex_id.to_string(),
+    }
+    .to_string()
 }
 
 /// Reconcile the published graph views and their word lanes at boot

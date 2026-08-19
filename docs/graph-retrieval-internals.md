@@ -178,9 +178,21 @@ session before fusion.
 Vector lanes are per route: hybrid search iterates on-disk vector
 partitions with a nonzero active count and maps each back to a
 configured text bucket (`code`, `docs`, `knowledge`, `transcripts`,
-`git_message`, `notes`, `threads`, `agent_manifest`) or visual route,
-and each contributing partition becomes its own ranked list. Unmapped
-partitions are skipped and reported in `degraded.skipped_partitions`.
+`git_message`, `notes`, `threads`, `agent_manifest`, `graph`) or visual
+route, and each contributing partition becomes its own ranked list.
+Unmapped partitions are skipped and reported in
+`degraded.skipped_partitions`.
+
+Graph vertex vectors (the `graph` route) carry only an entity id and a
+distance, so the graph authority that the word lane composes into the
+BM25 query is mirrored per hit BEFORE fusion by
+`retain_authorized_graph_vectors`: the pinned policy snapshot says which
+lanes embed at all and pins each lane's accepted generation, and a hit
+whose vertex is no longer embed-eligible on that generation (removed,
+type excluded, annotation withdrawn) drops; the per-call project scope,
+`graph_source` planes, and `graph_ids` selection drop the rest. A search
+with no snapshot drops every graph vector: a lane that cannot prove a
+vertex readable does not serve it.
 
 ### RRF fusion
 

@@ -313,6 +313,66 @@ pub fn enqueue_thread_hook(thread: &Thread) {
     let _ = enqueue_thread(thread);
 }
 
+/// Enqueue one published graph vertex's composed embed projection
+/// (unified-retrieval design 4.4). `entity_id` is the canonical
+/// `project_graph_vertex:<project>:<graph>:<vertex>` ref, which is what the
+/// vector hit carries back into the hybrid lane; `project_id` lets a
+/// per-project `[embed.routes.per_project.<id>] graph` override select the
+/// provider. The dedup key is the versioned envelope hash over the composed
+/// text (`GRAPH_EMBED_TEXT_VERSION`), so an unchanged vertex across
+/// generations is not re-embedded and a composition change re-embeds once.
+pub fn enqueue_graph_vertex(
+    project_id: &str,
+    entity_id: &str,
+    projection: &bbox_project_graph::GraphVertexEmbedProjection,
+) -> bool {
+    enqueue(EmbedRequest {
+        bucket: Bucket::Graph,
+        project_id: Some(project_id.to_string()),
+        entity_id: entity_id.to_string(),
+        chunk_hash: projection.content_hash(),
+        text: projection.text.clone(),
+        visual_kind: None,
+        visual_payload: None,
+    })
+}
+
+/// Drop the vectors of graph vertices that left the embed-eligible set: a
+/// generation flip removed them, a policy change excluded them, or their
+/// graph left the accepted view. One store batch across every route.
+pub fn tombstone_graph_vertices(entity_ids: &[String]) {
+    if entity_ids.is_empty() {
+        return;
+    }
+    if let Some(queue) = queue_slot().read().as_ref() {
+        queue.tombstone_batch(entity_ids);
+    } else {
+        tracing::debug!(
+            route = "graph",
+            count = entity_ids.len(),
+            "embedding queue not installed; accepted graph tombstones as no-op"
+        );
+    }
+}
+
+/// Whether one graph vertex's vector is active under its current envelope
+/// hash. `None` when there is no queue, route table, or vector store to ask;
+/// callers report that as "unknown", never as zero.
+pub fn graph_vertex_vector_is_active(
+    project_id: &str,
+    entity_id: &str,
+    content_hash: &str,
+) -> Option<bool> {
+    queue_slot().read().as_ref().and_then(|handle| {
+        handle.vector_is_active_for_project(
+            Bucket::Graph,
+            Some(project_id),
+            entity_id,
+            content_hash,
+        )
+    })
+}
+
 pub fn enqueue_transcript(
     provider: &str,
     session_id: &str,

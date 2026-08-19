@@ -1023,6 +1023,25 @@ graph the caller cannot read is dropped before fusion, proven by the score
 of the surviving results being unchanged. Turning the route off degrades to
 word-only with `degraded.skipped_partitions` populated and no error.
 
+*Landed 2026-08-19 (gap-58218542).* `Bucket::Graph` (route name `graph`);
+the composed projection and `GRAPH_EMBED_TEXT_VERSION` live in
+`bbox_project_graph::embed` so the install-time enqueue, the backfill, and
+the query-time re-check share one function. Three refinements to the text
+above, all in its spirit: (1) the policy snapshot's vector half pins the
+accepted `GraphGeneration` per embedding lane (an `Arc`, taken under the
+same catalog read as the word half), and `retain_authorized_graph_vectors`
+drops any hit whose vertex is no longer embed-eligible on that generation,
+so a stale vector between a flip and its tombstone never ranks; (2) the
+backfill route walks the installed published views, never the word index,
+because the indexed document deliberately omits the embed projection, and
+it also tombstones orphaned graph vectors on the route so the partition
+converges exactly after a boot-time gap; (3) the describe participation
+block reports `embed_eligible_vertex_count` beside `embedded_vertex_count`
+(null when no vector store is installed) so "policy on, nothing embedded"
+is distinguishable from "nothing opted in". A label-only vertex (opted-in
+properties absent or blank) does not embed: the word lane already carries
+the label.
+
 ### 7.6 Deferred beyond M9
 
 - **Cross-project graph retrieval.** The kernel defers cross-project graph

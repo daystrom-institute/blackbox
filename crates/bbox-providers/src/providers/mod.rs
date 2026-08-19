@@ -138,6 +138,10 @@ pub struct CorpusStores<'a> {
     pub packets: &'a RwLock<Packets>,
     pub artifacts: &'a RwLock<ArtifactCatalog>,
     pub whiteboards: &'a WhiteboardRegistry,
+    /// Installed published project-graph views: the source of the graph
+    /// embedding route's coverage (the embed projection lives only in the
+    /// in-memory accepted generation, never in the word index).
+    pub project_graph_views: &'a RwLock<bbox_indexing::project_graph_view::ProjectGraphViewCatalog>,
     pub store_dir: &'a std::path::Path,
 }
 

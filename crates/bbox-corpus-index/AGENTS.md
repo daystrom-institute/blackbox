@@ -81,3 +81,13 @@
   has no file, and a dedup key that fell back to `entity_id` would make every
   vertex its own singleton file group. `file_dedup_key` returning `None` for
   graph refs is the invariant, not an accident of prefix matching.
+- The vector lane's graph authority is the per-hit mirror of the word lane's
+  query clause (`retain_authorized_graph_vectors` in bbox-mcp-tools), fed by
+  `GraphWordPolicySnapshot.embed_lanes`: the accepted generation of every
+  lane that embeds, pinned as an `Arc` before the search starts. The
+  re-check is "is this vertex still embed-eligible on the pinned
+  generation" via `bbox_project_graph::vertex_embed_text`, which is also the
+  enqueue-time and backfill-time projection; one function, three consumers,
+  so they cannot disagree. The embed projection is NOT stored in the word
+  index (documents carry label + `index: text` values only): never try to
+  rebuild graph vectors from a tantivy scan.

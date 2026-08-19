@@ -121,10 +121,78 @@ impl GraphWordAuthority {
 /// may read at all, snapshotted once before a search so the catalog lock is
 /// never held across the query and a mid-search view install cannot change
 /// the answer halfway through.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// It also carries the vector lane's half (`embed_lanes`, unified-retrieval
+/// design 4.4 / 5.1): vector hits carry only an entity id and a distance, so
+/// no index predicate reaches them, and `retain_authorized_graph_vectors`
+/// re-checks each graph hit against the pinned accepted generation of its
+/// lane instead. Pinning the `Arc` here is what keeps that re-check on the
+/// same generation the word lane ranked from.
+#[derive(Debug, Clone, Default)]
 pub struct GraphWordPolicySnapshot {
     pub disabled_graph_lanes: std::collections::BTreeSet<(String, String)>,
     pub excluded_vertex_types: BTreeMap<(String, String), std::collections::BTreeSet<String>>,
+    /// `(project_id, graph_id)` lanes whose accepted generation embeds at all
+    /// (`embeddings_enabled`, not local scratch), each with that generation
+    /// pinned. A vector hit for a lane absent here is unreadable and drops
+    /// before fusion; a hit whose vertex is no longer embed-eligible on the
+    /// pinned generation (removed, excluded, annotation withdrawn) is stale
+    /// and drops too.
+    pub embed_lanes:
+        BTreeMap<(String, String), std::sync::Arc<bbox_project_graph::GraphGeneration>>,
+}
+
+impl PartialEq for GraphWordPolicySnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.disabled_graph_lanes == other.disabled_graph_lanes
+            && self.excluded_vertex_types == other.excluded_vertex_types
+            && self.embed_lanes.len() == other.embed_lanes.len()
+            && self.embed_lanes.iter().zip(other.embed_lanes.iter()).all(
+                |((lane_a, gen_a), (lane_b, gen_b))| {
+                    // Generations are content-addressed: same fingerprint,
+                    // same projection, same eligibility answers.
+                    lane_a == lane_b && gen_a.fingerprint == gen_b.fingerprint
+                },
+            )
+    }
+}
+
+impl Eq for GraphWordPolicySnapshot {}
+
+impl GraphWordPolicySnapshot {
+    /// Whether one published graph vertex vector may enter fusion: its lane
+    /// embeds under the pinned accepted generation AND the vertex is still
+    /// embed-eligible there. `entity_id` is the vector hit's id; anything that
+    /// is not a `project_graph_vertex:` ref is not this lane's concern and
+    /// passes. Provisional vertex refs never embed in this milestone and are
+    /// dropped outright so a stray vector cannot leak a checkout-private
+    /// vertex into another caller's results.
+    pub fn admits_graph_vector(&self, entity_id: &str) -> bool {
+        use bbox_corpus_core::entity_ref::EntityRef;
+        match EntityRef::parse(entity_id) {
+            Ok(EntityRef::ProjectGraphVertex {
+                project_id,
+                graph_id,
+                vertex_id,
+            }) => self
+                .embed_lanes
+                .get(&(project_id, graph_id))
+                .and_then(|generation| {
+                    generation.vertices.get(&vertex_id).map(|vertex| {
+                        bbox_project_graph::vertex_embed_text(generation, vertex).is_some()
+                    })
+                })
+                .unwrap_or(false),
+            Ok(EntityRef::ProvisionalProjectGraphVertex { .. }) => false,
+            Err(_)
+                if entity_id.starts_with("project_graph_vertex:")
+                    || entity_id.starts_with("provisional_project_graph_vertex:") =>
+            {
+                false
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Indexed state of one graph lane, for the describe participation report
@@ -4220,6 +4288,7 @@ mod graph_word_lane_tests {
                 ("p1".to_string(), "g2".to_string()),
                 BTreeSet::from(["repo:Secret".to_string()]),
             )]),
+            ..Default::default()
         };
         let authority = GraphWordAuthority::from_parts(
             Some(&snapshot),

@@ -10,6 +10,26 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Project-graph vertex embeddings (gap-58218542, unified-retrieval M9e):
+  a new `graph` embedding route gives vector lane coverage to graph
+  vertices whose schema opts them in (`index_policy.embeddings_enabled`
+  plus `embed: true` property annotations, vertex type not excluded). The
+  embedding input is the composed projection (label, then the opted-in
+  property values in schema order), versioned by
+  `GRAPH_EMBED_TEXT_VERSION` so a composition change re-embeds once.
+  Vectors enqueue when a published graph view installs, vertices that
+  leave the eligible set are tombstoned on the next install, and
+  `bbox_reembed(route="graph")` backfills from the installed views and
+  reconciles orphans exactly. Hybrid search drops graph vectors the caller
+  cannot read BEFORE fusion (`retain_authorized_graph_vectors`: lane
+  embeds, vertex still eligible on the pinned accepted generation, project
+  scope, `graph_source` plane, `graph_ids`), and vector-only graph hits
+  label from their stored preview. `bbox_project_graph_describe` now
+  reports `embeddings_enabled`, `embed_eligible_vertex_count`, and a real
+  `embedded_vertex_count` (null when no vector store is installed);
+  `bbox_embed_status` coverage includes the route. Config:
+  `[embed.routes] graph = "<alias>"`, per-project overridable; unconfigured
+  it rides the default provider like every other bucket.
 - Convergence drain gate (gap-4e0e30b8): converging or cycling the daemon
   no longer has to run blind against live orchestration. `GET
   /admin/orchestration-activity` is a cheap JSON probe of running bro tasks

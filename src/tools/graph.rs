@@ -5090,3 +5090,303 @@ mod catalog_adapter_tests {
         assert!(error.starts_with("error.project_mismatch"), "{error}");
     }
 }
+
+/// The graph vector lane (unified-retrieval design 4.4 / 7.5): a published
+/// view install enqueues the composed embed projection of every eligible
+/// vertex, a generation flip tombstones the vectors of vertices that left
+/// the eligible set, and the describe participation report counts both
+/// halves so "why is my graph not in vector search" is answerable without
+/// reading a schema artifact.
+#[cfg(test)]
+mod graph_vector_lane {
+    use super::*;
+    use crate::server::knowledge_view::{
+        PublishedGraphViewInstaller, install_published_graph_view,
+    };
+    use crate::server::state::SharedState;
+    use bbox_corpus_core::identity::PublishedScope;
+    use bbox_corpus_core::project_catalog::ProjectId;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    const GRAPH_ID: &str = "pg-campaigns";
+
+    struct FixedProvider;
+
+    #[async_trait::async_trait]
+    impl crate::embed::EmbeddingProvider for FixedProvider {
+        async fn embed_batch(
+            &self,
+            inputs: &[crate::embed::EmbedInput],
+            _input_type: crate::embed::EmbedInputType,
+        ) -> anyhow::Result<Vec<crate::embed::EmbedOutput>> {
+            Ok(inputs
+                .iter()
+                .map(|_| crate::embed::EmbedOutput::single(vec![1.0, 0.0, 0.0, 0.0]))
+                .collect())
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn document_model(&self) -> &str {
+            "fixed-test"
+        }
+        fn endpoint_kind(&self) -> crate::embed::EmbedEndpointKind {
+            crate::embed::EmbedEndpointKind::Text
+        }
+        fn id(&self) -> &str {
+            "fixed-test"
+        }
+    }
+
+    fn install_isolated_graph_queue(root: &std::path::Path) -> Arc<crate::vectors::VectorStore> {
+        let vectors = Arc::new(crate::vectors::VectorStore::open(root).unwrap());
+        let queue = crate::embed::queue::EmbedQueueHandle::isolated_for_test(
+            "graph",
+            Arc::new(FixedProvider),
+            vectors.clone(),
+        );
+        crate::embed_queue::install(queue);
+        vectors
+    }
+
+    fn active_graph_vectors(vectors: &crate::vectors::VectorStore) -> Vec<String> {
+        let mut ids: Vec<String> = vectors
+            .search("graph", &[1.0, 0.0, 0.0, 0.0], 32)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Async because the isolated queue's worker runs on the test's
+    /// current-thread runtime: a blocking sleep here would starve it.
+    async fn wait_for_graph_vectors(
+        vectors: &crate::vectors::VectorStore,
+        expected: &[String],
+    ) -> Vec<String> {
+        let mut expected = expected.to_vec();
+        expected.sort();
+        for _ in 0..300 {
+            let ids = active_graph_vectors(vectors);
+            if ids == expected {
+                return ids;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        active_graph_vectors(vectors)
+    }
+
+    /// A campaign-shaped graph: `Idiom.statement` opts into embedding,
+    /// `Idiom.status` is word-indexed only, `Note` has no opt-in at all.
+    fn campaign_graph(
+        project_id: &str,
+        idioms: &[(&str, &str)],
+        embeddings_enabled: bool,
+    ) -> bbox_project_graph::GraphGeneration {
+        // An `embed: true` annotation under a policy that forbids it is a
+        // schema error, not a silent skip, so the policy-off generation
+        // withdraws the annotation as a real author would.
+        let statement_term = if embeddings_enabled {
+            json!({"type": "string", "index": "text", "embed": true})
+        } else {
+            json!({"type": "string", "index": "text"})
+        };
+        let schema = serde_json::to_vec(&json!({
+            "version": 1,
+            "namespace": "campaign",
+            "vertex_types": {
+                "campaign:Idiom": {"properties": {
+                    "statement": statement_term,
+                    "status": {"type": "string", "index": "word"}
+                }},
+                "campaign:Note": {"properties": {"text": "string"}}
+            },
+            "edge_types": [],
+            "index_policy": {"embeddings_enabled": embeddings_enabled}
+        }))
+        .unwrap();
+        let mut vertices = Vec::new();
+        for (id, statement) in idioms {
+            vertices.push(
+                serde_json::to_string(&json!({
+                    "id": id,
+                    "type": "campaign:Idiom",
+                    "label": id,
+                    "properties": {"statement": statement, "status": "active"}
+                }))
+                .unwrap(),
+            );
+        }
+        vertices.push(
+            serde_json::to_string(&json!({
+                "id": "note/plain",
+                "type": "campaign:Note",
+                "label": "plain note",
+                "properties": {"text": "never embedded"}
+            }))
+            .unwrap(),
+        );
+        let vertices = vertices.join("\n");
+        let loaded = bbox_project_graph::load_graph_documents(
+            project_id,
+            GRAPH_ID,
+            bbox_project_graph::GraphDocumentBytes {
+                descriptor: None,
+                schema: &schema,
+                vertices: vertices.as_bytes(),
+                edges: b"",
+            },
+            bbox_project_graph::GraphParseLimits::default(),
+            std::path::PathBuf::new(),
+        );
+        assert!(loaded.report.valid, "{:?}", loaded.report.errors);
+        loaded.generation.unwrap()
+    }
+
+    fn view(
+        project_id: &ProjectId,
+        generation: bbox_project_graph::GraphGeneration,
+        stamp: &str,
+    ) -> bbox_indexing::project_graph_view::PublishedProjectGraphView {
+        bbox_indexing::project_graph_view::PublishedProjectGraphView {
+            project_id: project_id.clone(),
+            scope: PublishedScope::try_new("repo-campaigns", ".").unwrap(),
+            accepted_generation: stamp.into(),
+            graphs: std::collections::BTreeMap::from([(
+                GRAPH_ID.to_string(),
+                bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
+                    GRAPH_ID.to_string(),
+                    bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                        accepted_generation: stamp.into(),
+                        accepted_commit: "a".repeat(40),
+                        source_generation: None,
+                        workspace_id: None,
+                        content_hash: generation.fingerprint.clone(),
+                    },
+                    generation,
+                ),
+            )]),
+            evidence: bbox_project_graph::EvidenceBindingSet::default(),
+        }
+    }
+
+    fn vertex_ref(project_id: &str, vertex_id: &str) -> String {
+        format!("project_graph_vertex:{project_id}:{GRAPH_ID}:{vertex_id}")
+    }
+
+    #[tokio::test]
+    async fn install_embeds_eligible_vertices_and_a_flip_tombstones_the_departed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let vectors = install_isolated_graph_queue(&root.join("vectors"));
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
+        let project = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&root)
+            .unwrap();
+        let project_id = ProjectId::parse(project.project_id.clone()).unwrap();
+
+        // Generation one: two eligible idioms plus a note that never embeds.
+        let first = campaign_graph(
+            project_id.as_str(),
+            &[
+                (
+                    "idiom/delete-then-insert",
+                    "replace rows by delete then insert",
+                ),
+                (
+                    "idiom/push-durable",
+                    "worker loss is lane loss; push durable work",
+                ),
+            ],
+            true,
+        );
+        install_published_graph_view(
+            &server.state,
+            view(&project_id, first, "gen-one"),
+            PublishedGraphViewInstaller::Test,
+        );
+        let expected = vec![
+            vertex_ref(project_id.as_str(), "idiom/delete-then-insert"),
+            vertex_ref(project_id.as_str(), "idiom/push-durable"),
+        ];
+        assert_eq!(
+            wait_for_graph_vectors(&vectors, &expected).await,
+            expected,
+            "every embed-eligible vertex gets a vector; the note never does"
+        );
+
+        // The participation report says what embeds and how much of it did.
+        let described = server
+            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+                project: project.project_id.clone(),
+                graph_id: GRAPH_ID.into(),
+                provisional: Some("published".into()),
+            }))
+            .await;
+        let wire = serde_json::to_value(&described).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let described: serde_json::Value = serde_json::from_str(text).unwrap();
+        let retrieval = &described["graphs"][0]["retrieval"];
+        assert_eq!(retrieval["embeddings_enabled"], json!(true), "{text}");
+        assert_eq!(retrieval["embed_eligible_vertex_count"], json!(2), "{text}");
+        // The isolated queue carries no router, so activity is unknowable
+        // here and must be reported as null rather than a phantom zero.
+        assert!(retrieval["embedded_vertex_count"].is_null(), "{text}");
+
+        // Generation two drops one idiom: its vector is tombstoned, the
+        // survivor (unchanged projection) is not re-embedded or removed.
+        let second = campaign_graph(
+            project_id.as_str(),
+            &[(
+                "idiom/delete-then-insert",
+                "replace rows by delete then insert",
+            )],
+            true,
+        );
+        install_published_graph_view(
+            &server.state,
+            view(&project_id, second, "gen-two"),
+            PublishedGraphViewInstaller::Test,
+        );
+        let expected = vec![vertex_ref(project_id.as_str(), "idiom/delete-then-insert")];
+        assert_eq!(wait_for_graph_vectors(&vectors, &expected).await, expected);
+
+        // Policy off: the whole lane leaves the vector store.
+        let third = campaign_graph(
+            project_id.as_str(),
+            &[(
+                "idiom/delete-then-insert",
+                "replace rows by delete then insert",
+            )],
+            false,
+        );
+        install_published_graph_view(
+            &server.state,
+            view(&project_id, third, "gen-three"),
+            PublishedGraphViewInstaller::Test,
+        );
+        assert!(wait_for_graph_vectors(&vectors, &[]).await.is_empty());
+        let described = server
+            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+                project: project.project_id.clone(),
+                graph_id: GRAPH_ID.into(),
+                provisional: Some("published".into()),
+            }))
+            .await;
+        let wire = serde_json::to_value(&described).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let described: serde_json::Value = serde_json::from_str(text).unwrap();
+        let retrieval = &described["graphs"][0]["retrieval"];
+        assert_eq!(retrieval["embeddings_enabled"], json!(false), "{text}");
+        assert_eq!(retrieval["embed_eligible_vertex_count"], json!(0), "{text}");
+        assert_eq!(retrieval["embedded_vertex_count"], json!(0), "{text}");
+    }
+}

@@ -36,6 +36,10 @@ bbox-code-source-store = { path = "../bbox-code-source-store" }
 bbox-conversation-source = { path = "../bbox-conversation-source" }
 bbox-conversation-source-store = { path = "../bbox-conversation-source-store" }
 bbox-corpus-core = { path = "../bbox-corpus-core" }
+# Leaf-to-leaf: the graph kernel depends only on bbox-corpus-core. Needed so
+# the query-time graph authority snapshot can carry the accepted generation
+# the vector lane re-checks eligibility against (unified-retrieval 5.1).
+bbox-project-graph = { path = "../bbox-project-graph" }
 bbox-edge-sidecar = { path = "../bbox-edge-sidecar" }
 bro-core = { path = "../bro-core" }
 bro-transcript = { path = "../bro-transcript" }
