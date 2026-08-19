@@ -1475,7 +1475,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "whiteboard_archive",
         category: ToolCategory::Whiteboards,
-        summary: "Archive the board. Resolve phase only, unless force=true (facilitator/operator role) — the abandon path for boards stranded mid-phase by a failed arc. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics.",
+        summary: "Archive the board (facilitator/operator role, same authority as a phase transition). Resolve phase only, unless force=true, the abandon path for boards stranded mid-phase by a failed arc. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics.",
         when_to_use: "Use after the deliberation completes and any synthesis artifact (ADR markdown, PR body, etc.) has been produced. Use force=true from cleanup hooks (e.g. on_arc_exit) when a failed arc stranded the board mid-phase. Archived boards stay readable on disk for audit but no longer count toward inbox attention.",
         example: Some(r#"whiteboard_archive(board_id="adr-2026-04-27", agent_name="facilitator")"#),
     },

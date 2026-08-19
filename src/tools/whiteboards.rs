@@ -492,7 +492,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "whiteboard_archive",
-        description = "Archive the board. Resolve phase only, unless force=true (facilitator/operator role) — the abandon path for boards stranded mid-phase by a failed arc. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics."
+        description = "Archive the board (facilitator/operator role, same authority as a phase transition). Resolve phase only, unless force=true, the abandon path for boards stranded mid-phase by a failed arc. Strips active state, moves to `<store>/whiteboards/archive/<id>.json`, returns summary statistics."
     )]
     async fn whiteboard_archive(
         &self,

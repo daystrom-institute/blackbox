@@ -264,6 +264,13 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- `whiteboard_archive` now enforces the facilitator/operator role on the
+  normal resolve-phase path, not only when `force=true`. The force-archive
+  fix (gap-0301dc75) gated the force branch alone, so any registered
+  specialist could archive a resolve-phase board even though
+  `whiteboard_transition` refuses specialists unconditionally; archiving is a
+  phase transition in effect and now shares that authority model. `force`
+  still relaxes only the phase precondition (gap-2ed75162).
 - `bbox_render(scope=global)` no longer refuses every daemon with
   `error.global_render_authority` naming an empty knowledge source. The
   render tool projects a detached session knowledge view, and that view

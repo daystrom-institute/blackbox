@@ -157,11 +157,14 @@ whiteboard_summarize(board_id = "adr-2026-05-07", agent_name = "facilitator-clau
 whiteboard_archive(board_id = "adr-2026-05-07", agent_name = "facilitator-claude")
 ```
 
+Archiving is a phase transition in effect (`resolve -> archived`), so it
+requires a facilitator or operator role on every path, exactly like
+`whiteboard_transition`; a registered specialist cannot archive a board.
 Normal archives are legal only from the `resolve` phase. `force = true`
 archives from ANY phase - the abandon path for boards stranded mid-phase
-when their arc fails (e.g. `on_arc_exit` cleanup hooks). Force requires a
-facilitator or operator role, and the archived board's phase history
-records the phase it was abandoned from.
+when their arc fails (e.g. `on_arc_exit` cleanup hooks). Force only relaxes
+the phase precondition, never the role check, and the archived board's
+phase history records the phase it was abandoned from.
 
 ```json
 whiteboard_archive(board_id = "adr-2026-05-07", agent_name = "facilitator-claude", force = true)
