@@ -1542,7 +1542,8 @@ mod tests {
         // pipe made such commands block forever (pathless rg/grep and their
         // wrappers; gap-aa2baeb3). yield_time_ms=0 plus the outer timeout
         // means a regression fails loudly instead of hanging the suite.
-        let fut = ShellRun.call(json!({"command": "cat", "yield_time_ms": 0}), &cx());
+        let c = cx();
+        let fut = ShellRun.call(json!({"command": "cat", "yield_time_ms": 0}), &c);
         let v = as_json(
             tokio::time::timeout(Duration::from_secs(6), fut)
                 .await
@@ -1558,9 +1559,10 @@ mod tests {
         // grep with no file arguments reads stdin (the observed incident was
         // the same shape with rg): with /dev/null it reads EOF at once and
         // exits 1 ("no match") instead of sitting asleep on fd 0.
+        let c = cx();
         let fut = ShellRun.call(
             json!({"command": "grep zq-no-such-token", "yield_time_ms": 0}),
-            &cx(),
+            &c,
         );
         let v = as_json(
             tokio::time::timeout(Duration::from_secs(6), fut)
