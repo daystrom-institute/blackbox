@@ -15,8 +15,11 @@
   "blocking_level": "none",
   "dedupe_key": "tooling/whiteboards/archive-authority-gate",
   "notes": "This is the real bug the arch-pathology-rust PE-6 run found (its plan subject). Extracted from thread-cc07f395 item 7 during thread triage.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "thread_id": "thread-cc07f395",
   "created_at": "2026-06-11T17:07:28Z",
-  "updated_at": "2026-06-11T17:07:28Z"
+  "updated_at": "2026-08-19T00:24:33Z",
+  "resolved_at": "2026-08-19T00:24:33Z",
+  "resolution_note": "implemented in commit 1ac3814e: Role::can_transition() now guards both archive paths (force relaxes only the phase precondition, preserving 80794d55 semantics); specialist non-force refusal test added. Merged at ae68cace, cluster gates green (bbox-verify-7bv6c), deployed in image ae68cace48bf. Operator-approved closure 2026-08-18."
 }
