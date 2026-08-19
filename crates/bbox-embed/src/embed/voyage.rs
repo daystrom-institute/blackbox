@@ -250,26 +250,26 @@ impl EmbeddingProvider for VoyageProvider {
             .context("sending voyage embedding request")?;
         let status = raw.status();
         if !status.is_success() {
+            let retry_after = super::queue::parse_retry_after_secs(
+                raw.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+            );
             let body = raw.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(512).collect();
             let message = format!(
                 "voyage embedding request failed: HTTP {status} batch_size={} body={snippet}",
                 texts.len()
             );
-            // Payload-level rejections (4xx other than timeout/rate-limit)
-            // fail identically on retry — mark them non-retryable so the
-            // queue bisects to the poison item instead of dropping the
-            // whole batch (gap-e3e033ce: one empty string took 51
-            // batch-mates with it).
-            if status.is_client_error()
-                && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                return Err(
-                    anyhow::Error::new(super::queue::NonRetryableBatchError).context(message)
-                );
-            }
-            bail!("{message}");
+            // Payload-level 4xx is non-retryable (the queue bisects to the
+            // poison item, gap-e3e033ce); 429 carries the rate-limit marker
+            // so the queue waits out the per-minute window instead of
+            // dropping the batch; everything else is a plain retry.
+            return Err(super::queue::classify_provider_http_failure(
+                status,
+                retry_after,
+                message,
+            ));
         }
         let response = raw
             .json::<VoyageResponse>()

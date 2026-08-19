@@ -281,6 +281,16 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Embedding queue: retry state is now per batch instead of one worker-level
+  slot. A wave dispatches `WORKER_CONCURRENCY` batches in parallel, and the
+  shared slot let a second failing batch-mate overwrite the first (and a
+  succeeding batch-mate clear it), stranding items in the pending identity
+  set with their `queue_depth` accounted but no path to persist, drop, or
+  re-enqueue until a daemon restart (observed as the docs route frozen at
+  depth 524 after Voyage TPM 429s). Provider 429s now carry a rate-limit
+  marker (`Retry-After` honored when sent) and get a longer retry budget
+  with a per-minute-window backoff floor, so a token-per-minute cap no
+  longer drops batches that would embed seconds later.
 - `whiteboard_archive` now enforces the facilitator/operator role on the
   normal resolve-phase path, not only when `force=true`. The force-archive
   fix (gap-0301dc75) gated the force branch alone, so any registered

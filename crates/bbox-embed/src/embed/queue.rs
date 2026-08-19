@@ -19,6 +19,16 @@ const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_BATCH_RETRIES: u8 = 3;
+// Rate-limit (HTTP 429) retries get a longer budget and a longer floor than
+// generic failures: Voyage's caps are per-minute windows (RPM and TPM), so
+// the generic 1s/2s/4s ladder burns all three attempts inside the same
+// window that rejected the batch and then drops work that would have
+// embedded fine a few seconds later. The floor is a multiple of the base
+// backoff (so tests keep their millisecond clocks): in production that is
+// 15s, doubling to the 2-minute cap, ~6 minutes of patience per batch.
+const MAX_RATE_LIMIT_RETRIES: u8 = 6;
+const RATE_LIMIT_BACKOFF_MULTIPLIER: u32 = 15;
+const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(120);
 const MAX_ROUTE_QUEUE_DEPTH: u64 = 10_000;
 const MAX_ROUTE_QUEUE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -51,6 +61,60 @@ impl std::error::Error for NonRetryableBatchError {}
 fn is_non_retryable(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.downcast_ref::<NonRetryableBatchError>().is_some())
+}
+
+/// Marker for provider rate-limit rejections (HTTP 429). Retryable, but on
+/// a per-minute window: the worker gives these batches the longer
+/// `MAX_RATE_LIMIT_RETRIES` budget and the `RATE_LIMIT_BACKOFF_MULTIPLIER`
+/// floor (honoring a delta-seconds `Retry-After` when the provider sends
+/// one) instead of the generic 1s/2s/4s ladder that cannot outlast the
+/// window that rejected the batch.
+#[derive(Debug)]
+pub struct RateLimitedBatchError {
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for RateLimitedBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(delay) => write!(f, "provider rate limit (retry after {}s)", delay.as_secs()),
+            None => f.write_str("provider rate limit"),
+        }
+    }
+}
+
+impl std::error::Error for RateLimitedBatchError {}
+
+fn rate_limit_of(err: &anyhow::Error) -> Option<Option<Duration>> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<RateLimitedBatchError>())
+        .map(|marker| marker.retry_after)
+}
+
+/// Parse a delta-seconds `Retry-After` header value. HTTP-date forms are
+/// ignored (Voyage sends seconds when it sends anything).
+pub fn parse_retry_after_secs(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// Shared classification of a non-2xx provider response for the Voyage
+/// family: payload-level 4xx is non-retryable (the worker bisects to the
+/// poison item), 429 carries the rate-limit marker (extended backoff), and
+/// everything else (408, 5xx, transport) is a plain retryable failure.
+pub fn classify_provider_http_failure(
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    message: String,
+) -> anyhow::Error {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return anyhow::Error::new(RateLimitedBatchError { retry_after }).context(message);
+    }
+    if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT {
+        return anyhow::Error::new(NonRetryableBatchError).context(message);
+    }
+    anyhow!("{message}")
 }
 
 /// Seed a route's status with the provider's routing identity so
@@ -1180,18 +1244,77 @@ fn pack_mode_for(endpoint_kind: EmbedEndpointKind) -> PackMode {
     }
 }
 
+/// One failed batch parked for another attempt. Retry state is per batch,
+/// never a single worker-level slot: a wave dispatches up to
+/// `WORKER_CONCURRENCY` batches in parallel, and with one shared slot a
+/// second failing batch-mate overwrote the first (and a succeeding
+/// batch-mate cleared it), stranding items in the `pending` identity set
+/// with their `queue_depth` accounted but no path to persist, drop, or
+/// re-enqueue (the 2026-08 docs-route freeze at depth 524).
+struct RetryBatch {
+    requests: Vec<EmbedRequest>,
+    attempts: u8,
+    not_before: Instant,
+}
+
+/// Route-wide backoff state. Generic failures and rate limits keep
+/// separate ladders because their recovery windows differ by an order of
+/// magnitude; both reset on any successful batch.
+struct RouteBackoff {
+    base: Duration,
+    generic: Duration,
+    rate_limit: Duration,
+}
+
+impl RouteBackoff {
+    fn new(base: Duration) -> Self {
+        Self {
+            base,
+            generic: base,
+            rate_limit: base * RATE_LIMIT_BACKOFF_MULTIPLIER,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.generic = self.base;
+        self.rate_limit = self.base * RATE_LIMIT_BACKOFF_MULTIPLIER;
+    }
+
+    /// Delay before the next attempt for a generic failure, advancing the
+    /// ladder.
+    fn next_generic(&mut self) -> Duration {
+        let delay = self.generic;
+        self.generic = (self.generic * 2).min(MAX_RETRY_BACKOFF);
+        delay
+    }
+
+    /// Delay before the next attempt after a rate limit: the provider's
+    /// `Retry-After` when it is longer than the current floor, else the
+    /// floor; the ladder doubles up to the rate-limit cap.
+    fn next_rate_limit(&mut self, retry_after: Option<Duration>) -> Duration {
+        let floor = self.rate_limit;
+        self.rate_limit = (self.rate_limit * 2).min(MAX_RATE_LIMIT_BACKOFF);
+        retry_after.map_or(floor, |advised| advised.max(floor))
+    }
+}
+
+/// One dispatched batch, its prior attempt count, and the provider result.
+type BatchOutcome = (Vec<EmbedRequest>, u8, anyhow::Result<Vec<Vec<f32>>>);
+
 async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCommand>) {
     let mut pending = VecDeque::new();
-    let mut retry_batch = Vec::new();
-    let mut retry_attempts = 0_u8;
-    let mut backoff = spec.retry_backoff;
+    let mut retries: VecDeque<RetryBatch> = VecDeque::new();
+    let mut backoff = RouteBackoff::new(spec.retry_backoff);
     let mut rate_limiter = spec.rate_limit_per_min.and_then(TokenBucket::new);
     loop {
         // Drain up to WORKER_CONCURRENCY batches and dispatch them in
         // parallel. The retry path keeps single-batch semantics so we
-        // don't fan out a known-failing batch.
-        let mut batches = if !retry_batch.is_empty() {
-            vec![retry_batch.clone()]
+        // don't fan out a known-failing batch; parked batches retry in
+        // arrival order, each after its own scheduled delay.
+        let mut batches: Vec<(Vec<EmbedRequest>, u8)> = if let Some(front) = retries.front() {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(front.not_before)).await;
+            let parked = retries.pop_front().expect("front was just observed");
+            vec![(parked.requests, parked.attempts)]
         } else {
             let mut acc = Vec::with_capacity(WORKER_CONCURRENCY);
             // First batch blocks for input; subsequent batches only
@@ -1199,7 +1322,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
             // don't add latency waiting for a second batch to fill).
             let mode = pack_mode_for(spec.provider.endpoint_kind());
             match collect_quiescent_batch(&mut rx, &mut pending, spec.debounce, mode).await {
-                Some(b) => acc.push(b),
+                Some(b) => acc.push((b, 0)),
                 None => return,
             }
             for _ in 1..WORKER_CONCURRENCY {
@@ -1208,7 +1331,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
                 }
                 let batch = pack_batch(&mut pending, mode);
                 if !batch.is_empty() {
-                    acc.push(batch);
+                    acc.push((batch, 0));
                 }
             }
             acc
@@ -1216,7 +1339,7 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
         if let Some(limiter) = &mut rate_limiter {
             let permitted = limiter.acquire_wave(batches.len()).await;
             let deferred = batches.split_off(permitted);
-            for batch in deferred.into_iter().rev() {
+            for (batch, _) in deferred.into_iter().rev() {
                 for request in batch.into_iter().rev() {
                     pending.push_front(request);
                 }
@@ -1230,69 +1353,57 @@ async fn worker_loop(spec: WorkerSpec, mut rx: mpsc::UnboundedReceiver<WorkerCom
         // in production and turn a full-corpus rebuild into hours of avoidable
         // wall time.
         let provider = &spec.provider;
-        let mut results: Vec<(Vec<EmbedRequest>, anyhow::Result<Vec<Vec<f32>>>)> = {
-            let futures = batches
-                .iter()
-                .map(|batch| async move { embed_batch_requests(provider.as_ref(), batch).await })
-                .collect::<Vec<_>>();
+        let mut results: Vec<BatchOutcome> = {
+            let futures =
+                batches
+                    .iter()
+                    .map(|(batch, _)| async move {
+                        embed_batch_requests(provider.as_ref(), batch).await
+                    })
+                    .collect::<Vec<_>>();
             let outcomes = futures::future::join_all(futures).await;
-            batches.into_iter().zip(outcomes).collect()
+            batches
+                .into_iter()
+                .zip(outcomes)
+                .map(|((batch, attempts), outcome)| (batch, attempts, outcome))
+                .collect()
         };
         // Process results sequentially (persist + retry-or-drop is not
-        // safe to run in parallel against the same WAL). Each batch is
-        // treated independently for retry decisions; we still mutate
-        // the worker-level retry/backoff state so a persistent failure
-        // backs off the route as a whole.
-        for (batch, result) in results.drain(..) {
-            process_batch_outcome(
-                &spec,
-                &mut retry_batch,
-                &mut retry_attempts,
-                &mut backoff,
-                batch,
-                result,
-            )
-            .await;
+        // safe to run in parallel against the same WAL). Each batch owns
+        // its retry decision and attempt count; only the backoff ladder is
+        // route-wide, so a persistent failure backs off the route as a
+        // whole while a success resets it.
+        for (batch, attempts, result) in results.drain(..) {
+            process_batch_outcome(&spec, &mut retries, &mut backoff, batch, attempts, result).await;
         }
     }
 }
 
-/// Per-batch outcome handler. Persists vectors on success, schedules
-/// retry/drop on failure. Mutates retry/backoff state on the worker so
-/// a sticky provider outage backs off the whole route.
+/// Per-batch outcome handler. Persists vectors on success, parks the batch
+/// for retry or drops it on failure. Never touches other parked batches:
+/// a success resets the route-wide backoff ladder only.
 async fn process_batch_outcome(
     spec: &WorkerSpec,
-    retry_batch: &mut Vec<EmbedRequest>,
-    retry_attempts: &mut u8,
-    backoff: &mut Duration,
+    retries: &mut VecDeque<RetryBatch>,
+    backoff: &mut RouteBackoff,
     batch: Vec<EmbedRequest>,
+    attempts: u8,
     result: anyhow::Result<Vec<Vec<f32>>>,
 ) {
     match result {
         Ok(vectors) => {
-            if spec.persist_vectors {
-                if let Err(err) = persist_vectors(spec, &batch, vectors) {
-                    let sanitized = sanitize_error(&err);
-                    tracing::warn!(
-                        route = %spec.route,
-                        vector_route = %spec.vector_route,
-                        error = %sanitized,
-                        "embedding vector persistence failed; route will retry"
-                    );
-                    if !schedule_retry_or_drop(
-                        spec,
-                        retry_batch,
-                        retry_attempts,
-                        backoff,
-                        batch,
-                        &sanitized,
-                    )
-                    .await
-                    {
-                        *backoff = spec.retry_backoff;
-                    }
-                    return;
-                }
+            if spec.persist_vectors
+                && let Err(err) = persist_vectors(spec, &batch, vectors)
+            {
+                let sanitized = sanitize_error(&err);
+                tracing::warn!(
+                    route = %spec.route,
+                    vector_route = %spec.vector_route,
+                    error = %sanitized,
+                    "embedding vector persistence failed; route will retry"
+                );
+                schedule_retry_or_drop(spec, retries, backoff, batch, attempts, &sanitized, None);
+                return;
             }
             tracing::debug!(
                 route = %spec.route,
@@ -1309,9 +1420,7 @@ async fn process_batch_outcome(
                 batch.len() as u64,
                 batch_text_bytes(&batch),
             );
-            retry_batch.clear();
-            *retry_attempts = 0;
-            *backoff = spec.retry_backoff;
+            backoff.reset();
         }
         Err(err) => {
             if is_non_retryable(&err) {
@@ -1324,29 +1433,19 @@ async fn process_batch_outcome(
                     "embedding batch rejected by provider; isolating poison payload"
                 );
                 isolate_poison_batch(spec, batch).await;
-                retry_batch.clear();
-                *retry_attempts = 0;
-                *backoff = spec.retry_backoff;
                 return;
             }
+            let rate_limit = rate_limit_of(&err);
             let sanitized = sanitize_error(&err);
             tracing::warn!(
                 route = %spec.route,
+                rate_limited = rate_limit.is_some(),
                 error = %sanitized,
                 "embedding batch failed; route will retry without affecting search"
             );
-            if !schedule_retry_or_drop(
-                spec,
-                retry_batch,
-                retry_attempts,
-                backoff,
-                batch,
-                &sanitized,
-            )
-            .await
-            {
-                *backoff = spec.retry_backoff;
-            }
+            schedule_retry_or_drop(
+                spec, retries, backoff, batch, attempts, &sanitized, rate_limit,
+            );
         }
     }
 }
@@ -1455,20 +1554,30 @@ async fn isolate_poison_batch(spec: &WorkerSpec, batch: Vec<EmbedRequest>) {
     }
 }
 
-async fn schedule_retry_or_drop(
+/// Park a failed batch for another attempt, or drop it once its budget is
+/// spent. `rate_limit` is `Some(retry_after)` for provider 429s, which get
+/// the longer `MAX_RATE_LIMIT_RETRIES` budget and floor. Returns true when
+/// the batch was parked.
+fn schedule_retry_or_drop(
     spec: &WorkerSpec,
-    retry_batch: &mut Vec<EmbedRequest>,
-    retry_attempts: &mut u8,
-    backoff: &mut Duration,
+    retries: &mut VecDeque<RetryBatch>,
+    backoff: &mut RouteBackoff,
     batch: Vec<EmbedRequest>,
+    attempts: u8,
     error: &str,
+    rate_limit: Option<Option<Duration>>,
 ) -> bool {
-    *retry_attempts = retry_attempts.saturating_add(1);
+    let attempts = attempts.saturating_add(1);
     mark_retry(&spec.statuses, &spec.route);
-    if *retry_attempts >= MAX_BATCH_RETRIES {
+    let limit = if rate_limit.is_some() {
+        MAX_RATE_LIMIT_RETRIES
+    } else {
+        MAX_BATCH_RETRIES
+    };
+    if attempts >= limit {
         let dropped = batch.len() as u64;
         let dropped_bytes = batch_text_bytes(&batch);
-        let message = format!("embedding batch dropped after {MAX_BATCH_RETRIES} retries: {error}");
+        let message = format!("embedding batch dropped after {limit} retries: {error}");
         tracing::warn!(
             route = %spec.route,
             vector_route = %spec.vector_route,
@@ -1483,16 +1592,18 @@ async fn schedule_retry_or_drop(
             dropped_bytes,
             &message,
         );
-        retry_batch.clear();
-        *retry_attempts = 0;
-        false
-    } else {
-        retry_batch.clear();
-        retry_batch.extend(batch);
-        tokio::time::sleep(*backoff).await;
-        *backoff = (*backoff * 2).min(MAX_RETRY_BACKOFF);
-        true
+        return false;
     }
+    let delay = match rate_limit {
+        Some(retry_after) => backoff.next_rate_limit(retry_after),
+        None => backoff.next_generic(),
+    };
+    retries.push_back(RetryBatch {
+        requests: batch,
+        attempts,
+        not_before: Instant::now() + delay,
+    });
+    true
 }
 
 // Voyage API caps: 128 docs/request and ~120k tokens/request. The bytes
@@ -2409,6 +2520,238 @@ mod tests {
         assert_eq!(status.queue_depth, 0);
         assert_eq!(status.queue_bytes, 0);
         queue.shutdown();
+    }
+
+    /// Provider whose first `fail_first` calls fail with the scripted
+    /// error, then succeed. Drives the multi-batch retry scenarios.
+    struct ScriptedProvider {
+        calls: AtomicUsize,
+        fail_first: usize,
+        error: fn() -> anyhow::Error,
+    }
+
+    impl ScriptedProvider {
+        fn new(fail_first: usize, error: fn() -> anyhow::Error) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail_first,
+                error,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for ScriptedProvider {
+        async fn embed_batch(
+            &self,
+            inputs: &[EmbedInput],
+            _input_type: EmbedInputType,
+        ) -> Result<Vec<EmbedOutput>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            // Hold the call open briefly so a wave's batches are genuinely
+            // in flight together before any outcome is processed.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if call < self.fail_first {
+                return Err((self.error)());
+            }
+            Ok(inputs
+                .iter()
+                .map(|_| EmbedOutput::single(vec![0.0_f32; 4]))
+                .collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        fn document_model(&self) -> &str {
+            "scripted"
+        }
+
+        fn endpoint_kind(&self) -> EmbedEndpointKind {
+            EmbedEndpointKind::Text
+        }
+
+        fn id(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    fn generic_failure() -> anyhow::Error {
+        anyhow!("provider unavailable: token redacted")
+    }
+
+    fn rate_limit_failure() -> anyhow::Error {
+        anyhow::Error::new(RateLimitedBatchError { retry_after: None })
+            .context("voyage embedding request failed: HTTP 429 Too Many Requests")
+    }
+
+    /// Four requests heavy enough that each packs into its own batch, so one
+    /// debounced wave dispatches WORKER_CONCURRENCY batches in parallel.
+    fn enqueue_one_batch_per_slot(queue: &EmbedQueueHandle) {
+        let heavy = "x".repeat(MAX_BATCH_BYTES / 2 + 1);
+        for i in 0..WORKER_CONCURRENCY {
+            let id = format!("e{i}");
+            assert!(queue.enqueue(request_with_text(Bucket::Code, &id, "h", &heavy)));
+        }
+    }
+
+    async fn wait_until(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    /// A wave where every in-flight batch fails must park every batch for
+    /// retry. The old single retry slot let a second failing batch-mate
+    /// overwrite the first, stranding it in the pending set with its depth
+    /// still accounted and no path to persist, drop, or re-enqueue.
+    #[tokio::test]
+    async fn concurrent_failing_batches_all_retry_instead_of_orphaning() {
+        let provider = Arc::new(ScriptedProvider::new(WORKER_CONCURRENCY, generic_failure));
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", provider.clone())],
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+        );
+        enqueue_one_batch_per_slot(&queue);
+        let converged = wait_until(Duration::from_secs(5), || {
+            queue.status().routes["code"].queue_depth == 0
+        })
+        .await;
+        assert!(converged, "every batch must reach a terminal outcome");
+        let status = queue.status().routes["code"].clone();
+        assert_eq!(status.indexed_count, WORKER_CONCURRENCY as u64);
+        assert_eq!(status.dropped_count, 0);
+        assert_eq!(status.retried_count, WORKER_CONCURRENCY as u64);
+        assert!(status.available);
+        // Every identity was released: re-enqueue admits it again.
+        let heavy = "x".repeat(MAX_BATCH_BYTES / 2 + 1);
+        for i in 0..WORKER_CONCURRENCY {
+            let id = format!("e{i}");
+            assert!(
+                queue.enqueue(request_with_text(Bucket::Code, &id, "h", &heavy)),
+                "{id} must not be stuck in the pending set"
+            );
+        }
+        queue.shutdown();
+    }
+
+    /// A succeeding batch-mate resets the route backoff but must not touch
+    /// a parked batch. The old code cleared the retry slot on any success,
+    /// which is the common orphan path: one 429 in an otherwise healthy wave.
+    #[tokio::test]
+    async fn batch_mate_success_does_not_clear_a_parked_retry() {
+        let provider = Arc::new(ScriptedProvider::new(1, generic_failure));
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", provider.clone())],
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+        );
+        enqueue_one_batch_per_slot(&queue);
+        let converged = wait_until(Duration::from_secs(5), || {
+            queue.status().routes["code"].queue_depth == 0
+        })
+        .await;
+        assert!(converged, "the failed batch must still be retried");
+        let status = queue.status().routes["code"].clone();
+        assert_eq!(status.indexed_count, WORKER_CONCURRENCY as u64);
+        assert_eq!(status.dropped_count, 0);
+        assert_eq!(status.retried_count, 1);
+        queue.shutdown();
+    }
+
+    /// Rate-limit rejections get the longer budget: four consecutive 429s
+    /// would exhaust the generic three-attempt ladder, but the batch must
+    /// still embed once the window opens.
+    #[tokio::test]
+    async fn rate_limited_batches_outlast_the_generic_retry_budget() {
+        let failures = usize::from(MAX_BATCH_RETRIES) + 1;
+        let provider = Arc::new(ScriptedProvider::new(failures, rate_limit_failure));
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("code", provider.clone())],
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+        );
+        assert!(queue.enqueue(request(Bucket::Code, "a", "h1")));
+        let converged = wait_until(Duration::from_secs(10), || {
+            queue.status().routes["code"].indexed_count == 1
+        })
+        .await;
+        assert!(
+            converged,
+            "a rate-limited batch must embed after the window opens"
+        );
+        let status = queue.status().routes["code"].clone();
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(status.dropped_count, 0);
+        assert_eq!(status.retried_count, failures as u64);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), failures + 1);
+        queue.shutdown();
+    }
+
+    #[test]
+    fn rate_limit_backoff_honors_retry_after_above_the_floor() {
+        let base = Duration::from_secs(1);
+        let mut backoff = RouteBackoff::new(base);
+        let floor = base * RATE_LIMIT_BACKOFF_MULTIPLIER;
+        assert_eq!(backoff.next_rate_limit(None), floor);
+        assert_eq!(
+            backoff.next_rate_limit(Some(Duration::from_secs(1))),
+            floor * 2
+        );
+        assert_eq!(
+            backoff.next_rate_limit(Some(Duration::from_secs(90))),
+            Duration::from_secs(90)
+        );
+        backoff.reset();
+        assert_eq!(backoff.next_rate_limit(None), floor);
+        assert_eq!(backoff.next_generic(), base);
+        assert_eq!(backoff.next_generic(), base * 2);
+    }
+
+    #[test]
+    fn provider_http_failures_classify_by_status() {
+        use reqwest::StatusCode;
+        let rate_limited = classify_provider_http_failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            parse_retry_after_secs(Some("30")),
+            "429".into(),
+        );
+        assert_eq!(
+            rate_limit_of(&rate_limited),
+            Some(Some(Duration::from_secs(30)))
+        );
+        assert!(!is_non_retryable(&rate_limited));
+        let poison = classify_provider_http_failure(StatusCode::BAD_REQUEST, None, "400".into());
+        assert!(is_non_retryable(&poison));
+        assert!(rate_limit_of(&poison).is_none());
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            let err = classify_provider_http_failure(status, None, status.to_string());
+            assert!(!is_non_retryable(&err), "{status} must stay retryable");
+            assert!(
+                rate_limit_of(&err).is_none(),
+                "{status} is not a rate limit"
+            );
+        }
+        assert_eq!(
+            parse_retry_after_secs(Some(" 7 ")),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            parse_retry_after_secs(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after_secs(None), None);
     }
 
     #[tokio::test]

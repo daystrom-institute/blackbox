@@ -195,22 +195,26 @@ impl EmbeddingProvider for VoyageContextProvider {
             .context("sending voyage contextualized embedding request")?;
         let status = raw.status();
         if !status.is_success() {
+            let retry_after = super::queue::parse_retry_after_secs(
+                raw.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+            );
             let body = raw.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(512).collect();
             let message = format!(
                 "voyage contextualized embedding request failed: HTTP {status} documents={} body={snippet}",
                 groups.len()
             );
-            // Same poison contract as the text provider (gap-e3e033ce).
-            if status.is_client_error()
-                && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                return Err(
-                    anyhow::Error::new(super::queue::NonRetryableBatchError).context(message)
-                );
-            }
-            bail!("{message}");
+            // Payload-level 4xx is non-retryable (the queue bisects to the
+            // poison item, gap-e3e033ce); 429 carries the rate-limit marker
+            // so the queue waits out the per-minute window instead of
+            // dropping the batch; everything else is a plain retry.
+            return Err(super::queue::classify_provider_http_failure(
+                status,
+                retry_after,
+                message,
+            ));
         }
         let response = raw
             .json::<ContextResponse>()

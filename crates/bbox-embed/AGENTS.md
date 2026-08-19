@@ -32,3 +32,15 @@
 - Every embed call carries an `EmbedInputType` role: queue workers send
   `Document`, live retrieval sends `Query`. Voyage vectors differ by role,
   so a new provider/call site must never default one role for both.
+- Queue worker retry state is PER BATCH (`RetryBatch` queue in
+  `queue.rs`), never a single worker-level slot: a wave dispatches
+  `WORKER_CONCURRENCY` batches in parallel, and a shared slot let a second
+  failing batch-mate overwrite the first (and a succeeding batch-mate clear
+  it), stranding items in the `pending` identity set with their
+  `queue_depth` accounted and no path to persist, drop, or re-enqueue until
+  a daemon restart. Every admitted batch must end in exactly one of
+  `mark_success`, `mark_dropped`, or `mark_poison_dropped`, each paired
+  with `release_pending`. Provider 429s carry `RateLimitedBatchError`
+  (attach it via `classify_provider_http_failure`) and get the longer
+  `MAX_RATE_LIMIT_RETRIES` budget with a per-minute-window floor; the
+  generic 1s/2s/4s ladder cannot outlast a TPM window.
