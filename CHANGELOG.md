@@ -281,6 +281,24 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- The checkout call-site audit scanner no longer unaudits the rest of a
+  file after a column-0 `#[cfg(test)]` line (gap-bacd5e20). Test scope is
+  tracked structurally: a cfg(test) attribute gates exactly one item, its
+  braced block through string/comment-aware brace counting (so a gated
+  item nested in a test module does not end the module's scope) or the
+  `;`-terminated item itself, and a bare gated import or struct field no
+  longer hides every later acquisition. The sticky flag had been silently
+  skipping real production sites this way; four of them
+  (`code_source.rs::probe_ladder`, `code_source.rs::attempt_cutback_catalog`,
+  `routes.rs::enqueue_project_knowledge_embeds`, `render.rs::bbox_render`)
+  land their audit rows as a result. A row whose site disappears from the
+  scan is now reported as SCAN/SITE MISMATCH when the scan still sees its
+  acquisitions as cfg(test)-scoped (report the scanner, keep the row)
+  versus STALE ROW when nothing remains (remove or rekey it), so a
+  scan-side classification change no longer steers authors toward
+  deleting correct ledger rows. Run
+  `scripts/acceptance-checkout-callsites.sh --self-test` for the fixture
+  coverage of the tracking and the messages.
 - `whiteboard_archive` now enforces the facilitator/operator role on the
   normal resolve-phase path, not only when `force=true`. The force-archive
   fix (gap-0301dc75) gated the force branch alone, so any registered
