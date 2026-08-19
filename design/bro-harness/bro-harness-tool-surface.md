@@ -129,6 +129,11 @@ Operator-confirmed for v1:
     (`READER_DRAIN_GRACE`) and aborts stragglers.
   - *`close_stdin`:* read-until-EOF commands (`cat`, `sort`) could never finish
     without an EOF; added on both run and poll.
+  - *Default stdin is /dev/null, not an open pipe:* piped-always stdin made
+    pathless stdin-reading commands (rg/grep/cat/jq with no path) block
+    forever on a read whose EOF never comes. `stdin` is piped only when the
+    caller supplies it (an explicit `""` pipes an initially-empty stream for
+    later `shell_poll` feeds).
   - *`shell_kill`:* the only prior way to stop a non-timeout session was
     `run()`-end drop; now there's an in-dispatch signal+reap with SIGKILL
     escalation after `grace_ms`.

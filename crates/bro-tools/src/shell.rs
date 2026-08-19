@@ -609,7 +609,12 @@ struct ShellRunInput {
     /// default 10000). The TAIL is kept so trailing errors survive.
     max_output_tokens: Option<usize>,
     /// Initial stdin written to the process. The stream stays open for
-    /// shell_poll to feed more, unless close_stdin is set.
+    /// shell_poll to feed more, unless close_stdin is set. When omitted, the
+    /// child's stdin is /dev/null (immediate EOF): a command that reads stdin
+    /// when it is not a tty (pathless rg/grep, cat, jq without files) then
+    /// finishes empty or fails fast instead of blocking forever. Pass
+    /// stdin: "" to open an initially-empty pipe you intend to feed via
+    /// shell_poll.
     stdin: Option<String>,
     /// Close (EOF) the stdin stream after writing `stdin`. Required for
     /// commands that read until EOF (e.g. `cat`, `sort`) to terminate.
@@ -635,7 +640,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue yielded sessions with shell_poll until running=false. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). output_filter keeps matching stdout/stderr lines after capture without changing the real exit_code. stdin feeds initial input; close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. Long commands yield by default after ~1s with running=true + session_id; set yield_time_ms to wait that many ms for exit, or 0 to block until exit/timeout. Continue yielded sessions with shell_poll until running=false. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). output_filter keeps matching stdout/stderr lines after capture without changing the real exit_code. stdin feeds initial input (omitted stdin means /dev/null, so stdin-reading commands like pathless rg/grep or bare cat see EOF immediately instead of hanging); close_stdin sends EOF; env injects variables. Refuses categorically destructive commands."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -662,7 +667,6 @@ impl Tool for ShellRun {
         let mut cmd = tokio::process::Command::new("bash");
         cmd.args(["-lc", &args.command])
             .current_dir(&cwd)
-            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -671,6 +675,18 @@ impl Tool for ShellRun {
             // (codex-rs does the equivalent via setsid/setpgid in pre_exec).
             // kill_on_drop alone only reaps the direct bash child.
             .process_group(0);
+        // Stdin is piped only when the caller supplies it. An always-open
+        // pipe made pathless stdin-reading commands (rg/grep/cat/jq with no
+        // path, and wrappers over them) block forever on a read whose EOF
+        // never comes; with no `stdin` the child reads /dev/null instead, so
+        // such commands see immediate EOF and finish empty or fail fast.
+        // An explicit `stdin: ""` still pipes, keeping the stream open for a
+        // later shell_poll feed (gap-aa2baeb3).
+        cmd.stdin(if args.stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
         apply_child_env(&mut cmd, &cx.shell_env);
         for (k, v) in &args.env {
             cmd.env(k, v);
@@ -780,7 +796,9 @@ impl Tool for ShellRun {
 struct ShellPollInput {
     /// Session id from a prior shell_run that returned running=true.
     session_id: String,
-    /// Optional stdin to feed before draining.
+    /// Optional stdin to feed before draining. Only a session started with
+    /// shell_run's `stdin` has an open pipe to feed; the write is dropped
+    /// otherwise (sessions spawned without `stdin` read /dev/null).
     stdin: Option<String>,
     /// Close (EOF) the stdin stream after writing `stdin`.
     #[serde(default)]
@@ -1515,6 +1533,78 @@ mod tests {
         assert_eq!(v["running"], false, "EOF should let cat exit: {v}");
         assert_eq!(v["exit_code"], 0);
         assert_eq!(v["stdout"], "abc\n");
+    }
+
+    #[tokio::test]
+    async fn omitted_stdin_is_dev_null_so_stdin_readers_finish() {
+        // With no `stdin` arg the child's stdin is /dev/null, never an open
+        // pipe: `cat` sees immediate EOF and completes inline. An always-open
+        // pipe made such commands block forever (pathless rg/grep and their
+        // wrappers; gap-aa2baeb3). yield_time_ms=0 plus the outer timeout
+        // means a regression fails loudly instead of hanging the suite.
+        let fut = ShellRun.call(json!({"command": "cat", "yield_time_ms": 0}), &cx());
+        let v = as_json(
+            tokio::time::timeout(Duration::from_secs(6), fut)
+                .await
+                .expect("cat blocked: omitted stdin must be /dev/null, not an open pipe"),
+        );
+        assert_eq!(v["running"], false, "{v}");
+        assert_eq!(v["exit_code"], 0, "{v}");
+        assert_eq!(v["stdout"], "");
+    }
+
+    #[tokio::test]
+    async fn omitted_stdin_pathless_grep_fails_fast() {
+        // grep with no file arguments reads stdin (the observed incident was
+        // the same shape with rg): with /dev/null it reads EOF at once and
+        // exits 1 ("no match") instead of sitting asleep on fd 0.
+        let fut = ShellRun.call(
+            json!({"command": "grep zq-no-such-token", "yield_time_ms": 0}),
+            &cx(),
+        );
+        let v = as_json(
+            tokio::time::timeout(Duration::from_secs(6), fut)
+                .await
+                .expect("pathless grep blocked on stdin"),
+        );
+        assert_eq!(v["running"], false, "{v}");
+        assert_eq!(v["exit_code"], 1, "grep on empty stdin is no-match: {v}");
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_stdin_pipes_and_poll_can_feed_later() {
+        // `stdin: ""` is an explicit pipe request: the stream stays open so a
+        // yielded session can be fed via shell_poll, distinct from omitted
+        // stdin (/dev/null). Guards the escape hatch for callers that feed
+        // input only after the yield.
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "read x; echo got=$x", "stdin": "",
+                           "yield_time_ms": 50}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(v["running"], true, "read blocks on the open pipe: {v}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let p = as_json(
+            ShellPoll
+                .call(
+                    json!({"session_id": sid, "stdin": "fed-later\n",
+                           "close_stdin": true, "yield_time_ms": 3000}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(p["running"], false, "{p}");
+        assert_eq!(p["exit_code"], 0, "{p}");
+        assert!(
+            p["stdout"].as_str().unwrap().contains("got=fed-later"),
+            "{p}"
+        );
     }
 
     #[tokio::test]
