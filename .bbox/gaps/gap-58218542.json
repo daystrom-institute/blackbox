@@ -1,0 +1,22 @@
+{
+  "id": "gap-58218542",
+  "title": "Project-graph vertices never embed: no vector route serves them despite embeddings_enabled and embed:true annotations",
+  "gap_kind": "mcp_surface",
+  "domain": "project-graph",
+  "wanted_capability": "Graph vertices whose schema properties carry embed:true (pg-campaigns: Idiom.statement, Decision.question, Directive.text, EndState.text, Finding.summary, Trigger.statement, Inquiry.question, Spike.hypothesis) should gain vector embeddings so bbox_hybrid_search's vector lane can rank them against prose competition. Observed: embedded_vertex_count stays 0 across multiple accepted generations (b71df430 through af7fe40e) with index_policy.embeddings_enabled true and the text index current; bbox_reembed exposes no project-graph route (valid routes: all, backfill, knowledge, code, docs, transcripts, git_message, notes, threads, agent_manifest) and an explicit backfill reembed changed nothing. Wanted: a project-graph embedding route wired into the publish/index cycle, or the graph vertices riding an existing route, plus bbox_reembed coverage.",
+  "fallback_used": "Text/BM25 lane only for graph retrieval (indexed_vertex_count current); findability calibration proceeds on the text lane and the campaign 46 search-annotations subunit stays gated on this gap for the vector half.",
+  "evidence": [
+    "bbox_project_graph_describe pg-campaigns retrieval block: embedded_vertex_count 0 at accepted af7fe40ee6",
+    "bbox_reembed route enumeration (no project_graph route)",
+    "planglobal thread-7b768d31 step 2"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/project-graph/vertex-embeddings-never-produced",
+  "notes": "2026-08-19: operator directive SD-10 (planglobal campaigns/DIRECTIVES.md, mined as directive/SD-10@1) makes agent-facing graph retrievability the primary interface goal for the pg-campaigns graph; renders are demoted to human viewports. This gap is now the top blocker on campaign 46's search-annotations gate, so impact raised medium to high from the consumer side. A runnable acceptance probe is codified consumer-side as spike/46-vector-lane-acceptance-probe@1 in the pg-campaigns graph (route present, embedded_vertex_count > 0, two named hybrid queries expecting idiom/delete-then-insert@1 top-5, one a no-shared-keyword paraphrase to prove the vector lane). Consumer-side embed:true property set is FINALIZED and published (operator ruling 2026-08-19, planglobal commit c1e3937d00, accepted generation serves it): Subunit.summary, Target.description, and Decision.rationale added; Campaign.status_qualifier deliberately excluded (churns every sync). The backfill can run once against this set.",
+  "resolution": "addressed",
+  "created_at": "2026-08-18T09:25:55Z",
+  "updated_at": "2026-08-19T21:36:25Z",
+  "resolved_at": "2026-08-19T21:36:25Z",
+  "resolution_note": "Landed in blackbox 373ff9e9 (beta/blackbox-v2) and converged to the cage 2026-08-19 (image 373ff9e9f2a9). New `graph` embedding route (Bucket::Graph; [embed.routes] graph, per-project overridable) embeds the composed label + embed:true property projection under the three-way gate; published view installs enqueue and tombstone, bbox_reembed(route=graph) backfills from installed views and reconciles orphans, hybrid search drops unreadable/stale graph vectors before fusion, bbox_project_graph_describe reports embed_eligible_vertex_count / embedded_vertex_count. Verified live on pg-campaigns: embed_eligible_vertex_count=159, embedded_vertex_count=159; vector-only paraphrase \"remove the old rows first and then write the fresh ones instead of updating in place\" ranks idiom/delete-then-insert@1 at #1 with no BM25 contribution. Note for the consumer: the cage embed.toml has no explicit graph route so it rides the default `voyage` alias (voyage-code-3); setting `[embed.routes] graph = \"voyage_text\"` (voyage-4-large) would put prose-shaped vertices on the prose model (cheap re-embed of 159 vectors; then prune the orphaned partition via bbox_embed_partitions)."
+}
