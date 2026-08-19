@@ -16,11 +16,12 @@
   "dedupe_key": "mcp_surface/refactor-tools/plan-kind-catalog-pagination-projection",
   "suggested_owner": "blackbox",
   "notes": "Observed all-language bbox_refactor_plan_kinds response_too_large at 100862 bytes over an 81920 cap while exploring isolate usage.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "task_id": "a0143f51-0a2b-43e7-a300-4c9ce4d3fa80",
   "session_id": "da082ef9-697e-41e1-b321-f476006ce2a5",
   "created_at": "2026-06-12T15:51:14Z",
-  "updated_at": "2026-06-18T00:51:28Z",
-  "resolved_at": "2026-06-18T00:51:28Z",
-  "resolution_note": "Partially met: RefactorPlanKindsParams (crates/bbox-refactor/src/lib.rs:148) already supports projection-by-filter (language/safety_class/backend), and add_plan_kind_group (:1552) emits compact per-kind records (no large previews). Remaining ask (offset/limit pagination, field-level projection) is deliberately not pursued: the v1 bbox_refactor_plan_kinds catalog is CLOSED and on the kill list (decision af3c4783 \"Refactor tooling is harness-native; daemon refactor surfaces retire with no bridge\" + b8dc263d; bbox-refactor/AGENTS.md). The harness-native future (bro-harness cell bindings code.*/edits.*/java.*) does not consume this catalog — they are thin adapters over `plan`. Adding pagination to a retiring endpoint is moot investment."
+  "updated_at": "2026-08-19T02:50:09Z",
+  "resolved_at": "2026-08-19T02:50:09Z",
+  "resolution_note": "Closed as obviated 2026-08-19: the daemon-MCP refactor plan/apply/run surface no longer exists (operator ruling in-session; crates/bbox-mcp-tools registers only agentic-graph tools, and code/java transforms live in bro-harness bindings). Surface retirement is the resolution; no fix to cite."
 }

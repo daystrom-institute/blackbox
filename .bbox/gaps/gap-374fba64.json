@@ -16,11 +16,12 @@
   "dedupe_key": "mcp_surface/refactor-tools/per-kind-schema-describe",
   "suggested_owner": "blackbox",
   "notes": "The current broad bbox_refactor_plan schema is too large and union-shaped for reliable isolate composition.",
-  "resolution": "acknowledged",
+  "resolution": "addressed",
+  "project_id": "89bd722f",
   "task_id": "a0143f51-0a2b-43e7-a300-4c9ce4d3fa80",
   "session_id": "da082ef9-697e-41e1-b321-f476006ce2a5",
   "created_at": "2026-06-12T15:51:14Z",
-  "updated_at": "2026-06-18T00:34:42Z",
-  "resolved_at": "2026-06-18T00:34:42Z",
-  "resolution_note": "Partially met by bbox_refactor_plan_kinds (crates/bbox-refactor/src/lib.rs:1290 via add_plan_kind_group :1552), which already returns per-kind: language, safety_class, backend, item_kinds, required_fields, optional_fields, suggested_preflight (ordered+default_first+notes), semantic_status_expected/meaning, when_to_use, notes. Remaining asks (typed JSON schema, opt-out flags, example invocations, response shape) are deliberately not pursued: the v1 bbox_refactor_* catalog is CLOSED and on the kill list (decision af3c4783 \"Refactor tooling is harness-native; daemon refactor surfaces retire with no bridge\" + b8dc263d; bbox-refactor/AGENTS.md). New capability lands as bro-harness cell bindings (code.*/edits.*/java.*/analysis.*), not a richer v1 describe API. Building the requested endpoint would invest in the retiring path."
+  "updated_at": "2026-08-19T02:50:09Z",
+  "resolved_at": "2026-08-19T02:50:09Z",
+  "resolution_note": "Closed as obviated 2026-08-19: the daemon-MCP refactor plan/apply/run surface no longer exists (operator ruling in-session; crates/bbox-mcp-tools registers only agentic-graph tools, and code/java transforms live in bro-harness bindings). Surface retirement is the resolution; no fix to cite."
 }
