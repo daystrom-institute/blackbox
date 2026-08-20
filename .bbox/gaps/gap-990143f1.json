@@ -1,0 +1,22 @@
+{
+  "id": "gap-990143f1",
+  "title": "Spill envelope is unreachable for remote MCP clients: spilled_to is a daemon-local path",
+  "gap_kind": "mcp_surface",
+  "domain": "response-cap",
+  "wanted_capability": "The over-cap spill envelope (spilled_to pointing into <state_dir>/response-dumps/) assumes the MCP client shares a filesystem with the daemon. For remote clients (macOS control-plane host talking to the cage daemon over HTTP MCP) the path is unreachable, so an over-cap response is not lossless, it is effectively lost: the client gets a preview plus a pointer it cannot dereference. Wanted: a wire-level retrieval path for spilled payloads, e.g. a bbox tool or HTTP route that fetches a spill by id with offset/limit chunking (each chunk under the response cap), or client-locality detection that falls back to paginated delivery instead of a local path. The spill id is already in the envelope; only the dereference primitive is missing.",
+  "missing_primitive": "Remote dereference for response-dump spill files (fetch-by-id with chunking) or locality-aware spill delivery",
+  "fallback_used": "Re-issued the query in a narrower form (bro_brofile get by name instead of list) to stay under the cap; brofile survey questions stay unanswerable remotely.",
+  "evidence": [
+    "bro_brofile(action=list) -> 91,116 bytes spilled to /var/lib/blackbox/state/response-dumps/resp-1787210381708-de5bfe63ed50dca3.json, unreachable from the macOS MCP client (2026-08-20)",
+    "umbrella gap-ecff3899 (mcp_surface/response-cap/per-tool-oversized-producers) treats spill as lossless recovery, which only holds for colocated clients",
+    "sibling gap-f29ee57e (bbox_gaps listing shape)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/response-cap/spill-unreachable-remote-clients",
+  "notes": "Filed at operator direction mid-session. The spill mechanism's losslessness claim silently depends on filesystem colocation; every remote-client over-cap response is a hard data loss today. Producer-side shaping (gap-ecff3899) reduces frequency but the dereference primitive is still missing for the residual cases.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-20T07:24:21Z",
+  "updated_at": "2026-08-20T07:24:21Z"
+}
