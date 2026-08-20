@@ -1,0 +1,21 @@
+{
+  "id": "gap-32d28e0d",
+  "title": "Anthropic transport thinking replay omits signature field, rejected by OpenRouter's strict validator",
+  "gap_kind": "tooling",
+  "domain": "bro-harness/transport",
+  "wanted_capability": "OpenRouter serves the Anthropic Messages API natively (https://openrouter.ai/api/v1/messages), which makes it a viable back end for the existing Anthropic-transport dispatch lanes via a brofile account env override (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN), unlocking provider-pinned fast-silicon workers (MiniMax M2.7 on Groq/SambaNova at 280-365 tok/s vs 11-34 tok/s on the current GLM lanes). The first live dispatch fails on turn 2: crates/bro-harness/src/transport/anthropic.rs (~461) replays the prior assistant thinking block but attaches signature only when the stream provided a non-empty signature_delta. OpenRouter's request validator requires signature as a string on replayed thinking blocks (its own responses carry signature: \"\"), so the continuation 400s with invalid_union at messages[N].content[0].signature. Wanted: replay thinking blocks with a signature field always present (empty string when the stream gave none), or an equivalent compatibility knob, after verifying the first-party lanes (Z.AI, MiniMax, Kimi, DeepSeek) tolerate signature: \"\".",
+  "missing_primitive": "OpenRouter-compatible thinking-block replay on the bro-harness anthropic transport",
+  "fallback_used": "None yet; the mm-samba brofile (minimax provider + openrouter account env) is parked on this failure.",
+  "evidence": [
+    "task dc322d0b-1a3d-4feb-9440-deedbd1e775c (session 921ab674): anthropic messages 400 invalid_union at messages[2].content[0].signature, 2026-08-20",
+    "crates/bro-harness/src/transport/anthropic.rs:454-465 (signature attached only when non-empty)",
+    "direct OR probe: POST /api/v1/messages response thinking block carries signature: \"\" (2026-08-20)"
+  ],
+  "impact": "medium",
+  "blocking_level": "blocks_task",
+  "dedupe_key": "tooling/bro-harness-transport/thinking-replay-signature-openrouter",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-20T07:24:41Z",
+  "updated_at": "2026-08-20T07:24:41Z"
+}

@@ -455,14 +455,17 @@ fn reconstruct_segment(
                 // Replay the thinking block on the next turn. Thinking-native
                 // models (MiniMax-M3) return empty output on a continuation if a
                 // prior assistant turn's thinking block is missing while
-                // `thinking` is enabled. The signature is included when the
-                // stream provided one; MiniMax tolerates its absence, and real
-                // Anthropic needs it to validate the replayed block.
-                let mut tb = json!({"type": "thinking", "thinking": b.text});
-                if !b.signature.is_empty() {
-                    tb["signature"] = json!(b.signature);
-                }
-                content.push(tb);
+                // `thinking` is enabled. The signature field is always present,
+                // empty when the stream gave no signature_delta: real Anthropic
+                // needs the streamed value to validate the replayed block, and
+                // OpenRouter's validator requires the field itself (it 400s a
+                // signature-less thinking block, gap-32d28e0d) while MiniMax,
+                // Z.AI, and OpenRouter all accept signature: "".
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": b.text,
+                    "signature": b.signature,
+                }));
                 thinking_out.push_str(&b.text);
             }
             "tool_use" => {
@@ -1636,6 +1639,24 @@ mod tests {
         assert!(tool_calls.is_empty());
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["signature"], "sig-123");
+    }
+
+    /// OpenRouter's Anthropic-format validator requires `signature` to be a
+    /// string on replayed thinking blocks and 400s when the field is absent
+    /// (gap-32d28e0d); MiniMax, Z.AI, and OpenRouter all accept `""`. A stream
+    /// with no signature_delta must therefore still replay `signature: ""`.
+    #[test]
+    fn reconstruct_segment_emits_empty_signature_when_stream_gave_none() {
+        let blocks = vec![SseBlock {
+            kind: "thinking".into(),
+            text: "reasoned".into(),
+            ..Default::default()
+        }];
+
+        let (content, _text, thinking, _tool_calls) = reconstruct_segment(&blocks).unwrap();
+        assert_eq!(thinking, "reasoned");
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "");
     }
 
     /// GLM (z.ai) shape: real Anthropic puts input tokens in
