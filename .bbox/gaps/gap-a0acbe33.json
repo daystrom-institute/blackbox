@@ -1,0 +1,21 @@
+{
+  "id": "gap-a0acbe33",
+  "title": "Store JSON serialization change breaks immutable-install idempotency for same-id generations",
+  "gap_kind": "tooling",
+  "domain": "git-source-transport",
+  "wanted_capability": "Byte-format-independent idempotency for content-addressed generation installs. install_immutable_json compares stored bytes against the new serialization; a deploy that changed store JSON from pretty-printed to compact made every previously installed generation dir refuse re-install of the SAME generation id (identical manifest_sha256, identical logical content) with StoreRequestError::InvalidInput. Because history_source_generation_id pins (producer, repo_history, namespace, repo_head, manifest_sha256), a repo whose HEAD does not move re-derives the same id forever, so finalize 422s on every attempt: this was the actual origin of the 5-day wampum git-history wedge (generation ghs_dffc1c8a installed 2026-08-19 pretty-printed, superseded by the coverage freeze; every later same-head upload refused at finalize). Fix direction: treat an existing generation dir whose manifest_sha256/descriptor match as idempotent success (semantic compare or re-derived hash compare), or pin the store serialization format as part of the on-disk contract. Remedy: deleted the superseded relic dir and the wedged upload; the next pass finalized fresh.",
+  "missing_primitive": "semantic-equality (or descriptor-hash) idempotency check in install_immutable_json callers for generation artifacts",
+  "fallback_used": "Deleted the pretty-JSON-era superseded generation dir and wedged upload record in the pod by hand.",
+  "evidence": [
+    "crates/bbox-git-source-store/src/lib.rs finalize_history_upload install_immutable_json calls",
+    "crates/bbox-git-source/src/lib.rs:533-557 (generation id covers manifest_sha256, so same-head same-content re-derives the same id)",
+    "pod: ghs_dffc1c8a manifest.json pretty-printed (Aug 19, 242111 bytes) vs current upload compact (207729 bytes), identical entries"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/git-source-transport/immutable-install-serialization-drift",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-23T06:49:44Z",
+  "updated_at": "2026-08-23T06:49:44Z"
+}

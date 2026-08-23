@@ -883,8 +883,6 @@ fn enqueue_reembed_routes(
         let mut index_enqueued = 0usize;
         let mut index_docs_seen = 0usize;
         let mut visual_docs_seen = 0usize;
-        let mut visual_docs_reconstructed = 0usize;
-        let mut visual_payloads_decoded = 0usize;
         let mut visual_docs_enqueued = 0usize;
         state
             .idx
@@ -894,16 +892,15 @@ fn enqueue_reembed_routes(
                     return Ok(());
                 }
                 index_docs_seen += 1;
+                // Classification must not reconstruct the chunk: decoding a
+                // visual payload here allocated the full image for a counter,
+                // and at 14k visual docs per sweep that was a multi-GB
+                // allocation burst every interval while the docs themselves
+                // were never enqueued from this pass.
                 let visual = doc.doc_type == "project_file"
                     && crate::embed_queue::is_visual_chunk_kind(&doc.chunk_kind);
                 if visual {
                     visual_docs_seen += 1;
-                    if let Some(chunk) = chunk_from_embedding_doc(&doc) {
-                        visual_docs_reconstructed += 1;
-                        if chunk.visual_payload.is_some() {
-                            visual_payloads_decoded += 1;
-                        }
-                    }
                 }
                 let accepted = enqueue_reembed_index_doc(buckets, &doc);
                 if accepted {
@@ -918,8 +915,6 @@ fn enqueue_reembed_routes(
             index_docs_seen,
             index_enqueued,
             visual_docs_seen,
-            visual_docs_reconstructed,
-            visual_payloads_decoded,
             visual_docs_enqueued,
             "embedding rebuild index-source refill classified"
         );
