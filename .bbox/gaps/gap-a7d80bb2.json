@@ -14,8 +14,9 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "refactor_primitive/history-activation/overlay-only-drift-full-lane-replacement",
+  "notes": "Mechanism pinned precisely (2026-08-23 overnight): activation_metadata_current (src/server/history_activation.rs:893) returns stale whenever current code selectors differ from journal.code_selectors, UNCONDITIONALLY, even when the overlay set is empty or the drift cannot change overlay eligibility (heads permanently diverged). Every code-source push for a member project therefore forces a full re-activation, and publication replaces the consolidated commit lane (observed corpus doc oscillation 604k to 655k, ~51k docs) and re-seeds a ~51-55k doc embed residue each cycle, whose refill+drain spiked the daemon to its 48Gi cgroup ceiling (touched 48.00GiB at 06:48:53Z). Fix shape: currency should recompute would-be overlay selectors under the current manifest and treat the journal as current when they equal the journal's overlay set; a changed set should update overlays without whole-lane republication when source and P3 identity are unchanged. Overnight mitigations in place: collector git_history/provenance paused for the two actively-churning repos (transcript-search, pg-flare) in the host collector config, collector interval 600s, embed refill no longer decodes visual payloads (5fe29a84).",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "created_at": "2026-08-23T06:06:16Z",
-  "updated_at": "2026-08-23T06:06:16Z"
+  "updated_at": "2026-08-23T07:05:22Z"
 }
