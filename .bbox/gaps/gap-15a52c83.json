@@ -1,0 +1,21 @@
+{
+  "id": "gap-15a52c83",
+  "title": "bbox_thread mutations stall for the full duration of a slow edge-index rebuild",
+  "gap_kind": "tooling",
+  "domain": "daemon-runtime",
+  "wanted_capability": "Identification and removal of the shared resource that blocks bbox_thread mutations while an edge-index rebuild is in flight. Prod evidence (2026-08-23, cage daemon): three bbox_thread calls took 205s, 327s, and 169s, each completing within ~1 second of an edge-index rebuild finishing (271.6s, 374.9s, 194.6s rebuilds); tokio runtime metrics showed a core worker busy-blocked for the full 169s, so the handler blocks synchronously (a lock or lease, not an await). The rebuild's store read-guards drop before the multi-GB sidecar parse by design, so the contended resource is something held for the WHOLE rebuild (candidates: the index_writer publication guard's interaction with downstream paths, a Write-intent project-resolver lease, or the manifest coordinator). Phase-timing instrumentation (commit a3dbeb11) now logs which phase (resolve_project, store_write_guard, persist_durable) exceeds 5s; the next occurrence names the culprit.",
+  "fallback_used": "Reduced rebuild frequency and duration by fixing the churn engines (marker retirement unwedging wampum, code-source probe); slow rebuilds were amplified by memory pressure near the 48Gi cgroup limit.",
+  "evidence": [
+    "prod tool log: tool=bbox_thread elapsed_ms=327053 at 04:59:26.982, rebuild elapsed_ms=374852 finished 04:59:27.374",
+    "prod tool log: elapsed_ms=168998 at 05:11:13.123, rebuild elapsed_ms=194600 finished 05:11:14",
+    "runtime metrics 05:12:05: max_busy_duration_micros=168988015",
+    "src/tools/threads.rs slow-phase instrumentation (a3dbeb11)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/daemon-runtime/thread-mutation-blocks-on-edge-rebuild",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-23T06:06:29Z",
+  "updated_at": "2026-08-23T06:06:29Z"
+}

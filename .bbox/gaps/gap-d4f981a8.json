@@ -1,0 +1,22 @@
+{
+  "id": "gap-d4f981a8",
+  "title": "Git-transport recutover has no exit path for a stale covered row",
+  "gap_kind": "docs_runbook",
+  "domain": "git-transport-cutover",
+  "wanted_capability": "A supported ceremony path to unwedge a CoverageStalePendingRecutover row. Once a covered repo's catalog membership_generation moves past its marker row (wampum went 1 to 13 as 12 subtree projects were promoted after the 2026-08-06 cutover), typed history activation AND provenance import refuse pending a newer cutover, the collector's continued uploads retire the last Committed journal, and readiness evidence for a new marker (Committed journal at current ready source, per-member provenance receipts, code HEAD matching typed history) becomes unbuildable: the freeze forbids exactly the publications the evidence requires. The apply path only replaces Proposed rows and carries every other predecessor row forward verbatim, so a stale row can never leave the marker; the resolution artifact only acknowledges blocked (assignment-removed) repos, and blocking wampum's grant would have severed its code-source and knowledge lanes too. 2026-08-23 remedy: retired the marker + receipt entirely (backups at /var/lib/blackbox/state/backups/pre-git-recutover-20260822/), returning all 19 repos to Uncovered-with-grant, which activates normally (pg-flare ran that mode healthily for 2 weeks). Wampum's stuck 2026-08-19 source activated within minutes. Re-establishing coverage needs per-member provenance for wampum's 13 members, then a fresh full cutover ceremony.",
+  "missing_primitive": "ceremony verb (or resolution arm) that drops or re-baselines a stale covered row without forging evidence",
+  "fallback_used": "Offline marker + receipt retirement with PVC and local backups; all repos fall back to Uncovered-with-grant which the activation gate admits.",
+  "evidence": [
+    "crates/bbox-indexing/src/git_transport_cutover.rs:1604-1620 (carried rows = predecessor minus Proposed)",
+    "crates/bbox-indexing/src/git_transport_cutover.rs:2233-2325 (readiness defects)",
+    "src/server/history_activation.rs:689-697 (transport_governed && !current refuses at finish_activation)",
+    "prod: 5 days of 422 invalid_upload_state on wampum git-history lane, ~660/day since 2026-08-19"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/git-transport-cutover/stale-covered-row-no-exit",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-23T06:06:44Z",
+  "updated_at": "2026-08-23T06:06:44Z"
+}

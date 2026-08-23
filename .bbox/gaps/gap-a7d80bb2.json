@@ -1,0 +1,21 @@
+{
+  "id": "gap-a7d80bb2",
+  "title": "Git-history activation replaces the whole commit lane on overlay-only drift",
+  "gap_kind": "refactor_primitive",
+  "domain": "history-activation",
+  "wanted_capability": "An overlay-selector-only update path in activate_source: when the committed journal's source generation and P3 generation are unchanged and only the code selector / overlay eligibility drifted, swap the overlay selectors without clearing overlays and re-running the full activation (which replaces the entire (repo_id, commit) tantivy lane). Under active development the current behavior re-commits the same generation every ~2 minutes: prod showed rh_5f9fcb37 (transcript-search, 3,303 commits) re-committing continuously, oscillating the corpus doc count 604,168 to 607,693, keeping edge sidecars churning so the EdgeIndex watcher rebuilt a 1.5M-edge graph near-continuously (rebuilds up to 375s), re-enqueueing a constant 3,591-doc embed residue every 5-minute sweep, and growing the daemon heap to its 48Gi limit (4 OOMKills in 3 days).",
+  "missing_primitive": "overlay-selector swap without whole-lane republication when source+P3 identity is unchanged",
+  "fallback_used": "Reduced upstream churn instead: code-source pre-upload currency probe (commit a3dbeb11) stops unchanged-tree code generations, so overlay eligibility flaps only when the tree genuinely changes.",
+  "evidence": [
+    "src/server/history_activation.rs:277 (clear_transport_overlays_for_repo before full re-activation)",
+    "src/server/history_activation.rs:236-276 (no-op path whose committed_metadata_current check fails on code-selector drift)",
+    "prod blackboxd logs 2026-08-23: repeated 'typed Git-history activation committed' same ghs/p3, overlays toggling 0/1 every ~2min"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "refactor_primitive/history-activation/overlay-only-drift-full-lane-replacement",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-23T06:06:16Z",
+  "updated_at": "2026-08-23T06:06:16Z"
+}
