@@ -1,0 +1,21 @@
+{
+  "id": "gap-9c91a9c0",
+  "title": "Git-history upload resume protocol wedges mid-state uploads permanently",
+  "gap_kind": "tooling",
+  "domain": "git-source-transport",
+  "wanted_capability": "A resumable or abortable git-history upload protocol. begin_history_upload resumes an existing non-terminal upload record with the same descriptor (returns its upload_id), but the collector client always replays the flow from manifest-page upload, which is invalid for a record stuck in missing_records: the result is a permanent 422 invalid_upload_state loop (wampum program repo, every pass from 2026-08-19 to 2026-08-23, ~660 failures/day). Either the begin response should carry the resumed record's state so the client can continue from the right step, or the client needs an abort/restart verb. Separately, terminal ready/superseded upload staging dirs are never cleaned: 47 leftover ready records had accumulated for one producer (34 for one actively-developed repo). Remedy tonight: deleted the stuck staging dir by hand in the pod; the next collector pass re-uploaded fresh.",
+  "missing_primitive": "upload state in begin response, or an abort-upload verb, plus terminal-upload staging GC",
+  "fallback_used": "Manual rm -rf of the stuck upload staging dir in the daemon pod.",
+  "evidence": [
+    "crates/bbox-git-source-store/src/lib.rs:1640-1661 (begin resumes same-descriptor non-terminal record)",
+    "crates/bbox-code-collector/src/main.rs publish_git_history (always replays from manifest)",
+    "collector log: ~660/day 422 invalid_upload_state on wampum program since 2026-08-19"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/git-source-transport/upload-resume-mid-state-wedge",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-23T06:14:17Z",
+  "updated_at": "2026-08-23T06:14:17Z"
+}
