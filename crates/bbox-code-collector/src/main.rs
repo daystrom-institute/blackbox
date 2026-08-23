@@ -2735,9 +2735,13 @@ async fn response_error(response: reqwest::Response) -> Result<()> {
 
 async fn response_error_value(response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
+    // Path only (no query/host churn): pins WHICH protocol step failed.
+    // A five-day 422 loop was undiagnosable from the lane error alone
+    // because every step reports through this one error shape.
+    let path = response.url().path().to_string();
     let body = response.text().await.unwrap_or_default();
     if status == StatusCode::UNAUTHORIZED {
-        anyhow!("code-source server rejected collector credentials")
+        anyhow!("code-source server rejected collector credentials at {path}")
     } else {
         let parsed = serde_json::from_str::<ErrorResponse>(&body).ok();
         anyhow!(RemoteResponseError {
@@ -2747,6 +2751,7 @@ async fn response_error_value(response: reqwest::Response) -> anyhow::Error {
                 .map(|error| error.message)
                 .unwrap_or_else(|| truncate(&body, 512)),
         })
+        .context(format!("request path {path}"))
     }
 }
 

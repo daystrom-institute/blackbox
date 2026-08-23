@@ -609,6 +609,41 @@ impl VectorStore {
         Ok(hashes)
     }
 
+    /// Visit every active `(entity_id, content_hash)` pair in one route
+    /// without materializing the whole set (a large partition holds hundreds
+    /// of thousands of rows; cloning every pair for a scan is real memory).
+    /// The partition read lock is held for the duration of the walk.
+    pub fn for_each_active(&self, route: &str, mut visit: impl FnMut(&str, &str)) -> Result<()> {
+        let Some(partition) = self.partitions.read().get(route).cloned() else {
+            return Ok(());
+        };
+        let guard = partition.read();
+        for entry in guard.slab.active_entries() {
+            visit(&entry.entity_id, &entry.content_hash);
+        }
+        Ok(())
+    }
+
+    /// See `Partition::clone_active`: re-key an unchanged-content row to a
+    /// re-minted entity id without a provider call. Returns false when the
+    /// route has no partition or the source row is absent, inactive, or
+    /// carries a different content hash.
+    pub fn clone_active(
+        &self,
+        route: &str,
+        from_entity_id: &str,
+        to_entity_id: &str,
+        content_hash: &str,
+    ) -> Result<bool> {
+        let Some(partition) = self.partitions.read().get(route).cloned() else {
+            return Ok(false);
+        };
+        let cloned = partition
+            .write()
+            .clone_active(from_entity_id, to_entity_id, content_hash)?;
+        Ok(cloned)
+    }
+
     pub(crate) fn cluster_neighbors_within_route(
         &self,
         route: &str,
@@ -1329,6 +1364,32 @@ impl Partition {
                 .map_err(anyhow::Error::msg)?,
             None => self.rebuild_hnsw()?,
         }
+        Ok(true)
+    }
+
+    /// Re-key an active row to a new entity id without re-embedding: used
+    /// when an entity's identity is re-minted (a new code-source snapshot id
+    /// inside a `project_file_v2` ref) while its content, and therefore its
+    /// vector, is unchanged. Copies the stored vector under `to_entity_id`
+    /// and tombstones the source row, all through the normal WAL ops. Returns
+    /// false (and does nothing) unless the source row is active and its
+    /// content hash matches - the content-hash equality is the correctness
+    /// guard that keeps this strictly a re-key, never a stale-content alias.
+    fn clone_active(
+        &mut self,
+        from_entity_id: &str,
+        to_entity_id: &str,
+        content_hash: &str,
+    ) -> Result<bool> {
+        if from_entity_id == to_entity_id {
+            return Ok(false);
+        }
+        let vector = match self.slab.active_entry(from_entity_id) {
+            Some(entry) if entry.content_hash == content_hash => entry.vector.clone(),
+            _ => return Ok(false),
+        };
+        self.upsert(to_entity_id, content_hash, vector)?;
+        self.delete(from_entity_id)?;
         Ok(true)
     }
 
@@ -2060,6 +2121,62 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_active_rekeys_without_reembedding_and_survives_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "old-id", "h1", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        // Content-hash mismatch refuses the re-key.
+        assert!(
+            !store
+                .clone_active("voyage-1024", "old-id", "new-id", "other-hash")
+                .unwrap()
+        );
+        // Absent source refuses.
+        assert!(
+            !store
+                .clone_active("voyage-1024", "missing", "new-id", "h1")
+                .unwrap()
+        );
+        // Matching hash re-keys: new id active, old id tombstoned.
+        assert!(
+            store
+                .clone_active("voyage-1024", "old-id", "new-id", "h1")
+                .unwrap()
+        );
+        assert!(
+            store
+                .contains_active("voyage-1024", "new-id", "h1")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .contains_active("voyage-1024", "old-id", "h1")
+                .unwrap()
+        );
+        let hits = store
+            .search("voyage-1024", &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
+        assert_eq!(hits[0].id, "new-id");
+
+        // The re-key rides the WAL like any other mutation.
+        drop(store);
+        let restored = VectorStore::open(tmp.path()).unwrap();
+        assert!(
+            restored
+                .contains_active("voyage-1024", "new-id", "h1")
+                .unwrap()
+        );
+        assert!(
+            !restored
+                .contains_active("voyage-1024", "old-id", "h1")
+                .unwrap()
+        );
+    }
 
     #[test]
     fn wal_rebuild_restores_active_vectors() {

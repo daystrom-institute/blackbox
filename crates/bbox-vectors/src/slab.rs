@@ -91,6 +91,22 @@ impl VectorSlab {
         }
     }
 
+    /// The currently-active entry for one entity id, if any. Same lookup
+    /// discipline as `contains_active`: O(1) through the active index when
+    /// built, linear fallback for immutable pre-index callers.
+    pub fn active_entry(&self, entity_id: &str) -> Option<&SlabEntry> {
+        if !self.index_built {
+            return self
+                .entries
+                .iter()
+                .find(|entry| entry.active && entry.entity_id == entity_id);
+        }
+        self.active_index
+            .get(entity_id)
+            .map(|&idx| &self.entries[idx])
+            .filter(|entry| entry.active)
+    }
+
     fn ensure_index_built(&mut self) {
         if self.index_built {
             return;

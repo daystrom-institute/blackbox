@@ -1,0 +1,20 @@
+{
+  "id": "gap-694a3e62",
+  "title": "No daemon-side embedding spend budget; runaway loops bill silently",
+  "gap_kind": "tooling",
+  "domain": "embedding",
+  "wanted_capability": "A daemon-side embedding budget guard: a configurable daily token or request ceiling per provider (and per route) that, once crossed, parks the affected routes in an explicit health state (health_reason=budget_exhausted, visible in bbox_embed_status and bbox_inbox) instead of continuing to call the provider. The 2026-08 incident re-embedded a never-converging ~51k-doc cohort every sweep for two weeks at roughly 50-60 USD/day on Voyage because nothing bounded provider calls and nothing surfaced the volume: the loop was only visible in the vendor's bill. A budget guard turns a runaway loop into a loud, cheap failure within a day. Counters already exist per route (indexed/retried/capped); the missing piece is a provider-call meter with a ceiling and a health trip.",
+  "missing_primitive": "per-provider daily embedding call/token budget with route health trip",
+  "fallback_used": "Sweeper disabled outright (BLACKBOX_EMBED_SWEEP_INTERVAL_SECS=0) and operator advised to set a vendor-side key cap.",
+  "evidence": [
+    "Voyage billing: ~50-60 USD/day from 2026-08-08 to 2026-08-23, exclusively after the voyage-4 route migration went live",
+    "src/embed_runtime.rs residue sweeper re-enqueueing 3,591-51,593 docs per sweep with coverage never landing (gap-a7d80bb2)"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/embedding/spend-budget-guard",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-23T16:06:39Z",
+  "updated_at": "2026-08-23T16:06:39Z"
+}

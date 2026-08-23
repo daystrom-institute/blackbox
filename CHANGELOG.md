@@ -8,6 +8,26 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Fixed
+
+- Runaway embedding re-embeds across code-source snapshot re-mints
+  (gap-a7d80bb2): `project_file_v2`/`symbol_v2` entity ids embed the snapshot
+  id, so every generation activation re-minted every chunk's identity and the
+  vector-store dedupe re-embedded whole projects through the provider for
+  unchanged content (~50-60 USD/day of Voyage spend for two weeks, and 875k
+  stale-identity rows left active in one partition). The embed queue now
+  keeps a snapshot-reuse index: a dedupe miss whose identity differs only in
+  the snapshot id re-keys the stored vector (`VectorStore::clone_active`,
+  WAL-backed, tombstoning the stale row) instead of calling the provider.
+- Git-history activation no longer re-runs a committed activation when code
+  selectors move without changing the overlay outcome. The strict currency
+  check treated ANY code-selector drift as staleness, so an actively-edited
+  repo re-ran a full activation (replacing the whole consolidated commit
+  lane, ~51k docs) every collector pass. Outcome-level currency now
+  recomputes the overlay plan and treats the journal as current when the
+  planned, recorded, and published overlay states already agree; durability
+  (publication verification) is checked separately from currency.
+
 ### Added
 
 - Code-source pre-upload currency probe: the collector now POSTs its scanned

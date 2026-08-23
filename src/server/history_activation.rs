@@ -243,12 +243,22 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
             &existing.checksum_sha256,
             searcher_generation,
         );
+        // Durability (are the committed publications still intact?) and
+        // currency (does the journal still select the right producer view?)
+        // are separate questions: `verify_committed_publications` answers
+        // the first, and the currency pair below answers the second. Folding
+        // metadata into the durability probe (the old
+        // `verify_committed_activation` call) made every code-selector move
+        // read as lost durability and forced a full re-activation.
         let durable = if cached {
             verify_overlay_receipts(&edges_dir(state), &existing).is_ok()
         } else {
-            verify_committed_activation(state, &existing).is_ok()
+            verify_committed_publications(state, &existing).is_ok()
         };
-        if durable && committed_metadata_current(state, &existing)? {
+        let current = durable
+            && (committed_metadata_current(state, &existing)?
+                || committed_overlay_outcome_current(state, &grant, &existing)?);
+        if current {
             state.git_sources.mark_activation_validated(
                 existing.repo_history_id.as_str(),
                 &existing.checksum_sha256,
@@ -345,81 +355,20 @@ pub(crate) fn activate_source(state: &Arc<SharedState>, source_generation_id: &s
 
     let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir(state))?;
     let recovery_journal = source_store.read_activation_journal(&source.repo_history_id)?;
-    let mut code_selectors = BTreeMap::new();
-    let mut overlays = Vec::new();
-    let mut overlay_clears = Vec::new();
-    for member in &grant.members {
-        let project_id = member.project_id.as_str();
-        let Some(entry) = manifest.workspaces.get(project_id) else {
-            continue;
-        };
-        let Some(code_generation) = entry.code_source_generation.as_ref() else {
-            continue;
-        };
-        code_selectors.insert(project_id.to_string(), code_generation.clone());
-        let active_transport = entry
-            .git_overlay
-            .as_ref()
-            .is_some_and(|overlay| overlay.source.producer_transport().is_some());
-        let Some(snapshot_id) = active_snapshot_id(entry.active_snapshot.as_deref()) else {
-            if active_transport {
-                overlay_clears.push(project_id.to_string());
-            }
-            continue;
-        };
-        let stored = state
-            .code_sources
-            .store()
-            .load_generation_mixed(&member.scope, code_generation)?;
-        if stored.descriptor().head_commit != source.repo_head || !entry.git_overlay_managed {
-            if active_transport {
-                overlay_clears.push(project_id.to_string());
-            }
-            continue;
-        }
-        let previous_overlay_generation = recovery_journal
-            .as_ref()
-            .filter(|journal| {
-                !journal.stage.terminal()
-                    && journal.source_generation_id == source.source_generation_id
-            })
-            .and_then(|journal| {
-                journal
-                    .overlays
-                    .iter()
-                    .find(|overlay| overlay.project_id == project_id)
-            })
-            .filter(|overlay| overlay.selector.code_generation == *code_generation)
-            .map(|overlay| overlay.selector.overlay_generation)
-            .unwrap_or_else(|| {
-                entry
-                    .git_overlay
-                    .as_ref()
-                    .map(|overlay| overlay.overlay_generation)
-                    .unwrap_or(0)
-                    .saturating_add(1)
-            });
-        overlays.push(HistoryActivationOverlayV1 {
-            project_id: project_id.to_string(),
-            snapshot_id,
-            selector: GitOverlaySelector {
-                project_id: project_id.to_string(),
-                code_generation: code_generation.clone(),
-                repo_history_generation: planned_id.clone(),
-                source: GitOverlaySourceV1::ProducerTransport {
-                    producer_id: grant.producer_id.clone(),
-                    source_generation_id: source.source_generation_id.clone(),
-                },
-                repo_head: source.repo_head.clone(),
-                commit_namespace: source.primary_namespace.as_str().to_string(),
-                overlay_generation: previous_overlay_generation,
-            },
-            file_commitment: None,
-        });
-    }
-    overlays.sort_by(|left, right| left.project_id.cmp(&right.project_id));
-    overlay_clears.sort();
-    overlay_clears.dedup();
+    let OverlayPlan {
+        code_selectors,
+        overlays,
+        overlay_clears,
+    } = plan_overlay_selection(
+        state,
+        &manifest,
+        &grant,
+        &source.source_generation_id,
+        &source.repo_head,
+        source.primary_namespace.as_str(),
+        &planned_id,
+        recovery_journal.as_ref(),
+    )?;
 
     let prior_p3_generation_id = pinned
         .catalog()
@@ -933,6 +882,208 @@ fn activation_metadata_current(
     true
 }
 
+/// The overlay outcome one activation pass would select for a repo's members
+/// against the current edge-sidecar manifest: per-member code selectors, the
+/// producer-transport overlays to publish, and the overlays to clear.
+struct OverlayPlan {
+    code_selectors: BTreeMap<String, String>,
+    overlays: Vec<HistoryActivationOverlayV1>,
+    overlay_clears: Vec<String>,
+}
+
+/// One overlay-selection rule, shared by activation preparation and the
+/// committed-journal currency check. Extracted verbatim from the prepare
+/// path: an overlay is eligible only when the member's active code
+/// generation was captured at the history source's head and the workspace
+/// still delegates overlay management; an active transport overlay that
+/// loses eligibility is cleared.
+#[allow(clippy::too_many_arguments)]
+fn plan_overlay_selection(
+    state: &Arc<SharedState>,
+    manifest: &bbox_edge_sidecar::manifest::ManifestIndex,
+    grant: &super::producer_auth::RepoTransportGrant,
+    source_generation_id: &str,
+    repo_head: &str,
+    primary_namespace: &str,
+    planned_p3_generation_id: &str,
+    recovery_journal: Option<&HistoryActivationJournalV1>,
+) -> Result<OverlayPlan> {
+    let mut code_selectors = BTreeMap::new();
+    let mut overlays = Vec::new();
+    let mut overlay_clears = Vec::new();
+    for member in &grant.members {
+        let project_id = member.project_id.as_str();
+        let Some(entry) = manifest.workspaces.get(project_id) else {
+            continue;
+        };
+        let Some(code_generation) = entry.code_source_generation.as_ref() else {
+            continue;
+        };
+        code_selectors.insert(project_id.to_string(), code_generation.clone());
+        let active_transport = entry
+            .git_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.source.producer_transport().is_some());
+        let Some(snapshot_id) = active_snapshot_id(entry.active_snapshot.as_deref()) else {
+            if active_transport {
+                overlay_clears.push(project_id.to_string());
+            }
+            continue;
+        };
+        let stored = state
+            .code_sources
+            .store()
+            .load_generation_mixed(&member.scope, code_generation)?;
+        if stored.descriptor().head_commit != repo_head || !entry.git_overlay_managed {
+            if active_transport {
+                overlay_clears.push(project_id.to_string());
+            }
+            continue;
+        }
+        let previous_overlay_generation = recovery_journal
+            .filter(|journal| {
+                !journal.stage.terminal() && journal.source_generation_id == source_generation_id
+            })
+            .and_then(|journal| {
+                journal
+                    .overlays
+                    .iter()
+                    .find(|overlay| overlay.project_id == project_id)
+            })
+            .filter(|overlay| overlay.selector.code_generation == *code_generation)
+            .map(|overlay| overlay.selector.overlay_generation)
+            .unwrap_or_else(|| {
+                entry
+                    .git_overlay
+                    .as_ref()
+                    .map(|overlay| overlay.overlay_generation)
+                    .unwrap_or(0)
+                    .saturating_add(1)
+            });
+        overlays.push(HistoryActivationOverlayV1 {
+            project_id: project_id.to_string(),
+            snapshot_id,
+            selector: GitOverlaySelector {
+                project_id: project_id.to_string(),
+                code_generation: code_generation.clone(),
+                repo_history_generation: planned_p3_generation_id.to_string(),
+                source: GitOverlaySourceV1::ProducerTransport {
+                    producer_id: grant.producer_id.clone(),
+                    source_generation_id: source_generation_id.to_string(),
+                },
+                repo_head: repo_head.to_string(),
+                commit_namespace: primary_namespace.to_string(),
+                overlay_generation: previous_overlay_generation,
+            },
+            file_commitment: None,
+        });
+    }
+    overlays.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    overlay_clears.sort();
+    overlay_clears.dedup();
+    Ok(OverlayPlan {
+        code_selectors,
+        overlays,
+        overlay_clears,
+    })
+}
+
+/// Outcome-level currency for a Committed journal whose strict metadata
+/// check failed only on code-selector drift. `activation_metadata_current`
+/// treats ANY code-selector movement as staleness, but a moved selector
+/// whose recomputed overlay plan demands exactly the already-published
+/// overlay state (typically: heads diverged, so no member is
+/// overlay-eligible and nothing is published) changes no durable outcome.
+/// Re-running the full activation there replaces the whole consolidated
+/// commit lane for a no-op - under active development that re-ran every
+/// collector pass and drove the 2026-08 rebuild/re-embed/OOM churn
+/// (gap-a7d80bb2). Overlay publish counters are masked in the comparison:
+/// they only advance when something is actually republished.
+fn committed_overlay_outcome_current(
+    state: &Arc<SharedState>,
+    grant: &super::producer_auth::RepoTransportGrant,
+    journal: &HistoryActivationJournalV1,
+) -> Result<bool> {
+    if journal.stage != HistoryActivationStageV1::Committed
+        || grant.commitment != journal.grant_commitment
+    {
+        return Ok(false);
+    }
+    let Some(catalog_store) = state.project_authority.catalog_store() else {
+        return Ok(false);
+    };
+    let catalog = catalog_store.snapshot()?;
+    let materialization_current = catalog
+        .catalog()
+        .repo_histories
+        .get(&journal.repo_history_id)
+        .is_some_and(|record| {
+            matches!(
+                &record.materialization,
+                RepoHistoryMaterialization::Ready { generation_id }
+                    if generation_id.as_str() == journal.planned_p3_generation_id
+            )
+        });
+    if !materialization_current {
+        return Ok(false);
+    }
+    let source = state
+        .git_sources
+        .store()
+        .verified_history_source(&journal.producer_id, &journal.source_generation_id)?;
+    let manifest = bbox_edge_sidecar::manifest::ManifestIndex::load_or_new(&edges_dir(state))?;
+    let plan = plan_overlay_selection(
+        state,
+        &manifest,
+        grant,
+        &journal.source_generation_id,
+        &source.repo_head,
+        source.primary_namespace.as_str(),
+        &journal.planned_p3_generation_id,
+        None,
+    )?;
+    // Anything the plan wants cleared is still published: not current.
+    if !plan.overlay_clears.is_empty() {
+        return Ok(false);
+    }
+    // The journal's recorded outcome must match the plan too: a journal
+    // whose overlay record disagrees with what the plan (and the published
+    // manifest) now hold needs one real re-activation to reconverge, or the
+    // durable audit trail drifts from the published state.
+    if journal.overlays.len() != plan.overlays.len()
+        || journal
+            .overlays
+            .iter()
+            .zip(&plan.overlays)
+            .any(|(recorded, planned)| {
+                let mut masked = planned.selector.clone();
+                masked.overlay_generation = recorded.selector.overlay_generation;
+                recorded.project_id != planned.project_id
+                    || recorded.snapshot_id != planned.snapshot_id
+                    || recorded.selector != masked
+            })
+    {
+        return Ok(false);
+    }
+    // Every planned overlay must already be published exactly, publish
+    // counter aside.
+    for planned in &plan.overlays {
+        let published = manifest
+            .workspaces
+            .get(&planned.project_id)
+            .and_then(|entry| entry.git_overlay.as_ref());
+        let Some(published) = published else {
+            return Ok(false);
+        };
+        let mut masked = planned.selector.clone();
+        masked.overlay_generation = published.overlay_generation;
+        if *published != masked {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn committed_metadata_current(
     state: &SharedState,
     journal: &HistoryActivationJournalV1,
@@ -1420,6 +1571,116 @@ mod tests {
             .finalize_history_upload("producer-a", &upload.upload_id)
             .unwrap()
             .source_generation_id
+    }
+
+    #[test]
+    fn diverged_code_head_does_not_rerun_a_committed_activation() {
+        let fixture = CatalogFixture::new();
+        let root_scope = CatalogFixture::scope(".");
+        let root_project = "p_reactivation_root";
+        fixture.add_published_project(root_project, &root_scope);
+        let history = RepoHistoryId::parse("rh_00000000000000000000000000000002").unwrap();
+        let namespace = CommitNamespace::parse("repo_example").unwrap();
+        let epoch = fixture.epoch();
+        fixture
+            .store()
+            .transact(epoch, |catalog, _| {
+                catalog.repo_histories.insert(
+                    history.clone(),
+                    RepoHistoryRecord {
+                        repo_history_id: history.clone(),
+                        membership_generation: 0,
+                        authority: RepoHistoryAuthority::Recorded(
+                            RecordedRepoAuthority::parse("repo_example").unwrap(),
+                        ),
+                        primary_namespace: namespace.clone(),
+                        compatibility_namespaces: Default::default(),
+                        materialization: RepoHistoryMaterialization::NotBuilt,
+                    },
+                );
+                catalog
+                    .projects
+                    .get_mut(&ProjectId::parse(root_project).unwrap())
+                    .unwrap()
+                    .repo_history = Some(history.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = fixture.server().state;
+        let token = bro_rpc::ServiceToken::parse("8".repeat(64)).unwrap();
+        let catalog = fixture.store().snapshot().unwrap();
+        state
+            .code_sources
+            .install_auth_for_test(Arc::new(ProducerAuthRuntime::for_test_catalog(
+                vec![(
+                    token,
+                    ProducerGrant {
+                        producer_id: "producer-a".into(),
+                        projects: BTreeMap::from([(root_scope.clone(), root_project.to_string())]),
+                    },
+                )],
+                catalog.catalog(),
+            )));
+        let head = "1".repeat(40);
+        install_empty_code_generation(&state, root_project, root_scope.clone(), &head);
+        let source =
+            install_history_source(&state, &history, &namespace, root_scope.clone(), &head);
+        activate_source(&state, &source).unwrap();
+        let committed = state
+            .git_sources
+            .store()
+            .read_activation_journal(&history)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.stage, HistoryActivationStageV1::Committed);
+        assert_eq!(committed.overlays.len(), 1);
+
+        // The code lane moves past the frozen history head: the overlay loses
+        // eligibility and ONE full re-activation clears it.
+        let head_two = "2".repeat(40);
+        let generation_two =
+            install_empty_code_generation(&state, root_project, root_scope.clone(), &head_two);
+        activate_source(&state, &source).unwrap();
+        let cleared = state
+            .git_sources
+            .store()
+            .read_activation_journal(&history)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.stage, HistoryActivationStageV1::Committed);
+        assert!(cleared.overlays.is_empty());
+        assert_ne!(cleared.checksum_sha256, committed.checksum_sha256);
+        assert!(
+            bbox_edge_sidecar::snapshot::selected_git_overlays(&edges_dir(&state))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Further code movement with no overlay consequence must be a no-op.
+        // Before the outcome-currency widening, every new code generation
+        // re-ran the whole activation (and republished the commit lane) for
+        // a state that changes nothing durable - the perpetual churn behind
+        // gap-a7d80bb2.
+        let head_three = "3".repeat(40);
+        let generation_three =
+            install_empty_code_generation(&state, root_project, root_scope.clone(), &head_three);
+        assert_ne!(generation_two, generation_three);
+        activate_source(&state, &source).unwrap();
+        let after = state
+            .git_sources
+            .store()
+            .read_activation_journal(&history)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.checksum_sha256, cleared.checksum_sha256,
+            "a committed activation whose overlay outcome is unchanged must not re-run"
+        );
+        assert_eq!(
+            after.code_selectors,
+            BTreeMap::from([(root_project.to_string(), generation_two)]),
+            "the journal deliberately keeps the selectors it committed with"
+        );
     }
 
     #[test]

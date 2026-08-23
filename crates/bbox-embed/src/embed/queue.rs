@@ -629,6 +629,10 @@ struct EmbedQueueInner {
     /// full cap→drain→refill cycle against a tiny cap without enqueuing 10k
     /// items. Atomic so a test can lower it through the shared `Arc` handle.
     max_queue_depth: std::sync::atomic::AtomicU64,
+    /// Snapshot-identity vector reuse (see `snapshot_reuse`): re-keys an
+    /// unchanged chunk's stored vector across code-source snapshot re-mints
+    /// instead of re-embedding the whole project through the provider.
+    snapshot_reuse: super::snapshot_reuse::SnapshotReuseIndex,
 }
 
 struct ResolvedRoute {
@@ -824,6 +828,26 @@ impl EmbedQueueHandle {
             );
             return EnqueueOutcome::Skipped;
         }
+        // Snapshot-scoped identity re-mint: the content is unchanged and the
+        // store already holds its vector under the prior snapshot's entity
+        // id. Re-key the row instead of paying a provider call for the same
+        // bytes (the 2026-08 runaway re-embed incident).
+        if let Some(store) = &self.inner.vector_store
+            && self.inner.snapshot_reuse.try_reuse(
+                store,
+                &resolved.vector_route,
+                &request.entity_id,
+                &request.chunk_hash,
+            )
+        {
+            tracing::debug!(
+                route = %resolved.queue_route,
+                vector_route = %resolved.vector_route,
+                entity_id = %request.entity_id,
+                "embedding enqueue satisfied by snapshot vector reuse"
+            );
+            return EnqueueOutcome::Skipped;
+        }
         let pending_key = PendingKey::new(&resolved.vector_route, &request);
         if !self.inner.pending.lock().insert(pending_key.clone()) {
             tracing::debug!(
@@ -858,6 +882,13 @@ impl EmbedQueueHandle {
         let sender = self.ensure_sender(&resolved, &request);
         match sender {
             Some(sender) => {
+                // Keep the snapshot-reuse index current: once this embed
+                // lands, future snapshot re-mints of the same content re-key
+                // this row instead of re-embedding. Recording before the
+                // write lands is safe (a reuse re-checks the store).
+                self.inner
+                    .snapshot_reuse
+                    .record(&resolved.vector_route, &request.entity_id);
                 let sent = sender.send(WorkerCommand::Enqueue(request)).is_ok();
                 if !sent {
                     self.inner.pending.lock().remove(&pending_key);
@@ -1131,6 +1162,7 @@ impl EmbedQueueHandle {
                 debounce: DEFAULT_DEBOUNCE,
                 retry_backoff: DEFAULT_RETRY_BACKOFF,
                 max_queue_depth: std::sync::atomic::AtomicU64::new(MAX_ROUTE_QUEUE_DEPTH),
+                snapshot_reuse: super::snapshot_reuse::SnapshotReuseIndex::default(),
             }),
         }
     }
@@ -1201,6 +1233,7 @@ impl EmbedQueueHandle {
                 debounce,
                 retry_backoff,
                 max_queue_depth: std::sync::atomic::AtomicU64::new(MAX_ROUTE_QUEUE_DEPTH),
+                snapshot_reuse: super::snapshot_reuse::SnapshotReuseIndex::default(),
             }),
         }
     }
