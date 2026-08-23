@@ -21,17 +21,36 @@ impl BlackboxServer {
         Parameters(p): Parameters<ThreadParams>,
     ) -> CallToolResult {
         let start = std::time::Instant::now();
+        // Phase timing pins multi-minute stalls to their blocked phase
+        // (resolver lease, store write guard, or durable persist). Prod
+        // showed 169-327s calls tracking edge-index rebuild windows exactly;
+        // the per-call total alone could not name the contended resource.
+        let slow_phase = |phase: &str, elapsed: std::time::Duration| {
+            if elapsed > std::time::Duration::from_secs(5) {
+                tracing::warn!(
+                    target: "blackbox::tool",
+                    tool = "bbox_thread",
+                    phase,
+                    phase_ms = elapsed.as_secs_f64() * 1000.0,
+                    "slow bbox_thread phase"
+                );
+            }
+        };
         let mutation_result: anyhow::Result<_> = {
             // When the agent passes a managed fleet worktree as `project`, key the
             // thread to its registered base (durable scope) but write the committed
             // `.bbox/record/` snapshot into the worktree so it travels with the
             // agent's branch. Resolution rides the shared engine (phase-2
             // §9.2); the threads store stays registry-free.
+            let resolve_started = std::time::Instant::now();
             let resolved = p
                 .project
                 .as_deref()
                 .and_then(|proj| self.resolve_worktree_scope_and_dir(proj));
+            slow_phase("resolve_project", resolve_started.elapsed());
+            let lock_started = std::time::Instant::now();
             let mut threads = self.state.threads.write();
+            slow_phase("store_write_guard", lock_started.elapsed());
             match resolved {
                 Some((base, worktree)) => {
                     let mut p = p.clone();
@@ -51,7 +70,10 @@ impl BlackboxServer {
         };
 
         if p.action != "get" {
-            if let Err(e) = self.state.persist_threads_durable().await {
+            let persist_started = std::time::Instant::now();
+            let persist_result = self.state.persist_threads_durable().await;
+            slow_phase("persist_durable", persist_started.elapsed());
+            if let Err(e) = persist_result {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_thread", elapsed_ms = ms, error = %e, "err");
                 return Self::err_text(&format!("Error: {e:#}"));

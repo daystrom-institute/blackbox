@@ -13,9 +13,10 @@ use axum::{Json, Router};
 use bbox_code_source::{
     BeginUploadRequest, CatalogOnboardRequestV1, CatalogOnboardResponseV1,
     CheckoutMutationAckRequestV1, CheckoutMutationAckResponseV1, CheckoutMutationPollRequestV1,
-    CheckoutMutationPollResponseV1, ContractError, CutbackErrorClass, CutbackReason,
-    CutbackStateV2, ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus,
-    ManifestPage, MissingBlobsPage,
+    CheckoutMutationPollResponseV1, CodeSourceProbeCurrentV1, CodeSourceProbeRequestV1,
+    CodeSourceProbeResponseV1, ContractError, CutbackErrorClass, CutbackReason, CutbackStateV2,
+    ErrorResponse, FinalizeResponse, GenerationState, GenerationStatus, ManifestPage,
+    MissingBlobsPage,
 };
 use bbox_code_source_store::{
     ActivationFence, ActivationFenceConflict, ActivationRecord, ActivationRecordV2,
@@ -830,6 +831,10 @@ fn store_limits(config: &crate::config::Config) -> StoreLimits {
 pub(crate) fn router(state: Arc<SharedState>) -> Router<Arc<SharedState>> {
     Router::new()
         .route(
+            "/internal/code-source/v1/probe",
+            post(probe_code_source).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
             "/internal/code-source/v1/uploads",
             post(begin_upload).layer(DefaultBodyLimit::max(64 * 1024)),
         )
@@ -889,6 +894,26 @@ async fn begin_upload(
     let response =
         blocking(move || store.begin_upload(&grant.producer_id, request.descriptor)).await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn probe_code_source(
+    State(state): State<Arc<SharedState>>,
+    Extension(grant): Extension<ProducerGrant>,
+    Json(request): Json<CodeSourceProbeRequestV1>,
+) -> Result<Json<CodeSourceProbeResponseV1>, HttpError> {
+    request
+        .validate()
+        .map_err(|error| HttpError::from_store(anyhow::Error::new(error)))?;
+    require_scope(&grant, &request.descriptor.scope)?;
+    let store = state.code_sources.store();
+    let current = blocking(move || store.probe_current_generation(&request.descriptor))
+        .await?
+        .map(|generation| CodeSourceProbeCurrentV1 {
+            generation_id: generation.generation_id().to_string(),
+            file_count: generation.descriptor().file_count,
+            logical_bytes: generation.descriptor().logical_bytes,
+        });
+    Ok(Json(CodeSourceProbeResponseV1 { current }))
 }
 
 async fn put_manifest_page(

@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbox_code_source::{
-    BeginUploadRequest, BeginUploadResponse, ErrorResponse, FinalizeResponse, GenerationDescriptor,
-    GenerationState, GenerationStatus, ManifestEntry, ManifestPage, MissingBlobsPage,
-    SCHEMA_VERSION, WALKER_POLICY_VERSION, dirty_fingerprint, is_skipped_component,
-    manifest_sha256, max_bytes_for_path,
+    BeginUploadRequest, BeginUploadResponse, CodeSourceProbeRequestV1, CodeSourceProbeResponseV1,
+    ErrorResponse, FinalizeResponse, GenerationDescriptor, GenerationState, GenerationStatus,
+    ManifestEntry, ManifestPage, MissingBlobsPage, SCHEMA_VERSION, WALKER_POLICY_VERSION,
+    dirty_fingerprint, is_skipped_component, manifest_sha256, max_bytes_for_path,
 };
 use bbox_corpus_core::identity::{PublishedScope, bbox_root_relpath, resolve_recorded_repo_id};
 use bbox_git_source::{
@@ -1919,6 +1919,27 @@ async fn publish_project(
     scanned: ScannedProject,
     status_timeout: Duration,
 ) -> Result<()> {
+    let probe: CodeSourceProbeResponseV1 = send_json(
+        runtime
+            .request(
+                reqwest::Method::POST,
+                runtime.endpoint("internal/code-source/v1/probe")?,
+            )
+            .json(&CodeSourceProbeRequestV1 {
+                descriptor: scanned.descriptor.clone(),
+            }),
+    )
+    .await?;
+    if let Some(current) = probe.current {
+        tracing::info!(
+            generation = %current.generation_id,
+            files = current.file_count,
+            bytes = current.logical_bytes,
+            "code source is already current"
+        );
+        return Ok(());
+    }
+
     let begin: BeginUploadResponse = send_json(
         runtime
             .request(

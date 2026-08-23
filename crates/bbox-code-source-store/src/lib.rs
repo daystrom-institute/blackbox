@@ -4083,6 +4083,35 @@ impl CodeSourceStore {
         bail!("generation not found")
     }
 
+    /// Pre-upload currency probe: return the scope's active generation when
+    /// its stored descriptor is identical to the one the collector just
+    /// scanned. Any read failure answers "not current" rather than erroring,
+    /// so a mid-swap race degrades to a normal (wasted) upload instead of
+    /// failing the collector's lane pass.
+    pub fn probe_current_generation(
+        &self,
+        descriptor: &GenerationDescriptor,
+    ) -> Result<Option<MixedStoredGeneration>> {
+        let Ok(activations) = self.activation_records_mixed() else {
+            return Ok(None);
+        };
+        for activation in activations {
+            if activation.published_scope() != Some(&descriptor.scope) {
+                continue;
+            }
+            let Ok(generation) = self.find_generation_mixed(activation.generation_id()) else {
+                return Ok(None);
+            };
+            if generation.descriptor() == descriptor
+                && matches!(generation.state(), GenerationState::Active)
+            {
+                return Ok(Some(generation));
+            }
+            return Ok(None);
+        }
+        Ok(None)
+    }
+
     pub fn find_generation(&self, generation: &str) -> Result<StoredGeneration> {
         validate_sha256(generation)?;
         for scope_entry in fs::read_dir(self.root().join("scopes"))? {
@@ -10686,6 +10715,43 @@ mod tests {
         activation.cutback = None;
         activation.cutback_pending = true;
         assert!(activation.validate().is_ok());
+    }
+
+    #[test]
+    fn probe_current_generation_matches_only_identical_active_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let store = CodeSourceStore::open_with_mode(
+            root.join("code-sources"),
+            StoreLimits::default(),
+            RuntimeRecordMode::CatalogV2,
+        )
+        .unwrap();
+        let generation = sample_v2_generation();
+        let activation = sample_v2_activation(&generation);
+        store.save_generation_v2_locked(&generation).unwrap();
+        store.save_activation_v2(&activation).unwrap();
+
+        let current = store
+            .probe_current_generation(&generation.descriptor)
+            .unwrap();
+        assert_eq!(
+            current.map(|found| found.generation_id().to_string()),
+            Some(generation.generation_id.clone())
+        );
+
+        let mut changed = generation.descriptor.clone();
+        changed.dirty_fingerprint = "d".repeat(64);
+        assert!(store.probe_current_generation(&changed).unwrap().is_none());
+
+        let mut other_scope = generation.descriptor.clone();
+        other_scope.scope = PublishedScope::try_new("other-repo-family", ".").unwrap();
+        assert!(
+            store
+                .probe_current_generation(&other_scope)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

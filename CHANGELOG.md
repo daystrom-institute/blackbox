@@ -10,6 +10,17 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Code-source pre-upload currency probe: the collector now POSTs its scanned
+  descriptor to `internal/code-source/v1/probe` before beginning an upload
+  and skips the entire upload protocol when the scope's active generation
+  already has identical content (mirrors the Git-history probe). Previously
+  every 120s pass re-ran begin/manifest/finalize for every project even when
+  nothing changed, re-reporting identical generations thousands of times per
+  day and keeping the daemon's reconcile and edge-index pipelines hot.
+  `bbox_thread` mutations also log a `slow bbox_thread phase` warning naming
+  the blocked phase (project resolve, store write guard, durable persist)
+  whenever a phase exceeds 5s, so multi-minute stalls can be attributed.
+
 - Project-graph vertex embeddings (gap-58218542, unified-retrieval M9e):
   a new `graph` embedding route gives vector lane coverage to graph
   vertices whose schema opts them in (`index_policy.embeddings_enabled`

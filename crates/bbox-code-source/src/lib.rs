@@ -176,6 +176,34 @@ pub struct BeginUploadResponse {
     pub max_page_bytes: usize,
 }
 
+/// Pre-upload currency probe: the collector sends the descriptor it just
+/// scanned and the server answers with the active generation when the scope's
+/// activated content is identical, letting the collector skip the entire
+/// upload protocol for an unchanged tree (mirrors the Git-history probe).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodeSourceProbeRequestV1 {
+    pub descriptor: GenerationDescriptor,
+}
+
+impl CodeSourceProbeRequestV1 {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.descriptor.validate_header()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeSourceProbeResponseV1 {
+    pub current: Option<CodeSourceProbeCurrentV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeSourceProbeCurrentV1 {
+    pub generation_id: String,
+    pub file_count: u64,
+    pub logical_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestPage {
