@@ -1,0 +1,22 @@
+{
+  "id": "gap-0f2ec093",
+  "title": "No MCP path to retire a project whose only attachment root is gone (corpse projects are invisible and unremovable)",
+  "gap_kind": "mcp_surface",
+  "domain": "project-catalog",
+  "wanted_capability": "An operator path to fully retire a registered project whose checkout root was deleted from disk. Today: bbox_project_unregister refuses with error.project_attachment_required because it resolves the selector through resolve_attached and requires a Catalog attachment; a path selector cannot resolve either (the path is gone); bbox_project_detach works only attachment-by-attachment and leaves the catalog project + v1 registry record behind; and bbox_project_list hides the project entirely (attached-rows projection), so the corpse is invisible on the operator surface while still real in projects.json and the catalog. Wanted: unregister/retire accepts a project_id with no active attachment (detached-state unregister), and the list surface shows registered-but-unattached projects instead of hiding them. Live case: project 6233da25 (deleted repo ~/repos/rtk), whose stale attached row poisoned every gap/knowledge store mutation daemon-wide until fadfaf5bb025 made store reloads tolerate unreadable carriers; the record remains unremovable after detach.",
+  "missing_primitive": "detached-state project unregister/retire on the MCP surface",
+  "fallback_used": "bbox_project_detach on the stale attachment (epoch-gated) to neutralize it; the catalog project and registry record remain as inert corpses.",
+  "evidence": [
+    "error.project_attachment_required: 6233da25 from bbox_project_unregister after detach",
+    "src/server/checkout_access.rs catalog_attachment_target bail error.project_attachment_required",
+    "commit fadfaf5bb025 (stores: tolerate unreadable repo carriers)"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/project-catalog/corpse-project-retirement",
+  "suggested_owner": "blackbox",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-25T23:13:58Z",
+  "updated_at": "2026-08-25T23:13:58Z"
+}
