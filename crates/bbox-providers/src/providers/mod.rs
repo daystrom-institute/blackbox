@@ -122,6 +122,18 @@ pub struct EdgeFamilyExpectation {
 /// sits below the daemon core in the crate DAG.
 #[derive(Clone, Copy)]
 pub struct CorpusStores<'a> {
+    /// INVARIANT: provider code may run on a thread that ALREADY holds a
+    /// shared guard on this lock (the search tools pass
+    /// `&state.idx.read()` into hybrid/discover and the providers are
+    /// invoked while that guard lives). Every acquisition inside this
+    /// crate must therefore be `read_recursive()`, never `read()`: a
+    /// plain `read()` parks behind a queued writer, and with the outer
+    /// guard held that writer can never be granted, deadlocking the
+    /// whole index plane (cage incident 2026-08-25:
+    /// hybrid-search labeling vs `republish_code_read_view`'s
+    /// `idx.write()`). Regression test:
+    /// `provider_reads_do_not_deadlock_behind_queued_idx_writer` in
+    /// `src/tools/transcripts.rs`.
     pub idx: &'a RwLock<TranscriptIndex>,
     pub kb: &'a RwLock<Knowledge>,
     pub roadmap: &'a RwLock<Roadmap>,
@@ -354,7 +366,8 @@ impl<'a> ProviderContext<'a> {
         let Some(stores) = self.stores() else {
             return Ok(None);
         };
-        let index = stores.idx.read();
+        // read_recursive, not read: see the invariant on `CorpusStores::idx`.
+        let index = stores.idx.read_recursive();
         match self.searcher {
             Some(searcher) => index.entity_properties_with_searcher(entity_id, searcher),
             None => index.entity_properties(entity_id),

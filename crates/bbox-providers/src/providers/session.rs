@@ -33,9 +33,10 @@ impl InspectableEntityProvider for SessionProvider {
         properties.insert("provider".into(), provider.clone());
         properties.insert("session_id".into(), session_id.clone());
         if let Some(stores) = ctx.stores() {
+            // read_recursive: see the invariant on `CorpusStores::idx`.
             let indexed = stores
                 .idx
-                .read()
+                .read_recursive()
                 .session_properties(provider, session_id)?
                 .ok_or_else(|| anyhow::anyhow!("session entity {r} not found"))?;
             properties.extend(indexed);
@@ -81,7 +82,11 @@ impl InspectableEntityProvider for SessionProvider {
         };
         let short = session_id.chars().take(12).collect::<String>();
         if let Some(stores) = ctx.stores() {
-            if let Ok(Some(properties)) = stores.idx.read().session_properties(provider, session_id)
+            // read_recursive: see the invariant on `CorpusStores::idx`.
+            if let Ok(Some(properties)) = stores
+                .idx
+                .read_recursive()
+                .session_properties(provider, session_id)
             {
                 if let Some(prompt) = properties.get("first_user_prompt") {
                     return Some(truncate_label(prompt));

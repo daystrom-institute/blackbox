@@ -37,9 +37,10 @@ impl InspectableEntityProvider for TranscriptProvider {
         properties.insert("line_offset".into(), line_offset.to_string());
         properties.insert("event_idx".into(), event_idx.to_string());
         if let Some(stores) = ctx.stores() {
+            // read_recursive: see the invariant on `CorpusStores::idx`.
             let indexed = stores
                 .idx
-                .read()
+                .read_recursive()
                 .transcript_properties(provider, session_id, *line_offset)?
                 .ok_or_else(|| anyhow::anyhow!("transcript entity {r} not found"))?;
             properties.extend(indexed);
@@ -87,12 +88,12 @@ impl InspectableEntityProvider for TranscriptProvider {
             return None;
         };
         if let Some(stores) = ctx.stores() {
-            if let Ok(Some(properties)) =
-                stores
-                    .idx
-                    .read()
-                    .transcript_properties(provider, session_id, *line_offset)
-            {
+            // read_recursive: see the invariant on `CorpusStores::idx`.
+            if let Ok(Some(properties)) = stores.idx.read_recursive().transcript_properties(
+                provider,
+                session_id,
+                *line_offset,
+            ) {
                 if let Some(role) = properties.get("role") {
                     if let Some(preview) = properties.get("content_preview") {
                         return Some(truncate_label(format!("{role}: {preview}")));
