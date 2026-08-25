@@ -4140,6 +4140,53 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Regression for the 2026-08-25 cage index-plane deadlock:
+    /// `bbox_hybrid_search` / `bbox_discover_seed_entities` hold
+    /// `state.idx.read()` across the whole search call, and provider
+    /// property/label lookups re-acquire the same lock on the same thread.
+    /// A writer queued between the two acquisitions (history activation's
+    /// `republish_code_read_view` taking `idx.write()`) parked the nested
+    /// read forever: reader waits on writer, writer waits on reader, and
+    /// every later `idx.read()` (all searches, stats, the edge watcher)
+    /// piled up behind them. The fix is `read_recursive()` at every
+    /// acquisition inside bbox-providers (invariant documented on
+    /// `CorpusStores::idx`).
+    ///
+    /// Against the buggy code this test deadlocks rather than asserting;
+    /// the nextest per-test timeout turns that hang into a named failure.
+    #[test]
+    fn provider_reads_do_not_deadlock_behind_queued_idx_writer() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(&tmp.path().join("bro")));
+
+        // The outer guard the search tools hold across provider calls.
+        let outer = state.idx.read();
+
+        // Queue a writer behind the held read and let it park.
+        let st = state.clone();
+        let writer = std::thread::spawn(move || {
+            let _w = st.idx.write();
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !writer.is_finished(),
+            "precondition: writer must be parked behind the outer read guard"
+        );
+
+        // The provider-side lookup runs on THIS thread (the incident
+        // shape) and must complete while the writer is still parked.
+        let ctx = crate::providers::ProviderContext::new(state.corpus_stores());
+        let looked_up = ctx
+            .indexed_entity_properties("session:claude:does-not-exist")
+            .expect("empty-corpus lookup must not error");
+        assert!(looked_up.is_none(), "empty corpus has no entity properties");
+
+        drop(outer);
+        writer.join().unwrap();
+    }
+
     fn signature_test_edge(kind: &str) -> edge_index::Edge {
         edge_index::Edge {
             source: entity_ref::EntityRef::Knowledge {

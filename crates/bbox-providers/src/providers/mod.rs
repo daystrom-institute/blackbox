@@ -133,7 +133,7 @@ pub struct CorpusStores<'a> {
     /// hybrid-search labeling vs `republish_code_read_view`'s
     /// `idx.write()`). Regression test:
     /// `provider_reads_do_not_deadlock_behind_queued_idx_writer` in
-    /// `src/tools/transcripts.rs`.
+    /// `src/server/routes.rs`.
     pub idx: &'a RwLock<TranscriptIndex>,
     pub kb: &'a RwLock<Knowledge>,
     pub roadmap: &'a RwLock<Roadmap>,
