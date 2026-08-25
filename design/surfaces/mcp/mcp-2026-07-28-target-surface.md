@@ -42,7 +42,7 @@ is the largest protocol break since Streamable HTTP:
   Logging deprecated. `structuredContent` relaxed to any JSON value;
   schemas loosened to full JSON Schema 2020-12 (SEP-2106).
 
-### Client landscape (verified 2026-08-04, Claude Code 2.1.221; re-verified 2026-08-14, 2.1.233 - posture unchanged)
+### Client landscape (verified 2026-08-04, Claude Code 2.1.221; re-verified 2026-08-14, 2.1.233 - posture unchanged; re-verified 2026-08-24, 2.1.243 - tasks consumption now LIVE in legacy flavor, see below)
 
 Anthropic authored the spec revision, and Claude Code support has now
 shipped in part. Strings probe against
@@ -63,6 +63,19 @@ against 2.1.233 on 2026-08-14 with near-identical counts):
   capture shows the extension key negotiated, treat Claude Code's tasks
   support as legacy experimental and serve it plain JSON, never
   `CreateTaskResult`.
+- **Update 2026-08-24 (2.1.243)**: Claude Code now actively CONSUMES
+  tasks as first-class `mcp_task` background tasks (poll loop honoring
+  `pollIntervalMs`, `tasks/result` payload fetch, reconnect/reconcile
+  after restart, kill support) - but via the legacy experimental API
+  (top-level `tasks` capability, legacy method quadruple,
+  `notifications/tasks/status`). The `io.modelcontextprotocol/tasks`
+  extension key is now bundled in a vendored SDK copy with
+  capability-gated task acceptance, but no `tasks/update` and no
+  evidence of outbound extension declaration: the verdict stays legacy,
+  the flip may be close, and the strict extension-key gate is now
+  load-bearing rather than precautionary - a looser "declares tasks"
+  gate would hand `CreateTaskResult` to a legacy-flavor consumer.
+  Details in the migration plan's probe history.
 
 Baseline 2026-08-03 (v2.1.220, four days older): all modern strings absent,
 `2025-11-25` max. The core protocol landed in 2.1.221.
@@ -84,7 +97,7 @@ Consequences:
 proving ground for the tasks extension specifically, since no client we
 consume declares it yet.
 
-### Codex (OpenAI) as second data point (verified 2026-08-04; re-verified 2026-08-14 at HEAD 233739e76a - posture unchanged)
+### Codex (OpenAI) as second data point (verified 2026-08-04; re-verified 2026-08-14 at HEAD 233739e76a - posture unchanged; re-verified 2026-08-24 at HEAD cbfd999db7 plus a LIVE wire capture of shipped 0.149.1 - rmcp bumped to =3.1.3, modern core VERIFIED WORKING behind `features.mcp_2026_07_28=true` including full stateless operation on discover success, default still Legacy, still no tasks/listen)
 
 Source-level probe of the codex-rs workspace (local checkout, HEAD
 78306a32af; ~180 commits later at 233739e76a nothing below has moved -

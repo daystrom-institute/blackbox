@@ -324,6 +324,77 @@ Probe history:
   NON-SPEC `events/list` + `events/stream` CustomRequest surface for
   their hosted Plugin Runtime (#37494) - bespoke event subscriptions
   built beside, not on, SEP-2575 listen.
+- 2026-08-24, v2.1.243 (structural probe; 2.1.239/240/241 spot-checked):
+  modern core and legacy bridge markers unchanged (dual-stack retained).
+  TASKS MOVED, in two ways that pull in opposite directions:
+  1. Claude Code now actively CONSUMES MCP tasks. A first-class
+     `mcp_task` background-task type exists in the app (task registry,
+     kill support, labels from `statusMessage`), with a `tasks/get` poll
+     loop honoring `pollIntervalMs` (clamped 100ms-60s, default 2s),
+     payload fetch via `tasks/result` on completion and during
+     `input_required`, reconnect-and-reconcile after restart (30s
+     window, state persisted in local storage). No feature-flag or env
+     gate found around it.
+  2. The `io.modelcontextprotocol/tasks` extension key is now bundled
+     (present since at least 2.1.239; absent at 2.1.233). A vendored SDK
+     copy carries capability-gated task acceptance in `tools/call`
+     (caller `allowTask` opt-in + `capabilities.extensions[key]` check +
+     result validation) and `execution.taskSupport:
+     required|optional|forbidden` tool metadata.
+  Structurally, though, the flavor is STILL legacy experimental: method
+  set is exactly {`tasks/get`, `tasks/result`, `tasks/list`,
+  `tasks/cancel`} with no `tasks/update`; the notification is legacy
+  `notifications/tasks/status`, not bare `notifications/tasks`; the
+  live poll harness drives the `experimental.tasks` legacy API and the
+  top-level `tasks` capability, and a compat shim exists that strips
+  `execution` from tool defs and deletes `tasks` from capabilities.
+  Verdict by the stated rules: NOT flipped to SEP-2663 (key literal
+  present, structural signature absent). Reading: the vendored SDK has
+  begun the extension migration while app code still speaks the legacy
+  experimental flavor; the flip may be close.
+- 2026-08-24, codex-rs HEAD cbfd999db7 (source probe, fresh pull ~1,000
+  commits past 233739e76a): rmcp bumped `=3.0.0` -> `=3.1.3` (#39798),
+  taking the 3.1.x conformance fixes this plan targets. Otherwise
+  posture unchanged: `Feature::Mcp20260728` (key `mcp_2026_07_28`)
+  still `Stage::UnderDevelopment`, `default_enabled: false`; Legacy
+  mode still negotiates via `ClientLifecycleMode::Initialize`, modern
+  via `Auto`. Zero hits workspace-wide for the tasks extension key and
+  `subscriptions/listen`; their own MCP server explicitly answers
+  `tasks/get`/`tasks/cancel` with "unsupported". MCP code restructured
+  into a new `codex-mcp` crate (connection manager, runtime, resource
+  client, tool catalog cache, elicitation reviewer) plus a `mcp-server`
+  crate; the TUI gained rmcp streamable-http-server features. Extension
+  investment is OpenAI-proprietary: Codex whitelists only
+  `openai/form`-family and app-UI extension namespaces from
+  host-declared extensions, plus a bespoke sandbox-state `_meta`
+  capability. The non-spec `events/list`/`events/stream` Plugin Runtime
+  surface keeps growing (dedicated event-notification transport with
+  byte-capped queueing). OAuth hardening continues (issuer binding for
+  endpoints and refresh tokens, credential-write hardening).
+- 2026-08-24, codex 0.149.1 LIVE WIRE CAPTURE (Homebrew binary against a
+  local logging sink; corrects the emphasis of the source probes above).
+  "Default OFF" does not mean immature: the modern client is shipped and
+  fully functional behind the single config key
+  `features.mcp_2026_07_28 = true` (session-global, user-settable in
+  config.toml; the release binary at tag rust-v0.149.0 carries the same
+  UnderDevelopment/default-off spec). Observed behavior:
+  - Default mode: pure legacy. `initialize` at `2025-06-18`,
+    `Mcp-Session-Id` echo, GET SSE stream, DELETE session teardown. No
+    `server/discover` probe at all.
+  - Flag on, discover rejected: leads with `server/discover`
+    (`Mcp-Method` header, `mcp-protocol-version: 2026-07-28`, SEP-2575
+    `_meta` self-description with protocolVersion/clientInfo/
+    clientCapabilities), then falls back cleanly to legacy `initialize`
+    - `ClientLifecycleMode::Auto` working as designed.
+  - Flag on, discover answered (DiscoverResult with supportedVersions/
+    ttlMs/cacheScope): proceeds FULLY STATELESS - no initialize, no
+    session id, no GET stream; every subsequent request carries the
+    self-describing `_meta` and `Mcp-Method` header.
+  Codex's declared client capabilities in both modes:
+  `elicitation: {form, url}` only - no tasks, no listen, matching the
+  source probe. Net correction: Codex "supports 2026-07-28 except
+  tasks/listen" is TRUE at the wire level today for anyone who flips
+  the config key; only the default is legacy.
 
 Flip criteria, split by surface:
 
@@ -332,7 +403,15 @@ Flip criteria, split by surface:
   as soon as Phase 1 lands and a live round-trip validates.
 - **Tasks extension**: flip only when a probe (or better, a daemon
   capability log) shows `io.modelcontextprotocol/tasks` negotiated. Until
-  then all clients get plain JSON from `bro_exec`/`bro_resume`.
+  then all clients get plain JSON from `bro_exec`/`bro_resume`. As of
+  2.1.243 the key is BUNDLED but the live harness speaks the legacy
+  experimental flavor, so a strings probe can no longer settle this
+  question alone: the capability trace log (negotiated
+  `clientCapabilities` at initialize / per-request `_meta`) is now the
+  only trustworthy flip signal. A client declaring the legacy top-level
+  `tasks` capability (which Claude Code now plausibly does) must still
+  get plain JSON; only the extension key in `capabilities.extensions`
+  flips the shape.
 
 Strings show what is bundled, not what is negotiated. Phase 0 should add a
 one-line trace log of client `protocolVersion` + capabilities at
