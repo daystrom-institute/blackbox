@@ -1015,6 +1015,12 @@ pub struct GapStore {
     /// Store-layer enforcement for the monotonic path-authority cut.
     path_fallback_cut: bool,
     view_metadata: BTreeMap<String, GapViewMetadata>,
+    /// Durable project scopes whose committed overlay could not be read
+    /// during the latest reload, with the error that skipped them. One stale
+    /// checkout must not fail every store mutation: a skipped carrier
+    /// contributes no repo-owned mark and no loaded ids, so save() neither
+    /// writes to nor purges it.
+    degraded_carriers: BTreeMap<String, String>,
 }
 
 impl GapStore {
@@ -1094,6 +1100,7 @@ impl GapStore {
             repo_loaded_ids: BTreeMap::new(),
             path_fallback_cut: false,
             view_metadata: BTreeMap::new(),
+            degraded_carriers: BTreeMap::new(),
         };
         s.reload()?;
         Ok(s)
@@ -1150,6 +1157,7 @@ impl GapStore {
         self.repo_owned_projects.clear();
         self.repo_owned_carriers.clear();
         self.repo_loaded_ids.clear();
+        self.degraded_carriers.clear();
         self.load_project_entries()?;
         Ok(())
     }
@@ -1157,12 +1165,25 @@ impl GapStore {
     fn load_project_entries(&mut self) -> Result<()> {
         let carriers = self.project_carriers.clone();
         for carrier in &carriers {
-            let (repo_owned, entries) = self.with_repo_read(carrier, |root| {
+            let loaded = self.with_repo_read(carrier, |root| {
                 Ok((
                     project_is_repo_owned(root),
                     load_repo_gap_entries(root, &carrier.project)?,
                 ))
-            })?;
+            });
+            let (repo_owned, entries) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    tracing::warn!(
+                        project = %carrier.project,
+                        error = format!("{error:#}"),
+                        "gaps load: skipping unreadable repo-owned carrier"
+                    );
+                    self.degraded_carriers
+                        .insert(carrier.project.clone(), format!("{error:#}"));
+                    continue;
+                }
+            };
             if repo_owned {
                 self.repo_owned_projects.insert(carrier.project.clone());
                 self.repo_owned_carriers.insert(carrier.carrier_id.clone());
@@ -1422,11 +1443,19 @@ impl GapStore {
             repo_loaded_ids: BTreeMap::new(),
             path_fallback_cut: true,
             view_metadata,
+            degraded_carriers: BTreeMap::new(),
         }
     }
 
     pub fn view_metadata(&self, id: &str) -> Option<&GapViewMetadata> {
         self.view_metadata.get(id)
+    }
+
+    /// Durable project scopes whose committed overlay was skipped by the
+    /// latest reload, with the error that skipped each. Empty when every
+    /// carrier loaded.
+    pub fn degraded_carriers(&self) -> &BTreeMap<String, String> {
+        &self.degraded_carriers
     }
 
     /// Project records still relying on the host-local central path key.
@@ -2343,6 +2372,68 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].impact, GapImpact::High);
         assert_eq!(listed[0].gap_kind, GapKind::Tooling);
+    }
+
+    #[test]
+    fn unreadable_carrier_degrades_instead_of_failing_every_mutation() {
+        use crate::repo_io::test_support::TestGapRepoIo;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let healthy = root.join("healthy-project");
+        fs::create_dir_all(&healthy).unwrap();
+        let healthy_project = healthy.to_string_lossy().into_owned();
+        let healthy_carrier =
+            GapRepoCarrier::new(healthy_project.clone(), healthy_project.clone()).unwrap();
+        let io = Arc::new(TestGapRepoIo::default());
+        io.replace(&[(healthy_carrier.clone(), healthy.clone())]);
+
+        // Seed a committed project gap through a healthy-only configuration.
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        store
+            .configure_repo_io(io.clone(), io.clone(), vec![healthy_carrier.clone()])
+            .unwrap();
+        fs::create_dir_all(healthy.join(".bbox")).unwrap();
+        let mut project_params = file_params("project gap", "tooling/test-domain/project-gap");
+        project_params.scope = Some("project".into());
+        project_params.project = Some(healthy_project.clone());
+        store.file(&project_params).unwrap();
+
+        // A carrier whose root is gone joins the set, FIRST, so tolerance for
+        // it must not stop later carriers from loading.
+        let broken_project = root.join("missing-project").to_string_lossy().into_owned();
+        let broken_carrier =
+            GapRepoCarrier::new(broken_project.clone(), broken_project.clone()).unwrap();
+        store
+            .configure_repo_io(io.clone(), io, vec![broken_carrier, healthy_carrier])
+            .unwrap();
+
+        assert_eq!(
+            store.degraded_carriers().len(),
+            1,
+            "{:?}",
+            store.degraded_carriers()
+        );
+        assert!(store.degraded_carriers().contains_key(&broken_project));
+        assert!(
+            store
+                .all()
+                .iter()
+                .any(|gap| gap.project.as_deref() == Some(healthy_project.as_str())),
+            "healthy carrier entries must survive a degraded sibling"
+        );
+
+        // The load-bearing regression: a global filing succeeds while an
+        // unrelated carrier is unreadable.
+        let (id, created) = store
+            .file(&file_params(
+                "global still writes",
+                "tooling/test-domain/global-after-degraded",
+            ))
+            .unwrap();
+        assert!(created);
+        assert!(id.starts_with("gap-"));
+        assert!(store.degraded_carriers().contains_key(&broken_project));
     }
 
     #[test]

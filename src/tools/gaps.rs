@@ -709,6 +709,13 @@ impl BlackboxServer {
                     p.project_id = Some(resolved);
                 }
             }
+            // The mutation store's reload tolerates unreadable carriers by
+            // skipping them; tell the caller which projects that hid.
+            for (project, error) in self.state.gaps.read().degraded_carriers() {
+                filter_diagnostics.push(format!(
+                    "gap store overlay skipped for project {project}: {error}"
+                ));
+            }
             let mut used_stamp_refs = Vec::<String>::new();
             let selected = view.gaps.query(&p);
             // Response-scoped diagnostics (gap-40ab1102): the legacy-lane

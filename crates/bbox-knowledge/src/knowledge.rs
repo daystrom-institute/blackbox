@@ -2006,6 +2006,12 @@ pub struct Knowledge {
     /// lifecycle flips this while holding the store write lock, closing the
     /// race between cut readiness and an in-flight legacy mutation.
     path_fallback_cut: bool,
+    /// Durable project scopes whose committed overlay could not be read
+    /// during the latest reload, with the error that skipped them. One stale
+    /// checkout must not fail every store mutation: a skipped carrier
+    /// contributes no repo-owned mark and no loaded ids, so persistence
+    /// neither writes to nor purges it.
+    degraded_carriers: BTreeMap<String, String>,
 }
 
 struct CheckoutMutationRestore {
@@ -2172,6 +2178,7 @@ impl Knowledge {
             repo_loaded_ids: BTreeMap::new(),
             view_metadata: BTreeMap::new(),
             path_fallback_cut: false,
+            degraded_carriers: BTreeMap::new(),
         };
         k.reload()?;
         Ok(k)
@@ -2527,9 +2534,10 @@ impl Knowledge {
         self.store.provenance.clear();
         self.repo_owned_projects.clear();
         self.repo_loaded_ids.clear();
+        self.degraded_carriers.clear();
         for carrier in &carriers {
             let durable_project = carrier.project.clone();
-            let (head, entries, mut prov, repo_owned) = self.with_repo_read(carrier, |root| {
+            let loaded = self.with_repo_read(carrier, |root| {
                 let (entries, provenance) = load_repo_kb_entries(root, &carrier.project)?;
                 Ok((
                     bbox_corpus_core::git::current_head(root),
@@ -2537,7 +2545,20 @@ impl Knowledge {
                     provenance,
                     project_is_repo_owned(root),
                 ))
-            })?;
+            });
+            let (head, entries, mut prov, repo_owned) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    tracing::warn!(
+                        project = %durable_project,
+                        error = format!("{error:#}"),
+                        "kb load: skipping unreadable repo-owned carrier"
+                    );
+                    self.degraded_carriers
+                        .insert(durable_project, format!("{error:#}"));
+                    continue;
+                }
+            };
             // Repo-owned project state is reconstructed from its published
             // carrier. This also migrates old central snapshots that retained
             // worktree copies under the durable base project path.
@@ -2637,6 +2658,13 @@ impl Knowledge {
     /// consumer reads to distinguish published from provisional.
     pub fn built_from(&self) -> &BTreeMap<String, String> {
         &self.store.built_from
+    }
+
+    /// Durable project scopes whose committed overlay was skipped by the
+    /// latest reload, with the error that skipped each. Empty when every
+    /// carrier loaded.
+    pub fn degraded_carriers(&self) -> &BTreeMap<String, String> {
+        &self.degraded_carriers
     }
 
     /// Published-vs-provisional label for an entry id (design §3.4, slice 3.2).
@@ -4702,6 +4730,7 @@ impl Knowledge {
             repo_loaded_ids: BTreeMap::new(),
             view_metadata,
             path_fallback_cut: true,
+            degraded_carriers: BTreeMap::new(),
         }
     }
 
@@ -5025,6 +5054,76 @@ mod tests {
             .map(|entry| entry.id.as_str())
             .collect::<BTreeSet<_>>();
         persist_repo_kb_entries(root, entries, purge, &known_ids, &BTreeSet::new())
+    }
+
+    #[test]
+    fn unreadable_carrier_degrades_instead_of_failing_every_mutation() {
+        use crate::repo_io::test_support::TestKnowledgeRepoIo;
+
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let healthy_root = repo.path().canonicalize().unwrap();
+        let healthy_project = healthy_root.to_string_lossy().into_owned();
+        let healthy_carrier =
+            KnowledgeRepoCarrier::new(healthy_project.clone(), healthy_project.clone()).unwrap();
+        let dir = repo_kb_dir(&healthy_root);
+        fs::create_dir_all(&dir).unwrap();
+        let on_disk = entry("degrade01", "Survivor", "content", Scope::Project);
+        bbox_corpus_core::json_store::atomic_write_json_locked(
+            &dir.join("degrade01.json"),
+            &on_disk,
+        )
+        .unwrap();
+
+        // A carrier whose root is gone joins the set, FIRST, so tolerance for
+        // it must not stop later carriers from loading.
+        let broken_project = healthy_root
+            .join("missing-project")
+            .to_string_lossy()
+            .into_owned();
+        let broken_carrier =
+            KnowledgeRepoCarrier::new(broken_project.clone(), broken_project.clone()).unwrap();
+        let io = Arc::new(TestKnowledgeRepoIo::default());
+        io.replace(&[(healthy_carrier.clone(), healthy_root.clone())]);
+
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.configure_repo_io(io.clone(), io, vec![broken_carrier, healthy_carrier])
+            .unwrap();
+
+        assert_eq!(
+            kb.degraded_carriers().len(),
+            1,
+            "{:?}",
+            kb.degraded_carriers()
+        );
+        assert!(kb.degraded_carriers().contains_key(&broken_project));
+        assert!(
+            kb.entry("degrade01").is_some(),
+            "healthy carrier entries must survive a degraded sibling"
+        );
+
+        // The load-bearing regression: a global write succeeds while an
+        // unrelated carrier is unreadable.
+        kb.learn(
+            &LearnParams {
+                content: "global still writes".into(),
+                category: "convention".into(),
+                format: None,
+                title: Some("global write".into()),
+                scope: Some("global".into()),
+                project: None,
+                project_id: None,
+                providers: None,
+                priority: None,
+                weight: None,
+                expires_at: None,
+                cluster: None,
+                id: None,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(kb.degraded_carriers().contains_key(&broken_project));
     }
 
     #[test]

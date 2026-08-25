@@ -316,12 +316,29 @@ impl RepoIoAuthority {
         operation: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()> {
         let target = decode_target(carrier_id)?;
-        let project_id = match &target {
-            RepoCarrierTarget::Selected { project_id }
-            | RepoCarrierTarget::Checkout { project_id, .. }
-            | RepoCarrierTarget::Attachment { project_id, .. } => project_id,
-        }
-        .clone();
+        // Name the target in every failure below: a refused lease otherwise
+        // reads as the caller's own project being broken when the culprit is
+        // an unrelated registered checkout swept up by a full-store reload.
+        let (project_id, label) = match &target {
+            RepoCarrierTarget::Selected { project_id } => {
+                (project_id.clone(), format!("project {project_id}"))
+            }
+            RepoCarrierTarget::Checkout {
+                project_id,
+                checkout_id,
+            } => (
+                project_id.clone(),
+                format!("project {project_id} checkout {checkout_id}"),
+            ),
+            RepoCarrierTarget::Attachment {
+                project_id,
+                attachment_id,
+                ..
+            } => (
+                project_id.clone(),
+                format!("project {project_id} attachment {attachment_id}"),
+            ),
+        };
         // A native attachment target names its checkout outright, so it needs
         // no scope-discovery lease. Skipping it also keeps the gate honest:
         // `PublisherConfigTreeRead` rides `repo_knowledge` (D-032), so
@@ -349,7 +366,7 @@ impl RepoIoAuthority {
                         intent: CheckoutAccessIntent::Read,
                         source_lane: CheckoutAccessSourceLane::LegacyProjectRecord,
                     })
-                    .map_err(anyhow::Error::new)?;
+                    .with_context(|| format!("checkout access for {label}"))?;
                 let expected_scope = scope_lease.published_scope().cloned();
                 drop(scope_lease);
                 match legacy {
@@ -377,7 +394,7 @@ impl RepoIoAuthority {
                 intent,
                 source_lane,
             })
-            .map_err(anyhow::Error::new)?;
+            .with_context(|| format!("checkout access for {label}"))?;
         // Revalidate before publication (plan section 8, P5-F repo-I/O item
         // 4). A Write-intent lease already pins the mutation lane for its
         // lifetime, so the fence itself is not what this adds: the guard
@@ -389,13 +406,15 @@ impl RepoIoAuthority {
             CheckoutAccessIntent::Write => Some(
                 self.broker
                     .publication_guard(&lease)
-                    .map_err(anyhow::Error::new)?,
+                    .with_context(|| format!("checkout access for {label}"))?,
             ),
             CheckoutAccessIntent::Read => None,
         };
         let outcome = operation(lease.project_root());
         drop(publication);
-        self.broker.revalidate(&lease).map_err(anyhow::Error::new)?;
+        self.broker
+            .revalidate(&lease)
+            .with_context(|| format!("checkout access for {label}"))?;
         outcome
     }
 }
