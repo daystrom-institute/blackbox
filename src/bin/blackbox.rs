@@ -3499,7 +3499,7 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
             "error.project_catalog_cli_unprobeable_reference_class",
             format!(
                 "these reference classes could not be probed and may still hold references: {}",
-                probe.unprobeable.join(", ")
+                probe.unprobeable_display()
             ),
         ));
     }
@@ -3515,6 +3515,7 @@ fn execute_retire(args: RetireArgs) -> Result<serde_json::Value, CommandFailure>
         "blocking": inventory.blocking,
         "probed_reference_classes": RETIRE_REFERENCE_CLASSES,
         "unprobeable_reference_classes": probe.unprobeable,
+        "unprobeable_reference_reasons": probe.unprobeable_reasons,
         "removable_attachments": inventory.removable_attachments,
         "removable_migrations": inventory.removable_migrations,
         "removable_bindings": inventory.removable_bindings,
@@ -3559,7 +3560,7 @@ fn execute_retirement_journal(
             "error.project_catalog_cli_unprobeable_reference_class",
             format!(
                 "these reference classes could not be probed and may still hold references: {}",
-                probe.unprobeable.join(", ")
+                probe.unprobeable_display()
             ),
         ));
     }
@@ -3627,6 +3628,7 @@ fn execute_retirement_journal(
         "catalog_epoch": preflight.catalog_epoch,
         "probed_reference_classes": RETIRE_REFERENCE_CLASSES,
         "unprobeable_reference_classes": probe.unprobeable,
+        "unprobeable_reference_reasons": probe.unprobeable_reasons,
         "plan_hash": plan_hash,
         "plan": {
             "project_selectors": planned_evidence.project_selectors,
@@ -4347,7 +4349,7 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
                 "error.project_catalog_retire_recovery_reprobe",
                 format!(
                     "post-cut recovery could not probe: {}",
-                    probe.unprobeable.join(", ")
+                    probe.unprobeable_display()
                 ),
             ));
         }
@@ -4600,7 +4602,9 @@ const SLACK_ROW_KEYS: [&str; 3] = ["project", "project_id", "project_dir"];
 enum ClassProbe {
     Counted(u64),
     Committed(Vec<String>),
-    Unprobeable,
+    /// The reason travels for display and refusal messages only; evidence
+    /// and plan hashes keep the bare class name.
+    Unprobeable(String),
 }
 
 impl ClassProbe {
@@ -4618,6 +4622,9 @@ struct RetireProbe {
     evidence: project_catalog_admin::RetireEvidence,
     commitments: BTreeMap<String, Vec<String>>,
     unprobeable: Vec<String>,
+    /// Why each unprobeable class could not be read, keyed by class name.
+    /// Display-only: never folded into evidence or plan hashes.
+    unprobeable_reasons: BTreeMap<String, String>,
 }
 
 impl RetireProbe {
@@ -4642,8 +4649,23 @@ impl RetireProbe {
                     .insert(class.to_string(), identities.len() as u64);
                 self.commitments.insert(class.to_string(), identities);
             }
-            ClassProbe::Unprobeable => self.unprobeable.push(class.to_string()),
+            ClassProbe::Unprobeable(reason) => {
+                self.unprobeable.push(class.to_string());
+                self.unprobeable_reasons.insert(class.to_string(), reason);
+            }
         }
+    }
+
+    /// `class (reason)` lines for refusal messages.
+    fn unprobeable_display(&self) -> String {
+        self.unprobeable
+            .iter()
+            .map(|class| match self.unprobeable_reasons.get(class) {
+                Some(reason) => format!("{class} ({reason})"),
+                None => class.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -4759,13 +4781,16 @@ fn probe_retire_evidence(
                 ),
             );
         }
-        Err(_) => {
+        Err(error) => {
             for class in [
                 "code_source_activation",
                 "producer_assignments",
                 "code_source_generations",
             ] {
-                probe.record(class, ClassProbe::Unprobeable);
+                probe.record(
+                    class,
+                    ClassProbe::Unprobeable(format!("code-source store paths: {error}")),
+                );
             }
         }
     }
@@ -4774,7 +4799,9 @@ fn probe_retire_evidence(
         "accepted_publication_pointer",
         match accepted_publication_pointer(projects_path, project_id) {
             Some(pointer) => file_commitment_probe(&pointer),
-            None => ClassProbe::Unprobeable,
+            None => ClassProbe::Unprobeable(
+                "accepted-publication pointer path could not be derived".to_string(),
+            ),
         },
     );
 
@@ -5123,7 +5150,7 @@ fn capture_retirement_evidence(
             "error.project_catalog_retire_plan_evidence",
             format!(
                 "cannot capture a complete retirement plan; unprobeable classes: {}",
-                reference_probe.unprobeable.join(", ")
+                reference_probe.unprobeable_display()
             ),
         ));
     }
@@ -5227,15 +5254,15 @@ fn probe_code_source_generations_store_owned(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ClassProbe::Counted(0);
         }
-        Err(_) => return ClassProbe::Unprobeable,
+        Err(error) => return ClassProbe::Unprobeable(format!("reading scopes dir: {error}")),
     };
     let mut count = 0_u64;
     for scope_entry in scope_entries {
         let Ok(scope_entry) = scope_entry else {
-            return ClassProbe::Unprobeable;
+            return ClassProbe::Unprobeable("scope entry unreadable".to_string());
         };
         let Ok(kind) = scope_entry.file_type() else {
-            return ClassProbe::Unprobeable;
+            return ClassProbe::Unprobeable("scope entry file type unreadable".to_string());
         };
         if kind.is_symlink() || !kind.is_dir() {
             continue;
@@ -5249,14 +5276,18 @@ fn probe_code_source_generations_store_owned(
         let gen_entries = match std::fs::read_dir(&generations_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return ClassProbe::Unprobeable,
+            Err(error) => {
+                return ClassProbe::Unprobeable(format!("reading generations dir: {error}"));
+            }
         };
         for gen_entry in gen_entries {
             let Ok(gen_entry) = gen_entry else {
-                return ClassProbe::Unprobeable;
+                return ClassProbe::Unprobeable("generation entry unreadable".to_string());
             };
             let Ok(kind) = gen_entry.file_type() else {
-                return ClassProbe::Unprobeable;
+                return ClassProbe::Unprobeable(
+                    "generation entry file type unreadable".to_string(),
+                );
             };
             if kind.is_symlink() || !kind.is_dir() {
                 continue;
@@ -5313,7 +5344,7 @@ fn probe_edge_sidecar(edges_dir: &Path, project_id: &ProjectId) -> ClassProbe {
             }));
             ClassProbe::Committed(commitments)
         }
-        Err(_) => ClassProbe::Unprobeable,
+        Err(error) => ClassProbe::Unprobeable(format!("retirement inventory: {error}")),
     }
 }
 
@@ -5331,15 +5362,20 @@ fn probe_owner_snapshot_rows(
         OwnerSnapshotRowValueV1, OwnerSnapshotStateV1,
     };
 
-    let Ok(snapshot) = snapshot else {
-        return ClassProbe::Unprobeable;
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return ClassProbe::Unprobeable(format!("owner snapshot capture: {error}"));
+        }
     };
     match snapshot.state {
         OwnerSnapshotStateV1::Missing { .. } if snapshot.rows.is_empty() => {
             return ClassProbe::Committed(Vec::new());
         }
         OwnerSnapshotStateV1::Present { .. } => {}
-        _ => return ClassProbe::Unprobeable,
+        ref state => {
+            return ClassProbe::Unprobeable(format!("owner snapshot state: {state:?}"));
+        }
     }
     ClassProbe::Committed(
         snapshot
@@ -5381,7 +5417,7 @@ fn probe_index_entity_refs(
                 })
                 .collect(),
         ),
-        _ => ClassProbe::Unprobeable,
+        ref state => ClassProbe::Unprobeable(format!("corpus index state: {state:?}")),
     }
 }
 
@@ -5428,7 +5464,7 @@ fn probe_index_code_metadata_rows(
                 })
                 .collect(),
         ),
-        _ => ClassProbe::Unprobeable,
+        ref state => ClassProbe::Unprobeable(format!("code metadata state: {state:?}")),
     }
 }
 
@@ -5449,7 +5485,7 @@ fn probe_git_ingest_cursors(
                 .map(|row| retirement_commitment(&(&row.project_id, &row.last_ingested_sha)))
                 .collect(),
         ),
-        _ => ClassProbe::Unprobeable,
+        ref state => ClassProbe::Unprobeable(format!("git cursor state: {state:?}")),
     }
 }
 
@@ -5477,7 +5513,7 @@ fn probe_vector_entity_refs(
                 })
                 .collect(),
         ),
-        _ => ClassProbe::Unprobeable,
+        ref state => ClassProbe::Unprobeable(format!("vector store state: {state:?}")),
     }
 }
 
@@ -5493,10 +5529,12 @@ fn count_project_rows(
     let bytes = match read_regular_nofollow(path) {
         Ok(None) => return ClassProbe::Committed(Vec::new()),
         Ok(Some(bytes)) => bytes,
-        Err(()) => return ClassProbe::Unprobeable,
+        Err(()) => {
+            return ClassProbe::Unprobeable("unreadable or non-regular file".to_string());
+        }
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return ClassProbe::Unprobeable;
+        return ClassProbe::Unprobeable("unparseable JSON".to_string());
     };
     let mut commitments = Vec::new();
     let mut stack = vec![("$".to_string(), &value)];
@@ -5542,7 +5580,7 @@ fn file_commitment_probe(path: &Path) -> ClassProbe {
     match read_regular_nofollow(path) {
         Ok(None) => ClassProbe::Committed(Vec::new()),
         Ok(Some(bytes)) => ClassProbe::Committed(vec![retirement_commitment(&bytes)]),
-        Err(()) => ClassProbe::Unprobeable,
+        Err(()) => ClassProbe::Unprobeable("unreadable or non-regular file".to_string()),
     }
 }
 
