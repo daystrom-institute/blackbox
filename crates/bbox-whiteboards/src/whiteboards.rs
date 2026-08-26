@@ -878,35 +878,51 @@ pub fn discharge_project_catalog_rows(
         bail!("whiteboard store root is not a safe directory");
     }
     let mut removals = Vec::new();
-    for entry in std::fs::read_dir(storage_dir)? {
-        let entry = entry?;
-        // `archive/` is part of the store's own layout (archived boards move
-        // there); the runtime loader skips it the same way. Refusing the
-        // store's own directory made every project retirement on the host
-        // fail. Anything else non-canonical still refuses.
-        if entry.file_type()?.is_dir()
-            && !entry.file_type()?.is_symlink()
-            && entry.file_name() == OsStr::new("archive")
-        {
-            continue;
+    let mut synced_dirs = Vec::new();
+    // `archive/` is part of the store's own layout (archived boards move
+    // there). The owner-row evidence capture walks the whole tree for
+    // `*.json`, so the discharge must sweep the archive too or archived
+    // boards survive as undischargeable references; anything else
+    // non-canonical still refuses.
+    let archive_dir = storage_dir.join("archive");
+    for dir in [storage_dir, archive_dir.as_path()] {
+        match std::fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => bail!("whiteboard store contains a non-canonical entry"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
         }
-        if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("json")) {
-            bail!("whiteboard store contains a non-canonical entry");
-        }
-        let board: Board = serde_json::from_slice(&std::fs::read(entry.path())?)?;
-        let owned = match board.project_id.as_deref() {
-            Some(owner) => owner == project_id,
-            None => selectors.iter().any(|selector| selector == &board.project),
-        };
-        if owned {
-            removals.push(entry.path());
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if dir == storage_dir
+                && entry.file_type()?.is_dir()
+                && !entry.file_type()?.is_symlink()
+                && entry.file_name() == OsStr::new("archive")
+            {
+                continue;
+            }
+            if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("json"))
+            {
+                bail!("whiteboard store contains a non-canonical entry");
+            }
+            let board: Board = serde_json::from_slice(&std::fs::read(entry.path())?)?;
+            let owned = match board.project_id.as_deref() {
+                Some(owner) => owner == project_id,
+                None => selectors.iter().any(|selector| selector == &board.project),
+            };
+            if owned {
+                removals.push(entry.path());
+                if !synced_dirs.contains(&dir.to_path_buf()) {
+                    synced_dirs.push(dir.to_path_buf());
+                }
+            }
         }
     }
     for path in &removals {
         std::fs::remove_file(path)?;
     }
-    if !removals.is_empty() {
-        std::fs::File::open(storage_dir)?.sync_all()?;
+    for dir in &synced_dirs {
+        std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(removals.len())
 }
