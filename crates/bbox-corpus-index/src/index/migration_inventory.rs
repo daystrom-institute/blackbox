@@ -586,10 +586,22 @@ fn capture_index(
                 // counting it here would make the ref inventory claim rows
                 // the discharge path cannot clear.
                 if entity != local_activation_marker(&project) {
+                    tracing::warn!(
+                        entity,
+                        project,
+                        "corpus inventory: activation marker row failed validation"
+                    );
                     return corrupt_index("corpus_index_activation_marker_invalid");
                 }
             } else {
                 if project_id_from_entity_ref(&entity) != Some(project.as_str()) {
+                    let doc_type = optional_text(&document, doc_type).unwrap_or_default();
+                    tracing::warn!(
+                        entity,
+                        project,
+                        doc_type,
+                        "corpus inventory: row is not a recognized project-scoped ref"
+                    );
                     return corrupt_index("corpus_index_project_ref_invalid");
                 }
                 total_string_bytes =
