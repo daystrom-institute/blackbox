@@ -3816,8 +3816,14 @@ fn validate_journal_stage_history(
     Ok(())
 }
 
-/// Maximum byte size for a retirement journal (F6: bounded read).
-const MAX_JOURNAL_BYTES: usize = 64 * 1024;
+/// Maximum byte size for a retirement journal (F6: bounded read). The
+/// journal inlines per-class evidence commitments, and a real project's
+/// vector/edge/index commitment lists run to thousands of sha256 rows: 64KB
+/// refused every retirement on a populated deployment. Blob hashes already
+/// externalize to the sidecar; the remaining inline classes are bounded by
+/// the capture limits, and this cap is a hostile-file guard, not a shaping
+/// constraint.
+const MAX_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(unix)]
 fn atomic_write_retirement_leaf(

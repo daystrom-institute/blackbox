@@ -5749,10 +5749,15 @@ fn clear_wrapped_project_rows(
         let bytes = std::fs::read(path)?;
         let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
         for field in array_fields {
-            let rows = value
-                .get_mut(*field)
-                .and_then(serde_json::Value::as_array_mut)
-                .ok_or_else(|| anyhow::anyhow!("missing array field {field}"))?;
+            // Stores omit empty collections entirely (skip_serializing_if),
+            // so an absent field is the empty case, not corruption; a field
+            // that exists with a non-array shape still refuses.
+            let Some(slot) = value.get_mut(*field) else {
+                continue;
+            };
+            let rows = slot
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("field {field} is not an array"))?;
             rows.retain(|row| !row_matches_project(row, keys, project_id, selectors));
         }
         bbox_corpus_core::json_store::atomic_write_json_locked(path, &value)
