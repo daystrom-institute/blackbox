@@ -1,0 +1,22 @@
+{
+  "id": "gap-7e4c11ce",
+  "title": "Retirement does not discharge code-source locality governance marker rows",
+  "gap_kind": "tooling",
+  "domain": "project-catalog",
+  "wanted_capability": "The retirement journal should remove (or tombstone) the retired project's row from the checksummed code-source-locality cutover marker as a discharge stage, the same way it discharges activations, generations, and coordination rows. Today the marker keeps its row after the catalog pair is removed; boot now tolerates the stale rows (skip + warn, commits 006c667b and 2f30a07c) but the marker on the cage deployment permanently carries 13 rows for retired projects, every boot logs 13 warnings, and the tolerance weakens the governance invariant that every marker row names a live governed project. The marker has checksum helpers already; the discharge needs an atomic rewrite with recomputed checksum.",
+  "missing_primitive": "a locality-marker discharge stage in the retirement journal",
+  "fallback_used": "Boot-side tolerance: verify_assignments and verify_live skip rows whose project is absent from the catalog, with a warning per row.",
+  "evidence": [
+    "error.code_source_locality_assignment crash loop after retiring 13 projects on the cage deployment (2026-08-26)",
+    "commits 006c667b, 2f30a07c (boot tolerance)",
+    "crates/bbox-indexing/src/code_source_locality_cutover.rs verify_live"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-catalog/retire-locality-marker-discharge",
+  "suggested_owner": "blackbox",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-08-26T20:03:52Z",
+  "updated_at": "2026-08-26T20:03:52Z"
+}
