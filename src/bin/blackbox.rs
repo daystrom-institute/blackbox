@@ -4162,14 +4162,27 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         let state = store.snapshot()?;
         let epoch = state.epoch();
         let pid = project_id.clone();
+        let detached_at = offline_timestamp();
         store.transact(epoch, move |_catalog, attachments| {
+            // The full canonical detach transition (mirrors
+            // `detach_attachment`): strict validation refuses a detached row
+            // that keeps capability bits or lacks its timestamp, so flipping
+            // only the status made this stage refuse its own commit on any
+            // project retired with a live attachment.
+            let mut detached_ids = Vec::new();
             attachments
                 .attachments
                 .values_mut()
                 .filter(|row| row.project_id == pid && row.status == AttachmentStatus::Attached)
                 .for_each(|row| {
                     row.status = AttachmentStatus::Detached;
+                    row.detached_at = Some(detached_at.clone());
+                    row.capabilities = Default::default();
+                    detached_ids.push(row.attachment_id.clone());
                 });
+            attachments
+                .default_attachments
+                .retain(|_, selected| !detached_ids.contains(selected));
             Ok(())
         })?;
         Ok(())
