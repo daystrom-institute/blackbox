@@ -155,7 +155,29 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
         &self,
         assignments: &BTreeMap<PublishedScope, (String, String)>,
     ) -> Result<()> {
+        self.verify_assignments_with_catalog(assignments, |_| true)
+    }
+
+    /// Like [`Self::verify_assignments`], but a governance row whose project
+    /// is no longer in the catalog is stale aftermath of a retirement, not a
+    /// lost producer: retirement removes the catalog pair and revokes the
+    /// grant while the checksummed marker keeps its row, and refusing boot
+    /// over it held the daemon down after every retirement. Live projects
+    /// keep the full strict check.
+    pub fn verify_assignments_with_catalog(
+        &self,
+        assignments: &BTreeMap<PublishedScope, (String, String)>,
+        catalog_has_project: impl Fn(&str) -> bool,
+    ) -> Result<()> {
         for row in self.rows.values() {
+            if !catalog_has_project(row.project_id.as_str()) {
+                tracing::warn!(
+                    project = %row.project_id,
+                    producer = %row.producer_id,
+                    "locality governance row outlives its retired project; skipping"
+                );
+                continue;
+            }
             match assignments.get(&row.scope) {
                 Some((project_id, producer_id))
                     if project_id == row.project_id.as_str() && producer_id == &row.producer_id => {

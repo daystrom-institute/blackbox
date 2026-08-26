@@ -560,7 +560,11 @@ impl CodeSourceRuntime {
             None,
             &checkout_access,
         )?);
-        code_source_locality_cutover.verify_assignments(&assignment_map(&snapshot))?;
+        let catalog_projects = catalog_project_ids(catalog_store.as_deref())?;
+        code_source_locality_cutover
+            .verify_assignments_with_catalog(&assignment_map(&snapshot), |project_id| {
+                catalog_projects_contains(&catalog_projects, project_id)
+            })?;
         Ok(Self {
             snapshot: parking_lot::RwLock::new(snapshot),
             activating_projects: parking_lot::Mutex::new(BTreeMap::new()),
@@ -587,8 +591,11 @@ impl CodeSourceRuntime {
             Some(previous.store.clone()),
             &self.checkout_access,
         )?);
+        let catalog_projects = catalog_project_ids(self.catalog_store.as_deref())?;
         self.code_source_locality_cutover
-            .verify_assignments(&assignment_map(&replacement))?;
+            .verify_assignments_with_catalog(&assignment_map(&replacement), |project_id| {
+                catalog_projects_contains(&catalog_projects, project_id)
+            })?;
         replacement.store.update_limits(store_limits(config))?;
         let old_assignments = assignment_map(&previous);
         let new_assignments = assignment_map(&replacement);
@@ -769,6 +776,35 @@ impl bbox_indexing::index::ProducerAssignmentSource for CodeSourceRuntime {
 
 fn assignment_map(snapshot: &CodeSourceSnapshot) -> BTreeMap<PublishedScope, (String, String)> {
     snapshot.auth.assignment_map()
+}
+
+/// Catalog project-id set for governance verification; `None` (bridge mode)
+/// treats every governed row as live, preserving the strict behavior.
+fn catalog_project_ids(
+    catalog_store: Option<&bbox_indexing::project_catalog_store::ProjectCatalogStore>,
+) -> Result<Option<std::collections::BTreeSet<String>>> {
+    let Some(store) = catalog_store else {
+        return Ok(None);
+    };
+    let snapshot = store.snapshot()?;
+    Ok(Some(
+        snapshot
+            .catalog()
+            .projects
+            .keys()
+            .map(|project_id| project_id.as_str().to_string())
+            .collect(),
+    ))
+}
+
+fn catalog_projects_contains(
+    catalog_projects: &Option<std::collections::BTreeSet<String>>,
+    project_id: &str,
+) -> bool {
+    match catalog_projects {
+        Some(projects) => projects.contains(project_id),
+        None => true,
+    }
 }
 
 fn build_snapshot(
