@@ -4585,6 +4585,21 @@ impl CodeSourceStore {
     }
 
     /// Mode-aware generation load by scope and id (section 7.2).
+    /// Like [`Self::load_generation_mixed`] but a generation whose metadata
+    /// file is absent returns `Ok(None)` instead of an error. Retirement
+    /// evidence uses this to treat a retained-owner record whose generation
+    /// was already reclaimed as stale rather than refusing every retire.
+    pub fn load_generation_mixed_if_present(
+        &self,
+        scope: &PublishedScope,
+        generation: &str,
+    ) -> Result<Option<MixedStoredGeneration>> {
+        if !self.paths.generation_metadata(scope, generation)?.is_file() {
+            return Ok(None);
+        }
+        self.load_generation_mixed(scope, generation).map(Some)
+    }
+
     pub fn load_generation_mixed(
         &self,
         scope: &PublishedScope,

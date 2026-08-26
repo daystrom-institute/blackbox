@@ -5023,14 +5023,22 @@ fn capture_retirement_evidence(
             format!("failed to enumerate retained-generation ownership: {error}"),
         )
     })? {
-        let generation = store
-            .load_generation_mixed(&retained.published_scope, &retained.generation_id)
+        // A retained-owner record can outlive its generation: reclamation
+        // deletes the generation tree first and owner reconciliation sweeps
+        // the record later. A missing generation cannot collide with anything,
+        // so the stale record is skipped instead of refusing every retire on
+        // this host; any other read failure still refuses.
+        let generation = match store
+            .load_generation_mixed_if_present(&retained.published_scope, &retained.generation_id)
             .map_err(|error| {
                 project_catalog_admin::admin_error(
                     "error.project_catalog_retire_retained_owner",
                     format!("retained-generation owner record has no exact generation: {error}"),
                 )
-            })?;
+            })? {
+            Some(generation) => generation,
+            None => continue,
+        };
         if generation.generation_id() != retained.generation_id
             || generation.published_scope() != &retained.published_scope
         {
