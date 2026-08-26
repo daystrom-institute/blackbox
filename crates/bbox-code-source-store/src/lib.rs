@@ -4419,24 +4419,32 @@ impl CodeSourceStore {
     /// the project's strictly loaded current activation as the authority.
     pub fn ensure_retained_generation_ownership(&self, project_id: &ProjectId) -> Result<()> {
         let _guard = self.lock_mutation()?;
-        let scope = match self.shared.record_mode {
-            RuntimeRecordMode::CatalogV2 => self
-                .load_activation_v2_locked(project_id.as_str())?
-                .map(|activation| activation.published_scope),
-            RuntimeRecordMode::BridgeV1 => self
-                .load_activation(project_id.as_str())?
-                .map(|activation| {
-                    self.list_generations().map(|generations| {
-                        generations
-                            .into_iter()
-                            .find(|generation| {
-                                generation.generation_id() == activation.generation_id
-                            })
-                            .map(|generation| generation.published_scope().clone())
-                    })
-                })
-                .transpose()?
-                .flatten(),
+        // Retirement evidence reads the activation per FILE version, not per
+        // store record mode: an offline admin store administers whatever the
+        // deployment left behind, and a v2 deployment can still carry a
+        // pre-cutover v1 activation that retirement must account for (and a
+        // bridge-mode open must not choke on a v2 record it is retiring).
+        let path = self.paths.activation_for_str(project_id.as_str())?;
+        let scope = if path.is_file() {
+            match read_mixed_activation(&path)? {
+                MixedActivationRecord::CurrentV2(activation) => {
+                    if activation.project_id.as_str() != project_id.as_str() {
+                        bail!("activation record identity mismatch");
+                    }
+                    Some(activation.published_scope)
+                }
+                MixedActivationRecord::LegacyV1(activation) => {
+                    if activation.project_id != project_id.as_str() {
+                        bail!("activation record identity mismatch");
+                    }
+                    self.list_generations()?
+                        .into_iter()
+                        .find(|generation| generation.generation_id() == activation.generation_id)
+                        .map(|generation| generation.published_scope().clone())
+                }
+            }
+        } else {
+            None
         };
         if let Some(scope) = scope {
             self.backfill_retained_generation_owners_locked(project_id, &scope)?;

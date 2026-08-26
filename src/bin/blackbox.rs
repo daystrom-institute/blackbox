@@ -3864,11 +3864,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
             ));
         }
         let code_sources = self.config.paths.state_dir.join("code-sources");
-        let code_store = bbox_code_source_store::CodeSourceStore::open(
+        let code_store = bbox_code_source_store::CodeSourceStore::open_with_mode(
             &code_sources,
             bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
                 self.config,
             ),
+            bbox_code_source_store::RuntimeRecordMode::CatalogV2,
         )
         .map_err(|error| {
             project_catalog_admin::admin_error(
@@ -3951,11 +3952,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
     ) -> project_catalog_admin::AdminResult<()> {
         let code_sources = self.config.paths.state_dir.join("code-sources");
         // R2F1: fail on store-open errors instead of silently ignoring them.
-        let store = bbox_code_source_store::CodeSourceStore::open(
+        let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
             &code_sources,
             bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
                 self.config,
             ),
+            bbox_code_source_store::RuntimeRecordMode::CatalogV2,
         )
         .map_err(|e| {
             project_catalog_admin::admin_error(
@@ -4180,11 +4182,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         evidence: &project_catalog_admin::RetirementJournalEvidence,
     ) -> project_catalog_admin::AdminResult<()> {
         let code_sources = self.config.paths.state_dir.join("code-sources");
-        let store = bbox_code_source_store::CodeSourceStore::open(
+        let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
             &code_sources,
             bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
                 self.config,
             ),
+            bbox_code_source_store::RuntimeRecordMode::CatalogV2,
         )
         .map_err(|e| {
             project_catalog_admin::admin_error(
@@ -4290,11 +4293,12 @@ impl<'a> project_catalog_admin::RetirementDischargeWorkers for CliRetirementDisc
         })?;
         self.verify_source_authority_quiesced(&store, project_id, evidence)?;
         validate_retirement_targets_absent(self.config, evidence)?;
-        let code_store = bbox_code_source_store::CodeSourceStore::open(
+        let code_store = bbox_code_source_store::CodeSourceStore::open_with_mode(
             self.config.paths.state_dir.join("code-sources"),
             bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(
                 self.config,
             ),
+            bbox_code_source_store::RuntimeRecordMode::CatalogV2,
         )
         .map_err(|error| {
             project_catalog_admin::admin_error(
@@ -4384,9 +4388,10 @@ fn reconcile_completed_retained_owner_deletions(
     evidence: &project_catalog_admin::RetirementJournalEvidence,
 ) -> project_catalog_admin::AdminResult<()> {
     let code_sources = config.paths.state_dir.join("code-sources");
-    let store = bbox_code_source_store::CodeSourceStore::open(
+    let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
         &code_sources,
         bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(config),
+        bbox_code_source_store::RuntimeRecordMode::CatalogV2,
     )
     .map_err(|error| {
         project_catalog_admin::admin_error(
@@ -4450,9 +4455,10 @@ fn validate_retirement_targets_absent(
     evidence: &project_catalog_admin::RetirementJournalEvidence,
 ) -> project_catalog_admin::AdminResult<()> {
     let code_sources = config.paths.state_dir.join("code-sources");
-    let store = bbox_code_source_store::CodeSourceStore::open(
+    let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
         &code_sources,
         bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(config),
+        bbox_code_source_store::RuntimeRecordMode::CatalogV2,
     )
     .map_err(|error| {
         project_catalog_admin::admin_error(
@@ -4925,9 +4931,10 @@ fn capture_retirement_evidence(
     };
 
     let code_sources = config.paths.state_dir.join("code-sources");
-    let store = bbox_code_source_store::CodeSourceStore::open(
+    let store = bbox_code_source_store::CodeSourceStore::open_with_mode(
         &code_sources,
         bbox_indexing::project_catalog_migration::project_catalog_migration_store_limits(config),
+        bbox_code_source_store::RuntimeRecordMode::CatalogV2,
     )
     .map_err(|e| {
         project_catalog_admin::admin_error(
