@@ -204,10 +204,18 @@ impl CodeSourceLocalityCutoverRuntimeV1 {
         }
         let catalog = catalog_store.snapshot()?.catalog().as_ref().clone();
         for row in self.rows.values() {
-            let project = catalog
-                .projects
-                .get(&row.project_id)
-                .context("governed code-source project is absent from the catalog")?;
+            // A governance row whose project left the catalog is stale
+            // aftermath of a retirement (the marker is checksummed and not
+            // rewritten by the retire flow); refusing boot over it held the
+            // daemon down after every retirement. Live rows stay strict.
+            let Some(project) = catalog.projects.get(&row.project_id) else {
+                tracing::warn!(
+                    project = %row.project_id,
+                    producer = %row.producer_id,
+                    "locality governance row outlives its retired project; skipping"
+                );
+                continue;
+            };
             if project.scope != ProjectScope::Published(row.scope.clone()) {
                 bail!("governed code-source project scope changed");
             }
