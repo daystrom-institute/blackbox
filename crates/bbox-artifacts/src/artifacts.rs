@@ -528,7 +528,11 @@ pub fn capture_project_catalog_retirement_targets(
         let payload_relative = payload
             .strip_prefix(root)
             .context("artifact payload escaped its store root")?;
-        let canonical_owner = artifact_owner_identity(&metadata)?;
+        let Some(canonical_owner) = artifact_owner_identity(&metadata)? else {
+            // Global artifact: no project can own it, so no retirement
+            // inventories it.
+            continue;
+        };
         let mut version_metadata = Vec::new();
         let versions = directory.join(".versions");
         if versions.is_dir() {
@@ -548,7 +552,7 @@ pub fn capture_project_catalog_retirement_targets(
                     &mut aggregate_bytes,
                 )?;
                 let version_record: ArtifactMetadata = serde_json::from_slice(&bytes)?;
-                if artifact_owner_identity(&version_record)? != canonical_owner {
+                if artifact_owner_identity(&version_record)?.as_ref() != Some(&canonical_owner) {
                     bail!("artifact version metadata owner disagrees with canonical metadata");
                 }
                 version_metadata.push(ArtifactMetadataCommitment {
@@ -691,22 +695,27 @@ enum ArtifactOwnerIdentity {
     LegacyProjectPath(String),
 }
 
-fn artifact_owner_identity(metadata: &ArtifactMetadata) -> Result<ArtifactOwnerIdentity> {
+/// `None` is a global (project-less) artifact: a legitimate store resident
+/// that no project retirement can own, not an error. Refusing here made one
+/// global artifact fail every retire on the host before the per-project
+/// ownership filter could skip it.
+fn artifact_owner_identity(metadata: &ArtifactMetadata) -> Result<Option<ArtifactOwnerIdentity>> {
     if let Some(project_id) = metadata
         .project_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Ok(ArtifactOwnerIdentity::ProjectId(project_id.to_string()));
+        return Ok(Some(ArtifactOwnerIdentity::ProjectId(
+            project_id.to_string(),
+        )));
     }
-    metadata
+    Ok(metadata
         .project_path
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| ArtifactOwnerIdentity::LegacyProjectPath(value.to_string()))
-        .context("artifact metadata has no project owner")
+        .map(|value| ArtifactOwnerIdentity::LegacyProjectPath(value.to_string())))
 }
 
 fn validate_artifact_target_owner(
@@ -717,7 +726,7 @@ fn validate_artifact_target_owner(
         Some(path) => ArtifactOwnerIdentity::LegacyProjectPath(path.clone()),
         None => ArtifactOwnerIdentity::ProjectId(target.owner_project_id.clone()),
     };
-    if artifact_owner_identity(metadata)? != expected {
+    if artifact_owner_identity(metadata)? != Some(expected) {
         bail!("artifact metadata owner drifted after Prepared");
     }
     Ok(())
