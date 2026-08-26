@@ -1032,7 +1032,12 @@ fn project_id_from_entity_ref(entity_ref: &str) -> Option<&str> {
         EntityRef::ProjectFile { project_id, .. }
         | EntityRef::ProjectFileV2 { project_id, .. }
         | EntityRef::Symbol { project_id, .. }
-        | EntityRef::SymbolV2 { project_id, .. } => project_id,
+        | EntityRef::SymbolV2 { project_id, .. }
+        // Published-plane graph vertices (g13) carry the project term lane
+        // like file/symbol rows and are discharged by the same
+        // project-selector delete; omitting them here classified every
+        // graph-bearing index as corrupt.
+        | EntityRef::ProjectGraphVertex { project_id, .. } => project_id,
         _ => return None,
     };
     let (_, rest) = entity_ref.split_once(':')?;
