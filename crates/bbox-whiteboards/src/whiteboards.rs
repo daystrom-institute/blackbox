@@ -880,6 +880,16 @@ pub fn discharge_project_catalog_rows(
     let mut removals = Vec::new();
     for entry in std::fs::read_dir(storage_dir)? {
         let entry = entry?;
+        // `archive/` is part of the store's own layout (archived boards move
+        // there); the runtime loader skips it the same way. Refusing the
+        // store's own directory made every project retirement on the host
+        // fail. Anything else non-canonical still refuses.
+        if entry.file_type()?.is_dir()
+            && !entry.file_type()?.is_symlink()
+            && entry.file_name() == OsStr::new("archive")
+        {
+            continue;
+        }
         if !entry.file_type()?.is_file() || entry.path().extension() != Some(OsStr::new("json")) {
             bail!("whiteboard store contains a non-canonical entry");
         }
