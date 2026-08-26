@@ -573,8 +573,13 @@ fn capture_index(
         };
         let entity = optional_text(&document, entity_id).unwrap_or_default();
         let project = optional_text(&document, project_id).unwrap_or_default();
-        if !entity.is_empty() && !project.is_empty() {
-            if optional_text(&document, doc_type).as_deref() == Some("code_source_activation") {
+        let document_type = optional_text(&document, doc_type).unwrap_or_default();
+        // Commit rows may carry a `project_id` term lane (path-free schema
+        // rows stamp their owning project for filtered reads), but their
+        // entity is `commit:<repo_id>:<sha>` and their contract is validated
+        // by the commit pass below, not the project-scoped ref inventory.
+        if !entity.is_empty() && !project.is_empty() && document_type != "commit" {
+            if document_type == "code_source_activation" {
                 // The pending-local-activation marker (R28F2) is durable index
                 // STATE, not a corpus ref: it carries the `project_id` term
                 // lane so recovery can find it by project, and its entity id
@@ -595,11 +600,10 @@ fn capture_index(
                 }
             } else {
                 if project_id_from_entity_ref(&entity) != Some(project.as_str()) {
-                    let doc_type = optional_text(&document, doc_type).unwrap_or_default();
                     tracing::warn!(
                         entity,
                         project,
-                        doc_type,
+                        document_type,
                         "corpus inventory: row is not a recognized project-scoped ref"
                     );
                     return corrupt_index("corpus_index_project_ref_invalid");
@@ -615,7 +619,7 @@ fn capture_index(
                 }
             }
         }
-        if optional_text(&document, doc_type).as_deref() != Some("commit") {
+        if document_type != "commit" {
             continue;
         }
         let namespace = optional_text(&document, repo_id).unwrap_or_default();
