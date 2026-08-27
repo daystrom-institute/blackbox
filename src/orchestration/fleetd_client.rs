@@ -42,11 +42,13 @@
 //! running: killing an orphan the daemon merely forgot would destroy work, and
 //! fleetd GCs terminal sessions on its own once acked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -82,8 +84,13 @@ const SPAWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Worker inspection executes a handful of local Git and filesystem reads.
 const WORKSPACE_INSPECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for fleetd's `Sessions` answer when proving whether a
-/// colliding supervision key is still live, and during re-adoption.
+/// colliding supervision key is still live, during re-adoption, and on each
+/// heartbeat probe.
 const LIST_SESSIONS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often an established connection proves the link end-to-end. A write
+/// into a dead TCP peer succeeds into the kernel buffer, so only a served
+/// round-trip is evidence of liveness (see `spawn_heartbeat`).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// fleetd's error code for a spawn whose session id its registry still holds.
 /// A terminal entry nobody acked keeps the key occupied on fleetd's side even
 /// after the daemon has released its own slot.
@@ -125,6 +132,15 @@ pub struct FleetdConfig {
     /// Explicit roots on an off-host fleetd machine. Same-host Unix operation
     /// leaves this absent because daemon and worker paths are identical.
     pub worker_locality: Option<WorkerLocality>,
+    /// Cadence of the per-connection liveness probe. Production uses
+    /// [`HEARTBEAT_INTERVAL`]; tests shrink it to exercise the drop path.
+    pub heartbeat_interval: Duration,
+    /// Deadline for `Sessions` answers (re-adoption, stale-key proof, and the
+    /// heartbeat probe). Production uses [`LIST_SESSIONS_TIMEOUT`].
+    pub list_sessions_timeout: Duration,
+    /// Deadline for a workspace inspection answer. Production uses
+    /// [`WORKSPACE_INSPECTION_TIMEOUT`].
+    pub inspection_timeout: Duration,
 }
 
 impl FleetdConfig {
@@ -139,6 +155,9 @@ impl FleetdConfig {
                 .filter(|value| !value.trim().is_empty())
                 .map(PathBuf::from),
             worker_locality: None,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            list_sessions_timeout: LIST_SESSIONS_TIMEOUT,
+            inspection_timeout: WORKSPACE_INSPECTION_TIMEOUT,
         }
     }
 
@@ -188,6 +207,9 @@ impl FleetdConfig {
                 home: worker_home,
                 bro_home: worker_bro_home,
             }),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            list_sessions_timeout: LIST_SESSIONS_TIMEOUT,
+            inspection_timeout: WORKSPACE_INSPECTION_TIMEOUT,
         })
     }
 }
@@ -300,17 +322,43 @@ impl SessionSlot {
     }
 }
 
-/// The live connection: a command queue feeding the writer task, plus the
-/// generation fleetd allocated for it.
+/// The live connection: a command queue feeding the writer task, the
+/// generation fleetd allocated for it, and the cancellation lever that tears
+/// the whole actor down (writer, reader, heartbeat) as one unit.
 struct Connection {
     generation: u64,
     commands: mpsc::UnboundedSender<DaemonToFleetd>,
+    cancel: CancellationToken,
 }
 
 impl Connection {
+    /// A queue that is open but cancelled is a corpse: the writer has already
+    /// stopped draining it (or is about to), so handing it out would park the
+    /// caller on a channel nobody serves.
     fn is_alive(&self) -> bool {
-        !self.commands.is_closed()
+        !self.cancel.is_cancelled() && !self.commands.is_closed()
     }
+
+    fn lane(&self) -> Lane {
+        Lane {
+            generation: self.generation,
+            commands: self.commands.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
+}
+
+/// One caller's handle on the live connection: the command sender plus the
+/// lever to invalidate the connection when a round-trip proves it dead. A
+/// silently dead TCP peer (worker host reboot, dropped WAN path) accepts
+/// writes into the kernel buffer indefinitely, so write success proves
+/// nothing; callers whose reply deadline expires MUST cancel the lane rather
+/// than leave the corpse installed for the next dispatch.
+#[derive(Clone)]
+struct Lane {
+    generation: u64,
+    commands: mpsc::UnboundedSender<DaemonToFleetd>,
+    cancel: CancellationToken,
 }
 
 /// Shared client state. Sessions outlive any single connection, which is what
@@ -318,11 +366,19 @@ impl Connection {
 struct Shared {
     config: FleetdConfig,
     sessions: Mutex<HashMap<String, SessionSlot>>,
-    /// Waiters for the next `Sessions` answer, in FIFO order.
-    list_waiters: Mutex<Vec<oneshot::Sender<Vec<SessionSummary>>>>,
+    /// Waiters for `Sessions` answers as `(waiter_id, generation, sender)`,
+    /// matched to replies in FIFO order within their connection generation.
+    /// The waiter id lets a timed-out waiter remove itself (leaving it queued
+    /// would desync every later reply by one); the generation lets a dying
+    /// reader clear ITS waiters without wiping a successor connection's, and
+    /// keeps a stale connection's late reply from satisfying a fresh
+    /// connection's waiter.
+    list_waiters: Mutex<VecDeque<(u64, u64, oneshot::Sender<Vec<SessionSummary>>)>>,
     /// Workspace inspection replies are request-id correlated because more
     /// than one dispatch may inspect concurrently over the owner connection.
-    workspace_waiters: Mutex<HashMap<String, oneshot::Sender<WorkspaceInspectionOutcome>>>,
+    /// The generation exists for the dying reader's scoped cleanup, exactly
+    /// as for `list_waiters`.
+    workspace_waiters: Mutex<HashMap<String, (u64, oneshot::Sender<WorkspaceInspectionOutcome>)>>,
     message_counter: AtomicU64,
 }
 
@@ -347,7 +403,7 @@ impl FleetdExecutor {
             shared: Arc::new(Shared {
                 config,
                 sessions: Mutex::new(HashMap::new()),
-                list_waiters: Mutex::new(Vec::new()),
+                list_waiters: Mutex::new(VecDeque::new()),
                 workspace_waiters: Mutex::new(HashMap::new()),
                 message_counter: AtomicU64::new(0),
             }),
@@ -355,34 +411,33 @@ impl FleetdExecutor {
         }
     }
 
-    /// Return a live command sender, dialing (and if necessary starting)
-    /// fleetd first. Every successful dial runs re-adoption before returning,
-    /// so a caller that gets a sender is talking to a fleetd whose live
-    /// sessions are already reattached.
-    async fn commands(&self) -> anyhow::Result<mpsc::UnboundedSender<DaemonToFleetd>> {
+    /// Return a lane on a live connection, dialing (and if necessary
+    /// starting) fleetd first. Every successful dial runs re-adoption before
+    /// returning, so a caller that gets a lane is talking to a fleetd whose
+    /// live sessions are already reattached.
+    async fn lane(&self) -> anyhow::Result<Lane> {
         let mut guard = self.connection.lock().await;
         if let Some(connection) = guard.as_ref()
             && connection.is_alive()
         {
-            return Ok(connection.commands.clone());
+            return Ok(connection.lane());
         }
         let connection = self.dial().await?;
-        let commands = connection.commands.clone();
-        let generation = connection.generation;
+        let lane = connection.lane();
         *guard = Some(connection);
         drop(guard);
 
         // Re-adoption runs outside the connection lock: it awaits a
         // ListSessions round trip, and holding the lock across that would
         // serialize every concurrent dispatch behind it for no reason.
-        if let Err(error) = readopt_live_sessions(&self.shared, &commands).await {
+        if let Err(error) = readopt_live_sessions(&self.shared, &lane).await {
             tracing::warn!(
                 %error,
-                generation,
+                generation = lane.generation,
                 "fleetd re-adoption failed; live sessions may not be reattached"
             );
         }
-        Ok(commands)
+        Ok(lane)
     }
 
     /// Connect, authenticate, and start the connection actor.
@@ -485,8 +540,27 @@ impl FleetdExecutor {
 
         let (reader, writer) = io.split();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel::<DaemonToFleetd>();
-        spawn_writer(self.shared.clone(), writer, commands_rx, generation);
-        spawn_reader(self.shared.clone(), reader);
+        let cancel = CancellationToken::new();
+        spawn_writer(
+            self.shared.clone(),
+            writer,
+            commands_rx,
+            generation,
+            cancel.clone(),
+        );
+        spawn_reader(
+            self.shared.clone(),
+            reader,
+            commands_tx.clone(),
+            generation,
+            cancel.clone(),
+        );
+        spawn_heartbeat(
+            self.shared.clone(),
+            commands_tx.clone(),
+            generation,
+            cancel.clone(),
+        );
 
         tracing::info!(
             %endpoint,
@@ -498,6 +572,7 @@ impl FleetdExecutor {
         Ok(Connection {
             generation,
             commands: commands_tx,
+            cancel,
         })
     }
 }
@@ -512,40 +587,66 @@ impl HarnessExecutor for FleetdExecutor {
         self.shared.config.worker_locality.as_ref()
     }
 
+    /// Inspection is a read-only, idempotent probe, so a failed attempt
+    /// cancels the lane it ran on (installing nothing is better than leaving
+    /// a corpse for the next dispatch) and retries exactly once on a fresh
+    /// dial. That folds the single most common failure, a connection that
+    /// silently died since the last dispatch, into one transparent redial
+    /// instead of a failed dispatch.
     async fn inspect_workspace(
         &self,
         request: WorkspaceInspectionRequest,
     ) -> anyhow::Result<WorkspaceInspectionOutcome> {
-        let commands = self.commands().await?;
-        let request_id = self.shared.next_message_id();
-        let (tx, rx) = oneshot::channel();
-        self.shared
-            .workspace_waiters
-            .lock()
-            .insert(request_id.clone(), tx);
-        if commands
-            .send(DaemonToFleetd::InspectWorkspace {
-                request_id: request_id.clone(),
-                request,
-            })
-            .is_err()
-        {
-            self.shared.workspace_waiters.lock().remove(&request_id);
-            anyhow::bail!("fleetd connection dropped before workspace inspection was sent");
-        }
-        match tokio::time::timeout(WORKSPACE_INSPECTION_TIMEOUT, rx).await {
-            Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(_)) => {
-                anyhow::bail!("fleetd connection dropped before workspace inspection completed")
-            }
-            Err(_) => {
+        let mut last_error = None;
+        for attempt in 0..2u8 {
+            let lane = self.lane().await?;
+            let request_id = self.shared.next_message_id();
+            let (tx, rx) = oneshot::channel();
+            self.shared
+                .workspace_waiters
+                .lock()
+                .insert(request_id.clone(), (lane.generation, tx));
+            if lane
+                .commands
+                .send(DaemonToFleetd::InspectWorkspace {
+                    request_id: request_id.clone(),
+                    request: request.clone(),
+                })
+                .is_err()
+            {
                 self.shared.workspace_waiters.lock().remove(&request_id);
-                anyhow::bail!(
-                    "fleetd did not answer workspace inspection within {}s",
-                    WORKSPACE_INSPECTION_TIMEOUT.as_secs()
-                )
+                lane.cancel.cancel();
+                last_error = Some(anyhow::anyhow!(
+                    "fleetd connection dropped before workspace inspection was sent"
+                ));
+                continue;
+            }
+            match tokio::time::timeout(self.shared.config.inspection_timeout, rx).await {
+                Ok(Ok(outcome)) => return Ok(outcome),
+                Ok(Err(_)) => {
+                    lane.cancel.cancel();
+                    last_error = Some(anyhow::anyhow!(
+                        "fleetd connection dropped before workspace inspection completed"
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    self.shared.workspace_waiters.lock().remove(&request_id);
+                    lane.cancel.cancel();
+                    tracing::warn!(
+                        generation = lane.generation,
+                        attempt,
+                        "workspace inspection went unanswered; dropping the fleetd connection"
+                    );
+                    last_error = Some(anyhow::anyhow!(
+                        "fleetd did not answer workspace inspection within {}s",
+                        self.shared.config.inspection_timeout.as_secs()
+                    ));
+                    continue;
+                }
             }
         }
+        Err(last_error.expect("two failed inspection attempts recorded an error"))
     }
 
     async fn spawn(&self, mut spec: WorkerSpawnSpec) -> anyhow::Result<WorkerHandle> {
@@ -560,7 +661,8 @@ impl HarnessExecutor for FleetdExecutor {
                 .join("harness-sessions")
                 .join(format!("{}.events.jsonl", spec.session_id));
         }
-        let commands = self.commands().await?;
+        let lane = self.lane().await?;
+        let commands = lane.commands.clone();
         let session_id = spec.session_id.clone();
 
         // A supervision key may be released at most once per dispatch: if a
@@ -598,7 +700,7 @@ impl HarnessExecutor for FleetdExecutor {
                          one supervision key"
                     );
                 }
-                match release_stale_supervision_key(&self.shared, &commands, &session_id).await {
+                match release_stale_supervision_key(&self.shared, &lane, &session_id).await {
                     Ok(true) => {
                         released_stale_key = true;
                         continue;
@@ -635,8 +737,7 @@ impl HarnessExecutor for FleetdExecutor {
                     // live, release it, and try once more.
                     if message.starts_with(FLEETD_DUPLICATE_SESSION_CODE)
                         && !released_stale_key
-                        && release_stale_supervision_key(&self.shared, &commands, &session_id)
-                            .await?
+                        && release_stale_supervision_key(&self.shared, &lane, &session_id).await?
                     {
                         released_stale_key = true;
                         continue;
@@ -649,6 +750,12 @@ impl HarnessExecutor for FleetdExecutor {
                 }
                 Err(_) => {
                     self.shared.sessions.lock().remove(&session_id);
+                    // No retry here: unlike inspection, the spawn may have
+                    // gone through on fleetd's side, and retrying would risk
+                    // a second worker under the same supervision key. But an
+                    // unanswered ack is still proof the connection is dead,
+                    // so cancel it rather than leave the corpse installed.
+                    lane.cancel.cancel();
                     anyhow::bail!(
                         "fleetd did not acknowledge the spawn within {}s",
                         SPAWN_ACK_TIMEOUT.as_secs()
@@ -694,19 +801,29 @@ fn control_lane(
 }
 
 /// Writer task: wrap each queued command in a fenced envelope and put it on the
-/// wire. Exits when the queue closes or the socket errors, which drops the
-/// command sender and makes `Connection::is_alive` false so the next dispatch
-/// redials.
+/// wire. Exits when the queue closes, the socket errors, or the connection is
+/// cancelled; every exit path cancels the connection so the reader and
+/// heartbeat die with it and `Connection::is_alive` turns false for the next
+/// dispatch to redial on.
 fn spawn_writer<W>(
     shared: Arc<Shared>,
     mut writer: NegotiatedIo<W>,
     mut commands: mpsc::UnboundedReceiver<DaemonToFleetd>,
     generation: u64,
+    cancel: CancellationToken,
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(body) = commands.recv().await {
+        loop {
+            let body = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                body = commands.recv() => match body {
+                    Some(body) => body,
+                    None => break,
+                },
+            };
             let envelope = Envelope {
                 protocol_version: FLEETD_PROTOCOL_VERSION,
                 connection_generation: generation,
@@ -719,39 +836,112 @@ fn spawn_writer<W>(
                 break;
             }
         }
+        cancel.cancel();
     });
 }
 
 /// Reader task: fan every `FleetdToDaemon` out to the session it names.
-fn spawn_reader<R>(shared: Arc<Shared>, mut reader: NegotiatedIo<R>)
-where
+fn spawn_reader<R>(
+    shared: Arc<Shared>,
+    mut reader: NegotiatedIo<R>,
+    commands: mpsc::UnboundedSender<DaemonToFleetd>,
+    generation: u64,
+    cancel: CancellationToken,
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         loop {
-            let envelope = match reader.read_envelope::<FleetdToDaemon>().await {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    tracing::info!(%error, "fleetd connection closed");
-                    break;
-                }
+            // `read_envelope` is not cancel-safe, but that only matters for a
+            // reader that keeps reading afterwards: on cancellation the whole
+            // half is dropped, so a torn mid-frame read is unreachable.
+            let envelope = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = reader.read_envelope::<FleetdToDaemon>() => match result {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        tracing::info!(%error, "fleetd connection closed");
+                        break;
+                    }
+                },
             };
-            handle_message(&shared, envelope.body);
+            handle_message(&shared, envelope.body, generation);
         }
+        // Reader death is connection death: without a read half no reply can
+        // ever arrive, so an "alive" writer would only park callers on their
+        // reply deadlines (2026-08-27: exactly that corpse pattern held the
+        // dispatch plane down for hours after a worker-host reboot).
+        cancel.cancel();
         // The socket is gone. Live sessions keep their slots: fleetd kept the
         // children running, and the next dial re-adopts and replays them.
         // Pending spawn acks cannot be satisfied, so their waiters are dropped
         // (the `Err` arm in `spawn` turns that into a loud dispatch failure).
+        // Waiter cleanup is scoped to THIS generation: a retry on a fresh
+        // connection may already have waiters registered, and wiping those
+        // would fail the very dispatch the redial just rescued.
         let mut sessions = shared.sessions.lock();
         for slot in sessions.values_mut() {
-            slot.started.take();
+            if slot.commands.same_channel(&commands) {
+                slot.started.take();
+            }
         }
-        shared.list_waiters.lock().clear();
-        shared.workspace_waiters.lock().clear();
+        drop(sessions);
+        shared
+            .list_waiters
+            .lock()
+            .retain(|(_, waiter_generation, _)| *waiter_generation != generation);
+        shared
+            .workspace_waiters
+            .lock()
+            .retain(|_, (waiter_generation, _)| *waiter_generation != generation);
     });
 }
 
-fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon) {
+/// Heartbeat task: prove the connection end-to-end on a cadence, and cancel
+/// it the moment a probe goes unanswered.
+///
+/// A worker host that reboots (or a WAN path that dies underneath a long-idle
+/// connection) sends no FIN or RST: reads block forever and writes keep
+/// succeeding into the kernel buffer, so neither the reader's error path nor
+/// the writer's can notice. Only a served round-trip proves the peer is
+/// there. The probe is a `ListSessions` rather than a dedicated ping because
+/// deployed fleetd builds answer it today, whereas an unknown variant falls
+/// into their `#[serde(other)]` skip and a probe nobody answers would kill
+/// every healthy connection to an older fleetd.
+fn spawn_heartbeat(
+    shared: Arc<Shared>,
+    commands: mpsc::UnboundedSender<DaemonToFleetd>,
+    generation: u64,
+    cancel: CancellationToken,
+) {
+    let interval = shared.config.heartbeat_interval;
+    let lane = Lane {
+        generation,
+        commands,
+        cancel: cancel.clone(),
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+            if let Err(error) = list_sessions(&shared, &lane).await {
+                tracing::warn!(
+                    %error,
+                    generation,
+                    "fleetd heartbeat went unanswered; dropping the connection"
+                );
+                cancel.cancel();
+                return;
+            }
+        }
+    });
+}
+
+fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon, generation: u64) {
     match message {
         FleetdToDaemon::SessionStarted {
             session_id, pid, ..
@@ -796,8 +986,17 @@ fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon) {
             }
         }
         FleetdToDaemon::Sessions { sessions } => {
-            let waiter = shared.list_waiters.lock().pop();
-            if let Some(waiter) = waiter {
+            // Replies match waiters FIFO within the connection that carried
+            // them: a stale connection's late answer must not satisfy (and
+            // thereby desync) a fresh connection's queue.
+            let waiter = {
+                let mut waiters = shared.list_waiters.lock();
+                waiters
+                    .iter()
+                    .position(|(_, waiter_generation, _)| *waiter_generation == generation)
+                    .and_then(|index| waiters.remove(index))
+            };
+            if let Some((_, _, waiter)) = waiter {
                 let _ = waiter.send(sessions);
             }
         }
@@ -806,7 +1005,7 @@ fn handle_message(shared: &Arc<Shared>, message: FleetdToDaemon) {
             outcome,
         } => {
             let waiter = shared.workspace_waiters.lock().remove(&request_id);
-            if let Some(waiter) = waiter {
+            if let Some((_, waiter)) = waiter {
                 let _ = waiter.send(outcome);
             } else {
                 tracing::debug!(%request_id, "late or unknown workspace inspection reply");
@@ -931,19 +1130,31 @@ fn finish_dead_session_slot(shared: &Arc<Shared>, session_id: &str, through_seq:
 }
 
 /// One `ListSessions` round trip.
-async fn list_sessions(
-    shared: &Arc<Shared>,
-    commands: &mpsc::UnboundedSender<DaemonToFleetd>,
-) -> anyhow::Result<Vec<SessionSummary>> {
+async fn list_sessions(shared: &Arc<Shared>, lane: &Lane) -> anyhow::Result<Vec<SessionSummary>> {
     let (tx, rx) = oneshot::channel();
-    shared.list_waiters.lock().push(tx);
-    commands
-        .send(DaemonToFleetd::ListSessions)
-        .map_err(|_| anyhow::anyhow!("connection dropped before ListSessions"))?;
-    tokio::time::timeout(LIST_SESSIONS_TIMEOUT, rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("fleetd did not answer ListSessions in time"))?
-        .map_err(|_| anyhow::anyhow!("connection dropped awaiting ListSessions"))
+    let waiter_id = shared.message_counter.fetch_add(1, Ordering::Relaxed);
+    shared
+        .list_waiters
+        .lock()
+        .push_back((waiter_id, lane.generation, tx));
+    let unqueue = || {
+        shared
+            .list_waiters
+            .lock()
+            .retain(|(id, _, _)| *id != waiter_id);
+    };
+    if lane.commands.send(DaemonToFleetd::ListSessions).is_err() {
+        unqueue();
+        anyhow::bail!("connection dropped before ListSessions");
+    }
+    match tokio::time::timeout(shared.config.list_sessions_timeout, rx).await {
+        Ok(Ok(sessions)) => Ok(sessions),
+        Ok(Err(_)) => anyhow::bail!("connection dropped awaiting ListSessions"),
+        Err(_) => {
+            unqueue();
+            anyhow::bail!("fleetd did not answer ListSessions in time")
+        }
+    }
 }
 
 /// Prove whether the supervision key `session_id` is still owned by a live
@@ -972,9 +1183,10 @@ async fn list_sessions(
 /// Returns `Ok(true)` when the key was released and the caller may retry.
 async fn release_stale_supervision_key(
     shared: &Arc<Shared>,
-    commands: &mpsc::UnboundedSender<DaemonToFleetd>,
+    lane: &Lane,
     session_id: &str,
 ) -> anyhow::Result<bool> {
+    let commands = &lane.commands;
     let in_flight = shared
         .sessions
         .lock()
@@ -984,7 +1196,7 @@ async fn release_stale_supervision_key(
         return Ok(false);
     }
 
-    let summaries = list_sessions(shared, commands).await?;
+    let summaries = list_sessions(shared, lane).await?;
     let summary = summaries
         .into_iter()
         .find(|summary| summary.session_id == session_id);
@@ -1054,11 +1266,9 @@ async fn release_stale_supervision_key(
 /// never saw is marked terminal-after-replay, and an interrupted replay is
 /// re-issued from the slot's cursor. Without this a daemon reconnect leaves
 /// dead keys registered as live.
-async fn readopt_live_sessions(
-    shared: &Arc<Shared>,
-    commands: &mpsc::UnboundedSender<DaemonToFleetd>,
-) -> anyhow::Result<()> {
-    let summaries = list_sessions(shared, commands).await?;
+async fn readopt_live_sessions(shared: &Arc<Shared>, lane: &Lane) -> anyhow::Result<()> {
+    let commands = &lane.commands;
+    let summaries = list_sessions(shared, lane).await?;
 
     let mut replays: Vec<(String, u64)> = Vec::new();
     let mut finished: Vec<(String, SessionSlot)> = Vec::new();
@@ -1289,6 +1499,36 @@ mod tests {
         Unavailable { earliest: u64, latest: u64 },
     }
 
+    /// How the fake treats `InspectWorkspace` requests.
+    #[derive(Clone, Copy)]
+    enum InspectionScript {
+        /// Answer every inspection with `Unmanaged`.
+        Answer,
+        /// Never answer: the daemon-side deadline must fire.
+        Silent,
+        /// Stay silent on the first accepted connection and answer on every
+        /// later one: the shape of a dead link healed by one redial.
+        SilentFirstConnection,
+    }
+
+    /// Per-lane behavior knobs for [`FakeFleetd`].
+    #[derive(Clone, Copy)]
+    struct Script {
+        /// Answer `ListSessions`? `false` starves re-adoption and the
+        /// heartbeat alike, the shape of a silently dead peer.
+        answer_lists: bool,
+        inspections: InspectionScript,
+    }
+
+    impl Default for Script {
+        fn default() -> Self {
+            Self {
+                answer_lists: true,
+                inspections: InspectionScript::Answer,
+            }
+        }
+    }
+
     /// A scripted fleetd on a real Unix socket. It speaks the real wire
     /// contract (handshake, bearer gate, generation-stamped envelopes) but
     /// its registry is a plain list the test seeds, so every liveness answer
@@ -1300,7 +1540,13 @@ mod tests {
         spawns: Arc<Mutex<Vec<String>>>,
         replays: Arc<Mutex<Vec<(String, u64)>>>,
         lists: Arc<AtomicUsize>,
+        inspections: Arc<Mutex<Vec<String>>>,
+        /// Connections that passed the bearer gate. The executor's Unix dial
+        /// makes a probe connect first, so raw accept counts overcount real
+        /// connections; scripts and asserts key on this ordinal instead.
+        authenticated: Arc<AtomicUsize>,
         replay: ReplayScript,
+        script: Script,
     }
 
     impl FakeFleetd {
@@ -1308,6 +1554,15 @@ mod tests {
             state_dir: &Path,
             sessions: Vec<SessionSummary>,
             replay: ReplayScript,
+        ) -> Arc<Self> {
+            Self::serve_with(state_dir, sessions, replay, Script::default())
+        }
+
+        fn serve_with(
+            state_dir: &Path,
+            sessions: Vec<SessionSummary>,
+            replay: ReplayScript,
+            script: Script,
         ) -> Arc<Self> {
             let token = ServiceToken::load_or_create(&state_dir.join(TOKEN_FILE)).unwrap();
             let listener = UnixListener::bind(state_dir.join(SOCKET_FILE)).unwrap();
@@ -1317,7 +1572,10 @@ mod tests {
                 spawns: Arc::new(Mutex::new(Vec::new())),
                 replays: Arc::new(Mutex::new(Vec::new())),
                 lists: Arc::new(AtomicUsize::new(0)),
+                inspections: Arc::new(Mutex::new(Vec::new())),
+                authenticated: Arc::new(AtomicUsize::new(0)),
                 replay,
+                script,
             });
             let served = fake.clone();
             tokio::spawn(async move {
@@ -1358,6 +1616,7 @@ mod tests {
                 anyhow::bail!("first message must authenticate");
             };
             assert!(token.verify(presented.expose_secret()));
+            let ordinal = self.authenticated.fetch_add(1, Ordering::SeqCst) + 1;
             reply(
                 &mut io,
                 binding,
@@ -1374,6 +1633,9 @@ mod tests {
                 match body {
                     DaemonToFleetd::ListSessions => {
                         self.lists.fetch_add(1, Ordering::SeqCst);
+                        if !self.script.answer_lists {
+                            continue;
+                        }
                         let sessions = self.sessions.lock().clone();
                         reply(
                             &mut io,
@@ -1383,6 +1645,27 @@ mod tests {
                             FleetdToDaemon::Sessions { sessions },
                         )
                         .await?;
+                    }
+                    DaemonToFleetd::InspectWorkspace { request_id, .. } => {
+                        self.inspections.lock().push(request_id.clone());
+                        let answer = match self.script.inspections {
+                            InspectionScript::Answer => true,
+                            InspectionScript::Silent => false,
+                            InspectionScript::SilentFirstConnection => ordinal > 1,
+                        };
+                        if answer {
+                            reply(
+                                &mut io,
+                                binding,
+                                generation,
+                                &mut counter,
+                                FleetdToDaemon::WorkspaceInspected {
+                                    request_id,
+                                    outcome: WorkspaceInspectionOutcome::Unmanaged,
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     DaemonToFleetd::Spawn { spec } => {
                         self.spawns.lock().push(spec.session_id.clone());
@@ -1691,7 +1974,7 @@ mod tests {
         let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
         let outcome = plant_slot(&executor, "sess-forgotten", None, 12, false);
 
-        executor.commands().await.unwrap();
+        executor.lane().await.unwrap();
 
         let outcome = tokio::time::timeout(Duration::from_secs(5), outcome)
             .await
@@ -1725,7 +2008,7 @@ mod tests {
         let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
         let outcome = plant_slot(&executor, "sess-gap", Some(Some(2)), 10, false);
 
-        executor.commands().await.unwrap();
+        executor.lane().await.unwrap();
 
         let outcome = tokio::time::timeout(Duration::from_secs(5), outcome)
             .await
@@ -1760,7 +2043,7 @@ mod tests {
         let executor = FleetdExecutor::new(FleetdConfig::in_state_dir(dir.path()));
         let _outcome = plant_slot(&executor, "sess-late-exit", None, 25, false);
 
-        executor.commands().await.unwrap();
+        executor.lane().await.unwrap();
         settle().await;
 
         assert_eq!(
@@ -1950,7 +2233,7 @@ mod tests {
         let shared = Arc::new(Shared {
             config: FleetdConfig::in_state_dir("/state/x"),
             sessions: Mutex::new(HashMap::new()),
-            list_waiters: Mutex::new(Vec::new()),
+            list_waiters: Mutex::new(VecDeque::new()),
             workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
         });
@@ -1976,6 +2259,7 @@ mod tests {
                 seq: Some(1),
                 line: "{\"type\":\"assistant\"}".to_string(),
             },
+            1,
         );
         handle_message(
             &shared,
@@ -1984,6 +2268,7 @@ mod tests {
                 exit_code: Some(0),
                 stderr_tail: "warn\n".to_string(),
             },
+            1,
         );
 
         assert_eq!(
@@ -2018,7 +2303,7 @@ mod tests {
         let shared = Arc::new(Shared {
             config: FleetdConfig::in_state_dir("/state/x"),
             sessions: Mutex::new(HashMap::new()),
-            list_waiters: Mutex::new(Vec::new()),
+            list_waiters: Mutex::new(VecDeque::new()),
             workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
         });
@@ -2045,6 +2330,7 @@ mod tests {
                 code: "spawn_failed".to_string(),
                 message: "no such file".to_string(),
             },
+            1,
         );
 
         let started = started_rx.await.expect("start resolved");
@@ -2058,7 +2344,7 @@ mod tests {
         let shared = Shared {
             config: FleetdConfig::in_state_dir("/state/x"),
             sessions: Mutex::new(HashMap::new()),
-            list_waiters: Mutex::new(Vec::new()),
+            list_waiters: Mutex::new(VecDeque::new()),
             workspace_waiters: Mutex::new(HashMap::new()),
             message_counter: AtomicU64::new(0),
         };
@@ -2066,6 +2352,141 @@ mod tests {
         let second = shared.next_message_id();
         assert!(!first.is_empty());
         assert_ne!(first, second);
+    }
+
+    /// Timings small enough to exercise the liveness paths in-test. The
+    /// probe deadline stays above the heartbeat interval so a healthy but
+    /// merely slow fake is never misread as dead.
+    fn fast_config(dir: &Path) -> FleetdConfig {
+        let mut config = FleetdConfig::in_state_dir(dir);
+        config.heartbeat_interval = Duration::from_millis(40);
+        config.list_sessions_timeout = Duration::from_millis(120);
+        config.inspection_timeout = Duration::from_millis(150);
+        config
+    }
+
+    fn inspection_request() -> WorkspaceInspectionRequest {
+        WorkspaceInspectionRequest {
+            cwd: "/somewhere/checkout".to_string(),
+            candidate_scopes: Vec::new(),
+        }
+    }
+
+    /// The 2026-08-27 incident shape: the peer stops serving round-trips (a
+    /// worker host reboot sends no FIN, so reads block and writes keep
+    /// landing in the kernel buffer). The heartbeat must notice within its
+    /// cadence and cancel the connection, and the next caller must get a
+    /// fresh dial instead of the corpse.
+    #[tokio::test]
+    async fn heartbeat_drops_a_connection_that_stops_answering() {
+        let dir = tempfile::tempdir().unwrap();
+        let _fake = FakeFleetd::serve_with(
+            dir.path(),
+            Vec::new(),
+            ReplayScript::Silent,
+            Script {
+                answer_lists: false,
+                inspections: InspectionScript::Answer,
+            },
+        );
+        let executor = FleetdExecutor::new(fast_config(dir.path()));
+
+        let first = executor.lane().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !first.cancel.is_cancelled() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "heartbeat never dropped the unanswered connection"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let second = executor.lane().await.unwrap();
+        assert_ne!(
+            first.generation, second.generation,
+            "a cancelled connection must not be handed out again"
+        );
+    }
+
+    /// An unanswered inspection proves the connection dead: the attempt must
+    /// cancel it and retry once on a fresh dial, and when that one also goes
+    /// unanswered, fail with the deadline error while leaving no corpse
+    /// installed (the next lane dials a third connection).
+    #[tokio::test]
+    async fn unanswered_inspection_invalidates_the_connection_and_retries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve_with(
+            dir.path(),
+            Vec::new(),
+            ReplayScript::Silent,
+            Script {
+                answer_lists: true,
+                inspections: InspectionScript::Silent,
+            },
+        );
+        let mut config = fast_config(dir.path());
+        // Keep the heartbeat out of the picture: this test drives
+        // invalidation through the inspection deadline alone.
+        config.heartbeat_interval = Duration::from_secs(3600);
+        let executor = FleetdExecutor::new(config);
+
+        let error = executor
+            .inspect_workspace(inspection_request())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not answer workspace inspection"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fake.inspections.lock().len(),
+            2,
+            "exactly one retry on a fresh connection"
+        );
+        assert_eq!(
+            fake.authenticated.load(Ordering::SeqCst),
+            2,
+            "each attempt ran on its own connection"
+        );
+        executor.lane().await.unwrap();
+        assert_eq!(
+            fake.authenticated.load(Ordering::SeqCst),
+            3,
+            "both failed attempts left cancelled connections behind, so the next lane redials"
+        );
+    }
+
+    /// The healed-by-redial shape: the stale connection swallows the first
+    /// inspection, the retry's fresh connection answers, and the caller sees
+    /// a success instead of a failed dispatch.
+    #[tokio::test]
+    async fn inspection_recovers_on_a_fresh_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeFleetd::serve_with(
+            dir.path(),
+            Vec::new(),
+            ReplayScript::Silent,
+            Script {
+                answer_lists: true,
+                inspections: InspectionScript::SilentFirstConnection,
+            },
+        );
+        let mut config = fast_config(dir.path());
+        config.heartbeat_interval = Duration::from_secs(3600);
+        let executor = FleetdExecutor::new(config);
+
+        let outcome = executor
+            .inspect_workspace(inspection_request())
+            .await
+            .unwrap();
+        assert_eq!(outcome, WorkspaceInspectionOutcome::Unmanaged);
+        assert_eq!(
+            fake.inspections.lock().len(),
+            2,
+            "first attempt timed out, retry was answered"
+        );
     }
 }
 
