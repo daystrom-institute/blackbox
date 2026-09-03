@@ -1,0 +1,21 @@
+{
+  "id": "gap-a250a047",
+  "title": "Attested scope migration does not carry code-source locality cutover state or close the code bridge",
+  "gap_kind": "tooling",
+  "domain": "project-catalog",
+  "wanted_capability": "An operator-attested relpath-move (blackbox project-catalog scope-migrate --operator-attested) on a project governed by the code-source locality cutover should leave the daemon bootable. Today the migration rewrites the catalog scope and opens a code bridge, but the checksummed code-source and blame locality cutover markers keep their rows at the old scope and the current generation stays keyed on the old scope, so verify_live fails closed at boot in sequence: first \"governed project must retain producer\" (row scope no longer matches catalog scope), then after a row rewrite \"invalid row\" (nested generation and observation scopes must agree), then \"no longer has a current generation from its cutover authority\" (generation still under the old scope). The reverse migration is refused while the bridge is open, and the bridge can only close through new-scope activation, which needs the daemon up. Wanted: the migration transaction should either rewrite or tombstone the project's locality rows (with recomputed checksum) and treat the pre-migration generation as an activation in flight until the first publish under the new scope, or refuse the migration up front for a governed project with a pointer to the bridge-aware sequence. Same family as the retirement discharge gap.",
+  "missing_primitive": "a locality-marker rewrite or tombstone stage in the scope-migration transaction, plus bridge-aware boot verification for a migrated governed project",
+  "fallback_used": "Manual maintenance-pod repair with the daemon stopped: removed the migrated project's row from both locality markers with recomputed checksums (backups kept on the state volume), matching how post-cutover onboarded projects carry no row; the collector's first publish under the new scope is expected to close the bridge. Roughly 25 minutes of corpus daemon downtime.",
+  "evidence": [
+    "sibling gap-7e4c11ce (retirement does not discharge locality marker rows)",
+    "crates/bbox-indexing/src/code_source_locality_cutover.rs verify_live and validate_row",
+    "crates/bbox-indexing/src/project_catalog_admin.rs error.project_catalog_scope_migration_bridge_open"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-catalog/scope-migrate-locality-cutover-state",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-03T22:28:12Z",
+  "updated_at": "2026-09-03T22:28:12Z"
+}
