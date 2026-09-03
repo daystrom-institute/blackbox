@@ -1,0 +1,21 @@
+{
+  "id": "gap-f124be6b",
+  "title": "Retirement leaves non-terminal git-history activation journals that redrive forever",
+  "gap_kind": "tooling",
+  "domain": "project-catalog",
+  "wanted_capability": "The retirement journal should discharge (supersede or remove) the retired project's typed git-history activation journals and their source generations. Today retirement discharges catalog rows, index refs, vectors, and coordination rows, then the producer grant is revoked, but every non-terminal HistoryActivationStageV1 journal under git-sources/repos/<repo_history>/history/ survives. The activation worker enumerates non-terminal journals on every redrive tick, each one fails with repo_history_not_found (no transport grant for a retired repo), and the daemon logs one warning per journal every ~30 seconds indefinitely. Six such journals from the last retirement batch are still redriving. Wanted: a discharge stage that marks those journals Superseded (terminal) or deletes them, mirroring the locality-marker discharge gap in the same family.",
+  "missing_primitive": "a git-history activation-journal discharge stage in the retirement journal, or a redrive policy that terminates journals whose repo history has no grant and no catalog member",
+  "fallback_used": "None applied; the warnings are noise only. A manual cleanup would be a maintenance-pod removal of the journal files with the daemon stopped.",
+  "evidence": [
+    "sibling gap-7e4c11ce (retirement does not discharge locality marker rows)",
+    "src/server/history_activation.rs spawn_worker: pending set is refilled from list_activation_journals() filtered on !stage.terminal()",
+    "src/server/producer_auth.rs RepoTransportGrantError::RepoHistoryNotFound"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-catalog/retire-git-history-activation-journals",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-03T22:52:03Z",
+  "updated_at": "2026-09-03T22:52:03Z"
+}

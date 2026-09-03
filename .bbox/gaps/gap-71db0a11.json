@@ -1,0 +1,22 @@
+{
+  "id": "gap-71db0a11",
+  "title": "Edge-index readiness fence stays down after publishes on large graphs, failing provenance export with edge_index_warming",
+  "gap_kind": "tooling",
+  "domain": "edge-index",
+  "wanted_capability": "Provenance export and every other complete_code_read_view consumer should recover after a code-source publish without waiting for an unrelated sidecar change. Every selector-changing publish (code_source.rs and file_source_activation.rs) lowers edge_index_ready and nudges the watcher; only a watcher rebuild raises it again (routes.rs). should_rebuild_edge_index refuses a nudge-only rebuild when the published graph exceeds BLACKBOX_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES (default 250,000) and sidecar authority did not change. The production graph has about 1.4 million published edges, so after each collector pass the fence stays down, the watcher records store_refresh_deferred, and the provenance lane returns 503 edge_index_warming for every project until some sidecar changes. The collector log shows this daily since the deferral limit landed. Wanted: either the deferral path re-raises the fence on the prior complete view (or the readiness fence is lowered only when a rebuild is actually scheduled), or the nudge limit scales with measured rebuild cost (a full rebuild of this graph takes about 11 seconds, well within budget).",
+  "missing_primitive": "readiness-fence semantics that distinguish \"rebuild deferred, prior view still complete\" from \"rebuild in progress\"",
+  "fallback_used": "Operator-side knob available: set BLACKBOX_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES above the published edge count in the cage deployment env so nudges rebuild (about 11 seconds each).",
+  "evidence": [
+    "src/server/routes.rs should_rebuild_edge_index, DEFAULT_EDGE_INDEX_NUDGE_MAX_CURRENT_EDGES, store_refresh_deferred",
+    "src/server/state.rs complete_code_read_view",
+    "src/server/git_source.rs provenance_export_page maps the readiness error to HttpError::edge_index_warming",
+    "collector log: provenance lane succeeded=1 failed=13 after every pass; daemon log: edge-index watcher deferred a store-only nudge published_edge_count=1412493 limit=250000"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/edge-index/nudge-deferral-leaves-readiness-fence-down",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-03T22:52:14Z",
+  "updated_at": "2026-09-03T22:52:14Z"
+}
