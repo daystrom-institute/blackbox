@@ -1,0 +1,22 @@
+{
+  "id": "gap-78c4fa64",
+  "title": "Catalog onboarding does not enroll new projects in the knowledge-transport cutover, so the cage daemon retries host-path discovery forever",
+  "gap_kind": "tooling",
+  "domain": "project-catalog",
+  "wanted_capability": "A project onboarded through the producer catalog-onboard route after the knowledge-transport cutover should be treated as producer-transported from the start. Today the knowledge lifecycle reconciliation (knowledge_lifecycle.rs) skips only projects covered by the knowledge-transport cutover marker; every project onboarded since that ceremony is not covered, so on every boot and reconciliation cycle the daemon calls acquire_selected_project_access for ArtifactWatchDiscovery on its host-local attachment, which cannot canonicalize a checkout-host path from the cage, and logs \"checkout reconciliation skipped unavailable discovery authority ... attachment_inactive\". The knowledge and gap view overlays hit the same path and emit one \"gap store overlay skipped ... checkout authority root cannot be canonicalized\" diagnostic per new project on every bbox_gaps and bbox_knowledge call, and publisher_status renders the sibling overlays as \"the attachment is detached\" although the attachments are active. Twelve projects onboarded on 2026-09-03 show this. Wanted: onboarding (or the accepted-publication establish with a producer binding) should extend knowledge-transport coverage to the project, or the reconciliation and overlay paths should treat a producer-bound accepted publication as authority and skip local discovery without a warning. The offline knowledge-transport-cutover CLI ceremony is the only enrollment path today and needs the daemon stopped.",
+  "missing_primitive": "automatic knowledge-transport coverage for producer-onboarded projects, or producer-binding-aware reconciliation that does not fall back to local discovery",
+  "fallback_used": "None; the warnings and overlay diagnostics are cosmetic once the accepted publication is producer-bound. Enrolling through the offline knowledge-transport-cutover ceremony would require another daemon maintenance window.",
+  "evidence": [
+    "src/server/knowledge_lifecycle.rs checkout reconciliation loop: knowledge_transport_cutover.covers_project_str gate before acquire_selected_project_access(ArtifactWatchDiscovery)",
+    "crates/bbox-indexing/src/checkout_access_v2.rs canonical_directory maps canonicalize failure to AttachmentInactive",
+    "src/server/knowledge_view.rs from_checkout_access renders AttachmentInactive as \"the attachment is detached\"",
+    "daemon boot log 2026-09-04: one warning per project onboarded on 2026-09-03; bbox_gaps diagnostics list the same projects"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/project-catalog/onboard-knowledge-transport-cutover-enrollment",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-04T14:46:55Z",
+  "updated_at": "2026-09-04T14:46:55Z"
+}
