@@ -1277,19 +1277,12 @@ impl BlackboxServer {
         Parameters(p): Parameters<WhenParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        let task_ids = match self.resolve_when_targets(p.team.as_deref(), p.task_ids.as_deref()) {
-            Ok(ids) => ids,
+        let tasks = match self.resolve_when_tasks(p.team.as_deref(), p.task_ids.as_deref()) {
+            Ok(tasks) => tasks,
             Err(e) => return Self::err_text(&e),
         };
-
-        let tasks: Vec<Arc<orch::Task>> = {
-            let store = self.state.task_store.read();
-            task_ids.iter().filter_map(|id| store.get(id)).collect()
-        };
-        let _long_poll = self
-            .state
-            .long_polls
-            .register("bro_when_all", task_ids.clone());
+        let task_ids: Vec<String> = tasks.iter().map(|task| task.id()).collect();
+        let _long_poll = self.state.long_polls.register("bro_when_all", task_ids);
 
         let progress_handle = context.meta.get_progress_token().map(|token| {
             spawn_progress_notifier(
@@ -1327,12 +1320,27 @@ impl BlackboxServer {
             })
             .collect();
 
-        let results: Vec<Value> = futures::future::join_all(futs).await;
+        let rows: Vec<Value> = futures::future::join_all(futs).await;
         if let Some(h) = progress_handle {
             h.abort();
         }
-        let all_done = results.iter().all(|r| r.get("timed_out").is_none());
-        let out = json!({ "all_completed": all_done, "results": results });
+        // Terminal is not success, and the summary is classified from the
+        // same captured rows that are returned (never by re-reading live
+        // task state, which could change after row capture).
+        let counts = orch::when_outcome_counts(&rows);
+        let all_completed = !rows.is_empty() && counts["running"].as_u64() == Some(0);
+        let all_succeeded =
+            !rows.is_empty() && counts["completed"].as_u64() == Some(rows.len() as u64);
+        let (results, results_truncated) = orch::bound_when_rows(rows);
+        let mut out = json!({
+            "all_completed": all_completed,
+            "all_succeeded": all_succeeded,
+            "outcome_counts": counts,
+            "results": results,
+        });
+        if let Some(truncation) = results_truncated {
+            out["resultsTruncated"] = truncation;
+        }
         Self::ok_json(&out)
     }
 
@@ -1345,23 +1353,16 @@ impl BlackboxServer {
         Parameters(p): Parameters<WhenParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        let task_ids = match self.resolve_when_targets(p.team.as_deref(), p.task_ids.as_deref()) {
-            Ok(ids) => ids,
+        let tasks = match self.resolve_when_tasks(p.team.as_deref(), p.task_ids.as_deref()) {
+            Ok(tasks) => tasks,
             Err(e) => return Self::err_text(&e),
         };
-
-        let tasks: Vec<Arc<orch::Task>> = {
-            let store = self.state.task_store.read();
-            task_ids.iter().filter_map(|id| store.get(id)).collect()
-        };
-        let _long_poll = self
-            .state
-            .long_polls
-            .register("bro_when_any", task_ids.clone());
+        let task_ids: Vec<String> = tasks.iter().map(|task| task.id()).collect();
+        let _long_poll = self.state.long_polls.register("bro_when_any", task_ids);
 
         // Check if any already done
         let any_done = tasks.iter().any(|t| t.inner.lock().status.is_terminal());
-        let progress_handle = if !any_done && !tasks.is_empty() {
+        let progress_handle = if !any_done {
             context.meta.get_progress_token().map(|token| {
                 spawn_progress_notifier(
                     tasks.clone(),
@@ -1374,7 +1375,7 @@ impl BlackboxServer {
             None
         };
 
-        if !any_done && !tasks.is_empty() {
+        if !any_done {
             // Race them
             let futs: Vec<_> = tasks
                 .iter()
@@ -1400,7 +1401,7 @@ impl BlackboxServer {
             h.abort();
         }
 
-        let mut results = Vec::new();
+        let mut rows = Vec::new();
         for task in &tasks {
             let inner = task.inner.lock();
             let bro_name =
@@ -1415,11 +1416,29 @@ impl BlackboxServer {
             if let Some(name) = bro_name {
                 r["bro"] = Value::String(name);
             }
-            results.push(r);
+            rows.push(r);
         }
 
-        let any_completed = results.iter().any(|r| r.get("timed_out").is_none());
-        Self::ok_json(&json!({ "any_completed": any_completed, "results": results }))
+        // Terminal is not success, and the summary is classified from the
+        // same captured rows that are returned: any terminal task ends the
+        // race, while `running` counts rows observed still in flight.
+        let counts = orch::when_outcome_counts(&rows);
+        let any_completed = counts["completed"].as_u64().unwrap_or(0)
+            + counts["failed"].as_u64().unwrap_or(0)
+            + counts["cancelled"].as_u64().unwrap_or(0)
+            > 0;
+        let any_succeeded = counts["completed"].as_u64().unwrap_or(0) > 0;
+        let (results, results_truncated) = orch::bound_when_rows(rows);
+        let mut out = json!({
+            "any_completed": any_completed,
+            "any_succeeded": any_succeeded,
+            "outcome_counts": counts,
+            "results": results,
+        });
+        if let Some(truncation) = results_truncated {
+            out["resultsTruncated"] = truncation;
+        }
+        Self::ok_json(&out)
     }
 
     #[tool(
@@ -1440,9 +1459,26 @@ impl BlackboxServer {
             let _team_lock = orchestration::team::lock_teams();
             match orchestration::team::load_team(&p.team, &self.state.store_dir) {
                 Some(t) => t,
-                None => return Self::err_text(&format!("Unknown team: {}", p.team)),
+                None => {
+                    return Self::err_text(&format!(
+                        "Unknown team: {}",
+                        orch::truncated_chars(&p.team, 64)
+                    ));
+                }
             }
         };
+        // Bound input fanout BEFORE any effect: no member launch, no
+        // team-file write. Team admission caps membership at 256, so only a
+        // hand-edited or legacy team can trip this, and it must refuse here
+        // rather than fan out unbounded dispatches.
+        if team.members.len() > orch::BROADCAST_MEMBER_LIMIT {
+            return Self::err_text(&format!(
+                "Team {} has {} members, exceeding the broadcast limit of {}. Split the team before broadcasting",
+                orch::truncated_chars(&p.team, 64),
+                team.members.len(),
+                orch::BROADCAST_MEMBER_LIMIT
+            ));
+        }
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let cwd = p.cwd.or(team.project_dir.clone());
         let store_dir = self.state.store_dir.clone();
@@ -1719,7 +1755,15 @@ impl BlackboxServer {
             let _team_lock = orchestration::team::lock_teams();
             orchestration::team::save_team(&updated_team, &store_dir);
         }
-        Self::ok_json(&json!({"team": p.team, "tasks": launched}))
+        // Every member keeps a receipt (identity + admission outcome); the
+        // aggregate is byte-bounded by compacting later rows, never by
+        // dropping members from the reply.
+        let (tasks, receipts_truncated) = orch::bound_broadcast_receipts(launched);
+        let mut out = json!({"team": p.team, "tasks": tasks});
+        if let Some(truncation) = receipts_truncated {
+            out["receiptsTruncated"] = truncation;
+        }
+        Self::ok_json(&out)
     }
 
     #[tool(
@@ -2697,32 +2741,97 @@ impl BlackboxServer {
         Err("Provide either bro or session_id + provider".into())
     }
 
-    pub(crate) fn resolve_when_targets(
+    /// Resolve the full aggregate-wait selection up front. The whole
+    /// selection is validated before any waiting: ambiguous selectors,
+    /// empty selections, teams with memberless/pruned history, unknown IDs,
+    /// and oversized fanout reject with actionable errors. Duplicate IDs are
+    /// deliberately preserved (one row per requested occurrence).
+    pub(crate) fn resolve_when_tasks(
         &self,
         team_name: Option<&str>,
         task_ids: Option<&[String]>,
-    ) -> Result<Vec<String>, String> {
-        if let Some(name) = team_name {
-            let team = orchestration::team::load_team(name, &self.state.store_dir)
-                .ok_or(format!("Unknown team: {name}"))?;
-            let ids: Vec<String> = team
-                .members
-                .iter()
-                .filter_map(|m| m.task_history.last().cloned())
-                .collect();
-            if ids.is_empty() {
-                return Err(format!("No tasks found for team {name}"));
-            }
-            return Ok(ids);
+    ) -> Result<Vec<Arc<orch::Task>>, String> {
+        if let (Some(team), Some(ids)) = (team_name, task_ids) {
+            return Err(format!(
+                "Provide either team or task_ids, not both (team={}, task_ids={})",
+                orch::truncated_chars(team, 64),
+                ids.len()
+            ));
         }
-        if let Some(ids) = task_ids {
+        let ids: Vec<String> = if let Some(name) = team_name {
+            let team = orchestration::team::load_team(name, &self.state.store_dir)
+                .ok_or_else(|| format!("Unknown team: {}", orch::truncated_chars(name, 64)))?;
+            if team.members.is_empty() {
+                return Err(format!(
+                    "Team {} has no members",
+                    orch::truncated_chars(name, 64)
+                ));
+            }
+            let mut memberless = Vec::new();
+            let mut ids = Vec::with_capacity(team.members.len());
+            for member in &team.members {
+                match member.task_history.last() {
+                    Some(id) => ids.push(id.clone()),
+                    None => memberless.push(orch::truncated_chars(&member.name, 64)),
+                }
+            }
+            if !memberless.is_empty() {
+                return Err(format!(
+                    "Team {} members have no task history: {}. Dispatch or broadcast before waiting",
+                    orch::truncated_chars(name, 64),
+                    summarize_when_ids(&memberless)
+                ));
+            }
+            ids
+        } else if let Some(ids) = task_ids {
             if ids.is_empty() {
                 return Err("Empty task_ids array".into());
             }
-            return Ok(ids.to_vec());
+            ids.to_vec()
+        } else {
+            return Err("Provide either team or task_ids".into());
+        };
+        if ids.len() > orch::WHEN_TARGET_LIMIT {
+            return Err(format!(
+                "Selection of {} tasks exceeds the aggregate wait limit of {}. Split the selection into batches of at most {}",
+                ids.len(),
+                orch::WHEN_TARGET_LIMIT,
+                orch::WHEN_TARGET_LIMIT
+            ));
         }
-        Err("Provide either team or task_ids".into())
+        let store = self.state.task_store.read();
+        let mut tasks = Vec::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for id in &ids {
+            match store.get(id) {
+                Some(task) => tasks.push(task),
+                None => missing.push(orch::truncated_chars(id, 64)),
+            }
+        }
+        drop(store);
+        if !missing.is_empty() {
+            return Err(format!(
+                "Unknown task IDs (missing or pruned): {}",
+                summarize_when_ids(&missing)
+            ));
+        }
+        Ok(tasks)
     }
+}
+
+/// Count-cap and per-string bound unknown-ID/member listings in selection
+/// errors so an oversized bad batch cannot turn the diagnostic itself into
+/// an oversized reply.
+fn summarize_when_ids(ids: &[String]) -> String {
+    const MAX_LISTED: usize = 10;
+    if ids.len() <= MAX_LISTED {
+        return ids.join(", ");
+    }
+    format!(
+        "{} (and {} more)",
+        ids[..MAX_LISTED].join(", "),
+        ids.len() - MAX_LISTED
+    )
 }
 
 #[cfg(test)]
@@ -2971,6 +3080,352 @@ mod tests {
         }
         client.cancel().await.unwrap();
         serving.await.unwrap();
+    }
+
+    fn seed_when_task(
+        state: &crate::server::state::SharedState,
+        id: &str,
+        status: orch::TaskStatus,
+    ) -> Arc<orch::Task> {
+        let task = orch::test_task(id, status, Provider::Glm);
+        state
+            .task_store
+            .write()
+            .insert(id.into(), task.clone())
+            .unwrap();
+        task
+    }
+
+    fn when_ids(ids: &[&str]) -> Option<Vec<String>> {
+        Some(ids.iter().map(|id| id.to_string()).collect())
+    }
+
+    fn save_when_team(server: &BlackboxServer, name: &str, members: Value) {
+        let team: orchestration::team::Team = serde_json::from_value(json!({
+            "name": name,
+            "teamplate": "when-template",
+            "created_at": 0,
+            "members": members,
+        }))
+        .unwrap();
+        orchestration::team::save_team(&team, &server.state.store_dir);
+    }
+
+    fn when_row<'a>(value: &'a Value, id: &str) -> &'a Value {
+        value["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["taskId"] == id)
+            .unwrap_or_else(|| panic!("missing row for {id}: {value}"))
+    }
+
+    #[test]
+    fn when_selection_validates_entire_input_before_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_when_task(&server.state, "known-done", orch::TaskStatus::Completed);
+
+        // All-missing selections reject instead of becoming empty success.
+        let err = server
+            .resolve_when_tasks(None, when_ids(&["missing-a"]).as_deref())
+            .unwrap_err();
+        assert!(err.contains("Unknown task IDs"), "{err}");
+        assert!(err.contains("missing-a"), "{err}");
+
+        // Oversized individual IDs are truncated in the diagnostic itself.
+        let long_id = "m".repeat(300);
+        let err = server
+            .resolve_when_tasks(None, Some(&[long_id.clone()]))
+            .unwrap_err();
+        assert!(err.contains(&"m".repeat(64)), "{err}");
+        assert!(!err.contains(&long_id), "{err}");
+
+        // Mixed known/missing rejects the whole selection, naming the gap.
+        let err = server
+            .resolve_when_tasks(None, when_ids(&["known-done", "missing-b"]).as_deref())
+            .unwrap_err();
+        assert!(err.contains("missing-b"), "{err}");
+        assert!(!err.contains("known-done"), "{err}");
+
+        // Duplicates are deliberately preserved, one row per occurrence.
+        let tasks = server
+            .resolve_when_tasks(None, when_ids(&["known-done", "known-done"]).as_deref())
+            .unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id(), "known-done");
+
+        // Competing selectors are ambiguous and reject.
+        let err = server
+            .resolve_when_tasks(Some("panel"), when_ids(&["known-done"]).as_deref())
+            .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+
+        // Empty selections reject, including the missing-selector case.
+        assert!(server.resolve_when_tasks(None, Some(&[])).is_err());
+        assert!(server.resolve_when_tasks(None, None).is_err());
+
+        // Oversized fanout rejects before any waiting.
+        let oversized: Vec<String> = (0..=orch::WHEN_TARGET_LIMIT)
+            .map(|index| format!("bulk-{index}"))
+            .collect();
+        let err = server
+            .resolve_when_tasks(None, Some(&oversized))
+            .unwrap_err();
+        assert!(err.contains("exceeds the aggregate wait limit"), "{err}");
+    }
+
+    #[test]
+    fn when_team_selection_defines_stale_history_and_empty_teams() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let err = server
+            .resolve_when_tasks(Some("ghost-team"), None)
+            .unwrap_err();
+        assert!(err.contains("Unknown team"), "{err}");
+
+        // An empty team rejects instead of an empty all-true aggregate.
+        save_when_team(&server, "empty-team", json!([]));
+        let err = server
+            .resolve_when_tasks(Some("empty-team"), None)
+            .unwrap_err();
+        assert!(err.contains("no members"), "{err}");
+
+        // Members without dispatch history reject with guidance.
+        save_when_team(
+            &server,
+            "fresh-team",
+            json!([
+                {"name": "alpha", "brofile": "bf-alpha", "task_history": []},
+                {"name": "beta", "brofile": "bf-beta", "task_history": []}
+            ]),
+        );
+        let err = server
+            .resolve_when_tasks(Some("fresh-team"), None)
+            .unwrap_err();
+        assert!(err.contains("no task history"), "{err}");
+        assert!(err.contains("alpha") && err.contains("beta"), "{err}");
+
+        // Stale (pruned) team history IDs reject the whole selection.
+        seed_when_task(&server.state, "live-task", orch::TaskStatus::Completed);
+        save_when_team(
+            &server,
+            "stale-team",
+            json!([
+                {"name": "live", "brofile": "bf-live", "task_history": ["live-task"]},
+                {"name": "stale", "brofile": "bf-stale", "task_history": ["pruned-task"]}
+            ]),
+        );
+        let err = server
+            .resolve_when_tasks(Some("stale-team"), None)
+            .unwrap_err();
+        assert!(err.contains("pruned-task"), "{err}");
+
+        // A healthy team resolves each member's latest task.
+        save_when_team(
+            &server,
+            "healthy-team",
+            json!([{
+                "name": "live",
+                "brofile": "bf-live",
+                "task_history": ["older-task", "live-task"]
+            }]),
+        );
+        let tasks = server
+            .resolve_when_tasks(Some("healthy-team"), None)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id(), "live-task");
+    }
+
+    #[tokio::test]
+    async fn when_aggregates_preserve_mixed_outcomes_and_bound_bodies() {
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::{ClientHandler, ServiceExt};
+        struct WaitClient;
+        impl ClientHandler for WaitClient {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root.join("bro"))));
+        let state = server.state.clone();
+
+        let bulky = seed_when_task(&state, "bulky-done", orch::TaskStatus::Completed);
+        bulky.inner.lock().last_assistant_message = Some("B".repeat(6 * 1024));
+        seed_when_task(&state, "plain-failed", orch::TaskStatus::Failed);
+        seed_when_task(&state, "plain-cancelled", orch::TaskStatus::Cancelled);
+        seed_when_task(&state, "still-running", orch::TaskStatus::Running);
+
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(async move {
+            server
+                .serve(server_io)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = WaitClient.serve(client_io).await.unwrap();
+
+        for tool in ["bro_when_all", "bro_when_any"] {
+            let response = client
+                .call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(
+                        json!({
+                            "task_ids": [
+                                "bulky-done",
+                                "plain-failed",
+                                "plain-cancelled",
+                                "still-running"
+                            ],
+                            "timeout_seconds": 0,
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.is_error, Some(true), "{response:?}");
+            let value: Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            let counts = &value["outcome_counts"];
+            assert_eq!(counts["completed"], json!(1), "{value}");
+            assert_eq!(counts["failed"], json!(1), "{value}");
+            assert_eq!(counts["cancelled"], json!(1), "{value}");
+            assert_eq!(counts["running"], json!(1), "{value}");
+            assert_eq!(value["results"].as_array().unwrap().len(), 4, "{value}");
+
+            // Terminal versus success stay distinct, and a timeout row
+            // never becomes a success row.
+            if tool == "bro_when_all" {
+                assert_eq!(value["all_completed"], json!(false), "{value}");
+                assert_eq!(value["all_succeeded"], json!(false), "{value}");
+            } else {
+                assert_eq!(value["any_completed"], json!(true), "{value}");
+                assert_eq!(value["any_succeeded"], json!(true), "{value}");
+            }
+            let running = when_row(&value, "still-running");
+            assert_eq!(running["timed_out"], json!(true), "{value}");
+            assert_eq!(running["status"], json!("running"), "{value}");
+            let failed = when_row(&value, "plain-failed");
+            assert_eq!(failed["status"], json!("failed"), "{value}");
+            assert!(failed.get("timed_out").is_none(), "{value}");
+        }
+
+        // Bulk bodies compact under the aggregate byte budget: every task
+        // keeps a row, and omitted bodies move behind the bro_status hint.
+        let mut ids = vec!["bulky-done".to_string()];
+        for index in 0..11 {
+            let id = format!("bulk-{index}");
+            let task = seed_when_task(&state, &id, orch::TaskStatus::Completed);
+            task.inner.lock().last_assistant_message = Some("K".repeat(6 * 1024));
+            ids.push(id);
+        }
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("bro_when_all").with_arguments(
+                    json!({"task_ids": ids, "timeout_seconds": 0})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        let value: Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(value["all_completed"], json!(true), "{value}");
+        assert_eq!(value["all_succeeded"], json!(true), "{value}");
+        assert_eq!(value["results"].as_array().unwrap().len(), 12, "{value}");
+        assert!(
+            value["resultsTruncated"]["compacted_rows"]
+                .as_u64()
+                .unwrap()
+                > 0,
+            "{value}"
+        );
+        for row in value["results"].as_array().unwrap() {
+            if row.get("resultOmitted") == Some(&json!(true)) {
+                assert!(row.get("result").is_none(), "{row}");
+                assert!(
+                    row["resultHint"].as_str().unwrap().contains("bro_status"),
+                    "{row}"
+                );
+                assert!(row.get("status").is_some(), "{row}");
+            }
+        }
+
+        client.cancel().await.unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn broadcast_rejects_oversized_team_before_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let members = Value::Array(
+            (0..orch::BROADCAST_MEMBER_LIMIT + 1)
+                .map(|i| {
+                    json!({
+                        "name": format!("alpha-{i:03}"),
+                        "brofile": format!("missing-{i:03}"),
+                        "task_history": [],
+                    })
+                })
+                .collect(),
+        );
+        save_when_team(&server, "too-big", members);
+        let team_path = server.state.store_dir.join("teams").join("too-big.json");
+        let before = std::fs::read_to_string(&team_path).expect("team file readable");
+
+        let p: BroadcastParams =
+            serde_json::from_value(json!({"team": "too-big", "prompt": "should never launch"}))
+                .unwrap();
+        let result = server.bro_broadcast(Parameters(p)).await;
+        let err = call_result_text(&result);
+        assert_eq!(result.is_error, Some(true));
+
+        assert!(err.contains("exceeding the broadcast limit"), "{err}");
+        assert!(err.contains("256"), "{err}");
+        let after = std::fs::read_to_string(&team_path).expect("team file readable");
+        assert_eq!(before, after, "oversized team must not be rewritten");
+        assert!(
+            server.state.task_store.read().all_tasks().is_empty(),
+            "oversized team must not dispatch any tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_receipts_preserve_member_outcomes_with_missing_brofiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        save_when_team(
+            &server,
+            "receipt-panel",
+            json!([
+                {"name": "alpha", "brofile": "missing-alpha", "task_history": []},
+                {"name": "beta", "brofile": "missing-beta", "task_history": []}
+            ]),
+        );
+        let p: BroadcastParams =
+            serde_json::from_value(json!({"team": "receipt-panel", "prompt": "noop"})).unwrap();
+        let result = server.bro_broadcast(Parameters(p)).await;
+        let value: Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        let receipts = value["tasks"].as_array().unwrap();
+        assert_eq!(receipts.len(), 2, "{value}");
+        for (row, name) in receipts.iter().zip(["alpha", "beta"]) {
+            assert_eq!(row["bro"], json!(name), "{value}");
+            assert!(
+                row["error"].as_str().unwrap().contains("Brofile not found"),
+                "{value}"
+            );
+        }
+        assert!(value.get("receiptsTruncated").is_none(), "{value}");
     }
 
     #[test]

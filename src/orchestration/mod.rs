@@ -5738,6 +5738,192 @@ fn observed_event_count(inner: &TaskInner) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Aggregate wait and broadcast reply shaping
+// ---------------------------------------------------------------------------
+
+/// Maximum task occurrences one aggregate wait (`bro_when_all` /
+/// `bro_when_any`) may observe. Oversized selections are rejected before any
+/// waiting so callers partition batches explicitly instead of losing rows.
+pub(crate) const WHEN_TARGET_LIMIT: usize = 64;
+
+/// Serialized byte budget for aggregate wait result rows. The MCP response
+/// cap is 80 KiB; once this budget is exhausted rows are compacted (never
+/// dropped) so every selected task keeps identity and outcome while exact
+/// bodies stay recoverable through `bro_status`.
+const WHEN_ROWS_BUDGET_BYTES: usize = 40 * 1024;
+
+/// Serialized byte budget for full broadcast receipt rows. Team admission
+/// caps membership at 256, so compacted receipts (member + taskId + short
+/// error) keep the complete envelope inside the transport cap; the typed
+/// `response_too_large` error remains the backstop for hand-edited stores.
+const BROADCAST_RECEIPTS_BUDGET_BYTES: usize = 16 * 1024;
+
+/// Maximum members one `bro_broadcast` call may dispatch. The check runs
+/// before any member launch or team-file write so an oversized (for example
+/// hand-edited) team cannot fan out unbounded effects.
+pub(crate) const BROADCAST_MEMBER_LIMIT: usize = 256;
+
+/// Outcome counts for aggregate waits, classified from the same captured
+/// result rows that are returned to the caller (never by re-reading live
+/// task state, which could change between row capture and counting). A row
+/// with `timed_out: true` counts as `running` even if its embedded status
+/// raced a late completion, so the summary can never disagree with the rows
+/// and a timeout never masquerades as success. Duplicate IDs count once per
+/// requested occurrence, matching result-row cardinality.
+pub(crate) fn when_outcome_counts(rows: &[Value]) -> Value {
+    let mut completed = 0usize;
+    let mut failed = 0usize;
+    let mut cancelled = 0usize;
+    let mut running = 0usize;
+    for row in rows {
+        if row.get("timed_out") == Some(&Value::Bool(true)) {
+            running += 1;
+            continue;
+        }
+        match row.get("status").and_then(Value::as_str) {
+            Some("completed") => completed += 1,
+            Some("failed") => failed += 1,
+            Some("cancelled") => cancelled += 1,
+            _ => running += 1,
+        }
+    }
+    json!({
+        "completed": completed,
+        "failed": failed,
+        "cancelled": cancelled,
+        "running": running,
+    })
+}
+
+fn compact_when_row(row: &Value) -> Value {
+    let mut compact = serde_json::Map::new();
+    for key in ["taskId", "provider", "status", "timed_out", "bro"] {
+        if let Some(value) = row.get(key).filter(|value| !value.is_null()) {
+            compact.insert(key.into(), value.clone());
+        }
+    }
+    compact.insert("resultOmitted".into(), Value::Bool(true));
+    compact.insert(
+        "resultHint".into(),
+        Value::String(
+            "Read bro_status(task_id=..., detail=result); follow body.next_cursor for further pages."
+                .to_string(),
+        ),
+    );
+    Value::Object(compact)
+}
+
+/// Bound aggregate wait rows to `WHEN_ROWS_BUDGET_BYTES`. Every requested
+/// task keeps a row in selection order; once the budget is exhausted the
+/// remaining rows are compacted to identity plus outcome plus the
+/// `bro_status` recovery hint. Returns the rows and a truncation note when
+/// any row was compacted.
+pub(crate) fn bound_when_rows(rows: Vec<Value>) -> (Vec<Value>, Option<Value>) {
+    let mut used = 0usize;
+    let mut compacted = 0usize;
+    let mut bounded = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bytes = serde_json::to_vec(&row)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if used.saturating_add(bytes) > WHEN_ROWS_BUDGET_BYTES {
+            compacted += 1;
+            let compact = compact_when_row(&row);
+            used = used.saturating_add(
+                serde_json::to_vec(&compact)
+                    .map(|encoded| encoded.len())
+                    .unwrap_or(0),
+            );
+            bounded.push(compact);
+        } else {
+            used += bytes;
+            bounded.push(row);
+        }
+    }
+    let truncation = (compacted > 0).then(|| {
+        json!({
+            "compacted_rows": compacted,
+            "byte_budget": WHEN_ROWS_BUDGET_BYTES,
+            "hint": "Every selected task keeps a row; compacted rows omit bodies. Read exact per-task results with bro_status(task_id=..., detail=result), following body.next_cursor.",
+        })
+    });
+    (bounded, truncation)
+}
+
+/// Truncate a diagnostic string on a character boundary, marking the cut
+/// with an ellipsis so caller-supplied text cannot inflate error replies.
+pub(crate) fn truncated_chars(value: &str, max_chars: usize) -> String {
+    let mut cut: String = value.chars().take(max_chars).collect();
+    if cut.chars().count() < value.chars().count() {
+        cut.push('…');
+    }
+    cut
+}
+
+/// Bound broadcast receipts. Each member keeps a receipt preserving identity
+/// and admission outcome: over-long error text is truncated with an explicit
+/// marker, and once the full-row budget is exhausted later rows are
+/// compacted to member + taskId + short error with `receiptCompacted: true`.
+/// Dispatch mechanics are untouched; only the serialized reply is shaped.
+pub(crate) fn bound_broadcast_receipts(rows: Vec<Value>) -> (Vec<Value>, Option<Value>) {
+    const FULL_ERROR_CHARS: usize = 512;
+    const COMPACT_ERROR_CHARS: usize = 64;
+    let mut used = 0usize;
+    let mut compacted = 0usize;
+    let mut bounded = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        if let Some(error) = row.get("error").and_then(Value::as_str).map(str::to_string)
+            && error.chars().count() > FULL_ERROR_CHARS
+        {
+            if let Some(map) = row.as_object_mut() {
+                map.insert(
+                    "error".into(),
+                    Value::String(truncated_chars(&error, FULL_ERROR_CHARS)),
+                );
+                map.insert("errorTruncated".into(), Value::Bool(true));
+            }
+        }
+        let bytes = serde_json::to_vec(&row)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if used.saturating_add(bytes) > BROADCAST_RECEIPTS_BUDGET_BYTES {
+            compacted += 1;
+            let mut compact = serde_json::Map::new();
+            for key in ["bro", "taskId"] {
+                if let Some(value) = row.get(key).filter(|value| !value.is_null()) {
+                    compact.insert(key.into(), value.clone());
+                }
+            }
+            if let Some(error) = row.get("error").and_then(Value::as_str) {
+                compact.insert(
+                    "error".into(),
+                    Value::String(truncated_chars(error, COMPACT_ERROR_CHARS)),
+                );
+            }
+            compact.insert("receiptCompacted".into(), Value::Bool(true));
+            let value = Value::Object(compact);
+            used = used.saturating_add(
+                serde_json::to_vec(&value)
+                    .map(|encoded| encoded.len())
+                    .unwrap_or(0),
+            );
+            bounded.push(value);
+        } else {
+            used += bytes;
+            bounded.push(row);
+        }
+    }
+    let truncation = (compacted > 0).then(|| {
+        json!({
+            "compacted_receipts": compacted,
+            "byte_budget": BROADCAST_RECEIPTS_BUDGET_BYTES,
+            "hint": "Every member keeps a receipt; compacted receipts omit session detail. Read admitted task state with bro_status(task_id=...).",
+        })
+    });
+    (bounded, truncation)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -5752,6 +5938,87 @@ mod tests {
     fn test_tail_tx() -> tokio::sync::broadcast::Sender<tail::TailEvent> {
         let (tail_tx, _) = tokio::sync::broadcast::channel(16);
         tail_tx
+    }
+
+    #[test]
+    fn when_outcome_counts_match_returned_rows() {
+        let rows = vec![
+            json!({"taskId": "a", "status": "completed"}),
+            // Duplicate occurrences count once per request, not once per ID.
+            json!({"taskId": "a", "status": "completed"}),
+            json!({"taskId": "b", "status": "failed"}),
+            json!({"taskId": "c", "status": "cancelled"}),
+            json!({"taskId": "d", "status": "running", "timed_out": true}),
+            // A late completion racing the timeout still counts as running:
+            // the row (and only the row) is the summary's source of truth.
+            json!({"taskId": "e", "status": "completed", "timed_out": true}),
+        ];
+        let counts = when_outcome_counts(&rows);
+        assert_eq!(counts["completed"], serde_json::json!(2));
+        assert_eq!(counts["failed"], serde_json::json!(1));
+        assert_eq!(counts["cancelled"], serde_json::json!(1));
+        assert_eq!(counts["running"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn bound_when_rows_compact_without_dropping_rows() {
+        let rows: Vec<Value> = (0..12)
+            .map(|index| {
+                json!({
+                    "taskId": format!("task-{index}"),
+                    "status": "completed",
+                    "timed_out": false,
+                    "result": "R".repeat(6 * 1024),
+                })
+            })
+            .collect();
+        let (bounded, truncation) = bound_when_rows(rows);
+        assert_eq!(bounded.len(), 12);
+        let note = truncation.expect("budget must trigger compaction");
+        assert!(note["compacted_rows"].as_u64().unwrap() > 0);
+        for (index, row) in bounded.iter().enumerate() {
+            assert_eq!(row["taskId"], json!(format!("task-{index}")));
+            assert_eq!(row["status"], json!("completed"));
+        }
+        let compacted = bounded
+            .iter()
+            .filter(|row| row.get("resultOmitted") == Some(&json!(true)))
+            .count();
+        assert!(compacted > 0);
+        assert!(
+            bounded
+                .iter()
+                .any(|row| row["resultHint"].as_str().unwrap().contains("bro_status"))
+        );
+    }
+
+    #[test]
+    fn bound_broadcast_receipts_compact_and_truncate_errors() {
+        let long_error = "E".repeat(2048);
+        let rows: Vec<Value> = (0..40)
+            .map(|index| {
+                json!({
+                    "bro": format!("member-{index}"),
+                    "taskId": format!("task-{index}"),
+                    "sessionId": format!("session-{index}"),
+                    "error": long_error,
+                })
+            })
+            .collect();
+        let (bounded, truncation) = bound_broadcast_receipts(rows);
+        assert_eq!(bounded.len(), 40);
+        let note = truncation.expect("budget must compact receipts");
+        assert!(note["compacted_receipts"].as_u64().unwrap() > 0);
+        for (index, row) in bounded.iter().enumerate() {
+            assert_eq!(row["bro"], json!(format!("member-{index}")));
+            let error = row["error"].as_str().unwrap();
+            assert!(error.chars().count() <= 513, "{error}");
+        }
+        assert!(
+            bounded
+                .iter()
+                .any(|row| row.get("receiptCompacted") == Some(&json!(true)))
+        );
     }
 
     #[test]
