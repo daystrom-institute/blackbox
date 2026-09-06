@@ -216,7 +216,8 @@ pub(crate) struct ResumeParams {
 pub(crate) struct WaitParams {
     /// Task ID from exec or resume
     pub(crate) task_id: String,
-    /// Max seconds to wait (recommended: 120)
+    /// Max seconds to wait (recommended: 120). Must be finite, nonnegative,
+    /// and within the platform clock range; zero requests an immediate snapshot.
     #[serde(default)]
     pub(crate) timeout_seconds: Option<f64>,
 }
@@ -236,7 +237,8 @@ pub(crate) struct WhenParams {
     /// call; split larger batches.
     #[serde(default)]
     pub(crate) task_ids: Option<Vec<String>>,
-    /// Max seconds to wait (recommended: 120)
+    /// Max seconds to wait (recommended: 120). Must be finite, nonnegative,
+    /// and within the platform clock range; zero requests an immediate snapshot.
     #[serde(default)]
     pub(crate) timeout_seconds: Option<f64>,
 }

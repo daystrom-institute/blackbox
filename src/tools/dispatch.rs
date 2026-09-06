@@ -82,6 +82,19 @@ pub(crate) struct FreshDispatchResult {
     pub(crate) allocation: Option<orchestration::allocator::Allocation>,
 }
 
+/// Validate before registering observers or touching task state. Both duration
+/// conversion and the platform clock deadline must be representable.
+fn validate_wait_timeout(seconds: Option<f64>) -> Result<(), &'static str> {
+    if let Some(seconds) = seconds {
+        let duration = std::time::Duration::try_from_secs_f64(seconds)
+            .map_err(|_| "timeout_seconds must be finite, nonnegative, and representable")?;
+        if std::time::Instant::now().checked_add(duration).is_none() {
+            return Err("timeout_seconds exceeds the platform clock range");
+        }
+    }
+    Ok(())
+}
+
 fn exec_params_have_runtime(p: &ExecParams) -> bool {
     p.tier.is_some()
         || p.tier_ladder.is_some()
@@ -1470,6 +1483,9 @@ impl BlackboxServer {
         Parameters(p): Parameters<WaitParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
+        if let Err(error) = validate_wait_timeout(p.timeout_seconds) {
+            return Self::err_text(error);
+        }
         let task = match self.state.task_store.read().get(&p.task_id) {
             Some(t) => t,
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
@@ -1517,6 +1533,9 @@ impl BlackboxServer {
         Parameters(p): Parameters<WhenParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
+        if let Err(error) = validate_wait_timeout(p.timeout_seconds) {
+            return Self::err_text(error);
+        }
         let tasks = match self.resolve_when_tasks(p.team.as_deref(), p.task_ids.as_deref()) {
             Ok(tasks) => tasks,
             Err(e) => return Self::err_text(&e),
@@ -1593,6 +1612,9 @@ impl BlackboxServer {
         Parameters(p): Parameters<WhenParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
+        if let Err(error) = validate_wait_timeout(p.timeout_seconds) {
+            return Self::err_text(error);
+        }
         let tasks = match self.resolve_when_tasks(p.team.as_deref(), p.task_ids.as_deref()) {
             Ok(tasks) => tasks,
             Err(e) => return Self::err_text(&e),
@@ -2044,6 +2066,20 @@ impl BlackboxServer {
         description = "Drop terminal tasks from the store + persisted tasks.json; filter by status/provider/age, or pass task_ids to drop only specific tasks you created."
     )]
     pub(crate) async fn bro_prune(&self, Parameters(p): Parameters<PruneParams>) -> CallToolResult {
+        if p.task_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Self::err_text(
+                "task_ids must not be empty; omit it only for an intentional filtered sweep",
+            );
+        }
+        let filter_provider = match p
+            .provider
+            .as_deref()
+            .map(str::parse::<Provider>)
+            .transpose()
+        {
+            Ok(provider) => provider,
+            Err(_) => return Self::err_text("Unknown provider; no tasks were selected or pruned"),
+        };
         let allowed = ["failed", "completed", "cancelled"];
         // Validate an explicitly-supplied status; absence is meaningful
         // (see effective_status below), so don't default it here.
@@ -2063,11 +2099,8 @@ impl BlackboxServer {
             None => None,
         };
 
-        let task_id_set: Option<std::collections::HashSet<String>> = p
-            .task_ids
-            .as_ref()
-            .filter(|v| !v.is_empty())
-            .map(|v| v.iter().cloned().collect());
+        let task_id_set: Option<std::collections::HashSet<String>> =
+            p.task_ids.as_ref().map(|v| v.iter().cloned().collect());
 
         // Status resolution: an explicit status always wins; otherwise a
         // task_ids list matches any terminal status (you named the exact
@@ -2084,10 +2117,6 @@ impl BlackboxServer {
             (None, None) => "failed".to_string(),
         };
 
-        let filter_provider = p
-            .provider
-            .as_deref()
-            .and_then(|s| s.parse::<Provider>().ok());
         let cutoff_ms = p
             .older_than_hours
             .map(|h| orch::now_ms().saturating_sub(h.saturating_mul(3600 * 1000)));
@@ -3909,6 +3938,51 @@ mod tests {
             .resolve_exec_target(Some("no-such-bro"), None, None)
             .unwrap_err();
         assert!(err.contains("Unknown bro or brofile"), "got: {err}");
+    }
+
+    #[test]
+    fn wait_timeouts_refuse_invalid_durations_before_observation() {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(validate_wait_timeout(Some(invalid)).is_err());
+        }
+        for valid in [None, Some(0.0), Some(0.001), Some(900.0)] {
+            assert!(validate_wait_timeout(valid).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_invalid_selectors_preserve_all_tasks_and_store_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_prune_store(&server);
+        server
+            .state
+            .task_store
+            .write()
+            .insert(
+                "other-provider".into(),
+                orch::test_task("other-provider", orch::TaskStatus::Failed, Provider::Brodex),
+            )
+            .unwrap();
+        let snapshot = server.state.store_dir.join("tasks.json");
+        std::fs::write(&snapshot, b"synthetic existing snapshot").unwrap();
+        for preview in [true, false] {
+            for empty in [true, false] {
+                let mut p = prune_params(if empty { Some(vec![]) } else { None }, None);
+                p.dry_run = Some(preview);
+                p.retro = Some(true);
+                if !empty {
+                    p.provider = Some("synthetic-invalid".into());
+                }
+                let response = server.bro_prune(Parameters(p)).await;
+                assert_eq!(response.is_error, Some(true));
+                assert_eq!(server.state.task_store.read().all_tasks().len(), 5);
+                assert_eq!(
+                    std::fs::read(&snapshot).unwrap(),
+                    b"synthetic existing snapshot"
+                );
+            }
+        }
     }
 
     #[tokio::test]
