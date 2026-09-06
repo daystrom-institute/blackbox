@@ -1756,11 +1756,14 @@ fn bound_entry_metadata(entry: &mut serde_json::Map<String, serde_json::Value>) 
         };
         if value.len() > STRUCTURED_KNOWLEDGE_METADATA_BYTES {
             let bytes_field = format!("{field}_bytes");
-            entry[field] = json!(compact_text_fragment(
-                &value,
-                STRUCTURED_KNOWLEDGE_METADATA_BYTES
-            ));
-            entry[bytes_field.as_str()] = json!(value.len());
+            entry.insert(
+                field.into(),
+                json!(compact_text_fragment(
+                    &value,
+                    STRUCTURED_KNOWLEDGE_METADATA_BYTES
+                )),
+            );
+            entry.insert(bytes_field, json!(value.len()));
             truncated = true;
         }
     }
@@ -1805,8 +1808,8 @@ fn bound_structured_knowledge_rows(structured: &mut serde_json::Value, p: &Knowl
                 &content,
                 STRUCTURED_KNOWLEDGE_CONTENT_BYTES
             ));
-            entry["content_bytes"] = json!(content.len());
-            entry["content_truncated"] = json!(true);
+            entry.insert("content_bytes".into(), json!(content.len()));
+            entry.insert("content_truncated".into(), json!(true));
             truncated = true;
         }
         truncated |= bound_entry_metadata(entry);
@@ -2228,7 +2231,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces matching rule-packets and system memories; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters."
+        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces bounded rule-packet and system-memory sidecars; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters."
     )]
     pub(crate) async fn bbox_knowledge(
         &self,
@@ -3571,7 +3574,7 @@ mod tests {
             wire.len()
         );
         let first = first.structured_content.expect("structured detail");
-        assert_eq!(first["scope"]["entry_detail"], "knowledge:metadata-entry");
+        assert_eq!(first["entity_ref"], "knowledge:metadata-entry");
         let mut reconstructed = first["body"]["text"].as_str().unwrap().to_string();
         let mut cursor = first["body"]["next_cursor"].as_str().map(str::to_string);
         while let Some(active_cursor) = cursor {

@@ -983,7 +983,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_doctor",
         category: ToolCategory::Operations,
-        summary: "Diagnose Blackbox health with ranked, paginated findings. format selects summary text or JSON; detail=full adds server-owned diagnostics. Narrow with section.",
+        summary: "Diagnose Blackbox health with ranked, paginated findings. format selects summary text or JSON; detail=full returns exact bounded body pages (cursor/body_limit). Narrow with section: the section name is validated before collection and collects only that section.",
         when_to_use: "Use as the first call when asking \"what do I need to know about Blackbox right now?\"; replaces the scattered manual smoke checklist (bbox_stats, bbox_embed_status, bbox_project_list, bbox_lint, bbox_inbox) with one ranked surface. Route findings distinguish real failures (action) from opt-in absence like unconfigured visual chunk kinds (info). Default detail=summary returns up to 20 findings (max 100) ordered worst severity, section, then message; next_offset continues. Section status is separate from the findings page. detail=full returns a JSON envelope with exact body pages (body_limit default/max 4096 bytes, minimum 4). Concatenate body.text and replay body.next_cursor as cursor with the same section and format. Health is collected on each page; changed evidence rejects continuation, so restart without cursor. A requested section is validated BEFORE collection and collects only that section's existing producer instead of the full report. format=json does not imply full detail. Restart pagination after a state change.",
         example: Some(r#"bbox_doctor(format="summary")"#),
     },

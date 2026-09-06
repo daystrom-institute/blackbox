@@ -17,7 +17,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_pin",
-        description = "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope. Reads are host-owned: list returns bounded preview pages (follow next_offset; exact bodies need id + full=true)."
+        description = "Persist scoped ambient context for an active execution lane. Pins survive daemon restarts, are never rendered into repo agent files, and are injected only when the current dispatch matches their session/bro/thread/work-item scope. action=list returns bounded preview pages (200-char bodies); id + full=true is the exact recovery read through a content-bound body cursor."
     )]
     pub(crate) async fn bbox_pin(&self, Parameters(p): Parameters<PinParams>) -> CallToolResult {
         let start = std::time::Instant::now();
@@ -609,18 +609,16 @@ mod tests {
         let server = fixture.server();
 
         // A pin keyed under the historical path, carrying no project id.
-        let set = server
-            .bbox_pin(Parameters(crate::pins::PinParams {
-                action: "set".into(),
-                content: Some("LEDGER_ARM_PIN".into()),
-                title: Some("legacy".into()),
-                scope: Some("bro".into()),
-                target: Some("executor".into()),
-                project: Some(historical.into()),
-                ..Default::default()
-            }))
-            .await;
-        assert_ne!(set.is_error, Some(true), "{set:?}");
+        let set = server.state.pins.write().pin(&crate::pins::PinParams {
+            action: "set".into(),
+            content: Some("LEDGER_ARM_PIN".into()),
+            title: Some("legacy".into()),
+            scope: Some("bro".into()),
+            target: Some("executor".into()),
+            project: Some(historical.into()),
+            ..Default::default()
+        });
+        set.unwrap();
 
         let listed = server
             .bbox_pin(Parameters(crate::pins::PinParams {

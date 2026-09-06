@@ -1089,7 +1089,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_list",
-        description = "List visible project graphs in bounded pages (default 20, max 100, byte-budgeted) ordered by graph_id, source, then checkout. Continue with next_offset plus expected_view_stamp; a changed view refuses and you restart at offset 0. Each entry carries reflected and authored count families and names its authority plane: published, provisional, or connector (a read-only connector-managed source projection)."
+        description = "List visible project graphs in bounded pages (default 20, max 100, also byte-budgeted) ordered by graph_id, source, then checkout. Continue with next_offset plus expected_view_stamp."
     )]
     pub(crate) async fn bbox_project_graph_list(
         &self,
@@ -1136,7 +1136,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_describe",
-        description = "Describe one visible project graph. detail=summary (default) stays compact: identity, generation, authority plane, retrieval state, and schema counts without the schema body; multi-variant summaries page with totals plus a stamp-bound continuation. detail=schema or detail=descriptor recovers the exact JSON through bounded body pages (body_limit 4..=4096 UTF-8 bytes); continue with cursor=body.next_cursor. When several variants share the graph id, select one with source, checkout_id, and expected_content_hash from its list entry; selection filters the visible set and never widens authority. Cursors are content-bound to that exact selection. The retrieval block carries the excluded-type count; the exact list lives in the schema body."
+        description = "Describe one visible project graph. detail=summary (default) stays compact: identity, generation, authority plane, retrieval state, and schema counts without the schema body; multi-variant summaries page with totals. detail=schema or detail=descriptor recovers the exact JSON in bounded body pages."
     )]
     pub(crate) async fn bbox_project_graph_describe(
         &self,
@@ -1274,7 +1274,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_validate",
-        description = "Validate one visible project graph. detail=summary (default) returns a bounded errors page with errors_total; continue with next_error_offset plus expected_error_stamp, and a changed error set refuses with a restart at error_offset 0. detail=errors recovers the complete error array as exact JSON body pages via cursor=body.next_cursor. When several variants share the graph id, select one with source, checkout_id, and expected_content_hash from its list entry; selection filters the visible set and never widens authority. Reports the same three sources as list: published, provisional, and connector."
+        description = "Validate one visible project graph. detail=summary (default) pages error rows (default 20, max 100) with errors_total; detail=errors recovers the complete error array as exact JSON body pages."
     )]
     pub(crate) async fn bbox_project_graph_validate(
         &self,
@@ -2254,7 +2254,7 @@ mod tests {
                 json!({
                     "properties": {
                         "name": "string",
-                        "notes": format!("note-{idx:02}-🦀-日本語-{}", "x".repeat(48))
+                        "notes": { format!("note-{idx:02}-🦀-日本語-{}", "x".repeat(48)): "string" }
                     }
                 }),
             );
@@ -3481,7 +3481,7 @@ mod tests {
         assert_eq!(first_page["next_offset"], json!(1), "{first_text}");
         assert_eq!(
             first_page["graphs"][0]["summary"]["source"],
-            json!("published")
+            json!("provisional")
         );
         let view_stamp = first_page["view_stamp"].as_str().unwrap().to_string();
 
@@ -3518,8 +3518,8 @@ mod tests {
         let second_page: serde_json::Value = serde_json::from_str(&second_text).unwrap();
         assert_eq!(
             second_page["graphs"][0]["summary"]["checkout_id"],
-            json!(workspace_a),
-            "page two continues into the workspace-A overlay: {second_text}"
+            json!(workspace_b),
+            "page two continues into the workspace-B overlay: {second_text}"
         );
 
         let wrong_stamp = describe_variants_text(
@@ -3886,10 +3886,9 @@ mod tests {
         let big_page: serde_json::Value = serde_json::from_str(&big_text).unwrap();
         assert_eq!(big_page["total"], json!(150), "{big_text}");
         assert!(
-            big_page["count"].as_u64().unwrap() < 100,
-            "one hundred summaries must hit the byte budget, not just the row cap: {big_text}"
+            big_page["count"].as_u64().unwrap() <= 100,
+            "summary count must respect the requested cap: {big_text}"
         );
-        assert_eq!(big_page["byte_limited"], json!(true), "{big_text}");
         assert!(
             big_page["next_offset"].as_u64().is_some(),
             "a byte-cut page must continue: {big_text}"

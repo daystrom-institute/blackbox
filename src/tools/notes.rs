@@ -110,7 +110,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_notes",
-        description = "List note summary pages (default 20, maximum 100), newest first then id. Continue with next_offset; use id and full=true for complete bodies (content-bound pages; follow body.next_cursor). Filter by kind, project, session, thread, or resolution."
+        description = "List note summary pages (default 20, maximum 100), newest first then id. Continue with next_offset; use id and full=true for complete bodies through a content-bound cursor. Filter by kind, project, session, thread, or resolution."
     )]
     pub(crate) fn bbox_notes(
         &self,

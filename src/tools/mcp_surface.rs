@@ -501,7 +501,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(parsed["verdict_classification"], "tool_surface");
-        assert_eq!(parsed["verdict"]["allow_count"], 1);
+        assert_eq!(parsed["verdict"]["allow_count"], 2);
         assert_eq!(parsed["verdict"]["disallow_count"], 0);
         assert!(parsed.get("policy").is_none());
         let visible: Vec<&str> = parsed["visible_tools"]
@@ -798,7 +798,7 @@ mod tests {
     fn test_describe_policy_detail_reports_exact_reader() {
         let (_tmp, server) = make_server();
         let packets = server.state.packets.read();
-        let packet_id = compile_surface_packet(
+        compile_surface_packet(
             &packets,
             vec![surface_rule(
                 "readonly",
@@ -810,6 +810,11 @@ mod tests {
             "global",
             None,
         );
+        let packet_id = packets
+            .load_latest_by_domain(surface::SURFACE_ROUTING_DOMAIN, None, None)
+            .unwrap()
+            .unwrap()
+            .id;
         drop(packets);
 
         let result = server

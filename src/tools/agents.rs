@@ -146,7 +146,10 @@ impl BlackboxServer {
             Ok(Some(rec)) => {
                 let mut m = serde_json::Map::from_iter([
                     ("name".into(), serde_json::Value::String(rec.name.clone())),
-                    ("version".into(), serde_json::Value::String(rec.version)),
+                    (
+                        "version".into(),
+                        serde_json::Value::String(rec.version.clone()),
+                    ),
                     ("active".into(), serde_json::Value::Bool(rec.active)),
                     (
                         "installed_at".into(),
@@ -188,7 +191,7 @@ impl BlackboxServer {
                             ));
                         }
                     };
-                    let selection = format!("agent-get:{}", rec.name);
+                    let selection = format!("agent-get:{}@{}", rec.name, rec.version);
                     match super::body_page::json_body_page(
                         &selection,
                         &stored,
@@ -212,37 +215,31 @@ impl BlackboxServer {
         }
     }
 
-    /// Redact credential values from configuration-shaped JSON before it
-    /// enters a caller-facing view. Only maps keyed `env` are treated as
-    /// credential carriers (the same contract as `Account::response_view`):
-    /// keys stay as identity, string values become `<redacted>`, and nested
-    /// non-string values recurse. Arbitrary free-text fields are not guessed
-    /// to be secrets.
+    /// Redact configuration credential carriers, preserving their key names.
+    /// The entire value is sensitive even when an inline manifest represents
+    /// it as a nested object. Free-text fields are not credential carriers.
     pub(crate) fn redact_config_credentials(value: &serde_json::Value) -> serde_json::Value {
         match value {
-            serde_json::Value::Object(map) => {
-                let mut out = serde_json::Map::new();
-                for (key, inner) in map {
-                    if key == "env" {
-                        if let serde_json::Value::Object(env) = inner {
-                            let mut redacted = serde_json::Map::new();
-                            for (env_key, env_value) in env {
-                                let replacement = match env_value {
-                                    serde_json::Value::String(_) => {
-                                        serde_json::Value::String("<redacted>".into())
-                                    }
-                                    other => Self::redact_config_credentials(other),
-                                };
-                                redacted.insert(env_key.clone(), replacement);
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(key, inner)| {
+                        let value = if matches!(key.as_str(), "env" | "headers") {
+                            match inner.as_object() {
+                                Some(values) => serde_json::Value::Object(
+                                    values
+                                        .keys()
+                                        .map(|name| (name.clone(), serde_json::json!("<redacted>")))
+                                        .collect(),
+                                ),
+                                None => serde_json::json!("<redacted>"),
                             }
-                            out.insert(key.clone(), serde_json::Value::Object(redacted));
-                            continue;
-                        }
-                    }
-                    out.insert(key.clone(), Self::redact_config_credentials(inner));
-                }
-                serde_json::Value::Object(out)
-            }
+                        } else {
+                            Self::redact_config_credentials(inner)
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect(),
+            ),
             serde_json::Value::Array(items) => serde_json::Value::Array(
                 items.iter().map(Self::redact_config_credentials).collect(),
             ),
@@ -389,7 +386,7 @@ impl BlackboxServer {
                         "stored_manifest": {
                             "status": "parse_failed",
                             "error": preview_text(
-                                &rec.manifest_parse_error.unwrap_or_default(),
+                                &format!("manifest parse failed: {}", rec.manifest_parse_error.unwrap_or_default()),
                                 512
                             ),
                             "action": "reinstall or upgrade this agent so the manifest parses; bro_agent_get(name) previews the stored parse error",
@@ -475,7 +472,7 @@ impl BlackboxServer {
                     return Self::err_text(&format!("manifest serialization failed: {error}"));
                 }
             };
-            let selection = format!("agent-describe:{}:manifest", rec.name);
+            let selection = format!("agent-describe:{}@{}:manifest", rec.name, rec.version);
             return match super::body_page::json_body_page(
                 &selection,
                 &stored,
@@ -513,7 +510,7 @@ impl BlackboxServer {
                     );
                 }
             };
-            let selection = format!("agent-describe:{}:brofile", rec.name);
+            let selection = format!("agent-describe:{}@{}:brofile", rec.name, rec.version);
             return match super::body_page::json_body_page(
                 &selection,
                 &plane_value,
@@ -592,7 +589,10 @@ impl BlackboxServer {
 
         let mut result = serde_json::Map::from_iter([
             ("name".into(), serde_json::Value::String(rec.name.clone())),
-            ("version".into(), serde_json::Value::String(rec.version)),
+            (
+                "version".into(),
+                serde_json::Value::String(rec.version.clone()),
+            ),
             ("active".into(), serde_json::Value::Bool(rec.active)),
             (
                 "embedding_status".into(),
@@ -3206,11 +3206,12 @@ mod tests {
     }
 
     #[test]
-    fn redact_config_credentials_redacts_only_env_carriers() {
+    fn redact_config_credentials_redacts_nested_env_and_header_values() {
         let input = serde_json::json!({
             "runtime": {
                 "env": {
                     "PATH": "/usr/bin",
+                    "NESTED": {"value": "nested-secret-sentinel"},
                     "SECRET_KEY": "sk-ant-test-secret-do-not-ship"
                 }
             },
@@ -3219,13 +3220,16 @@ mod tests {
                 "env": {"CLI_TOKEN": "sk-live-test-secret-do-not-ship"},
                 "message": "error: auth failed for sk-live-test-secret-do-not-ship"
             },
-            "config": {"flags": ["--verbose"]}
+            "config": {"flags": ["--verbose"], "headers": {"Authorization": {"value": "header-secret-sentinel"}}}
         });
         let redacted = BlackboxServer::redact_config_credentials(&input);
         assert_eq!(redacted["runtime"]["env"]["PATH"], "<redacted>");
         assert_eq!(redacted["runtime"]["env"]["SECRET_KEY"], "<redacted>");
         assert_eq!(redacted["debug"]["env"]["CLI_TOKEN"], "<redacted>");
         let wire = redacted.to_string();
+        assert!(!wire.contains("nested-secret-sentinel"));
+        assert!(!wire.contains("header-secret-sentinel"));
+        assert_eq!(redacted["runtime"]["env"]["NESTED"], "<redacted>");
         // env VALUES are credential carriers; env KEYS stay as identity, and
         // free-text fields are not blindly treated as credentials.
         assert!(wire.contains("SECRET_KEY"));
@@ -3276,14 +3280,33 @@ mod tests {
         assert_ne!(first.is_error, Some(true));
         let text = extract_text(&first);
         assert!(!text.contains("sk-live-test-secret-do-not-ship"), "{text}");
-        assert!(text.contains("<redacted>"), "{text}");
+        // Redacted fields may occur on later body pages.
+        let mut recovered = String::new();
+        let mut continuation = None;
+        loop {
+            let page = server.bro_agent_describe(Parameters(AgentDescribeParams {
+                agent: "big-inline".into(),
+                detail_plane: Some("brofile".into()),
+                cursor: continuation,
+                body_limit: Some(512),
+            }));
+            assert_ne!(page.is_error, Some(true));
+            let value: serde_json::Value = serde_json::from_str(&extract_text(&page)).unwrap();
+            recovered.push_str(value["body"]["text"].as_str().unwrap());
+            continuation = value["body"]["next_cursor"].as_str().map(str::to_owned);
+            if continuation.is_none() {
+                break;
+            }
+        }
+        assert!(recovered.contains("<redacted>"));
+        assert!(!recovered.contains("sk-live-test-secret-do-not-ship"));
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["plane"], "brofile");
         assert!(body["body"]["next_cursor"].is_string());
         let next_cursor = body["body"]["next_cursor"].as_str().unwrap().to_string();
         assert!(!next_cursor.is_empty());
 
-        // Stale cursor: change the stored manifest, then reuse the old cursor.
+        // A different version must reject the cursor even with identical body bytes.
         server
             .state
             .artifacts
@@ -3295,11 +3318,7 @@ mod tests {
                     "kind": "agent",
                     "name": "big-inline",
                     "version": 2,
-                    "manifest": {
-                        "description": "changed".to_string(),
-                        "when_to_use": ["changed"],
-                        "brofile_inline": {"provider": "claude"},
-                    },
+                    "manifest": manifest,
                 }),
                 None,
                 None,

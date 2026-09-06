@@ -43,7 +43,7 @@ fn default_true() -> bool {
 impl BlackboxServer {
     #[tool(
         name = "bbox_storage_migrate_legacy_edges",
-        description = "Dry-run or apply daemon-local legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Project selectors (project_id, operator alias, registered path) resolve through one authority in dry-run and apply; unknown selectors fail both modes. Dry-run plans are paged (limit default 20, max 100; follow next_offset). Drops derived only when managed replacement exists; quarantines malformed lines."
+        description = "Dry-run or apply daemon-local legacy edge sidecar migration into lifecycle-owned explicit/observed lanes. Selectors (project_id, operator alias, registered path) resolve through one authority in both modes; unknown selectors fail both. Dry-run plans are paged."
     )]
     pub(crate) async fn bbox_storage_migrate_legacy_edges(
         &self,
@@ -209,7 +209,7 @@ mod tests {
         let registered = server.state.corpus_registered_project_ids();
         assert!(registered.contains(&record.project_id));
 
-        let edges = root.join("edges");
+        let edges = storage_health::find_edges_dir(&server.state.store_dir, None);
         std::fs::create_dir_all(edges.join("derived").join("project")).unwrap();
         std::fs::write(
             edges.join(format!("{}.jsonl", record.project_id)),
@@ -283,7 +283,7 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let server = test_server(&root);
         let registry = server.state.project_authority.bridge_registry().unwrap();
-        let edges = root.join("edges");
+        let edges = storage_health::find_edges_dir(&server.state.store_dir, None);
         std::fs::create_dir_all(&edges).unwrap();
         let mut ids = Vec::new();
         for name in ["alpha", "beta", "gamma"] {

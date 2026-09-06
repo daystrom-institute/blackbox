@@ -4483,10 +4483,11 @@ impl Knowledge {
                 "changed_behavior": "A changed queue invalidates cursor; restart with action=\"list\" and no cursor.",
             },
         });
-        if end < total {
-            envelope["next_cursor"] = serde_json::json!(format!("{revision}:{end}"));
+        envelope = bbox_corpus_core::response_page::bound_page(envelope, "rows")?;
+        if let Some(next) = envelope["next_offset"].as_u64() {
+            envelope["next_cursor"] = serde_json::json!(format!("{revision}:{next}"));
         }
-        Ok(serde_json::to_string_pretty(&envelope)?)
+        Ok(serde_json::to_string(&envelope)?)
     }
 
     fn review_record_response(
@@ -6470,7 +6471,7 @@ mod tests {
             .to_string();
         let mut cursor = None;
         let mut reconstructed = String::new();
-        for _ in 0..8 {
+        for _ in 0..200 {
             let page = kb
                 .review(&ReviewParams {
                     action: Some("get".into()),

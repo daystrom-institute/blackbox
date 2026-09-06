@@ -600,6 +600,9 @@ fn apply_tool_accepts_stringified_entity() {
             mode: Some(ApplyMode::First),
         })
         .unwrap();
-    assert!(report.contains("\"match\": true"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report).unwrap()["match"],
+        true
+    );
     assert!(report.contains("breaking_api_no_migration"));
 }

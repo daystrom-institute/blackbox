@@ -2452,8 +2452,8 @@ pdf_figure = "voyage_visual"
         assert_eq!(value["count"], 2);
         assert_eq!(value["offset"], 1);
         assert_eq!(value["next_offset"], 3);
-        assert_eq!(value["partitions"][0]["route"], "orphan-0-1024-deadbeef");
-        assert_eq!(value["partitions"][1]["route"], "orphan-1-1024-deadbeef");
+        assert_eq!(value["partitions"][0]["route"], "orphan-1-1024-deadbeef");
+        assert_eq!(value["partitions"][1]["route"], "orphan-2-1024-deadbeef");
         assert!(
             value["continuation"]
                 .as_str()

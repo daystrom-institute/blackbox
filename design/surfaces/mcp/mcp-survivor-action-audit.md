@@ -703,3 +703,22 @@ Source-only mutation, large-input and confidentiality cases are not upgraded to
 verified by the existence of past global green gates. Runtime fixes should be
 small changes justified by these caller-facing findings, followed by focused
 fixture/served-contract validation. The audit thread remains active.
+
+
+## Integration review evidence (in progress)
+
+The operator-authorized caller-contract corrections supersede the old byte-for-byte
+knowledge presentation freeze for three bridge fixture rows: all_knowledge,
+own_knowledge, and published_knowledge. Entry selection and provenance stay the
+same. Memory signposts now describe bounded exact reads; visibility diagnostics
+move from an unbounded repeated text list into the structured diagnostic projection
+with explicit exact recovery. The reviewed fixture update covers only those three
+rows. It does not authorize changing registry authority or hiding tombstones.
+
+The first complete integration gate at 9c82824b compiled and ran 6,667 tests:
+6,629 passed, 38 failed, 24 were skipped under the mid-cycle profile. This is
+failure evidence, not acceptance. Corrections include missing packet pagination
+metadata, knowledge map insertion, complete review envelope bounds, fixture
+continuations, and source/documentation chooser parity. Protocol replay and native
+observation regressions passed earlier at 8c01614d. No deployed proof is claimed
+for these integration changes.

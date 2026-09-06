@@ -672,38 +672,47 @@ fn all_mismatch_row(mismatch: &AllModeMismatch, detail: bool) -> serde_json::Val
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct EventCursor {
     offset: usize,
     total: usize,
+    revision: String,
 }
 
-fn encode_event_cursor(offset: usize, total: usize) -> String {
-    format!("v1:{offset}:{total}")
+fn event_revision(params: &EventsParams, events: &[PacketEvent], path: &Path) -> Result<String> {
+    let selection = serde_json::json!({
+        "store": path,
+        "op": params.op.as_ref().map(PacketEventOp::as_str),
+        "packet_id": params.packet_id.as_deref().map(normalize_id),
+        "outcome": params.outcome.as_ref().map(PacketEventOutcome::as_str),
+        "since": params.since,
+        "detail": params.detail,
+        "events": events,
+    });
+    Ok(bbox_corpus_core::project_catalog_snapshot::sha256_hex(
+        &serde_json::to_vec(&selection)?,
+    ))
+}
+
+fn encode_event_cursor(offset: usize, total: usize, revision: &str) -> String {
+    format!("v2:{offset}:{total}:{revision}")
 }
 
 fn parse_event_cursor(raw: &str) -> Result<EventCursor> {
-    let (version, rest) = raw
-        .split_once(':')
-        .context("expected v1:<offset>:<total>")?;
-    if version != "v1" {
-        anyhow::bail!(
-            "unsupported cursor version {version:?}; use next_cursor from the first page"
-        );
+    let parts: Vec<_> = raw.split(':').collect();
+    if parts.len() != 4 || parts[0] != "v2" {
+        anyhow::bail!("invalid cursor; use next_cursor from the first page");
     }
-    let (offset, total) = rest
-        .split_once(':')
-        .context("expected v1:<offset>:<total>")?;
-    let offset = offset
-        .parse::<usize>()
-        .context("offset must be a non-negative integer")?;
-    let total = total
-        .parse::<usize>()
-        .context("total must be a non-negative integer")?;
+    let offset = parts[1].parse::<usize>().context("invalid cursor offset")?;
+    let total = parts[2].parse::<usize>().context("invalid cursor total")?;
     if offset > total {
-        anyhow::bail!("cursor offset {offset} exceeds its snapshot total {total}");
+        anyhow::bail!("cursor offset exceeds its snapshot total");
     }
-    Ok(EventCursor { offset, total })
+    Ok(EventCursor {
+        offset,
+        total,
+        revision: parts[3].into(),
+    })
 }
 
 fn event_page_row(event: &PacketEvent, detail: bool) -> serde_json::Value {
@@ -846,15 +855,15 @@ impl Packets {
     /// Query a bounded, ordered page of the live event log.
     ///
     /// Offsets point into the current newest-first view. New appends do not
-    /// move older offsets, while removals or rewrites can; a cursor from a
-    /// smaller matching view is therefore rejected instead of masquerading as
-    /// an empty terminal page; same-size rewrites remain cursor-unsafe.
+    /// move older offsets. Continuations bind the selection and previously
+    /// observed events, rejecting removals and rewrites before returning rows.
     pub fn events_page(&self, params: &EventsParams) -> Result<serde_json::Value> {
-        if let Some(since) = &params.since
-            && chrono::DateTime::parse_from_rfc3339(since).is_err()
-        {
-            anyhow::bail!("'since' must be an RFC 3339 timestamp, got {since:?}");
-        }
+        let since = params
+            .since
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+            .transpose()
+            .context("'since' must be an RFC 3339 timestamp")?;
         let cursor = params
             .cursor
             .as_deref()
@@ -894,16 +903,21 @@ impl Packets {
             if outcome.is_some_and(|wanted| event.outcome != wanted) {
                 continue;
             }
-            if let Some(since) = &params.since
-                && event.timestamp.as_str() < since.as_str()
-            {
-                continue;
+            if let Some(since) = since {
+                match chrono::DateTime::parse_from_rfc3339(&event.timestamp) {
+                    Ok(timestamp) if timestamp >= since => {}
+                    Ok(_) => continue,
+                    Err(_) => {
+                        malformed += 1;
+                        continue;
+                    }
+                }
             }
             events.push(event);
             total += 1;
         }
 
-        if let Some(cursor) = cursor
+        if let Some(cursor) = cursor.as_ref()
             && (cursor.total > total || cursor.offset > total)
         {
             anyhow::bail!(
@@ -912,10 +926,19 @@ impl Packets {
                 cursor.offset
             );
         }
-        let requested_offset = cursor.map(|cursor| cursor.offset).unwrap_or(0);
+        let requested_offset = cursor.as_ref().map(|cursor| cursor.offset).unwrap_or(0);
         let appended = cursor
+            .as_ref()
             .map(|cursor| total.saturating_sub(cursor.total))
             .unwrap_or_default();
+        if let Some(cursor) = cursor.as_ref()
+            && cursor.revision != event_revision(params, &events[appended..], &path)?
+        {
+            anyhow::bail!(
+                "error.stale_event_cursor: selection or prior events changed; restart from the first page"
+            );
+        }
+        let revision = event_revision(params, &events, &path)?;
         let offset = requested_offset.saturating_add(appended);
         let rows: Vec<serde_json::Value> = events
             .iter()
@@ -931,7 +954,7 @@ impl Packets {
             "offset": offset,
             "limit": limit,
             "order": "timestamp_file_order_desc",
-            "continuation_semantics": "live_offset: appends keep older offsets stable; a smaller matching view rejects its cursor; other rewrites are not cursor-safe",
+            "continuation_semantics": "append_stable: cursors bind filters and prior events; changed selection, removal or rewrite requires restart",
             "malformed_lines_omitted": malformed,
             "detail": params.detail,
             "detail_hint": "Set detail=true for complete event details; packet:<id> body pages remain the exact packet reader.",
@@ -939,7 +962,11 @@ impl Packets {
         page = bbox_corpus_core::response_page::bound_page(page, "events")?;
         let bounded_next_offset = page["next_offset"].as_u64().unwrap_or(next_offset as u64);
         page["next_cursor"] = if bounded_next_offset < total as u64 {
-            serde_json::Value::String(encode_event_cursor(bounded_next_offset as usize, total))
+            serde_json::Value::String(encode_event_cursor(
+                bounded_next_offset as usize,
+                total,
+                &revision,
+            ))
         } else {
             serde_json::Value::Null
         };
@@ -1686,6 +1713,8 @@ impl Packets {
                     "next_finding_offset": (next_offset < total).then_some(next_offset),
                     "observation_event": "written",
                 });
+                page["offset"] = serde_json::json!(finding_offset);
+                page["total"] = serde_json::json!(total);
                 page = bbox_corpus_core::response_page::bound_page(page, "findings")?;
                 let bounded_next_offset =
                     page["next_offset"].as_u64().unwrap_or(next_offset as u64);
@@ -1781,7 +1810,10 @@ impl Packets {
                     "next_mismatch_offset": (next_offset < mismatch_total).then_some(next_offset),
                     "observation_event": "written",
                 });
+                page["offset"] = serde_json::json!(mismatch_offset);
+                page["total"] = serde_json::json!(mismatch_total);
                 page = bbox_corpus_core::response_page::bound_page(page, "mismatches")?;
+                page["total"] = serde_json::json!(report.total);
                 let bounded_next_offset =
                     page["next_offset"].as_u64().unwrap_or(next_offset as u64);
                 page["next_mismatch_offset"] = if bounded_next_offset < mismatch_total as u64 {
@@ -1841,7 +1873,10 @@ impl Packets {
                     "next_mismatch_offset": (next_offset < mismatch_total).then_some(next_offset),
                     "observation_event": "written",
                 });
+                page["offset"] = serde_json::json!(mismatch_offset);
+                page["total"] = serde_json::json!(mismatch_total);
                 page = bbox_corpus_core::response_page::bound_page(page, "mismatches")?;
+                page["total"] = serde_json::json!(report.total);
                 let bounded_next_offset =
                     page["next_offset"].as_u64().unwrap_or(next_offset as u64);
                 page["next_mismatch_offset"] = if bounded_next_offset < mismatch_total as u64 {

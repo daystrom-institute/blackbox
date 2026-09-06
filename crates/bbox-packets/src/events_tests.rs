@@ -395,10 +395,45 @@ fn large_event_pages_remain_bounded_and_recover_the_tail() {
         assert!(count > 0);
         let sequence = tail["events"][0]["details"]["sequence"].as_u64().unwrap();
         assert!(sequence < newest_remaining);
-        newest_remaining = sequence;
+        newest_remaining =
+            tail["events"].as_array().unwrap().last().unwrap()["details"]["sequence"]
+                .as_u64()
+                .unwrap();
         first_count += count;
         cursor = tail["next_cursor"].as_str().map(str::to_owned);
     }
     assert_eq!(first_count, 501);
     assert_eq!(newest_remaining, 0);
+}
+
+#[test]
+fn event_cursors_reject_filter_changes_and_same_size_rewrites() {
+    let (directory, packets) = tmp_packets();
+    packets.log_gap("gap A", None, None, None, None).unwrap();
+    packets.log_gap("gap B", None, None, None, None).unwrap();
+    let params: EventsParams = serde_json::from_value(json!({"op":"gap", "limit":1})).unwrap();
+    let first = packets.events_page(&params).unwrap();
+    for extra in [json!({"outcome":"logged"}), json!({"detail":true})] {
+        let mut next = json!({"op":"gap", "limit":1, "cursor":first["next_cursor"]});
+        next.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let error = packets
+            .events_page(&serde_json::from_value(next).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("stale_event_cursor"));
+    }
+    let event_log = directory.path().join("events.jsonl");
+    let raw = std::fs::read_to_string(&event_log).unwrap();
+    std::fs::write(&event_log, raw.replace("gap A", "gap Z")).unwrap();
+    let next =
+        serde_json::from_value(json!({"op":"gap", "limit":1, "cursor":first["next_cursor"]}))
+            .unwrap();
+    assert!(
+        packets
+            .events_page(&next)
+            .unwrap_err()
+            .to_string()
+            .contains("stale_event_cursor")
+    );
 }

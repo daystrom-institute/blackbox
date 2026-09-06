@@ -149,7 +149,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_apply",
-        description = "Evaluate a packet against one entity deterministically, without an LLM. mode=\"first\" returns the first matching rule; mode=\"all\" returns a bounded finding page plus an aggregate verdict. Continue finding pages with next_finding_offset."
+        description = "Evaluate a packet against one entity deterministically, without an LLM. mode=\"first\" returns the first matching rule; mode=\"all\" returns one bounded finding page plus an aggregate verdict. Continue finding pages with next_finding_offset."
     )]
     pub(crate) async fn bbox_apply(
         &self,
@@ -171,7 +171,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_audit",
-        description = "Run a packet against a mode-specific {entity, expectation}[] dataset and report fidelity with bounded mismatch pages. Fidelity measures agreement with the supplied dataset, not universal classifier correctness; continue mismatches with next_mismatch_offset."
+        description = "Run a packet against a mode-specific {entity, expectation}[] dataset and report fidelity plus bounded mismatch pages. Fidelity measures agreement with the supplied dataset, not universal classifier correctness. Continue mismatches with next_mismatch_offset."
     )]
     pub(crate) async fn bbox_audit(
         &self,
@@ -210,7 +210,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_packet_events",
-        description = "Query bounded pages of the live packet operation log. Returns newest-first rows with total, explicit ordering, next_cursor, and live-view continuation semantics. Filter by closed op/outcome enums, packet_id, or RFC 3339 since; continue older pages with next_cursor."
+        description = "Query bounded pages of the live packet operation log. Returns newest-first rows with total, explicit ordering, next_cursor, and live-view continuation semantics. Filter by closed op/outcome enums, packet_id, or RFC 3339 since."
     )]
     pub(crate) async fn bbox_packet_events(
         &self,

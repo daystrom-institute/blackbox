@@ -401,7 +401,10 @@ fn apply_tool_and_audit_tool() {
         mode: None,
     };
     let out = store.apply_tool(&apply_params).unwrap();
-    assert!(out.contains("\"consequent\": \"DENY\""));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["consequent"],
+        "DENY"
+    );
     assert!(out.contains("anom_reader_get_team"));
 
     // audit

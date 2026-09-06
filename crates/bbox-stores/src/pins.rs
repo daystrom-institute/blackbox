@@ -460,7 +460,7 @@ impl Pins {
             .collect();
         let next_offset = offset.saturating_add(pins.len());
         let mut page = serde_json::json!({
-            "pins": pins, "total": total, "offset": offset, "limit": limit,
+            "count": pins.len(), "pins": pins, "total": total, "offset": offset, "limit": limit,
             "next_offset": (next_offset < total).then_some(next_offset),
             "order": "scope_priority_asc,updated_at_desc,id_asc",
             "pagination": "live_offset: pin writes, updates, and expiries can shift rows between pages; re-query from offset 0 after mutating pins",

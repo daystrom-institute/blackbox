@@ -4690,6 +4690,7 @@ mod tests {
         let first = server.bro_allocator_probe(Parameters(AllocatorProbeParams {
             cursor: None,
             body_limit: Some(64),
+            credential_status: None,
             ..update_probe_params()
         }));
         assert_ne!(first.is_error, Some(true));
@@ -4707,6 +4708,7 @@ mod tests {
         let stale = server.bro_allocator_probe(Parameters(AllocatorProbeParams {
             cursor: Some(cursor),
             body_limit: Some(64),
+            credential_status: None,
             ..update_probe_params()
         }));
         assert_eq!(stale.is_error, Some(true));
@@ -4715,6 +4717,7 @@ mod tests {
 
         let missing = server.bro_allocator_probe(Parameters(AllocatorProbeParams {
             provider: "glm".into(),
+            credential_status: None,
             ..update_probe_params()
         }));
         assert_eq!(missing.is_error, Some(true));

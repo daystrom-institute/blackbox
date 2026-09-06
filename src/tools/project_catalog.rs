@@ -5495,6 +5495,7 @@ mod tests {
 
         fixture.detach(CatalogFixture::attachment().as_str());
         fixture.migrate_project_scope("p_status_stale", &CatalogFixture::scope("sub/moved"));
+        let server = fixture.server();
         let result = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_status_stale".into(),
@@ -5562,6 +5563,7 @@ mod tests {
             "ffffffffffffffffffffffffffffffff",
             true,
         );
+        let server = fixture.server();
         let result = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_status_detail".into(),

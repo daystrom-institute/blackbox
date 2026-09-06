@@ -329,7 +329,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_absorb",
-        description = "Compatibility no-op for the old rendered-file import path."
+        description = "Compatibility no-op retained for callable-name compatibility; it imports no rendered-file content."
     )]
     pub(crate) async fn bbox_absorb(
         &self,
@@ -350,7 +350,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_review",
-        description = "Approve or reject entries awaiting review, or page bounded review reads."
+        description = "Approve or reject entries awaiting review, or page bounded review-queue records."
     )]
     pub(crate) async fn bbox_review(
         &self,
@@ -405,7 +405,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_bootstrap",
-        description = "Retired compatibility operation. Use bbox_hybrid_search for indexed instruction-file discovery and bbox_inspect_entity to expand refs; this operation does not import knowledge or read caller files."
+        description = "Retired compatibility refusal retained for callable-name compatibility. Use bbox_hybrid_search for indexed instruction-file discovery and bbox_inspect_entity to expand refs; this operation imports no knowledge and reads no caller files."
     )]
     pub(crate) async fn bbox_bootstrap(
         &self,
@@ -872,7 +872,8 @@ mod tests {
 
         let published_server = BlackboxServer::new(fixture.state.clone());
         let published = published_server.review_session_knowledge(&list).unwrap();
-        assert!(published.contains("[visible]"), "{published}");
+        let published_json: serde_json::Value = serde_json::from_str(&published).unwrap();
+        assert_eq!(published_json["total"], 1);
         assert!(published.contains("PUBLISHED_REVIEW"), "{published}");
         assert!(!published.contains("OWN_REVIEW"), "{published}");
         assert!(!published.contains("PEER_REVIEW"), "{published}");

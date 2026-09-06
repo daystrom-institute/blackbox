@@ -80,7 +80,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_thread",
-        description = "Open / continue / resolve / promote / rename / link a work thread. action=get returns a bounded summary (counts + previews) by default; pass detail=notes|sessions|edges for paged history or detail=note|handoff for exact content-bound body reads."
+        description = "Open / continue / resolve / promote / rename / link a work thread. action=get returns a bounded summary (counts + 200-char previews); detail=notes|sessions|edges pages history, detail=note|handoff reads exact bodies through content-bound cursors."
     )]
     pub(crate) async fn bbox_thread(
         &self,
@@ -163,11 +163,11 @@ impl BlackboxServer {
             // §9.2); the threads store stays registry-free.
             let resolve_started = std::time::Instant::now();
             let mut p = p.inner.clone();
-            stamp_host_owned_thread_project(self, &mut p);
             let resolved = p
                 .project
                 .as_deref()
                 .and_then(|proj| self.resolve_worktree_scope_and_dir(proj));
+            stamp_host_owned_thread_project(self, &mut p);
             slow_phase("resolve_project", resolve_started.elapsed());
             let lock_started = std::time::Instant::now();
             let mut threads = self.state.threads.write();
@@ -219,7 +219,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_thread_list",
-        description = "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for full context."
+        description = "List thread summary pages (default 20, maximum 100), ordered by last activity then id. Continue with next_offset; use bbox_thread(action=get,id=...) for a bounded summary, then detail pages."
     )]
     pub(crate) fn bbox_thread_list(
         &self,
@@ -547,7 +547,7 @@ mod tests {
             "{thread}"
         );
         assert_eq!(thread["latest_note_truncated"], true, "{thread}");
-        assert_eq!(thread["handoff_truncated"], true, "{thread}");
+        assert_eq!(thread["handoff_doc_truncated"], true, "{thread}");
         assert!(
             serde_json::to_vec(thread).unwrap().len() <= 4096,
             "summary must stay bounded: {thread}"
