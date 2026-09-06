@@ -675,6 +675,65 @@ impl BlackboxServer {
         self.state.project_authority.catalog_store().cloned()
     }
 
+    pub(crate) fn require_local_catalog_admin(
+        &self,
+        project_id: &str,
+        operation: &str,
+    ) -> anyhow::Result<()> {
+        if self
+            .state
+            .knowledge_transport_cutover
+            .covers_project_str(project_id)
+            || self
+                .state
+                .code_source_locality_cutover
+                .transport_governed(project_id)
+        {
+            anyhow::bail!(
+                "error.project_admin_locality_required: {operation} requires checkout-owner evidence that this MCP operation cannot obtain for a transport-owned project. No catalog or checkout changes were made. Use bbox_project_catalog_get to inspect identity and attachments. Collector onboarding supports source enrollment; it does not implement relocation, attached scope migration, or central knowledge ejection."
+            );
+        }
+        Ok(())
+    }
+
+    /// Prove existing checkout authority before any raw-path admin probes.
+    /// Keep these leases through the operation and revalidate before commit.
+    fn catalog_admin_leases(
+        &self,
+        store: &ProjectCatalogStore,
+        project_id: &ProjectId,
+        expected_epoch: u64,
+    ) -> anyhow::Result<Vec<bbox_indexing::checkout_access::ValidatedCheckoutLease>> {
+        let snapshot = store
+            .snapshot()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        if snapshot.epoch() != expected_epoch {
+            anyhow::bail!(
+                "error.project_catalog_epoch_conflict: expected catalog epoch {expected_epoch}, current epoch {}; read bbox_project_catalog_get and retry with its epoch",
+                snapshot.epoch()
+            );
+        }
+        let mut leases = Vec::new();
+        for row in
+            snapshot.attachments().attachments.values().filter(|row| {
+                &row.project_id == project_id && row.status == AttachmentStatus::Attached
+            })
+        {
+            let lease = self.state.checkout_access.acquire(CheckoutAccessRequest {
+                project_id: project_id.to_string(), attachment: CheckoutAttachmentSelector::AttachmentId(row.attachment_id.to_string()),
+                expected_scope: row.validated_scope.clone(), kind: CheckoutAccessKind::PublisherConfigTreeRead,
+                intent: CheckoutAccessIntent::Read, source_lane: CheckoutAccessSourceLane::NativeAttachment,
+            }).map_err(|error| anyhow::anyhow!("error.project_admin_locality_required: checkout authority refused ({}) before admin probes. No changes were made. This operation needs an administrator with access to the authoritative catalog and the attachment's checkout; ordinary source onboarding does not implement this transition.", error.code.as_str()))?;
+            leases.push(lease);
+        }
+        if leases.is_empty() {
+            anyhow::bail!(
+                "error.project_admin_locality_required: this project has no active local checkout authority. No changes were made. Inspect bbox_project_catalog_get; source enrollment uses the checkout-owner collector, while attaching or migrating catalog attachments requires a separate administrator workflow."
+            );
+        }
+        Ok(leases)
+    }
+
     fn catalog_paths(&self) -> (PathBuf, PathBuf) {
         let config = self.state.config.read();
         (
@@ -773,7 +832,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_attach",
-        description = "Attach a local checkout to an existing catalog project. The daemon probes the path off-lock (canonical checkout top, checkout identity, kind: base, linked worktree, or managed clone, committed scope at HEAD, observed capabilities) and the catalog transaction revalidates identity and uniqueness. A published project accepts only a checkout whose committed config proves the same scope exactly; a mismatch returns the scope-migration or promotion refusal instead of attaching. Well-formed, non-colliding aliases declared by the committed config are recorded as pending nominations, never accepted automatically. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Local administrator operation: add an already initialized checkout to a project with existing daemon checkout authority. Transport-owned or remote-only projects return error.project_admin_locality_required before probes; source enrollment uses the checkout-host collector. The daemon never mints checkout identity here. The daemon probes the path off-lock (canonical checkout top, checkout identity, kind: base, linked worktree, or managed clone, committed scope at HEAD, observed capabilities) and the catalog transaction revalidates identity and uniqueness. A published project accepts only a checkout whose committed config proves the same scope exactly; a mismatch returns the scope-migration or promotion refusal instead of attaching. Well-formed, non-colliding aliases declared by the committed config are recorded as pending nominations, never accepted automatically. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_attach(
         &self,
@@ -782,11 +841,15 @@ impl BlackboxServer {
         let Some(store) = self.catalog_store() else {
             return Self::err_text(&catalog_inactive());
         };
+        let server = self.clone();
         Self::run_blocking("bbox_project_attach", move || {
             let audit_reason = bounded_audit_reason(&p.audit_reason)?;
-            let probe = probe_checkout(&p.path)?;
             let project_id = resolve_project_selection(&store, &p.project)?;
-            let checkout_id = bbox_corpus_core::identity::ensure_checkout_id(&probe.checkout_dir)?;
+            server.require_local_catalog_admin(project_id.as_str(), "attach")?;
+            let leases = server.catalog_admin_leases(&store, &project_id, p.expected_catalog_epoch)?;
+            let probe = probe_checkout(&p.path)?;
+            let checkout_id = bbox_corpus_core::identity::read_checkout_id(&probe.checkout_dir.join(".bbox/local/checkout-id"))?
+                .ok_or_else(|| anyhow::anyhow!("error.project_admin_locality_required: attach requires an existing checkout-owner identity marker and will not mint one on the daemon. Initialize and enroll the checkout using the checkout-host collector; no changes were made."))?;
             let attach_probe = project_catalog_admin::AttachProbe {
                 checkout_id,
                 checkout_dir: probe.checkout_dir.to_string_lossy().into_owned(),
@@ -802,6 +865,7 @@ impl BlackboxServer {
                 capabilities: probe.capabilities,
                 attached_at: now_rfc3339(),
             };
+            for lease in &leases { server.state.checkout_access.revalidate(lease).map_err(anyhow::Error::new)?; }
             let receipt = project_catalog_admin::attach_checkout(
                 &store,
                 p.expected_catalog_epoch,
@@ -959,7 +1023,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_promote",
-        description = "Promote a legacy-local catalog project to the published scope its checkouts now prove. Requires the exact project_id, the designated attachment, and the proposed repo_id and bbox_root_relpath. The daemon probes every active attachment of the project at HEAD; each one must prove the exact proposed scope or the promotion refuses with per-attachment diagnostics, and the designated attachment cannot overrule siblings. An owned scope refuses and points at the offline compatibility workflow rather than merging. One pair transaction flips the scope, writes the attachment-proved promotion record with its proof, and performs the repo-history authority transition. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Promote a legacy-local catalog project to the published scope its checkouts now prove. Requires verified daemon checkout authority for every active attachment; transport-owned projects return error.project_admin_locality_required before probes. An administrator with the authoritative catalog and checkouts can use blackbox project-catalog promote; it does not call the remote daemon. Requires the exact project_id, the designated attachment, and the proposed repo_id and bbox_root_relpath. The daemon probes every active attachment of the project at HEAD; each one must prove the exact proposed scope or the promotion refuses with per-attachment diagnostics, and the designated attachment cannot overrule siblings. An owned scope refuses and points at the offline compatibility workflow rather than merging. One pair transaction flips the scope, writes the attachment-proved promotion record with its proof, and performs the repo-history authority transition. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_promote(
         &self,
@@ -969,9 +1033,13 @@ impl BlackboxServer {
             return Self::err_text(&catalog_inactive());
         };
         let (projects_path, state_dir) = self.catalog_paths();
+        let server = self.clone();
         Self::run_blocking("bbox_project_promote", move || {
             let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let project_id = parse_project_id(&p.project_id)?;
+            server.require_local_catalog_admin(project_id.as_str(), "promote")?;
+            let leases =
+                server.catalog_admin_leases(&store, &project_id, p.expected_catalog_epoch)?;
             let attachment_id = parse_attachment_id(&p.attachment_id)?;
             let proposed_scope =
                 PublishedScope::try_new(p.proposed_repo_id.clone(), p.proposed_relpath.clone())
@@ -987,6 +1055,13 @@ impl BlackboxServer {
                 operator_reason: Some(audit_reason),
                 proved_at: now_rfc3339(),
             };
+            for lease in &leases {
+                server
+                    .state
+                    .checkout_access
+                    .revalidate(lease)
+                    .map_err(anyhow::Error::new)?;
+            }
             let receipt = project_catalog_admin::promote_project(
                 &store,
                 p.expected_catalog_epoch,
@@ -1016,7 +1091,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_scope_migrate",
-        description = "Attachment-proved scope migration for a published catalog project: kind=relpath-move for a monorepo relocation, kind=repo-authority-change for a recorded-authority change. The daemon probes every active attachment at HEAD (and, for a relpath move, the relocated directory, which must exist) and the pair transaction rewrites the catalog scope, relocates the attachments, appends host-local path bindings, and writes the migration record with its proof. A repo-authority change requires acknowledge_repo_authority_change, which agents pass through from operator input and never default or infer. dry_run validates the complete mutation and commits nothing. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Local administrator operation requiring verified daemon checkout authority for every active attachment. Transport-owned projects return error.project_admin_locality_required before probes; no remote attached-migration lane is implemented. Attachment-proved scope migration for a published catalog project: kind=relpath-move for a monorepo relocation, kind=repo-authority-change for a recorded-authority change. The daemon probes every active attachment at HEAD (and, for a relpath move, the relocated directory, which must exist) and the pair transaction rewrites the catalog scope, relocates the attachments, appends host-local path bindings, and writes the migration record with its proof. A repo-authority change requires acknowledge_repo_authority_change, which agents pass through from operator input and never default or infer. dry_run validates the complete mutation and commits nothing. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_scope_migrate(
         &self,
@@ -1026,9 +1101,13 @@ impl BlackboxServer {
             return Self::err_text(&catalog_inactive());
         };
         let (projects_path, state_dir) = self.catalog_paths();
+        let server = self.clone();
         Self::run_blocking("bbox_project_scope_migrate", move || {
             let audit_reason = bounded_audit_reason(&p.audit_reason)?;
             let project_id = parse_project_id(&p.project_id)?;
+            server.require_local_catalog_admin(project_id.as_str(), "scope_migrate")?;
+            let leases =
+                server.catalog_admin_leases(&store, &project_id, p.expected_catalog_epoch)?;
             let designated_attachment = parse_attachment_id(&p.attachment_id)?;
             let kind = match p.kind.as_str() {
                 "relpath-move" => ScopeMigrationKind::RelpathMove,
@@ -1063,6 +1142,13 @@ impl BlackboxServer {
                 operator_reason: Some(audit_reason),
                 migrated_at: now_rfc3339(),
             };
+            for lease in &leases {
+                server
+                    .state
+                    .checkout_access
+                    .revalidate(lease)
+                    .map_err(anyhow::Error::new)?;
+            }
             let receipt = project_catalog_admin::scope_migrate_attached(
                 &store,
                 p.expected_catalog_epoch,
@@ -2129,6 +2215,8 @@ impl BlackboxServer {
         let epoch = state.epoch();
         drop(state);
 
+        self.require_local_catalog_admin(row.project_id.as_str(), "rename")?;
+
         // Probe the NEW path. Sameness is the durable checkout-id marker,
         // read (never minted) at the moved location: path existence and
         // inode reuse never prove sameness.
@@ -2384,6 +2472,127 @@ mod tests {
         p.query = Some("Project 104".into());
         let filtered = project_catalog_list_page(&catalog, &attachments, 7, &p).unwrap();
         assert_eq!(filtered["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn transport_owned_admin_operations_refuse_before_checkout_probes_or_marker_writes() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let fixture = CatalogFixture::new();
+        let project = "proj_admin_locality";
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project(project, &scope);
+        let mut server = fixture.server();
+        cover_knowledge_transport_project(&mut server, project, scope.clone());
+        let store = server.catalog_store().unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let attach = server
+            .bbox_project_attach(Parameters(ProjectAttachParams {
+                project: project.into(),
+                path: root.to_string_lossy().into_owned(),
+                expected_catalog_epoch: epoch,
+                audit_reason: "fixture".into(),
+            }))
+            .await;
+        let promote = server
+            .bbox_project_promote(Parameters(ProjectPromoteParams {
+                project_id: project.into(),
+                attachment_id: "att_00000000000000000000000000000d01".into(),
+                proposed_repo_id: scope.repo_id().into(),
+                proposed_relpath: ".".into(),
+                expected_catalog_epoch: epoch,
+                audit_reason: "fixture".into(),
+            }))
+            .await;
+        let migrate = server
+            .bbox_project_scope_migrate(Parameters(ProjectScopeMigrateParams {
+                project_id: project.into(),
+                attachment_id: "att_00000000000000000000000000000d01".into(),
+                expected_old_repo_id: scope.repo_id().into(),
+                expected_old_relpath: ".".into(),
+                new_repo_id: scope.repo_id().into(),
+                new_relpath: "nested".into(),
+                kind: "relpath-move".into(),
+                acknowledge_repo_authority_change: false,
+                dry_run: true,
+                expected_catalog_epoch: epoch,
+                audit_reason: "fixture".into(),
+            }))
+            .await;
+        let eject = server
+            .bbox_project_eject(Parameters(crate::projects::ProjectEjectParams {
+                project: project.into(),
+                dry_run: None,
+            }))
+            .await;
+        for result in [attach, promote, migrate, eject] {
+            assert_eq!(result.is_error, Some(true));
+            assert!(
+                error_text(&result).contains("error.project_admin_locality_required"),
+                "{}",
+                error_text(&result)
+            );
+        }
+        assert_eq!(store.snapshot().unwrap().epoch(), epoch);
+        assert!(!root.join(".bbox").exists());
+    }
+
+    #[tokio::test]
+    async fn remote_only_attach_refuses_even_when_the_requested_path_exists_on_the_daemon() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let fixture = CatalogFixture::new();
+        let project = "proj_admin_remote";
+        fixture.add_published_project(project, &CatalogFixture::scope("."));
+        let server = fixture.server();
+        let store = server.catalog_store().unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let result = server
+            .bbox_project_attach(Parameters(ProjectAttachParams {
+                project: project.into(),
+                path: root.to_string_lossy().into_owned(),
+                expected_catalog_epoch: epoch,
+                audit_reason: "fixture".into(),
+            }))
+            .await;
+        assert!(error_text(&result).contains("error.project_admin_locality_required"));
+        assert_eq!(store.snapshot().unwrap().epoch(), epoch);
+        assert!(!root.join(".bbox").exists());
+    }
+
+    #[tokio::test]
+    async fn detach_and_default_attachment_do_not_require_a_mounted_checkout() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let fixture = CatalogFixture::new();
+        let project = "proj_admin_path_free";
+        let scope = CatalogFixture::scope(".");
+        let attachment = "att_00000000000000000000000000000d01";
+        fixture.add_published_project(project, &scope);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fixture.attach_checkout(project, &scope, &root.join("never-mounted"), attachment);
+        let server = fixture.server();
+        let store = server.catalog_store().unwrap();
+        let result = server
+            .bbox_project_default_attachment(Parameters(ProjectDefaultAttachmentParams {
+                project: project.into(),
+                attachment_id: Some(attachment.into()),
+                expected_catalog_epoch: store.snapshot().unwrap().epoch(),
+                audit_reason: "fixture".into(),
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        let result = server
+            .bbox_project_detach(Parameters(ProjectDetachParams {
+                attachment_id: attachment.into(),
+                expected_catalog_epoch: store.snapshot().unwrap().epoch(),
+                audit_reason: "fixture".into(),
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        assert!(!root.join("never-mounted").exists());
     }
 
     fn bridge_server(tmp: &tempfile::TempDir) -> BlackboxServer {

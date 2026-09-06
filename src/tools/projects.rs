@@ -92,6 +92,25 @@ fn mutation_refusal(
     }
 }
 
+fn rename_partial_failure(
+    response: &crate::projects::ProjectRenameResponse,
+    error: &anyhow::Error,
+    registry_durable: bool,
+    owner_store_migration_complete: bool,
+) -> String {
+    json!({
+        "code": "error.project_rename_partial",
+        "project_id": response.record.project_id,
+        "old_path": response.old_record.canonical_path,
+        "new_path": response.record.canonical_path,
+        "registry_updated": true, "registry_durable": registry_durable,
+        "moved_on_disk": response.moved_on_disk,
+        "owner_store_migration_complete": owner_store_migration_complete,
+        "diagnostic": format!("{error:#}"),
+        "next_step": "Inspect the failed subsystem and reconcile references using old_path and new_path. A plain retry against the renamed record does not recover references still keyed to old_path.",
+    }).to_string()
+}
+
 // The registration path invokes this helper only from its surrounding
 // `spawn_blocking` phase. Keeping the filesystem read here preserves the
 // prepare-then-publish boundary while making the blocking-pool contract explicit.
@@ -770,7 +789,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_rename",
-        description = "Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename)."
+        description = "Local administrator operation; transport-owned catalog projects refuse with error.project_admin_locality_required because no remote relocation lane is implemented. A bridge failure after registry admission reports error.project_rename_partial with completed effects and old/new recovery coordinates. Rename a registered bbox project root while preserving its project_id and migrating project-scoped bbox state. Accepts project (project_id, registered canonical_path, or absolute path), new_path (absolute directory path), optional move_on_disk (default false), and optional dry_run. Updates project registry, knowledge, threads, notes, pins, packets, Slack channel bindings, live teams, whiteboards, pollers, and crons, then reindexes project files. In catalog mode rename is attachment relocation: the moved checkout must carry the same checkout-id marker and resolve the same scope, the ledger records the historical path, owner-store rows are never rewritten, and move_on_disk is refused (move first, then rename)."
     )]
     pub(crate) async fn bbox_project_rename(
         &self,
@@ -826,11 +845,14 @@ impl BlackboxServer {
             if let Err(e) = self.state.persist_projects_durable().await {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
-                return Self::err_text(&format!("Error: {e:#}"));
+                return Self::err_text(&rename_partial_failure(&response, &e, false, false));
             }
         }
         // Phase 2: heavy fs migration + reindex on the blocking pool.
         let server = self.clone();
+        let admitted = response.clone();
+        let migrated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let migrated_in_task = migrated.clone();
         let result: anyhow::Result<String> = tokio::task::spawn_blocking(move || {
             let old_project = response.old_record.canonical_path.clone();
             let new_project = response.record.canonical_path.clone();
@@ -844,6 +866,7 @@ impl BlackboxServer {
                     &new_project,
                     &response.record,
                 )?;
+                migrated_in_task.store(true, std::sync::atomic::Ordering::Release);
                 // Re-point logical carriers without reloading because the
                 // in-memory mutations from migrate_rename are still live.
                 let inputs = crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(
@@ -913,7 +936,16 @@ impl BlackboxServer {
             Err(e) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 tracing::warn!(target: "blackbox::tool", tool = "bbox_project_rename", elapsed_ms = ms, error = %e, "err");
-                Self::err_text(&format!("Error: {e:#}"))
+                if admitted.dry_run {
+                    Self::err_text(&format!("Error: {e:#}"))
+                } else {
+                    Self::err_text(&rename_partial_failure(
+                        &admitted,
+                        &e,
+                        true,
+                        migrated.load(std::sync::atomic::Ordering::Acquire),
+                    ))
+                }
             }
         }
     }
@@ -1077,7 +1109,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_eject",
-        description = "Migrate a registered project's central-store knowledge entries into the repo's committed .bbox/knowledge/ (one file per entry), so the project's durable knowledge travels with the checkout. Accepts project (project_id, registered canonical_path, or absolute path) and optional dry_run. Entries are written without the absolute project path (location encodes scope), dropped from the central store, and a clean schema-epoch marker is written by this explicit operator action. dry_run=true reports the count without writing. Commit the resulting .bbox/ files to publish them."
+        description = "Local administrator migration; apply requires exact base-checkout mutation authority and refuses transport-owned projects with error.project_admin_locality_required. No remote ejection lane is implemented. Migrate a registered project's central-store knowledge entries into the repo's committed .bbox/knowledge/ (one file per entry), so the project's durable knowledge travels with the checkout. Accepts project (project_id, registered canonical_path, or absolute path) and optional dry_run. Entries are written without the absolute project path (location encodes scope), dropped from the central store, and a clean schema-epoch marker is written by this explicit operator action. dry_run=true reports the count without writing. Commit the resulting .bbox/ files to publish them."
     )]
     pub(crate) async fn bbox_project_eject(
         &self,
@@ -1092,6 +1124,9 @@ impl BlackboxServer {
             // resolver; the projection row supplies the record shape in
             // both modes.
             let resolved_id = server.validate_project_selection(&p.project)?;
+            if !p.dry_run.unwrap_or(false) {
+                server.require_local_catalog_admin(&resolved_id, "eject")?;
+            }
             // Records and their exact base-attachment targets from ONE
             // catalog epoch: the lease this operation takes must name the
             // same attachment the record and its carriers were derived from.
@@ -1111,7 +1146,7 @@ impl BlackboxServer {
                 None if server.state.project_authority.catalog_store().is_some() => {
                     anyhow::bail!(
                         "error.project_attachment_required: eject writes repository files and \
-                         project {resolved_id} has no active attachment"
+                         project {resolved_id} has no active attachment. No remote ejection lane is implemented: source onboarding does not migrate central knowledge. Preserve the central entries and have an administrator inspect the project with bbox_project_catalog_get"
                     )
                 }
                 None => anyhow::bail!("project not registered: {}", p.project),
@@ -1195,9 +1230,12 @@ impl BlackboxServer {
                 .is_git_repo
                 .then(|| config::ensure_recorded_repo_id(lease.project_root()))
                 .transpose()?;
-            let entries = server.state.kb.write().eject_project_to_repo(&dir)?;
-            let report = server.write_knowledge_schema_epoch_marker(Path::new(&dir))?;
-            server.state.kb_persister.flush_blocking()?;
+            let entries = server.state.kb.write().eject_project_to_repo(&dir)
+                .context("error.project_eject_partial: repository ownership or files may already have changed; preserve central entries and inspect the destination before retrying")?;
+            server.state.kb_persister.flush_blocking()
+                .context("error.project_eject_partial: repository entries were written but central-store durability is unconfirmed; the schema marker was not advanced")?;
+            let report = server.write_knowledge_schema_epoch_marker(Path::new(&dir))
+                .context("error.project_eject_partial: repository entries and central-store removal are durable, but the schema marker needs repair")?;
             drop(publication);
             server
                 .state
@@ -1613,6 +1651,71 @@ mod tests {
             response.projects[0].project_id,
             entity_ref::project_id_for_path(&project).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn bridge_rename_reports_admitted_registry_when_later_store_migration_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let old = root.join("old");
+        let new = root.join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let server = test_server(&directory);
+        let record = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(&old)
+            .unwrap();
+        server.state.persist_projects_durable().await.unwrap();
+        let boards = root.join("board-storage");
+        server
+            .state
+            .whiteboards
+            .set_storage_dir(boards.clone())
+            .unwrap();
+        server
+            .state
+            .whiteboards
+            .open(
+                "fixture-board",
+                "fixture",
+                old.to_str().unwrap(),
+                Some(&record.project_id),
+                None,
+                "fixture",
+            )
+            .unwrap();
+        std::fs::remove_dir_all(&boards).unwrap();
+        std::fs::write(&boards, b"not a directory").unwrap();
+        let result = server
+            .bbox_project_rename(Parameters(ProjectRenameParams {
+                project: record.project_id.clone(),
+                new_path: new.to_string_lossy().into_owned(),
+                move_on_disk: None,
+                dry_run: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let text = result.content[0].as_text().unwrap().text.clone();
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["code"], "error.project_rename_partial");
+        assert_eq!(body["registry_durable"], true);
+        assert_eq!(body["owner_store_migration_complete"], false);
+        assert_eq!(body["old_path"], old.to_str().unwrap());
+        let current = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .read()
+            .resolve(&record.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.canonical_path, new.to_str().unwrap());
     }
 
     #[tokio::test]
