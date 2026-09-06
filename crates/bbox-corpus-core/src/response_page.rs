@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 /// Leave headroom below the transport safeguard for the MCP envelope.
-pub const PAGE_BUDGET_BYTES: usize = 32 * 1024;
+pub const PAGE_BUDGET_BYTES: usize = 24 * 1024;
 
 /// Truncate a display field at a UTF-8 boundary and mark the omitted suffix.
 /// Stable ids used for exact reads must not be passed to this helper.

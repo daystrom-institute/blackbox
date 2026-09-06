@@ -2,13 +2,76 @@ use crate::artifacts::{
     ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
 use crate::server::BlackboxServer;
-use crate::server::routes::{deactivate_artifact, install_artifact_from_params};
+use crate::server::routes::{
+    deactivate_artifact, install_artifact_from_params, install_artifact_value,
+};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::schemars;
 use rmcp::{tool, tool_router};
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactInstallToolParams {
+    pub kind: crate::artifacts::ArtifactKind,
+    /// Explicit HTTP(S) JSON URL. Supply exactly one of source or artifact; filesystem paths are not accepted.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Inline artifact object, validated against the selected kind's existing schema (maximum 1 MiB).
+    #[serde(default)]
+    pub artifact: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub supersedes: Option<String>,
+}
+
+fn artifact_install_input(
+    p: ArtifactInstallToolParams,
+) -> anyhow::Result<(ArtifactInstallParams, Option<serde_json::Value>)> {
+    let (source, artifact) = match (p.source, p.artifact) {
+        (Some(source), None) => {
+            let url = reqwest::Url::parse(&source).ok().filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+                .ok_or_else(|| anyhow::anyhow!("source must be an explicit HTTP(S) URL; caller filesystem paths are not readable by this MCP server. Supply artifact with the inline JSON object instead"))?;
+            (url.to_string(), None)
+        }
+        (None, Some(artifact)) => {
+            let artifact = serde_json::Value::Object(artifact);
+            if serde_json::to_vec(&artifact)?.len() > 1024 * 1024 {
+                anyhow::bail!("inline artifact exceeds the 1 MiB input limit");
+            }
+            ("inline:mcp".to_owned(), Some(artifact))
+        }
+        _ => anyhow::bail!(
+            "Supply exactly one of source (HTTP(S) URL) or artifact (inline JSON object)"
+        ),
+    };
+    Ok((
+        ArtifactInstallParams {
+            kind: p.kind,
+            source,
+            name: p.name,
+            version: p.version,
+            supersedes: p.supersedes,
+        },
+        artifact,
+    ))
+}
+
+fn installed_artifact_response(meta: &crate::artifacts::ArtifactMetadata) -> serde_json::Value {
+    let mut response = serde_json::json!({"kind": meta.kind, "name": meta.name, "version": meta.version, "active": meta.active});
+    if !meta.install_warnings.is_empty() {
+        response["warnings"] = serde_json::json!(meta.install_warnings);
+    }
+    if let Some(replacement) = &meta.superseded_by {
+        response["superseded_by"] = serde_json::json!(replacement);
+    }
+    response
+}
 
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(crate) struct ArtifactCatalogListParams {
@@ -73,15 +136,36 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a workflow, packet, brofile, agent, atom, team, or cron artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
+        description = "Install a typed artifact from an inline artifact object or explicit HTTP(S) source URL. Supply exactly one; caller filesystem paths are rejected. The selected kind controls validation. Returns activation state and actionable warnings without source credentials or storage paths."
     )]
     pub(crate) async fn bbox_artifact_install(
         &self,
-        Parameters(p): Parameters<ArtifactInstallParams>,
+        Parameters(p): Parameters<ArtifactInstallToolParams>,
     ) -> CallToolResult {
-        match install_artifact_from_params(&self.state, p).await {
-            Ok(meta) => Self::ok_json(&serde_json::to_value(meta).unwrap_or_default()),
-            Err(e) => Self::err_text(&format!("artifact install failed: {e:#}")),
+        let (params, artifact) = match artifact_install_input(p) {
+            Ok(input) => input,
+            Err(error) => return Self::err_text(&error.to_string()),
+        };
+        let result = match artifact {
+            Some(value) => install_artifact_value(&self.state, params, value).await,
+            None => install_artifact_from_params(&self.state, params).await,
+        };
+        match result {
+            Ok(meta) => Self::ok_json(&installed_artifact_response(&meta)),
+            Err(error) => {
+                if let Some(network) = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                {
+                    return Self::err_text(&format!(
+                        "Artifact source request failed (HTTP status {:?}); verify the URL and server access. The source URL is withheld because it may contain credentials",
+                        network.status()
+                    ));
+                }
+                Self::err_text(&format!(
+                    "Artifact install failed: {error:#}. Activation may be partial; inspect the named artifact and runtime before retrying"
+                ))
+            }
         }
     }
 
@@ -238,6 +322,105 @@ mod tests {
         let summary = artifact_list_page(vec![entry], &p).unwrap();
         assert_eq!(summary["artifacts"][0]["description_truncated"], true);
         assert!(summary["next_offset"].is_null());
+    }
+
+    #[tokio::test]
+    async fn artifact_install_mcp_rejects_existing_caller_file_before_installing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let file = root.join("artifact.json");
+        std::fs::write(&file, r#"{"name":"unexpected-local","provider":"glm"}"#).unwrap();
+        let p: ArtifactInstallToolParams = serde_json::from_value(json!({
+            "kind": "brofile", "source": file,
+        }))
+        .unwrap();
+        let result = server.bbox_artifact_install(Parameters(p)).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("HTTP(S)")
+        );
+        assert!(
+            server
+                .state
+                .artifacts
+                .read()
+                .list(&ArtifactListParams {
+                    kind: None,
+                    name: None,
+                    include_superseded: true
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            orchestration::brofile::resolve_brofile(
+                "unexpected-local",
+                &server.state.store_dir,
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_install_mcp_validates_inline_kind_and_returns_compact_activation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let invalid: ArtifactInstallToolParams = serde_json::from_value(json!({
+            "kind": "brofile", "artifact": {"name": "missing-provider"}, "version": "1",
+        }))
+        .unwrap();
+        assert_eq!(
+            server
+                .bbox_artifact_install(Parameters(invalid))
+                .await
+                .is_error,
+            Some(true)
+        );
+        let p: ArtifactInstallToolParams = serde_json::from_value(json!({
+            "kind": "brofile", "artifact": {"name": "inline-example", "provider": "glm"}, "version": "1",
+        })).unwrap();
+        let result = server.bbox_artifact_install(Parameters(p)).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let response: Value =
+            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(response["name"], "inline-example");
+        assert_eq!(response["active"], true);
+        assert!(response.get("source").is_none());
+        assert!(response.get("path").is_none());
+        assert!(
+            orchestration::brofile::resolve_brofile(
+                "inline-example",
+                &server.state.store_dir,
+                None
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn artifact_install_input_requires_one_inline_object_or_http_url() {
+        for payload in [
+            json!({"kind": "brofile"}),
+            json!({"kind": "brofile", "artifact": {}, "source": "https://example.test/artifact.json"}),
+            json!({"kind": "brofile", "source": "file:///private/credential.json"}),
+            json!({"kind": "brofile", "source": "relative/file.json"}),
+            json!({"kind": "brofile", "artifact": {"lens": "x".repeat(1024*1024)}}),
+        ] {
+            assert!(artifact_install_input(serde_json::from_value(payload).unwrap()).is_err());
+        }
+        let p = serde_json::from_value(json!({"kind": "brofile", "source": "https://example.test/artifact.json?key=synthetic-secret"})).unwrap();
+        let (params, value) = artifact_install_input(p).unwrap();
+        assert!(value.is_none());
+        assert_eq!(
+            params.source,
+            "https://example.test/artifact.json?key=synthetic-secret"
+        );
     }
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
