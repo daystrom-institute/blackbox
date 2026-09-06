@@ -4310,9 +4310,8 @@ mod native_drilldown_tests {
             .find(&format!("{argument}="))
             .expect("selector argument");
         let encoded = line[start + argument.len() + 1..].trim_start();
-        serde_json::Deserializer::from_str(encoded)
-            .deserialize()
-            .unwrap()
+        let mut deserializer = serde_json::Deserializer::from_str(encoded);
+        <String as serde::Deserialize>::deserialize(&mut deserializer).unwrap()
     }
 
     #[test]
