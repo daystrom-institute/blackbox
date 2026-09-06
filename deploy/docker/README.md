@@ -9,15 +9,9 @@ off-host and keeps only fleetd plus the checkout-bound collectors (code and
 transcript) on checkout machines. There is no runtime role mask, blackopsd
 target, checkout connector, or curated MCP projection.
 
-The image also carries `bbox-slack-collector`, the Slack conversation-source
-satellite. It reads nothing local to a checkout host (it talks to Slack and to
-the daemon), so it runs in the cluster as its own single-replica Deployment
-from this same image with `command` overridden to
-`bbox-slack-collector --config <path> watch`. It needs a small writable volume
-for its journal, the producer bearer as a 0600 file, the bot token as a 0600
-file (delivered by External Secrets from the operator's vault), and a config
-that references both by `token_file`. It never needs the `op` CLI in the
-container.
+Slack-specific collection and bot integration are retired. Historical
+conversation reads use explicit retained enrollment; see
+[conversation retention](../../docs/conversation-retention.md).
 
 The deployment must mount one writable volume at `/var/lib/blackbox` and run as
 uid/gid 10001. The image pins the state, Tantivy, vector, XDG state, and XDG

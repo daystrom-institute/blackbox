@@ -961,28 +961,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bbox-slack-collector"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bbox-conversation-source",
- "bbox-corpus-core",
- "chrono",
- "clap",
- "globset",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bbox-source-graph"
 version = "0.0.1"
 dependencies = [
@@ -1566,34 +1544,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
-]
-
-[[package]]
-name = "bro-slack"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "axum",
- "bbox-config",
- "bbox-util",
- "chrono",
- "clap",
- "dirs",
- "futures-util",
- "hex",
- "hmac",
- "jsonschema",
- "parking_lot",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

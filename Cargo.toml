@@ -16,7 +16,6 @@ members = [
     "crates/bro-transcript",
     "crates/bro-code-mode",
     "crates/bro-apply-patch",
-    "crates/bro-slack",
 
     # The per-machine fleet supervisor (slice 5). Its dependency ceiling is
     # narrow BY DESIGN and asserted by scripts/acceptance-fleetd-deps.sh: no
@@ -42,7 +41,6 @@ members = [
     "crates/bbox-transcript-source-store",
     "crates/bbox-conversation-source",
     "crates/bbox-conversation-source-store",
-    "crates/bbox-slack-collector",
     "crates/bbox-git-source",
     "crates/bbox-git-source-store",
     "crates/bbox-knowledge-source",

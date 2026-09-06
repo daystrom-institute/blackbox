@@ -5,7 +5,6 @@
 #
 #   out/blackboxd
 #   out/blackbox
-#   out/bbox-slack-collector
 #   system-defaults/memories/
 #
 # There is one runtime target. The retired corpus/operations role split is not
@@ -35,7 +34,6 @@ COPY out/blackbox /usr/local/bin/blackbox
 # The Slack conversation-source satellite ships in the same image and runs as
 # its own Deployment with an explicit entrypoint override; nothing local to a
 # checkout host is needed for it, so it belongs beside the daemon it feeds.
-COPY out/bbox-slack-collector /usr/local/bin/bbox-slack-collector
 COPY system-defaults/memories /usr/local/share/blackbox/memories
 
 # Every mutable root is explicit and expected to live below the one PVC mount.
