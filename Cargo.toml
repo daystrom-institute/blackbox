@@ -37,6 +37,7 @@ members = [
     "crates/bbox-file-source",
     "crates/bbox-file-source-store",
     "crates/bbox-file-collector",
+    "crates/bbox-transcript-collector",
     "crates/bbox-transcript-source",
     "crates/bbox-transcript-source-store",
     "crates/bbox-conversation-source",
@@ -121,6 +122,8 @@ bbox-code-source = { path = "crates/bbox-code-source" }
 bbox-code-source-store = { path = "crates/bbox-code-source-store" }
 bbox-file-source = { path = "crates/bbox-file-source" }
 bbox-file-source-store = { path = "crates/bbox-file-source-store" }
+bbox-transcript-source = { path = "crates/bbox-transcript-source" }
+bbox-transcript-source-store = { path = "crates/bbox-transcript-source-store" }
 bbox-conversation-source = { path = "crates/bbox-conversation-source" }
 bbox-conversation-source-store = { path = "crates/bbox-conversation-source-store" }
 bbox-git-source = { path = "crates/bbox-git-source" }
@@ -246,6 +249,7 @@ bbox-mcp-tools = { path = "crates/bbox-mcp-tools" }
 bbox-visual-store = { path = "crates/bbox-visual-store" }
 
 [dev-dependencies]
+bbox-transcript-collector = { path = "crates/bbox-transcript-collector" }
 # Syntax-aware Rust source scanning for the blocking exit-gate proofs
 # (scripts/acceptance-catalog-ownership.sh). Test scope only: nothing the
 # daemon links parses Rust. `span-locations` is what lets the scanner slice

@@ -74,6 +74,18 @@ impl TranscriptAdapterRegistry {
                 tmp_root,
             )));
         }
+        if let Some(root) = &config.native_source_root {
+            for source in [TranscriptSource::Claude, TranscriptSource::Codex] {
+                match super::native::NativeTranscriptAdapter::open(
+                    root,
+                    config.native_sources.clone(),
+                    source,
+                ) {
+                    Ok(adapter) => adapters.push(Box::new(adapter)),
+                    Err(error) => tracing::warn!(%error, "native transcript source unavailable"),
+                }
+            }
+        }
         // Connector-landed conversations. Same explicit-only contract as every
         // other source: no root and no enrolled scopes means no adapter, so a
         // hermetic index never reaches the operator's landing store, and an

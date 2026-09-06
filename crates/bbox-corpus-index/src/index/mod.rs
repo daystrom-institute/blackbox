@@ -241,6 +241,8 @@ pub struct ReindexConfig {
     /// transcript documents. `None` disables the conversation adapter, which
     /// is what every hermetic index gets.
     pub conversation_source_root: Option<PathBuf>,
+    pub native_source_root: Option<PathBuf>,
+    pub native_sources: Vec<bbox_corpus_core::project_catalog::ConnectorScope>,
     /// Which conversation-lane connector scopes the corpus may project, with
     /// the vendor tenant each grant declares. Empty disables the adapter even
     /// when the root is set: enrollment is operator config, so retiring the
@@ -572,6 +574,8 @@ impl TranscriptIndex {
             harness_sessions_dir: None,
             gemini_tmp_root: None,
             conversation_source_root: None,
+            native_source_root: None,
+            native_sources: Vec::new(),
             conversation_sources: Vec::new(),
         };
         let active_code_selectors = load_active_code_selectors(
@@ -880,6 +884,15 @@ impl TranscriptIndex {
     /// authority: a granted scope that is later retired disappears from
     /// `sources`, its channels stop being scanned, and the purge phase removes
     /// their documents.
+    pub fn set_native_sources(
+        &mut self,
+        root: PathBuf,
+        scopes: Vec<bbox_corpus_core::project_catalog::ConnectorScope>,
+    ) {
+        self.config.native_source_root = Some(root);
+        self.config.native_sources = scopes;
+    }
+
     pub fn set_conversation_sources(
         &mut self,
         root: PathBuf,

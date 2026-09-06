@@ -551,6 +551,20 @@ pub(super) fn open_shared_state(
     {
         idx.set_gemini_tmp_root(gemini_tmp);
     }
+    idx.set_native_sources(
+        cfg.paths.state_dir.join("transcript-sources"),
+        if cfg.source_connectors.enabled {
+            cfg.source_connectors
+                .producers
+                .iter()
+                .flat_map(|producer| producer.scopes.iter())
+                .filter(|grant| grant.profile == config::ConnectorProfile::Transcript)
+                .map(|grant| grant.scope())
+                .collect()
+        } else {
+            Vec::new()
+        },
+    );
     // Connector-landed conversations. Enrollment is operator config, read
     // here from the connector grants that name the conversation lane: a scope
     // the operator retires stops being scanned and the reindex purge removes
