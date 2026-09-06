@@ -555,6 +555,7 @@ pub(super) fn parse_sse(
     }
 
     Ok(TurnOutput {
+        observation_content: None,
         text,
         thinking,
         tool_calls,

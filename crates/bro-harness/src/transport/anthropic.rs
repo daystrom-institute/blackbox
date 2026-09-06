@@ -848,6 +848,8 @@ impl Transport for AnthropicTransport {
             // can't double-count this turn's usage.
             self.last_segment_usage = Usage::default();
             return Ok(TurnOutput {
+                observation_content: assistant_idx
+                    .and_then(|index| self.messages[index]["content"].as_array().cloned()),
                 text: acc_text,
                 thinking: acc_thinking,
                 tool_calls: acc_tool_calls,
@@ -1957,6 +1959,8 @@ mod tests {
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"native-1\",\"name\":\"web_search_prime\",\"input\":{\"search_query\":\"synthetic\"}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_result\",\"tool_use_id\":\"native-1\",\"content\":\"[]\"}}\n\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1808,\"output_tokens\":94}}\n\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
@@ -1993,6 +1997,12 @@ mod tests {
         assert_eq!(out.usage.input_tokens, 1808);
         assert_eq!(out.usage.output_tokens, 94);
         assert_eq!(out.text, "ok");
+        let observed = out.observation_content.as_ref().unwrap();
+        assert_eq!(json!(observed), tx.messages.last().unwrap()["content"]);
+        assert_eq!(observed[1]["type"], "server_tool_use");
+        assert_eq!(observed[1]["name"], "web_search_prime");
+        assert_eq!(observed[2]["tool_use_id"], "native-1");
+        assert!(out.tool_calls.is_empty());
         // Clean return resets the partial-state field — a subsequent
         // take_interrupted_usage would return zeros, not a stale copy.
         assert_eq!(tx.take_interrupted_usage(), Usage::default());

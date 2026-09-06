@@ -177,6 +177,10 @@ impl StopReason {
 
 /// Normalized result of one assistant turn.
 pub struct TurnOutput {
+    /// Ordered Anthropic-shaped assistant blocks for durable observation.
+    /// Includes provider-owned calls/results that are not client dispatches.
+    /// None uses the normalized text/thinking/client-tool projection.
+    pub observation_content: Option<Vec<Value>>,
     pub text: String,
     /// Reasoning/thinking text for this turn, surfaced for display only. NOT
     /// replayed into the transport buffer (no persisted signature), so it never

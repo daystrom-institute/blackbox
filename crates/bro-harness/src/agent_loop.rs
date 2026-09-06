@@ -1374,26 +1374,29 @@ impl Session {
                 }
             }
 
-            // Full assistant turn (thinking + text + tool_use) for the daemon
-            // tail / fleet transcript; the daemon dedupes text against streamed
-            // deltas. The thinking block is display-only — it is emitted here for
-            // client rendering but never enters the transport replay buffer.
-            let mut assistant_content: Vec<Value> = Vec::new();
-            if !out.thinking.is_empty() {
-                assistant_content.push(json!({"type": "thinking", "thinking": out.thinking}));
-            }
+            // Preserve native block order and provider-owned tool results in
+            // the durable event. Only out.tool_calls enter client dispatch.
             if !out.text.is_empty() {
-                assistant_content.push(json!({"type": "text", "text": out.text}));
                 final_text = out.text.clone();
             }
-            for tc in &out.tool_calls {
-                assistant_content.push(json!({
-                    "type": "tool_use",
-                    "id": tc.id,
-                    "name": tc.name,
-                    "input": tc.args,
-                }));
-            }
+            let assistant_content = out.observation_content.clone().unwrap_or_else(|| {
+                let mut assistant_content: Vec<Value> = Vec::new();
+                if !out.thinking.is_empty() {
+                    assistant_content.push(json!({"type": "thinking", "thinking": out.thinking}));
+                }
+                if !out.text.is_empty() {
+                    assistant_content.push(json!({"type": "text", "text": out.text}));
+                }
+                for tc in &out.tool_calls {
+                    assistant_content.push(json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.args,
+                    }));
+                }
+                assistant_content
+            });
             if !assistant_content.is_empty() {
                 // Carry the step's stop_reason + usage on the persisted
                 // assistant event (gap-dab30623): same source of truth as the
@@ -2494,6 +2497,7 @@ mod tests {
     enum MockTurn {
         /// Return text immediately (Done, no tool calls).
         Text(String),
+        NativeSearch(Vec<Value>),
         /// Return text immediately with a Responses-style follow-up signal.
         TextWithEndTurn(String, Option<bool>),
         /// Wait on the shared gate, then request a tool call.
@@ -2578,6 +2582,7 @@ mod tests {
                     self.shared.model_gate.notified().await;
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
+                        observation_content: None,
                         text: String::new(),
                         thinking: String::new(),
                         tool_calls: vec![transport::ToolCall {
@@ -2593,6 +2598,7 @@ mod tests {
                 MockTurn::TwoReadProbes => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
+                        observation_content: None,
                         text: String::new(),
                         thinking: String::new(),
                         tool_calls: vec![
@@ -2615,6 +2621,7 @@ mod tests {
                 MockTurn::FinalResult => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
+                        observation_content: None,
                         text: String::new(),
                         thinking: String::new(),
                         tool_calls: vec![transport::ToolCall {
@@ -2630,6 +2637,7 @@ mod tests {
                 MockTurn::FileReadUnderChild => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
+                        observation_content: None,
                         text: String::new(),
                         thinking: String::new(),
                         tool_calls: vec![transport::ToolCall {
@@ -2642,9 +2650,19 @@ mod tests {
                         usage: Usage::default(),
                     })
                 }
+                MockTurn::NativeSearch(content) => Ok(transport::TurnOutput {
+                    observation_content: Some(content),
+                    text: "Search completed.".into(),
+                    thinking: String::new(),
+                    tool_calls: vec![],
+                    stop: StopReason::Done,
+                    end_turn: None,
+                    usage: Usage::default(),
+                }),
                 MockTurn::Text(t) => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
+                        observation_content: None,
                         text: t,
                         thinking: String::new(),
                         tool_calls: vec![],
@@ -2656,6 +2674,7 @@ mod tests {
                 MockTurn::TextWithEndTurn(t, end_turn) => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
+                        observation_content: None,
                         text: t,
                         thinking: String::new(),
                         tool_calls: vec![],
@@ -2908,6 +2927,49 @@ mod tests {
         assert!(pushed[0][0].content.contains("FILE-BODY"));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn native_search_blocks_survive_durable_events_without_client_dispatch() {
+        for (name, result) in [
+            (
+                "web_search",
+                json!({"type":"web_search_tool_result", "tool_use_id":"native-1", "content":[]}),
+            ),
+            (
+                "web_search_prime",
+                json!({"type":"tool_result", "tool_use_id":"native-1", "content":"[]"}),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let log = Arc::new(EventLog::at_path(root.join("events.jsonl")));
+            let content = vec![
+                json!({"type":"text", "text":"Searching."}),
+                json!({"type":"server_tool_use", "id":"native-1", "name":name, "input":{"search_query":"synthetic"}}),
+                result,
+                json!({"type":"text", "text":"Search completed."}),
+            ];
+            let (mut session, shared) = mk_session(vec![MockTurn::NativeSearch(content.clone())]);
+            session.event_log = log.clone();
+            session.emitter = Emitter::new("native-search-test".into()).with_event_log(log.clone());
+            run_user_turn(&mut session, "synthetic search").await;
+            let lines: Vec<Value> = std::fs::read_to_string(log.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let assistants: Vec<_> = lines
+                .iter()
+                .filter(|line| line["event"]["type"] == "assistant")
+                .collect();
+            assert_eq!(assistants.len(), 1);
+            assert_eq!(assistants[0]["event"]["message"]["content"], json!(content));
+            assert!(
+                shared.pushed_tool_results.lock().unwrap().is_empty(),
+                "provider-owned calls must never be dispatched again by the client"
+            );
+        }
     }
 
     #[tokio::test]

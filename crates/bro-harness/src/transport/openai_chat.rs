@@ -568,6 +568,7 @@ impl Transport for OpenAiChatTransport {
         }
 
         Ok(TurnOutput {
+            observation_content: None,
             text: text_out,
             // Display-only: thinking is surfaced for the assistant turn block
             // but never replayed into `self.messages` (the assistant message
