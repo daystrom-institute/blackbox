@@ -10,6 +10,17 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Whiteboard summary and detail reads preserve blind-phase and role visibility.
+  Artifact installation reports partial effects and retires replaced agent
+  snapshots only after the replacement is durable.
+- Poller replies distinguish requested and effective cadence. Cron installs
+  reject unsupported timezones; diagnostics reflect the scheduler's actual mode.
+- Corpus stats no longer mistake missing daemon-local transcript roots for
+  missing collected history. Embedding health distinguishes current-process
+  successes from measured corpus coverage.
+- Catalog-mode team creation and later dispatch use the same global
+  configuration authority, while preserving the worker's project context.
+
 - Unpinned runtime allocation uses only the selected provider's declared
   default account or native credentials. Unrelated global accounts no longer
   label or inject environment into Brodex dispatches.
@@ -44,6 +55,23 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- Breaking MCP response changes: catalog, thread, note, artifact, packet,
+  workflow, trigger, event, and team discovery use bounded summary pages.
+  Full task, arc, graph-property, whiteboard, proposal, and team configuration
+  reads provide explicit continuation. Routine diagnostics move behind detail
+  or debug options; stored-content and ingestion limits remain explicit.
+- Proposal lists omit drafts by default. Exact proposal reads and stable page
+  cursors accompany updated Badgey workflow consumers; upgrade the proposal
+  page packet, emitting child workflow, then triage parent workflow together.
+- Team creation rejects empty or more than 256 expanded members before
+  allocation. Team/template exact reads use JSON body pages. Unsupported
+  project-template operations refuse rather than accessing daemon-local paths.
+- Artifact install accepts inline JSON or HTTP(S), and roadmap rendering returns
+  content with inline templates. Unsupported checkout operations refuse before
+  mutation; legacy bootstrap/absorb surfaces leave ordinary discovery.
+- Trigger install schemas describe nested specs and required selectors instead
+  of opaque JSON objects. Doctor encoding is independent of detail level.
+
 - Gap lists return summary pages (20 by default, maximum 100) with total and
   next_offset. Exact id reads default to full detail; `detail=full` expands a
   page. Gap and knowledge diagnostics are limited to the requested project.
@@ -62,6 +90,13 @@ out explicitly under `Changed` or `Removed`.
   (or another provider id) for its model and effort catalog.
 
 ### Added
+
+- A native transcript collector publishes Claude and Codex history from its
+  source host through dedicated producer grants, chunked snapshots, and
+  generation-aware indexed reads. Source observations distinguish contact,
+  completed scans, publication, and indexing. macOS builds embed collector
+  identity and Local Network usage metadata; normal signing and user permission
+  remain deployment requirements.
 
 - Brodex accepts `gpt-6-astra`, with reasoning levels from `low` through
   `ultra`, default effort `medium`, and a 272,000-token default context
