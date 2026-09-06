@@ -393,18 +393,17 @@ impl BlackboxServer {
         mut request: FreshDispatchRequest,
         admission: Option<orch::admission::Attempt>,
     ) -> Result<FreshDispatchResult, String> {
-        // Admission drain (maintenance window): refuse NEW work while
-        // letting in-flight work continue. Workflow-origin dispatches are an
-        // already-running arc's nodes and atom-origin dispatches are either
-        // gated at the `atom_invoke` tool (external) or belong to in-flight
-        // work (workflow atom nodes, auto-supervision); both pass here.
-        if !matches!(
+        if matches!(
             request.origin,
-            bro_core::Origin::Workflow | bro_core::Origin::Atom
+            bro_core::Origin::Workflow
+                | bro_core::Origin::Atom
+                | bro_core::Origin::Cron
+                | bro_core::Origin::Webhook
         ) {
-            if let Some(refusal) = self.state.drain.admission_refusal("fresh dispatch") {
-                return Err(refusal);
-            }
+            return Err("error.retired_dispatch_origin: application orchestration cannot launch tasks; use ordinary bro execution".into());
+        }
+        if let Some(refusal) = self.state.drain.admission_refusal("fresh dispatch") {
+            return Err(refusal);
         }
         let store_dir = self.state.store_dir.clone();
         let allocation_guard = if request.allocation_request.is_some() {
@@ -3209,8 +3208,6 @@ mod tests {
         for origin in [
             bro_core::Origin::AgentDispatch,
             bro_core::Origin::Cockpit,
-            bro_core::Origin::Cron,
-            bro_core::Origin::Webhook,
             bro_core::Origin::Unknown,
         ] {
             let err = server
@@ -3231,36 +3228,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_gate_is_bypassed_for_in_flight_origins() {
-        // Workflow-origin (an in-flight arc's node) and atom-origin (workflow
-        // atom nodes / auto-supervision) dispatches must not hit the drain
-        // refusal. They may fail later for unrelated reasons in this
-        // harness-less test box; the assertion is only that the error, if
-        // any, is not the maintenance refusal.
+    async fn retired_origins_refuse_fresh_dispatch_with_or_without_drain() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
-        server.state.drain.set(None, None).unwrap();
-        for origin in [bro_core::Origin::Workflow, bro_core::Origin::Atom] {
-            let mut req = drain_test_request(origin);
-            // Route through the allocator with an impossible pin so the
-            // call returns deterministically (allocation error) without
-            // trying to spawn a harness child.
-            req.allocation_request = Some(orchestration::allocator::RuntimeRequest {
-                pin: Some(orchestration::allocator::RuntimePin {
-                    provider: Some(Provider::Glm),
-                    account: Some("no-such-account-for-drain-test".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-            match server.dispatch_fresh_bro_task(req).await {
-                Ok(_) => {}
-                Err(err) => assert!(
-                    !err.starts_with(crate::server::drain::MAINTENANCE_PENDING_CODE),
-                    "{origin} must bypass the drain gate, got: {err}"
-                ),
+        for draining in [false, true] {
+            if draining {
+                server.state.drain.set(None, None).unwrap();
+            }
+            for origin in [
+                bro_core::Origin::Workflow,
+                bro_core::Origin::Atom,
+                bro_core::Origin::Cron,
+                bro_core::Origin::Webhook,
+            ] {
+                let error = server
+                    .dispatch_fresh_bro_task(drain_test_request(origin))
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(error.starts_with("error.retired_dispatch_origin"));
             }
         }
+        assert!(server.state.task_store.read().all_tasks().is_empty());
     }
 
     #[tokio::test]
