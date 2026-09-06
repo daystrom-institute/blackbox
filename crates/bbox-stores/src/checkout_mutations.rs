@@ -66,6 +66,7 @@ pub struct MutationPublication {
 
 pub struct CheckoutMutations {
     store: CheckoutMutationStore,
+    publication_revision: u64,
 }
 
 impl StoreSnapshot for CheckoutMutations {
@@ -86,7 +87,10 @@ impl CheckoutMutations {
         } else {
             CheckoutMutationStore::default()
         };
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            publication_revision: 0,
+        })
     }
 
     /// Queue a mutation for checkout-owner delivery. Ids are minted by the
@@ -223,6 +227,11 @@ impl CheckoutMutations {
         })
     }
 
+    /// Process-local fence for snapshots captured before the queue lock.
+    pub fn publication_revision(&self) -> u64 {
+        self.publication_revision
+    }
+
     /// Retire the overlay prefix whose exact content has reached publication.
     /// Delivery acknowledgement alone is insufficient: the owner may not have
     /// committed and published the delivered file yet.
@@ -236,13 +245,37 @@ impl CheckoutMutations {
             &row.mutation.scope == scope
                 && row.mutation.relative_path == relative_path
                 && row.status != CheckoutMutationStatus::Failed
-                && row.publication.is_some()
+                && row
+                    .publication
+                    .as_ref()
+                    .is_some_and(|state| !state.observed)
                 && same_json(row.mutation.content_json.as_deref(), published)
         });
         let Some(last) = last else {
             return false;
         };
+        let previous_base = self.store.mutations[last]
+            .publication
+            .as_ref()
+            .unwrap()
+            .base_content_json
+            .clone();
         let mut changed = false;
+        // A published prefix advances only this chain's expected base. Older
+        // completed chains never exempt a later write from conflict detection.
+        for row in &mut self.store.mutations[last + 1..] {
+            if &row.mutation.scope == scope
+                && row.mutation.relative_path == relative_path
+                && let Some(publication) = &mut row.publication
+                && !publication.observed
+                && same_json(
+                    publication.base_content_json.as_deref(),
+                    previous_base.as_deref(),
+                )
+            {
+                publication.base_content_json = published.map(str::to_owned);
+            }
+        }
         for row in &mut self.store.mutations[..=last] {
             if &row.mutation.scope == scope
                 && row.mutation.relative_path == relative_path
@@ -252,6 +285,9 @@ impl CheckoutMutations {
                 publication.observed = true;
                 changed = true;
             }
+        }
+        if changed {
+            self.publication_revision = self.publication_revision.wrapping_add(1);
         }
         changed
     }
@@ -277,12 +313,6 @@ impl CheckoutMutations {
         };
         if let Some(publication) = &latest.publication
             && !same_json(publication.base_content_json.as_deref(), published)
-            && !self.store.mutations.iter().any(|row| {
-                row.mutation.scope == *scope
-                    && row.mutation.relative_path == relative_path
-                    && row.publication.as_ref().is_some_and(|state| state.observed)
-                    && same_json(row.mutation.content_json.as_deref(), published)
-            })
         {
             anyhow::bail!(
                 "error.checkout_mutation_conflict: published content changed while mutation {} \
@@ -304,7 +334,12 @@ impl CheckoutMutations {
         now: String,
     ) -> Result<Vec<String>> {
         let mut rows = Vec::new();
+        let mut paths = BTreeSet::new();
         for (relative_path, content, base) in writes {
+            anyhow::ensure!(
+                paths.insert(relative_path.clone()),
+                "duplicate checkout mutation path in one edit"
+            );
             let mutation = CheckoutMutationV1 {
                 schema_version: CHECKOUT_MUTATION_SCHEMA_VERSION,
                 mutation_id: self.mint_id(),
@@ -453,6 +488,54 @@ mod tests {
             reason: "test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn an_old_completed_chain_never_authorizes_a_new_publication_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CheckoutMutations::open(&dir.path().join("mutations.json")).unwrap();
+        let file = ".bbox/gaps/gap-0123abcd.json";
+        let b = r#"{"title":"B"}"#;
+        let c = r#"{"title":"C"}"#;
+        let d = r#"{"title":"D"}"#;
+        store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(file.into(), b.into(), Some("{}".into()))],
+                "first".into(),
+                "2026-09-06T00:00:00Z".into(),
+            )
+            .unwrap();
+        let captured = store.publication_revision();
+        assert!(store.observe_publication(&scope(), file, Some(b)));
+        assert_ne!(captured, store.publication_revision());
+        store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(file.into(), d.into(), Some(c.into()))],
+                "second".into(),
+                "2026-09-06T00:00:00Z".into(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .write_base(&scope(), file, Some(b))
+                .unwrap_err()
+                .to_string()
+                .contains("checkout_mutation_conflict")
+        );
+        let count = store.pending_count();
+        assert!(
+            store
+                .enqueue_tracked_writes(
+                    scope(),
+                    vec![(file.into(), b.into(), None), (file.into(), c.into(), None)],
+                    "duplicate".into(),
+                    "2026-09-06T00:00:00Z".into()
+                )
+                .is_err()
+        );
+        assert_eq!(store.pending_count(), count);
     }
 
     #[test]

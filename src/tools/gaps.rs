@@ -212,25 +212,60 @@ impl BlackboxServer {
         reason: &str,
         edit: impl FnOnce(&mut [crate::gaps::GapNote]) -> anyhow::Result<()>,
     ) -> anyhow::Result<String> {
-        let view = self.session_gap_view(Some(project_id), Some("published"))?;
-        let published = ids
+        self.edit_queued_gaps_with_snapshot_hook(project_id, scope, ids, reason, || {}, edit)
+    }
+
+    fn edit_queued_gaps_with_snapshot_hook(
+        &self,
+        project_id: &str,
+        scope: bbox_corpus_core::identity::PublishedScope,
+        ids: &[&str],
+        reason: &str,
+        mut after_snapshot: impl FnMut(),
+        edit: impl FnOnce(&mut [crate::gaps::GapNote]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
+        let distinct = ids
             .iter()
-            .map(|id| -> anyhow::Result<Option<String>> {
-                Ok(view
-                    .gaps
-                    .all()
+            .map(|id| id.strip_prefix("gap-").unwrap_or(id))
+            .collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(
+            distinct.len() == ids.len(),
+            "a gap edit cannot target the same record twice"
+        );
+        let (mut queue, published) = {
+            let mut retries = 0;
+            loop {
+                let revision = self.state.checkout_mutations.read().publication_revision();
+                let view = self.session_gap_view(Some(project_id), Some("published"))?;
+                let published = ids
                     .iter()
-                    .find(|gap| {
-                        Self::gap_id_matches(&gap.id, id)
-                            && gap.project_id.as_deref() == Some(project_id)
+                    .map(|id| -> anyhow::Result<Option<String>> {
+                        Ok(view
+                            .gaps
+                            .all()
+                            .iter()
+                            .find(|gap| {
+                                Self::gap_id_matches(&gap.id, id)
+                                    && gap.project_id.as_deref() == Some(project_id)
+                            })
+                            .map(crate::gaps::committed_gap_note_bytes)
+                            .transpose()?
+                            .map(String::from_utf8)
+                            .transpose()?)
                     })
-                    .map(crate::gaps::committed_gap_note_bytes)
-                    .transpose()?
-                    .map(String::from_utf8)
-                    .transpose()?)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut queue = self.state.checkout_mutations.write();
+                    .collect::<Result<Vec<_>, _>>()?;
+                after_snapshot();
+                let queue = self.state.checkout_mutations.write();
+                if queue.publication_revision() == revision {
+                    break (queue, published);
+                }
+                retries += 1;
+                anyhow::ensure!(
+                    retries < 4,
+                    "error.checkout_publication_busy: publication changed repeatedly; retry the gap edit"
+                );
+            }
+        };
         let mut gaps = Vec::new();
         for (id, base) in ids.iter().zip(&published) {
             let canonical = if id.starts_with("gap-") {
@@ -342,8 +377,22 @@ impl BlackboxServer {
         gap.provider = p.provider.clone();
         gap.bro = p.bro.clone();
         gap.thread_id = p.thread_id.clone();
-        let view = self.session_gap_view(Some(raw), Some("published"))?;
-        let mut queue = self.state.checkout_mutations.write();
+        let (view, mut queue) = {
+            let mut retries = 0;
+            loop {
+                let revision = self.state.checkout_mutations.read().publication_revision();
+                let view = self.session_gap_view(Some(raw), Some("published"))?;
+                let queue = self.state.checkout_mutations.write();
+                if queue.publication_revision() == revision {
+                    break (view, queue);
+                }
+                retries += 1;
+                anyhow::ensure!(
+                    retries < 4,
+                    "error.checkout_publication_busy: publication changed repeatedly; retry gap filing"
+                );
+            }
+        };
         if !p.allow_recurrence.unwrap_or(false) {
             let mut visible = view
                 .gaps
@@ -667,7 +716,7 @@ impl BlackboxServer {
         };
         let mut ids = vec![p.id.as_str()];
         if let Some(by) = p.superseded_by.as_deref() {
-            if Self::gap_id_matches(by, &p.id) || Self::gap_id_matches(&p.id, by) {
+            if by.strip_prefix("gap-").unwrap_or(by) == p.id.strip_prefix("gap-").unwrap_or(&p.id) {
                 anyhow::bail!("a gap cannot supersede itself");
             }
             ids.push(by);
@@ -999,6 +1048,98 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_publication_between_capture_and_queue_lock_retries_the_gap_edit() {
+        use crate::server::state::catalog_fixture::{CatalogFixture, gap_note};
+        let fixture = CatalogFixture::new();
+        let scope = CatalogFixture::scope(".");
+        fixture.add_published_project("p_queue", &scope);
+        fixture.install_publication(
+            "p_queue",
+            &scope,
+            &"1".repeat(40),
+            &[],
+            &[gap_note("gap-1234abcd", "old")],
+        );
+        let server = fixture.server();
+        server
+            .edit_queued_gaps(
+                "p_queue",
+                scope.clone(),
+                &["gap-1234abcd"],
+                "title",
+                |gaps| {
+                    gaps[0].title = "published while paused".into();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let published: crate::gaps::GapNote = serde_json::from_str(
+            server
+                .state
+                .checkout_mutations
+                .read()
+                .outstanding_writes()
+                .last()
+                .unwrap()
+                .mutation
+                .content_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut captures = 0;
+        server
+            .edit_queued_gaps_with_snapshot_hook(
+                "p_queue",
+                scope.clone(),
+                &["1234abcd"],
+                "notes",
+                || {
+                    captures += 1;
+                    if captures == 1 {
+                        fixture.install_publication(
+                            "p_queue",
+                            &scope,
+                            &"2".repeat(40),
+                            &[],
+                            &[published.clone()],
+                        );
+                        server.invalidate_catalog_published_content(
+                            &bbox_corpus_core::project_catalog::ProjectId::parse("p_queue")
+                                .unwrap(),
+                        );
+                        server
+                            .session_gap_view(Some("p_queue"), Some("published"))
+                            .unwrap();
+                    }
+                },
+                |gaps| {
+                    assert_eq!(gaps[0].title, "published while paused");
+                    gaps[0].notes = Some("preserve accepted title".into());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(captures, 2);
+        let before = server.state.checkout_mutations.read().pending_count();
+        assert!(
+            server
+                .edit_queued_gaps(
+                    "p_queue",
+                    scope,
+                    &["1234abcd", "1234abcd"],
+                    "self-link",
+                    |_| panic!("duplicate IDs must refuse before editing")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            server.state.checkout_mutations.read().pending_count(),
+            before
+        );
+    }
 
     #[tokio::test]
     async fn queued_gap_edits_compose_across_delivery_and_publication() {
