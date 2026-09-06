@@ -18,8 +18,16 @@ pub struct InspectEntityParams {
     #[serde(default)]
     pub provisional: Option<String>,
     pub edge_types: Option<String>,
+    /// Edge direction: out, in, or both (default).
     pub direction: Option<String>,
+    /// Maximum edges per family and direction: default 5.
+    /// Zero requests properties only. At most 100 edges are returned overall;
+    /// edge_truncation reports matching and omitted counts when capped.
     pub per_type_limit: Option<usize>,
+    /// Property detail: smart (default, text shortened to 300 characters),
+    /// summary (names, status, source identity and freshness), or full.
+    /// property_projection identifies omitted/shortened properties and how
+    /// to retrieve them in full. Unknown values are errors.
     pub property_mode: Option<String>,
 }
 
@@ -49,11 +57,12 @@ enum PropertyMode {
 }
 
 impl PropertyMode {
-    fn parse(input: Option<&str>) -> Self {
+    fn parse(input: Option<&str>) -> Result<Self> {
         match input.unwrap_or("smart").to_ascii_lowercase().as_str() {
-            "summary" => Self::Summary,
-            "full" => Self::Full,
-            _ => Self::Smart,
+            "summary" => Ok(Self::Summary),
+            "smart" => Ok(Self::Smart),
+            "full" => Ok(Self::Full),
+            other => bail!("invalid property_mode `{other}`; use summary, smart, or full"),
         }
     }
 }
@@ -111,6 +120,19 @@ pub fn bad_input(entity_ref: &str, message: impl AsRef<str>) -> String {
     .to_string()
 }
 
+pub fn bad_input_field(field: &str, message: impl AsRef<str>, suggested_fix: &str) -> String {
+    json!({
+        "status": "error.bad_input",
+        "error": {
+            "code": "error.bad_input",
+            "message": message.as_ref(),
+            "field": field,
+            "suggested_fix": suggested_fix,
+        },
+    })
+    .to_string()
+}
+
 pub fn not_found(r: &EntityRef, similar_refs: Vec<String>) -> String {
     json!({
         "status": "error.not_found",
@@ -145,9 +167,24 @@ pub fn inspect_entity(
 ) -> Result<String> {
     let direction = match InspectDirection::parse(p.direction.as_deref()) {
         Ok(direction) => direction,
-        Err(err) => return Ok(bad_input(&p.entity_ref, err.to_string())),
+        Err(err) => {
+            return Ok(bad_input_field(
+                "direction",
+                err.to_string(),
+                "Use direction=out, in, or both.",
+            ));
+        }
     };
-    let property_mode = PropertyMode::parse(p.property_mode.as_deref());
+    let property_mode = match PropertyMode::parse(p.property_mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(err) => {
+            return Ok(bad_input_field(
+                "property_mode",
+                err.to_string(),
+                "Use property_mode=summary, smart, or full.",
+            ));
+        }
+    };
     let per_type_limit = p.per_type_limit.unwrap_or(5);
     let edge_filter = parse_edge_filter(p.edge_types.as_deref());
     let provider = providers::provider_for(r.entity_type());
@@ -167,7 +204,7 @@ pub fn inspect_entity(
         Err(_) => return Ok(not_found(r, similar_refs(edge_index, r))),
     };
     let canonical_ref = EntityRef::parse(&entity.ref_string).unwrap_or_else(|_| r.clone());
-    let mut full_neighborhood = if matches!(
+    let full_neighborhood = if matches!(
         r.entity_type(),
         bbox_corpus_core::entity_ref::EntityType::ProjectGraphVertex
             | bbox_corpus_core::entity_ref::EntityType::ProvisionalProjectGraphVertex
@@ -189,26 +226,28 @@ pub fn inspect_entity(
         }
         neighborhood
     };
-    for edge in full_neighborhood
-        .forward
-        .iter_mut()
-        .chain(full_neighborhood.reverse.iter_mut())
-    {
-        refine_evidence_edge(ctx, edge);
-    }
     entity.neighborhood = filtered_neighborhood(
         &full_neighborhood,
         direction,
         edge_filter.as_ref(),
         per_type_limit,
     );
+    // Resolve freshness only for the bounded preview. Counts and authored
+    // next-hop semantics use the complete neighborhood without endpoint loads.
+    for edge in entity
+        .neighborhood
+        .forward
+        .iter_mut()
+        .chain(entity.neighborhood.reverse.iter_mut())
+    {
+        refine_evidence_edge(ctx, edge);
+    }
     let rendered_forward = render_edges(ctx, &entity.neighborhood.forward, "out");
     let rendered_reverse = render_edges(ctx, &entity.neighborhood.reverse, "in");
     let recommended = render_next_hops(provider.recommended_next_hops(&entity, &full_neighborhood));
     let coverage = provider
         .expected_edge_families(r)
         .into_iter()
-        .take(10)
         .map(|expectation| {
             let count = full_neighborhood
                 .forward
@@ -230,30 +269,14 @@ pub fn inspect_entity(
         })
         .collect::<Vec<_>>();
     let properties = render_properties(&entity, property_mode);
-    let text = render_text(InspectText {
-        ctx,
-        r: &canonical_ref,
-        entity: &entity,
-        properties: &properties,
-        forward: &rendered_forward,
-        reverse: &rendered_reverse,
-        recommended: &recommended,
-        coverage: &coverage,
-    });
-    // The full `coverage` drives the human `text` render above (which surfaces
-    // optional-but-absent families as orientation). The structured array,
-    // though, drops optional zero-count rows: a machine reader infers "absent"
-    // from a family simply not being listed, so emitting `{count: 0, status:
-    // "0 (expected)"}` for every unused optional family is pure padding.
-    // Required families are retained even at count 0 so the "expected but
-    // missing" signal still reaches a structured consumer.
+    // Keep required absences and observed relationships; generic optional
+    // zero-count families add no evidence. Authored absences remain in hops.
     let coverage_json: Vec<&RenderedCoverage> = coverage
         .iter()
         .filter(|c| c.count > 0 || c.expected == "required")
         .collect();
-    Ok(serde_json::to_string_pretty(&json!({
+    let mut out = json!({
         "status": "ok",
-        "text": text,
         "entity_ref": canonical_ref.to_string(),
         "entity_type": canonical_ref.entity_type().as_str(),
         "properties": properties,
@@ -261,9 +284,36 @@ pub fn inspect_entity(
             "out": rendered_forward,
             "in": rendered_reverse,
         },
-        "recommended_next_hops": recommended,
-        "edge_family_coverage": coverage_json,
-    }))?)
+    });
+    if !recommended.is_empty() {
+        out["recommended_next_hops"] = json!(recommended);
+    }
+    if !coverage_json.is_empty() {
+        out["edge_family_coverage"] = json!(coverage_json);
+    }
+    if let Some(truncation) = edge_truncation(
+        &full_neighborhood,
+        &entity.neighborhood,
+        direction,
+        edge_filter.as_ref(),
+        per_type_limit,
+    ) {
+        out["edge_truncation"] = truncation;
+    }
+    let omitted = entity.properties.len().saturating_sub(properties.len());
+    let shortened: Vec<&str> = properties
+        .iter()
+        .filter(|(key, value)| entity.properties.get(*key) != Some(*value))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    if omitted > 0 || !shortened.is_empty() {
+        out["property_projection"] = json!({
+            "omitted": omitted,
+            "shortened": shortened,
+            "expand_hint": "Call bbox_inspect_entity with this entity_ref and property_mode=full for complete properties.",
+        });
+    }
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 fn parse_edge_filter(raw: Option<&str>) -> Option<HashSet<String>> {
@@ -385,17 +435,58 @@ fn filtered_neighborhood(
     if per_type_limit == 0 {
         return Neighborhood::default();
     }
-    let forward = if matches!(direction, InspectDirection::Out | InspectDirection::Both) {
+    let mut forward = if matches!(direction, InspectDirection::Out | InspectDirection::Both) {
         filter_and_limit(&full.forward, edge_filter, per_type_limit)
     } else {
         Vec::new()
     };
-    let reverse = if matches!(direction, InspectDirection::In | InspectDirection::Both) {
+    let mut reverse = if matches!(direction, InspectDirection::In | InspectDirection::Both) {
         filter_and_limit(&full.reverse, edge_filter, per_type_limit)
     } else {
         Vec::new()
     };
+    let out_budget = (TOTAL_EDGE_CAP / 2).max(TOTAL_EDGE_CAP.saturating_sub(reverse.len()));
+    forward.truncate(out_budget);
+    reverse.truncate(TOTAL_EDGE_CAP.saturating_sub(forward.len()));
     Neighborhood { forward, reverse }
+}
+
+const TOTAL_EDGE_CAP: usize = 100;
+
+fn edge_truncation(
+    full: &Neighborhood,
+    returned: &Neighborhood,
+    direction: InspectDirection,
+    edge_filter: Option<&HashSet<String>>,
+    per_type_limit: usize,
+) -> Option<serde_json::Value> {
+    let matching = |edges: &[Edge]| {
+        edges
+            .iter()
+            .filter(|edge| edge_filter.is_none_or(|allowed| allowed.contains(&edge.kind)))
+            .count()
+    };
+    let out = if matches!(direction, InspectDirection::Out | InspectDirection::Both) {
+        matching(&full.forward)
+    } else {
+        0
+    };
+    let inbound = if matches!(direction, InspectDirection::In | InspectDirection::Both) {
+        matching(&full.reverse)
+    } else {
+        0
+    };
+    let out_omitted = out.saturating_sub(returned.forward.len());
+    let in_omitted = inbound.saturating_sub(returned.reverse.len());
+    (out_omitted + in_omitted > 0).then(|| json!({
+        "matching": out + inbound,
+        "returned": returned.forward.len() + returned.reverse.len(),
+        "out_omitted": out_omitted,
+        "in_omitted": in_omitted,
+        "per_type_limit": per_type_limit,
+        "total_limit": TOTAL_EDGE_CAP,
+        "next_step": "This is a capped preview. Narrow edge_types and direction, or increase per_type_limit within the total limit. There is no edge continuation cursor.",
+    }))
 }
 
 fn filter_and_limit(
@@ -456,7 +547,7 @@ fn render_next_hops(hops: Vec<NextHop>) -> Vec<RenderedNextHop> {
     let budget = NEXT_HOP_DISPLAY_CAP.max(authored_count);
     let mut rendered = Vec::new();
     for hop in hops {
-        if !hop.authored && rendered.len() >= budget {
+        if !hop.authored && (hop.count == 0 || rendered.len() >= budget) {
             continue;
         }
         rendered.push(RenderedNextHop {
@@ -480,6 +571,7 @@ fn render_next_hops(hops: Vec<NextHop>) -> Vec<RenderedNextHop> {
 /// `(none)` rather than `(0)`, because "there are no open findings" is the
 /// answer, not a missing number. A direction-blind hop keeps the older
 /// `family (count)` shape.
+#[cfg(test)]
 fn next_hop_line(hop: &RenderedNextHop) -> String {
     let Some(direction) = hop.direction.as_deref() else {
         return format!("  {} ({})\n", hop.edge_family, hop.count);
@@ -501,6 +593,25 @@ fn next_hop_line(hop: &RenderedNextHop) -> String {
     )
 }
 
+fn is_identity_property(key: &str) -> bool {
+    key.ends_with("_id")
+        || key.ends_with("_ref")
+        || key.ends_with("_generation")
+        || key.starts_with("evidence.")
+        || matches!(
+            key,
+            "ref"
+                | "source_uri"
+                | "relative_path"
+                | "generation"
+                | "graph_source"
+                | "graph_source_connector"
+                | "provisional"
+                | "visibility"
+                | "freshness"
+        )
+}
+
 fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeMap<String, String> {
     let summary_keys = ["name", "title", "status", "kind", "severity", "id"];
     entity
@@ -509,12 +620,14 @@ fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeM
         .filter(|(key, _)| {
             property_mode != PropertyMode::Summary
                 || summary_keys.contains(&key.as_str())
-                || key.ends_with("_id")
+                || is_identity_property(key)
         })
         .map(|(key, value)| {
             let value = match property_mode {
                 PropertyMode::Full => value.clone(),
-                PropertyMode::Smart if value.len() > 300 => {
+                PropertyMode::Smart
+                    if !is_identity_property(key) && value.chars().count() > 300 =>
+                {
                     format!("{}...", value.chars().take(300).collect::<String>())
                 }
                 _ => value.clone(),
@@ -522,100 +635,6 @@ fn render_properties(entity: &EntityView, property_mode: PropertyMode) -> BTreeM
             (key.clone(), value)
         })
         .collect()
-}
-
-struct InspectText<'a> {
-    ctx: &'a ProviderContext<'a>,
-    r: &'a EntityRef,
-    entity: &'a EntityView,
-    properties: &'a BTreeMap<String, String>,
-    forward: &'a [RenderedEdge],
-    reverse: &'a [RenderedEdge],
-    recommended: &'a [RenderedNextHop],
-    coverage: &'a [RenderedCoverage],
-}
-
-fn render_text(input: InspectText<'_>) -> String {
-    let InspectText {
-        ctx,
-        r,
-        entity,
-        properties,
-        forward,
-        reverse,
-        recommended,
-        coverage,
-    } = input;
-    let header = compact_label(ctx, r, Some(&entity.properties))
-        .unwrap_or_else(|| entity.ref_string.clone());
-    let mut text = format!("## {header}\n\n");
-    text.push_str(&format!(
-        "`{}` ({})\n\n",
-        entity.ref_string,
-        entity.entity_type.as_str()
-    ));
-    text.push_str("### Properties\n");
-    for (key, value) in properties {
-        text.push_str(&format!("- `{key}`: {value}\n"));
-    }
-    text.push_str("\n### Edges\n");
-    if forward.is_empty() && reverse.is_empty() {
-        text.push_str("  (no edges)\n");
-    } else {
-        for edge in forward {
-            text.push_str(&format!(
-                "  -->[{}{}] {}\n",
-                edge.kind,
-                rendered_edge_freshness(edge),
-                labeled_ref(&edge.target, edge.target_label.as_deref())
-            ));
-        }
-        for edge in reverse {
-            text.push_str(&format!(
-                "  <--[{}{}] {}\n",
-                edge.kind,
-                rendered_edge_freshness(edge),
-                labeled_ref(&edge.source, edge.source_label.as_deref())
-            ));
-        }
-    }
-    text.push_str("\n### Recommended next hops\n");
-    if recommended.is_empty() {
-        text.push_str("  (none)\n");
-    } else {
-        for hop in recommended {
-            text.push_str(&next_hop_line(hop));
-        }
-    }
-    text.push_str("\n### Edge family coverage\n");
-    if coverage.is_empty() {
-        text.push_str("  (none)\n");
-    } else {
-        for row in coverage {
-            text.push_str(&format!(
-                "  {}: count={} expected={} status={}\n",
-                row.family, row.count, row.expected, row.status
-            ));
-        }
-    }
-    text
-}
-
-/// Shows an evidence edge's freshness inline. A non-current binding stays
-/// visible for diagnosis rather than being hidden, so the reader can see that
-/// the assertion exists and that one of its endpoints has moved.
-fn rendered_edge_freshness(edge: &RenderedEdge) -> String {
-    edge.properties
-        .get(bbox_project_graph::EVIDENCE_META_FRESHNESS)
-        .map(|status| format!(" {status}"))
-        .unwrap_or_default()
-}
-
-fn labeled_ref(entity_ref: &str, label: Option<&str>) -> String {
-    match label {
-        Some(label) if label != entity_ref => format!("{entity_ref} ({label})"),
-        _ => entity_ref.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -712,6 +731,159 @@ mod tests {
     }
 
     #[test]
+    fn invalid_options_report_the_actual_field_before_loading_an_entity() {
+        let mut params = InspectEntityParams {
+            entity_ref: "knowledge:missing".into(),
+            provisional: None,
+            edge_types: None,
+            direction: Some("sideways".into()),
+            per_type_limit: None,
+            property_mode: None,
+        };
+        let entity = EntityRef::parse(&params.entity_ref).unwrap();
+        for field in ["direction", "property_mode"] {
+            if field == "property_mode" {
+                params.direction = None;
+                params.property_mode = Some("smrat".into());
+            }
+            let wire: serde_json::Value = serde_json::from_str(
+                &inspect_entity(
+                    &params,
+                    &ProviderContext::empty_for_tests(),
+                    &entity,
+                    &EdgeIndex::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["status"], "error.bad_input");
+            assert_eq!(wire["error"]["field"], field);
+            assert!(
+                wire["error"]["suggested_fix"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field)
+            );
+        }
+    }
+
+    #[test]
+    fn generic_zero_count_hops_do_not_hide_authored_absences() {
+        let rendered = render_next_hops(vec![
+            hop("OPTIONAL_GENERIC", 0, None, None),
+            hop(
+                "OPEN_FINDINGS",
+                0,
+                Some(providers::NextHopDirection::In),
+                Some("open findings"),
+            ),
+        ]);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].edge_family, "OPEN_FINDINGS");
+        assert_eq!(rendered[0].count, 0);
+        assert_eq!(rendered[0].direction.as_deref(), Some("in"));
+    }
+
+    #[test]
+    fn inspection_edge_budget_is_aggregate_balanced_and_honest_about_scope() {
+        use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+        let center = EntityRef::parse("knowledge:center").unwrap();
+        let edges: Vec<Edge> = (0..150)
+            .map(|idx| Edge {
+                source: center.clone(),
+                target: EntityRef::parse(&format!("knowledge:item{idx}")).unwrap(),
+                kind: format!("FAMILY_{}", idx / 10),
+                provenance: EdgeProvenance::Derived,
+                confidence: EdgeConfidence::Exact,
+                metadata: Default::default(),
+                project_id: None,
+            })
+            .collect();
+        let full = Neighborhood {
+            forward: edges.clone(),
+            reverse: edges
+                .into_iter()
+                .map(|mut edge| {
+                    std::mem::swap(&mut edge.source, &mut edge.target);
+                    edge
+                })
+                .collect(),
+        };
+        let preview = filtered_neighborhood(&full, InspectDirection::Both, None, 5);
+        assert_eq!(preview.forward.len(), 50);
+        assert_eq!(preview.reverse.len(), 50);
+        let omitted = edge_truncation(&full, &preview, InspectDirection::Both, None, 5).unwrap();
+        assert_eq!(omitted["matching"], 300);
+        assert_eq!(omitted["returned"], 100);
+        assert_eq!(omitted["out_omitted"], 100);
+        assert_eq!(omitted["in_omitted"], 100);
+
+        let filter = HashSet::from(["FAMILY_0".into()]);
+        let targeted = filtered_neighborhood(&full, InspectDirection::In, Some(&filter), 5);
+        assert!(targeted.forward.is_empty());
+        let omitted =
+            edge_truncation(&full, &targeted, InspectDirection::In, Some(&filter), 5).unwrap();
+        assert_eq!(omitted["matching"], 10);
+        assert_eq!(omitted["in_omitted"], 5);
+        assert_eq!(omitted["out_omitted"], 0);
+    }
+
+    #[test]
+    fn explicit_per_family_limit_above_fifty_is_honored_within_aggregate_cap() {
+        use bbox_chunker::{EdgeConfidence, EdgeProvenance};
+        let full = Neighborhood {
+            forward: (0..90)
+                .map(|idx| Edge {
+                    source: EntityRef::parse("knowledge:center").unwrap(),
+                    target: EntityRef::parse(&format!("knowledge:item{idx}")).unwrap(),
+                    kind: "RELATED_TO".into(),
+                    provenance: EdgeProvenance::Derived,
+                    confidence: EdgeConfidence::Exact,
+                    metadata: Default::default(),
+                    project_id: None,
+                })
+                .collect(),
+            reverse: Vec::new(),
+        };
+        let preview = filtered_neighborhood(&full, InspectDirection::Out, None, 75);
+        assert_eq!(preview.forward.len(), 75);
+        let omission = edge_truncation(&full, &preview, InspectDirection::Out, None, 75).unwrap();
+        assert_eq!(omission["per_type_limit"], 75);
+        assert_eq!(omission["matching"], 90);
+        assert_eq!(omission["out_omitted"], 15);
+    }
+
+    #[test]
+    fn property_projection_preserves_authority_and_counts_unicode_as_characters() {
+        let entity = EntityView {
+            ref_string: "knowledge:example".into(),
+            entity_type: bbox_corpus_core::entity_ref::EntityType::Knowledge,
+            properties: BTreeMap::from([
+                ("title".into(), "Example".into()),
+                ("content".into(), "語".repeat(200)),
+                ("graph_generation".into(), "g".repeat(400)),
+                ("graph_source".into(), "published".into()),
+                ("evidence.freshness".into(), "stale".into()),
+            ]),
+            neighborhood: Neighborhood::default(),
+            next_hop_hints: Vec::new(),
+        };
+        assert_eq!(
+            render_properties(&entity, PropertyMode::Smart),
+            entity.properties
+        );
+        let summary = render_properties(&entity, PropertyMode::Summary);
+        assert!(!summary.contains_key("content"));
+        assert_eq!(summary["evidence.freshness"], "stale");
+        assert_eq!(summary["graph_generation"], "g".repeat(400));
+        assert_eq!(summary["graph_source"], "published");
+        assert_eq!(
+            render_properties(&entity, PropertyMode::Full),
+            entity.properties
+        );
+    }
+
+    #[test]
     fn bad_input_uses_design_error_shape() {
         let rendered = bad_input("not-a-ref", "invalid ref");
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
@@ -755,6 +927,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["status"], "ok");
+        assert!(value.get("text").is_none());
+        assert!(value["property_projection"]["omitted"].as_u64().unwrap() > 0);
+        assert!(value["property_projection"]["expand_hint"].is_string());
         assert_eq!(
             value["entity_ref"],
             "system_memory:sm-agentic-opening-sequence"
@@ -831,7 +1006,10 @@ mod tests {
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        let coverage = value["edge_family_coverage"].as_array().unwrap();
+        let coverage = value["edge_family_coverage"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         for row in coverage {
             let count = row["count"].as_u64().unwrap();
             let expected = row["expected"].as_str().unwrap();

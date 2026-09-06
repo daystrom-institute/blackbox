@@ -69,102 +69,22 @@ pub fn describe_schema_with_options(
         })
         .collect::<Vec<_>>();
     let edge_families = edge_families();
-    let included_agents = if options.include_agents { agents } else { &[] };
-    let agents_by_adapter = group_agents_by_adapter(included_agents);
-    let consultants = consultants();
-    let text = render_text(
-        &vertex_types,
-        &edge_families,
-        included_agents,
-        &consultants,
-        !options.include_agents,
-    );
-    let response = json!({
+    let mut response = json!({
         "status": "ok",
-        "text": text,
         "vertex_types": vertex_types,
         "edge_families": edge_families,
-        "agents": included_agents,
-        "agents_omitted": !options.include_agents,
-        "agents_hint": "Pass include_agents=true or mode=\"full\" to include the installed-agent catalog.",
-        "agents_by_dispatch_adapter": agents_by_adapter,
-        "consultants": consultants,
     });
+    if options.include_agents {
+        if !agents.is_empty() {
+            response["agents"] = json!(agents);
+        }
+        response["consultants"] = json!(consultants());
+    } else {
+        response["agents_omitted"] = json!(true);
+        response["agents_hint"] =
+            json!("Pass include_agents=true or mode=full for installed agents and consultants.");
+    }
     Ok(serde_json::to_string_pretty(&response)?)
-}
-
-fn render_text(
-    vertex_types: &[serde_json::Value],
-    edge_families: &[serde_json::Value],
-    agents: &[AgentSchemaEntry],
-    consultants: &[ConsultantSchemaEntry],
-    agents_omitted: bool,
-) -> String {
-    let mut text = String::from("## Agentic Corpus Schema\n\n### Vertex Types\n");
-    for vertex in vertex_types {
-        text.push_str(&format!(
-            "- `{}`: {} entities\n",
-            vertex["entity_type"].as_str().unwrap_or_default(),
-            vertex["population_count"].as_u64().unwrap_or_default()
-        ));
-    }
-    text.push_str("\n### Edge Families\n");
-    for family in edge_families {
-        text.push_str(&format!(
-            "- **{}**: {}\n",
-            family["family"].as_str().unwrap_or_default(),
-            family["types"]
-                .as_array()
-                .map(|values| values
-                    .iter()
-                    .filter_map(|value| value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "))
-                .unwrap_or_default()
-        ));
-    }
-    if !agents.is_empty() {
-        text.push_str("\n### Installed Agents\n");
-        for agent in agents {
-            text.push_str(&format!(
-                "- **{}** (v{}, {}): {}\n",
-                agent.name, agent.version, agent.cost_class, agent.description
-            ));
-            if !agent.when_to_use.is_empty() {
-                for w in &agent.when_to_use {
-                    text.push_str(&format!("  - use: {w}\n"));
-                }
-            }
-        }
-    } else if agents_omitted {
-        text.push_str(
-            "\n### Installed Agents\n- Omitted from compact orientation. Call `bbox_describe_schema` with `include_agents=true` or `mode=\"full\"` for the installed-agent catalog.\n",
-        );
-    }
-    if !consultants.is_empty() {
-        text.push_str("\n### Consultants\n");
-        for consultant in consultants {
-            text.push_str(&format!(
-                "- **{}**: {} Tools: {}\n",
-                consultant.name,
-                consultant.description,
-                consultant.tools.join(", ")
-            ));
-        }
-    }
-    text
-}
-
-fn group_agents_by_adapter(agents: &[AgentSchemaEntry]) -> BTreeMap<String, Vec<&str>> {
-    let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    for agent in agents {
-        let key = agent
-            .dispatch_adapter
-            .clone()
-            .unwrap_or_else(|| "direct".to_string());
-        groups.entry(key).or_default().push(&agent.name);
-    }
-    groups
 }
 
 fn consultants() -> Vec<ConsultantSchemaEntry> {
@@ -364,42 +284,47 @@ mod tests {
         );
         assert_eq!(agents_arr[1]["dispatch_adapter"].as_str(), Some("badgey"));
 
-        let by_adapter = value["agents_by_dispatch_adapter"].as_object().unwrap();
-        assert_eq!(by_adapter.len(), 2);
-        let direct = by_adapter["direct"].as_array().unwrap();
-        assert_eq!(direct.len(), 1);
-        assert_eq!(direct[0].as_str(), Some("reviewer"));
-        let badgey = by_adapter["badgey"].as_array().unwrap();
-        assert_eq!(badgey.len(), 1);
-        assert_eq!(badgey[0].as_str(), Some("badge-tester"));
-
-        let text = value["text"].as_str().unwrap();
-        assert!(text.contains("### Installed Agents"));
-        assert!(text.contains("**reviewer** (v2, normal)"));
+        assert!(value.get("text").is_none());
+        assert!(value.get("agents_by_dispatch_adapter").is_none());
     }
 
     #[test]
     fn schema_no_agents_section_when_empty() {
         let rendered = describe_schema(&BTreeMap::new(), &[]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(
-            value["agents"].as_array().unwrap().len(),
-            0,
-            "agents should be empty array"
-        );
-        assert_eq!(
-            value["agents_by_dispatch_adapter"]
-                .as_object()
-                .unwrap()
-                .len(),
-            0,
-            "agents_by_dispatch_adapter should be empty object"
-        );
-        let text = value["text"].as_str().unwrap();
-        assert!(
-            !text.contains("### Installed Agents"),
-            "no agents header when empty"
-        );
+        assert!(value.get("agents").is_none());
+        assert!(value.get("agents_by_dispatch_adapter").is_none());
+        assert!(value.get("text").is_none());
+    }
+
+    #[test]
+    fn orientation_omits_unrequested_catalogs_and_keeps_vocabulary() {
+        let orientation: serde_json::Value = serde_json::from_str(
+            &describe_schema_with_options(
+                &BTreeMap::new(),
+                &[],
+                DescribeSchemaOptions {
+                    include_agents: false,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let full: serde_json::Value =
+            serde_json::from_str(&describe_schema(&BTreeMap::new(), &[]).unwrap()).unwrap();
+        for field in ["vertex_types", "edge_families"] {
+            assert_eq!(orientation[field], full[field]);
+        }
+        assert_eq!(orientation["agents_omitted"], true);
+        assert!(orientation["agents_hint"].is_string());
+        for field in [
+            "text",
+            "agents",
+            "consultants",
+            "agents_by_dispatch_adapter",
+        ] {
+            assert!(orientation.get(field).is_none(), "{field}");
+        }
     }
 
     #[test]
@@ -418,6 +343,6 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "badgey_exec")
         );
-        assert!(value["text"].as_str().unwrap().contains("### Consultants"));
+        assert!(value.get("text").is_none());
     }
 }

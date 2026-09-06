@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,8 +25,9 @@ pub struct BundleEvidenceParams {
     /// Knowledge visibility policy: published, own, or all.
     #[serde(default)]
     pub provisional: Option<String>,
-    /// Entity property payload mode. `full` preserves legacy behavior.
-    /// `summary` truncates long string properties. `none` omits properties.
+    /// Entity properties: full (default), summary (strings shortened to 600
+    /// characters), or none. Unknown modes are rejected. Shortened summaries
+    /// are marked; repeat with full and fewer entity_refs for complete bodies.
     #[serde(default)]
     pub property_mode: Option<String>,
 }
@@ -44,6 +45,16 @@ pub fn bundle_evidence(
     edge_index: &EdgeIndex,
     cache: &mut PathCache,
 ) -> Result<String> {
+    let property_mode = match PropertyMode::from_param(p.property_mode.as_deref()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            return Ok(super::inspect::bad_input_field(
+                "property_mode",
+                error.to_string(),
+                "Use property_mode=full, summary, or none.",
+            ));
+        }
+    };
     let mut entities = Vec::new();
     let mut unresolved_entity_refs = Vec::new();
     if p.entity_refs.is_empty() {
@@ -93,21 +104,14 @@ pub fn bundle_evidence(
 
     let refs = entities.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>();
     let mut intra_bundle_edges = intra_bundle_edges(ctx, edge_index, &refs);
-    let intra_bundle_edges_truncated = intra_bundle_edges.len() > INTRA_BUNDLE_EDGE_CAP;
+    let intra_bundle_edge_count = intra_bundle_edges.len();
+    let intra_bundle_edges_truncated = intra_bundle_edge_count > INTRA_BUNDLE_EDGE_CAP;
     intra_bundle_edges.truncate(INTRA_BUNDLE_EDGE_CAP);
     let mut intra_bundle_convergences = intra_bundle_convergences(edge_index, &refs);
+    let intra_bundle_convergence_count = intra_bundle_convergences.len();
     let intra_bundle_convergences_truncated =
-        intra_bundle_convergences.len() > INTRA_BUNDLE_EDGE_CAP;
+        intra_bundle_convergence_count > INTRA_BUNDLE_EDGE_CAP;
     intra_bundle_convergences.truncate(INTRA_BUNDLE_EDGE_CAP);
-    let text = render_text(
-        ctx,
-        &p.question,
-        &entities,
-        &paths,
-        &stale_path_ids,
-        &unresolved_entity_refs,
-    );
-    let property_mode = PropertyMode::from_param(p.property_mode.as_deref());
     // Build `degraded` from only the signal-bearing facts. A clean bundle —
     // nothing stale, nothing unresolved, nothing omitted or truncated, full
     // property mode — degraded to nothing, so the whole block is dropped rather
@@ -132,16 +136,23 @@ pub fn bundle_evidence(
     }
     if intra_bundle_edges_truncated {
         degraded.insert("intra_bundle_edges_truncated".into(), json!(true));
+        degraded.insert(
+            "omitted_intra_bundle_edges".into(),
+            json!(intra_bundle_edge_count - INTRA_BUNDLE_EDGE_CAP),
+        );
     }
     if intra_bundle_convergences_truncated {
         degraded.insert("intra_bundle_convergences_truncated".into(), json!(true));
+        degraded.insert(
+            "omitted_intra_bundle_convergences".into(),
+            json!(intra_bundle_convergence_count - INTRA_BUNDLE_EDGE_CAP),
+        );
     }
     if property_mode != PropertyMode::Full {
         degraded.insert("property_mode".into(), json!(property_mode.as_str()));
     }
     let mut out = json!({
         "status": "ok",
-        "text": text,
         "question": p.question,
         "entities": entities.iter().map(|(r, properties)| json!({
             "entity_ref": r.to_string(),
@@ -177,11 +188,12 @@ enum PropertyMode {
 }
 
 impl PropertyMode {
-    fn from_param(raw: Option<&str>) -> Self {
+    fn from_param(raw: Option<&str>) -> Result<Self> {
         match raw.unwrap_or("full").trim().to_ascii_lowercase().as_str() {
-            "summary" | "compact" => Self::Summary,
-            "none" | "omit" | "omitted" => Self::None,
-            _ => Self::Full,
+            "summary" | "compact" => Ok(Self::Summary),
+            "none" | "omit" | "omitted" => Ok(Self::None),
+            "full" => Ok(Self::Full),
+            other => bail!("invalid property_mode `{other}`; use full, summary, or none"),
         }
     }
 
@@ -387,40 +399,6 @@ fn render_node_short(r: &EntityRef) -> String {
     r.to_string()
 }
 
-fn render_text(
-    ctx: &ProviderContext<'_>,
-    question: &str,
-    entities: &[(EntityRef, BTreeMap<String, String>)],
-    paths: &[CachedPath],
-    stale_path_ids: &[String],
-    unresolved_entity_refs: &[UnresolvedEntityRef],
-) -> String {
-    let mut text = format!("## Evidence Bundle\n\nQuestion: {question}\n\n### Entities\n");
-    for (r, _) in entities {
-        text.push_str(&format!("- {}\n", render_node(ctx, r)));
-    }
-    text.push_str("\n### Paths\n");
-    for path in paths {
-        text.push_str(&format!("- {}: {}\n", path.id, render_path(ctx, path)));
-    }
-    if !stale_path_ids.is_empty() {
-        text.push_str(&format!(
-            "\nDegraded: stale path IDs: {}\n",
-            stale_path_ids.join(", ")
-        ));
-    }
-    if !unresolved_entity_refs.is_empty() {
-        text.push_str("\nDegraded: unresolved entity refs:\n");
-        for unresolved in unresolved_entity_refs {
-            text.push_str(&format!(
-                "- {}: {}\n",
-                unresolved.entity_ref, unresolved.error
-            ));
-        }
-    }
-    text
-}
-
 fn not_found_bundle(unresolved_entity_refs: Vec<UnresolvedEntityRef>) -> String {
     json!({
         "status": "error.not_found",
@@ -436,6 +414,29 @@ fn not_found_bundle(unresolved_entity_refs: Vec<UnresolvedEntityRef>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_property_mode_is_rejected_before_entity_resolution() {
+        let params = BundleEvidenceParams {
+            question: "why?".into(),
+            entity_refs: vec!["knowledge:missing".into()],
+            path_ids: Vec::new(),
+            provisional: None,
+            property_mode: Some("summray".into()),
+        };
+        let value: serde_json::Value = serde_json::from_str(
+            &bundle_evidence(
+                &params,
+                &ProviderContext::empty_for_tests(),
+                &EdgeIndex::default(),
+                &mut PathCache::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["status"], "error.bad_input");
+        assert_eq!(value["error"]["field"], "property_mode");
+    }
 
     #[test]
     fn stale_path_ids_degrade_without_failing_bundle() {
@@ -554,6 +555,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["status"], "ok");
         for absent in [
+            "text",
             "degraded",
             "intra_bundle_edges",
             "intra_bundle_convergences",
