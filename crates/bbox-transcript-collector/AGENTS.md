@@ -21,3 +21,7 @@
 - Begin and complete each scan with authenticated contact evidence. Recording
   scan completion can fail after snapshots were admitted; report that partial
   effect. Transport errors expose only bounded machine codes, never proxy bodies.
+
+- Watch diagnostics retain contextual and underlying transport/OS causes with a
+  bounded error chain. Keep the scan-completion partial-effect context without
+  flattening its cause. HTTP error bodies and bearer headers remain excluded.

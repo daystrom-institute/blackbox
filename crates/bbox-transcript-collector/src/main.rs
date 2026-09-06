@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bbox_transcript_collector::{Client, Config, publish_cycle};
+use bbox_transcript_collector::{Client, Config, error_diagnostic, publish_cycle};
 use clap::{Parser, Subcommand};
 #[derive(Parser)]
 struct Cli {
@@ -35,7 +35,10 @@ async fn main() -> Result<()> {
         Command::Watch { interval_secs } => loop {
             match publish_cycle(&config, &client).await {
                 Ok(report) => println!("{}", serde_json::to_string(&report)?),
-                Err(error) => eprintln!("native transcript cycle failed: {error}"),
+                Err(error) => eprintln!(
+                    "native transcript cycle failed: {}",
+                    error_diagnostic(&error)
+                ),
             }
             tokio::select! { _ = tokio::signal::ctrl_c() => break, _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs.max(1))) => {} }
         },
