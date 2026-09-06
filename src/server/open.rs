@@ -143,34 +143,6 @@ fn open_checkout_registry(store_dir: &Path) -> bbox_indexing::checkout_registry:
     registry
 }
 
-/// Which conversation-lane connector scopes the corpus may project, from the
-/// operator's connector grants.
-///
-/// Config is the authority, not the landing store: a store directory survives
-/// a grant being retired, and projecting from directories on disk would keep a
-/// retired workspace searchable. Reading the grants means retiring one is what
-/// unenrolls it, and the reindex purge follows on the next pass.
-///
-/// The declared `remote_authority` travels with each scope because it is the
-/// one input permalink derivation needs beyond the record itself, and it is
-/// operator-declared rather than producer-supplied.
-fn conversation_source_enrollments(
-    cfg: &config::Config,
-) -> Vec<bbox_corpus_index::transcripts::conversation::ConversationSourceEnrollmentV1> {
-    cfg.source_connectors
-        .producers
-        .iter()
-        .flat_map(|producer| producer.scopes.iter())
-        .filter(|grant| grant.profile == config::ConnectorProfile::Conversation)
-        .map(
-            |grant| bbox_corpus_index::transcripts::conversation::ConversationSourceEnrollmentV1 {
-                scope: grant.scope(),
-                remote_authority: grant.remote_authority.clone(),
-            },
-        )
-        .collect()
-}
-
 fn backfill_project_languages(
     projects: &Arc<RwLock<ProjectRegistry>>,
     checkout_access: &bbox_indexing::checkout_access::CheckoutAccessBroker,
@@ -565,14 +537,21 @@ pub(super) fn open_shared_state(
             Vec::new()
         },
     );
-    // Connector-landed conversations. Enrollment is operator config, read
-    // here from the connector grants that name the conversation lane: a scope
-    // the operator retires stops being scanned and the reindex purge removes
-    // its documents.
-    idx.set_conversation_sources(
-        cfg.paths.state_dir.join("conversation-sources"),
-        conversation_source_enrollments(&cfg),
-    );
+    // Read enrollment is explicit operator authority: live conversation
+    // grants or validated retained read-only scopes, never store discovery.
+    let conversation_root = cfg.paths.state_dir.join("conversation-sources");
+    let conversation_catalog = catalog_store
+        .as_ref()
+        .map(|store| store.snapshot())
+        .transpose()?;
+    let conversation_enrollments = super::conversation_enrollment::resolve(
+        &cfg.source_connectors,
+        conversation_catalog
+            .as_ref()
+            .map(|snapshot| snapshot.catalog()),
+        &conversation_root,
+    )?;
+    idx.set_conversation_sources(conversation_root, conversation_enrollments);
     // The daemon's single tantivy writer: every index mutation and reindex
     // pass flows through this actor (concurrency-model §4.3). Spawned AFTER
     // all ReindexConfig mutation — the actor clones the config at spawn.

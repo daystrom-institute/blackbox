@@ -785,6 +785,7 @@ mod tests {
     fn table(root: &StdPath) -> ConnectorGrantRuntime {
         use crate::config::ConnectorProfile;
         let config = crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![
                 crate::config::ConnectorProducerConfig {
@@ -1005,6 +1006,7 @@ mod tests {
     ) -> String {
         let token_secret = "c".repeat(64);
         let config = crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![crate::config::ConnectorProducerConfig {
                 producer_id: "producer-a".into(),
@@ -1039,6 +1041,7 @@ mod tests {
         let conversation_secret = "c".repeat(64);
         let other_secret = "d".repeat(64);
         let config = crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![
                 crate::config::ConnectorProducerConfig {
@@ -1168,6 +1171,199 @@ mod tests {
             records,
             observed_at: "2026-08-13T00:00:00Z".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn retained_conversation_history_survives_grant_removal_without_authorizing_writes() {
+        use bbox_corpus_index::transcripts::adapters::{
+            TranscriptReadAdapter, TranscriptScanTarget,
+        };
+        use bbox_corpus_index::transcripts::conversation::ConversationTranscriptAdapter;
+        use tower::ServiceExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (state, token) = pending_state(&root);
+        let app = router(state.clone()).with_state(state.clone());
+        for (endpoint, body) in [
+            (
+                "catalog/onboard",
+                serde_json::to_vec(&onboard_request()).unwrap(),
+            ),
+            ("batches", serde_json::to_vec(&one_message_batch()).unwrap()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "POST",
+                    &format!("/internal/conversation-source/v1/{endpoint}"),
+                    &token,
+                    axum::body::Body::from(body),
+                    "fixture",
+                ))
+                .await
+                .unwrap();
+            assert!(
+                response.status().is_success(),
+                "initial ingest failed: {}",
+                response.status()
+            );
+        }
+        let catalog = state
+            .project_authority
+            .catalog_store()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let landing_root = root.join(CONVERSATION_SOURCE_DIR);
+        let live = super::super::conversation_enrollment::resolve(
+            &state.config.read().source_connectors,
+            Some(catalog.catalog()),
+            &landing_root,
+        )
+        .unwrap();
+        let retained = crate::config::SourceConnectorsConfig {
+            retained_conversations: vec![crate::config::RetainedConversationSource {
+                connector_source_id: scope(SOURCE_A).connector_source_id().clone(),
+                connector_kind: scope(SOURCE_A).connector_kind().clone(),
+                workspace_id: "T0FIXTURE".into(),
+                remote_authority: "workspace.example".into(),
+            }],
+            ..Default::default()
+        };
+        let read_enrollments = super::super::conversation_enrollment::resolve(
+            &retained,
+            Some(catalog.catalog()),
+            &landing_root,
+        )
+        .unwrap();
+        assert_eq!(
+            read_enrollments, live,
+            "retention preserves the exact existing transcript projection identity"
+        );
+        let auth = ConnectorGrantRuntime::build(&retained, Some(catalog.catalog())).unwrap();
+        assert!(auth.authenticate(&token).is_none());
+        assert!(auth.grants().is_empty());
+        assert_eq!(
+            require_ingest_scope(&auth, &caller("producer-a"), &scope(SOURCE_A))
+                .unwrap_err()
+                .body
+                .code,
+            "scope_forbidden"
+        );
+        state.config.write().source_connectors = retained.clone();
+        state.code_sources.install_auth_for_test(Arc::new(
+            crate::server::producer_auth::ProducerAuthRuntime::for_test_connectors(Arc::new(auth)),
+        ));
+
+        let store = state.conversation_sources.store();
+        let journal = store.channel_journal_path(&scope(SOURCE_A), "T0FIXTURE", "C0OPSFIX");
+        let before = std::fs::read(&journal).unwrap();
+        for endpoint in ["catalog/onboard", "channels", "batches", "revisions"] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "POST",
+                    &format!("/internal/conversation-source/v1/{endpoint}"),
+                    &token,
+                    axum::body::Body::from(serde_json::to_vec(&one_message_batch()).unwrap()),
+                    "fixture",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let error: ErrorResponse = json_body(response).await;
+            assert_eq!(
+                error.code, "service_disabled",
+                "retained rows cannot reopen the ingest middleware"
+            );
+        }
+        // Retention also stays read-only while an unrelated producer keeps
+        // the ingest family enabled: neither the retired token nor a valid
+        // token for a different source can write this history.
+        let other_token = "d".repeat(64);
+        let mut enabled_retention = retained.clone();
+        enabled_retention.enabled = true;
+        enabled_retention.producers = vec![crate::config::ConnectorProducerConfig {
+            producer_id: "producer-other".into(),
+            token_file: token_file(&root, "token-retention-other", &other_token),
+            token_files: Vec::new(),
+            scopes: vec![grant(SOURCE_C, crate::config::ConnectorProfile::File)],
+        }];
+        let auth =
+            ConnectorGrantRuntime::build(&enabled_retention, Some(catalog.catalog())).unwrap();
+        assert!(auth.authenticate(&token).is_none());
+        state.config.write().source_connectors = enabled_retention;
+        state.code_sources.install_auth_for_test(Arc::new(
+            crate::server::producer_auth::ProducerAuthRuntime::for_test_connectors(Arc::new(auth)),
+        ));
+        for (bearer, expected_status, expected_code) in [
+            (&token, StatusCode::UNAUTHORIZED, "unauthorized"),
+            (&other_token, StatusCode::FORBIDDEN, "scope_forbidden"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "POST",
+                    "/internal/conversation-source/v1/batches",
+                    bearer,
+                    axum::body::Body::from(serde_json::to_vec(&one_message_batch()).unwrap()),
+                    "fixture",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                json_body::<ErrorResponse>(response).await.code,
+                expected_code
+            );
+        }
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        let adapter = ConversationTranscriptAdapter::open(&landing_root, read_enrollments).unwrap();
+        let locations = adapter
+            .scan_locations(TranscriptScanTarget::Sessions)
+            .unwrap();
+        assert_eq!(locations.len(), 1);
+        let snapshot = adapter.load_snapshot(&locations[0]).unwrap();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(
+            snapshot.events[0].content,
+            one_message_batch().records[0].text
+        );
+        assert_eq!(
+            snapshot.events[0].timestamp.as_deref(),
+            Some("2024-04-05T19:34:38Z")
+        );
+
+        // Retention does not override an existing membership revocation.
+        store
+            .record_roster(
+                &scope(SOURCE_A),
+                "T0FIXTURE",
+                &[bbox_conversation_source::ChannelObservationV1 {
+                    channel_id: "C0OPSFIX".into(),
+                    observed_name: None,
+                    class: bbox_conversation_source::ChannelClassV1::Public,
+                    is_member: false,
+                    observed_at: "2026-08-13T00:10:00Z".into(),
+                }],
+                false,
+                "2026-08-13T00:10:00Z",
+            )
+            .unwrap();
+        assert!(
+            adapter
+                .scan_locations(TranscriptScanTarget::Sessions)
+                .unwrap()
+                .is_empty()
+        );
+        let revoked = super::super::conversation_enrollment::resolve(
+            &crate::config::SourceConnectorsConfig::default(),
+            Some(catalog.catalog()),
+            &landing_root,
+        )
+        .unwrap();
+        assert!(ConversationTranscriptAdapter::open(&landing_root, revoked).is_none());
     }
 
     #[tokio::test]

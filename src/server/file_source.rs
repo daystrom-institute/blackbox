@@ -789,6 +789,7 @@ mod tests {
     /// SOURCE_B, with only `cataloged` resolved to a catalog project.
     fn table(root: &StdPath, cataloged: &str) -> ConnectorGrantRuntime {
         let config = crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![
                 crate::config::ConnectorProducerConfig {
@@ -875,6 +876,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let config = crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![crate::config::ConnectorProducerConfig {
                 producer_id: "producer-conversation".into(),
