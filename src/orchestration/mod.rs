@@ -265,7 +265,7 @@ pub struct ReadoptedSession {
 /// rather than killing them.
 ///
 /// A task the previous daemon left `Running` was flipped to `Failed`
-/// (`recoverable: true`) by `TaskStore::load`. Re-adoption puts it back to
+/// (`recoverable: true`) by `TaskStore::load` unless owner-managed. Re-adoption puts it back to
 /// `Running`, because the child genuinely never died: the daemon did.
 pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
     let ReadoptedSession {
@@ -283,6 +283,16 @@ pub fn readopt_harness_session(session: ReadoptedSession) -> Option<u64> {
     } = session;
     let env = readoption_env().get()?;
     let task = env.task_store.read().get(&task_id)?;
+    {
+        let inner = task.inner.lock();
+        if inner.workflow_owned
+            || workflow_owned_for_origin(inner.origin)
+            || inner.provider == Provider::Workflow
+        {
+            tracing::warn!(%task_id, "owner-managed task is not eligible for ordinary harness re-adoption");
+            return None;
+        }
+    }
 
     match (&workspace_id, &workspace_scope, &workspace_binding_token) {
         (Some(workspace_id), Some(workspace_scope), Some(token)) => {
@@ -1621,6 +1631,10 @@ pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc
 pub struct TaskStore {
     tasks: HashMap<String, Arc<Task>>,
     reserved: HashSet<String>,
+    // Opaque rows remain in snapshots and cannot acquire executable identities.
+    quarantined_rows: Vec<Value>,
+    quarantined_ids: HashSet<String>,
+    persistence_blocked: bool,
 }
 
 impl TaskStore {
@@ -1646,6 +1660,9 @@ impl TaskStore {
         Self {
             tasks: HashMap::new(),
             reserved: HashSet::new(),
+            quarantined_rows: Vec::new(),
+            quarantined_ids: HashSet::new(),
+            persistence_blocked: false,
         }
     }
 
@@ -1654,7 +1671,9 @@ impl TaskStore {
     }
 
     pub fn contains(&self, id: &str) -> bool {
-        self.tasks.contains_key(id) || self.reserved.contains(id)
+        self.tasks.contains_key(id)
+            || self.reserved.contains(id)
+            || self.quarantined_ids.contains(id)
     }
 
     pub fn reserve_id(&mut self, id: &str) -> Result<(), BroSpawnError> {
@@ -1670,7 +1689,7 @@ impl TaskStore {
         if self.tasks.contains_key(&id) {
             return Err(BroSpawnError::DuplicateTaskId { id });
         }
-        if self.reserved.contains(&id) {
+        if self.reserved.contains(&id) || self.quarantined_ids.contains(&id) {
             return Err(BroSpawnError::ReservedTaskId { id });
         }
         self.tasks.insert(id, task);
@@ -1678,7 +1697,7 @@ impl TaskStore {
     }
 
     fn insert_reserved(&mut self, id: String, task: Arc<Task>) -> Result<(), BroSpawnError> {
-        if self.tasks.contains_key(&id) {
+        if self.tasks.contains_key(&id) || self.quarantined_ids.contains(&id) {
             self.reserved.remove(&id);
             return Err(BroSpawnError::DuplicateTaskId { id });
         }
@@ -1799,6 +1818,39 @@ struct PersistedTask {
     workflow_owned: Option<bool>,
 }
 
+/// Preserve the exact input before a repaired snapshot may replace it. The
+/// content-addressed name avoids repeated backups of unchanged bad snapshots.
+fn quarantine_task_snapshot(store_dir: &std::path::Path, data: &[u8]) -> std::io::Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let backup = store_dir.join(format!("tasks.quarantine.{:x}.json", Sha256::digest(data)));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&backup) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+                let _ = std::fs::remove_file(&backup);
+                return Err(error);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read(&backup)? != data {
+                return Err(std::io::Error::other(
+                    "existing task quarantine does not match snapshot",
+                ));
+            }
+            std::fs::File::open(&backup)?.sync_all()?;
+        }
+        Err(error) => return Err(error),
+    }
+    std::fs::File::open(store_dir)?.sync_all()?;
+    Ok(backup)
+}
+
 impl TaskStore {
     /// Synchronous full persist. The runtime hot paths now route through the
     /// off-worker [`request_persist`] actor; this direct entry is retained for
@@ -1831,7 +1883,13 @@ impl TaskStore {
     /// `persist` path and the off-worker [`TaskPersister`] actor so the two can
     /// never diverge in what they write.
     pub fn serialize_snapshot(&self, event_limit: usize) -> Option<String> {
-        let records: Vec<PersistedTask> = self
+        if self.persistence_blocked {
+            tracing::error!(
+                "task persistence refused: repair the unreadable tasks.json or its quarantine storage, then restart; existing snapshot has not been replaced"
+            );
+            return None;
+        }
+        let mut records: Vec<PersistedTask> = self
             .tasks
             .values()
             .map(|t| {
@@ -1879,7 +1937,26 @@ impl TaskStore {
                 }
             })
             .collect();
-        serde_json::to_string(&records).ok()
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum SnapshotRow<'a> {
+            Task(&'a PersistedTask),
+            Quarantined(&'a Value),
+        }
+        let rows: Vec<_> = records
+            .iter()
+            .map(SnapshotRow::Task)
+            .chain(self.quarantined_rows.iter().map(SnapshotRow::Quarantined))
+            .collect();
+        let result = serde_json::to_string(&rows);
+        match result {
+            Ok(data) => Some(data),
+            Err(error) => {
+                tracing::error!(%error, "task snapshot serialization failed; existing snapshot retained");
+                None
+            }
+        }
     }
 
     /// Atomically write a pre-serialized snapshot to `tasks.json` (tmp + rename).
@@ -1895,17 +1972,69 @@ impl TaskStore {
         }
     }
 
+    /// Recover readable rows independently. Damaged rows remain opaque and
+    /// reserve their IDs; invalid snapshots or failed exact-byte quarantine
+    /// disable persistence so later writes cannot erase the input evidence.
     pub fn load(store_dir: &std::path::Path, ttl_ms: u64) -> Self {
         let file = store_dir.join("tasks.json");
         let mut store = Self::new();
-        let data = match std::fs::read_to_string(&file) {
-            Ok(d) => d,
-            Err(_) => return store,
+        let data = match std::fs::read(&file) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return store,
+            Err(error) => {
+                store.persistence_blocked = true;
+                tracing::error!(%error, "cannot read tasks.json; task persistence disabled until repair and restart");
+                return store;
+            }
         };
-        let records: Vec<PersistedTask> = match serde_json::from_str(&data) {
-            Ok(r) => r,
-            Err(_) => return store,
+        let rows: Vec<Value> = match serde_json::from_slice(&data) {
+            Ok(rows) => rows,
+            Err(error) => {
+                store.persistence_blocked = true;
+                tracing::error!(
+                    line = error.line(),
+                    column = error.column(),
+                    "invalid tasks.json array; task persistence disabled until repair and restart; original bytes retained"
+                );
+                return store;
+            }
         };
+        let mut id_counts = HashMap::<String, usize>::new();
+        for row in &rows {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                *id_counts.entry(id.to_owned()).or_default() += 1;
+            }
+        }
+        let mut records = Vec::new();
+        for row in rows {
+            let duplicate = row
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id_counts[id] > 1);
+            match serde_json::from_value::<PersistedTask>(row.clone()) {
+                Ok(record) if !duplicate => records.push(record),
+                _ => {
+                    if let Some(id) = row.get("id").and_then(Value::as_str) {
+                        store.quarantined_ids.insert(id.to_owned());
+                    }
+                    store.quarantined_rows.push(row);
+                }
+            }
+        }
+        if !store.quarantined_rows.is_empty() {
+            match quarantine_task_snapshot(store_dir, &data) {
+                Ok(backup) => tracing::error!(
+                    quarantined_rows = store.quarantined_rows.len(),
+                    snapshot_backup = %backup.display(),
+                    "unreadable or duplicate task rows quarantined; readable tasks retained; opaque rows remain in future snapshots and require operator repair"
+                ),
+                Err(error) => {
+                    store.persistence_blocked = true;
+                    tracing::error!(%error, quarantined_rows = store.quarantined_rows.len(),
+                        "task snapshot quarantine failed; readable tasks retained in memory but persistence disabled until repair and restart");
+                }
+            }
+        }
         // ── Task TTL retention ───────────────────────────────────────────
         // At daemon startup, tasks whose `started_at` is older than `ttl_ms`
         // are permanently dropped from the store. This is the ONLY automatic
@@ -1922,17 +2051,32 @@ impl TaskStore {
             if rec.started_at < cutoff {
                 continue;
             }
+            // Ownership cannot be weakened by an older/inconsistent false flag.
+            let workflow_owned = rec.workflow_owned.unwrap_or(false)
+                || workflow_owned_for_origin(rec.origin)
+                || rec.provider == Provider::Workflow;
             let model = rec.model.or_else(|| model_from_events_at_load(&rec.events));
             if rec.status == TaskStatus::Running {
                 rec.status = TaskStatus::Failed;
                 rec.completed_at = Some(now_ms());
-                rec.stderr.push_str(
-                    "\n[blackbox] server restarted while task was running. \
-                     The provider session is still on disk; retry with \
-                     `bro_resume(session_id=...)` to continue the conversation \
-                     rather than starting a fresh session.",
-                );
-                rec.recoverable = true;
+                if workflow_owned {
+                    rec.stderr.push_str(
+                        "\n[blackbox] server restarted while an owner-managed task was running. \
+                         Retained for inspection; ordinary bro resume/re-adoption is unavailable. \
+                         The owning workflow or atom must handle recovery while that runtime exists.",
+                    );
+                } else {
+                    rec.stderr.push_str(
+                        "\n[blackbox] server restarted while task was running. \
+                         The provider session is still on disk; retry with \
+                         `bro_resume(session_id=...)` to continue the conversation \
+                         rather than starting a fresh session.",
+                    );
+                }
+                rec.recoverable = !workflow_owned;
+            }
+            if workflow_owned {
+                rec.recoverable = false;
             }
             let events = EventRing::from_loaded(rec.events);
             let live_cursor = rec.live_cursor.max(events.len() as u64);
@@ -1970,9 +2114,7 @@ impl TaskStore {
                     last_delta_roster_emit_ms: 0,
                     supervision: rec.supervision,
                     origin: rec.origin,
-                    workflow_owned: rec
-                        .workflow_owned
-                        .unwrap_or_else(|| workflow_owned_for_origin(rec.origin)),
+                    workflow_owned,
                 }),
                 notify: Arc::new(Notify::new()),
                 child_id: Mutex::new(None),
@@ -7175,6 +7317,221 @@ mod tests {
         );
     }
 
+    fn persisted_task_fixture(id: &str) -> Value {
+        let mut store = TaskStore::new();
+        store
+            .insert(
+                id.into(),
+                test_task(id, TaskStatus::Completed, Provider::Brodex),
+            )
+            .unwrap();
+        let rows: Vec<Value> =
+            serde_json::from_str(&store.serialize_snapshot(50).unwrap()).unwrap();
+        rows.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn task_store_quarantines_unknown_rows_without_losing_readable_tasks_or_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let current = persisted_task_fixture("current");
+        let mut unknown_provider = persisted_task_fixture("future-provider");
+        unknown_provider["provider"] = json!("future-provider-kind");
+        let mut unknown_origin = persisted_task_fixture("future-origin");
+        unknown_origin["origin"] = json!("future-origin-kind");
+        let mut invalid_events = persisted_task_fixture("broken-events");
+        invalid_events["events"] = json!("not-an-array");
+        let opaque = vec![unknown_provider, unknown_origin, invalid_events];
+        let mut rows = vec![current];
+        rows.extend(opaque.clone());
+        let original = serde_json::to_vec_pretty(&rows).unwrap();
+        std::fs::write(root.join("tasks.json"), &original).unwrap();
+
+        let mut loaded = TaskStore::load(&root, u64::MAX);
+        assert_eq!(loaded.all_tasks().len(), 1);
+        assert_eq!(loaded.quarantined_rows, opaque);
+        assert!(!loaded.persistence_blocked);
+        let backup = quarantine_task_snapshot(&root, &original).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        for id in ["future-provider", "future-origin", "broken-events"] {
+            assert!(loaded.get(id).is_none());
+            assert!(loaded.reserve_id(id).is_err());
+            assert!(
+                loaded
+                    .insert_reserved(
+                        id.into(),
+                        test_task(id, TaskStatus::Running, Provider::Brodex)
+                    )
+                    .is_err()
+            );
+        }
+        loaded.get("current").unwrap().inner.lock().name = Some("updated".into());
+        loaded.persist(&root);
+        let reloaded = TaskStore::load(&root, u64::MAX);
+        assert_eq!(
+            reloaded
+                .get("current")
+                .unwrap()
+                .inner
+                .lock()
+                .name
+                .as_deref(),
+            Some("updated")
+        );
+        assert_eq!(reloaded.quarantined_rows, opaque);
+        assert_eq!(std::fs::read(backup).unwrap(), original);
+    }
+
+    #[test]
+    fn task_store_quarantines_every_duplicate_identity_instead_of_choosing_a_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let first = persisted_task_fixture("ambiguous");
+        let mut second = first.clone();
+        second["session_id"] = json!("another-session");
+        let rows = json!([first, second, persisted_task_fixture("unambiguous")]);
+        std::fs::write(root.join("tasks.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
+        let mut loaded = TaskStore::load(&root, u64::MAX);
+        assert!(loaded.get("ambiguous").is_none());
+        assert!(loaded.reserve_id("ambiguous").is_err());
+        assert!(loaded.get("unambiguous").is_some());
+        assert_eq!(loaded.quarantined_rows.len(), 2);
+        loaded.persist(&root);
+        let reloaded = TaskStore::load(&root, u64::MAX);
+        assert!(reloaded.get("ambiguous").is_none());
+        assert_eq!(reloaded.quarantined_rows.len(), 2);
+    }
+
+    #[test]
+    fn task_store_unreadable_snapshot_blocks_every_snapshot_path_without_overwriting() {
+        for original in [b"[{\"id\":\"partial".as_slice(), b"{}", &[0xff, 0xfe]] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            std::fs::write(root.join("tasks.json"), original).unwrap();
+            let mut loaded = TaskStore::load(&root, u64::MAX);
+            assert!(loaded.persistence_blocked);
+            loaded
+                .insert(
+                    "new-task".into(),
+                    test_task("new-task", TaskStatus::Completed, Provider::Brodex),
+                )
+                .unwrap();
+            assert!(loaded.serialize_snapshot(50).is_none());
+            loaded.persist(&root);
+            loaded.persist_all_events(&root);
+            assert_eq!(std::fs::read(root.join("tasks.json")).unwrap(), original);
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("tasks.json")).unwrap();
+        assert!(TaskStore::load(&root, u64::MAX).persistence_blocked);
+        assert!(!TaskStore::load(&root.join("missing-store"), u64::MAX).persistence_blocked);
+    }
+
+    #[test]
+    fn task_store_quarantine_failure_retains_valid_rows_but_blocks_overwrite() {
+        use sha2::{Digest, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let original =
+            serde_json::to_vec(&json!([persisted_task_fixture("valid"), {"id": "invalid"}]))
+                .unwrap();
+        std::fs::write(root.join("tasks.json"), &original).unwrap();
+        let backup = root.join(format!(
+            "tasks.quarantine.{:x}.json",
+            Sha256::digest(&original)
+        ));
+        // An existing, incorrect backup must never be trusted or overwritten.
+        std::fs::write(&backup, b"unrelated bytes").unwrap();
+        let loaded = TaskStore::load(&root, u64::MAX);
+        assert!(loaded.get("valid").is_some());
+        assert!(loaded.persistence_blocked);
+        loaded.persist(&root);
+        assert_eq!(std::fs::read(root.join("tasks.json")).unwrap(), original);
+        assert_eq!(std::fs::read(backup).unwrap(), b"unrelated bytes");
+    }
+
+    #[test]
+    fn task_store_mixed_legacy_tasks_remain_inspectable_and_owner_guarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut rows = Vec::new();
+        for (id, provider, origin, owned) in [
+            ("current", "brodex", "cockpit", false),
+            ("legacy-workflow-provider", "workflow", "unknown", false),
+            ("legacy-workflow-origin", "glm", "workflow", false),
+            ("legacy-atom", "glm", "atom", false),
+            ("legacy-owned", "brodex", "unknown", true),
+        ] {
+            let mut row = persisted_task_fixture(id);
+            row["provider"] = json!(provider);
+            row["origin"] = json!(origin);
+            row["workflow_owned"] = json!(owned);
+            row["status"] = json!("running");
+            row["recoverable"] = json!(true);
+            row["managed_worktree"] = json!("/synthetic/retained-worktree");
+            rows.push(row);
+        }
+        let mut missing_owner_flag = persisted_task_fixture("legacy-missing-owner");
+        missing_owner_flag["origin"] = json!("atom");
+        missing_owner_flag["recoverable"] = json!(true);
+        missing_owner_flag["status"] = json!("failed");
+        missing_owner_flag
+            .as_object_mut()
+            .unwrap()
+            .remove("workflow_owned");
+        rows.push(missing_owner_flag);
+        std::fs::write(root.join("tasks.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
+        let loaded = TaskStore::load(&root, u64::MAX);
+        assert_eq!(loaded.all_tasks().len(), rows.len());
+        assert!(loaded.quarantined_rows.is_empty());
+        for row in &rows {
+            let id = row["id"].as_str().unwrap();
+            let task = loaded.get(id).unwrap();
+            let inner = task.inner.lock();
+            assert_eq!(inner.status, TaskStatus::Failed);
+            if id == "current" {
+                assert!(!inner.workflow_owned);
+                assert!(inner.recoverable);
+                assert!(inner.stderr.contains("bro_resume"));
+            } else {
+                assert!(inner.workflow_owned, "ownership lost for {id}");
+                assert!(
+                    !inner.recoverable,
+                    "owner-managed task became resumable: {id}"
+                );
+                assert!(!inner.stderr.contains("bro_resume"));
+                assert_eq!(serde_json::to_value(inner.origin).unwrap(), row["origin"]);
+                assert_eq!(
+                    serde_json::to_value(inner.provider).unwrap(),
+                    row["provider"]
+                );
+            }
+            assert_eq!(
+                inner.managed_worktree.as_deref(),
+                row["managed_worktree"].as_str()
+            );
+        }
+        loaded.persist(&root);
+        let again = TaskStore::load(&root, u64::MAX);
+        assert!(
+            again
+                .get("legacy-workflow-provider")
+                .unwrap()
+                .inner
+                .lock()
+                .workflow_owned
+        );
+        assert!(
+            !again
+                .get("legacy-missing-owner")
+                .unwrap()
+                .inner
+                .lock()
+                .recoverable
+        );
+    }
+
     // Slice 1b — the spawn-time `origin` (bro_core::Origin) must
     // SURVIVE the on-disk round-trip so a daemon restart doesn't
     // reset every task's origin to `Unknown` and lose the
@@ -7202,6 +7559,8 @@ mod tests {
             ("origin-atom", bro_core::Origin::Atom),
             ("origin-agent", bro_core::Origin::AgentDispatch),
             ("origin-unknown", bro_core::Origin::Unknown),
+            ("origin-cron", bro_core::Origin::Cron),
+            ("origin-webhook", bro_core::Origin::Webhook),
         ];
         for (id, origin) in variants {
             let task = test_task(id, TaskStatus::Completed, Provider::Glm);
@@ -7227,6 +7586,8 @@ mod tests {
             "\"origin\":\"atom\"",
             "\"origin\":\"agentdispatch\"",
             "\"origin\":\"unknown\"",
+            "\"origin\":\"cron\"",
+            "\"origin\":\"webhook\"",
         ] {
             assert!(
                 raw.contains(needle),
