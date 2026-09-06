@@ -659,7 +659,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_inbox",
         category: ToolCategory::Inbox,
         summary: "Aggregate attention layer across every store.",
-        when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view. Open gaps from the `bbox_gap` store surface here too; pass `import_gap_spool=true`, `aggregate_gaps=true`, or `check_gap_closeouts=true` for the gap workflow helpers. See `sm-gap-notes` via `bbox_knowledge`.",
+        when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view. Open gaps appear here too. This is a read-only preview: default 10, maximum 20 rows per section. aggregate_gaps=true adds bounded group counts. Expand with the dedicated list/search tools. Gap-spool import and Git closeout checks are retired from this tool; use bbox_gap for filing and the owning harness for repository checks. See `sm-gap-notes` via `bbox_knowledge`.",
         example: Some(r#"bbox_inbox(project="/repo/x", stale_days=3)"#),
     },
     // ── Artifact catalog ─────────────────────────────────────────────
@@ -926,7 +926,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_agent_list",
         category: ToolCategory::Orchestration,
         summary: "List installed agents in name/version order as compact summary pages (default 20, maximum 100). Continue with next_offset. Existing registry filters apply before paging. detail=true expands descriptions and installation diagnostics; bro_agent_get/bro_agent_describe reads one exact agent.",
-        when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history.",
+        when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history, including retired adapter-backed manifests marked inactive. Retired manifests remain readable by exact name/ref but never appear as callable agents.",
         example: Some(r#"bro_agent_list(include_superseded=true)"#),
     },
     ToolDoc {

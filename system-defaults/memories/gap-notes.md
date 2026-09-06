@@ -126,9 +126,13 @@ An open gap with the same `dedupe_key` **dedupes automatically**: `bbox_gap` ret
 
 If you are actively authoring a packet and the AST is the missing surface, use `bbox_packet_gap` directly. It records the packet event AND emits the companion gap into the gap store for you; do not double-file.
 
-## File-drop spool (non-MCP agents)
+## Filing without direct MCP access
 
-An agent without the `bbox_gap` tool can drop a `blackbox.gap_note.v1` JSON file into `<project>/.bbox/gaps/inbox/` (or the host spool `~/.local/share/blackbox/gaps/inbox/`). `bbox_inbox(import_gap_spool=true)` ingests each into the typed gap store and moves the file to `inbox/imported/`. The envelope mirrors the `bbox_gap` fields with a `"type": "blackbox.gap_note.v1"` routing tag. The spool requires a daemon with local checkout access to ingest; on a transport-governed estate nothing consumes it there, so non-MCP agents on such estates hand the envelope to an agent that has the tool instead.
+A caller without `bbox_gap` should hand the typed gap fields to a caller that
+has it. Daemon-side file-drop import and Git closeout checks are retired from
+`bbox_inbox`, which is a read-only attention preview. Repository checks belong
+in the checkout-owning harness. A queued project-gap reply means delivery was
+accepted durably; the owner still commits and publishes the delivered changes.
 
 ## Lifecycle
 

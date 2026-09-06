@@ -10,6 +10,7 @@ use bbox_threads::threads::{Thread, ThreadStatus, Threads};
 // ── MCP parameter struct ──────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InboxParams {
     /// Filter to a project path substring
     #[serde(default)]
@@ -17,7 +18,7 @@ pub struct InboxParams {
     /// Knowledge visibility policy: published, own, or all.
     #[serde(default)]
     pub provisional: Option<String>,
-    /// Max rows per section (default: 10)
+    /// Max preview rows per section and aggregate group (default 10, clamped 1..20).
     #[serde(default)]
     pub limit: Option<u64>,
     /// Threads idle ≥ this many days are flagged stale (default: 7)
@@ -26,18 +27,9 @@ pub struct InboxParams {
     /// Include failed bro tasks (default: true)
     #[serde(default)]
     pub include_tasks: Option<bool>,
-    /// Explicitly import JSON gap files from .bbox/gaps/inbox and the host spool
-    #[serde(default)]
-    pub import_gap_spool: Option<bool>,
     /// Include read-only grouped gap-note counts
     #[serde(default)]
     pub aggregate_gaps: Option<bool>,
-    /// Check git commit trailers that claim gap-note close-outs
-    #[serde(default)]
-    pub check_gap_closeouts: Option<bool>,
-    /// Optional git rev/range for check_gap_closeouts (default: HEAD)
-    #[serde(default)]
-    pub gap_commit_range: Option<String>,
 }
 
 // ── Aggregator ────────────────────────────────────────────────────
@@ -89,7 +81,7 @@ pub fn compute_inbox(
     conversation_silence: &[ConversationProducerSilence],
     p: &InboxParams,
 ) -> Result<String> {
-    let limit = p.limit.unwrap_or(10).max(1) as usize;
+    let limit = p.limit.unwrap_or(10).clamp(1, 20) as usize;
     let stale_days = p.stale_days.unwrap_or(7);
     let include_tasks = p.include_tasks.unwrap_or(true);
     let project_filter = p.project.as_deref().map(|s| s.to_lowercase());
@@ -125,7 +117,7 @@ pub fn compute_inbox(
             "## Vector connectivity risk ({})\n",
             vector_alerts.len()
         ));
-        for alert in vector_alerts {
+        for alert in vector_alerts.iter().take(limit) {
             match alert {
                 VectorConnectivityAlert::Breach {
                     route,
@@ -138,7 +130,7 @@ pub fn compute_inbox(
                 )),
                 VectorConnectivityAlert::DiagnosticsUnavailable { route, reason } => {
                     out.push_str(&format!(
-                        "  {route} — connectivity diagnostics unavailable ({reason}); health is unknown, not healthy\n"
+                        "  {} - connectivity diagnostics unavailable ({}); health is unknown, not healthy\n", truncate(route, 120), truncate(reason, 240)
                     ));
                 }
             }
@@ -155,7 +147,7 @@ pub fn compute_inbox(
             "## Conversation producer silence ({})\n",
             conversation_silence.len()
         ));
-        for alert in conversation_silence {
+        for alert in conversation_silence.iter().take(limit) {
             match alert {
                 ConversationProducerSilence::Stale {
                     scope,
@@ -318,32 +310,15 @@ pub fn compute_inbox(
     }
 
     if p.aggregate_gaps.unwrap_or(false) {
-        let aggregate = render_gap_aggregates(gaps, project_filter.as_deref());
+        let aggregate = render_gap_aggregates(gaps, project_filter.as_deref(), limit);
         if !aggregate.is_empty() {
             out.push_str(&aggregate);
         }
     }
 
-    if p.check_gap_closeouts.unwrap_or(false) {
-        if let Some(project) = p.project.as_deref() {
-            match bbox_gaps::gap_closeout::render_git_closeout_check(
-                gaps,
-                std::path::Path::new(project),
-                p.gap_commit_range.as_deref(),
-            ) {
-                Ok(report) if !report.is_empty() => out.push_str(&report),
-                Ok(_) => {}
-                Err(err) => {
-                    out.push_str("## Gap close-out checks\n");
-                    out.push_str(&format!("  error — {err:#}\n\n"));
-                }
-            }
-        } else {
-            out.push_str("## Gap close-out checks\n");
-            out.push_str("  error — project is required for git trailer checks\n\n");
-        }
+    if out.trim_end() != "# Inbox" {
+        out.push_str(&format!("Preview: up to {limit} rows per section. Expand with bbox_notes, bbox_gaps, bbox_thread_list, bbox_knowledge, bro_dashboard, or bbox_embed_status.\n"));
     }
-
     if out.trim_end() == "# Inbox" {
         out.push_str("_nothing needs attention — clean plate._\n");
     }
@@ -549,7 +524,7 @@ impl GapBucket {
     }
 }
 
-fn render_gap_aggregates(gaps: &GapStore, project_filter: Option<&str>) -> String {
+fn render_gap_aggregates(gaps: &GapStore, project_filter: Option<&str>, limit: usize) -> String {
     use std::collections::BTreeMap;
 
     let mut by_kind: BTreeMap<String, GapBucket> = BTreeMap::new();
@@ -578,9 +553,9 @@ fn render_gap_aggregates(gaps: &GapStore, project_filter: Option<&str>) -> Strin
 
     let mut out = String::new();
     out.push_str("## Gap aggregates\n");
-    render_gap_bucket_group(&mut out, "gap_kind", &by_kind, false);
-    render_gap_bucket_group(&mut out, "domain", &by_domain, false);
-    render_gap_bucket_group(&mut out, "dedupe_key", &by_dedupe, true);
+    render_gap_bucket_group(&mut out, "gap_kind", &by_kind, false, limit);
+    render_gap_bucket_group(&mut out, "domain", &by_domain, false, limit);
+    render_gap_bucket_group(&mut out, "dedupe_key", &by_dedupe, true, limit);
     out.push('\n');
     out
 }
@@ -590,6 +565,7 @@ fn render_gap_bucket_group(
     label: &str,
     buckets: &std::collections::BTreeMap<String, GapBucket>,
     only_repeated_open: bool,
+    limit: usize,
 ) {
     let rows: Vec<_> = buckets
         .iter()
@@ -600,12 +576,23 @@ fn render_gap_bucket_group(
     }
 
     out.push_str(&format!("### by {label}\n"));
-    for (key, bucket) in rows {
+    let omitted = rows.len().saturating_sub(limit);
+    for (key, bucket) in rows.into_iter().take(limit) {
         let oldest = bucket.oldest_open.as_deref().unwrap_or("-");
         let newest = bucket.newest_open.as_deref().unwrap_or("-");
         out.push_str(&format!(
             "  {} — unresolved={} acknowledged={} addressed={} oldest_open={} newest_open={}\n",
-            key, bucket.unresolved, bucket.acknowledged, bucket.addressed, oldest, newest
+            truncate(key, 120),
+            bucket.unresolved,
+            bucket.acknowledged,
+            bucket.addressed,
+            truncate(oldest, 40),
+            truncate(newest, 40)
+        ));
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "  {omitted} more {label} groups omitted; narrow project or query bbox_gaps.\n"
         ));
     }
 }
@@ -888,6 +875,27 @@ mod tests {
     }
 
     #[test]
+    fn inbox_rejects_retired_mutation_and_checkout_options() {
+        for key in [
+            "import_gap_spool",
+            "check_gap_closeouts",
+            "gap_commit_range",
+        ] {
+            let mut value = serde_json::json!({});
+            value[key] = serde_json::json!(true);
+            assert!(serde_json::from_value::<InboxParams>(value).is_err());
+        }
+        let mut buckets = std::collections::BTreeMap::new();
+        for i in 0..100 {
+            buckets.insert(format!("group-{i:03}"), GapBucket::default());
+        }
+        let mut out = String::new();
+        render_gap_bucket_group(&mut out, "domain", &buckets, false, 3);
+        assert_eq!(out.matches("unresolved=").count(), 3);
+        assert!(out.contains("97 more domain groups omitted"));
+    }
+
+    #[test]
     fn inbox_clean_plate_when_nothing_pending() {
         let dir = tempdir().unwrap();
         let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
@@ -909,10 +917,8 @@ mod tests {
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -949,10 +955,8 @@ mod tests {
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -990,10 +994,8 @@ mod tests {
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -1036,10 +1038,8 @@ mod tests {
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -1182,10 +1182,8 @@ mod tests {
                 limit: None,
                 stale_days: Some(0), // any open thread counts as stale
                 include_tasks: None,
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -1247,10 +1245,8 @@ mod tests {
                 limit: None,
                 stale_days: None,
                 include_tasks: None,
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -1344,10 +1340,8 @@ mod tests {
                 limit: Some(10),
                 stale_days: None,
                 include_tasks: Some(false),
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -1409,10 +1403,8 @@ mod tests {
                 limit: None,
                 stale_days: Some(1),
                 include_tasks: Some(false),
-                import_gap_spool: None,
+
                 aggregate_gaps: None,
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();
@@ -1481,10 +1473,8 @@ mod tests {
                 limit: None,
                 stale_days: None,
                 include_tasks: Some(false),
-                import_gap_spool: None,
+
                 aggregate_gaps: Some(true),
-                check_gap_closeouts: None,
-                gap_commit_range: None,
             },
         )
         .unwrap();

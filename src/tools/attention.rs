@@ -1,7 +1,7 @@
+use crate::inbox;
 use crate::inbox::InboxParams;
 use crate::pins::PinParams;
 use crate::server::BlackboxServer;
-use crate::{gap_spool, inbox};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -85,10 +85,8 @@ impl BlackboxServer {
         &self,
         Parameters(p): Parameters<InboxParams>,
     ) -> CallToolResult {
-        // Gap-spool import is full-store disk I/O under the gaps write lock,
-        // and compute_inbox stacks five store read guards — run on the
-        // blocking pool, not a tokio worker. (The import's guards drop before
-        // the read stack below; only in-memory work happens under the stack.)
+        // View assembly reads several stores and may resolve publication inputs.
+        // Keep it on the blocking pool. Inbox never writes checkout files.
         let server = self.clone();
         Self::run_blocking("bbox_inbox", move || {
             // Worktree filter paths map to the registered base (where every
@@ -102,92 +100,6 @@ impl BlackboxServer {
             {
                 p.project = Some(base);
             }
-            let import_report = if p.import_gap_spool.unwrap_or(false) {
-                let inputs =
-                    crate::server::repo_io::CatalogBaseTargets::read_consistent_for_state(
-                        &server.state,
-                    )?;
-                let projects = inputs.records.clone();
-                let local_projects = projects
-                    .iter()
-                    .filter(|project| {
-                        !server
-                            .state
-                            .knowledge_transport_cutover
-                            .covers_project_str(&project.project_id)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let repo_write = crate::server::repo_io::RepoIoAuthority::new(
-                    server.state.checkout_access.clone(),
-                );
-                let mut carriers = crate::server::repo_io::RepoIoAuthority::gap_base_carriers(
-                    &local_projects,
-                    inputs.targets.as_ref(),
-                )?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-                let checkout_rows = server.state.checkout_registry.read().rows().to_vec();
-                for row in &checkout_rows {
-                    let Some(scope) = row.published_scope() else {
-                        continue;
-                    };
-                    let project_id = if let Some(project_id) = row.project_id.clone() {
-                        project_id
-                    } else {
-                        match crate::server::checkout_access::project_id_for_published_scope(
-                            &server.state.checkout_access,
-                            projects.iter().map(|project| project.project_id.clone()),
-                            &scope,
-                        ) {
-                            Ok(Some(project_id)) => project_id,
-                            Ok(None) => continue,
-                            Err(error) => {
-                                tracing::warn!(
-                                    checkout_id = %row.checkout_id,
-                                    error = %error,
-                                    "gap spool skipped checkout carrier with unavailable scope authority"
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    if server
-                        .state
-                        .knowledge_transport_cutover
-                        .covers_project_str(&project_id)
-                    {
-                        continue;
-                    }
-                    let project = projects
-                        .iter()
-                        .find(|project| project.project_id == project_id)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "published checkout scope resolved to an unknown project"
-                            )
-                        })?;
-                    carriers.insert(
-                        crate::server::repo_io::RepoIoAuthority::gap_checkout_carrier_for_ids(
-                            project.canonical_path.clone(),
-                            &project_id,
-                            &row.checkout_id,
-                        )?,
-                    );
-                }
-                let carriers = carriers.into_iter().collect::<Vec<_>>();
-                let state_dir = server.state.config.read().paths.state_dir.clone();
-                let mut gaps = server.state.gaps.write();
-                Some(gap_spool::import_gap_spool(
-                    &mut gaps,
-                    &carriers,
-                    &repo_write,
-                    &state_dir,
-                )?)
-            } else {
-                None
-            };
-
             let knowledge_view =
                 server.session_knowledge_view(p.project.as_deref(), p.provisional.as_deref())?;
             let gap_view =
@@ -208,23 +120,12 @@ impl BlackboxServer {
                     &gap_view.gaps,
                     &failed_rows,
                     &vector_alerts,
-
                     &conversation_silence,
-
                     &p,
                 )?,
                 &overlay_diagnostics,
             );
-            let mut output = if let Some(report) = import_report {
-                let rendered = report.render();
-                if rendered.is_empty() {
-                    inbox
-                } else {
-                    format!("{rendered}{inbox}")
-                }
-            } else {
-                inbox
-            };
+            let mut output = inbox;
 
             let mut response_table = bbox_corpus_core::built_from::BuiltFromTable::default();
             let mut knowledge_rows = Vec::<(String, String)>::new();
@@ -291,10 +192,19 @@ fn append_overlay_diagnostics(inbox: String, diagnostics: &[String]) -> String {
         return inbox;
     }
     let mut out = String::from("Checkout visibility diagnostics:\n");
-    for diagnostic in diagnostics {
+    for diagnostic in diagnostics.iter().take(5) {
         out.push_str("  - ");
-        out.push_str(diagnostic);
+        out.extend(diagnostic.chars().take(512));
+        if diagnostic.chars().count() > 512 {
+            out.push_str(" [truncated]");
+        }
         out.push('\n');
+    }
+    if diagnostics.len() > 5 {
+        out.push_str(&format!(
+            "  {} additional visibility diagnostics omitted; narrow project.\n",
+            diagnostics.len() - 5
+        ));
     }
     out.push('\n');
     out.push_str(&inbox);
