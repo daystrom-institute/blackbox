@@ -829,7 +829,6 @@ impl EventRing {
         self.total_count
     }
 
-    #[cfg(test)]
     pub fn retained_len(&self) -> usize {
         self.events.len()
     }
@@ -5097,8 +5096,8 @@ fn task_body_page(
     Ok(out)
 }
 
-/// MCP routine status and explicit exact body pages. The Fleet HTTP/control
-/// snapshot and workflow engine keep their existing full typed contracts.
+/// MCP routine status and explicit exact body pages. HTTP control uses its
+/// own bounded projection; workflow consumers retain full internal data.
 pub(crate) fn mcp_task_status_json(
     task: &Task,
     detail: &str,
@@ -5209,7 +5208,11 @@ pub(crate) fn mcp_task_status_json(
 /// JSON body accessor. Internal workflow consumers keep the full exit.
 pub(crate) fn mcp_task_result_json(task: &Task) -> Value {
     let inner = task.inner.lock();
-    let mut out = task_view_json_from_inner(&inner, true, false, false);
+    mcp_task_result_json_from_inner(&inner)
+}
+
+fn mcp_task_result_json_from_inner(inner: &TaskInner) -> Value {
+    let mut out = task_view_json_from_inner(inner, true, false, false);
     if let Some(body) = inner.last_assistant_message.as_deref()
         && body.len() > MCP_TASK_BODY_PAGE_BYTES
     {
@@ -5261,11 +5264,15 @@ fn populate_transcript_handle(task: &Task) {
 
 /// Project a task's core state into the shared `bro_protocol` wire DTO — the
 /// status-plane half of the contract bottom (harness-process-boundary.md §2).
-/// This is the typed snapshot the fleet client consumes from `/control/status`;
-/// it is what gives `bro_protocol::TaskSnapshot`/`TaskStatus` a real producer.
+/// The control endpoint retains optional dispatch/error facets of this DTO.
+/// Current Fleet clients use roster snapshots and SSE for live task state.
 /// (A free fn, not `From`, because the orphan rule forbids
 /// `impl From<&TaskInner> for bro_protocol::TaskSnapshot` — both are foreign.)
 pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
+    protocol_task_snapshot_projection(inner, true)
+}
+
+fn protocol_task_snapshot_projection(inner: &TaskInner, full: bool) -> bro_protocol::TaskSnapshot {
     use bro_protocol::TaskStatus as Wire;
     let status = match inner.status {
         TaskStatus::Running => Wire::Running,
@@ -5276,7 +5283,11 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
     let error = if matches!(inner.status, TaskStatus::Failed) && !inner.stderr.trim().is_empty() {
         Some(bro_core::BroError::new(
             "task_failed",
-            inner.stderr.trim().to_string(),
+            if full {
+                inner.stderr.trim().to_string()
+            } else {
+                tail_str_safe(inner.stderr.trim(), 512)
+            },
         ))
     } else {
         None
@@ -5286,7 +5297,7 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
         session_id: (!inner.session_id.is_empty())
             .then(|| bro_core::SessionId::new(inner.session_id.clone())),
         status,
-        last_message: inner.last_assistant_message.clone(),
+        last_message: full.then(|| inner.last_assistant_message.clone()).flatten(),
         error,
         origin: inner.origin,
         managed_worktree: inner.managed_worktree.clone(),
@@ -5295,70 +5306,32 @@ pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
     }
 }
 
-const STATUS_RESULT_BUDGET_BYTES: usize = 16 * 1024;
-const STATUS_RECENT_EVENTS_BUDGET_BYTES: usize = 56 * 1024;
-const STATUS_REPORT_BUDGET_BYTES: usize = 8 * 1024;
+const CONTROL_BODY_WIRE_BYTES: usize = 4096;
+const CONTROL_EVENTS_WIRE_BYTES: usize = 4096;
 
-// `/control/status` is returned through `server/response.rs::cap_response_text`,
-// which caps MCP responses at 80 KiB. Keep the status producer comfortably below
-// that cap by budgeting the chatty fields together: 16 KiB for the final
-// `result` tail, 56 KiB for serialized `recentEvents`, 8 KiB for `report`,
-// 2 KiB for `stderrTail`, and the remaining space for snapshot/scalars/metadata.
-fn budget_status_result(obj: &mut Value) {
-    let Some(result) = obj.get("result").and_then(Value::as_str) else {
-        return;
-    };
-    let result_bytes = result.len();
-    if result_bytes <= STATUS_RESULT_BUDGET_BYTES {
-        return;
+/// Exact pages budget serialized JSON as well as UTF-8 bytes. Escaped control
+/// characters can occupy six wire bytes each, and the response transport may
+/// mirror this body in both text and structured content.
+fn control_body_page(
+    task_id: &str,
+    detail: &str,
+    body: &str,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+) -> anyhow::Result<Value> {
+    let mut limit = limit
+        .unwrap_or(MCP_TASK_BODY_PAGE_BYTES)
+        .clamp(4, MCP_TASK_BODY_PAGE_BYTES);
+    loop {
+        let page = task_body_page(task_id, detail, body, cursor, limit)?;
+        if serde_json::to_vec(&page)?.len() <= CONTROL_BODY_WIRE_BYTES || limit == 4 {
+            return Ok(page);
+        }
+        limit = (limit / 2).max(4);
     }
-
-    let mut start = result_bytes - STATUS_RESULT_BUDGET_BYTES;
-    while start < result_bytes && !result.is_char_boundary(start) {
-        start += 1;
-    }
-    obj["result"] = Value::String(format!("…{}", &result[start..]));
-    obj["resultTruncated"] = Value::Bool(true);
-    obj["resultBytes"] = Value::from(result_bytes);
 }
 
-/// Replace the `report` value with a compact envelope when its serialized form
-/// exceeds [`STATUS_REPORT_BUDGET_BYTES`]. Keeps the message field (char-safe
-/// tail, within budget) and attaches truncation metadata so callers can detect
-/// the compaction. The full report remains in `task_result_json` (data plane)
-/// unchanged.
-fn budget_status_report(obj: &mut Value) {
-    let Some(report) = obj.get("report") else {
-        return;
-    };
-    let report_str = serde_json::to_string(report).unwrap_or_default();
-    let report_bytes = report_str.len();
-    if report_bytes <= STATUS_REPORT_BUDGET_BYTES {
-        return;
-    }
-    let message = report
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    // Reserve space for the envelope keys + numeric field. Over-estimate the
-    // integer width so a wide `reportBytes` doesn't overflow the budget.
-    let overhead = format!(
-        r#"{{"reportTruncated":true,"reportBytes":{},"message":""}}"#,
-        report_bytes
-    )
-    .len();
-    let msg_budget = STATUS_REPORT_BUDGET_BYTES.saturating_sub(overhead);
-    let msg_tail = tail_str_safe(&message, msg_budget);
-    obj["report"] = serde_json::json!({
-        "reportTruncated": true,
-        "reportBytes": report_bytes,
-        "message": msg_tail,
-    });
-}
-
-/// Return the tail of `s` that fits within `max_bytes` while staying on a
-/// char boundary.
+/// Return the tail of `s` that fits within `max_bytes` on a char boundary.
 fn tail_str_safe(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -5370,100 +5343,174 @@ fn tail_str_safe(s: &str, max_bytes: usize) -> String {
     s[start..].to_string()
 }
 
+/// Compatibility status used by control and attached supervision. Full result
+/// bodies stay in task_result_json for workflow consumers; this projection
+/// shares the MCP deliverable and report continuation contract.
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
-    let (mut obj, snapshot, event_count, had_events, compacted_events, stderr_tail) = {
-        let inner = task.inner.lock();
-        let obj = task_result_json_from_inner(&inner);
-        let snapshot = protocol_task_snapshot(&inner);
-        let event_count = observed_event_count(&inner);
-        let had_events = tail > 0 && !inner.events.is_empty();
-        let compacted_events = if had_events {
-            inner
-                .events
-                .iter()
-                .rev()
-                .filter_map(compact_status_event)
-                .take(tail)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let stderr_tail = if (inner.status == TaskStatus::Failed || event_count == 0)
-            && !inner.stderr.trim().is_empty()
-        {
-            const MAX: usize = 2000;
-            let s = inner.stderr.trim_end();
-            Some(if s.len() > MAX {
-                let mut start = s.len() - MAX;
-                while start < s.len() && !s.is_char_boundary(start) {
-                    start += 1;
-                }
-                format!("…{}", &s[start..])
-            } else {
-                s.to_string()
-            })
-        } else {
-            None
-        };
-        (
-            obj,
-            snapshot,
-            event_count,
-            had_events,
-            compacted_events,
-            stderr_tail,
-        )
-    };
-
-    budget_status_result(&mut obj);
-    budget_status_report(&mut obj);
-    // Typed wire snapshot. The flat taskId/sessionId/status/result fields above
-    // already carry its task_id/session_id/status/last_message, and the fleet
-    // cockpit reads dispatch facets (origin/managed_worktree/workflow_owned)
-    // from the roster endpoint (RosterSummaryV1), not from here. So attach the
-    // snapshot only when it adds something a flat-field reader cannot already
-    // see: a structured error, a non-default origin, a managed worktree, or
-    // workflow ownership. In the common case it is pure duplication — omitted.
+    let inner = task.inner.lock();
+    let mut obj = mcp_task_result_json_from_inner(&inner);
+    if let Some(result) = inner.last_assistant_message.as_deref() {
+        let page = control_body_page(&inner.id, "result", result, None, None)
+            .expect("initial UTF-8 body page is valid");
+        obj["result"] = page["text"].clone();
+        if let Some(cursor) = page.get("next_cursor") {
+            obj["resultTruncated"] = json!(true);
+            obj["resultBytes"] = json!(result.len());
+            obj["resultCursor"] = cursor.clone();
+            obj["resultHint"] = json!(
+                "Continue with bro_status(task_id=..., detail=result, cursor=resultCursor), then follow body.next_cursor; concatenate text exactly."
+            );
+        }
+    }
+    // The optional snapshot keeps typed control facets but never duplicates
+    // the assistant body. Its error is a preview, with exact captured stderr
+    // available through the control endpoint's detail=stderr pages.
+    let snapshot = protocol_task_snapshot_projection(&inner, false);
     if snapshot.error.is_some()
         || snapshot.origin != bro_core::Origin::Unknown
         || snapshot.managed_worktree.is_some()
         || snapshot.workflow_owned
         || snapshot.interrupted
     {
-        obj["snapshot"] = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+        let mut value = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+        value.as_object_mut().unwrap().remove("last_message");
+        obj["snapshot"] = value;
     }
-    obj["eventCount"] = Value::from(event_count);
-    if had_events {
-        // Bound `recentEvents` by SERIALIZED SIZE as well as by `tail` count, so
-        // the whole status response stays under the 80KB MCP response cap
-        // (`server/response.rs::cap_response_text`). That cap BYTE-truncates an
-        // over-limit response mid-JSON-string — producing invalid JSON that the
-        // fleet poller can't parse, so the agent's row silently freezes (the
-        // root cause of the "poller stall"). Per-string content is already
-        // capped at 2KB by `compact_status_event`; this caps the array total.
-        // Walk newest→oldest and keep events until the budget is hit (always
-        // keeping at least one), so the response is valid regardless of `tail`.
-        let mut recent: Vec<Value> = Vec::new();
-        let mut bytes = 0usize;
-        for ev in compacted_events {
-            let sz = serde_json::to_string(&ev).map(|s| s.len()).unwrap_or(0);
-            if !recent.is_empty() && bytes + sz > STATUS_RECENT_EVENTS_BUDGET_BYTES {
+    // A single stderr tail carries the actionable failure; the full captured
+    // stream stays available as a separate body rather than a second preview.
+    obj.as_object_mut().unwrap().remove("stderr");
+    let event_count = observed_event_count(&inner);
+    if (inner.status == TaskStatus::Failed || event_count == 0) && !inner.stderr.trim().is_empty() {
+        let stderr = inner.stderr.trim_end();
+        obj["stderrTail"] = json!(tail_str_safe(stderr, 1024));
+        if stderr.len() > 1024 {
+            obj["stderrTruncated"] = json!(true);
+            obj["stderrBytes"] = json!(inner.stderr.len());
+        }
+    }
+    obj["eventCount"] = json!(event_count);
+    if tail > 0 {
+        let mut recent = Vec::new();
+        let mut bytes = 2;
+        for event in inner
+            .events
+            .iter()
+            .rev()
+            .filter_map(compact_status_event)
+            .take(tail.min(50))
+        {
+            let event_bytes = serde_json::to_vec(&event).map(|v| v.len()).unwrap_or(0);
+            if bytes + event_bytes + 1 > CONTROL_EVENTS_WIRE_BYTES {
                 break;
             }
-            bytes += sz;
-            recent.push(ev);
+            bytes += event_bytes + 1;
+            recent.push(event);
         }
+        // This is a compact preview even when every selected event fits:
+        // thinking/stream partials and long strings are deliberately projected.
+        obj["eventPreview"] = json!({
+            "requested":tail, "returned":recent.len(),
+            "retained_events":inner.events.retained_len(),
+            "byte_limit":CONTROL_EVENTS_WIRE_BYTES,
+        });
         recent.reverse();
-        obj["recentEvents"] = Value::Array(recent);
-    }
-    // Surface the captured stderr tail when the task failed or emitted no
-    // stream events — otherwise a pre-stream bail (e.g. the harness exiting
-    // before any stdout) shows only exitCode:1 with no reason. Bounded so a
-    // chatty stderr can't flood the response.
-    if let Some(tail_str) = stderr_tail {
-        obj["stderrTail"] = Value::from(tail_str);
+        obj["recentEvents"] = json!(recent);
     }
     obj
+}
+
+/// HTTP status and exact captured detail bodies. No filesystem access is
+/// required by the caller. Event pages contain the retained ring only, with
+/// observed/retained counts distinguishing this from a complete transcript.
+pub(crate) fn control_task_status_json(
+    task: &Task,
+    detail: &str,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    tail: usize,
+) -> anyhow::Result<Value> {
+    if detail == "summary" {
+        if cursor.is_some() || limit.is_some() {
+            anyhow::bail!("cursor and limit require an explicit body detail");
+        }
+        let mut out = task_status_json(task, tail);
+        if out.get("resultCursor").is_some() {
+            out["resultHint"] = json!(
+                "GET /control/status/{taskId}?detail=result&cursor={resultCursor}; concatenate body.text and follow body.next_cursor."
+            );
+        }
+        if out.get("structuredExitOmitted").is_some() {
+            out["structuredExitHint"] = json!(
+                "GET /control/status/{taskId}?detail=structured_exit; concatenate body.text pages, then parse JSON."
+            );
+        }
+        if out["report"]["detailsOmitted"] == true {
+            out["report"]["detailHint"] = json!(
+                "GET /control/status/{taskId}?detail=report; concatenate body.text pages, then parse JSON."
+            );
+        }
+        if out.get("stderrTruncated").is_some() {
+            out["stderrHint"] = json!(
+                "GET /control/status/{taskId}?detail=stderr for exact captured stderr pages."
+            );
+        }
+        if out.get("eventPreview").is_some() {
+            out["eventPreview"]["detailHint"] = json!(
+                "GET /control/status/{taskId}?detail=events for exact retained events as JSON pages; this ring may not contain the full transcript."
+            );
+        }
+        return Ok(out);
+    }
+    if tail > 0 {
+        anyhow::bail!("tail is only valid with detail=summary");
+    }
+    let inner = task.inner.lock();
+    let body = match detail {
+        "result" => inner
+            .last_assistant_message
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("task has no captured assistant result"))?,
+        "report" => serde_json::to_string(
+            inner
+                .report
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("task has no progress report"))?,
+        )?,
+        "stderr" => inner.stderr.clone(),
+        "events" => serde_json::to_string(&inner.events.iter().collect::<Vec<_>>())?,
+        "structured_exit" => {
+            let exit = inner
+                .last_assistant_message
+                .as_deref()
+                .filter(|_| inner.provider == Provider::Workflow)
+                .and_then(|message| serde_json::from_str::<Value>(message).ok())
+                .and_then(|mut value| {
+                    value
+                        .as_object_mut()
+                        .and_then(|object| object.remove("structured_exit"))
+                })
+                .filter(|value| !value.is_null())
+                .ok_or_else(|| anyhow::anyhow!("task has no workflow structured exit"))?;
+            serde_json::to_string(&exit)?
+        }
+        _ => anyhow::bail!(
+            "detail must be summary, result, report, structured_exit, stderr, or events"
+        ),
+    };
+    let mut page = control_body_page(&inner.id, detail, &body, cursor, limit)?;
+    page["format"] = json!(
+        if matches!(detail, "report" | "structured_exit" | "events") {
+            "json"
+        } else {
+            "text"
+        }
+    );
+    let mut out = json!({"taskId":inner.id, "sessionId":inner.session_id, "status":inner.status, "detail":detail, "body":page});
+    if detail == "events" {
+        out["retainedEvents"] = json!(inner.events.retained_len());
+        out["eventCount"] = json!(observed_event_count(&inner));
+    }
+    Ok(out)
 }
 
 fn compact_status_event(event: &Value) -> Option<Value> {
@@ -7316,7 +7363,7 @@ mod tests {
     }
 
     #[test]
-    fn status_truncates_large_result_tail_and_keeps_status_fields() {
+    fn status_pages_large_result_and_keeps_status_fields() {
         let final_summary = "final summary ".repeat(2_000);
         let original = format!("{}{}", "progress narration ".repeat(2_000), final_summary);
         let completed = task_with(
@@ -7329,8 +7376,8 @@ mod tests {
         let json = task_status_json(&completed, 1);
         let result = json["result"].as_str().expect("result should be present");
 
-        assert!(result.starts_with("…"));
-        assert!(original.ends_with(result.trim_start_matches('…')));
+        assert!(original.starts_with(result));
+        assert!(json["resultCursor"].is_string());
         assert_eq!(json["resultTruncated"], true);
         assert_eq!(json["resultBytes"], original.len());
         assert_eq!(json["status"], "completed");
@@ -7722,7 +7769,8 @@ mod tests {
         assert_eq!(status["status"], "cancelled");
         assert_eq!(status["interrupted"], true);
         assert_eq!(status["result"], "partial text before escape");
-        assert_eq!(status["numTurns"], 0);
+        assert!(status.get("numTurns").is_none());
+        assert_eq!(task_result_json(&task)["numTurns"], 0);
         assert_eq!(status["snapshot"]["status"], "cancelled");
         assert_eq!(status["snapshot"]["interrupted"], true);
 
@@ -9496,8 +9544,121 @@ mod tests {
     }
 
     #[test]
+    fn control_status_bounds_mirrored_envelope_and_keeps_typed_control_facets() {
+        let task = task_with(
+            TaskStatus::Failed,
+            &"\u{0001}".repeat(30000),
+            vec![
+                json!({"type":"assistant", "message":{"content":(0..5000).map(|_| json!({"type":"text", "text":"wide"})).collect::<Vec<_>>()}}),
+            ],
+        );
+        {
+            let mut inner = task.inner.lock();
+            inner.last_assistant_message = Some("\u{0001}語".repeat(30000));
+            inner.origin = bro_core::Origin::Cockpit;
+            inner.workflow_owned = true;
+            inner.interrupted = true;
+            inner.report = Some(BroReport {
+                message: "\u{0001}".repeat(9000),
+                needs: Some("\u{0001}".repeat(9000)),
+                data: Some(json!({"payload":"large".repeat(9000)})),
+                reported_at: 1,
+            });
+        }
+        let status = control_task_status_json(&task, "summary", None, None, usize::MAX).unwrap();
+        assert_eq!(status["status"], "failed");
+        assert!(status["snapshot"].get("last_message").is_none());
+        let snapshot: bro_protocol::TaskSnapshot =
+            serde_json::from_value(status["snapshot"].clone()).unwrap();
+        assert_eq!(snapshot.origin, bro_core::Origin::Cockpit);
+        assert!(snapshot.interrupted && snapshot.workflow_owned);
+        assert_eq!(snapshot.error.unwrap().code, "task_failed");
+        assert!(snapshot.last_message.is_none());
+        assert_eq!(status["resultTruncated"], true);
+        assert_eq!(status["stderrTruncated"], true);
+        assert_eq!(status["eventPreview"]["returned"], 0);
+        assert_eq!(status["eventPreview"]["retained_events"], 1);
+        assert!(status.get("stderr").is_none());
+        assert!(status.get("usage").is_none());
+        // Exercise worst-case JSON escaping and the transport's optional mirror.
+        let envelope = json!({"content":[{"type":"text", "text":serde_json::to_string_pretty(&status).unwrap()}], "structuredContent":status});
+        assert!(serde_json::to_vec(&envelope).unwrap().len() < 80 * 1024);
+        let response = crate::server::BlackboxServer::ok_json(&status);
+        let wire = serde_json::to_value(response).unwrap();
+        assert_ne!(wire["isError"], true);
+        let decoded: Value =
+            serde_json::from_str(wire["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded["taskId"], "t");
+    }
+
+    #[test]
+    fn control_detail_pages_reassemble_exact_bodies_and_reject_stale_cursors() {
+        let task = task_with(
+            TaskStatus::Failed,
+            &"failure \u{0001}語\n".repeat(1500),
+            vec![],
+        );
+        {
+            let mut inner = task.inner.lock();
+            inner.last_assistant_message = Some("deliverable 🦀\n".repeat(1500));
+            inner.report = Some(BroReport {
+                message: "update".into(),
+                needs: None,
+                data: Some(json!({"text":"\u{0001}".repeat(9000)})),
+                reported_at: 1,
+            });
+            for idx in 0..TASK_EVENT_RING_CAPACITY + 3 {
+                inner
+                    .events
+                    .push(json!({"type":"assistant", "idx":idx, "message":"🦀"}));
+            }
+        }
+        for detail in ["result", "report", "stderr", "events"] {
+            let expected = {
+                let inner = task.inner.lock();
+                match detail {
+                    "result" => inner.last_assistant_message.clone().unwrap(),
+                    "report" => serde_json::to_string(inner.report.as_ref().unwrap()).unwrap(),
+                    "stderr" => inner.stderr.clone(),
+                    "events" => {
+                        serde_json::to_string(&inner.events.iter().collect::<Vec<_>>()).unwrap()
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            let mut cursor: Option<String> = None;
+            let mut full = String::new();
+            loop {
+                let page =
+                    control_task_status_json(&task, detail, cursor.as_deref(), None, 0).unwrap();
+                assert!(
+                    serde_json::to_vec(&page["body"]).unwrap().len() <= CONTROL_BODY_WIRE_BYTES
+                );
+                if detail == "events" {
+                    assert_eq!(page["retainedEvents"], TASK_EVENT_RING_CAPACITY);
+                    assert_eq!(page["eventCount"], TASK_EVENT_RING_CAPACITY + 3);
+                }
+                full.push_str(page["body"]["text"].as_str().unwrap());
+                cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(full, expected);
+        }
+        let first = control_task_status_json(&task, "stderr", None, None, 0).unwrap();
+        let cursor = first["body"]["next_cursor"].as_str().unwrap();
+        assert!(control_task_status_json(&task, "result", Some(cursor), None, 0).is_err());
+        task.inner.lock().stderr.push_str("changed");
+        assert!(control_task_status_json(&task, "stderr", Some(cursor), None, 0).is_err());
+        assert!(control_task_status_json(&task, "summary", Some(cursor), None, 0).is_err());
+        assert!(control_task_status_json(&task, "events", None, None, 1).is_err());
+        assert!(control_task_status_json(&task, "unknown", None, None, 0).is_err());
+    }
+
+    #[test]
     fn report_truncated_when_oversized() {
-        let huge_message = "x".repeat(STATUS_REPORT_BUDGET_BYTES * 2);
+        let huge_message = "x".repeat(16000);
         let task = task_with(TaskStatus::Running, "", vec![]);
         {
             let mut inner = task.inner.lock();
@@ -9510,12 +9671,16 @@ mod tests {
         }
         let json = task_status_json(&task, 0);
         let report = &json["report"];
-        assert_eq!(report["reportTruncated"], true);
-        assert!(report["reportBytes"].as_u64().unwrap() > STATUS_REPORT_BUDGET_BYTES as u64);
+        assert_eq!(report["detailsOmitted"], true);
+        assert!(
+            report["detailHint"]
+                .as_str()
+                .unwrap()
+                .contains("detail=report")
+        );
         let msg = report["message"].as_str().unwrap();
-        // Message must be a tail substring of the original and fit within budget.
-        assert!(huge_message.ends_with(msg));
-        assert!(msg.len() <= STATUS_REPORT_BUDGET_BYTES);
+        assert!(huge_message.starts_with(msg));
+        assert!(msg.len() <= 512);
         // The whole status object must still be valid JSON and under the 80K cap.
         let status_str = serde_json::to_string(&json).unwrap();
         assert!(status_str.len() <= 80 * 1024);
