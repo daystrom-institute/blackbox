@@ -20,7 +20,7 @@ use crate::threads::Threads;
 use crate::tools::bro_runtime_params::*;
 use crate::{
     artifacts, crons, edge_index, path_cache, pollers, slack_channel_bindings,
-    slack_proposal_links, slack_thread_store, system_events, webhooks, whiteboards, workflow,
+    slack_proposal_links, system_events, webhooks, whiteboards, workflow,
 };
 use tokio::sync::broadcast;
 
@@ -230,9 +230,6 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         agent_adapter_registry: Arc::new(RwLock::new(
             orchestration::agents::adapter::AgentAdapterRegistry::new(),
         )),
-        slack_thread_store: Arc::new(
-            slack_thread_store::SlackThreadStore::open(&tmp.path().join("bro")).unwrap(),
-        ),
         slack_channel_bindings: Arc::new(
             slack_channel_bindings::SlackChannelBindings::open(&tmp.path().join("bro")).unwrap(),
         ),

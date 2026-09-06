@@ -9,7 +9,6 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::dispatch::try_slack_proposal_signal_hook;
 use super::state::{ArcSnapshot, BlackboxServer, SharedState, SignalEvent, WebhookDelivery};
 use super::workflow_capabilities::validate_workflow_capabilities;
 use crate::artifacts::{
@@ -623,18 +622,6 @@ pub(crate) async fn dispatch_verdict(
                 None,
             )
             .await;
-            // Slack proposal-approved hook: when a `proposal-approved`
-            // signal falls idle (no workflow waiting) AND the reacted
-            // message maps to a posted triage proposal, acknowledge in
-            // Slack and bump the link version. Real apply (CAS to
-            // BadgeyProposalStore + dispatched task) drops in trivially
-            // once §6.3 sub-bro authoring stores proposals under a
-            // registered BadgeyInstance.
-            if matches!(signal.as_str(), "proposal-approved" | "proposal-clarify")
-                && resolved.get("status").and_then(|v| v.as_str()) == Some("no_matching_wait")
-            {
-                try_slack_proposal_signal_hook(&signal, &state, &correlate, &entity).await;
-            }
             Ok(resolved)
         }
         RoutingVerdict::CancelArc { correlate } => {
@@ -794,26 +781,6 @@ pub(crate) async fn dispatch_verdict(
                     }
                 }
             }
-            // Slack thread continuity: if this arc came in through the
-            // slack inlet and the entity carries `(team_id, channel,
-            // thread_ts)`, look up any prior Claude session_id for
-            // that thread and seed the badgey actor with it. The
-            // `_actor_session.<actor>` magic key is stripped from
-            // initial_vars in the engine before seed_vars runs (see
-            // `extract_actor_session_seeds`).
-            let slack_thread_key = (inlet_name == "slack")
-                .then(|| {
-                    let team = merged_vars.get("team_id").and_then(Value::as_str)?;
-                    let channel = merged_vars.get("channel").and_then(Value::as_str)?;
-                    let thread_ts = merged_vars.get("thread_ts").and_then(Value::as_str)?;
-                    Some((team.to_string(), channel.to_string(), thread_ts.to_string()))
-                })
-                .flatten();
-            if let Some((team, channel, thread_ts)) = slack_thread_key.as_ref() {
-                if let Some(session_id) = state.slack_thread_store.get(team, channel, thread_ts) {
-                    merged_vars.insert("_actor_session.badgey".into(), Value::String(session_id));
-                }
-            }
             // project_dir resolution priority:
             //   1. ${INLET_NAME_UPPERCASE}_PROJECT_DIR env override
             //      (works for webhooks AND pollers — both pass their
@@ -836,9 +803,8 @@ pub(crate) async fn dispatch_verdict(
             let cron_name = inlet_name.strip_prefix("cron:").map(|s| s.to_string());
             let crons_for_done = state.crons.clone();
             let server = BlackboxServer::new(state.clone());
-            let slack_state = state.clone();
             tokio::spawn(async move {
-                let result = workflow::run_workflow_with_initial_vars(
+                let _result = workflow::run_workflow_with_initial_vars(
                     &server,
                     &compiled,
                     project_dir,
@@ -846,18 +812,6 @@ pub(crate) async fn dispatch_verdict(
                     merged_vars,
                 )
                 .await;
-                // Capture the badgey session_id back to the slack
-                // thread store so the next @mention in this thread
-                // resumes the same conversation.
-                if let Some((team, channel, thread_ts)) = slack_thread_key.as_ref() {
-                    if let Some(session_id) = result.actor_sessions.get("badgey") {
-                        if !session_id.is_empty() && session_id != "pending" {
-                            slack_state
-                                .slack_thread_store
-                                .set(team, channel, thread_ts, session_id);
-                        }
-                    }
-                }
                 if let Some(name) = cron_name {
                     crons_for_done.mark_done(&name);
                 }

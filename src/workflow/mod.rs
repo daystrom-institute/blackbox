@@ -45,6 +45,11 @@ pub struct CompiledWorkflow {
 /// Cross-validate transitions, actor references, late_inject sources,
 /// fork branches, and reachability. Errors name the specific mismatch.
 pub fn compile(spec: Workflow) -> Result<CompiledWorkflow> {
+    if spec.name == "badgey" || spec.name.starts_with("badgey-") {
+        anyhow::bail!(
+            "Badgey application workflows are retired; retained definitions are historical evidence only"
+        );
+    }
     cross_validate(&spec)?;
     Ok(CompiledWorkflow { spec })
 }
@@ -985,6 +990,14 @@ mod tests {
                 include_str!("../../system-defaults/workflows/phase-decompose/main-edit.json"),
             ),
         ]
+    }
+
+    #[test]
+    fn retired_badgey_workflows_refuse_compilation_for_install_run_and_recovery() {
+        let mut spec: Workflow =
+            serde_json::from_str(include_str!("../../examples/workflows/e2e-smoke.json")).unwrap();
+        spec.name = "badgey-triage-channel-arc".into();
+        assert!(compile(spec).unwrap_err().to_string().contains("retired"));
     }
 
     #[test]

@@ -21,8 +21,8 @@ use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
     artifacts, config, crons, edge_index, index, orchestration, path_cache, pollers,
-    slack_channel_bindings, slack_proposal_links, slack_thread_store, system_events, system_memory,
-    tool_docs, vectors, webhooks, whiteboards,
+    slack_channel_bindings, slack_proposal_links, system_events, system_memory, tool_docs, vectors,
+    webhooks, whiteboards,
 };
 
 pub(super) struct OpenedServer {
@@ -1049,10 +1049,6 @@ pub(super) fn open_shared_state(
         drain: super::drain::DrainState::open(&store_dir),
         long_polls: Arc::new(super::drain::LongPollRegistry::new()),
         agent_adapter_registry,
-        slack_thread_store: Arc::new(
-            slack_thread_store::SlackThreadStore::open(&store_dir)
-                .unwrap_or_else(|e| panic!("opening slack thread store at {store_dir:?}: {e}")),
-        ),
         slack_channel_bindings: Arc::new(
             slack_channel_bindings::SlackChannelBindings::open(&store_dir)
                 .unwrap_or_else(|e| panic!("opening slack channel bindings at {store_dir:?}: {e}")),

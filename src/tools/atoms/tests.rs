@@ -678,7 +678,7 @@ async fn historical_consultant_atom_refuses_execution_without_rewriting_notes_or
     std::fs::write(&journal, b"legacy action evidence").unwrap();
     let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
     let artifact: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../system-defaults/atoms/consultant/badgey-consult.json"
+        "../../../tests/fixtures/retired-orchestration/badgey-consult.json"
     ))
     .unwrap();
     let metadata = server

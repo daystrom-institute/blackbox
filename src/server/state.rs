@@ -24,7 +24,7 @@ use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
     artifacts, crons, edge_index, path_cache, pollers, slack_channel_bindings,
-    slack_proposal_links, slack_thread_store, system_events, webhooks, whiteboards, workflow,
+    slack_proposal_links, system_events, webhooks, whiteboards, workflow,
 };
 
 // ---------------------------------------------------------------------------
@@ -377,22 +377,9 @@ pub(crate) struct SharedState {
     /// membership against the live registry.
     pub(crate) agent_adapter_registry:
         Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
-    /// Slack thread → claude session_id continuity map. Webhook
-    /// `start_arc` looks up the prior session before starting an arc
-    /// and seeds it into actor_sessions; the arc writes back when
-    /// the executor turn completes. Lets follow-up @mentions in the
-    /// same Slack thread continue the same Badgey conversation.
-    pub(crate) slack_thread_store: Arc<slack_thread_store::SlackThreadStore>,
-    /// Slack channel → project bindings. Resolves which bbox project
-    /// a Slack channel maps to so inbound badgey activity is auto-scoped
-    /// and the daily-triage cron knows where to fan out per-channel
-    /// briefs. Channel (id, team) is the lookup key; renames are
-    /// id-stable.
+    /// Retained linkage records for catalog migration and project renames.
+    /// No bot, signal hook, or application runtime consumes these stores.
     pub(crate) slack_channel_bindings: Arc<slack_channel_bindings::SlackChannelBindings>,
-    /// Slack message → proposal/authoring-session link records. One
-    /// entry per proposal posted into Slack by the daily-triage tool.
-    /// Reaction handlers resolve item_ts → proposal_id; thread-reply
-    /// handlers resolve thread_ts → authoring_session_id.
     pub(crate) slack_proposal_links: Arc<slack_proposal_links::SlackProposalLinks>,
     pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
     pub(crate) atom_invocation_store: orchestration::atoms::invocation::SharedInvocationStore,
@@ -1173,9 +1160,6 @@ impl SharedState {
             agent_adapter_registry: Arc::new(RwLock::new(
                 orchestration::agents::adapter::AgentAdapterRegistry::new(),
             )),
-            slack_thread_store: Arc::new(
-                slack_thread_store::SlackThreadStore::open(store_dir).unwrap(),
-            ),
             slack_channel_bindings: Arc::new(
                 slack_channel_bindings::SlackChannelBindings::open(store_dir).unwrap(),
             ),

@@ -51,7 +51,9 @@ fn restore_pollers(shared: &Arc<SharedState>) {
 fn restore_crons(shared: &Arc<SharedState>) {
     let cron_dir = shared.store_dir.join("crons");
     for spec in crons::load_all(&cron_dir) {
-        match crons::validate_schedule(&spec.schedule) {
+        match crons::refuse_retired_application(&spec.name)
+            .and_then(|_| crons::validate_schedule(&spec.schedule))
+        {
             Ok(()) => {
                 tracing::info!(
                     "restoring cron '{}' (schedule '{}', concurrency {})",

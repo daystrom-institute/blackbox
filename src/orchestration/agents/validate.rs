@@ -642,7 +642,7 @@ mod tests {
             ),
             (
                 "badgey",
-                include_str!("../../../system-defaults/agents/badgey.json"),
+                include_str!("../../../tests/fixtures/retired-orchestration/badgey-agent.json"),
             ),
             (
                 "corpus-pathfinder",
@@ -1285,7 +1285,7 @@ mod tests {
             brofile_exists: |_name: &str| true,
             agent_exists: |_name: &str| true,
         };
-        let src = include_str!("../../../system-defaults/agents/badgey.json");
+        let src = include_str!("../../../tests/fixtures/retired-orchestration/badgey-agent.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         validate_agent_install(&v, &ctx).expect("badgey validates cleanly");
     }
@@ -1294,7 +1294,7 @@ mod tests {
     fn reference_agent_badgey_fails_without_adapter() {
         let registry = AgentAdapterRegistry::new();
         let ctx = make_ctx(&registry);
-        let src = include_str!("../../../system-defaults/agents/badgey.json");
+        let src = include_str!("../../../tests/fixtures/retired-orchestration/badgey-agent.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         let err = validate_agent_install(&v, &ctx).unwrap_err();
         assert_eq!(err.step, "lint_dispatch_adapter");
@@ -1369,7 +1369,7 @@ mod tests {
         let agents: &[&str] = &[
             include_str!("../../../system-defaults/agents/code-reviewer.json"),
             include_str!("../../../system-defaults/agents/diff-narrator.json"),
-            include_str!("../../../system-defaults/agents/badgey.json"),
+            include_str!("../../../tests/fixtures/retired-orchestration/badgey-agent.json"),
             include_str!("../../../system-defaults/agents/corpus-pathfinder.json"),
         ];
         for src in agents {
@@ -1461,7 +1461,7 @@ mod tests {
         }
         registry.register(Arc::new(TestBadgeyAdapter));
 
-        let src = include_str!("../../../system-defaults/agents/badgey.json");
+        let src = include_str!("../../../tests/fixtures/retired-orchestration/badgey-agent.json");
         let v: serde_json::Value = serde_json::from_str(src).expect("badgey.json parses");
         let ctx = make_ctx(&registry);
         validate_agent_install(&v, &ctx).expect("badgey with registered adapter should validate");

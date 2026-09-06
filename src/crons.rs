@@ -107,10 +107,18 @@ impl CronSpec {
     /// Validate before installation or artifact activation performs any write
     /// or starts a timer. Legacy restoration retains its runtime fallback.
     pub fn validate(&self) -> Result<()> {
+        refuse_retired_application(&self.name)?;
         validate_schedule(&self.schedule)?;
         timezone_is_local(self.tz.as_deref())?;
         Ok(())
     }
+}
+
+pub(crate) fn refuse_retired_application(name: &str) -> Result<()> {
+    if name == "badgey" || name.starts_with("badgey-") {
+        return Err(anyhow!("Badgey application schedules are retired"));
+    }
+    Ok(())
 }
 
 fn timezone_is_local(tz: Option<&str>) -> Result<bool> {
@@ -336,6 +344,7 @@ fn build_entity(spec: &CronSpec) -> Value {
 /// the arc spawned or skipped due to concurrency cap), Ok(false) if
 /// the routing packet returned no_match.
 pub async fn run_one_tick(state: &Arc<SharedState>, spec: &CronSpec) -> Result<bool> {
+    refuse_retired_application(&spec.name)?;
     // Concurrency check — claim a slot before dispatching, refund if
     // dispatch fails.
     if !state.crons.try_claim(&spec.name, spec.concurrency) {
@@ -476,6 +485,17 @@ pub fn debug_build_entity(spec: &CronSpec) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retired_badgey_schedule_refuses_new_install_and_old_timer_admission() {
+        let spec: CronSpec = serde_json::from_str(include_str!(
+            "../tests/fixtures/retired-orchestration/badgey-cron.json"
+        ))
+        .unwrap();
+        assert!(spec.validate().unwrap_err().to_string().contains("retired"));
+        assert!(refuse_retired_application(&spec.name).is_err());
+        assert!(refuse_retired_application("daily-compaction").is_ok());
+    }
 
     #[test]
     fn schedule_parses_six_fields() {

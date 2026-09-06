@@ -89,7 +89,6 @@ pub mod server;
 use bbox_edge_index::storage_health;
 pub use bbox_slack::slack_channel_bindings;
 pub use bbox_slack::slack_proposal_links;
-use bbox_slack::slack_thread_store;
 use bbox_stores::store_persister;
 use bbox_system_events::system_events;
 mod system_events_runtime;

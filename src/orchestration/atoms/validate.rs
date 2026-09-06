@@ -1030,17 +1030,18 @@ mod tests {
     #[test]
     fn consultant_implementation_is_readable_but_refuses_new_install() {
         let mut atom: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../system-defaults/atoms/consultant/badgey-consult.json"
+            "../../../tests/fixtures/retired-orchestration/badgey-consult.json"
         ))
         .unwrap();
         let ctx = InstallCtx {
             brofile_exists: |_| true,
             atom_exists: |_| false,
         };
-        let legacy: super::types::AtomArtifact = serde_json::from_value(atom.clone()).unwrap();
+        let legacy: crate::orchestration::atoms::types::AtomArtifact =
+            serde_json::from_value(atom.clone()).unwrap();
         assert!(matches!(
             legacy.manifest.implementation,
-            super::types::AtomImplementation::Consultant { .. }
+            crate::orchestration::atoms::types::AtomImplementation::Consultant { .. }
         ));
         let err = validate_atom_install(&atom, &ctx).unwrap_err();
         assert!(err.message.contains("consultant execution is retired"));
