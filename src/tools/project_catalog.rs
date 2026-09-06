@@ -448,6 +448,8 @@ pub(crate) enum ProjectPublisherStatusDetail {
     Health,
     /// The complete connector publication view as exact body pages.
     Connector,
+    /// The complete auto-advance grant and latest policy attempt.
+    AutoAdvance,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -461,7 +463,7 @@ pub(crate) struct ProjectPublisherStatusParams {
     /// epoch, or detail body refuses continuation.
     #[serde(default)]
     pub detail_cursor: Option<String>,
-    /// Detail page byte budget, clamped to 4..=4096.
+    /// Exact detail page byte budget, 4..=4096. Requires detail.
     #[serde(default)]
     pub detail_limit: Option<usize>,
 }
@@ -710,6 +712,27 @@ fn publisher_status_lane_inventory(values: &[&str]) -> serde_json::Value {
         "omitted": total - returned,
         "values": sorted[..returned],
     })
+}
+
+fn validate_publisher_status_detail(p: &ProjectPublisherStatusParams) -> anyhow::Result<()> {
+    if p.detail.is_none() && (p.detail_cursor.is_some() || p.detail_limit.is_some()) {
+        anyhow::bail!("error.project_publisher_status_detail_cursor: detail_cursor and detail_limit require detail");
+    }
+    if p.detail_limit.is_some_and(|limit| !(4..=4096).contains(&limit)) {
+        anyhow::bail!("error.project_publisher_status_detail_limit: detail_limit must be between 4 and 4096");
+    }
+    Ok(())
+}
+
+// Policy outcome structure is fixed, but refusal prose and source identities
+// are producer data. Keep every outcome flag while bounding these strings.
+fn publisher_auto_advance_summary(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => publisher_status_bounded_text(text),
+        serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter()
+            .map(|(key, value)| (key.clone(), publisher_auto_advance_summary(value))).collect()),
+        _ => value.clone(),
+    }
 }
 
 /// Bound a decision-relevant diagnostic string without lying about what
@@ -1401,7 +1424,7 @@ impl BlackboxServer {
             )
             .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-            let census_removed = server.deregister_detached_pair(&row);
+            let cleanup = server.deregister_detached_pair(&row);
 
             tracing::info!(
                 tool = "bbox_project_detach",
@@ -1412,12 +1435,14 @@ impl BlackboxServer {
             );
 
             Ok(serde_json::to_string_pretty(&json!({
-                "status": "ok",
+                "status": if cleanup.failed() { "partial" } else { "ok" },
+                "catalog_detached": true,
                 "attachment_id": attachment_id.as_str(),
                 "project_id": row.project_id.as_str(),
                 "checkout_id": row.checkout_id,
                 "audit_reason": audit_reason,
-                "census_row_removed": census_removed,
+                "census_row_removed": cleanup.census == "removed",
+                "cleanup": cleanup,
                 "epoch": commit.epoch,
                 "catalog_sha256": commit.catalog_sha256,
                 "attachments_sha256": commit.attachments_sha256,
@@ -1632,7 +1657,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_bind",
-        description = "Rebind the accepted-publication pointer of a published project to another of its attachments. The pointer's ref, accepted commit, accepted scope, generation, and payload bytes are unchanged: only the attachment binding moves, so the strict pointer and generation agreement holds identically before and after. The new attachment's object database must already contain the pointer's accepted commit, and a project with no pointer refuses rather than inventing one. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Local checkout administration: rebind a published project to another capable attachment. Transport-owned projects refuse with error.knowledge_transport_authoritative. Rebind the accepted-publication pointer of a published project to another of its attachments. The pointer's ref, accepted commit, accepted scope, generation, and payload bytes are unchanged: only the attachment binding moves, so the strict pointer and generation agreement holds identically before and after. The new attachment's object database must already contain the pointer's accepted commit, and a project with no pointer refuses rather than inventing one. Requires expected_catalog_epoch and a bounded audit_reason. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_bind(
         &self,
@@ -1986,7 +2011,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, and the generation_id plus pointer_sha256 compare-and-swap tokens. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view and detail=connector returns the complete connector view as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, and the generation_id plus pointer_sha256 compare-and-swap tokens. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view, detail=connector the complete connector view, and detail=auto_advance the grant and latest policy attempt as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -2003,18 +2028,7 @@ impl BlackboxServer {
             // Validate the paging request before any catalog or runtime
             // assembly: a malformed combination must not pay for, or depend
             // on, the evidence it is trying to page through.
-            if p.detail.is_none() && p.detail_cursor.is_some() {
-                anyhow::bail!(
-                    "error.project_publisher_status_detail_cursor: detail_cursor requires detail"
-                );
-            }
-            if let Some(limit) = p.detail_limit
-                && !(4..=4096).contains(&limit)
-            {
-                anyhow::bail!(
-                    "error.project_publisher_status_detail_limit: detail_limit must be between 4 and 4096"
-                );
-            }
+            validate_publisher_status_detail(&p)?;
             let project_id = parse_project_id(&p.project_id)?;
             let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
             let Some(project) = state.catalog().projects.get(&project_id) else {
@@ -2083,6 +2097,10 @@ impl BlackboxServer {
                 .knowledge_sources
                 .auto_advance_ledger()
                 .last_attempt(project_id.as_str());
+            let auto_advance_detail = json!({
+                "grant": auto_advance_grant,
+                "last_attempt": auto_advance_last_attempt,
+            });
             let connector_detail_source = project.scope.connector().map(|scope| {
                 let file_source =
                     connector_publication_json(server.state.file_sources.store().as_ref(), scope);
@@ -2104,6 +2122,15 @@ impl BlackboxServer {
                     super::body_page::json_body_page(
                         &format!("publisher-status:{project_id}:{}:health", state.epoch()),
                         &health_detail_source,
+                        p.detail_cursor.as_deref(),
+                        p.detail_limit,
+                    )?,
+                )),
+                Some(ProjectPublisherStatusDetail::AutoAdvance) => Some((
+                    "auto_advance",
+                    super::body_page::json_body_page(
+                        &format!("publisher-status:{project_id}:{}:auto_advance", state.epoch()),
+                        &auto_advance_detail,
                         p.detail_cursor.as_deref(),
                         p.detail_limit,
                     )?,
@@ -2146,12 +2173,9 @@ impl BlackboxServer {
                 "pointer_sha256": status.binding_stamp().map(|stamp| stamp.pointer_sha256()),
                 "diagnostic": status.failure().map(|failure| failure.code()),
                 "epoch": state.epoch(),
-                "auto_advance": {
-                    "grant": auto_advance_grant,
-                    "last_attempt": auto_advance_last_attempt,
-                },
+                "auto_advance": publisher_auto_advance_summary(&auto_advance_detail),
                 "health": health_summary,
-                "detail_hint": "detail=health or detail=connector returns exact bounded pages; replay detail.body.next_cursor while the body is unchanged",
+                "detail_hint": "detail=health, detail=connector or detail=auto_advance returns exact bounded pages; replay detail.body.next_cursor while the body is unchanged",
             });
             if let Some((selector, body)) = detail {
                 response["detail"] = json!({"selector": selector, "body": body});
@@ -2168,57 +2192,52 @@ impl BlackboxServer {
     fn deregister_detached_pair(
         &self,
         row: &bbox_corpus_core::project_catalog::CheckoutAttachment,
-    ) -> bool {
-        let census_removed = match row.validated_scope.as_ref() {
-            Some(scope) => {
-                let lifecycle = match self.state.checkout_access.lifecycle_mutation_guard() {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        tracing::warn!(
-                            attachment = %row.attachment_id,
-                            error = %error,
-                            "detach could not take the lifecycle guard for census deregistration"
-                        );
-                        return false;
-                    }
-                };
-                let removed = self
-                    .state
-                    .checkout_registry
-                    .write()
-                    .deregister_scope(&row.checkout_id, scope);
-                drop(lifecycle);
-                match removed {
-                    Ok(removed) => removed,
-                    Err(error) => {
-                        tracing::warn!(
-                            attachment = %row.attachment_id,
-                            error = %error,
-                            "detach could not remove the census row for this attachment pair"
-                        );
-                        false
-                    }
-                }
-            }
-            // A scope-less attachment owns no scope-keyed census row.
-            None => false,
+    ) -> DetachCleanup {
+        let census = match row.validated_scope.as_ref() {
+            None => Ok(false),
+            Some(scope) => (|| -> anyhow::Result<bool> {
+                let _lifecycle = self.state.checkout_access.lifecycle_mutation_guard()
+                    .map_err(anyhow::Error::new)?;
+                self.state.checkout_registry.write()
+                    .deregister_scope(&row.checkout_id, scope)
+            })(),
         };
-        if let Ok(mut guard) = self.state.bbox_watcher.lock()
-            && let Some(watcher) = guard.as_mut()
-            && let Ok(carrier) = crate::watcher::ArtifactWatchCarrier::checkout(
-                row.project_id.as_str().to_string(),
-                row.checkout_id.clone(),
-            )
-            && let Err(error) = watcher.unwatch_carrier(&carrier)
-        {
-            tracing::warn!(
-                attachment = %row.attachment_id,
-                checkout_id = %row.checkout_id,
-                error = %error,
-                "detach could not remove the paired checkout watcher registration"
-            );
+        let watcher = (|| -> anyhow::Result<bool> {
+            let mut guard = self.state.bbox_watcher.lock()
+                .map_err(|_| anyhow::anyhow!("watcher lock unavailable"))?;
+            let Some(watcher) = guard.as_mut() else { return Ok(false); };
+            let carrier = crate::watcher::ArtifactWatchCarrier::checkout(
+                row.project_id.as_str().to_string(), row.checkout_id.clone(),
+            )?;
+            watcher.unwatch_carrier(&carrier)
+        })();
+        for (stage, result) in [("census", &census), ("watcher", &watcher)] {
+            if let Err(error) = result {
+                tracing::warn!(attachment = %row.attachment_id, stage, error = %error,
+                    "catalog detach committed but auxiliary cleanup failed");
+            }
         }
-        census_removed
+        DetachCleanup::from_results(census, watcher)
+    }
+
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DetachCleanup {
+    census: &'static str,
+    watcher: &'static str,
+}
+
+impl DetachCleanup {
+    fn from_results(census: anyhow::Result<bool>, watcher: anyhow::Result<bool>) -> Self {
+        fn outcome(result: anyhow::Result<bool>) -> &'static str {
+            match result { Ok(true) => "removed", Ok(false) => "not_registered", Err(_) => "failed" }
+        }
+        Self { census: outcome(census), watcher: outcome(watcher) }
+    }
+
+    fn failed(&self) -> bool {
+        self.census == "failed" || self.watcher == "failed"
     }
 }
 
@@ -2834,13 +2853,15 @@ impl BlackboxServer {
         let commit =
             project_catalog_admin::detach_attachment(&store, epoch, &attachment_id, &now_rfc3339())
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let census_removed = self.deregister_detached_pair(&row);
+        let cleanup = self.deregister_detached_pair(&row);
         Ok(serde_json::to_string_pretty(&json!({
-            "status": "ok",
+            "status": if cleanup.failed() { "partial" } else { "ok" },
+                "catalog_detached": true,
             "project_id": row.project_id.as_str(),
             "attachment_id": attachment_id.as_str(),
             "detached": true,
-            "census_row_removed": census_removed,
+            "census_row_removed": cleanup.census == "removed",
+                "cleanup": cleanup,
             "logical_state": "preserved",
             "catalog_deletion": "blackbox project-catalog retire",
             "epoch": commit.epoch,
@@ -2933,6 +2954,79 @@ impl BlackboxServer {
 mod tests {
     use super::*;
     use crate::server::state::SharedState;
+
+    #[test]
+    fn publisher_detail_selectors_refuse_before_collection() {
+        for params in [
+            ProjectPublisherStatusParams { detail_limit: Some(512), ..Default::default() },
+            ProjectPublisherStatusParams { detail_cursor: Some("old".into()), ..Default::default() },
+            ProjectPublisherStatusParams { detail: Some(ProjectPublisherStatusDetail::AutoAdvance), detail_limit: Some(3), ..Default::default() },
+        ] {
+            assert!(validate_publisher_status_detail(&params).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn publisher_policy_refusal_is_bounded_and_exactly_recoverable() {
+        use crate::server::publisher_auto_advance::{AutoAdvanceAttempt, AutoAdvanceOutcome};
+        let (fixture, _, _) = publisher_health_fixture("p_status_policy", 1);
+        let server = fixture.server();
+        let ledger = server.state.knowledge_sources.auto_advance_ledger();
+        let detail = "escaped-\"\n诊断".repeat(5000);
+        ledger.record("p_status_policy", AutoAdvanceAttempt {
+            source_generation_id: "source-a".into(), producer_id: "producer-a".into(),
+            outcome: AutoAdvanceOutcome::Refused { code: "error.refused".into(), detail: detail.clone(), may_have_swapped: true },
+            at_unix_secs: 42,
+        });
+        let summary = server.bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+            project_id: "p_status_policy".into(), ..Default::default()
+        })).await;
+        assert_ne!(summary.is_error, Some(true));
+        assert!(serde_json::to_vec(&summary).unwrap().len() < BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&error_text(&summary)).unwrap();
+        assert_eq!(value["auto_advance"]["last_attempt"]["may_have_swapped"], true);
+        assert_eq!(value["auto_advance"]["last_attempt"]["detail"]["truncated"], true);
+        let full = page_publisher_status_detail(&server, "p_status_policy", ProjectPublisherStatusDetail::AutoAdvance).await;
+        let recovered: serde_json::Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(recovered["last_attempt"]["detail"], detail);
+        let first = server.bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+            project_id: "p_status_policy".into(), detail: Some(ProjectPublisherStatusDetail::AutoAdvance), detail_limit: Some(128), ..Default::default()
+        })).await;
+        let first: serde_json::Value = serde_json::from_str(&error_text(&first)).unwrap();
+        let cursor = first["detail"]["body"]["next_cursor"].as_str().unwrap().to_owned();
+        ledger.record("p_status_policy", AutoAdvanceAttempt {
+            source_generation_id: "source-b".into(), producer_id: "producer-a".into(),
+            outcome: AutoAdvanceOutcome::PolicyDisabled, at_unix_secs: 43,
+        });
+        let stale = server.bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+            project_id: "p_status_policy".into(), detail: Some(ProjectPublisherStatusDetail::AutoAdvance), detail_cursor: Some(cursor), ..Default::default()
+        })).await;
+        assert_eq!(stale.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn detach_reports_committed_catalog_when_watcher_cleanup_fails() {
+        use crate::server::state::catalog_fixture::CatalogFixture;
+        let (fixture, _, _) = publisher_health_fixture("p_detach_cleanup", 1);
+        let server = fixture.server();
+        let store = server.catalog_store().unwrap();
+        let epoch = store.snapshot().unwrap().epoch();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = server.state.bbox_watcher.lock().unwrap();
+            panic!("synthetic watcher poison");
+        }));
+        let result = server.bbox_project_detach(Parameters(ProjectDetachParams {
+            attachment_id: CatalogFixture::attachment().to_string(), expected_catalog_epoch: epoch, audit_reason: "cleanup fixture".into(),
+        })).await;
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(body["status"], "partial");
+        assert_eq!(body["catalog_detached"], true);
+        assert_eq!(body["cleanup"]["watcher"], "failed");
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.attachments().attachments[&CatalogFixture::attachment()].status, AttachmentStatus::Detached);
+        assert!(!DetachCleanup::from_results(Ok(false), Ok(false)).failed());
+    }
 
     fn catalog_get_fixture() -> (
         bbox_corpus_core::project_catalog::CatalogSnapshotV2,

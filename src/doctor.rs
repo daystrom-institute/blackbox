@@ -345,10 +345,8 @@ pub(crate) fn run_section(
     Ok(DoctorReport::from_sections(vec![section_report]))
 }
 
-/// How many per-project findings one catalog section emits before it
-/// summarizes the rest. Doctor output is an operator surface, not a
-/// dump; the projection itself stays complete for programmatic consumers.
-const MAX_PROJECT_FINDINGS: usize = 20;
+// Collect every finding before response projection. MCP summaries page these
+// records; exact reads must never inherit a producer-side preview cutoff.
 
 /// Project every catalog project's runtime status once, for the sections
 /// below to read. `None` in bridge mode, where these sections do not apply
@@ -367,23 +365,12 @@ fn catalog_project_statuses(
     )
 }
 
-/// Append a bounded tail line when a section had more to say than it showed.
-fn bound_findings(findings: &mut Vec<Finding>, considered: usize, section: &str) {
-    if considered > MAX_PROJECT_FINDINGS {
-        findings.push(Finding::info(format!(
-            "{} more {section} findings not shown",
-            considered - MAX_PROJECT_FINDINGS
-        )));
-    }
-}
-
 /// Accepted-publication state per project, plus the two states that read
 /// fine but refuse mutation: Prior fallback and the scope-migration bridge.
 fn accepted_publication_section(
     statuses: &[crate::server::state::ProjectRuntimeStatus],
 ) -> SectionReport {
     let mut findings = Vec::new();
-    let mut considered = 0;
     let mut current = 0;
     for status in statuses {
         // An unreadable catalog pair is reported FIRST, then the accepted
@@ -394,50 +381,47 @@ fn accepted_publication_section(
         // the first has no way to find out mid-poisoning
         // (bbox_project_publisher_status needs a catalog snapshot itself).
         if status.catalog_authority == "unavailable" {
-            considered += 1;
-            if considered <= MAX_PROJECT_FINDINGS {
-                let project = &status.project_id;
-                findings.push(Finding::action(
+            let project = &status.project_id;
+            findings.push(Finding::action(
+                format!(
+                    "project {project} could not be read from the catalog pair; \
+                     its catalog-derived status is unavailable, not denied"
+                ),
+                "bbox_doctor",
+            ));
+            findings.push(match status.accepted.state {
+                "current" if status.accepted.serves_published_content => {
+                    Finding::info(format!(
+                        "project {project} accepted publication is verified independently \
+                         of the catalog and is CURRENT; published knowledge and gaps keep \
+                         serving while the catalog pair is unreadable"
+                    ))
+                }
+                "prior" => Finding::action(
                     format!(
-                        "project {project} could not be read from the catalog pair; \
-                         its catalog-derived status is unavailable, not denied"
+                        "project {project} accepted publication is verified independently \
+                         of the catalog and fell back to its PRIOR generation; reads \
+                         continue and every mutation refuses until repair"
                     ),
-                    "bbox_doctor",
-                ));
-                findings.push(match status.accepted.state {
-                    "current" if status.accepted.serves_published_content => {
-                        Finding::info(format!(
-                            "project {project} accepted publication is verified independently \
-                             of the catalog and is CURRENT; published knowledge and gaps keep \
-                             serving while the catalog pair is unreadable"
-                        ))
-                    }
-                    "prior" => Finding::action(
-                        format!(
-                            "project {project} accepted publication is verified independently \
-                             of the catalog and fell back to its PRIOR generation; reads \
-                             continue and every mutation refuses until repair"
-                        ),
-                        "bbox_project_publisher_status",
+                    "bbox_project_publisher_status",
+                ),
+                "missing" => Finding::info(format!(
+                    "project {project} has no accepted publication pointer; that is \
+                     independent of the unreadable catalog pair"
+                )),
+                "corrupt" => Finding::action(
+                    format!(
+                        "project {project} accepted publication is CORRUPT independently \
+                         of the unreadable catalog pair; published reads are unavailable \
+                         for it"
                     ),
-                    "missing" => Finding::info(format!(
-                        "project {project} has no accepted publication pointer; that is \
-                         independent of the unreadable catalog pair"
-                    )),
-                    "corrupt" => Finding::action(
-                        format!(
-                            "project {project} accepted publication is CORRUPT independently \
-                             of the unreadable catalog pair; published reads are unavailable \
-                             for it"
-                        ),
-                        "bbox_project_publisher_status",
-                    ),
-                    other => Finding::warn(format!(
-                        "project {project} accepted publication state is {other} and could \
-                         not be evaluated further while the catalog pair is unreadable"
-                    )),
-                });
-            }
+                    "bbox_project_publisher_status",
+                ),
+                other => Finding::warn(format!(
+                    "project {project} accepted publication state is {other} and could \
+                     not be evaluated further while the catalog pair is unreadable"
+                )),
+            });
             continue;
         }
         let notable = match status.accepted.state {
@@ -446,10 +430,6 @@ fn accepted_publication_section(
         };
         if !notable {
             current += 1;
-            continue;
-        }
-        considered += 1;
-        if considered > MAX_PROJECT_FINDINGS {
             continue;
         }
         let project = &status.project_id;
@@ -491,7 +471,7 @@ fn accepted_publication_section(
             other => Finding::info(format!("project {project} accepted state {other}")),
         });
     }
-    bound_findings(&mut findings, considered, "accepted-publication");
+
     if findings.is_empty() && current > 0 {
         findings.push(Finding::ok(format!(
             "{current} catalog project(s) serve their current accepted generation"
@@ -508,7 +488,6 @@ fn publisher_binding_section(
     statuses: &[crate::server::state::ProjectRuntimeStatus],
 ) -> SectionReport {
     let mut findings = Vec::new();
-    let mut considered = 0;
     let mut healthy = 0;
     for status in statuses {
         let project = &status.project_id;
@@ -542,13 +521,10 @@ fn publisher_binding_section(
             }
         };
         if let Some(finding) = finding {
-            considered += 1;
-            if considered <= MAX_PROJECT_FINDINGS {
-                findings.push(finding);
-            }
+            findings.push(finding);
         }
     }
-    bound_findings(&mut findings, considered, "publisher-binding");
+
     if findings.is_empty() && healthy > 0 {
         findings.push(Finding::ok(format!(
             "{healthy} catalog pointer binding(s) name an attached attachment"
@@ -565,16 +541,11 @@ fn overlay_baseline_section(
     statuses: &[crate::server::state::ProjectRuntimeStatus],
 ) -> SectionReport {
     let mut findings = Vec::new();
-    let mut considered = 0;
     let mut fresh = 0;
     for status in statuses {
         for overlay in &status.overlays {
             if overlay.outcome == "fresh" {
                 fresh += 1;
-                continue;
-            }
-            considered += 1;
-            if considered > MAX_PROJECT_FINDINGS {
                 continue;
             }
             findings.push(Finding::warn(format!(
@@ -590,7 +561,7 @@ fn overlay_baseline_section(
             )));
         }
     }
-    bound_findings(&mut findings, considered, "overlay-baseline");
+
     if findings.is_empty() && fresh > 0 {
         findings.push(Finding::ok(format!("{fresh} checkout overlay(s) fresh")));
     }
@@ -609,7 +580,6 @@ fn attachment_capability_section(
     statuses: &[crate::server::state::ProjectRuntimeStatus],
 ) -> SectionReport {
     let mut findings = Vec::new();
-    let mut considered = 0;
     let mut attached = 0;
     let mut remote_only = 0;
     for status in statuses {
@@ -627,10 +597,6 @@ fn attachment_capability_section(
             if !attachment.available.is_empty() {
                 continue;
             }
-            considered += 1;
-            if considered > MAX_PROJECT_FINDINGS {
-                continue;
-            }
             findings.push(Finding::warn(format!(
                 "project {} attachment {} records no capabilities; every checkout-backed lane \
                  degrades for it",
@@ -638,7 +604,7 @@ fn attachment_capability_section(
             )));
         }
     }
-    bound_findings(&mut findings, considered, "attachment-capability");
+
     if remote_only > 0 {
         findings.push(Finding::info(format!(
             "{remote_only} catalog project(s) are remote-only; published reads serve and every \
@@ -661,7 +627,6 @@ fn artifact_watcher_section(
     statuses: &[crate::server::state::ProjectRuntimeStatus],
 ) -> SectionReport {
     let mut findings = Vec::new();
-    let mut considered = 0;
     let mut registered = 0;
     if statuses
         .iter()
@@ -693,10 +658,6 @@ fn artifact_watcher_section(
         if status.watcher.capable_but_unregistered.is_empty() {
             continue;
         }
-        considered += 1;
-        if considered > MAX_PROJECT_FINDINGS {
-            continue;
-        }
         findings.push(Finding::warn(format!(
             "project {} has {} attachment(s) recording artifact_watching with no live watcher \
              registration",
@@ -704,7 +665,7 @@ fn artifact_watcher_section(
             status.watcher.capable_but_unregistered.len()
         )));
     }
-    bound_findings(&mut findings, considered, "artifact-watcher");
+
     if findings.is_empty() {
         findings.push(Finding::ok(format!(
             "{registered} attachment watcher registration(s) active"
@@ -812,7 +773,6 @@ fn knowledge_transport_section(
         })
         .collect::<std::collections::BTreeSet<_>>();
     let mut current = 0usize;
-    let mut considered = 0usize;
 
     match catalog {
         Err(error) => findings.push(Finding::blocked(format!(
@@ -834,20 +794,17 @@ fn knowledge_transport_section(
                 if coverage == KnowledgeTransportRuntimeCoverageV1::Current {
                     current += 1;
                 } else {
-                    considered += 1;
-                    if considered <= MAX_PROJECT_FINDINGS {
-                        findings.push(Finding::action(
-                            format!(
-                                "project {} remains transport-governed but is {}; local fallback stays closed",
-                                row.project_id,
-                                serde_json::to_value(coverage)
-                                    .ok()
-                                    .and_then(|value| value.as_str().map(str::to_owned))
-                                    .unwrap_or_else(|| "pending_recutover".into())
-                            ),
-                            "blackbox project-catalog knowledge-transport-cutover --preflight",
-                        ));
-                    }
+                    findings.push(Finding::action(
+                        format!(
+                            "project {} remains transport-governed but is {}; local fallback stays closed",
+                            row.project_id,
+                            serde_json::to_value(coverage)
+                                .ok()
+                                .and_then(|value| value.as_str().map(str::to_owned))
+                                .unwrap_or_else(|| "pending_recutover".into())
+                        ),
+                        "blackbox project-catalog knowledge-transport-cutover --preflight",
+                    ));
                 }
 
                 for baseline in &row.capability_baselines {
@@ -925,7 +882,7 @@ fn knowledge_transport_section(
             "covered knowledge transport recorded {degraded_count} degraded operation(s); local fallback remained closed"
         )));
     }
-    bound_findings(&mut findings, considered, "knowledge-transport");
+
     if current > 0 {
         findings.push(Finding::ok(format!(
             "{current} strict knowledge transport row(s) are current; {remote_count} remote operation(s) observed"
@@ -2239,6 +2196,35 @@ mod catalog_health_tests {
             .map(|finding| finding.message.clone())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn catalog_findings_beyond_twenty_remain_exactly_recoverable() {
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project(PROJECT, &CatalogFixture::scope("."));
+        let base = status(&fixture.server());
+        let mut statuses = (0..35).map(|index| {
+            let mut row = base.clone();
+            row.project_id = format!("p_health_{index:02}");
+            row.accepted.state = "missing";
+            row
+        }).collect::<Vec<_>>();
+        statuses[34].accepted.state = "corrupt";
+        statuses[34].accepted.diagnostic = Some("late-诊断-\"\n".repeat(2000));
+        let section = accepted_publication_section(&statuses);
+        assert_eq!(section.findings.len(), 35);
+        assert_eq!(section.worst(), FindingLevel::Blocked);
+        let report = serde_json::to_value(DoctorReport::from_sections(vec![section])).unwrap();
+        let mut recovered = String::new();
+        let mut cursor = None;
+        loop {
+            let page = bbox_corpus_core::response_page::json_body_page("doctor", &report, cursor.as_deref(), Some(257)).unwrap();
+            recovered.push_str(page["text"].as_str().unwrap());
+            cursor = page["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() { break; }
+        }
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&recovered).unwrap(), report);
+        assert!(recovered.contains("p_health_34"));
     }
 
     /// Accepted Current, and the section says so without inventing findings.
