@@ -178,6 +178,10 @@ struct RawSourceConnectorsConfig {
     pub enabled: bool,
     #[serde(default)]
     pub producers: Vec<ConnectorProducerConfig>,
+    /// Explicit read-only retention of already landed conversation sources.
+    /// These rows authorize no producer or ingest operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_conversations: Vec<RetainedConversationSource>,
 }
 
 impl Default for RawCodeCollectionConfig {
@@ -719,6 +723,81 @@ impl CodeCollectionProducerConfig {
 pub struct SourceConnectorsConfig {
     pub enabled: bool,
     pub producers: Vec<ConnectorProducerConfig>,
+    /// Explicit read-only retention of already landed conversation sources.
+    /// These rows authorize no producer or ingest operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_conversations: Vec<RetainedConversationSource>,
+}
+
+/// Operator authorization to keep reading an already onboarded conversation
+/// source after its write grant is removed. This is not a live producer grant
+/// or an immutable snapshot: existing revisions and roster exclusions apply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedConversationSource {
+    pub connector_source_id: ConnectorSourceId,
+    pub connector_kind: ConnectorKind,
+    /// Must match the source's durable workspace binding at startup.
+    pub workspace_id: String,
+    /// Display/permalink authority, not a catalog identity or freshness claim.
+    pub remote_authority: String,
+}
+
+impl RetainedConversationSource {
+    pub fn scope(&self) -> ConnectorScope {
+        ConnectorScope::new(
+            self.connector_source_id.clone(),
+            self.connector_kind.clone(),
+        )
+    }
+}
+
+impl SourceConnectorsConfig {
+    /// Also called at the read and write runtime boundaries so a constructed
+    /// config cannot overlap retained read scopes with producer grants.
+    pub fn validate_retained_conversations(&self) -> Result<()> {
+        let write_ids: std::collections::BTreeSet<_> = self
+            .producers
+            .iter()
+            .flat_map(|producer| producer.scopes.iter())
+            .map(|scope| &scope.connector_source_id)
+            .collect();
+        let mut read_ids = std::collections::BTreeSet::new();
+        for retained in &self.retained_conversations {
+            if !read_ids.insert(&retained.connector_source_id) {
+                anyhow::bail!(
+                    "duplicate retained conversation source {}",
+                    retained.connector_source_id
+                );
+            }
+            if write_ids.contains(&retained.connector_source_id) {
+                anyhow::bail!(
+                    "retained conversation source {} also has a producer grant; remove that grant before retaining read-only access",
+                    retained.connector_source_id
+                );
+            }
+            for (field, value, max_bytes) in [
+                ("workspace_id", &retained.workspace_id, 128),
+                (
+                    "remote_authority",
+                    &retained.remote_authority,
+                    MAX_REMOTE_AUTHORITY_BYTES,
+                ),
+            ] {
+                if value.is_empty()
+                    || value.len() > max_bytes
+                    || value.trim() != value.as_str()
+                    || value.chars().any(char::is_control)
+                {
+                    anyhow::bail!(
+                        "retained conversation {field} must be bounded, trimmed, and control-free for {}",
+                        retained.connector_source_id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -854,6 +933,7 @@ const MAX_REMOTE_AUTHORITY_BYTES: usize = 256;
 /// intent, and the one rule that actually protects the catalog, which is
 /// that a `connector_source_id` may be granted to exactly one producer.
 fn validate_source_connectors(config: &SourceConnectorsConfig) -> Result<()> {
+    config.validate_retained_conversations()?;
     if !config.enabled {
         // A disabled family still refuses malformed grants rather than
         // hiding them until the day it is switched on.
@@ -1322,6 +1402,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
         .collect::<Result<Vec<_>>>()?;
 
     let source_connectors = SourceConnectorsConfig {
+        retained_conversations: raw.source_connectors.retained_conversations.clone(),
         enabled: raw.source_connectors.enabled,
         producers: raw
             .source_connectors
@@ -3433,6 +3514,7 @@ state_dir = "~"
         scopes: Vec<ConnectorScopeGrant>,
     ) -> SourceConnectorsConfig {
         SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![ConnectorProducerConfig {
                 producer_id: producer_id.to_string(),
@@ -3628,6 +3710,7 @@ profile = "conversation"
     #[test]
     fn source_connectors_validation_refuses_empty_and_malformed_shapes() {
         let enabled_without_producers = SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: Vec::new(),
         };
@@ -3719,13 +3802,84 @@ profile = "conversation"
     }
 
     #[test]
+    fn retained_conversation_config_is_explicit_read_only_and_strict() {
+        let input = r#"
+[[retained_conversations]]
+connector_source_id = "csrc_0000000000000001"
+connector_kind = "fixture"
+workspace_id = "WORKSPACE_EXAMPLE"
+remote_authority = "workspace.example"
+"#;
+        let raw: RawSourceConnectorsConfig =
+            Figment::new().merge(Toml::string(input)).extract().unwrap();
+        let mut config = SourceConnectorsConfig {
+            enabled: raw.enabled,
+            producers: raw.producers,
+            retained_conversations: raw.retained_conversations,
+        };
+        assert!(!config.enabled);
+        assert!(config.producers.is_empty());
+        validate_source_connectors(&config).unwrap();
+        let retained = config.retained_conversations[0].clone();
+        for extra in [
+            "token_file = '/tmp/not-a-read-grant'",
+            "profile = 'file'",
+            "workspace = 'typo'",
+        ] {
+            assert!(
+                Figment::new()
+                    .merge(Toml::string(&format!("{input}\n{extra}")))
+                    .extract::<RawSourceConnectorsConfig>()
+                    .is_err()
+            );
+        }
+        for field in ["workspace_id", "remote_authority"] {
+            for bad in ["", " leading", "trailing ", "control\n", &"x".repeat(257)] {
+                config.retained_conversations[0] = retained.clone();
+                if field == "workspace_id" {
+                    config.retained_conversations[0].workspace_id = bad.into();
+                } else {
+                    config.retained_conversations[0].remote_authority = bad.into();
+                }
+                assert!(validate_source_connectors(&config).is_err());
+            }
+        }
+        config.retained_conversations = vec![retained.clone(), retained.clone()];
+        assert!(
+            validate_source_connectors(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        config.retained_conversations = vec![retained.clone()];
+        config.producers = connector_producer(
+            "producer-example",
+            vec![ConnectorScopeGrant {
+                connector_source_id: retained.connector_source_id,
+                connector_kind: retained.connector_kind,
+                remote_authority: retained.remote_authority,
+                profile: ConnectorProfile::File,
+            }],
+        )
+        .producers;
+        assert!(
+            validate_source_connectors(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("also has a producer grant")
+        );
+    }
+
+    #[test]
     fn source_connectors_default_to_disabled_and_empty() {
         // Read the DEFAULTS, never the host's real config file: a daemon with
         // connector grants configured must not turn this assertion red.
         let raw = RawSourceConnectorsConfig::default();
         assert!(!raw.enabled);
         assert!(raw.producers.is_empty());
+        assert!(raw.retained_conversations.is_empty());
         validate_source_connectors(&SourceConnectorsConfig {
+            retained_conversations: raw.retained_conversations,
             enabled: raw.enabled,
             producers: raw.producers,
         })

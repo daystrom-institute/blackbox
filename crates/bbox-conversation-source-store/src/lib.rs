@@ -248,6 +248,18 @@ impl ConversationSourceStore {
         Ok(Self { root })
     }
 
+    /// Open an existing store for read-only inspection without creating any
+    /// directories. A missing or unreadable store is an explicit error.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let metadata = std::fs::metadata(root.join("scopes"))
+            .context("reading existing conversation source store")?;
+        if !metadata.is_dir() {
+            bail!("existing conversation source store is not a directory");
+        }
+        Ok(Self { root })
+    }
+
     fn scope_dir(&self, scope: &ConnectorScope) -> PathBuf {
         self.root.join("scopes").join(scope_hash(scope))
     }

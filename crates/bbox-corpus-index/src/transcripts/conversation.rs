@@ -53,9 +53,10 @@
 //! # Enrollment and purge
 //!
 //! A channel is projected when an enrolled conversation-lane scope covers it:
-//! the scope is in the daemon's connector grants, and the channel's latest
-//! roster observation says the observing identity is still a member. Drop
-//! either and the channel stops being emitted by [`scan_locations`], its
+//! the operator authorizes reads through a live conversation grant or an
+//! explicit retained enrollment, and no stored roster observation excludes
+//! the channel. Remove all read enrollment or record non-membership and the
+//! channel stops being emitted by [`scan_locations`], its
 //! locator leaves the reindex scan set, and the purge phase deletes its
 //! documents by that term. See [`ConversationTranscriptAdapter`] for the one
 //! enrollment signal this lane does NOT yet expose.
@@ -78,11 +79,11 @@ use super::types::{
 
 /// One conversation-lane connector source the corpus is allowed to project.
 ///
-/// The operator's config is the authority for both halves: `scope` is the
-/// grant, and `remote_authority` is the vendor tenant that grant declares.
-/// Nothing here is producer-supplied, which is why an unenrolled source
-/// disappears from the projection by the operator editing config rather than
-/// by a producer deciding to stop reporting.
+/// The operator's config authorizes `scope` through a live conversation grant
+/// or explicit retained read enrollment; `remote_authority` supplies permalink
+/// metadata. Retained enrollment authorizes no ingest and makes no freshness
+/// claim. Nothing here is producer-supplied: stopping a producer does not
+/// revoke read authorization, and removing every enrollment does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSourceEnrollmentV1 {
     pub scope: ConnectorScope,
@@ -104,7 +105,7 @@ pub struct ConversationSourceEnrollmentV1 {
 /// documents another observer still covers.
 ///
 /// **The enrollment signal.** Coverage ends when the roster reports
-/// `is_member: false` or when the operator removes the grant; this adapter
+/// `is_member: false` or when the operator removes every read enrollment; this adapter
 /// reads only that signal and does not care how it got there.
 ///
 /// `record_roster` writes the latest observation per channel and never
@@ -130,7 +131,8 @@ pub struct ConversationSourceEnrollmentV1 {
 /// posts a complete roster (an old, unredeployed satellite, or one whose
 /// enumeration this cycle was provably partial) still leaves a stale
 /// observation in place until an explicit `is_member: false` arrives or the
-/// operator removes the grant, exactly as before.
+/// operator removes every read enrollment. Retained history preserves the
+/// latest stored observation; it does not assert current remote membership.
 pub struct ConversationTranscriptAdapter {
     store: ConversationSourceStore,
     sources: Vec<ConversationSourceEnrollmentV1>,
@@ -1614,13 +1616,14 @@ mod gate_tests {
     }
 
     #[test]
-    fn retiring_the_operator_grant_unenrolls_every_channel_under_it() {
+    fn removing_all_read_enrollment_unenrolls_every_channel_under_it() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         landed_store(&root);
 
         // The other half of the enrollment signal: config, not the store. A
-        // landing directory that outlives its grant must not keep projecting.
+        // landing directory that outlives every live or retained read
+        // enrollment must not keep projecting.
         assert!(
             ConversationTranscriptAdapter::open(&root, Vec::new()).is_none(),
             "no enrolled scope means no adapter, so nothing is scanned"

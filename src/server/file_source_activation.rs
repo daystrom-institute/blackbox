@@ -920,6 +920,7 @@ mod tests {
     ) -> String {
         let token_secret = "a".repeat(64);
         let config = crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![crate::config::ConnectorProducerConfig {
                 producer_id: PRODUCER.into(),

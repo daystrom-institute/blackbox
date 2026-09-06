@@ -276,6 +276,7 @@ mod tests {
             std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let config = crate::config::SourceConnectorsConfig {
+            retained_conversations: Vec::new(),
             enabled: true,
             producers: vec![crate::config::ConnectorProducerConfig {
                 producer_id: "fixture-producer".into(),

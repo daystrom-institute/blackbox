@@ -70,7 +70,9 @@ Filter early:
 ## Conversations (Slack Lane)
 
 Connector-landed Slack conversations are searchable through the same
-`bbox_search`. The channel is a first-class coordinate:
+`bbox_search`. [Retained conversation enrollment](conversation-retention.md)
+keeps explicitly authorized history readable after removing its ingest grant;
+it does not imply collection is current. The channel is a first-class coordinate:
 
 ```text
 bbox_search(query="import mapping", channel="#ops-incident-4565")

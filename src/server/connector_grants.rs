@@ -135,6 +135,7 @@ impl ConnectorGrantRuntime {
         config: &crate::config::SourceConnectorsConfig,
         catalog: Option<&CatalogSnapshotV2>,
     ) -> Result<Self> {
+        config.validate_retained_conversations()?;
         if !config.enabled {
             return Ok(Self::disabled());
         }
@@ -409,7 +410,11 @@ mod tests {
         producers: Vec<ConnectorProducerConfig>,
         enabled: bool,
     ) -> SourceConnectorsConfig {
-        SourceConnectorsConfig { enabled, producers }
+        SourceConnectorsConfig {
+            enabled,
+            producers,
+            retained_conversations: Vec::new(),
+        }
     }
 
     fn grant(connector_source_id: &str, kind: &str, authority: &str) -> ConnectorScopeGrant {
