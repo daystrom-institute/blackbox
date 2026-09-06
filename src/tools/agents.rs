@@ -21,7 +21,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bro_agent_list",
-        description = "List installed agents from the registry. Optional filters for cost_class, provenance_kind, include_superseded, and limit."
+        description = "List installed agents in name/version order as compact summary pages (default 20, maximum 100). Continue with next_offset. Existing registry filters apply before paging. detail=true expands descriptions and installation diagnostics; bro_agent_get/bro_agent_describe reads one exact agent."
     )]
     pub(crate) fn bro_agent_list(
         &self,
@@ -53,46 +53,18 @@ impl BlackboxServer {
             provenance_kind: p.provenance_kind,
         };
         match reg.list(&filter) {
-            Ok(summaries) => {
-                let capped = match p.limit {
-                    Some(n) => summaries.into_iter().take(n).collect::<Vec<_>>(),
-                    None => summaries,
-                };
-                Self::ok_json(&serde_json::json!({
-                    "agents": capped.iter().map(|s| {
-                        let mut m = serde_json::Map::from_iter([
-                            ("name".into(), serde_json::Value::String(s.name.clone())),
-                            ("version".into(), serde_json::Value::String(s.version.clone())),
-                            ("active".into(), serde_json::Value::Bool(s.active)),
-                            ("installed_at".into(), serde_json::Value::String(s.installed_at.clone())),
-                            ("embedding_pending".into(), match s.embedding_pending {
-                                Some(b) => serde_json::Value::Bool(b),
-                                None => serde_json::Value::Null,
-                            }),
-                        ]);
-                        if let Some(desc) = &s.description {
-                            m.insert("description".into(), serde_json::Value::String(desc.clone()));
-                        }
-                        if let Some(cc) = &s.cost_class {
-                            m.insert("cost_class".into(), serde_json::Value::String(cc.to_string()));
-                        }
-                        if let Some(pk) = &s.provenance_kind {
-                            m.insert("provenance_kind".into(), serde_json::Value::String(pk.clone()));
-                        }
-                        if !s.supersedes_chain.is_empty() {
-                            m.insert(
-                                "supersedes_chain".into(),
-                                serde_json::Value::Array(
-                                    s.supersedes_chain
-                                        .iter()
-                                        .map(|c| serde_json::Value::String(c.clone()))
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        serde_json::Value::Object(m)
-                    }).collect::<Vec<_>>()
-                }))
+            Ok(mut summaries) => {
+                summaries.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+                let rows = summaries
+                    .iter()
+                    .map(|summary| summary.response_view(p.detail))
+                    .collect();
+                match bbox_corpus_core::response_page::collection_page(
+                    rows, "agents", p.limit, p.offset,
+                ) {
+                    Ok(page) => Self::ok_json(&page),
+                    Err(error) => Self::err_text(&error.to_string()),
+                }
             }
             Err(e) => Self::err_text(&format!("registry list failed: {e}")),
         }
@@ -1030,6 +1002,8 @@ mod tests {
         );
 
         let result = server.bro_agent_list(Parameters(AgentListParams {
+            offset: None,
+            detail: false,
             include_superseded: None,
             cost_class: None,
             provenance_kind: None,
@@ -1045,7 +1019,7 @@ mod tests {
         assert_eq!(reviewer["version"], "1");
         assert_eq!(reviewer["active"], true);
         assert_eq!(reviewer["cost_class"], "expensive");
-        assert_eq!(reviewer["embedding_pending"], true);
+        assert!(reviewer.get("embedding_pending").is_none());
 
         let writer = agents.iter().find(|a| a["name"] == "writer").unwrap();
         assert_eq!(writer["version"], "2");
@@ -1058,6 +1032,8 @@ mod tests {
         let server = test_server(&tmp);
 
         let result = server.bro_agent_list(Parameters(AgentListParams {
+            offset: None,
+            detail: false,
             include_superseded: None,
             cost_class: Some("notavalidclass".into()),
             provenance_kind: None,
@@ -1177,6 +1153,8 @@ mod tests {
         seed_test_agent(cat, "a3.json", "gamma", 1, None);
 
         let result = server.bro_agent_list(Parameters(AgentListParams {
+            offset: None,
+            detail: false,
             include_superseded: None,
             cost_class: None,
             provenance_kind: None,
@@ -1202,6 +1180,8 @@ mod tests {
         );
 
         let result = server.bro_agent_list(Parameters(AgentListParams {
+            offset: None,
+            detail: false,
             include_superseded: None,
             cost_class: None,
             provenance_kind: Some("distilled".into()),
@@ -1261,6 +1241,8 @@ mod tests {
         .unwrap();
 
         let default_result = server.bro_agent_list(Parameters(AgentListParams {
+            offset: None,
+            detail: false,
             include_superseded: None,
             cost_class: None,
             provenance_kind: None,
@@ -1284,6 +1266,8 @@ mod tests {
         );
 
         let with_superseded = server.bro_agent_list(Parameters(AgentListParams {
+            offset: None,
+            detail: false,
             include_superseded: Some(true),
             cost_class: None,
             provenance_kind: None,

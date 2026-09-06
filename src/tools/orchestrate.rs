@@ -22,8 +22,40 @@ use crate::workflow;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
-use rmcp::{tool, tool_router};
+use rmcp::{schemars, tool, tool_router};
 use serde_json::Value;
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeCatalogListParams {
+    /// Exact installed name/id filter; no match returns an empty page.
+    #[serde(default)]
+    name: Option<String>,
+    /// Maximum rows per page (default 20, capped at 100).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Continue from next_offset returned by the previous page.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Expand safe configuration diagnostics. Credentials, bodies, selector constants,
+    /// and server-local project paths are never returned.
+    #[serde(default)]
+    detail: bool,
+}
+
+fn runtime_catalog_page(
+    mut rows: Vec<Value>,
+    field: &str,
+    p: &RuntimeCatalogListParams,
+) -> anyhow::Result<Value> {
+    rows.retain(|row| {
+        p.name
+            .as_deref()
+            .is_none_or(|name| row["name"].as_str() == Some(name))
+    });
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    bbox_corpus_core::response_page::collection_page(rows, field, p.limit, p.offset)
+}
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::orchestrate_tools()
@@ -665,11 +697,23 @@ Constraints:\n\
 
     #[tool(
         name = "bro_webhook_list",
-        description = "List installed webhook endpoints with their signature scheme + routing packet."
+        description = "List installed webhooks as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted."
     )]
-    pub(crate) async fn bro_webhook_list(&self) -> CallToolResult {
-        let list = self.state.webhooks.list();
-        Self::ok_json(&serde_json::json!({"webhooks": list}))
+    pub(crate) async fn bro_webhook_list(
+        &self,
+        Parameters(p): Parameters<RuntimeCatalogListParams>,
+    ) -> CallToolResult {
+        let rows = self
+            .state
+            .webhooks
+            .list()
+            .iter()
+            .map(|spec| spec.response_view(p.detail))
+            .collect();
+        match runtime_catalog_page(rows, "webhooks", &p) {
+            Ok(page) => Self::ok_json(&page),
+            Err(error) => Self::err_text(&error.to_string()),
+        }
     }
 
     #[tool(
@@ -738,11 +782,23 @@ Constraints:\n\
 
     #[tool(
         name = "bro_poller_list",
-        description = "List installed pollers with their schedule + source URL + routing packet."
+        description = "List installed pollers as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted."
     )]
-    pub(crate) async fn bro_poller_list(&self) -> CallToolResult {
-        let list = self.state.pollers.list();
-        Self::ok_json(&serde_json::json!({"pollers": list}))
+    pub(crate) async fn bro_poller_list(
+        &self,
+        Parameters(p): Parameters<RuntimeCatalogListParams>,
+    ) -> CallToolResult {
+        let rows = self
+            .state
+            .pollers
+            .list()
+            .iter()
+            .map(|spec| spec.response_view(p.detail))
+            .collect();
+        match runtime_catalog_page(rows, "pollers", &p) {
+            Ok(page) => Self::ok_json(&page),
+            Err(error) => Self::err_text(&error.to_string()),
+        }
     }
 
     #[tool(
@@ -816,11 +872,23 @@ Constraints:\n\
 
     #[tool(
         name = "bro_cron_list",
-        description = "List installed crons with schedule + concurrency cap + routing packet."
+        description = "List installed crons as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted."
     )]
-    pub(crate) async fn bro_cron_list(&self) -> CallToolResult {
-        let list = self.state.crons.list();
-        Self::ok_json(&serde_json::json!({"crons": list}))
+    pub(crate) async fn bro_cron_list(
+        &self,
+        Parameters(p): Parameters<RuntimeCatalogListParams>,
+    ) -> CallToolResult {
+        let rows = self
+            .state
+            .crons
+            .list()
+            .iter()
+            .map(|spec| spec.response_view(p.detail))
+            .collect();
+        match runtime_catalog_page(rows, "crons", &p) {
+            Ok(page) => Self::ok_json(&page),
+            Err(error) => Self::err_text(&error.to_string()),
+        }
     }
 
     #[tool(
@@ -929,12 +997,35 @@ Constraints:\n\
 
     #[tool(
         name = "bro_workflow_list",
-        description = "List installed workflow specs by id."
+        description = "List installed workflows as name/version summary pages (default 20, maximum 100), ordered by registry name. Filter by exact name and continue with next_offset. detail=true adds entry node, node/actor counts, and policy packet; workflow hooks and embedded credentials are never returned."
     )]
-    pub(crate) async fn bro_workflow_list(&self) -> CallToolResult {
-        let map = self.state.workflow_registry.read();
-        let names: Vec<String> = map.keys().cloned().collect();
-        Self::ok_json(&serde_json::json!({"workflows": names}))
+    pub(crate) async fn bro_workflow_list(
+        &self,
+        Parameters(p): Parameters<RuntimeCatalogListParams>,
+    ) -> CallToolResult {
+        let rows = self
+            .state
+            .workflow_registry
+            .read()
+            .iter()
+            .map(|(id, spec)| {
+                let mut row = serde_json::json!({"name": id, "version": spec.version});
+                if p.detail {
+                    row["spec_name"] = serde_json::json!(spec.name);
+                    row["start"] = serde_json::json!(spec.start);
+                    row["node_count"] = serde_json::json!(spec.nodes.len());
+                    row["actor_count"] = serde_json::json!(spec.actors.len());
+                    if let Some(packet) = &spec.policy_packet {
+                        row["policy_packet"] = serde_json::json!(packet);
+                    }
+                }
+                row
+            })
+            .collect();
+        match runtime_catalog_page(rows, "workflows", &p) {
+            Ok(page) => Self::ok_json(&page),
+            Err(error) => Self::err_text(&error.to_string()),
+        }
     }
 
     #[tool(
@@ -1022,6 +1113,93 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[tokio::test]
+    async fn runtime_catalog_pages_filter_sort_and_redact_even_with_detail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        for index in (0..35).rev() {
+            let spec: pollers::PollerSpec = serde_json::from_value(serde_json::json!({
+                "name": format!("poller-{index:02}"), "every_seconds": 60,
+                "source": {"url": "https://user:synthetic-password@example.test/private-token?key=synthetic-query#fragment", "headers": {"Authorization": "synthetic-header"}, "body": {"credential": "synthetic-body"}},
+                "extractor": {"outputs": {"token": {"kind": "const", "value": "synthetic-selector"}}},
+                "routing_packet": "packet-example", "default_project_dir": "/private/daemon/project"
+            })).unwrap();
+            server.state.pollers.install(spec);
+        }
+        for detail in [false, true] {
+            let response = server
+                .bro_poller_list(Parameters(RuntimeCatalogListParams {
+                    detail,
+                    ..Default::default()
+                }))
+                .await;
+            assert_ne!(response.is_error, Some(true), "{response:?}");
+            let text = &response.content[0].as_text().unwrap().text;
+            for secret in [
+                "synthetic-password",
+                "private-token",
+                "synthetic-query",
+                "fragment",
+                "synthetic-header",
+                "synthetic-body",
+                "synthetic-selector",
+                "/private/daemon",
+            ] {
+                assert!(!text.contains(secret), "leaked {secret}");
+            }
+            let page: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(page["count"], 20);
+            assert_eq!(page["next_offset"], 20);
+            assert_eq!(page["pollers"][0]["name"], "poller-00");
+            assert_eq!(
+                page["pollers"][0]["source"]["endpoint_origin"],
+                "https://example.test"
+            );
+            assert_eq!(
+                page["pollers"][0]["source"].get("header_names").is_some(),
+                detail
+            );
+        }
+        let filtered = server
+            .bro_poller_list(Parameters(RuntimeCatalogListParams {
+                name: Some("poller-34".into()),
+                ..Default::default()
+            }))
+            .await;
+        let page: Value =
+            serde_json::from_str(&filtered.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["pollers"][0]["name"], "poller-34");
+        let missing = server
+            .bro_poller_list(Parameters(RuntimeCatalogListParams {
+                name: Some("missing".into()),
+                ..Default::default()
+            }))
+            .await;
+        let page: Value =
+            serde_json::from_str(&missing.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(page["total"], 0);
+    }
+
+    #[test]
+    fn trigger_diagnostics_omit_payloads_selector_literals_and_local_paths() {
+        let cron: crons::CronSpec = serde_json::from_value(serde_json::json!({
+            "name": "example", "schedule": "0 0 9 * * *", "routing_packet": "packet-example",
+            "payload": {"token": "synthetic-secret"}, "default_project_dir": "/private/daemon/project"
+        })).unwrap();
+        let webhook: webhooks::WebhookSpec = serde_json::from_value(serde_json::json!({
+            "name": "example", "signature": {"kind": "hmac_sha256", "secret_env": "EXAMPLE_SECRET", "header": "X-Signature"},
+            "extractor": {"outputs": {"token": {"kind": "const", "value": "synthetic-secret"}}},
+            "routing_packet": "packet-example", "default_project_dir": "/private/daemon/project"
+        })).unwrap();
+        for detail in [false, true] {
+            for view in [cron.response_view(detail), webhook.response_view(detail)] {
+                assert!(!view.to_string().contains("synthetic-secret"));
+                assert!(!view.to_string().contains("/private/daemon"));
+            }
+        }
     }
 
     #[tokio::test]

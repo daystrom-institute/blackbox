@@ -78,6 +78,23 @@ pub struct PollerSpec {
     pub default_project_dir: Option<String>,
 }
 
+impl PollerSpec {
+    /// Credential-safe discovery; detail expands configuration diagnostics only.
+    pub fn response_view(&self, detail: bool) -> Value {
+        let mut row = serde_json::json!({"name": self.name, "every_seconds": self.every_seconds,
+            "source": self.source.response_view(detail), "routing_packet": self.routing_packet});
+        if detail {
+            let mut fields: Vec<_> = self.extractor.outputs.keys().collect();
+            fields.sort();
+            row["extractor_fields"] = serde_json::json!(fields);
+            row["iterate_configured"] = serde_json::json!(self.iterate.is_some());
+            row["dedup_configured"] = serde_json::json!(self.dedup_id_path.is_some());
+            row["project_configured"] = serde_json::json!(self.default_project_dir.is_some());
+        }
+        row
+    }
+}
+
 #[derive(Default)]
 struct DedupRing {
     seen: VecDeque<String>,

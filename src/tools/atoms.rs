@@ -115,7 +115,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "atom_list",
-        description = "List installed atoms from the registry. Optional filters for cost_class, provenance_kind, subcontract, include_superseded, and limit."
+        description = "List installed atoms in name/version order as compact summary pages (default 20, maximum 100). Continue with next_offset. Existing registry filters apply before paging. detail=true expands descriptions and installation diagnostics; atom_get/atom_describe reads one exact atom."
     )]
     pub(crate) fn atom_list(&self, Parameters(p): Parameters<AtomListParams>) -> CallToolResult {
         use orchestration::atoms::registry::{AtomListFilter, AtomRegistry};
@@ -145,45 +145,18 @@ impl BlackboxServer {
             subcontract: p.subcontract,
         };
         match reg.list(&filter) {
-            Ok(summaries) => {
-                let capped = match p.limit {
-                    Some(n) => summaries.into_iter().take(n).collect::<Vec<_>>(),
-                    None => summaries,
-                };
-                Self::ok_json(&serde_json::json!({
-                    "atoms": capped.iter().map(|s| {
-                        let mut m = serde_json::Map::from_iter([
-                            ("name".into(), serde_json::Value::String(s.name.clone())),
-                            ("version".into(), serde_json::Value::String(s.version.clone())),
-                            ("active".into(), serde_json::Value::Bool(s.active)),
-                            ("installed_at".into(), serde_json::Value::String(s.installed_at.clone())),
-                        ]);
-                        if let Some(desc) = &s.description {
-                            m.insert("description".into(), serde_json::Value::String(desc.clone()));
-                        }
-                        if let Some(cc) = &s.cost_class {
-                            m.insert("cost_class".into(), serde_json::Value::String(cc.to_string()));
-                        }
-                        if let Some(pk) = &s.provenance_kind {
-                            m.insert("provenance_kind".into(), serde_json::Value::String(pk.clone()));
-                        }
-                        if let Some(sc) = &s.subcontract {
-                            m.insert("subcontract".into(), serde_json::Value::String(sc.clone()));
-                        }
-                        if let Some(ik) = &s.implementation_kind {
-                            m.insert("implementation_kind".into(), serde_json::Value::String(ik.clone()));
-                        }
-                        if !s.supersedes_chain.is_empty() {
-                            m.insert(
-                                "supersedes_chain".into(),
-                                serde_json::Value::Array(
-                                    s.supersedes_chain.iter().map(|c| serde_json::Value::String(c.clone())).collect(),
-                                ),
-                            );
-                        }
-                        serde_json::Value::Object(m)
-                    }).collect::<Vec<_>>()
-                }))
+            Ok(mut summaries) => {
+                summaries.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+                let rows = summaries
+                    .iter()
+                    .map(|summary| summary.response_view(p.detail))
+                    .collect();
+                match bbox_corpus_core::response_page::collection_page(
+                    rows, "atoms", p.limit, p.offset,
+                ) {
+                    Ok(page) => Self::ok_json(&page),
+                    Err(error) => Self::err_text(&error.to_string()),
+                }
             }
             Err(e) => Self::err_text(&format!("atom registry list failed: {e}")),
         }
