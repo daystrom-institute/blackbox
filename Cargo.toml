@@ -37,6 +37,8 @@ members = [
     "crates/bbox-file-source",
     "crates/bbox-file-source-store",
     "crates/bbox-file-collector",
+    "crates/bbox-transcript-source",
+    "crates/bbox-transcript-source-store",
     "crates/bbox-conversation-source",
     "crates/bbox-conversation-source-store",
     "crates/bbox-slack-collector",

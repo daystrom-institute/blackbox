@@ -17,6 +17,7 @@ use super::helpers::*;
 use super::passes::*;
 use super::project_files;
 use super::{FieldHandles, FileMeta, TranscriptIndex};
+use crate::index::first_u64;
 use bbox_corpus_core::query::smart_query_to_tantivy;
 
 #[derive(Debug)]
