@@ -998,8 +998,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_team",
         category: ToolCategory::Orchestration,
-        summary: "Manage teamplates and instantiated teams.",
-        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. Team members resume existing sessions on later broadcasts; dissolve/recreate when validating new brofile context or provider-default suppression. See `sm-brofile-context` via `bbox_knowledge`. Before `save_template` or `create`, list existing objects first to avoid duplicates. Dissolve ad hoc teams you created after their work is terminal; do not dissolve another operator's team unless instructed. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
+        summary: "Manage teamplates and teams. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages.",
+        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. list/list_templates/roster page at default 20, maximum 100; next_offset continues with the same exact name/project filters. get/get_template return exact stored JSON: concatenate body.text pages using cursor=body.next_cursor, then parse; source changes invalidate cursors. Template scope accepts global or project. In catalog mode, project template discovery refuses because legacy .bro files have no owner transport; use global templates or owner-side reads. Team members resume existing sessions on later broadcasts; dissolve/recreate when validating new brofile context or provider-default suppression. See `sm-brofile-context` via `bbox_knowledge`. Before `save_template` or `create`, list existing objects first to avoid duplicates. Dissolve ad hoc teams you created after their work is terminal; do not dissolve another operator's team unless instructed. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#,
         ),

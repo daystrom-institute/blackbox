@@ -1,26 +1,23 @@
 {
   "id": "gap-e40feb8f",
-  "title": "Transcript lane has no cage-era ingestion path; corpus has had zero transcript ingest since 2026-07-18",
+  "title": "Native transcript backfill restored; continuous host collection awaits Local Network approval",
   "gap_kind": "tooling",
   "domain": "corpus/transcript-ingest",
-  "wanted_capability": "bbox_search / bbox_sessions_list / bbox_cite over current Claude Code and Codex transcripts. Today the cage corpus daemon has no transcript source at all: bbox_stats reports \"claude: (no projects dir)\", bbox_sessions_list returns zero sessions, and a term present in local ~/.claude/projects transcripts since at least Aug 20 (e.g. \"cerebras\") returns zero hits in both smart and fulltext mode. The legacy bbox-collector satellite shipped transcripts to the retired bbox-corpus tailnet host until 2026-07-18 (corpus went unreachable, collector shut down, launchd plist renamed .disabled the same hour) and was never re-pointed at the cage: the bbox-collector crate and its /internal/records daemon ingress exist only on branch salvage/satellite-arc-20260718, never merged, so the deployed cage image cannot accept transcript records even if the old binary were re-enabled. Wanted: a cage-era transcript ingest lane (revive/merge the satellite arc against the cage producer-auth model, or generalize bbox-code-collector / the connector transport to ship provider transcript roots), plus backfill of the roughly six-week local-only window.",
-  "missing_primitive": "A transcript-shipping transport from checkout hosts to the cage corpus daemon (satellite collector plus daemon-side producer ingress), analogous to the code_collection and source_connectors lanes in cage-daemon.toml",
-  "fallback_used": "Raw rg over ~/.claude/projects on the checkout host (how the miss was noticed); no corpus-side workaround exists.",
+  "wanted_capability": "Continuously collect current Claude Code and Codex transcript streams from their source host into the cage corpus, with source freshness and indexed drill-down. The dedicated native transport and initial backfill are deployed; verify unattended launch-agent collection after normal macOS signing and Local Network approval.",
+  "missing_primitive": "Operational activation of the installed native collector launch agent: its own macOS Local Network permission and successful background scan. The producer grant, chunk/snapshot transport, enrollment, backfill, indexing, and retrieval are implemented.",
+  "fallback_used": "An interactive source-host collector publish completed the initial 720-stream backfill. Indexed native search/context/messages/session reads work; repeat interactive publication remains available until background execution is authorized.",
   "evidence": [
-    "~/Library/LaunchAgents/com.daystrom.bbox-collector.plist.disabled (ctime 2026-07-18 03:03, matches log shutdown)",
-    "~/Library/Logs/bbox-collector.log tail: corpus unreachable backoff then 'collector shutting down' 2026-07-18T09:03Z",
-    "~/.config/blackbox/collector.toml still points at http://bbox-corpus.tailf7668f.ts.net:7264 (retired host)",
-    "~/.config/blackbox/cage-daemon.toml: code_collection + source_connectors producer stanzas exist, no transcript lane",
-    "rg 'internal/records' over src/ and crates/ on beta/blackbox-v2: zero hits; bbox-collector crate only on salvage/satellite-arc-20260718 (commits 15101067, 1de9de9e, 825c383b)",
-    "bbox_stats: 'claude: (no projects dir)'; bbox_sessions_list: no sessions; bbox_search cerebras: zero hits both modes",
-    "knowledge:72d2dcb38bf3190d (Aug 14) lists host satellites without bbox-collector, while PROJECT.md still claims 'checkout-bound collectors (code, transcripts)'"
+    "Deployed image ef7f7f04d0f1; full verification bbox-verify-kb8t8 passed 7464 tests, 21 skipped, Clippy and concurrency lint.",
+    "Interactive collector summary: discovered=720, published=720, unchanged=0, deferred=0, failed=0, uploaded_bytes=3022167556.",
+    "Live bbox_search, bbox_context, bbox_messages and bbox_session native reads succeeded with matching published and indexed generations.",
+    "Installed launch-agent contact fails with TCP errno 65; interactive execution succeeds. Operator runbook: docs/native-transcript-collector.md."
   ],
   "impact": "high",
   "blocking_level": "blocks_class_of_work",
   "dedupe_key": "tooling/corpus-transcript-ingest/no-cage-era-transcript-collector",
-  "notes": "Reported by another agent 2026-09-01 (cerebras zero-hit repro). A bbox_reindex cannot help: the cage daemon has no transcript roots to scan. The local transcript history is intact on the checkout host, so a revived lane can backfill the gap window. PROJECT.md's Runtime section should be corrected or the lane restored so doc and reality agree.",
+  "notes": "2026-09-06: image ef7f7f04d0f1 deployed with dedicated native producer credentials. Backfill published 720/720 streams, 3022167556 bytes, zero failed or deferred. Live native Claude and Codex retrieval has matching published/indexed generations. The configured launch agent reports a TCP connect error, No route to host (os error 65), while the identical binary reaches the server interactively; macOS Local Network privacy distinguishes these execution contexts. Normal stable signing is blocked by unavailable keychain interaction in this unattended session. Do not claim continuous collection until the operator completes normal signing/Local Network approval and a background scan succeeds. See docs/native-transcript-collector.md and the MCP response audit. Historical initial-gap evidence remains in Git history.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "created_at": "2026-09-01T15:59:45Z",
-  "updated_at": "2026-09-01T15:59:45Z"
+  "updated_at": "2026-09-06T06:23:00Z"
 }
