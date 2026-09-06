@@ -167,7 +167,7 @@ impl BlackboxServer {
                 {
                     return Self::err_text(&failure.response().to_string());
                 }
-                Self::err_text(&json!({
+                Self::err_text(&serde_json::json!({
                     "error": "error.artifact_source_read_failed", "completed": [],
                     "reason": "The source could not be loaded or decoded; no installation steps ran"
                 }).to_string())
