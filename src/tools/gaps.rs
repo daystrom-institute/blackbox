@@ -9,7 +9,46 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::gaps_tools()
 }
 
+fn carrier_matches_filter(
+    carrier: &str,
+    carrier_id: Option<&str>,
+    project: Option<&str>,
+    project_id: Option<&str>,
+    ledger_paths: &[String],
+) -> bool {
+    if project.is_none_or(|project| project.trim().is_empty()) && project_id.is_none() {
+        return true;
+    }
+    bbox_corpus_core::project_selector::project_scope_matches(carrier_id, project_id, || {
+        let carrier = carrier.to_lowercase();
+        project.is_some_and(|project| carrier.contains(&project.to_lowercase()))
+            || ledger_paths
+                .iter()
+                .any(|path| carrier.contains(&path.to_lowercase()))
+            || project_id.is_some_and(|id| carrier == id.to_lowercase())
+    })
+}
+
 impl BlackboxServer {
+    /// A skipped carrier is relevant only if its rows could match this read.
+    /// Resolve carrier identity before the path fallback, just as row filters do.
+    pub(crate) fn carrier_affects_project_filter(
+        &self,
+        carrier: &str,
+        project: Option<&str>,
+        project_id: Option<&str>,
+        ledger_paths: &[String],
+    ) -> bool {
+        let carrier_id = project_id.and_then(|_| self.project_filter_identity(carrier).ok());
+        carrier_matches_filter(
+            carrier,
+            carrier_id.as_deref(),
+            project,
+            project_id,
+            ledger_paths,
+        )
+    }
+
     fn guard_workspace_bound_project_gap(&self, scope: Option<&str>) -> anyhow::Result<()> {
         if self.authoritative_session_workspace_binding().is_some() && scope != Some("global") {
             anyhow::bail!(
@@ -665,7 +704,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_gaps",
-        description = "List / filter substrate gap notes by typed fields (gap_kind, impact, blocking_level, dedupe_key, resolution, project)."
+        description = "List compact gap summaries with filters and pagination (limit defaults to 20, clamped to 1..100; offset defaults to 0). Exact id defaults to full detail; detail=full expands a page. Summary omissions are explicit. Addressed gaps are excluded from lists by default. Ordering is newest created_at, then id; concurrent writes may shift offsets."
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
         Self::run_with_structured("bbox_gaps", || {
@@ -712,53 +751,33 @@ impl BlackboxServer {
             // The mutation store's reload tolerates unreadable carriers by
             // skipping them; tell the caller which projects that hid.
             for (project, error) in self.state.gaps.read().degraded_carriers() {
+                if !self.carrier_affects_project_filter(
+                    project,
+                    p.project.as_deref(),
+                    p.project_id.as_deref(),
+                    &p.project_ledger_paths,
+                ) {
+                    continue;
+                }
                 filter_diagnostics.push(format!(
                     "gap store overlay skipped for project {project}: {error}"
                 ));
             }
-            let mut used_stamp_refs = Vec::<String>::new();
-            let selected = view.gaps.query(&p);
-            // Response-scoped diagnostics (gap-40ab1102): the legacy-lane
-            // line belongs to the rows this caller actually got, and the
-            // filter-resolution lines lead so an empty result explains
-            // itself.
-            let returned_legacy_rows =
-                view.returned_rows_include_legacy_lane(selected.iter().map(|gap| gap.id.as_str()));
-            let rows = selected
-                .into_iter()
-                .map(|gap| {
-                    let metadata = view.gaps.view_metadata(&gap.id);
-                    let mut row = serde_json::to_value(gap)?;
-                    let object = row
-                        .as_object_mut()
-                        .expect("serialized gap response row must be an object");
-                    if let Some(reference) =
-                        metadata.and_then(|metadata| metadata.built_from_ref.as_ref())
-                    {
-                        object.insert(
-                            "built_from_ref".into(),
-                            serde_json::Value::String(reference.clone()),
-                        );
-                        used_stamp_refs.push(reference.clone());
-                    }
-                    if let Some(lane) =
-                        metadata.and_then(|metadata| metadata.compatibility_lane.as_ref())
-                    {
-                        object.insert(
-                            "compatibility_lane".into(),
-                            serde_json::Value::String(lane.clone()),
-                        );
-                    }
-                    Ok::<_, anyhow::Error>(row)
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let mut structured = view.gaps.list_page(&p)?;
+            let rows = structured["rows"]
+                .as_array()
+                .expect("gap page rows are an array");
+            let used_stamp_refs = rows
+                .iter()
+                .filter_map(|row| row["built_from_ref"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            let returned_legacy_rows = view.returned_rows_include_legacy_lane(
+                rows.iter().filter_map(|row| row["id"].as_str()),
+            );
             view.finalize_response_diagnostics(returned_legacy_rows, filter_diagnostics);
             let built_from = view.built_from_for_refs(used_stamp_refs.iter().map(String::as_str));
-            let mut structured = serde_json::json!({
-                "rows": rows,
-                "built_from": &built_from,
-                "diagnostics": &view.diagnostics,
-            });
+            structured["built_from"] = serde_json::to_value(&built_from)?;
+            structured["diagnostics"] = serde_json::to_value(&view.diagnostics)?;
             // Bounded structured degradation for `all` (plan §10.5): each
             // checkout the survey omitted, as a typed row. Omitted entirely
             // when nothing degraded, so bridge responses and healthy catalog
@@ -770,7 +789,7 @@ impl BlackboxServer {
             let mut rendered = if p.json.unwrap_or(false) {
                 serde_json::to_string_pretty(&structured)?
             } else {
-                view.gaps.list_rendered(&p)?
+                crate::gaps::GapStore::render_page(&structured, false)?
             };
             if !p.json.unwrap_or(false) {
                 if !view.diagnostics.is_empty() {
@@ -908,6 +927,49 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
+
+    #[test]
+    fn degraded_carrier_diagnostics_follow_the_requested_scope() {
+        assert!(carrier_matches_filter("/repos/a", None, None, None, &[]));
+        assert!(carrier_matches_filter(
+            "/repos/a",
+            None,
+            Some("a"),
+            None,
+            &[]
+        ));
+        assert!(!carrier_matches_filter(
+            "/repos/b",
+            None,
+            Some("/repos/a"),
+            None,
+            &[]
+        ));
+        assert!(carrier_matches_filter(
+            "/old/a",
+            None,
+            Some("/new/a"),
+            Some("p-a"),
+            &["/old/a".into()]
+        ));
+        assert!(carrier_matches_filter(
+            "/old/a",
+            Some("p-a"),
+            Some("/new/a"),
+            Some("p-a"),
+            &[]
+        ));
+        // Reusing a path must not import a retired project's diagnostics.
+        assert!(!carrier_matches_filter(
+            "/repos/a",
+            Some("p-old"),
+            Some("/repos/a"),
+            Some("p-new"),
+            &[]
+        ));
+        assert!(carrier_matches_filter("p-a", None, None, Some("p-a"), &[]));
+        assert!(!carrier_matches_filter("p-b", None, None, Some("p-a"), &[]));
+    }
 
     fn bind_remote_workspace(server: &BlackboxServer) {
         assert!(
