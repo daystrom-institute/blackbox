@@ -86,33 +86,49 @@ impl BlackboxServer {
         // retention cutoff (default 24 h from `started_at`).
         let limit = p.limit.unwrap_or(20);
 
-        let filter_provider = p
+        let filter_provider = match p
             .provider
             .as_deref()
-            .and_then(|s| s.parse::<Provider>().ok());
-        // Filter status parses through the in-process enum (no
-        // `Pending` variant) and is then converted to the wire
-        // enum for comparison against `RosterSummaryV1.status`.
-        let filter_status: Option<bro_protocol::TaskStatus> =
-            p.status.as_deref().and_then(|s| match s {
-                "pending" => Some(bro_protocol::TaskStatus::Pending),
-                "running" => Some(bro_protocol::TaskStatus::Running),
-                "completed" => Some(bro_protocol::TaskStatus::Completed),
-                "failed" => Some(bro_protocol::TaskStatus::Failed),
-                "cancelled" => Some(bro_protocol::TaskStatus::Cancelled),
-                _ => None,
-            });
+            .map(str::parse::<Provider>)
+            .transpose()
+        {
+            Ok(provider) => provider,
+            Err(_) => {
+                return Self::err_text(
+                    "Invalid provider filter; use bro_providers to list provider names",
+                );
+            }
+        };
+        let filter_status = match p.status.as_deref() {
+            None => None,
+            Some("pending") => Some(bro_protocol::TaskStatus::Pending),
+            Some("running") => Some(bro_protocol::TaskStatus::Running),
+            Some("completed") => Some(bro_protocol::TaskStatus::Completed),
+            Some("failed") => Some(bro_protocol::TaskStatus::Failed),
+            Some("cancelled") => Some(bro_protocol::TaskStatus::Cancelled),
+            Some(_) => {
+                return Self::err_text(
+                    "Invalid status filter; use pending, running, completed, failed, or cancelled",
+                );
+            }
+        };
 
-        let team_task_ids: Option<std::collections::HashSet<String>> =
-            p.team.as_ref().and_then(|name| {
-                let team = orchestration::team::load_team(name, &self.state.store_dir)?;
-                Some(
+        let team_task_ids: Option<std::collections::HashSet<String>> = match p.team.as_ref() {
+            None => None,
+            Some(name) => match orchestration::team::load_team(name, &self.state.store_dir) {
+                Some(team) => Some(
                     team.members
                         .iter()
-                        .flat_map(|m| m.task_history.clone())
+                        .flat_map(|member| member.task_history.clone())
                         .collect(),
-                )
-            });
+                ),
+                None => {
+                    return Self::err_text(
+                        "Team filter could not be loaded; use bro_team(action=list) to select an existing team",
+                    );
+                }
+            },
+        };
 
         // Wave 7c: read the materialized RosterView snapshot instead
         // of iterating `task_store` and locking every per-task inner
@@ -435,7 +451,9 @@ impl BlackboxServer {
                         ..Default::default()
                     },
                 );
-                brofile::save_config(&config, store_dir);
+                if let Err(error) = brofile::save_config(&config, store_dir) {
+                    return Self::err_text(&format!("Configuration was not saved: {error}"));
+                }
                 Self::ok_json(&json!({"account": name, "updated": true,
                     "configuration": config.accounts[name].response_view()}))
             }
@@ -469,7 +487,9 @@ impl BlackboxServer {
                         account: account.clone(),
                     },
                 );
-                brofile::save_config(&config, store_dir);
+                if let Err(error) = brofile::save_config(&config, store_dir) {
+                    return Self::err_text(&format!("Configuration was not saved: {error}"));
+                }
                 Self::ok_json(
                     &json!({"provider": provider.as_str(), "account": account, "updated": true}),
                 )
@@ -506,7 +526,9 @@ impl BlackboxServer {
                 };
                 let mut config = brofile::load_config(store_dir);
                 let removed = config.provider_defaults.remove(&provider).is_some();
-                brofile::save_config(&config, store_dir);
+                if let Err(error) = brofile::save_config(&config, store_dir) {
+                    return Self::err_text(&format!("Configuration was not saved: {error}"));
+                }
                 Self::ok_json(&json!({"provider": provider.as_str(), "removed": removed}))
             }
             _ => Self::err_text(&format!("Unknown brofile action: {}", p.action)),
@@ -1527,6 +1549,37 @@ mod tests {
     }
 
     #[test]
+    fn account_mutations_report_failed_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut state = SharedState::for_test(&root);
+        // A file where the store directory should be fails deterministically,
+        // including tests running as root, without changing filesystem modes.
+        let blocked = root.join("blocked-store");
+        std::fs::write(&blocked, "existing-file").unwrap();
+        state.store_dir = blocked.clone();
+        let server = BlackboxServer::new(Arc::new(state));
+        for action in [
+            "set_account",
+            "set_provider_default",
+            "clear_provider_default",
+        ] {
+            let params: BrofileParams = serde_json::from_value(json!({
+                "action": action, "name": "synthetic", "provider": "brodex",
+                "account": "synthetic", "env": {"TOKEN": "synthetic-secret"},
+            }))
+            .unwrap();
+            let result = server.bro_brofile(Parameters(params));
+            assert_eq!(result.is_error, Some(true), "{action} claimed success");
+            let response = extract_text(&result);
+            assert!(response.contains("not saved"));
+            assert!(!response.contains("synthetic-secret"));
+            assert!(!response.contains("\"updated\": true"));
+        }
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "existing-file");
+    }
+
+    #[test]
     fn account_responses_hide_environment_values_but_persist_them() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
@@ -1776,6 +1829,35 @@ mod tests {
                 "terminal success must roll up: {agents:?}"
             );
             assert_eq!(agents["agent-live-1@v1"]["success_count"].as_u64(), None);
+        }
+
+        #[test]
+        fn dashboard_invalid_filters_fail_without_broadening() {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            server.state.roster_view.upsert(
+                "unrelated-task".into(),
+                live_summary("unrelated-task", Provider::Brodex, 1_700_000_000_000),
+            );
+            for input in [
+                json!({"provider": "typo"}),
+                json!({"provider": ""}),
+                json!({"status": "typo"}),
+                json!({"status": ""}),
+                json!({"team": "missing-team"}),
+                json!({"team": ""}),
+            ] {
+                let params: DashboardParams = serde_json::from_value(input.clone()).unwrap();
+                let result = server.bro_dashboard(Parameters(params));
+                assert_eq!(result.is_error, Some(true), "filter broadened: {input}");
+                assert!(!extract_text(&result).contains("unrelated-task"));
+            }
+            let params: DashboardParams =
+                serde_json::from_value(json!({"provider": "kimi"})).unwrap();
+            let result = server.bro_dashboard(Parameters(params));
+            assert_ne!(result.is_error, Some(true));
+            let body: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+            assert_eq!(body["tasks"], json!([]));
         }
 
         #[test]
