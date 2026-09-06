@@ -28,9 +28,9 @@ forgejo, gate, executors, template).
 
 | Tool | Minimum surface | Notes |
 |---|---|---|
-| `system_event_list` | `readonly` | Filter by kind/producer/project. |
+| `system_event_list` | `readonly` | Newest-first summaries, default 20/max 100. Keep filters and pass `next_before` as `before`. Open one event for payload/correlation/principal. |
 | `system_event_open` | `readonly` | Returns event + causation chain. |
-| `reaction_list` | `default` | All installed reactions. |
+| `reaction_list` | `default` | Name-ordered pages, default 20/max 100. Exact `name` filter; `next_offset` continuation. `detail=true` adds safe policy diagnostics, `view="warnings"` pages load warnings. |
 | `reaction_deliveries` | `default` | Outbox rows. Filter by event_id/status. |
 | `reaction_replay` (`mode=dry_run`) | `default` | Renders idempotency key, gate verdict, and redacted action args. No side effects. |
 | `identity_list` / `identity_get` | `readonly` | Mappings only — no token material. |
@@ -152,12 +152,16 @@ stale-claim recovery, before the outbox worker spawns. Operators can also run
 
 For long-lived daemons, install the bundled daily maintenance flow:
 
+MCP install examples below use variables containing parsed artifact JSON objects.
+Obtain those objects from source-owned evidence or an explicit HTTP(S) source;
+repository filenames are not server-readable MCP source arguments.
+
 ```text
-bbox_artifact_install(kind="workflow", source="system-defaults/maintenance/workflows/daily-compaction-arc.json")
-bbox_artifact_install(kind="packet", source="system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.json")
-bbox_artifact_install(kind="packet", source="system-defaults/agentic-corpus/packets/embed/compaction-policy.json")
-bbox_artifact_install(kind="packet", source="system-defaults/maintenance/packets/cron-routing/daily-compaction.json")
-bbox_artifact_install(kind="cron", source="system-defaults/maintenance/crons/daily-compaction.json")
+bbox_artifact_install(kind="workflow", artifact=daily_compaction_arc_workflow)
+bbox_artifact_install(kind="packet", artifact=arc_budget_packet)
+bbox_artifact_install(kind="packet", artifact=compaction_policy_packet)
+bbox_artifact_install(kind="packet", artifact=daily_compaction_packet)
+bbox_artifact_install(kind="cron", artifact=daily_compaction_cron)
 ```
 
 That cron starts `daily-compaction-arc`, which runs system-event compaction,
@@ -191,8 +195,9 @@ system_event_open  →  reaction_deliveries  →  reaction_replay (dry_run)  →
 
 1. `system_event_open(event_id=...)` — confirm the event was journaled and
    note its `kind`.
-2. `reaction_list()` — confirm a reaction subscribes to that kind and is
-   `enabled: true`. A reaction with `enabled: false` will not match.
+2. `reaction_list()` returns one summary page. Follow `next_offset` or filter
+   by `name` to find the reaction. Use `detail=true` for all subscribed kinds;
+   confirm `enabled: true`. Check `view="warnings"` when `warning_count` is nonzero.
 3. `reaction_deliveries(event_id=...)` — expect a row per matching
    reaction. If zero rows:
    - kind mismatch (typo, new kind not yet registered),
@@ -208,8 +213,10 @@ system_event_open  →  reaction_deliveries  →  reaction_replay (dry_run)  →
 1. `reaction_deliveries(event_id=...)` — expect at most one row per
    reaction. Multiple rows for the same (event_id, reaction) indicate
    missing idempotency key on the reaction spec.
-2. Check the reaction spec via `reaction_list()` — the `idempotency_key`
-   template should produce a unique-per-effect string. Examples:
+2. Use `reaction_list(name=..., detail=true)` to confirm idempotency is
+   configured. Inspect the rendered key through `reaction_replay(event_id=...,
+   reaction=...)`; list diagnostics deliberately omit raw templates and action
+   arguments. The rendered key should be unique per effect. Examples:
    - `forgejo:${event.payload.instance}:${event.subject.id}` for per-bro
      Forgejo provisioning,
    - `pr-comment:${event.payload.pr_id}:${event.payload.review_id}` for

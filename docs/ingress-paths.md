@@ -25,6 +25,12 @@ The daemon has no hardcoded Forgejo/GitHub/Slack path. JSON-speaking upstreams
 all converge on extractor to packet to dispatch. You iterate on routing by
 replaying payloads, not by redeploying code.
 
+The webhook, poller, and cron list tools return name-ordered summary pages
+(default 20, maximum 100). Continue with `next_offset` as `offset`, or select an
+exact `name`. `detail=true` adds safe configuration diagnostics. List replies
+omit credentials, URL paths/query/userinfo, payload values, selector constants,
+and host project paths, including in detail mode.
+
 ## Webhooks
 
 The daemon exposes `POST /webhook/<name>` for inbound webhook deliveries.

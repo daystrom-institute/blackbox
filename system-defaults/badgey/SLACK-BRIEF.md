@@ -70,8 +70,25 @@ indexed evidence or an HTTP source, then pass that object directly:
 bbox_artifact_install(kind="workflow", artifact=<typed workflow JSON object>)
 ```
 
-Install the `hook-route/proposal-page` packet before upgrading
-`badgey-slack-emit-proposal-arc` and `badgey-triage-channel-arc`. The other
+Deployment of the executable does not install these artifacts. Startup reloads
+persisted specs and the active artifact catalog; the container image carries
+system memories, not the Badgey artifact tree. Perform this explicit migration
+after the daemon serving the new proposal API is deployed, with no triage arc
+running or due to start during the update:
+
+1. List/get the existing `hook-route/proposal-page` packet and both workflow
+   names to check the installed versions.
+2. Install the `hook-route/proposal-page` packet, then confirm
+   `bbox_packet_list(domain="hook-route/proposal-page")` finds it.
+3. Install child `badgey-slack-emit-proposal-arc` version 2. Its exact read also
+   accepts an old parent's full proposal as input.
+4. Install parent `badgey-triage-channel-arc` version 3.
+5. Verify both runtime versions with `bro_workflow_list(name=..., detail=true)`
+   and their catalog versions with `bbox_artifact_list(kind="workflow", name=...)`.
+
+Stop on any install or verification failure. The packet must exist before the
+new parent can take its continuation branch; the child must support summary
+inputs before the new parent runs. The other
 prerequisites are the Badgey/scout brofiles and agents, scout workflow,
 channel-fanout workflow, cron-routing packet, and daily cron. Host deployment
 scripts may load repository files through the host-domain install API.

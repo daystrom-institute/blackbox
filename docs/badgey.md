@@ -112,9 +112,14 @@ badgey_proposals_list(badgey_id="bg-deadbeef-cafef00d", proposal_id="P-3")
 ```
 
 The `proposals` array then contains the exact record and its full draft.
-`include_events=true` adds transition history for that exact read. Individual
-records that exceed the response budget fail explicitly; no hidden file is
-created. The consumer-neutral `consultant_proposals_list` has the same contract.
+`include_events=true` adds transition history for that exact read. For an
+oversized record, use `detail="full"` with `proposal_id`. That returns a `body`
+JSON text page; concatenate `body.text` in order, following `body.next_cursor`
+as `cursor` until absent, then parse the complete JSON. `body_limit` defaults
+to 4096 bytes and cannot exceed 4096. Cursors bind the instance, proposal,
+selected history, and content revision; a changed record requires a fresh read.
+Small exact reads continue to return `proposals[0]` for workflow consumers.
+The consumer-neutral `consultant_proposals_list` has the same contract.
 
 **`badgey_apply_proposal`** - One-shot apply: state-machine transition
 `Pending/Failed -> Applying`, kind-specific dispatch, record

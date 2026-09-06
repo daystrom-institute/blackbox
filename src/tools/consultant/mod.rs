@@ -43,11 +43,42 @@ fn resolve(consumer: &str, consultant_id: &str) -> Result<ConsultantId, String> 
         .map_err(|e| format!("error.bad_input(code=invalid_consultant_id): {e}"))
 }
 
+/// Shared transport projection for the generic and Badgey-pinned proposal reads.
+pub(super) fn proposal_response_page(
+    store: &crate::orchestration::consultant::proposals::ProposalStore,
+    instance: &ConsultantId,
+    options: &crate::orchestration::consultant::proposals::ProposalReadOptions,
+    mut envelope: Value,
+    detail: Option<&str>,
+    cursor: Option<&str>,
+    body_limit: Option<usize>,
+) -> anyhow::Result<Value> {
+    let full = crate::tools::body_page::validate_detail(detail, cursor, body_limit)?;
+    if full {
+        let record = store.exact_response_row(instance, options)?;
+        let proposal_id = options.proposal_id.as_deref().unwrap();
+        let scope = format!(
+            "proposal:{}:{proposal_id}:events={}",
+            instance.as_str(),
+            options.include_events
+        );
+        envelope["proposal_id"] = json!(proposal_id);
+        envelope["body"] =
+            crate::tools::body_page::json_body_page(&scope, &record, cursor, body_limit)?;
+        return Ok(envelope);
+    }
+    store.response_page(instance, options, envelope).map_err(|error| {
+        if options.proposal_id.is_some() && error.to_string().contains("error.collection_row_too_large") {
+            anyhow::anyhow!("error.proposal_body_requires_paging: exact proposal exceeds the response budget; retry the same proposal_id with detail=full, concatenate body.text pages, and continue with body.next_cursor as cursor")
+        } else { error }
+    })
+}
+
 #[tool_router(router = consultant_tools)]
 impl BlackboxServer {
     #[tool(
         name = "consultant_proposals_list",
-        description = "List consultant proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine list filters/cursors. Returns proposals[], count, has_more, next_after, through."
+        description = "List consultant proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine since/only_pending/limit/after/through. detail=full with proposal_id returns lossless JSON body pages; continue body.next_cursor as cursor (body_limit up to 4096). Ordinary small exact reads retain proposals[0]."
     )]
     pub(crate) async fn consultant_proposals_list(
         &self,
@@ -56,12 +87,14 @@ impl BlackboxServer {
         let server = self.clone();
         Self::run_blocking("consultant_proposals_list", move || {
             let id = resolve(&p.consumer, &p.consultant_id).map_err(|e| anyhow::anyhow!(e))?;
-            let page = server.state.consultant_proposals.response_page(
+            let page = proposal_response_page(
+                &server.state.consultant_proposals,
                 &id,
                 &p.read_options(),
-                json!({
-                    "consumer": p.consumer, "consultant_id": p.consultant_id,
-                }),
+                json!({"consumer": p.consumer, "consultant_id": p.consultant_id}),
+                p.detail.as_deref(),
+                p.cursor.as_deref(),
+                p.body_limit,
             )?;
             Ok(serde_json::to_string_pretty(&page)?)
         })
@@ -253,6 +286,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_proposal_body_pages_reconstruct_unicode_and_reject_stale_or_foreign_cursors() {
+        use crate::orchestration::consultant::types::ProposalState;
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let id: ConsultantId = "bg-0123abcd-4567ef89".parse().unwrap();
+        let other: ConsultantId = "bg-11111111-22222222".parse().unwrap();
+        let draft = json!({"headline":"large proposal", "evidence":"\u{0001}界\n".repeat(8000)});
+        server
+            .state
+            .consultant_proposals
+            .create(&id, "packet", draft.clone(), None)
+            .unwrap();
+        server
+            .state
+            .consultant_proposals
+            .create(&other, "packet", draft.clone(), None)
+            .unwrap();
+        let basic = json!({"consumer":"badgey", "consultant_id":id.as_str(), "proposal_id":"P-1"});
+        let result = server
+            .consultant_proposals_list(Parameters(serde_json::from_value(basic.clone()).unwrap()))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(extract_text(&result).contains("proposal_body_requires_paging"));
+        let mut args = basic;
+        args["detail"] = json!("full");
+        let mut reconstructed = String::new();
+        let mut first_cursor = None;
+        loop {
+            let result = server
+                .consultant_proposals_list(Parameters(
+                    serde_json::from_value(args.clone()).unwrap(),
+                ))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let page: Value = serde_json::from_str(&extract_text(&result)).unwrap();
+            assert!(serde_json::to_vec(&page["body"]).unwrap().len() <= 4096);
+            reconstructed.push_str(page["body"]["text"].as_str().unwrap());
+            let Some(cursor) = page["body"]["next_cursor"].as_str() else {
+                break;
+            };
+            if first_cursor.is_none() {
+                first_cursor = Some(cursor.to_owned());
+            }
+            args["cursor"] = json!(cursor);
+        }
+        let record: Value = serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(record["draft"], draft);
+        args["cursor"] = json!(first_cursor.clone().unwrap());
+        args["consultant_id"] = json!(other.as_str());
+        let foreign = server
+            .consultant_proposals_list(Parameters(serde_json::from_value(args.clone()).unwrap()))
+            .await;
+        assert_eq!(foreign.is_error, Some(true));
+        args["consultant_id"] = json!(id.as_str());
+        server
+            .state
+            .consultant_proposals
+            .transition(
+                &id,
+                "P-1",
+                ProposalState::Pending,
+                ProposalState::Failed,
+                None,
+            )
+            .unwrap();
+        let stale = server
+            .consultant_proposals_list(Parameters(serde_json::from_value(args).unwrap()))
+            .await;
+        assert_eq!(stale.is_error, Some(true));
+        assert!(extract_text(&stale).contains("restart without cursor"));
+    }
+
+    #[tokio::test]
     async fn shipped_proposal_workflows_follow_pages_and_expand_each_draft_without_side_effects() {
         use crate::workflow::context::{ArcContext, resolve_arg_value};
         let tmp = tempfile::tempdir().unwrap();
@@ -385,6 +491,9 @@ mod tests {
             .unwrap();
         let result = server
             .consultant_proposals_list(Parameters(ConsultantProposalsListParams {
+                detail: None,
+                cursor: None,
+                body_limit: None,
                 limit: None,
                 after: None,
                 through: None,

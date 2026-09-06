@@ -17,8 +17,12 @@ schemas, effect limits, child-invocation rules, ownership, and trace state.
 
 Install an atom:
 
+MCP install examples below use variables containing parsed artifact JSON objects.
+Obtain those objects from source-owned evidence or an explicit HTTP(S) source;
+repository filenames are not server-readable MCP source arguments.
+
 ```text
-bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/echo.json")
+bbox_artifact_install(kind="atom", artifact=echo_atom)
 ```
 
 Invoke it:
@@ -62,17 +66,17 @@ The daemon does not auto-install shipped defaults. Pick what you want from
 for install order and catalog mechanics.
 
 ```text
-bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/echo.json")
-bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/validate-schema.json")
-bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
-bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-test-island-extract.json")
+bbox_artifact_install(kind="atom", artifact=echo_atom)
+bbox_artifact_install(kind="atom", artifact=validate_schema_atom)
+bbox_artifact_install(kind="brofile", artifact=rust_refactor_persona_brofile)
+bbox_artifact_install(kind="atom", artifact=rust_test_island_extract_atom)
 ```
 
 Workflow-backed atoms need the referenced workflow installed first:
 
 ```text
-bbox_artifact_install(kind="workflow", source="system-defaults/workflows/atoms/echo-review.json")
-bbox_artifact_install(kind="atom", source="system-defaults/atoms/workflows/echo-review.json")
+bbox_artifact_install(kind="workflow", artifact=echo_review_workflow)
+bbox_artifact_install(kind="atom", artifact=echo_review_atom)
 ```
 
 If `atom_invoke` says the workflow is missing, install the workflow artifact.
@@ -80,7 +84,10 @@ The atom manifest is only the wrapper; it does not embed the workflow body.
 
 ## Discovery
 
-Use `atom_list` when you already know the catalog shape:
+Use `atom_list` when you already know the catalog shape. It returns 20 compact
+summaries by default (maximum 100). Follow `next_offset` as `offset` with the
+same filters. `detail=true` expands descriptions and installation diagnostics;
+`atom_get`/`atom_describe` reads one exact atom:
 
 ```text
 atom_list(subcontract="refactor/v1")

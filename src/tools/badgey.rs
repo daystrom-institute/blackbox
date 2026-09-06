@@ -226,7 +226,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "badgey_proposals_list",
-        description = "List Badgey proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine list filters/cursors. Returns proposals[], count, has_more, next_after, through."
+        description = "List Badgey proposal summaries by numeric id (default 20, maximum 100). Continue with next_after as after and the returned through bound, keeping since/only_pending unchanged. No drafts or history in list pages. proposal_id reads one exact draft; include_events=true adds transition history. Exact reads cannot combine since/only_pending/limit/after/through. detail=full with proposal_id returns lossless JSON body pages; continue body.next_cursor as cursor (body_limit up to 4096). Ordinary small exact reads retain proposals[0]."
     )]
     pub(crate) fn badgey_proposals_list(
         &self,
@@ -236,10 +236,14 @@ impl BlackboxServer {
             Ok(parsed) => parsed,
             Err(e) => return Self::err_text(&e),
         };
-        match self.state.consultant_proposals.response_page(
+        match crate::tools::consultant::proposal_response_page(
+            &self.state.consultant_proposals,
             &id,
             &p.read_options(),
             json!({"badgey_id": p.badgey_id}),
+            p.detail.as_deref(),
+            p.cursor.as_deref(),
+            p.body_limit,
         ) {
             Ok(page) => Self::ok_json(&page),
             Err(error) => Self::err_text(&error.to_string()),
