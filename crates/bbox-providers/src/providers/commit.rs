@@ -30,7 +30,7 @@ impl InspectableEntityProvider for CommitProvider {
         properties.insert("sha".into(), sha.clone());
         if ctx.stores().is_some() {
             let indexed = ctx
-                .indexed_entity_properties(&r.to_string())?
+                .indexed_entity_properties_with_content(&r.to_string())?
                 .ok_or_else(|| anyhow::anyhow!("commit entity {r} not found"))?;
             properties.extend(indexed);
         }
@@ -40,7 +40,7 @@ impl InspectableEntityProvider for CommitProvider {
     fn schema(&self) -> EntitySchemaView {
         schema(
             self.entity_type(),
-            &["repo_id", "sha", "subject", "author"],
+            &["repo_id", "sha", "subject", "author", "content"],
             &[
                 "COMMIT_PARENT",
                 "COMMIT_PRODUCED_BY_ARC",

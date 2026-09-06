@@ -44,6 +44,24 @@ Use `direction=both` for orientation, then narrow to `direction=out` or
 `error.bad_input` with a `suggested_fix`, use the suggestion verbatim.
 The ref encodes details that are not reliably reconstructible by hand.
 
+Property detail defaults to `smart`. `property_projection.shortened` and
+`omitted_keys` identify response-level reductions; select `property="content"`
+(or another returned key) and follow `body.next_cursor` to recover its exact
+stored value. `property_mode="full"` returns all provider properties when they
+fit. These controls do not undo upstream ingestion limits. A field named
+`content_preview`, including those on indexed project-file, transcript and
+session entities, is an intrinsic provider preview; selecting that field reads
+only the preview, even in full mode. Session `first_user_prompt` is also a
+preview.
+
+Commit inspection exposes the indexed message as `content`, so a message longer
+than the smart preview has an explicit shortening marker and exact property
+pages. Commit ingestion retains at most 16 KiB, including its truncation suffix.
+When that suffix is present, `evidence.content_completeness="ingest_truncated"`
+and `evidence.content_limitation` remain visible in summaries and exact pages.
+Completing those pages recovers the stored message, not omitted original Git
+bytes. Retrieval uses the pinned index generation; it does not read a checkout.
+
 ### `bbox_find_paths`
 
 Input: a source ref, a destination (an exact `to` ref or a `to_type`
