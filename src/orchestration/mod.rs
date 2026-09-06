@@ -1236,6 +1236,7 @@ mod roster_view_tests {
             let mut inner = task.inner.lock();
             inner.status = TaskStatus::Completed;
             inner.last_assistant_message = Some("done".to_string());
+            inner.latest_assistant_preview.set("done");
         }
         sink.emit_updated(&task);
         let snap = view.snapshot();
