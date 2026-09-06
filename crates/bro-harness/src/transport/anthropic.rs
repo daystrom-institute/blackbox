@@ -1056,8 +1056,11 @@ fn normalize_anthropic_messages(messages: &mut Vec<Value>) {
 
     let mut idx = 0;
     while idx < messages.len() {
+        // Server tools and their results belong to the provider. A canonical
+        // web_search_tool_result is not a missing client tool_result, and a
+        // paused native call must not acquire a fabricated user response.
         let missing: Vec<Value> = content_blocks(&messages[idx])
-            .filter(|block| matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use")))
+            .filter(|block| block["type"] == "tool_use")
             .filter_map(|block| block["id"].as_str())
             .filter(|id| !tool_results.contains(*id))
             .map(|id| json!({"type": "tool_result", "tool_use_id": id, "content": "aborted"}))
@@ -2062,6 +2065,52 @@ mod tests {
             .count();
         assert_eq!(assistant_turns, 1, "the empty turn must not be retained");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn normalize_preserves_native_search_results_without_client_repairs() {
+        for (name, result) in [
+            (
+                "web_search",
+                json!({"type":"web_search_tool_result", "tool_use_id":"native-1", "content":[]}),
+            ),
+            (
+                "web_search_prime",
+                json!({"type":"tool_result", "tool_use_id":"native-1", "content":"[]"}),
+            ),
+        ] {
+            let mut messages = vec![json!({"role":"assistant", "content":[
+                {"type":"server_tool_use", "id":"native-1", "name":name, "input":{"search_query":"synthetic query"}},
+                result,
+                {"type":"text", "text":"Search completed."},
+            ]})];
+            let expected = messages.clone();
+            normalize_anthropic_messages(&mut messages);
+            assert_eq!(messages, expected);
+            normalize_anthropic_messages(&mut messages);
+            assert_eq!(
+                messages, expected,
+                "replay normalization must be idempotent"
+            );
+        }
+        let native = json!({"role":"assistant", "content":[
+            {"type":"server_tool_use", "id":"native-paused", "name":"web_search", "input":{"query":"synthetic"}},
+        ]});
+        let mut paused = vec![native.clone()];
+        normalize_anthropic_messages(&mut paused);
+        assert_eq!(
+            paused,
+            vec![native],
+            "unfinished native tools remain provider-owned"
+        );
+
+        let mut client = vec![json!({"role":"assistant", "content":[
+            {"type":"tool_use", "id":"client-interrupted", "name":"file_read", "input":{}},
+        ]})];
+        normalize_anthropic_messages(&mut client);
+        assert_eq!(client[1]["role"], "user");
+        assert_eq!(client[1]["content"][0]["tool_use_id"], "client-interrupted");
+        assert_eq!(client[1]["content"][0]["content"], "aborted");
     }
 
     #[test]

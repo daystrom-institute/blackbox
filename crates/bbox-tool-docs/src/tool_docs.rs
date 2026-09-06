@@ -932,7 +932,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_agent_get",
         category: ToolCategory::Orchestration,
-        summary: "Read full details for a single agent by name or agent-ref (name@vN or agent:name@vN). Returns manifest, metadata, and lifecycle state.",
+        summary: "Read one agent by name or agent-ref with lifecycle state, a manifest summary, and exact redacted manifest body pages.",
         when_to_use: "Inspect a specific agent's manifest (brofile config, filter overlay, inputs/outputs, composition constraints) before dispatching or composing it into a pipeline.",
         example: Some(r#"bro_agent_get(name="reviewer")"#),
     },
