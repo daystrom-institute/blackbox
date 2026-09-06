@@ -79,7 +79,7 @@ pub struct ToolCallsParams {
     /// Filter by project path (cwd recorded at call time).
     #[serde(default)]
     pub project: Option<String>,
-    /// ISO 8601 lower bound on timestamp (lexical compare).
+    /// RFC 3339 lower bound on timestamp; timezone offsets are compared as instants.
     #[serde(default)]
     pub since: Option<String>,
     /// Max rows to return (default 20, max 100).
@@ -87,6 +87,7 @@ pub struct ToolCallsParams {
     pub limit: Option<u32>,
     /// Continue with next_offset from the previous response, using identical filters.
     /// This is a candidate cursor; a filtered page can be empty and still have more.
+    /// Maximum 100000; narrow filters to continue beyond that candidate window.
     #[serde(default)]
     pub offset: Option<usize>,
 }
@@ -96,6 +97,21 @@ fn query_tool_calls(
     p: &ToolCallsParams,
     project_filter: Option<&ProjectFilterInput>,
 ) -> anyhow::Result<String> {
+    let since = p
+        .since
+        .as_deref()
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("since must be an RFC 3339 timestamp with a timezone"))?;
+    if let Some(kind) = &p.tool_kind {
+        anyhow::ensure!(
+            matches!(
+                kind.as_str(),
+                "read" | "write" | "edit" | "bash" | "mcp" | "unknown"
+            ),
+            "tool_kind must be read, write, edit, bash, mcp, or unknown"
+        );
+    }
     let searcher = idx.searcher();
     let fields = idx.field_handles();
 
@@ -167,9 +183,9 @@ fn query_tool_calls(
             || p.tool_target
                 .as_ref()
                 .is_some_and(|wanted| !target.contains(wanted))
-            || p.since
-                .as_ref()
-                .is_some_and(|since| timestamp.is_empty() || timestamp < *since)
+            || since.as_ref().is_some_and(|since| {
+                chrono::DateTime::parse_from_rfc3339(&timestamp).map_or(true, |time| time < *since)
+            })
             || project_filter.as_ref().is_some_and(|filter| {
                 !project.contains(&filter.literal)
                     && !filter
@@ -195,11 +211,37 @@ fn query_tool_calls(
         row.as_object_mut()
             .unwrap()
             .retain(|_, v| v.as_str() != Some(""));
+        for key in [
+            "server",
+            "tool_name",
+            "tool_kind",
+            "session_id",
+            "project",
+            "timestamp",
+            "task_id",
+        ] {
+            bbox_corpus_core::response_page::preview_field(&mut row, key, 256);
+        }
+        for key in ["target", "outcome"] {
+            bbox_corpus_core::response_page::preview_field(&mut row, key, 1024);
+        }
+        let locator = doc_text(&doc, fields.file_path);
+        if !locator.is_empty()
+            && let Some(tantivy::schema::OwnedValue::U64(offset)) =
+                doc.get_first(fields.byte_offset)
+        {
+            let context = json!({"file_path": locator, "byte_offset": offset});
+            if serde_json::to_vec(&context)?.len() <= 4096 {
+                row["context"] = context;
+            } else {
+                row["context_unavailable"] = "stored locator exceeds the response budget".into();
+            }
+        }
         let row_bytes = serde_json::to_vec(&row)?.len();
         if bytes + row_bytes > 32_000 {
             anyhow::ensure!(
                 !rows.is_empty(),
-                "tool-call record exceeds the response budget; narrow the query to other records"
+                "tool-call preview exceeds the response budget"
             );
             break;
         }
@@ -269,6 +311,14 @@ mod tests {
             doc.add_text(fields.session_id, format!("session-{i}"));
             writer.add_document(doc).unwrap();
         }
+        let mut giant = tantivy::TantivyDocument::new();
+        giant.add_text(fields.doc_type, "tool_call");
+        giant.add_text(fields.tool_name, "giant-fixture");
+        giant.add_text(fields.tool_target, "界\n\"".repeat(20000));
+        giant.add_text(fields.file_path, "native://fixture/session");
+        giant.add_u64(fields.byte_offset, 99);
+        giant.add_text(fields.timestamp, "2026-09-06T01:00:00+02:00");
+        writer.add_document(giant).unwrap();
         writer.commit().unwrap();
         idx.reader_reload_for_test();
         let mut params = ToolCallsParams {
@@ -306,5 +356,24 @@ mod tests {
             serde_json::from_str(&query_tool_calls(&idx, &params, None).unwrap()).unwrap();
         assert!(page["rows"].as_array().unwrap().is_empty());
         assert!(page["next_offset"].is_null());
+        let mut giant_params = ToolCallsParams {
+            tool_name: Some("giant-fixture".into()),
+            since: Some("2026-09-05T22:30:00Z".into()),
+            ..Default::default()
+        };
+        let output = query_tool_calls(&idx, &giant_params, None).unwrap();
+        assert!(output.len() < 32000);
+        let page: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(page["rows"][0]["target_truncated"], true);
+        assert_eq!(
+            page["rows"][0]["context"],
+            json!({"file_path":"native://fixture/session", "byte_offset":99})
+        );
+        giant_params.since = Some("2026-09-05T23:30:00Z".into());
+        let page: serde_json::Value =
+            serde_json::from_str(&query_tool_calls(&idx, &giant_params, None).unwrap()).unwrap();
+        assert!(page["rows"].as_array().unwrap().is_empty());
+        giant_params.since = Some("not-a-time".into());
+        assert!(query_tool_calls(&idx, &giant_params, None).is_err());
     }
 }

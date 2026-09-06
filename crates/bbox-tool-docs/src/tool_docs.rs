@@ -970,7 +970,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_tool_calls",
         category: ToolCategory::Workspace,
         summary: "Search indexed tool-call history by server, tool name, kind, target, project and time. Returns bounded rows and next_offset; paths in records describe historical calls, not files the caller must open.",
-        when_to_use: "Use for tool-use evidence from indexed transcripts. Exact server/tool/kind filters narrow the index query. Glob (* wildcard), target substring, project and since filters apply to a bounded candidate page. Follow next_offset even when rows is empty; use identical filters, and restart after index changes. No automatic reindex or local file read occurs.",
+        when_to_use: "Use for tool-use evidence from indexed transcripts. Exact server/tool/kind filters narrow the index query. Glob (* wildcard), target substring, project and since filters apply to a bounded candidate page. Rows preview long fields with explicit truncation markers. When context is present, pass it as the arguments to bbox_context for the indexed source event (an indexed projection, not a guaranteed complete transcript). outcome=requested records invocation, not successful completion. Default limit 20, maximum 100. Follow next_offset even when rows is empty; use identical filters, and restart after index changes. Offsets stop at 100000; narrow filters beyond that window. since requires RFC 3339 with timezone. No automatic reindex or local file read occurs.",
         example: Some(r#"bbox_tool_calls(server="blackbox", tool_name="bro_exec", limit=20)"#),
     },
     // ── Roadmap ─────────────────────────────────────────────────────
