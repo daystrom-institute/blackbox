@@ -462,7 +462,7 @@ mod tests {
             let server = test_server(&tmp);
             std::fs::create_dir_all(&server.state.store_dir).unwrap();
             std::fs::write(server.state.store_dir.join(blocked_stage), "blocked").unwrap();
-            let p = serde_json::from_value(json!({"kind": "team", "version": "1", "artifact": {"name": "example", "members": []}})).unwrap();
+            let p = serde_json::from_value(json!({"kind": "team", "version": "1", "artifact": {"name": "example", "members": [{"brofile": "example", "count": 1}]}})).unwrap();
             let response = server.bbox_artifact_install(Parameters(p)).await;
             assert_eq!(response.is_error, Some(true), "{response:?}");
             let failure: Value =
