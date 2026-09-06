@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.daystrom.bbox-transcript-collector</string>
+    <key>CFBundleName</key>
+    <string>Blackbox Transcript Collector</string>
+    <key>CFBundleDisplayName</key>
+    <string>Blackbox Transcript Collector</string>
+    <key>CFBundleExecutable</key>
+    <string>bbox-transcript-collector</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Publishes retained Claude Code and Codex session transcripts to your configured Blackbox corpus server on the local network.</string>
+</dict>
+</plist>

@@ -25,3 +25,8 @@
 - Watch diagnostics retain contextual and underlying transport/OS causes with a
   bounded error chain. Keep the scan-completion partial-effect context without
   flattening its cause. HTTP error bodies and bearer headers remain excluded.
+
+- macOS builds embed the collector's own identity and Local Network usage
+  explanation in the executable. This metadata supplies attribution, not an
+  access grant. Preserve it across packaging; do not borrow another app's
+  identity. Signing and user approval remain separate deployment requirements.
