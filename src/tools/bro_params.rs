@@ -963,9 +963,11 @@ pub(crate) struct TeamParams {
     pub(crate) members: Option<Vec<TeamMemberSlot>>,
     #[serde(default)]
     pub(crate) template: Option<String>,
-    /// Create's project association; exact stored association filter for team
-    /// list/get/roster. Template actions require scope=project and an explicit
-    /// absolute owner-host directory; catalog-mode discovery has no local read fallback.
+    /// Create's worker/project association; catalog-mode create resolves only
+    /// daemon-owned global templates/brofiles. Exact stored association filter
+    /// for team list/get/roster. Template actions require scope=project and an explicit
+    /// absolute owner-host directory; catalog mode refuses project template
+    /// reads/writes because no owner transport exists.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
     /// Template actions only: global (default) or project. Never filters live teams.
@@ -997,6 +999,8 @@ pub(crate) struct TeamMemberSlot {
     #[serde(default)]
     pub(crate) alias: Option<String>,
     #[serde(default)]
+    /// Instances of this member (default 1, minimum 1); the sum of all slots
+    /// must not exceed 256. Save/create refuse before expansion or persistence.
     pub(crate) count: Option<u32>,
 }
 

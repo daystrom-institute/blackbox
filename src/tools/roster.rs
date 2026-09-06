@@ -561,7 +561,9 @@ impl BlackboxServer {
         description = "Manage teamplates and teams. list/list_templates/roster return bounded summaries; get/get_template return exact JSON body pages."
     )]
     pub(crate) async fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
-        if let Err(error) = validate_team_params(&p) {
+        if let Err(error) =
+            validate_team_params(&p).and_then(|()| require_team_template_locality(self, &p))
+        {
             return Self::err_text(&error.to_string());
         }
         if matches!(
@@ -578,6 +580,7 @@ impl BlackboxServer {
         use orchestration::team;
         let store_dir = &self.state.store_dir;
         let scope = p.scope.as_deref().unwrap_or("global");
+        let source_project_dir = team_source_project_dir(self, p.project_dir.as_deref());
 
         match p.action.as_str() {
             "save_template" => {
@@ -597,7 +600,7 @@ impl BlackboxServer {
                     if orchestration::brofile::resolve_brofile(
                         &m.brofile,
                         store_dir,
-                        p.project_dir.as_deref(),
+                        source_project_dir,
                     )
                     .is_none()
                     {
@@ -607,7 +610,7 @@ impl BlackboxServer {
                 let advisor = match self.resolve_team_advisor_config(
                     p.advisor.as_ref(),
                     store_dir,
-                    p.project_dir.as_deref(),
+                    source_project_dir,
                 ) {
                     Ok(cfg) => cfg,
                     Err(e) => return Self::err_text(&e),
@@ -651,17 +654,27 @@ impl BlackboxServer {
                     Some(t) => t,
                     None => return Self::err_text("template is required"),
                 };
-                let tp =
-                    match team::resolve_teamplate(template, store_dir, p.project_dir.as_deref()) {
-                        Some(tp) => tp,
-                        None => return Self::err_text(&format!("Teamplate not found: {template}")),
-                    };
-                // Validate all brofiles exist before instantiating
+                let tp = match team::resolve_teamplate(template, store_dir, source_project_dir) {
+                    Some(tp) => tp,
+                    None => {
+                        return Self::err_text(&format!(
+                            "Teamplate not found in the available source: {template}. In catalog mode create uses daemon-owned global templates; use bro_team(action=list_templates, scope=global), or inspect a project template through the checkout owner's file tools and save an approved global template. project_dir supplies worker context, not template read authority"
+                        ));
+                    }
+                };
+                // Catalog-mode creation uses only global configuration. The
+                // project association is still retained for worker dispatch.
+                if let Err(error) = validate_team_object_name(&tp.name) {
+                    return Self::err_text(&error.to_string());
+                }
                 for m in &tp.members {
+                    if let Err(error) = validate_team_object_name(&m.brofile) {
+                        return Self::err_text(&error.to_string());
+                    }
                     if orchestration::brofile::resolve_brofile(
                         &m.brofile,
                         store_dir,
-                        p.project_dir.as_deref(),
+                        source_project_dir,
                     )
                     .is_none()
                     {
@@ -671,20 +684,26 @@ impl BlackboxServer {
                 let advisor_override = match self.resolve_team_advisor_config(
                     p.advisor.as_ref(),
                     store_dir,
-                    p.project_dir.as_deref(),
+                    source_project_dir,
                 ) {
                     Ok(cfg) => cfg,
                     Err(e) => return Self::err_text(&e),
                 };
-                if let Some(ref cfg) = advisor_override {
+                if let Some(advisor) = advisor_override.as_ref().or(tp.advisor.as_ref()) {
+                    if let Err(error) = validate_team_object_name(&advisor.brofile) {
+                        return Self::err_text(&error.to_string());
+                    }
                     if orchestration::brofile::resolve_brofile(
-                        &cfg.brofile,
+                        &advisor.brofile,
                         store_dir,
-                        p.project_dir.as_deref(),
+                        source_project_dir,
                     )
                     .is_none()
                     {
-                        return Self::err_text(&format!("Brofile not found: {}", cfg.brofile));
+                        return Self::err_text(&format!(
+                            "Advisor brofile not found in the available source: {}; catalog teams require a daemon-owned global brofile",
+                            advisor.brofile
+                        ));
                     }
                 }
                 let team_name = p
@@ -707,19 +726,10 @@ impl BlackboxServer {
                 if let Err(e) = self.initialize_team_advisor(&mut t).await {
                     return Self::err_text(&e);
                 }
-                Self::ok_json(&json!({
-                    "created": t.name,
-                    "teamplate": tp.name,
-                    "members": t.members.iter().map(|m| json!({"name": m.name, "brofile": m.brofile})).collect::<Vec<_>>(),
-                    "advisor": t.advisor.as_ref().map(|a| json!({
-                        "name": a.name,
-                        "brofile": a.config.brofile,
-                        "sessionId": a.session_id,
-                        "taskCount": a.task_history.len(),
-                        "packetId": a.config.packet_id,
-                        "mode": a.config.mode.as_ref(),
-                    })),
-                }))
+                Self::ok_json(&team_create_receipt(
+                    &t,
+                    !self.state.project_authority.is_bridge(),
+                ))
             }
             "dissolve" => {
                 let name = match &p.name {
@@ -857,11 +867,12 @@ Next step: <one concrete steering suggestion>\n",
             Some(a) => a,
             None => return Err("team has no advisor configured".into()),
         };
+        validate_team_object_name(&advisor.config.brofile).map_err(|error| error.to_string())?;
         let store_dir = self.state.store_dir.clone();
         let brofile = orchestration::brofile::resolve_brofile(
             &advisor.config.brofile,
             &store_dir,
-            team.project_dir.as_deref(),
+            team_source_project_dir(self, team.project_dir.as_deref()),
         )
         .ok_or_else(|| format!("Brofile not found: {}", advisor.config.brofile))?;
         let provider = brofile.provider;
@@ -1411,6 +1422,51 @@ Next step: <one concrete steering suggestion>\n"
     }
 }
 
+fn team_source_project_dir<'a>(
+    server: &BlackboxServer,
+    project: Option<&'a str>,
+) -> Option<&'a str> {
+    if server.state.project_authority.is_bridge() {
+        project
+    } else {
+        None
+    }
+}
+
+fn require_team_template_locality(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<()> {
+    if matches!(
+        p.action.as_str(),
+        "save_template" | "delete_template" | "list_templates" | "get_template"
+    ) && p.scope.as_deref() == Some("project")
+        && !server.state.project_authority.is_bridge()
+    {
+        anyhow::bail!(
+            "error.team_template_locality_required: project .bro/teamplates have no remote source lane; inspect or edit them with the checkout owner's file tools, or use daemon-owned templates with scope=global and no project_dir. No project template was read or changed; passing a caller path cannot grant daemon checkout access"
+        );
+    }
+    Ok(())
+}
+
+fn validate_team_object_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty() && !matches!(name, "." | "..") && !name.contains(['/', '\\', '\0']),
+        "name must be an exact stored team/template/brofile name, not a path"
+    );
+    Ok(())
+}
+
+fn team_create_receipt(team: &orchestration::team::Team, global_source: bool) -> Value {
+    let mut receipt = json!({"created":team.name, "teamplate":team.teamplate, "memberCount":team.members.len(),
+        "detail_hint":"bro_team(action=roster, name=<created>) for member pages; action=get for exact stored configuration and history"});
+    if global_source {
+        receipt["templateScope"] = json!("global");
+    }
+    if team.advisor.is_some() {
+        receipt["hasAdvisor"] = json!(true);
+    }
+    receipt
+}
+
 /// Validate action-specific selectors before any store access. A missing
 /// project selector must never become the daemon's current directory.
 fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
@@ -1449,11 +1505,19 @@ fn validate_team_params(p: &TeamParams) -> anyhow::Result<()> {
     if matches!(p.action.as_str(), "get" | "get_template" | "roster") && p.name.is_none() {
         anyhow::bail!("name is required");
     }
-    if let Some(name) = p.name.as_deref().filter(|_| list || exact) {
-        anyhow::ensure!(
-            !name.is_empty() && !matches!(name, "." | "..") && !name.contains(['/', '\\', '\0']),
-            "name must be an exact stored team/template name, not a path"
-        );
+    if let Some(name) = p.name.as_deref() {
+        validate_team_object_name(name)?;
+    }
+    if let Some(template) = p.template.as_deref() {
+        validate_team_object_name(template)?;
+    }
+    if let Some(members) = &p.members {
+        for member in members {
+            validate_team_object_name(&member.brofile)?;
+        }
+    }
+    if let Some(advisor) = &p.advisor {
+        validate_team_object_name(&advisor.brofile)?;
     }
     if (list || exact)
         && (p.members.is_some()
@@ -1489,9 +1553,12 @@ fn team_template_summary(template: &orchestration::team::Teamplate) -> Value {
         .map(|member| member.brofile.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     let mut row = json!({"name": template.name, "slotCount": template.members.len(),
-        "memberCount": template.members.iter().map(|member| u64::from(member.count.max(1))).sum::<u64>(),
+        "memberCount": template.members.iter().map(|member| u64::from(member.count)).sum::<u64>(),
         "brofiles": brofiles.iter().take(3).collect::<Vec<_>>(),
     });
+    if let Err(error) = orchestration::team::validate_teamplate_member_count(template) {
+        row["admissionError"] = json!(error.to_string());
+    }
     if brofiles.len() > 3 {
         row["omittedBrofileCount"] = json!(brofiles.len() - 3);
     }
@@ -1530,11 +1597,7 @@ fn team_discovery(server: &BlackboxServer, p: &TeamParams) -> anyhow::Result<Val
     let store = &server.state.store_dir;
     if matches!(p.action.as_str(), "list_templates" | "get_template") {
         let scope = p.scope.as_deref().unwrap_or("global");
-        if scope == "project" && !server.state.project_authority.is_bridge() {
-            anyhow::bail!(
-                "error.team_template_locality_required: project .bro/teamplates have no remote discovery lane; inspect them with the checkout owner's file tools, or list daemon-owned templates with scope=global and no project_dir. Passing a caller path cannot grant daemon checkout access"
-            );
-        }
+        require_team_template_locality(server, p)?;
         if p.action == "get_template" {
             let name = p.name.as_deref().expect("validated template name");
             let template =
@@ -1683,6 +1746,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn team_create_receipt_omits_unbounded_member_configuration() {
+        let mut team = fixture_team("large", "worker-context");
+        team.members = (0..10000)
+            .map(|n| orchestration::team::TeamMember {
+                name: format!("member-{n}"),
+                brofile: "large-lens-reference".repeat(100),
+                session_id: None,
+                task_history: vec![],
+            })
+            .collect();
+        let receipt = team_create_receipt(&team, true);
+        assert_eq!(receipt["memberCount"], 10000);
+        assert_eq!(receipt["templateScope"], "global");
+        assert!(receipt.get("members").is_none());
+        assert!(serde_json::to_vec(&receipt).unwrap().len() < 1000);
+        assert!(receipt["detail_hint"].as_str().unwrap().contains("roster"));
+    }
+
+    #[tokio::test]
+    async fn catalog_team_mutations_refuse_project_sources_and_keep_global_worker_context() {
+        use orchestration::{brofile, team};
+        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
+        let server = fixture.server();
+        let project = fixture
+            .root()
+            .canonicalize()
+            .unwrap()
+            .join("worker-checkout");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.to_str().unwrap();
+        let reviewer: brofile::Brofile =
+            serde_json::from_value(json!({"name":"reviewer","provider":"glm"})).unwrap();
+        brofile::save_brofile(&reviewer, "global", &server.state.store_dir, None).unwrap();
+        let mut template = team::Teamplate {
+            name: "panel".into(),
+            members: vec![team::TeamplateMember {
+                brofile: "reviewer".into(),
+                alias: None,
+                count: 2,
+            }],
+            advisor: None,
+            diversity_floor: None,
+        };
+        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
+        template.members[0].count = 99;
+        team::save_teamplate(&template, "project", &server.state.store_dir, Some(project)).unwrap();
+        let path = Path::new(project).join(".bro/teamplates/panel.json");
+        let before = std::fs::read(&path).unwrap();
+        for action in ["save_template", "delete_template"] {
+            let result=server.bro_team(Parameters(team_params(json!({"action":action,"name":"panel","scope":"project","project_dir":project,"members":[{"brofile":"reviewer"}]})))).await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(extract_text(&result).contains("error.team_template_locality_required"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let created=server.bro_team(Parameters(team_params(json!({"action":"create","template":"panel","name":"global-team","project_dir":project})))).await;
+        assert_ne!(created.is_error, Some(true), "{}", extract_text(&created));
+        let receipt: Value = serde_json::from_str(&extract_text(&created)).unwrap();
+        assert_eq!(receipt["memberCount"], 2);
+        assert_eq!(receipt["templateScope"], "global");
+        assert!(receipt.get("members").is_none());
+        let saved = team::load_team("global-team", &server.state.store_dir).unwrap();
+        assert_eq!(saved.project_dir.as_deref(), Some(project));
+        assert_eq!(saved.members.len(), 2);
+        assert!(team_source_project_dir(&server, Some(project)).is_none());
+
+        template.name = "project-only".into();
+        team::save_teamplate(&template, "project", &server.state.store_dir, Some(project)).unwrap();
+        let refused=server.bro_team(Parameters(team_params(json!({"action":"create","template":"project-only","name":"must-not-exist","project_dir":project})))).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(team::load_team("must-not-exist", &server.state.store_dir).is_none());
+
+        let local: brofile::Brofile =
+            serde_json::from_value(json!({"name":"project-reviewer","provider":"glm"})).unwrap();
+        brofile::save_brofile(&local, "project", &server.state.store_dir, Some(project)).unwrap();
+        template.name = "global-local-reference".into();
+        template.members[0].brofile = local.name;
+        team::save_teamplate(&template, "global", &server.state.store_dir, None).unwrap();
+        let refused=server.bro_team(Parameters(team_params(json!({"action":"create","template":"global-local-reference","name":"missing-global-brofile","project_dir":project})))).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert!(team::load_team("missing-global-brofile", &server.state.store_dir).is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn team_discovery_filters_and_pages_without_expanding_stored_brofiles() {
         use orchestration::team::{self, TeamMember};
@@ -1777,7 +1924,7 @@ mod tests {
             members: vec![TeamplateMember {
                 brofile: "reviewer".into(),
                 alias: None,
-                count: 0,
+                count: 1,
             }],
             advisor: Some(advisor.clone()),
             diversity_floor: Some(2),
