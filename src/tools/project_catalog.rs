@@ -4105,17 +4105,25 @@ mod tests {
             .bbox_project_graph_list(Parameters(crate::tools::graph::ProjectGraphListParams {
                 project: Some("p_candidate_tool".into()),
                 provisional: Some("published".into()),
+                limit: None,
+                offset: None,
+                expected_view_stamp: None,
             }))
             .await;
         let listed_text = error_text(&listed);
         assert!(listed_text.contains("governance-record"), "{listed_text}");
 
         let described = server
-            .bbox_project_graph_describe(Parameters(crate::tools::graph::ProjectGraphExactParams {
-                project: "p_candidate_tool".into(),
-                graph_id: "governance-record".into(),
-                provisional: Some("published".into()),
-            }))
+            .bbox_project_graph_describe(Parameters(
+                crate::tools::graph::ProjectGraphDescribeParams {
+                    project: "p_candidate_tool".into(),
+                    graph_id: "governance-record".into(),
+                    provisional: Some("published".into()),
+                    detail: None,
+                    cursor: None,
+                    body_limit: None,
+                },
+            ))
             .await;
         let described_text = error_text(&described);
         assert!(

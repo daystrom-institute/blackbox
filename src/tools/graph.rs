@@ -932,10 +932,19 @@ pub(crate) struct ProjectGraphListParams {
     /// for older callers and recordings.
     #[serde(default, alias = "visibility")]
     pub provisional: Option<String>,
+    /// Maximum graphs per page (1..=100, default 20). Pages also obey a
+    /// serialized byte budget.
+    pub limit: Option<usize>,
+    /// Continuation offset from a previous page's next_offset. Nonzero
+    /// offsets require expected_view_stamp.
+    pub offset: Option<usize>,
+    /// View stamp from the previous page. A changed graph view refuses the
+    /// continuation; restart at offset 0.
+    pub expected_view_stamp: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub(crate) struct ProjectGraphExactParams {
+pub(crate) struct ProjectGraphDescribeParams {
     /// Registered project id, alias, base path, or worktree path.
     pub project: String,
     pub graph_id: String,
@@ -944,6 +953,43 @@ pub(crate) struct ProjectGraphExactParams {
     /// for older callers and recordings.
     #[serde(default, alias = "visibility")]
     pub provisional: Option<String>,
+    /// detail=summary (default) keeps the response compact; detail=schema
+    /// and detail=descriptor recover the exact JSON bodies in bounded pages.
+    pub detail: Option<String>,
+    /// Body continuation cursor; only valid with detail=schema or
+    /// descriptor. Cursors are content-bound: any graph, selection, or
+    /// content change rejects them.
+    pub cursor: Option<String>,
+    /// Body page size in UTF-8 bytes (4..=4096, default 4096).
+    pub body_limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProjectGraphValidateParams {
+    /// Registered project id, alias, base path, or worktree path.
+    pub project: String,
+    pub graph_id: String,
+    /// Visibility policy: published, own, or all. `provisional` is the
+    /// canonical spelling; `visibility` is accepted as a deprecated alias
+    /// for older callers and recordings.
+    #[serde(default, alias = "visibility")]
+    pub provisional: Option<String>,
+    /// detail=summary (default) returns bounded error pages; detail=errors
+    /// recovers the complete error array as exact JSON pages.
+    pub detail: Option<String>,
+    /// Body continuation cursor; only valid with detail=errors. Cursors are
+    /// content-bound: any graph, selection, or content change rejects them.
+    pub cursor: Option<String>,
+    /// Body page size in UTF-8 bytes (4..=4096, default 4096).
+    pub body_limit: Option<usize>,
+    /// Error page offset from a previous page's next_error_offset. Nonzero
+    /// offsets require expected_error_stamp.
+    pub error_offset: Option<usize>,
+    /// Maximum validation errors per page (1..=100, default 20).
+    pub error_limit: Option<usize>,
+    /// Error stamp from a previous page. A changed error set refuses the
+    /// continuation; restart at error_offset 0.
+    pub expected_error_stamp: Option<String>,
 }
 
 impl DescribeSchemaParams {
@@ -1015,7 +1061,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_graph_list",
-        description = "List visible project graphs. Pass provisional (published, own, or all); visibility is accepted as a deprecated alias. Each entry reports two count families: vertex_count/edge_count are the REFLECTED graph (authored rows plus schema-as-data vertex/edge type definitions plus meta:INSTANCE_OF edges), while authored_vertex_count/authored_edge_count count only rows sourced from vertices.jsonl/edges.jsonl. Compare authored_* against your source files, not vertex_count/edge_count. Each entry's source names its authority plane: published, provisional, or connector (a read-only connector-managed source projection)."
+        description = "List visible project graphs in bounded pages (default 20, max 100, byte-budgeted) ordered by graph_id, source, then checkout. Continue with next_offset plus expected_view_stamp; a changed view refuses and you restart at offset 0. Each entry carries reflected and authored count families and names its authority plane: published, provisional, or connector (a read-only connector-managed source projection)."
     )]
     pub(crate) async fn bbox_project_graph_list(
         &self,
@@ -1023,59 +1069,214 @@ impl BlackboxServer {
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_project_graph_list", move || {
-            let graphs =
-                server.project_graph_list_domain(p.project.as_deref(), p.provisional.as_deref())?;
-            Ok(serde_json::to_string_pretty(&json!({
-                "status": "ok",
-                "provisional": p.provisional,
-                "graphs": graphs,
-            }))?)
+            let offset = p.offset.unwrap_or(0);
+            let (_, graphs, view_stamp) = server.project_graph_inventory_domain(
+                p.project.as_deref(),
+                p.provisional.as_deref(),
+            )?;
+            if offset > 0 && p.expected_view_stamp.is_none() {
+                bail!("error.graph_view_stamp_required: continue with expected_view_stamp from the previous response");
+            }
+            if p
+                .expected_view_stamp
+                .as_deref()
+                .is_some_and(|expected| expected != view_stamp.as_str())
+            {
+                bail!("error.graph_view_changed: graph view changed since the previous page; restart at offset=0 without expected_view_stamp");
+            }
+            let rows = graphs
+                .into_iter()
+                .map(|graph| serde_json::to_value(&graph))
+                .collect::<Result<Vec<_>>>()?;
+            let mut page = bbox_corpus_core::response_page::collection_page(
+                rows,
+                "graphs",
+                p.limit,
+                p.offset,
+            )?;
+            page["status"] = json!("ok");
+            page["provisional"] = json!(p.provisional);
+            page["view_stamp"] = json!(view_stamp);
+            page["order"] = json!("graph_id_source_checkout_asc");
+            page["continuation_note"] = json!(
+                "Live view state, not a snapshot: published installs and provisional overlays replace whole entries, so a changed view refuses nonzero offsets instead of paging a different inventory."
+            );
+            Ok(serde_json::to_string(&page)?)
         })
         .await
     }
 
     #[tool(
         name = "bbox_project_graph_describe",
-        description = "Describe one visible project graph. Pass provisional (published, own, or all); visibility is accepted as a deprecated alias. The summary carries both count families: vertex_count/edge_count are the REFLECTED graph (authored rows plus schema-as-data vertex/edge type definitions plus meta:INSTANCE_OF edges), while authored_vertex_count/authored_edge_count count only rows sourced from vertices.jsonl/edges.jsonl. The retrieval block reports word-index participation: policy flags, excluded vertex types, indexed vertex count, embedded vertex count, and the indexed generation versus the accepted generation, so a graph that is not showing up in search can be diagnosed without reading a schema artifact."
+        description = "Describe one visible project graph. detail=summary (default) keeps the response compact: graph identity, generation, authority plane, retrieval state, and schema counts without the schema body. detail=schema or detail=descriptor recovers the exact JSON through bounded body pages (body_limit 4..=4096 UTF-8 bytes); continue with cursor=body.next_cursor. Cursors are content-bound and reject any graph, project, selection, or content change. The retrieval block reports word-index participation so a graph missing from search is diagnosed without reading a schema artifact."
     )]
     pub(crate) async fn bbox_project_graph_describe(
         &self,
-        Parameters(p): Parameters<ProjectGraphExactParams>,
+        Parameters(p): Parameters<ProjectGraphDescribeParams>,
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_project_graph_describe", move || {
-            let graphs = server.project_graph_describe_domain(
-                &p.project,
-                &p.graph_id,
-                p.provisional.as_deref(),
-            )?;
-            Ok(serde_json::to_string_pretty(&json!({
-                "status": "ok",
-                "graphs": graphs,
-            }))?)
+            let detail = crate::project_graph_read::GraphDescribeDetail::parse(p.detail.as_deref())?;
+            match detail {
+                crate::project_graph_read::GraphDescribeDetail::Summary => {
+                    if p.cursor.is_some() {
+                        bail!("error.bad_input: cursor requires detail=schema or detail=descriptor");
+                    }
+                    if p.body_limit.is_some() {
+                        bail!("error.bad_input: body_limit requires detail=schema or detail=descriptor");
+                    }
+                    let mut graphs = server.project_graph_describe_domain(
+                        &p.project,
+                        &p.graph_id,
+                        p.provisional.as_deref(),
+                    )?;
+                    if graphs.len() == 1 {
+                        let mut page =
+                            serde_json::to_value(graphs.pop().expect("one graph described"))?;
+                        page["status"] = json!("ok");
+                        page["detail"] = json!("summary");
+                        page["detail_hint"] = json!(
+                            "Exact schema: bbox_project_graph_describe(project,graph_id,detail=\"schema\"); descriptor: detail=\"descriptor\"; continue with cursor=body.next_cursor."
+                        );
+                        return Ok(serde_json::to_string_pretty(&page)?);
+                    }
+                    Ok(serde_json::to_string_pretty(&json!({
+                        "status": "ok",
+                        "detail": "summary",
+                        "graphs": graphs,
+                        "detail_hint": "Multiple generations matched this graph id; narrow provisional to published or own. Exact schema: detail=\"schema\"; descriptor: detail=\"descriptor\"; continue with cursor=body.next_cursor.",
+                    }))?)
+                }
+                crate::project_graph_read::GraphDescribeDetail::Schema
+                | crate::project_graph_read::GraphDescribeDetail::Descriptor => {
+                    let read = server.project_graph_detail_domain(
+                        &p.project,
+                        &p.graph_id,
+                        p.provisional.as_deref(),
+                        detail,
+                    )?;
+                    let content_hash = read.generation.content_hash.clone();
+                    let scope = format!(
+                        "{}:{}:{}:{}:{}",
+                        read.project_id,
+                        read.provisional_mode,
+                        p.graph_id,
+                        content_hash,
+                        detail.as_str()
+                    );
+                    let body = super::body_page::json_body_page(
+                        &scope,
+                        &read.body,
+                        p.cursor.as_deref(),
+                        p.body_limit,
+                    )?;
+                    Ok(serde_json::to_string_pretty(&json!({
+                        "status": "ok",
+                        "detail": detail.as_str(),
+                        "summary": read.summary,
+                        "generation": read.generation,
+                        "body": body,
+                    }))?)
+                }
+            }
         })
         .await
     }
 
     #[tool(
         name = "bbox_project_graph_validate",
-        description = "Validate one visible project graph. Pass provisional (published, own, or all); visibility is accepted as a deprecated alias."
+        description = "Validate one visible project graph. detail=summary (default) returns a bounded errors page with errors_total; continue with next_error_offset plus expected_error_stamp, and a changed error set refuses with a restart at error_offset 0. detail=errors recovers the complete error array as exact JSON body pages via cursor=body.next_cursor. Reports the same three sources as list: published, provisional, and connector."
     )]
     pub(crate) async fn bbox_project_graph_validate(
         &self,
-        Parameters(p): Parameters<ProjectGraphExactParams>,
+        Parameters(p): Parameters<ProjectGraphValidateParams>,
     ) -> CallToolResult {
         let server = self.clone();
         Self::run_blocking("bbox_project_graph_validate", move || {
-            let graphs = server.project_graph_validate_domain(
-                &p.project,
-                &p.graph_id,
-                p.provisional.as_deref(),
-            )?;
-            Ok(serde_json::to_string_pretty(&json!({
-                "status": "ok",
-                "graphs": graphs,
-            }))?)
+            let detail = crate::project_graph_read::GraphValidateDetail::parse(p.detail.as_deref())?;
+            match detail {
+                crate::project_graph_read::GraphValidateDetail::Summary => {
+                    if p.cursor.is_some() {
+                        bail!("error.bad_input: cursor requires detail=errors");
+                    }
+                    if p.body_limit.is_some() {
+                        bail!("error.bad_input: body_limit requires detail=errors");
+                    }
+                    let error_offset = p.error_offset.unwrap_or(0);
+                    let error_limit = p.error_limit.unwrap_or(20).clamp(1, 100);
+                    let graphs = server.project_graph_validate_domain(
+                        &p.project,
+                        &p.graph_id,
+                        p.provisional.as_deref(),
+                        error_offset,
+                        error_limit,
+                    )?;
+                    let paging = error_offset > 0 || p.expected_error_stamp.is_some();
+                    if paging {
+                        if graphs.len() > 1 {
+                            bail!(
+                                "error.project_graph_ambiguous: error paging requires exactly one graph generation; narrow provisional to published or own"
+                            );
+                        }
+                        let Some(graph) = graphs.first() else {
+                            bail!("error.not_found: graph `{}` was not found", p.graph_id);
+                        };
+                        if p.expected_error_stamp.is_none() {
+                            bail!("error.graph_error_stamp_required: continue with expected_error_stamp from the previous response");
+                        }
+                        if p
+                            .expected_error_stamp
+                            .as_deref()
+                            .is_some_and(|expected| expected != graph.error_stamp.as_str())
+                        {
+                            bail!("error.graph_errors_changed: validation errors changed since the previous page; restart at error_offset=0 without expected_error_stamp");
+                        }
+                    }
+                    Ok(serde_json::to_string_pretty(&json!({
+                        "status": "ok",
+                        "detail": "summary",
+                        "graphs": graphs,
+                        "detail_hint": "Exact errors: bbox_project_graph_validate(project,graph_id,detail=\"errors\"); continue with cursor=body.next_cursor.",
+                    }))?)
+                }
+                crate::project_graph_read::GraphValidateDetail::Errors => {
+                    if p.error_offset.is_some() {
+                        bail!("error.bad_input: error_offset applies only to detail=summary");
+                    }
+                    if p.error_limit.is_some() {
+                        bail!("error.bad_input: error_limit applies only to detail=summary");
+                    }
+                    if p.expected_error_stamp.is_some() {
+                        bail!("error.bad_input: expected_error_stamp applies only to detail=summary");
+                    }
+                    let read = server.project_graph_validation_errors_domain(
+                        &p.project,
+                        &p.graph_id,
+                        p.provisional.as_deref(),
+                    )?;
+                    let content_hash = read.generation.content_hash.clone();
+                    let scope = format!(
+                        "{}:{}:{}:{}:errors",
+                        read.project_id,
+                        read.provisional_mode,
+                        p.graph_id,
+                        content_hash
+                    );
+                    let body = super::body_page::json_body_page(
+                        &scope,
+                        &read.body,
+                        p.cursor.as_deref(),
+                        p.body_limit,
+                    )?;
+                    Ok(serde_json::to_string_pretty(&json!({
+                        "status": "ok",
+                        "detail": "errors",
+                        "summary": read.summary,
+                        "generation": read.generation,
+                        "body": body,
+                    }))?)
+                }
+            }
         })
         .await
     }
@@ -1903,6 +2104,133 @@ mod tests {
         )
     }
 
+    /// Installs a published view whose entries are built against the freshly
+    /// registered project id, so synthetic fixtures can embed it in their
+    /// parsed generation keys.
+    fn install_published_entries<F>(
+        server: &BlackboxServer,
+        root: &std::path::Path,
+        build: F,
+    ) -> String
+    where
+        F: FnOnce(&str) -> Vec<bbox_indexing::project_graph_view::ProjectGraphViewEntry>,
+    {
+        let project = server
+            .state
+            .project_authority
+            .bridge_registry()
+            .unwrap()
+            .write()
+            .register_path(root)
+            .unwrap();
+        let project_id =
+            bbox_corpus_core::project_catalog::ProjectId::parse(project.project_id.clone())
+                .unwrap();
+        let graphs = build(project_id.as_str())
+            .into_iter()
+            .map(|entry| (entry.graph_id.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        server.state.project_graph_views.write().install_published(
+            bbox_indexing::project_graph_view::PublishedProjectGraphView {
+                project_id,
+                scope: PublishedScope::try_new("test-plane", ".").unwrap(),
+                accepted_generation: "test-accepted-generation".into(),
+                graphs,
+                evidence: bbox_project_graph::EvidenceBindingSet::default(),
+            },
+        );
+        project.project_id
+    }
+
+    /// One valid graph whose schema serializes well past one 4 KiB body page,
+    /// with escaped multibyte characters in the property payloads. The
+    /// exact-read contract tests page it instead of depending on the
+    /// incidental size of a fixture file.
+    fn wide_schema_graph(
+        project_id: &str,
+        type_count: usize,
+    ) -> bbox_project_graph::GraphGeneration {
+        let mut vertex_types = serde_json::Map::new();
+        for idx in 0..type_count {
+            vertex_types.insert(
+                format!("wide:Type{idx:02}"),
+                json!({
+                    "properties": {
+                        "name": "string",
+                        "notes": format!("note-{idx:02}-🦀-日本語-{}", "x".repeat(48))
+                    }
+                }),
+            );
+        }
+        let schema = serde_json::to_vec(&json!({
+            "version": 1,
+            "namespace": "wide",
+            "vertex_types": vertex_types,
+            "edge_types": [
+                {
+                    "type": "wide:LINKS",
+                    "endpoints": [{"from": "wide:Type00", "to": "wide:Type00"}],
+                    "properties": {"note": "string"}
+                }
+            ]
+        }))
+        .unwrap();
+        let vertices = serde_json::to_vec(&json!({
+            "id": "seed",
+            "type": "wide:Type00",
+            "label": "seed",
+            "properties": {"name": "seed"}
+        }))
+        .unwrap();
+        let loaded = bbox_project_graph::load_graph_documents(
+            project_id,
+            "wide",
+            bbox_project_graph::GraphDocumentBytes {
+                descriptor: None,
+                schema: &schema,
+                vertices: &vertices,
+                edges: b"",
+            },
+            bbox_project_graph::GraphParseLimits::default(),
+            std::path::PathBuf::new(),
+        );
+        assert!(loaded.report.valid, "{:?}", loaded.report.errors);
+        loaded.generation.unwrap()
+    }
+
+    /// The synthetic validation-error fixture: `count` distinct rows with
+    /// multibyte characters, so paging and exact recovery must respect UTF-8
+    /// byte boundaries rather than slicing mid-character.
+    fn synthetic_validation_errors(count: usize) -> Vec<bbox_project_graph::ValidationError> {
+        (0..count)
+            .map(|idx| {
+                bbox_project_graph::ValidationError::new(
+                    "edge.missing_vertex",
+                    "edges.jsonl",
+                    Some(idx + 1),
+                    format!("edge target vertex-{idx:03} is missing 🦀 缺口 {idx:04}"),
+                )
+            })
+            .collect()
+    }
+
+    fn invalid_graph_entry(
+        graph_id: &str,
+        error_count: usize,
+    ) -> bbox_indexing::project_graph_view::ProjectGraphViewEntry {
+        bbox_indexing::project_graph_view::ProjectGraphViewEntry::invalid(
+            graph_id.to_string(),
+            bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                accepted_generation: "generation-one".into(),
+                accepted_commit: "b".repeat(40),
+                source_generation: None,
+                workspace_id: None,
+                content_hash: format!("invalid-{error_count:04}"),
+            },
+            synthetic_validation_errors(error_count),
+        )
+    }
+
     /// Installs the exit-gate shape: a tenant record graph, a separate source
     /// graph in the SAME project, and a binding set joining a record vertex to
     /// a source vertex and that source vertex to a published project file.
@@ -2306,10 +2634,13 @@ mod tests {
         // The describe surface explains WHY the lane is absent from search:
         // policy flags, counts, and both generations in one place.
         let described = server
-            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project_id.clone(),
                 graph_id: "source".into(),
                 provisional: Some("published".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
             }))
             .await;
         let described_text = extract_text(&described);
@@ -2455,7 +2786,7 @@ mod tests {
     /// family and `visibility` keeps working as a deprecated serde alias.
     #[test]
     fn project_graph_params_accept_visibility_as_a_deprecated_alias() {
-        let exact: ProjectGraphExactParams =
+        let exact: ProjectGraphDescribeParams =
             serde_json::from_str(r#"{"project":"p1","graph_id":"g","visibility":"own"}"#).unwrap();
         assert_eq!(exact.provisional.as_deref(), Some("own"));
         let listed: ProjectGraphListParams =
@@ -2464,6 +2795,610 @@ mod tests {
         let canonical: ProjectGraphListParams =
             serde_json::from_str(r#"{"provisional":"published"}"#).unwrap();
         assert_eq!(canonical.provisional.as_deref(), Some("published"));
+    }
+
+    /// Shared driver for the exact detail reads: returns the raw tool text so
+    /// refusals stay assertable alongside well-formed pages.
+    async fn describe_detail_text(
+        server: &BlackboxServer,
+        project: &str,
+        graph_id: &str,
+        detail: &str,
+        cursor: Option<String>,
+        body_limit: Option<usize>,
+    ) -> String {
+        let result = server
+            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
+                project: project.into(),
+                graph_id: graph_id.into(),
+                provisional: Some("published".into()),
+                detail: Some(detail.into()),
+                cursor,
+                body_limit,
+            }))
+            .await;
+        extract_text(&result)
+    }
+
+    /// Walks every body page of one detail read, asserting each serialized
+    /// page envelope stays inside the shared page budget, and returns the
+    /// concatenated exact bytes plus the page count.
+    async fn collect_describe_body(
+        server: &BlackboxServer,
+        project: &str,
+        graph_id: &str,
+        detail: &str,
+        body_limit: Option<usize>,
+    ) -> (String, usize) {
+        let mut joined = String::new();
+        let mut cursor = None;
+        let mut pages = 0usize;
+        loop {
+            let text =
+                describe_detail_text(server, project, graph_id, detail, cursor, body_limit).await;
+            let page: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let envelope = serde_json::to_vec(&page).unwrap().len();
+            assert!(
+                envelope <= 6144,
+                "detail pages stay inside the shared page budget: {envelope}"
+            );
+            assert_eq!(page["status"], json!("ok"), "{text}");
+            joined.push_str(page["body"]["text"].as_str().unwrap());
+            pages += 1;
+            cursor = page["body"]["next_cursor"]
+                .as_str()
+                .map(ToString::to_string);
+            if cursor.is_none() {
+                return (joined, pages);
+            }
+        }
+    }
+
+    /// Same walk for the exact validation-error array.
+    async fn collect_validation_errors(
+        server: &BlackboxServer,
+        project: &str,
+        graph_id: &str,
+        body_limit: Option<usize>,
+    ) -> String {
+        let mut joined = String::new();
+        let mut cursor = None;
+        loop {
+            let result = server
+                .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
+                    project: project.into(),
+                    graph_id: graph_id.into(),
+                    provisional: Some("published".into()),
+                    detail: Some("errors".into()),
+                    cursor,
+                    body_limit,
+                    error_offset: None,
+                    error_limit: None,
+                    expected_error_stamp: None,
+                }))
+                .await;
+            let text = extract_text(&result);
+            let page: serde_json::Value = serde_json::from_str(&text).unwrap();
+            joined.push_str(page["body"]["text"].as_str().unwrap());
+            cursor = page["body"]["next_cursor"]
+                .as_str()
+                .map(ToString::to_string);
+            if cursor.is_none() {
+                return joined;
+            }
+        }
+    }
+
+    /// A04: the default describe is a compact summary. Schema identity and
+    /// counts arrive inline; the schema body stays behind the exact detail
+    /// read, and page reconstruction is byte-exact across escaped multibyte
+    /// characters, default pages, and a tiny body_limit.
+    #[tokio::test]
+    async fn project_graph_describe_default_is_compact_and_schema_recovers_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_published_entries(&server, &root, |project| {
+            vec![graph_entry(wide_schema_graph(project, 60))]
+        });
+        let expected_schema =
+            serde_json::to_value(&wide_schema_graph(&project_id, 60).schema).unwrap();
+        let schema_bytes = serde_json::to_vec(&expected_schema).unwrap().len();
+        assert!(
+            schema_bytes > 8192,
+            "fixture must span multiple default body pages: {schema_bytes}"
+        );
+
+        let summary = server
+            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
+                project: project_id.clone(),
+                graph_id: "wide".into(),
+                provisional: Some("published".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
+            }))
+            .await;
+        let summary_text = extract_text(&summary);
+        let summary_page: serde_json::Value = serde_json::from_str(&summary_text).unwrap();
+        assert_eq!(summary_page["detail"], json!("summary"), "{summary_text}");
+        assert_eq!(summary_page["summary"]["graph_id"], json!("wide"));
+        assert_eq!(summary_page["summary"]["status"], json!("valid"));
+        assert_eq!(summary_page["summary"]["source"], json!("published"));
+        assert_eq!(summary_page["schema"]["vertex_type_count"], json!(60));
+        assert_eq!(summary_page["schema"]["edge_type_count"], json!(1));
+        assert!(
+            summary_page["schema"]["schema_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert!(
+            !summary_text.contains("vertex_types"),
+            "compact summary must not embed the schema body: {summary_text}"
+        );
+        let summary_envelope = serde_json::to_vec(&summary_page).unwrap().len();
+        assert!(
+            summary_envelope < 3000,
+            "serialized summary stays compact: {summary_envelope}"
+        );
+
+        let (joined, pages) =
+            collect_describe_body(&server, &project_id, "wide", "schema", None).await;
+        assert!(
+            pages > 1,
+            "one default page cannot hold {schema_bytes} bytes"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&joined).unwrap(),
+            expected_schema
+        );
+
+        let (tiny_joined, tiny_pages) =
+            collect_describe_body(&server, &project_id, "wide", "schema", Some(97)).await;
+        assert!(
+            tiny_pages > pages,
+            "a 97-byte body_limit must split into more pages than the default"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tiny_joined).unwrap(),
+            expected_schema
+        );
+
+        let (descriptor, descriptor_pages) =
+            collect_describe_body(&server, &project_id, "wide", "descriptor", None).await;
+        let descriptor_value: serde_json::Value = serde_json::from_str(&descriptor).unwrap();
+        assert_eq!(descriptor_value["graph_id"], json!("wide"));
+        assert_eq!(
+            descriptor_value["authority"],
+            json!(bbox_project_graph::GraphAuthority::Project)
+        );
+        assert_eq!(
+            descriptor_value["schema_id"],
+            summary_page["schema"]["schema_id"]
+        );
+        assert!(
+            descriptor_pages >= 1,
+            "descriptor walks at least one complete page"
+        );
+    }
+
+    /// A04: body cursors are content-bound. A cursor from one graph, one
+    /// detail kind, or one since-replaced generation must refuse instead of
+    /// silently paging different bytes.
+    #[tokio::test]
+    async fn project_graph_describe_body_cursors_are_content_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_published_entries(&server, &root, |project| {
+            vec![
+                graph_entry(wide_schema_graph(project, 60)),
+                graph_entry(synthetic_graph(project, "tiny", "tiny", "tiny:Node", "n1")),
+            ]
+        });
+
+        let first =
+            describe_detail_text(&server, &project_id, "wide", "schema", None, Some(64)).await;
+        let first_page: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let cursor = first_page["body"]["next_cursor"]
+            .as_str()
+            .expect("a 64-byte page of a multi-KiB schema always continues")
+            .to_string();
+
+        let cross_graph = describe_detail_text(
+            &server,
+            &project_id,
+            "tiny",
+            "schema",
+            Some(cursor.clone()),
+            None,
+        )
+        .await;
+        assert!(
+            cross_graph.contains("restart without cursor"),
+            "a cursor must not cross graph ids: {cross_graph}"
+        );
+
+        let cross_detail = describe_detail_text(
+            &server,
+            &project_id,
+            "wide",
+            "descriptor",
+            Some(cursor.clone()),
+            None,
+        )
+        .await;
+        assert!(
+            cross_detail.contains("restart without cursor"),
+            "a cursor must not cross detail kinds: {cross_detail}"
+        );
+
+        // Replace the wide graph with a changed generation; the old cursor
+        // names bytes that no longer exist.
+        {
+            let mut views = server.state.project_graph_views.write();
+            let parsed =
+                bbox_corpus_core::project_catalog::ProjectId::parse(project_id.clone()).unwrap();
+            let mut view = views.published_view(&parsed).unwrap().clone();
+            view.graphs.insert(
+                "wide".into(),
+                graph_entry(wide_schema_graph(project_id.as_str(), 61)),
+            );
+            views.install_published(view);
+        }
+        let stale =
+            describe_detail_text(&server, &project_id, "wide", "schema", Some(cursor), None).await;
+        assert!(
+            stale.contains("restart without cursor"),
+            "a cursor must refuse a replaced generation: {stale}"
+        );
+
+        let refused = server
+            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
+                project: project_id.clone(),
+                graph_id: "wide".into(),
+                provisional: Some("published".into()),
+                detail: None,
+                cursor: Some(cursor),
+                body_limit: None,
+            }))
+            .await;
+        let refused_text = extract_text(&refused);
+        assert!(
+            refused_text.contains("error.bad_input"),
+            "the compact summary takes no cursor: {refused_text}"
+        );
+
+        let unknown =
+            describe_detail_text(&server, &project_id, "wide", "museum", None, None).await;
+        assert!(
+            unknown.contains("error.bad_input"),
+            "unknown detail values refuse: {unknown}"
+        );
+    }
+
+    /// A06: list pages carry totals, byte budgets, and a view-stamp-bound
+    /// continuation. A changed inventory refuses instead of paging a
+    /// different view.
+    #[tokio::test]
+    async fn project_graph_list_pages_are_bounded_and_stamp_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_published_entries(&server, &root, |project| {
+            (0..150)
+                .map(|idx| {
+                    let graph_id = format!("g-{idx:03}");
+                    graph_entry(synthetic_graph(
+                        project,
+                        &graph_id,
+                        "inv",
+                        "inv:Node",
+                        &format!("n{idx:03}"),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let list =
+            |limit: Option<usize>, offset: Option<usize>, expected_view_stamp: Option<String>| {
+                let server = server.clone();
+                let project_id = project_id.clone();
+                async move {
+                    server
+                        .bbox_project_graph_list(Parameters(ProjectGraphListParams {
+                            project: Some(project_id),
+                            provisional: Some("published".into()),
+                            limit,
+                            offset,
+                            expected_view_stamp,
+                        }))
+                        .await
+                }
+            };
+
+        let first = list(None, None, None).await;
+        let first_text = extract_text(&first);
+        let first_page: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        assert_eq!(first_page["total"], json!(150), "{first_text}");
+        assert_eq!(first_page["count"], json!(20), "{first_text}");
+        assert_eq!(first_page["next_offset"], json!(20), "{first_text}");
+        assert_eq!(
+            first_page["graphs"][0]["graph_id"],
+            json!("g-000"),
+            "{first_text}"
+        );
+        let view_stamp = first_page["view_stamp"].as_str().unwrap().to_string();
+        assert!(!view_stamp.is_empty());
+        let first_envelope = serde_json::to_vec(&first_page).unwrap().len();
+        assert!(
+            first_envelope <= 24_576 + 1_024,
+            "the default page plus its continuation metadata stays inside the discovery budget: {first_envelope}"
+        );
+
+        let big = list(Some(100), None, None).await;
+        let big_text = extract_text(&big);
+        let big_page: serde_json::Value = serde_json::from_str(&big_text).unwrap();
+        assert_eq!(big_page["total"], json!(150), "{big_text}");
+        assert!(
+            big_page["count"].as_u64().unwrap() < 100,
+            "one hundred summaries must hit the byte budget, not just the row cap: {big_text}"
+        );
+        assert_eq!(big_page["byte_limited"], json!(true), "{big_text}");
+        assert!(
+            big_page["next_offset"].as_u64().is_some(),
+            "a byte-cut page must continue: {big_text}"
+        );
+        let big_envelope = serde_json::to_vec(&big_page).unwrap().len();
+        assert!(
+            big_envelope <= 24_576 + 1_024,
+            "byte-cut pages stay inside the discovery budget: {big_envelope}"
+        );
+
+        let unstamped = list(None, Some(20), None).await;
+        let unstamped_text = extract_text(&unstamped);
+        assert!(
+            unstamped_text.contains("error.graph_view_stamp_required"),
+            "nonzero offsets require the view stamp: {unstamped_text}"
+        );
+
+        let second = list(None, Some(20), Some(view_stamp.clone())).await;
+        let second_text = extract_text(&second);
+        let second_page: serde_json::Value = serde_json::from_str(&second_text).unwrap();
+        assert_eq!(
+            second_page["graphs"][0]["graph_id"],
+            json!("g-020"),
+            "continuation resumes at the recorded offset: {second_text}"
+        );
+        assert_eq!(second_page["next_offset"], json!(40), "{second_text}");
+        assert_eq!(second_page["view_stamp"], json!(view_stamp));
+
+        let wrong_stamp = list(None, Some(40), Some("deadbeef".into())).await;
+        let wrong_text = extract_text(&wrong_stamp);
+        assert!(
+            wrong_text.contains("error.graph_view_changed"),
+            "an unknown stamp refuses: {wrong_text}"
+        );
+
+        // Add one graph: the live view changed, so the old stamp refuses and
+        // the caller restarts at offset 0 without a stamp.
+        {
+            let mut views = server.state.project_graph_views.write();
+            let parsed =
+                bbox_corpus_core::project_catalog::ProjectId::parse(project_id.clone()).unwrap();
+            let mut view = views.published_view(&parsed).unwrap().clone();
+            view.graphs.insert(
+                "g-150".into(),
+                graph_entry(synthetic_graph(
+                    project_id.as_str(),
+                    "g-150",
+                    "inv",
+                    "inv:Node",
+                    "n150",
+                )),
+            );
+            views.install_published(view);
+        }
+        let changed = list(None, Some(40), Some(view_stamp)).await;
+        let changed_text = extract_text(&changed);
+        assert!(
+            changed_text.contains("error.graph_view_changed"),
+            "a changed inventory refuses continuation: {changed_text}"
+        );
+        let restarted = list(None, None, None).await;
+        let restarted_text = extract_text(&restarted);
+        let restarted_page: serde_json::Value = serde_json::from_str(&restarted_text).unwrap();
+        assert_eq!(restarted_page["total"], json!(151), "{restarted_text}");
+    }
+
+    /// A10/A13: validation summaries page the error rows with a stamp-bound
+    /// continuation; detail=errors recovers the complete array byte-exactly;
+    /// valid graphs and empty inventories stay distinguishable states.
+    #[tokio::test]
+    async fn project_graph_validate_pages_errors_and_recovers_the_exact_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_published_entries(&server, &root, |project| {
+            vec![
+                invalid_graph_entry("broken", 55),
+                graph_entry(synthetic_graph(project, "tiny", "tiny", "tiny:Node", "n1")),
+            ]
+        });
+
+        let validate = |graph_id: &str,
+                        detail: Option<&str>,
+                        error_offset: Option<usize>,
+                        expected_error_stamp: Option<String>| {
+            let server = server.clone();
+            let project_id = project_id.clone();
+            let graph_id = graph_id.to_string();
+            let detail = detail.map(ToString::to_string);
+            async move {
+                server
+                    .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
+                        project: project_id,
+                        graph_id,
+                        provisional: Some("published".into()),
+                        detail,
+                        cursor: None,
+                        body_limit: None,
+                        error_offset,
+                        error_limit: None,
+                        expected_error_stamp,
+                    }))
+                    .await
+            }
+        };
+
+        let first = validate("broken", None, None, None).await;
+        let first_text = extract_text(&first);
+        let first_page: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        let rows = first_page["graphs"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{first_text}");
+        let row = &rows[0];
+        assert_eq!(row["valid"], json!(false), "{first_text}");
+        assert_eq!(row["source"], json!("published"), "{first_text}");
+        assert_eq!(row["errors_total"], json!(55), "{first_text}");
+        assert_eq!(row["errors"].as_array().unwrap().len(), 20, "{first_text}");
+        assert_eq!(row["errors_offset"], json!(0), "{first_text}");
+        assert_eq!(row["next_error_offset"], json!(20), "{first_text}");
+        assert_eq!(
+            row["errors"][0]["code"],
+            json!("edge.missing_vertex"),
+            "{first_text}"
+        );
+        let error_stamp = row["error_stamp"].as_str().unwrap().to_string();
+        assert!(!error_stamp.is_empty());
+        let first_envelope = serde_json::to_vec(&first_page).unwrap().len();
+        assert!(
+            first_envelope < 12_288,
+            "the default error page stays well inside the response budget: {first_envelope}"
+        );
+
+        let second = validate("broken", None, Some(20), Some(error_stamp.clone())).await;
+        let second_text = extract_text(&second);
+        let second_page: serde_json::Value = serde_json::from_str(&second_text).unwrap();
+        let second_row = &second_page["graphs"][0];
+        assert_eq!(second_row["errors_offset"], json!(20), "{second_text}");
+        assert_eq!(second_row["errors"].as_array().unwrap().len(), 20);
+        assert_eq!(second_row["next_error_offset"], json!(40));
+
+        let third = validate("broken", None, Some(40), Some(error_stamp.clone())).await;
+        let third_text = extract_text(&third);
+        let third_page: serde_json::Value = serde_json::from_str(&third_text).unwrap();
+        let third_row = &third_page["graphs"][0];
+        assert_eq!(third_row["errors"].as_array().unwrap().len(), 15);
+        assert!(third_row["next_error_offset"].is_null(), "{third_text}");
+
+        let unstamped = validate("broken", None, Some(20), None).await;
+        let unstamped_text = extract_text(&unstamped);
+        assert!(
+            unstamped_text.contains("error.graph_error_stamp_required"),
+            "nonzero error offsets require the error stamp: {unstamped_text}"
+        );
+
+        let wrong = validate("broken", None, Some(20), Some("deadbeef".into())).await;
+        let wrong_text = extract_text(&wrong);
+        assert!(
+            wrong_text.contains("error.graph_errors_changed"),
+            "an unknown error stamp refuses: {wrong_text}"
+        );
+
+        // Exact recovery: the paged array reconstructs byte-for-byte and
+        // parses, in both default and tiny page sizes.
+        let expected_errors: Vec<serde_json::Value> = synthetic_validation_errors(55)
+            .iter()
+            .map(|error| serde_json::to_value(error).unwrap())
+            .collect();
+        let joined = collect_validation_errors(&server, &project_id, "broken", None).await;
+        let recovered: Vec<serde_json::Value> = serde_json::from_str(&joined).unwrap();
+        assert_eq!(recovered, expected_errors);
+        assert!(
+            joined.contains("缺口"),
+            "multibyte messages survive page boundaries: {joined}"
+        );
+        let tiny_joined = collect_validation_errors(&server, &project_id, "broken", Some(64)).await;
+        let tiny_recovered: Vec<serde_json::Value> = serde_json::from_str(&tiny_joined).unwrap();
+        assert_eq!(tiny_recovered, expected_errors);
+
+        // Empty states stay explicit rather than collapsing to nulls.
+        let valid = validate("tiny", None, None, None).await;
+        let valid_text = extract_text(&valid);
+        let valid_page: serde_json::Value = serde_json::from_str(&valid_text).unwrap();
+        assert_eq!(valid_page["graphs"][0]["valid"], json!(true));
+        assert_eq!(valid_page["graphs"][0]["errors"], json!([]));
+        assert_eq!(valid_page["graphs"][0]["errors_total"], json!(0));
+        let empty_errors = collect_validation_errors(&server, &project_id, "tiny", None).await;
+        assert_eq!(empty_errors, "[]");
+
+        // The invalid entry keeps its summary identity but has no exact
+        // schema payload to page.
+        let unavailable =
+            describe_detail_text(&server, &project_id, "broken", "schema", None, None).await;
+        assert!(
+            unavailable.contains("error.graph_payload_unavailable"),
+            "invalid entries distinguish unavailable payloads: {unavailable}"
+        );
+        assert!(
+            unavailable.contains("bbox_project_graph_validate"),
+            "the refusal names the diagnostics tool: {unavailable}"
+        );
+
+        // A changed error set refuses the old stamp.
+        {
+            let mut views = server.state.project_graph_views.write();
+            let parsed =
+                bbox_corpus_core::project_catalog::ProjectId::parse(project_id.clone()).unwrap();
+            let mut view = views.published_view(&parsed).unwrap().clone();
+            view.graphs
+                .insert("broken".into(), invalid_graph_entry("broken", 1));
+            views.install_published(view);
+        }
+        let changed = validate("broken", None, Some(0), Some(error_stamp)).await;
+        let changed_text = extract_text(&changed);
+        assert!(
+            changed_text.contains("error.graph_errors_changed"),
+            "a changed error set refuses continuation: {changed_text}"
+        );
+    }
+
+    /// A06: an inventory with no graphs and a missing graph stay distinct,
+    /// explicit empty and not_found states instead of empty pages.
+    #[tokio::test]
+    async fn project_graph_list_reports_empty_inventory_and_missing_graphs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        let project_id = install_published_entries(&server, &root, |_| Vec::new());
+
+        let listed = server
+            .bbox_project_graph_list(Parameters(ProjectGraphListParams {
+                project: Some(project_id.clone()),
+                provisional: Some("published".into()),
+                limit: None,
+                offset: None,
+                expected_view_stamp: None,
+            }))
+            .await;
+        let listed_text = extract_text(&listed);
+        let listed_page: serde_json::Value = serde_json::from_str(&listed_text).unwrap();
+        assert_eq!(listed_page["total"], json!(0), "{listed_text}");
+        assert_eq!(listed_page["graphs"], json!([]), "{listed_text}");
+        assert!(listed_page["next_offset"].is_null(), "{listed_text}");
+        assert!(
+            listed_page["view_stamp"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "even an empty view stamps its continuation state"
+        );
+
+        let missing =
+            describe_detail_text(&server, &project_id, "nowhere", "schema", None, None).await;
+        assert!(
+            missing.contains("error.not_found"),
+            "a missing graph is a not_found state, not an empty page: {missing}"
+        );
     }
 
     /// Evidence is an edge family on BOTH endpoints of a binding, so the same
@@ -2620,25 +3555,53 @@ mod tests {
             .bbox_project_graph_list(Parameters(ProjectGraphListParams {
                 project: Some(project_id.clone()),
                 provisional: Some("published".into()),
+                limit: None,
+                offset: None,
+                expected_view_stamp: None,
             }))
             .await;
         let listed_text = extract_text(&listed);
         assert!(listed_text.contains("governance-record"), "{listed_text}");
+        let listed_page: serde_json::Value = serde_json::from_str(&listed_text).unwrap();
+        assert_eq!(listed_page["total"], 1);
+        assert_eq!(listed_page["graphs"].as_array().unwrap().len(), 1);
+        assert!(
+            listed_page["view_stamp"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
 
         let described = server
-            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project_id.clone(),
                 graph_id: "governance-record".into(),
                 provisional: Some("published".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
             }))
             .await;
-        assert!(extract_text(&described).contains("governance-record-schema"));
+        let described_text = extract_text(&described);
+        assert!(
+            described_text.contains("governance-record-schema"),
+            "{described_text}"
+        );
+        assert!(
+            !described_text.contains("gov:Record"),
+            "the compact summary must not embed the schema body: {described_text}"
+        );
 
         let validated = server
-            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+            .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
                 project: project_id.clone(),
                 graph_id: "governance-record".into(),
                 provisional: Some("published".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
+                error_offset: None,
+                error_limit: None,
+                expected_error_stamp: None,
             }))
             .await;
         assert!(extract_text(&validated).contains("\"valid\": true"));
@@ -2853,10 +3816,16 @@ mod tests {
             );
 
         let own = server
-            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+            .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
                 project: project_id.clone(),
                 graph_id: "governance-record".into(),
                 provisional: Some("own".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
+                error_offset: None,
+                error_limit: None,
+                expected_error_stamp: None,
             }))
             .await;
         let own_text = extract_text(&own);
@@ -2868,10 +3837,16 @@ mod tests {
         );
 
         let published = server
-            .bbox_project_graph_validate(Parameters(ProjectGraphExactParams {
+            .bbox_project_graph_validate(Parameters(ProjectGraphValidateParams {
                 project: project_id,
                 graph_id: "governance-record".into(),
                 provisional: Some("published".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
+                error_offset: None,
+                error_limit: None,
+                expected_error_stamp: None,
             }))
             .await;
         assert!(extract_text(&published).contains("\"valid\": true"));
@@ -5357,16 +6332,19 @@ mod graph_vector_lane {
 
         // The participation report says what embeds and how much of it did.
         let described = server
-            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project.project_id.clone(),
                 graph_id: GRAPH_ID.into(),
                 provisional: Some("published".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
             }))
             .await;
         let wire = serde_json::to_value(&described).unwrap();
         let text = wire["content"][0]["text"].as_str().unwrap();
         let described: serde_json::Value = serde_json::from_str(text).unwrap();
-        let retrieval = &described["graphs"][0]["retrieval"];
+        let retrieval = &described["retrieval"];
         assert_eq!(retrieval["embeddings_enabled"], json!(true), "{text}");
         assert_eq!(retrieval["embed_eligible_vertex_count"], json!(2), "{text}");
         // The isolated queue carries no router, so activity is unknowable
@@ -5407,16 +6385,19 @@ mod graph_vector_lane {
         );
         assert!(wait_for_graph_vectors(&vectors, &[]).await.is_empty());
         let described = server
-            .bbox_project_graph_describe(Parameters(ProjectGraphExactParams {
+            .bbox_project_graph_describe(Parameters(ProjectGraphDescribeParams {
                 project: project.project_id.clone(),
                 graph_id: GRAPH_ID.into(),
                 provisional: Some("published".into()),
+                detail: None,
+                cursor: None,
+                body_limit: None,
             }))
             .await;
         let wire = serde_json::to_value(&described).unwrap();
         let text = wire["content"][0]["text"].as_str().unwrap();
         let described: serde_json::Value = serde_json::from_str(text).unwrap();
-        let retrieval = &described["graphs"][0]["retrieval"];
+        let retrieval = &described["retrieval"];
         assert_eq!(retrieval["embeddings_enabled"], json!(false), "{text}");
         assert_eq!(retrieval["embed_eligible_vertex_count"], json!(0), "{text}");
         assert_eq!(retrieval["embedded_vertex_count"], json!(0), "{text}");
