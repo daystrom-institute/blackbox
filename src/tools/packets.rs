@@ -11,6 +11,36 @@ use rmcp::{tool, tool_router};
 use serde_json::Value;
 
 #[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(crate) struct PacketApplyToolParams {
+    #[serde(flatten)]
+    pub packet: PacketApplyParams,
+    /// Continue mode=all findings in packet rule order.
+    #[serde(default)]
+    pub finding_offset: Option<usize>,
+    /// Maximum mode=all findings per page (default 100, maximum 100).
+    #[serde(default)]
+    pub finding_limit: Option<usize>,
+    /// Include complete finding consequents instead of bounded previews.
+    #[serde(default)]
+    pub finding_detail: bool,
+}
+
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(crate) struct PacketAuditToolParams {
+    #[serde(flatten)]
+    pub packet: AuditParams,
+    /// Continue mismatch pages in dataset order.
+    #[serde(default)]
+    pub mismatch_offset: Option<usize>,
+    /// Maximum mismatches per page (default 100, maximum 100).
+    #[serde(default)]
+    pub mismatch_limit: Option<usize>,
+    /// Include complete mismatch values instead of bounded previews.
+    #[serde(default)]
+    pub mismatch_detail: bool,
+}
+
+#[derive(Debug, serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(crate) struct PacketListToolParams {
     #[serde(flatten)]
     pub filters: PacketListParams,
@@ -119,32 +149,44 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_apply",
-        description = "Evaluate a packet against one entity — deterministic, no LLM. The receive-side of the packet workflow: a sub-agent that received packet_id from its orchestrator calls this to classify without reinterpreting the rubric. mode=\"first\" returns the first matching rule; mode=\"all\" returns every matching rule plus an aggregate verdict (for review / multi-finding shape). Cheap at arbitrary scale."
+        description = "Evaluate a packet against one entity deterministically, without an LLM. mode=\"first\" returns the first matching rule; mode=\"all\" returns a bounded finding page plus an aggregate verdict. Continue finding pages with next_finding_offset."
     )]
     pub(crate) async fn bbox_apply(
         &self,
-        Parameters(p): Parameters<PacketApplyParams>,
+        Parameters(p): Parameters<PacketApplyToolParams>,
     ) -> CallToolResult {
         // apply_tool loads the packet from disk and appends apply events.
         let server = self.clone();
         Self::run_blocking("bbox_apply", move || {
-            server.state.packets.read().apply_tool(&p)
+            server.state.packets.read().apply_tool_paged(
+                &p.packet,
+                p.finding_offset.unwrap_or(0),
+                p.finding_limit
+                    .unwrap_or(crate::packets::MAX_PACKET_RESULT_ROWS),
+                p.finding_detail,
+            )
         })
         .await
     }
 
     #[tool(
         name = "bbox_audit",
-        description = "Run a packet against a {entity, expected}[] dataset; report fidelity + mismatching rule ids. The self-verify step: a packet with fidelity < 1.0 is lying about its training data. ALWAYS call this after bbox_compile against the observations you derived the rules from — catches over-generalization, rule-ordering bugs, and field-name typos."
+        description = "Run a packet against a mode-specific {entity, expectation}[] dataset and report fidelity with bounded mismatch pages. Fidelity measures agreement with the supplied dataset, not universal classifier correctness; continue mismatches with next_mismatch_offset."
     )]
     pub(crate) async fn bbox_audit(
         &self,
-        Parameters(p): Parameters<AuditParams>,
+        Parameters(p): Parameters<PacketAuditToolParams>,
     ) -> CallToolResult {
         // audit_tool loads the packet from disk and appends audit events.
         let server = self.clone();
         Self::run_blocking("bbox_audit", move || {
-            server.state.packets.read().audit_tool(&p)
+            server.state.packets.read().audit_tool_paged(
+                &p.packet,
+                p.mismatch_offset.unwrap_or(0),
+                p.mismatch_limit
+                    .unwrap_or(crate::packets::MAX_PACKET_RESULT_ROWS),
+                p.mismatch_detail,
+            )
         })
         .await
     }
@@ -168,7 +210,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_packet_events",
-        description = "Query the packet operation log — every compile / apply / audit / gap event the daemon has recorded, plus `repair_candidate` events emitted by the self-heal scanner when enabled. Use to investigate packet behavior over time: low-fidelity audits, high no_match rates, compile failures, authoring gaps, and packets the scanner has flagged for repair. Filter by op (compile / apply / audit / gap / repair_candidate), packet_id, outcome, or since. Returns newest-first up to `limit` (default 50, max 500)."
+        description = "Query bounded pages of the live packet operation log. Returns newest-first rows with total, explicit ordering, next_cursor, and live-view continuation semantics. Filter by closed op/outcome enums, packet_id, or RFC 3339 since; continue older pages with next_cursor."
     )]
     pub(crate) async fn bbox_packet_events(
         &self,
@@ -177,19 +219,8 @@ impl BlackboxServer {
         // list_events reads the event log from disk.
         let server = self.clone();
         Self::run_blocking("bbox_packet_events", move || {
-            let limit = p.limit.unwrap_or(50).min(500);
-            let events = server.state.packets.read().list_events(
-                p.op.as_deref(),
-                p.packet_id.as_deref(),
-                p.outcome.as_deref(),
-                p.since.as_deref(),
-                limit,
-            )?;
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "count": events.len(),
-                "limit": limit,
-                "events": events,
-            }))?)
+            let page = server.state.packets.read().events_page(&p)?;
+            Ok(serde_json::to_string(&page)?)
         })
         .await
     }
@@ -363,5 +394,272 @@ mod tests {
                 .get("classification_histogram")
                 .is_some()
         );
+    }
+    fn packet_test_server(rules: Value) -> (tempfile::TempDir, BlackboxServer, String) {
+        use crate::server::state::SharedState;
+        use std::sync::Arc;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+        let params: CompileParams = serde_json::from_value(json!({
+            "domain": "packet-page-fixture",
+            "scope": "global",
+            "classification_lattice": ["flag", "pass"],
+            "rules": rules,
+        }))
+        .unwrap();
+        let compiled = server.state.packets.read().compile(&params).unwrap();
+        let packet_id = compiled.split_whitespace().nth(1).unwrap().to_owned();
+        (temporary, server, packet_id)
+    }
+
+    fn numbered_rules(count: usize) -> Value {
+        json!(
+            (0..count)
+                .map(|index| {
+                    json!({
+                        "id": format!("r{index:03}"),
+                        "classification": if index == 0 { "flag" } else { "pass" },
+                        "antecedent": {"op": "True"},
+                        "consequent": format!("FINDING_{index}"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+    #[test]
+    fn packet_event_operations_use_a_closed_enum() {
+        let error = serde_json::from_value::<EventsParams>(json!({
+            "op": "audit-invalid-operation"
+        }))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown variant"), "{message}");
+        assert!(message.contains("audit-invalid-operation"), "{message}");
+
+        let error = serde_json::from_value::<EventsParams>(json!({
+            "outcome": "invalid-outcome"
+        }))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown variant"), "{message}");
+        assert!(message.contains("invalid-outcome"), "{message}");
+
+        serde_json::from_value::<EventsParams>(json!({
+            "op": "gc",
+            "outcome": "partial"
+        }))
+        .unwrap();
+    }
+    #[test]
+    fn oversized_packet_compile_is_rejected_before_logging_an_event() {
+        use crate::server::state::SharedState;
+        use std::sync::Arc;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(&root)));
+        let rules = numbered_rules(crate::packets::MAX_PACKET_RULES + 1);
+        let params: CompileParams = serde_json::from_value(json!({
+            "domain": "oversized-compile",
+            "scope": "global",
+            "classification_lattice": ["flag", "pass"],
+            "rules": rules,
+        }))
+        .unwrap();
+        let error = server.state.packets.read().compile(&params).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("at most 500"), "{message}");
+        let compiles = server
+            .state
+            .packets
+            .read()
+            .list_events(Some("compile"), None, None, None, 500)
+            .unwrap();
+        assert!(
+            compiles.is_empty(),
+            "oversized compile must not write an event"
+        );
+    }
+
+    #[tokio::test]
+    async fn packet_apply_all_pages_findings_and_discloses_observation_writes() {
+        let (_temporary, server, packet_id) = packet_test_server(numbered_rules(3));
+        let first = server
+            .bbox_apply(Parameters(
+                serde_json::from_value::<PacketApplyToolParams>(json!({
+                    "packet_id": packet_id,
+                    "entity": {"case": "fixture"},
+                    "mode": "all",
+                    "finding_offset": 0,
+                    "finding_limit": 1,
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert!(!first.is_error.unwrap_or(false), "{first:?}");
+        let first: Value = serde_json::from_str(&first.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(first["finding_count"], 3);
+        assert_eq!(first["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(first["findings"][0]["rule_id"], "r000");
+        assert!(first["findings"][0].get("consequent").is_none());
+        assert!(first["findings"][0].get("consequent_preview").is_some());
+        let exact_reader = first["exact_reader"].as_str().unwrap();
+        assert!(exact_reader.starts_with("bbox_inspect_entity"));
+
+        let second = server
+            .bbox_apply(Parameters(
+                serde_json::from_value::<PacketApplyToolParams>(json!({
+                    "packet_id": packet_id,
+                    "entity": {"case": "fixture"},
+                    "mode": "all",
+                    "finding_offset": 2,
+                    "finding_limit": 1,
+                    "finding_detail": true,
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert!(!second.is_error.unwrap_or(false), "{second:?}");
+        let second: Value =
+            serde_json::from_str(&second.content[0].as_text().unwrap().text).unwrap();
+        let second_row = &second["findings"][0];
+        assert_eq!(second_row["rule_id"], "r002");
+        assert_eq!(second_row["consequent"], "FINDING_2");
+        assert_eq!(second["next_finding_offset"], serde_json::Value::Null);
+    }
+    #[tokio::test]
+    async fn packet_audit_pages_mismatches_and_rejects_oversized_batches_before_events() {
+        let (_temporary, server, packet_id) = packet_test_server(json!([{
+            "id": "reject",
+            "classification": "flag",
+            "antecedent": {"op": "True"},
+            "consequent": "REJECT",
+        }]));
+        let dataset = json!([
+            {"entity": {"case": 0}, "expected": "WRONG"},
+            {"entity": {"case": 1}, "expected": "WRONG"},
+            {"entity": {"case": 2}, "expected": "WRONG"}
+        ]);
+        let mut offset = 0;
+        let mut indexes = Vec::new();
+        loop {
+            let response = server
+                .bbox_audit(Parameters(
+                    serde_json::from_value::<PacketAuditToolParams>(json!({
+                        "packet_id": packet_id,
+                        "mode": "first",
+                        "mismatch_offset": offset,
+                        "mismatch_limit": 1,
+                        "dataset": dataset,
+                    }))
+                    .unwrap(),
+                ))
+                .await;
+            assert!(!response.is_error.unwrap_or(false), "{response:?}");
+            let page: Value =
+                serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+            assert_eq!(page["total"], 3);
+            assert_eq!(page["mismatch_count"], 3);
+            assert_eq!(page["fidelity"], 0.0);
+            assert_eq!(page["observation_event"], "written");
+            indexes.push(page["mismatches"][0]["dataset_index"].as_u64().unwrap());
+            offset = match page["next_mismatch_offset"].as_u64() {
+                Some(next) => usize::try_from(next).unwrap(),
+                None => break,
+            };
+        }
+        assert_eq!(indexes, vec![0, 1, 2]);
+
+        let oversized_dataset: Vec<Value> = (0..=crate::packets::MAX_AUDIT_DATASET_ROWS)
+            .map(|index| json!({"entity": {"case": index}, "expected": "REJECT"}))
+            .collect();
+        let rejected = server
+            .bbox_audit(Parameters(
+                serde_json::from_value::<PacketAuditToolParams>(json!({
+                    "packet_id": packet_id,
+                    "mode": "first",
+                    "dataset": oversized_dataset,
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert!(rejected.is_error.unwrap_or(false), "{rejected:?}");
+        let error = rejected.content[0].as_text().unwrap().text;
+        assert!(error.contains("at most 1000"), "{error}");
+
+        let audits = server
+            .state
+            .packets
+            .read()
+            .list_events(Some("audit"), None, None, None, 500)
+            .unwrap();
+        assert_eq!(audits.len(), 3, "oversized batch must not write an event");
+    }
+    #[tokio::test]
+    async fn packet_audit_all_preserves_mode_specific_item_outcomes() {
+        let (_temporary, server, packet_id) = packet_test_server(numbered_rules(3));
+        let response = server
+            .bbox_audit(Parameters(
+                serde_json::from_value::<PacketAuditToolParams>(json!({
+                    "packet_id": packet_id,
+                    "mode": "all",
+                    "mismatch_limit": 1,
+                    "dataset": [
+                        {
+                            "entity": {"case": "complete"},
+                            "expected_rule_ids": ["r000", "r001", "r002"]
+                        },
+                        {
+                            "entity": {"case": "incomplete"},
+                            "expected_rule_ids": ["r000"]
+                        }
+                    ],
+                }))
+                .unwrap(),
+            ))
+            .await;
+        assert!(!response.is_error.unwrap_or(false), "{response:?}");
+        let page: Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["correct"], 1);
+        assert_eq!(page["mismatch_count"], 1);
+        let mismatch = &page["mismatches"][0];
+        assert_eq!(mismatch["dataset_index"], 1);
+        assert_eq!(mismatch["check"], "rule_ids");
+        assert_eq!(mismatch["expected_rule_ids"], json!(["r000"]));
+        assert_eq!(mismatch["actual_rule_ids"], json!(["r000", "r001", "r002"]));
+        assert_eq!(page["next_mismatch_offset"], serde_json::Value::Null);
+    }
+    #[test]
+    fn large_apply_all_finding_pages_recover_every_item_in_order() {
+        let (_temporary, server, packet_id) = packet_test_server(numbered_rules(250));
+        let packets = server.state.packets.read();
+        let params = PacketApplyParams {
+            packet_id: packet_id.clone(),
+            entity: json!({"case": "large"}),
+            mode: Some(crate::packets::ApplyMode::All),
+        };
+        let mut offset = 0;
+        let mut rule_ids = Vec::new();
+        while offset < 250 {
+            let response = packets
+                .apply_tool_paged(&params, offset, 100, false)
+                .unwrap();
+            let page: Value = serde_json::from_str(&response).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= 24 * 1024);
+            let rows = page["findings"].as_array().unwrap();
+            assert!(!rows.is_empty());
+            rule_ids.extend(
+                rows.iter()
+                    .map(|row| row["rule_id"].as_str().unwrap().to_owned()),
+            );
+            offset = page["next_finding_offset"].as_u64().unwrap() as usize;
+        }
+        assert_eq!(rule_ids.len(), 250);
+        assert_eq!(rule_ids[0], "r000");
+        assert_eq!(rule_ids[249], "r249");
     }
 }
