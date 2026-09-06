@@ -62,6 +62,19 @@ fn queue_server(fixture: &CatalogFixture) -> BlackboxServer {
     server
 }
 
+fn publish(
+    fixture: &CatalogFixture,
+    server: &BlackboxServer,
+    scope: &PublishedScope,
+    commit: &str,
+    entries: &[KnowledgeEntry],
+) {
+    fixture.install_publication(PROJECT, scope, &commit.repeat(40), entries, &[]);
+    server.invalidate_catalog_published_content(
+        &bbox_corpus_core::project_catalog::ProjectId::parse(PROJECT).unwrap(),
+    );
+}
+
 fn fixture() -> (CatalogFixture, BlackboxServer, PublishedScope) {
     let fixture = CatalogFixture::new();
     let scope = CatalogFixture::scope(".");
@@ -150,7 +163,7 @@ async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publicatio
     let entry = latest(&server, &scope, ENTRY);
     assert_eq!(entry.content, "queued content");
     assert_eq!(entry.links.len(), 2);
-    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &[entry.clone()], &[]);
+    publish(&fixture, &server, &scope, "2", &[entry.clone()]);
     server
         .session_knowledge_view(Some(PROJECT), Some("published"))
         .unwrap();
@@ -165,7 +178,7 @@ async fn queued_knowledge_edits_compose_before_and_after_delivery_and_publicatio
     );
     let mut external = entry;
     external.content = "later publication".into();
-    fixture.install_publication(PROJECT, &scope, &"3".repeat(40), &[external], &[]);
+    publish(&fixture, &server, &scope, "3", &[external]);
     server
         .enqueue_link_via_checkout_owner(&link("knowledge:3333333333333333"))
         .unwrap();
@@ -186,9 +199,9 @@ async fn queued_knowledge_preserves_the_complete_canonical_entry() {
     entry.supersedes = Some("1111111111111111".into());
     entry.weight = 83;
     entry.approval = Approval::AgentInferred;
-    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &[entry.clone()], &[]);
+    publish(&fixture, &server, &scope, "2", &[entry.clone()]);
     server
-        .enqueue_review_via_checkout_owner("approve", ENTRY)
+        .enqueue_review_via_checkout_owner("approve", ENTRY, None)
         .unwrap();
     let updated = latest(&server, &scope, ENTRY);
     entry.approval = Approval::UserConfirmed;
@@ -211,12 +224,12 @@ async fn queued_knowledge_refuses_publication_conflicts_and_retries_capture_race
             || {
                 captures += 1;
                 if captures == 1 {
-                    fixture.install_publication(
-                        PROJECT,
+                    publish(
+                        &fixture,
+                        &server,
                         &scope,
-                        &"2".repeat(40),
+                        "2",
                         &[knowledge_entry(ENTRY, "changed during capture")],
-                        &[],
                     );
                 }
             },
@@ -230,12 +243,12 @@ async fn queued_knowledge_refuses_publication_conflicts_and_retries_capture_race
         )
         .unwrap();
     assert_eq!(captures, 2);
-    fixture.install_publication(
-        PROJECT,
+    publish(
+        &fixture,
+        &server,
         &scope,
-        &"3".repeat(40),
+        "3",
         &[knowledge_entry(ENTRY, "conflicting publication")],
-        &[],
     );
     let count = server.state.checkout_mutations.read().pending_count();
     let error = server
@@ -264,6 +277,7 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
         .unwrap();
     let result = server
         .bbox_forget(Parameters(ForgetParams {
+            project: None,
             id: ENTRY.into(),
             superseded_by: None,
         }))
@@ -298,7 +312,7 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
     );
     assert!(
         restarted
-            .enqueue_review_via_checkout_owner("approve", ENTRY)
+            .enqueue_review_via_checkout_owner("approve", ENTRY, None)
             .is_err()
     );
     assert!(
@@ -311,7 +325,7 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
             )
             .is_err()
     );
-    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &[], &[]);
+    publish(&fixture, &restarted, &scope, "2", &[]);
     restarted
         .session_knowledge_view(Some(PROJECT), Some("published"))
         .unwrap();
@@ -479,6 +493,7 @@ async fn queued_knowledge_genesis_and_id_addressed_updates_survive_restart() {
     );
     let result = server
         .bbox_review(Parameters(ReviewParams {
+            project: None,
             action: Some("reject".into()),
             id: Some(id.into()),
         }))
@@ -486,7 +501,7 @@ async fn queued_knowledge_genesis_and_id_addressed_updates_survive_restart() {
     assert_ne!(result.is_error, Some(true), "{result:?}");
     assert!(
         queue_server(&fixture)
-            .enqueue_review_via_checkout_owner("approve", id)
+            .enqueue_review_via_checkout_owner("approve", id, None)
             .is_err()
     );
 }
@@ -558,7 +573,7 @@ async fn queued_knowledge_unrelated_broken_publication_preserves_known_global_au
     );
     assert!(
         server
-            .enqueue_review_via_checkout_owner("approve", "unknown")
+            .enqueue_review_via_checkout_owner("approve", "unknown", None)
             .is_err()
     );
 }
@@ -588,11 +603,12 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
     };
     server
         .enqueue_forget_via_checkout_owner(&ForgetParams {
+            project: None,
             id: created.id.clone(),
             superseded_by: None,
         })
         .unwrap();
-    fixture.install_publication(PROJECT, &scope, &"1".repeat(40), &[], &[]);
+    publish(&fixture, &server, &scope, "1", &[]);
     server
         .session_knowledge_view(Some(PROJECT), Some("published"))
         .unwrap();
@@ -607,10 +623,10 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
     );
     assert!(
         server
-            .enqueue_review_via_checkout_owner("approve", &created.id)
+            .enqueue_review_via_checkout_owner("approve", &created.id, None)
             .is_err()
     );
-    fixture.install_publication(PROJECT, &scope, &"2".repeat(40), &[created.clone()], &[]);
+    publish(&fixture, &server, &scope, "2", &[created.clone()]);
     server
         .session_knowledge_view(Some(PROJECT), Some("published"))
         .unwrap();
@@ -625,7 +641,7 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
     );
     assert!(
         server
-            .enqueue_review_via_checkout_owner("approve", &created.id)
+            .enqueue_review_via_checkout_owner("approve", &created.id, None)
             .is_err()
     );
     let rows = server
@@ -648,7 +664,7 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
             )
             .unwrap();
     }
-    fixture.install_publication(PROJECT, &scope, &"3".repeat(40), &[], &[]);
+    publish(&fixture, &server, &scope, "3", &[]);
     server
         .session_knowledge_view(Some(PROJECT), Some("published"))
         .unwrap();
@@ -661,6 +677,253 @@ async fn queued_knowledge_genesis_delete_does_not_retire_on_preexisting_absence(
             .count(),
         0
     );
+}
+
+#[tokio::test]
+async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publication() {
+    let fixture = CatalogFixture::new();
+    let scope = CatalogFixture::scope(".");
+    fixture.add_published_project(PROJECT, &scope);
+    fixture.install_publication(PROJECT, &scope, &"1".repeat(40), &[], &[]);
+    let server = queue_server(&fixture);
+    let result = server
+        .bbox_learn(Parameters(learn(None, "captured before deletion")))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let create = server
+        .state
+        .checkout_mutations
+        .read()
+        .poll(&BTreeSet::from([scope.clone()]))
+        .0[0]
+        .clone();
+    let created: KnowledgeEntry =
+        serde_json::from_str(create.content_json.as_deref().unwrap()).unwrap();
+    server
+        .state
+        .checkout_mutations
+        .write()
+        .ack(
+            &create.mutation_id,
+            "applied",
+            None,
+            None,
+            "2026-09-06T00:00:00Z",
+        )
+        .unwrap();
+    let result = server
+        .bbox_forget(Parameters(ForgetParams {
+            id: created.id.clone(),
+            project: Some(PROJECT.into()),
+            superseded_by: None,
+        }))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let delete = server
+        .state
+        .checkout_mutations
+        .read()
+        .poll(&BTreeSet::from([scope.clone()]))
+        .0[0]
+        .clone();
+    assert_eq!(delete.mode, "delete");
+    server
+        .state
+        .checkout_mutations
+        .write()
+        .ack(
+            &delete.mutation_id,
+            "applied",
+            None,
+            None,
+            "2026-09-06T00:00:01Z",
+        )
+        .unwrap();
+    server
+        .state
+        .persist_checkout_mutations_durable()
+        .await
+        .unwrap();
+    drop(server);
+    let server = queue_server(&fixture);
+    server
+        .session_knowledge_view(Some(PROJECT), Some("published"))
+        .unwrap();
+    assert_eq!(
+        server
+            .state
+            .checkout_mutations
+            .read()
+            .outstanding_intents()
+            .count(),
+        2
+    );
+    assert!(
+        server
+            .enqueue_review_via_checkout_owner("approve", &created.id, Some(PROJECT))
+            .is_err()
+    );
+    publish(&fixture, &server, &scope, "2", &[created.clone()]);
+    server
+        .session_knowledge_view(Some(PROJECT), Some("published"))
+        .unwrap();
+    assert_eq!(
+        server
+            .state
+            .checkout_mutations
+            .read()
+            .outstanding_intents()
+            .count(),
+        1
+    );
+    assert!(
+        server
+            .enqueue_review_via_checkout_owner("approve", &created.id, Some(PROJECT))
+            .is_err()
+    );
+    publish(&fixture, &server, &scope, "3", &[]);
+    server
+        .session_knowledge_view(Some(PROJECT), Some("published"))
+        .unwrap();
+    assert_eq!(
+        server
+            .state
+            .checkout_mutations
+            .read()
+            .outstanding_intents()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_broken_projects() {
+    let (fixture, mut server, scope) = fixture();
+    let global = server
+        .state
+        .kb
+        .write()
+        .learn_result_with_checkout(
+            &LearnParams {
+                content: "global owner".into(),
+                category: "convention".into(),
+                scope: Some("global".into()),
+                ..Default::default()
+            },
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+    let broken_scope = CatalogFixture::scope("broken");
+    fixture.add_published_project("p_broken", &broken_scope);
+    let publication = fixture.install_publication(
+        "p_broken",
+        &broken_scope,
+        &"2".repeat(40),
+        &[knowledge_entry(ENTRY, "duplicate owner")],
+        &[],
+    );
+    cover_catalog_projects(&mut server);
+    assert!(
+        server
+            .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
+            .unwrap_err()
+            .to_string()
+            .contains("multiple projects")
+    );
+    fixture.corrupt_generation("p_broken", &publication.generation_id);
+    server.invalidate_catalog_published_content(
+        &bbox_corpus_core::project_catalog::ProjectId::parse("p_broken").unwrap(),
+    );
+    let ambiguous = server
+        .bbox_review(Parameters(ReviewParams {
+            id: Some(ENTRY.into()),
+            action: Some("approve".into()),
+            project: None,
+        }))
+        .await;
+    assert_eq!(ambiguous.is_error, Some(true));
+    assert!(format!("{ambiguous:?}").contains("pass project"));
+    assert!(
+        server
+            .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
+            .is_err()
+    );
+    assert!(
+        server
+            .enqueue_forget_via_checkout_owner(&ForgetParams {
+                id: ENTRY.into(),
+                superseded_by: None,
+                project: None,
+            })
+            .is_err()
+    );
+    assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
+    let mismatch = server
+        .bbox_review(Parameters(ReviewParams {
+            id: Some(global.id.clone()),
+            action: Some("approve".into()),
+            project: Some(PROJECT.into()),
+        }))
+        .await;
+    assert_eq!(mismatch.is_error, Some(true));
+    let local = server
+        .bbox_review(Parameters(ReviewParams {
+            id: Some(global.id),
+            action: Some("approve".into()),
+            project: None,
+        }))
+        .await;
+    assert_ne!(local.is_error, Some(true), "{local:?}");
+    assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
+    for selector in ["p_broken", "p_nonexistent"] {
+        let result = server
+            .bbox_review(Parameters(ReviewParams {
+                id: Some(ENTRY.into()),
+                action: Some("approve".into()),
+                project: Some(selector.into()),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+    }
+    assert_eq!(server.state.checkout_mutations.read().pending_count(), 0);
+    let result = server
+        .bbox_review(Parameters(ReviewParams {
+            id: Some(ENTRY.into()),
+            action: Some("approve".into()),
+            project: Some(PROJECT.into()),
+        }))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let mut params = link("knowledge:1111111111111111");
+    params.project = Some(PROJECT.into());
+    let result = server.bbox_knowledge_link(Parameters(params)).await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(latest(&server, &scope, ENTRY).links.len(), 1);
+    let result = server
+        .bbox_forget(Parameters(ForgetParams {
+            id: ENTRY.into(),
+            superseded_by: None,
+            project: Some(PROJECT.into()),
+        }))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert!(
+        server
+            .enqueue_review_via_checkout_owner("approve", ENTRY, Some(PROJECT))
+            .is_err()
+    );
+    let restarted = queue_server(&fixture);
+    let rows = restarted
+        .state
+        .checkout_mutations
+        .read()
+        .poll(&BTreeSet::from([scope.clone(), broken_scope]))
+        .0;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.scope == scope));
+    assert_eq!(rows.last().unwrap().mode, "delete");
 }
 
 #[tokio::test]
@@ -782,6 +1045,7 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
     );
     let result = server
         .bbox_review(Parameters(ReviewParams {
+            project: None,
             action: Some("approve".into()),
             id: Some(global.id.clone()),
         }))
@@ -789,6 +1053,7 @@ async fn queued_knowledge_broken_queue_does_not_block_durable_global_mutations()
     assert_ne!(result.is_error, Some(true), "{result:?}");
     let result = server
         .bbox_forget(Parameters(ForgetParams {
+            project: None,
             id: global.id.clone(),
             superseded_by: None,
         }))

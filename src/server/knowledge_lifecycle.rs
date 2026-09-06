@@ -1984,6 +1984,7 @@ mod tests {
             .write()
             .append_link_with_write_dir(
                 &bbox_knowledge::knowledge::KnowledgeLinkParams {
+                    project: None,
                     source: format!("knowledge:{}", link.id),
                     target: "knowledge:global-update".into(),
                     kind: "RelatesTo".into(),
@@ -2005,6 +2006,7 @@ mod tests {
             .write()
             .review_with_write_dir(
                 &bbox_knowledge::knowledge::ReviewParams {
+                    project: None,
                     action: Some("approve".into()),
                     id: Some(review.id),
                 },
@@ -2022,6 +2024,7 @@ mod tests {
             .write()
             .forget_with_write_dir(
                 &bbox_knowledge::knowledge::ForgetParams {
+                    project: None,
                     id: forget.id,
                     superseded_by: None,
                 },

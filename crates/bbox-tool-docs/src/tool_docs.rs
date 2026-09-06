@@ -531,14 +531,14 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_knowledge_link",
         category: ToolCategory::Knowledge,
         summary: "Append a knowledge edge.",
-        when_to_use: "",
+        when_to_use: "Pass project to select the source entry's checkout-owner project when IDs overlap or unrelated publications are unavailable. The selected project must contain the source entry; there is no fallback to another owner. Omit project for global or local-store entries. Unscoped mutations refuse when a unique owner cannot be established.",
         example: None,
     },
     ToolDoc {
         name: "bbox_forget",
         category: ToolCategory::Knowledge,
         summary: "Retire or supersede an entry.",
-        when_to_use: "Entry is stale or replaced. Prefer `bbox_decide` with `supersedes` if the replacement is itself a decision.",
+        when_to_use: "Entry is stale or replaced. Prefer `bbox_decide` with `supersedes` if the replacement is itself a decision. Pass project to select a checkout-owner project when IDs overlap or unrelated publications are unavailable; the selected project must contain the entry, with no fallback to another owner. Omit project for global or local-store entries. Unscoped mutations refuse when a unique owner cannot be established.",
         example: None,
     },
     ToolDoc {
@@ -566,7 +566,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_review",
         category: ToolCategory::Knowledge,
         summary: "Approve or reject entries awaiting review.",
-        when_to_use: "Use to approve or reject existing unverified entries. Review controls render eligibility; it does not import rendered-file edits. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
+        when_to_use: "Use to approve or reject existing unverified entries. Review controls render eligibility; it does not import rendered-file edits. For approve/reject, pass project to select a checkout-owner project when IDs overlap or unrelated publications are unavailable; the selected project must contain the entry, with no fallback to another owner. Omit project for list, global entries, or local-store entries. Unscoped mutations refuse when a unique owner cannot be established. See `sm-render-lifecycle` via `bbox_knowledge` for the full lifecycle.",
         example: None,
     },
     ToolDoc {

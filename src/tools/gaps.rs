@@ -546,18 +546,6 @@ impl BlackboxServer {
         }
     }
 
-    /// Pending backchannel write content for a repo path, when one is in
-    /// flight: chained mutations inside one collector cycle must see each
-    /// other, so the pending record supersedes the published view.
-    pub(crate) fn pending_mutation_content(&self, relative_path: &str) -> Option<String> {
-        self.state
-            .checkout_mutations
-            .read()
-            .pending_for_path(relative_path)
-            .filter(|pending| pending.mutation.mode == "write")
-            .and_then(|pending| pending.mutation.content_json.clone())
-    }
-
     /// The covered project that owns an id-addressed gap mutation, for a
     /// caller that supplied no project context (gap-40ab1102).
     ///

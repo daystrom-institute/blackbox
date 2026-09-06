@@ -3298,6 +3298,11 @@ mod catalog_view_tests {
         let mut second = first.clone();
         second.content = "second".into();
         fixture.install_publication(project.as_str(), &scope, COMMIT_TWO, &[second.clone()], &[]);
+        server.invalidate_catalog_published_content(&project);
+        assert_ne!(
+            runtime.load_verified(&project).unwrap().content_stamp(),
+            stale.content_stamp()
+        );
         let canonical = |entry: &KnowledgeEntry| {
             String::from_utf8(committed_knowledge_entry_bytes(entry).unwrap()).unwrap()
         };
@@ -3328,6 +3333,7 @@ mod catalog_view_tests {
             1
         );
         fixture.install_publication(project.as_str(), &scope, &"3".repeat(40), &[first], &[]);
+        server.invalidate_catalog_published_content(&project);
         server
             .session_knowledge_view(Some(project.as_str()), Some("published"))
             .unwrap();
