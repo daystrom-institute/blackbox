@@ -50,6 +50,11 @@ out explicitly under `Changed` or `Removed`.
   text instead of the opening of accumulated output. Preview state survives
   restart; full result pagination remains independent.
 
+- Queued knowledge edits compose against current publication and outstanding
+  intents, retain deletion protection across delayed publication, and durably
+  settle through their owning store. Review, link and forget accept an explicit
+  project owner when unrelated publications are unavailable.
+
 - Queued project-gap edits compose across concurrent calls and delivery before
   publication. Admission is durable, overlays stay project-scoped, conflicting
   publications are rejected, and covered projects can file and update gaps

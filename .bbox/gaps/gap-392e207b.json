@@ -8,9 +8,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "docs_runbook/render/host-guidance-after-remote-deploy",
   "notes": "Observed removed workflow recommendations and old artifact examples in the operator host common guidance while the daemon render plan was current. Official bro render global refreshed the host with automatic backup; deployment runbook needs an explicit host refresh step and no manual managed-file editing.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T18:17:42Z",
-  "updated_at": "2026-09-06T18:17:42Z"
+  "updated_at": "2026-09-06T18:20:41Z",
+  "resolved_at": "2026-09-06T18:20:41Z",
+  "resolution_note": "Official bro render global applied the current daemon plan to the operator host with automatic backup. Verified retired workflow recommendation and workflow artifact examples disappeared. Runbook commit d8fc74dd makes host refresh part of remote upgrades and removes retired maintenance/reaction instructions."
 }

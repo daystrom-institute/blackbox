@@ -874,3 +874,50 @@ result pages retain accumulated output. Empty text, tools and thinking events
 preserve the preceding text until new assistant text arrives. Follow-up
 verification and deployment are tracked in
 [gap-dbac4f82](../../../.bbox/gaps/gap-dbac4f82.json).
+
+
+### Deployed preview, knowledge and packet milestone
+
+Source `769b1241c326` passed `bbox-verify-kcm55`: 6,555 full-profile workspace
+tests, clippy and concurrency checks. Image build `build-bbox-image-6dgpr`
+succeeded. Cage commit `bc8bbcb` deploys digest
+`sha256:7bbfead4493fff3a501b270832cf8c6f7aee2ea4420ca0d8afb45e545c8fa3c3`.
+Native bro and bro-harness were rebuilt from runtime-equivalent `e7b71d67`,
+stablesigned, installed atomically, and checked against the signed artifacts.
+Admission is open.
+
+Live checks verified:
+
+- A task saved before preview persistence recovered its final review message.
+  Its exact result still began with opening narration. A new Brodex/Astra task
+  advanced through `PREVIEW_OPENING`, `PREVIEW_LATEST`, and `PREVIEW_FINISHED`
+  while exact result retrieval retained all three messages. Dashboard output
+  availability is independent of whether an old preview can be recovered.
+- A 256-byte exact result page returned 712 wire bytes by default and 2,142
+  with debug diagnostics. The default omits duplicate snippets and telemetry.
+- Complete installed routing policy JSON reconstructed through seven bounded
+  property pages: 6,969 source bytes, with each complete response below 3.5 KiB.
+  Summary inspection identified the omitted body and its expansion path.
+- Surface inspection rejected invalid actions and unknown fields with
+  invalid-params errors. Read-only replay retained 31 visible tools. The ops
+  catalog retained 109 tools, and the earlier surviving-surface smoke passed.
+- Knowledge review, link and forget expose explicit project selection in their
+  deployed schemas. Mutation correctness was verified with isolated tests and
+  independent review, including absent-base tombstone ABA, restart, concurrent
+  edits, supersession, owner isolation and durable persistence.
+- Official host-side global rendering removed stale workflow recommendations
+  and artifact examples. The upgrade runbook now refreshes host guidance and
+  retains the offline CLI installation step without retired maintenance or
+  reaction instructions.
+
+Addressed records: `gap-dbac4f82`, `gap-e2f4b76e`, `gap-3bbc041f`,
+`gap-f8190137`, and `gap-392e207b`. The broader surviving-surface audit remains
+partial; these checks do not imply every action has been exercised.
+
+The next correctness work is `gap-92bd3d34`: original-byte delivery
+preconditions, durable mutation-bound replay receipts, guarded transaction
+recovery, and durable duplicate acknowledgement handling. Existing checkout
+transactions can carry target-plus-receipt writes, but completed manifests are
+not a permanent replay ledger. Paired-file delivery needs a separate explicit
+batch contract. Unscoped knowledge diagnostics, thread history and publisher
+status also retain response-budget work.

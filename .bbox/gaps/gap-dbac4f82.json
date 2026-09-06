@@ -13,9 +13,11 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "mcp_surface/orchestration/latest-assistant-preview",
   "notes": "Confirmed by source inspection and live review task: body contains final findings but lastAssistantSnippet starts with the opening plan. Source fix cfaf1162 adds a bounded independently persisted preview and recovery from retained assistant events; awaiting cluster verification and deployed proof.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T17:59:13Z",
-  "updated_at": "2026-09-06T17:59:13Z"
+  "updated_at": "2026-09-06T18:39:13Z",
+  "resolved_at": "2026-09-06T18:39:13Z",
+  "resolution_note": "Deployed source 769b1241c326. Full workspace: 6555 passing tests plus clippy/concurrency. Live pre-upgrade review task recovered its final assistant preview while exact result retained opening narration. Fresh Brodex/Astra probe advanced PREVIEW_OPENING -> PREVIEW_LATEST -> PREVIEW_FINISHED and retained all output. Roster availability remains true when an older preview cannot be recovered."
 }

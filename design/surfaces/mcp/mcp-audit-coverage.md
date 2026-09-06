@@ -107,22 +107,26 @@ Source `481b735df118` addresses the first surviving-surface correctness pass:
 | Tool-call history | Bounded previews with indexed context handles | Instant-based timestamp filtering, explicit truncation, and context drill-down |
 | Installed agents | Callable discovery excludes retired adapters | Historical receipts remain readable and inactive; dispatch refuses with its existing typed error |
 
-This checkpoint does not complete the surviving-surface audit. Next priorities:
+The next deployed milestone, `769b1241c326`, adds publication-aware knowledge
+mutations, complete packet property pages, asynchronous and typed MCP surface
+inspection, and actual latest-assistant previews. Older tasks retain truthful
+result availability even without recoverable preview evidence. The response
+audit records full gates and live proofs; these contracts are adjusted.
 
-1. Knowledge mutation admission still reads published entries before queued
-   changes and uses a path-only pending lookup. Extend the gap reconciliation
-   invariants to knowledge writes, including deletion and supersession.
-2. Collector delivery still writes full files without a content precondition.
-   Lost acknowledgments and paired-file atomicity need separate transport
-   decisions; daemon queue reconciliation alone does not solve them.
-3. Packet inspection needs an exact, paged rule-body read. The current provider
-   exposes metadata only, forcing an operator into server-owned storage for a
-   faithful policy edit. Reuse graph property continuation rather than add a
-   new top-level tool.
-4. Publisher status, surface replay, and typed gap degradation still need
-   response-budget review. Preserve authority and actionable degraded state
-   while moving repeated hashes, raw policy inventories, and other diagnostics
-   behind bounded detail.
+The surviving-surface audit remains partial. Next priorities:
+
+1. Collector delivery preconditions and mutation-bound replay receipts. A lost
+   acknowledgement can still replay an old write over newer content. Duplicate
+   terminal acknowledgements also need a durable settlement barrier. Reuse
+   checkout transactions with guarded recovery; paired-file delivery requires
+   an explicit batch contract.
+2. Publisher status, surface replay, knowledge diagnostics and thread history
+   still need response-budget review. Preserve authority and actionable
+   degraded state while bounding repeated hashes, policy inventories and
+   historical detail.
+3. Finish explicit per-action dispositions for the surviving inventory,
+   including required input knowledge, useful response fields, and clear
+   reasons to retain each tool.
 
 The original inventory remains a historical baseline. Every surviving action
 still needs an explicit disposition and representative contract evidence.

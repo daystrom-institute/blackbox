@@ -11,10 +11,10 @@
   "impact": "high",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/checkout-mutations/delivery-preconditions-and-replay",
-  "notes": "Daemon admission now composes outstanding edits and rejects conflicting accepted publications. Collector delivery still writes complete files and retries unacknowledged deliveries; transport preconditions and paired-file atomicity are separate remaining work.",
+  "notes": "Daemon admission now composes outstanding edits and rejects conflicting accepted publications. Collector delivery still writes complete files and retries unacknowledged deliveries; transport preconditions and paired-file atomicity are separate remaining work.\n\nStatic follow-up traced operation-based replay and ACK durability gaps. Next bounded milestone: guarded write/delete preconditions using original source bytes or preceding queued postimages; durable per-checkout receipts bound to mutation identity and request hash; target plus receipt through existing checkout transactions; guarded recovery that refuses unexpected external content; validate ACK digest and repeat the persistence barrier for duplicate terminal ACKs. Paired-file atomicity needs separate batch identity/poll/settlement; existing transaction manifests are not a permanent replay ledger. Regression matrix: stale write/delete, lost ACK then local edit/recreation, crash/restart, conflicting IDs, chained preconditions, duplicate ACK after persistence failure.",
   "resolution": "unresolved",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T17:38:50Z",
-  "updated_at": "2026-09-06T17:38:50Z"
+  "updated_at": "2026-09-06T18:35:24Z"
 }

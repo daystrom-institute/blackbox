@@ -11,9 +11,11 @@
   "impact": "medium",
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/mcp-audit/packet-exact-rule-body",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "project_id": "89bd722f",
   "thread_id": "thread-d7cd3385",
   "created_at": "2026-09-06T17:18:30Z",
-  "updated_at": "2026-09-06T17:18:30Z"
+  "updated_at": "2026-09-06T18:39:13Z",
+  "resolved_at": "2026-09-06T18:39:13Z",
+  "resolution_note": "Deployed source 769b1241c326. Complete installed routing packet JSON reconstructed through seven 1023-byte property pages (6969 source bytes); complete response pages stayed below 3.5 KiB, summary omitted body with explicit expansion metadata. Source rules and evaluation settings now recover without access to server files. Authoring docs state scalar consequent types and predicate spelling."
 }
