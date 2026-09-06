@@ -75,7 +75,7 @@ fn publish(
     );
 }
 
-fn fixture() -> (CatalogFixture, BlackboxServer, PublishedScope) {
+fn published_fixture() -> (CatalogFixture, PublishedScope) {
     let fixture = CatalogFixture::new();
     let scope = CatalogFixture::scope(".");
     fixture.add_published_project(PROJECT, &scope);
@@ -86,6 +86,11 @@ fn fixture() -> (CatalogFixture, BlackboxServer, PublishedScope) {
         &[knowledge_entry(ENTRY, "published")],
         &[],
     );
+    (fixture, scope)
+}
+
+fn fixture() -> (CatalogFixture, BlackboxServer, PublishedScope) {
+    let (fixture, scope) = published_fixture();
     let server = queue_server(&fixture);
     (fixture, server, scope)
 }
@@ -342,7 +347,7 @@ async fn queued_knowledge_delete_is_a_tombstone_until_publication() {
 
 #[tokio::test]
 async fn queued_knowledge_scope_and_id_ambiguity_never_cross_project_boundaries() {
-    let (fixture, mut server, scope) = fixture();
+    let (fixture, scope) = published_fixture();
     let other_scope = CatalogFixture::scope("nested");
     fixture.add_published_project("p_other", &other_scope);
     fixture.install_publication(
@@ -352,7 +357,11 @@ async fn queued_knowledge_scope_and_id_ambiguity_never_cross_project_boundaries(
         &[knowledge_entry(ENTRY, "other")],
         &[],
     );
-    cover_catalog_projects(&mut server);
+    let server = queue_server(&fixture);
+    assert_eq!(
+        server.covered_scope_for_project_id("p_other"),
+        Some(other_scope.clone()),
+    );
     server
         .enqueue_learn_via_checkout_owner(
             &learn(Some(ENTRY), "first scope"),
@@ -394,7 +403,7 @@ async fn queued_knowledge_scope_and_id_ambiguity_never_cross_project_boundaries(
 
 #[tokio::test]
 async fn queued_knowledge_supersession_validates_both_records_before_admission() {
-    let (fixture, mut server, scope) = fixture();
+    let (fixture, scope) = published_fixture();
     let other_scope = CatalogFixture::scope("other");
     fixture.add_published_project("p_other", &other_scope);
     fixture.install_publication(
@@ -404,7 +413,11 @@ async fn queued_knowledge_supersession_validates_both_records_before_admission()
         &[knowledge_entry("2222222222222222", "foreign")],
         &[],
     );
-    cover_catalog_projects(&mut server);
+    let server = queue_server(&fixture);
+    assert_eq!(
+        server.covered_scope_for_project_id("p_other"),
+        Some(other_scope),
+    );
     let mut params = DecideParams {
         content: "replacement".into(),
         rationale: "justification".into(),
@@ -526,7 +539,22 @@ async fn queued_knowledge_durability_failure_never_returns_success() {
 
 #[tokio::test]
 async fn queued_knowledge_unrelated_broken_publication_preserves_known_global_authority() {
-    let (fixture, mut server, scope) = fixture();
+    let (fixture, scope) = published_fixture();
+    let broken_scope = CatalogFixture::scope("broken");
+    fixture.add_published_project("p_broken", &broken_scope);
+    let publication = fixture.install_publication(
+        "p_broken",
+        &broken_scope,
+        &"2".repeat(40),
+        &[knowledge_entry("2222222222222222", "broken")],
+        &[],
+    );
+    fixture.corrupt_generation("p_broken", &publication.generation_id);
+    let server = queue_server(&fixture);
+    assert_eq!(
+        server.covered_scope_for_project_id("p_broken"),
+        Some(broken_scope),
+    );
     let global = server
         .state
         .kb
@@ -543,17 +571,6 @@ async fn queued_knowledge_unrelated_broken_publication_preserves_known_global_au
             None,
         )
         .unwrap();
-    let broken_scope = CatalogFixture::scope("broken");
-    fixture.add_published_project("p_broken", &broken_scope);
-    let publication = fixture.install_publication(
-        "p_broken",
-        &broken_scope,
-        &"2".repeat(40),
-        &[knowledge_entry("2222222222222222", "broken")],
-        &[],
-    );
-    fixture.corrupt_generation("p_broken", &publication.generation_id);
-    cover_catalog_projects(&mut server);
     let mut params = link("knowledge:1111111111111111");
     params.source = format!("knowledge:{}", global.id);
     let result = server.bbox_knowledge_link(Parameters(params)).await;
@@ -798,7 +815,21 @@ async fn queued_knowledge_acknowledged_create_delete_survives_delayed_publicatio
 
 #[tokio::test]
 async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_broken_projects() {
-    let (fixture, mut server, scope) = fixture();
+    let (fixture, scope) = published_fixture();
+    let broken_scope = CatalogFixture::scope("broken");
+    fixture.add_published_project("p_broken", &broken_scope);
+    let publication = fixture.install_publication(
+        "p_broken",
+        &broken_scope,
+        &"2".repeat(40),
+        &[knowledge_entry(ENTRY, "duplicate owner")],
+        &[],
+    );
+    let server = queue_server(&fixture);
+    assert_eq!(
+        server.covered_scope_for_project_id("p_broken"),
+        Some(broken_scope.clone()),
+    );
     let global = server
         .state
         .kb
@@ -815,16 +846,6 @@ async fn queued_knowledge_explicit_owner_isolates_review_link_and_forget_from_br
             None,
         )
         .unwrap();
-    let broken_scope = CatalogFixture::scope("broken");
-    fixture.add_published_project("p_broken", &broken_scope);
-    let publication = fixture.install_publication(
-        "p_broken",
-        &broken_scope,
-        &"2".repeat(40),
-        &[knowledge_entry(ENTRY, "duplicate owner")],
-        &[],
-    );
-    cover_catalog_projects(&mut server);
     assert!(
         server
             .enqueue_link_via_checkout_owner(&link("knowledge:1111111111111111"))
