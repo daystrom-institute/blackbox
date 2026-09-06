@@ -55,6 +55,54 @@ impl TranscriptSourceStore {
         Ok(lease)
     }
 
+    /// Reads persisted producer evidence; a consumer read never renews it.
+    pub fn source_contact(&self, scope: &ConnectorScope) -> Result<Option<SourceContact>> {
+        match fs::read(self.scope_root(scope).join("contact.json")) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+    pub fn record_contact(&self, request: &ContactRequest, now: &str) -> Result<SourceContact> {
+        validate_hash(&request.scan_id)?;
+        let root = self.scope_root(&request.scope);
+        fs::create_dir_all(&root)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("contact.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let previous = self.source_contact(&request.scope)?;
+        let contact = if let Some(summary) = &request.completed {
+            let mut previous =
+                previous.ok_or_else(|| anyhow::anyhow!("transcript_scan_conflict"))?;
+            ensure!(
+                previous.scan_id == request.scan_id,
+                "transcript_scan_conflict"
+            );
+            previous.last_contact_at = now.into();
+            previous.scan_in_progress = false;
+            previous.last_completed_scan_at = Some(now.into());
+            previous.last_completed_scan = Some(summary.clone());
+            previous
+        } else {
+            SourceContact {
+                last_contact_at: now.into(),
+                scan_id: request.scan_id.clone(),
+                scan_started_at: now.into(),
+                scan_in_progress: true,
+                last_completed_scan_at: previous
+                    .as_ref()
+                    .and_then(|p| p.last_completed_scan_at.clone()),
+                last_completed_scan: previous.and_then(|p| p.last_completed_scan),
+            }
+        };
+        atomic_write(&root.join("contact.json"), &serde_json::to_vec(&contact)?)?;
+        Ok(contact)
+    }
+
     pub fn current(
         &self,
         scope: &ConnectorScope,
@@ -399,6 +447,51 @@ mod tests {
         );
         assert!(store.current(&scope(), &torn.stream_id).unwrap().is_none());
     }
+    #[test]
+    fn contact_records_distinguish_live_scan_from_last_completed_walk_and_reject_stale_completion()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = TranscriptSourceStore::open(&root).unwrap();
+        let mut request = ContactRequest {
+            scope: scope(),
+            scan_id: sha256(b"scan one"),
+            completed: None,
+        };
+        assert!(store.source_contact(&scope()).unwrap().is_none());
+        let started = store.record_contact(&request, "start").unwrap();
+        assert!(started.scan_in_progress);
+        assert!(started.last_completed_scan_at.is_none());
+        request.completed = Some(ScanSummary {
+            discovered: 2,
+            published: 1,
+            failed: 1,
+            ..Default::default()
+        });
+        store.record_contact(&request, "complete").unwrap();
+        let next = ContactRequest {
+            scope: scope(),
+            scan_id: sha256(b"scan two"),
+            completed: None,
+        };
+        store.record_contact(&next, "later").unwrap();
+        assert!(store.record_contact(&request, "stale").is_err());
+        let reopened = TranscriptSourceStore::open(&root).unwrap();
+        let contact = reopened.source_contact(&scope()).unwrap().unwrap();
+        assert_eq!(contact.last_contact_at, "later");
+        assert_eq!(contact.last_completed_scan_at.as_deref(), Some("complete"));
+        assert_eq!(contact.last_completed_scan.unwrap().failed, 1);
+        assert!(contact.scan_in_progress);
+        assert_eq!(
+            reopened
+                .source_contact(&scope())
+                .unwrap()
+                .unwrap()
+                .last_contact_at,
+            "later"
+        );
+    }
+
     #[test]
     fn source_reader_lease_pins_a_generation_across_multiple_publications() {
         let dir = tempfile::tempdir().unwrap();

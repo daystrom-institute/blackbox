@@ -17,3 +17,7 @@
   redirects so a credential cannot cross authorities.
 - Capture failures, deferred incomplete files, and unchanged/published streams
   have separate counts. One failed stream must not prevent backfill of others.
+
+- Begin and complete each scan with authenticated contact evidence. Recording
+  scan completion can fail after snapshots were admitted; report that partial
+  effect. Transport errors expose only bounded machine codes, never proxy bodies.

@@ -1716,7 +1716,7 @@ impl TranscriptIndex {
         };
         serde_json::to_string(&serde_json::json!({
             "view": "indexed_transcript", "completeness": "indexed_projection_only",
-            "source_freshness": "not_established", "total_indexed_messages": messages.len(),
+            "source_freshness": self.native_source_observations(std::iter::once(file_path)), "total_indexed_messages": messages.len(),
             "offset": start, "next_offset": (end < messages.len()).then_some(end),
             "page_limited_by_bytes": rows.len() < requested,
             "messages": rows,
@@ -1748,7 +1748,7 @@ impl TranscriptIndex {
             .collect::<BTreeSet<_>>();
         serde_json::to_string(&serde_json::json!({
             "session_id": p.session_id, "view": "indexed_transcript",
-            "completeness": "indexed_projection_only", "source_freshness": "not_established",
+            "completeness": "indexed_projection_only", "source_freshness": self.native_source_observations(locators.iter().copied()),
             "indexed_message_count": messages.len(), "sources": sources,
             "locator_count": locators.len(),
             "first_indexed_timestamp": timestamps.first(), "last_indexed_timestamp": timestamps.last(),
@@ -1876,13 +1876,76 @@ impl TranscriptIndex {
         let consumed = offset.saturating_add(returned);
         serde_json::to_string(&serde_json::json!({
             "view": "indexed_transcript", "completeness": "indexed_projection_only",
-            "source_freshness": "not_established", "total_matching_messages": total,
+            "source_freshness": self.native_source_observations(rows.iter().filter_map(|row| row["locator"].as_str())), "total_matching_messages": total,
             "offset": offset, "from_end": from_end,
             "next_offset": (consumed < total).then_some(consumed),
             "page_limited_by_bytes": returned < end - start,
             "messages": rows,
             "content_note": "Stored content may already be parser-truncated; content_truncated only describes this response preview. max_content_length=0 returns up to 12000 stored bytes."
         })).map_err(Into::into)
+    }
+
+    /// Source observations are read from enrolled landing metadata, never from
+    /// caller paths. A timestamp alone cannot establish live completeness.
+    fn native_source_observations<'a>(&self, locators: impl Iterator<Item = &'a str>) -> Value {
+        let unique = locators.collect::<BTreeSet<_>>();
+        let native = unique
+            .iter()
+            .copied()
+            .filter(|locator| locator.starts_with("native:"))
+            .collect::<Vec<_>>();
+        if native.is_empty() {
+            return Value::String("not_established".into());
+        }
+        let store =
+            self.config.native_source_root.as_ref().and_then(|root| {
+                bbox_transcript_source_store::TranscriptSourceStore::open(root).ok()
+            });
+        let mut sources = std::collections::BTreeMap::new();
+        let observations = native.iter().take(8).map(|locator| {
+            let mut row = serde_json::json!({"locator": locator, "status": "source_status_unavailable"});
+            let parts = locator.trim_start_matches("native:").split('/').collect::<Vec<_>>();
+            if parts.len() != 3 || bbox_transcript_source::validate_hash(parts[1]).is_err()
+                || bbox_transcript_source::validate_hash(parts[2]).is_err() {
+                row["status"] = Value::String("invalid_native_locator".into());
+                return row;
+            }
+            let Some(scope) = self.config.native_sources.iter().find(|scope| scope.connector_source_id().as_str() == parts[0]) else {
+                row["status"] = Value::String("source_not_enrolled".into());
+                return row;
+            };
+            let Some(store) = &store else { return row; };
+            sources.entry(parts[0].to_owned()).or_insert_with(|| {
+                match store.source_contact(scope) {
+                    Ok(Some(contact)) => serde_json::json!({
+                        "source_id": parts[0], "last_contact_at": contact.last_contact_at,
+                        "scan_started_at": contact.scan_started_at, "scan_in_progress": contact.scan_in_progress,
+                        "last_completed_scan_at": contact.last_completed_scan_at,
+                        "last_completed_scan": contact.last_completed_scan.map(|scan| serde_json::json!({
+                            "discovered": scan.discovered, "failed": scan.failed, "deferred": scan.deferred,
+                        })),
+                    }),
+                    Ok(None) => serde_json::json!({"source_id": parts[0], "status": "producer_contact_not_recorded"}),
+                    Err(_) => serde_json::json!({"source_id": parts[0], "status": "producer_contact_unavailable"}),
+                }
+            });
+            match store.current(scope, parts[1]) {
+                Ok(Some(current)) => {
+                    row["status"] = Value::String("published".into());
+                    row["published_at"] = Value::String(current.published_at);
+                    row["index_matches_published"] = Value::Bool(current.generation == parts[2]);
+                }
+                Ok(None) => row["status"] = Value::String("source_snapshot_missing".into()),
+                Err(_) => {},
+            }
+            row
+        }).collect::<Vec<_>>();
+        serde_json::json!({
+            "kind": "source_observations", "streams": observations,
+            "producers": sources.into_values().collect::<Vec<_>>(),
+            "omitted_native_locators": native.len().saturating_sub(8),
+            "untracked_locators": unique.len() - native.len(),
+        })
     }
 
     /// Retrieve stored projections by exact source identity. No client-supplied
@@ -3874,6 +3937,24 @@ mod native_drilldown_tests {
             })
             .unwrap();
         assert!(topics.contains("indexed projections"));
+    }
+
+    #[test]
+    fn native_source_status_bounds_evidence_and_preserves_unenrolled_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = fixture(&root, "legacy-locator", 1, 20);
+        let locators = (0..10)
+            .map(|n| format!("native:csrc_0123456789abcdef/{:064x}/{:064x}", n, n))
+            .collect::<Vec<_>>();
+        let status = index.native_source_observations(locators.iter().map(String::as_str));
+        assert_eq!(status["streams"].as_array().unwrap().len(), 8);
+        assert_eq!(status["omitted_native_locators"], 2);
+        assert_eq!(status["streams"][0]["status"], "source_not_enrolled");
+        assert_eq!(
+            index.native_source_observations(std::iter::once("legacy-locator")),
+            "not_established"
+        );
     }
 
     #[test]

@@ -17,3 +17,7 @@
 - Current and immediately previous materializations are retained when no read
   lease is active. Chunk blobs are retained, including interrupted uploads;
   maintenance must not remove a blob another producer operation may need.
+
+- Contact writes are source-scoped and serialized separately from stream writes.
+  Consumer status reads never renew producer contact; prior completed-scan
+  evidence survives an interrupted newer scan.
