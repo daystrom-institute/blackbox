@@ -64,6 +64,7 @@ canonical_path_read	src/tools/knowledge.rs	fn refresh_dark_knowledge_overlay	1	d
 canonical_path_read	src/tools/projects.rs	fn bbox_project_eject	1	delete with ProjectRecord
 canonical_path_read	src/tools/projects.rs	fn bbox_project_rename	2	delete with ProjectRecord
 canonical_path_read	src/tools/projects.rs	fn bbox_project_unregister	1	delete with ProjectRecord
+canonical_path_read	src/tools/projects.rs	fn rename_partial_failure	2	bridge-only response recovery coordinates from the already-admitted rename DTO; no path resolution or filesystem access; delete with ProjectRecord and bridge rename
 canonical_path_read	src/tools/projects.rs	fn run_post_register_pipeline	1	delete with ProjectRecord
 checkout_root_path	crates/bbox-artifacts/src/watcher.rs	fn handle_event_batch	1	collapse into the lease confined readers
 checkout_root_path	crates/bbox-artifacts/src/watcher.rs	fn register_inner	1	collapse into the lease confined readers
