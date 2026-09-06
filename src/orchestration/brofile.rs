@@ -391,8 +391,39 @@ pub fn load_config(store_dir: &Path) -> BroConfig {
         .unwrap_or_default()
 }
 
+/// Replace a complete config snapshot. Mutations should use `update_config`
+/// so the read and write share the same lock.
 pub fn save_config(config: &BroConfig, store_dir: &Path) -> anyhow::Result<()> {
-    crate::json_store::atomic_write_json_locked(&config_file(store_dir), config)
+    let file = config_file(store_dir);
+    crate::json_store::with_store_lock(&file, || {
+        crate::json_store::atomic_write_json_locked(&file, config)
+    })
+}
+
+/// Read, mutate, and persist under one store lock. Only an absent config starts
+/// empty; malformed or unreadable existing state must never be overwritten.
+pub fn update_config<T>(
+    store_dir: &Path,
+    update: impl FnOnce(&mut BroConfig) -> T,
+) -> anyhow::Result<T> {
+    let file = config_file(store_dir);
+    crate::json_store::with_store_lock(&file, || {
+        let mut config = match fs::read(&file) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                // Serde error text may quote invalid credential values. Keep
+                // location and failure class without echoing the stored data.
+                anyhow::anyhow!(
+                    "Invalid account configuration at line {}, column {}; existing configuration retained",
+                    error.line(), error.column(),
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BroConfig::default(),
+            Err(error) => return Err(error.into()),
+        };
+        let result = update(&mut config);
+        crate::json_store::atomic_write_json_locked(&file, &config)?;
+        Ok(result)
+    })
 }
 
 pub fn load_account(name: &str, store_dir: &Path) -> Option<Account> {
@@ -769,6 +800,44 @@ fn resolve_provider_env_for_locality(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_config_updates_preserve_accounts_and_provider_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|threads| {
+            for i in 0..8 {
+                let root = &root;
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    update_config(root, |config| {
+                        // Keep contenders overlapping between read and write.
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        config
+                            .accounts
+                            .insert(format!("synthetic-{i}"), Account::default());
+                        if i == 0 {
+                            config.provider_defaults.insert(
+                                Provider::Brodex,
+                                ProviderDefault {
+                                    account: "synthetic-0".into(),
+                                },
+                            );
+                        }
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let config = load_config(&root);
+        assert_eq!(config.accounts.len(), 8);
+        assert_eq!(
+            config.provider_defaults[&Provider::Brodex].account,
+            "synthetic-0"
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
 
