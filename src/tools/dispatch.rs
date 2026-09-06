@@ -1004,7 +1004,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_allocator_status",
-        description = "Read pool-backed runtime allocation config, active leases, in-flight lane counts, and optional candidate preview."
+        description = "Read pool-backed runtime allocation config plus bounded in-flight, probe, lease, and preview-candidate pages (default 20, maximum 100 rows; continue each section from its next_offset). Probe rows are compact lane status; read one exact lane with bro_allocator_probe."
     )]
     pub(crate) fn bro_allocator_status(
         &self,
@@ -1056,17 +1056,15 @@ impl BlackboxServer {
                         "score": candidate.score,
                         "score_components": &candidate.score_components,
                         "in_flight": ctx.in_flight.get(&lane_key).copied().unwrap_or(0),
-                        "probe": probe,
-                        "credential_status": probe.map(|probe| &probe.credential_status),
-                        "quota_status": probe.map(|probe| &probe.quota_status),
-                        "quota_confidence": probe.map(|probe| &probe.quota_confidence),
-                        "cooldown_until": probe.and_then(|probe| probe.cooldown_until),
-                        "cooldown_active": probe.and_then(|probe| probe.cooldown_until).is_some_and(|until| until > now),
+                        "probe": probe.map(|probe| probe.summary_view(now)),
                         "probe_observed_at": probe_observed_at,
                         "probe_staleness_ms": probe_observed_at.map(|observed| now.saturating_sub(observed)),
                     })
                 })
                 .collect();
+            let candidate_page =
+                bbox_corpus_core::response_page::collection_page(candidates, "candidates", p.limit, None)
+                    .unwrap_or_else(|_| json!({"candidates": [], "truncated": true}));
             json!({
                 "trace_id": &allocation.trace.id,
                 "request": &allocation.trace.request,
@@ -1074,25 +1072,79 @@ impl BlackboxServer {
                 "required_capabilities": &allocation.trace.required_capabilities,
                 "selected": &allocation.trace.selected,
                 "error": &allocation.trace.error,
-                "candidates": candidates,
+                "candidates": candidate_page,
             })
         });
+        let now = orchestration::now_ms();
+        let in_flight_rows: Vec<_> = ctx
+            .in_flight
+            .iter()
+            .map(|(lane_key, count)| json!({"lane_key": lane_key, "count": count}))
+            .collect();
+        let in_flight = match bbox_corpus_core::response_page::collection_page(
+            in_flight_rows,
+            "rows",
+            p.limit,
+            p.in_flight_offset,
+        ) {
+            Ok(page) => page,
+            Err(error) => return Self::err_text(&format!("in-flight page failed: {error}")),
+        };
+        let probe_rows: Vec<_> = probes
+            .records
+            .iter()
+            .map(|(lane_key, record)| {
+                let mut row = record.summary_view(now);
+                row["lane_key"] = json!(lane_key);
+                row
+            })
+            .collect();
+        let mut probe_page = match bbox_corpus_core::response_page::collection_page(
+            probe_rows,
+            "rows",
+            p.limit,
+            p.probe_offset,
+        ) {
+            Ok(page) => page,
+            Err(error) => return Self::err_text(&format!("probe page failed: {error}")),
+        };
+        probe_page["detail_hint"] = json!(
+            "exact lane record: bro_allocator_probe(provider, account) with body.next_cursor continuation"
+        );
+        let lease_rows: Vec<_> = leases
+            .leases
+            .iter()
+            .map(|(task_id, lease)| {
+                let mut row = serde_json::to_value(lease).unwrap_or(json!({}));
+                row["task_id"] = json!(task_id);
+                row
+            })
+            .collect();
+        let lease_page = match bbox_corpus_core::response_page::collection_page(
+            lease_rows,
+            "rows",
+            p.limit,
+            p.lease_offset,
+        ) {
+            Ok(page) => page,
+            Err(error) => return Self::err_text(&format!("lease page failed: {error}")),
+        };
         Self::ok_json(&json!({
             "provider_binary_location": ctx.provider_binary_location,
             "tiers": cfg.tiers,
             "tier_ladders": cfg.tier_ladders,
             "pools": cfg.pools,
             "selection_policies": cfg.selection_policies,
-            "in_flight": ctx.in_flight,
-            "probes": probes.records,
-            "leases": leases.leases,
+            "in_flight": in_flight,
+            "probes": probe_page,
+            "leases": lease_page,
             "preview": preview,
         }))
     }
 
     #[tool(
         name = "bro_allocator_trace",
-        description = "Read a previous runtime allocation selection trace by id."
+        description = "Read one exact allocation trace body, page by page (4096-byte default body budget; SHA256-revision-bound cursor restarts safely when the stored trace changes)."
     )]
     pub(crate) fn bro_allocator_trace(
         &self,
@@ -1100,7 +1152,61 @@ impl BlackboxServer {
     ) -> CallToolResult {
         match orchestration::allocator::load_trace(&self.state.store_dir, &p.selection_trace_id) {
             Some(trace) => {
-                Self::ok_json(&serde_json::to_value(trace).unwrap_or_else(|_| json!({})))
+                let candidate_rows: Vec<_> = trace
+                    .candidates
+                    .iter()
+                    .map(|candidate| {
+                        json!({
+                            "lane": &candidate.lane,
+                            "eligible": candidate.eligible,
+                            "exclusion_reason": &candidate.exclusion_reason,
+                            "score": candidate.score,
+                            "score_components": &candidate.score_components,
+                        })
+                    })
+                    .collect();
+                let candidates = match bbox_corpus_core::response_page::collection_page(
+                    candidate_rows,
+                    "candidates",
+                    None,
+                    None,
+                ) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        return Self::err_text(&format!("candidate page failed: {error}"));
+                    }
+                };
+                let summary = json!({
+                    "id": &trace.id,
+                    "request": &trace.request,
+                    "candidate_tiers": &trace.candidate_tiers,
+                    "required_capabilities": &trace.required_capabilities,
+                    "selected": &trace.selected,
+                    "error": &trace.error,
+                    "candidate_count": trace.candidates.len(),
+                    "candidates": candidates,
+                });
+                let body_value = match serde_json::to_value(&trace) {
+                    Ok(value) => Self::redact_config_credentials(&value),
+                    Err(error) => {
+                        return Self::err_text(&format!("trace serialization failed: {error}"));
+                    }
+                };
+                let selection = format!("allocator-trace:{}", trace.id);
+                let body = match super::body_page::json_body_page(
+                    &selection,
+                    &body_value,
+                    p.cursor.as_deref(),
+                    p.body_limit,
+                ) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return Self::err_text(&format!(
+                            "error.trace_body_page: {error}; restart without cursor"
+                        ));
+                    }
+                };
+                Self::ok_json(&json!({"summary": summary, "body": body}))
             }
             None => Self::err_text(&format!(
                 "Unknown allocation trace: {}",
@@ -1129,11 +1235,18 @@ impl BlackboxServer {
         let mut probes = orchestration::allocator::probe_store_load(&self.state.store_dir);
         if p.clear == Some(true) {
             let removed = probes.records.remove(&lane_key);
-            orchestration::allocator::probe_store_save(&self.state.store_dir, &probes);
+            if let Err(error) =
+                orchestration::allocator::probe_store_save(&self.state.store_dir, &probes)
+            {
+                return Self::err_text(&format!(
+                    "error.probe_persistence_failed: clear for lane '{lane_key}' was not persisted: {error}; the stored probe record is unchanged. Repair the allocator store path/permissions and retry"
+                ));
+            }
             return Self::ok_json(&json!({
                 "lane_key": lane_key,
                 "cleared": removed.is_some(),
                 "probe": serde_json::Value::Null,
+                "persisted": true,
             }));
         }
 
@@ -1212,12 +1325,56 @@ impl BlackboxServer {
                 record.raw_summary = p.raw_summary;
             }
             record.last_probe_at = Some(now);
-            orchestration::allocator::probe_store_save(&self.state.store_dir, &probes);
+            if let Err(error) =
+                orchestration::allocator::probe_store_save(&self.state.store_dir, &probes)
+            {
+                return Self::err_text(&format!(
+                    "error.probe_persistence_failed: update for lane '{lane_key}' was not persisted: {error}; the stored probe record is unchanged. Repair the allocator store path/permissions and retry"
+                ));
+            }
+            return Self::allocator_probe_response(
+                record,
+                &lane_key,
+                p.cursor.as_deref(),
+                p.body_limit,
+            );
         }
-        let probe = probes.records.get(&lane_key).cloned();
+        match probes.records.get(&lane_key) {
+            Some(record) => {
+                Self::allocator_probe_response(record, &lane_key, p.cursor.as_deref(), p.body_limit)
+            }
+            None => Self::err_text(&format!(
+                "No probe record for lane '{lane_key}'; initialize one with bro_allocator_probe(update fields) or wait for runtime observation"
+            )),
+        }
+    }
+
+    fn allocator_probe_response(
+        record: &orchestration::allocator::ProbeRecord,
+        lane_key: &str,
+        cursor: Option<&str>,
+        body_limit: Option<usize>,
+    ) -> CallToolResult {
+        let now = orchestration::now_ms();
+        let body_value = match serde_json::to_value(record) {
+            Ok(value) => Self::redact_config_credentials(&value),
+            Err(error) => return Self::err_text(&format!("probe serialization failed: {error}")),
+        };
+        let selection = format!("allocator-probe:{lane_key}");
+        let body =
+            match super::body_page::json_body_page(&selection, &body_value, cursor, body_limit) {
+                Ok(body) => body,
+                Err(error) => {
+                    return Self::err_text(&format!(
+                        "error.probe_body_page: {error}; restart without cursor"
+                    ));
+                }
+            };
         Self::ok_json(&json!({
             "lane_key": lane_key,
-            "probe": probe,
+            "probe": record.summary_view(now),
+            "persisted": true,
+            "body": body,
         }))
     }
 
@@ -3627,6 +3784,10 @@ mod tests {
             capabilities: Some(vec!["tool_use".into()]),
             durable: Some(false),
             selection_policy: Some(serde_json::json!("availability")),
+            limit: None,
+            in_flight_offset: None,
+            probe_offset: None,
+            lease_offset: None,
         };
         let request = allocator_status_runtime_request(&params).unwrap().unwrap();
         assert_eq!(request.tier.as_deref(), Some("standard"));
@@ -3735,5 +3896,340 @@ mod tests {
         assert_eq!(provider, Provider::Deepseek);
         assert_eq!(session_id, "sid-blue");
         assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
+    }
+
+    fn update_probe_params() -> AllocatorProbeParams {
+        AllocatorProbeParams {
+            provider: "brodex".into(),
+            account: None,
+            clear: None,
+            credential_status: Some("present".into()),
+            quota_status: None,
+            quota_confidence: None,
+            five_hour_utilization: None,
+            seven_day_utilization: None,
+            balance_capacity: None,
+            cooldown_until: None,
+            cooldown_ms: None,
+            raw_summary: None,
+            cursor: None,
+            body_limit: None,
+        }
+    }
+
+    fn block_probe_store_writes(tmp: &tempfile::TempDir) {
+        // `allocator` as a plain file makes probes.json uncreatable, so the
+        // atomic save fails before publication and the old file is untouched.
+        std::fs::write(tmp.path().join("bro/allocator"), b"not-a-dir").unwrap();
+    }
+
+    #[test]
+    fn allocator_probe_update_failed_save_returns_persistence_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        block_probe_store_writes(&tmp);
+        let mut p = update_probe_params();
+        p.quota_status = Some("exhausted".into());
+        let result = server.bro_allocator_probe(Parameters(p));
+        assert_eq!(result.is_error, Some(true));
+        let text = call_result_text(&result);
+        assert!(
+            text.contains("error.probe_persistence_failed")
+                && text.contains("not persisted")
+                && text.contains("stored probe record is unchanged"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn allocator_probe_clear_failed_save_returns_persistence_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        block_probe_store_writes(&tmp);
+        let mut p = update_probe_params();
+        p.credential_status = None;
+        p.clear = Some(true);
+        let result = server.bro_allocator_probe(Parameters(p));
+        assert_eq!(result.is_error, Some(true));
+        let text = call_result_text(&result);
+        assert!(
+            text.contains("error.probe_persistence_failed")
+                && text.contains("clear for lane 'brodex:default'"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn allocator_probe_update_success_is_compact_status_plus_exact_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut p = update_probe_params();
+        let long_summary = format!(
+            "quota window rotated; utilization stable. audit-marker-{}",
+            "y".repeat(600)
+        );
+        p.raw_summary = Some(long_summary.clone());
+        let result = server.bro_allocator_probe(Parameters(p));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        assert_eq!(body["lane_key"], "brodex:default");
+        assert_eq!(body["probe"]["credential_status"], "present");
+        let preview = body["probe"]["raw_summary_preview"]
+            .as_object()
+            .unwrap()
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert!(preview.len() <= 256, "preview len {}", preview.len());
+        let exact = body["body"]["text"].as_str().unwrap();
+        assert!(exact.contains("audit-marker-"), "missing exact summary");
+        assert!(
+            exact.matches('y').count() >= 600,
+            "exact body lost the full summary"
+        );
+        // Successful admission claims durable persistence truthfully: the
+        // exact same record reloads from disk.
+        let reloaded = orchestration::allocator::probe_store_load(&server.state.store_dir);
+        assert_eq!(
+            reloaded.records["brodex:default"].raw_summary.as_deref(),
+            Some(long_summary.as_str())
+        );
+    }
+
+    #[test]
+    fn allocator_probe_read_pages_exact_record_and_reports_stale_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        {
+            let mut store = orchestration::allocator::probe_store_load(&server.state.store_dir);
+            store.records.insert(
+                "brodex:default".into(),
+                orchestration::allocator::ProbeRecord {
+                    provider: Provider::Brodex,
+                    account: None,
+                    credential_status: Default::default(),
+                    quota_status: Default::default(),
+                    quota_confidence: Default::default(),
+                    five_hour_utilization: None,
+                    seven_day_utilization: None,
+                    balance_capacity: None,
+                    cooldown_until: None,
+                    last_probe_at: None,
+                    last_runtime_observation_at: None,
+                    raw_summary: Some(format!("z").repeat(9_000)),
+                },
+            );
+            orchestration::allocator::probe_store_save(&server.state.store_dir, &store).unwrap();
+        }
+        let first = server.bro_allocator_probe(Parameters(AllocatorProbeParams {
+            cursor: None,
+            body_limit: Some(64),
+            ..update_probe_params()
+        }));
+        assert_ne!(first.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&call_result_text(&first)).unwrap();
+        let cursor = body["body"]["next_cursor"].as_str().unwrap().to_string();
+        assert!(!cursor.is_empty());
+
+        // Rewrite the stored record, then reuse the old revision-bound cursor.
+        {
+            let mut store = orchestration::allocator::probe_store_load(&server.state.store_dir);
+            store.records.get_mut("brodex:default").unwrap().raw_summary =
+                Some(format!("w").repeat(9_000));
+            orchestration::allocator::probe_store_save(&server.state.store_dir, &store).unwrap();
+        }
+        let stale = server.bro_allocator_probe(Parameters(AllocatorProbeParams {
+            cursor: Some(cursor),
+            body_limit: Some(64),
+            ..update_probe_params()
+        }));
+        assert_eq!(stale.is_error, Some(true));
+        let text = call_result_text(&stale);
+        assert!(text.contains("restart without cursor"), "got: {text}");
+
+        let missing = server.bro_allocator_probe(Parameters(AllocatorProbeParams {
+            provider: "glm".into(),
+            ..update_probe_params()
+        }));
+        assert_eq!(missing.is_error, Some(true));
+        assert!(
+            call_result_text(&missing).contains("No probe record for lane 'glm:default'"),
+            "got: {}",
+            call_result_text(&missing)
+        );
+    }
+
+    #[test]
+    fn allocator_status_pages_probe_lease_and_inflight_inventories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        {
+            let mut store = orchestration::allocator::probe_store_load(&server.state.store_dir);
+            for provider in ["brodex", "glm", "deepseek"] {
+                store.records.insert(
+                    format!("{provider}:default"),
+                    orchestration::allocator::ProbeRecord {
+                        provider: provider.parse().unwrap(),
+                        account: None,
+                        credential_status: Default::default(),
+                        quota_status: Default::default(),
+                        quota_confidence: Default::default(),
+                        five_hour_utilization: None,
+                        seven_day_utilization: None,
+                        balance_capacity: None,
+                        cooldown_until: None,
+                        last_probe_at: None,
+                        last_runtime_observation_at: None,
+                        raw_summary: Some(format!("summary-{provider}-{}", "q".repeat(500))),
+                    },
+                );
+            }
+            orchestration::allocator::probe_store_save(&server.state.store_dir, &store).unwrap();
+        }
+        let result = server.bro_allocator_status(Parameters(AllocatorStatusParams {
+            limit: Some(2),
+            ..AllocatorStatusParams {
+                project_dir: None,
+                tier: None,
+                tier_ladder: None,
+                tier_mode: None,
+                min_tier: None,
+                max_tier: None,
+                pool_name: None,
+                pool_providers: None,
+                pin_provider: None,
+                pin_account: None,
+                pin_model: None,
+                pin_effort: None,
+                prefer_provider: None,
+                capabilities: None,
+                durable: None,
+                selection_policy: None,
+                limit: None,
+                in_flight_offset: None,
+                probe_offset: None,
+                lease_offset: None,
+            }
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        for section in ["probes", "in_flight", "leases"] {
+            let page = &body[section];
+            assert!(
+                page["rows"].as_array().unwrap().len() <= 2,
+                "{section} not paged: {page}"
+            );
+            assert!(page["next_offset"].is_u64() || page["next_offset"].is_null());
+        }
+        let probe_rows = body["probes"]["rows"].as_array().unwrap();
+        assert_eq!(probe_rows.len(), 2);
+        assert_eq!(body["probes"]["total"], 3);
+        assert!(probe_rows.iter().all(|row| row["lane_key"].is_string()));
+        assert!(
+            probe_rows
+                .iter()
+                .all(|row| row["raw_summary_preview"]["text"].as_str().unwrap().len() <= 256)
+        );
+        assert_eq!(body["probes"]["offset"], 0);
+        assert!(
+            body["probes"]["detail_hint"]
+                .as_str()
+                .unwrap()
+                .contains("bro_allocator_probe")
+        );
+        // Continue the probe page from next_offset.
+        let next = body["probes"]["next_offset"].as_u64().unwrap() as usize;
+        let page2 = server.bro_allocator_status(Parameters(AllocatorStatusParams {
+            limit: Some(2),
+            probe_offset: Some(next),
+            ..AllocatorStatusParams {
+                project_dir: None,
+                tier: None,
+                tier_ladder: None,
+                tier_mode: None,
+                min_tier: None,
+                max_tier: None,
+                pool_name: None,
+                pool_providers: None,
+                pin_provider: None,
+                pin_account: None,
+                pin_model: None,
+                pin_effort: None,
+                prefer_provider: None,
+                capabilities: None,
+                durable: None,
+                selection_policy: None,
+                limit: None,
+                in_flight_offset: None,
+                probe_offset: None,
+                lease_offset: None,
+            }
+        }));
+        let body2: serde_json::Value = serde_json::from_str(&call_result_text(&page2)).unwrap();
+        assert_eq!(body2["probes"]["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(body2["probes"]["offset"], 2);
+    }
+
+    #[test]
+    fn allocator_trace_returns_summary_and_exact_paged_body() {
+        use std::collections::BTreeMap;
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let trace = orchestration::allocator::SelectionTrace {
+            id: format!("alloc-{}", "ab".repeat(16)),
+            request: Default::default(),
+            candidate_tiers: vec!["standard".into()],
+            required_capabilities: vec![],
+            candidates: vec![orchestration::allocator::CandidateTrace {
+                lane: orchestration::allocator::RuntimeLane {
+                    provider: Provider::Brodex,
+                    account: Some("acct".into()),
+                    tier: Some("standard".into()),
+                    model: None,
+                    effort: None,
+                    capabilities: vec![],
+                },
+                eligible: true,
+                exclusion_reason: None,
+                score_components: BTreeMap::from([("quota".into(), 1.0)]),
+                score: 1.0,
+            }],
+            selected: None,
+            error: Some("exhausted".into()),
+        };
+        orchestration::allocator::save_trace(&server.state.store_dir, &trace);
+        let result = server.bro_allocator_trace(Parameters(AllocatorTraceParams {
+            selection_trace_id: trace.id.clone(),
+            cursor: None,
+            body_limit: Some(64),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&call_result_text(&result)).unwrap();
+        assert_eq!(body["summary"]["id"], trace.id);
+        assert_eq!(body["summary"]["candidate_count"], 1);
+        assert_eq!(body["summary"]["error"], "exhausted");
+        assert!(
+            body["summary"]["candidates"]["candidates"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1
+        );
+        let cursor = body["body"]["next_cursor"].as_str().unwrap().to_string();
+        let continued = server.bro_allocator_trace(Parameters(AllocatorTraceParams {
+            selection_trace_id: trace.id.clone(),
+            cursor: Some(cursor),
+            body_limit: Some(64),
+        }));
+        assert_ne!(continued.is_error, Some(true));
+
+        let unknown = server.bro_allocator_trace(Parameters(AllocatorTraceParams {
+            selection_trace_id: "alloc-deadbeef".into(),
+            cursor: None,
+            body_limit: None,
+        }));
+        assert_eq!(unknown.is_error, Some(true));
+        assert!(call_result_text(&unknown).contains("Unknown allocation trace"));
     }
 }
