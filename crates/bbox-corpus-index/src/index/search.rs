@@ -372,7 +372,9 @@ pub struct SearchParams {
     /// Search mode: smart (default) or fulltext
     #[serde(default)]
     pub mode: Option<String>,
-    /// Filter to account: 'claude', 'account2', 'account3', 'codex'
+    /// Exact source account label, as shown in search results (for example
+    /// default). Account labels are configured by the source owner; use source
+    /// to select a provider lane.
     #[serde(default)]
     pub account: Option<String>,
     /// Filter by project path keywords
