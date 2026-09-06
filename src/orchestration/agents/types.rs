@@ -672,3 +672,39 @@ impl MergedFilters {
         }
     }
 }
+
+#[cfg(test)]
+mod filter_merge_tests {
+    use super::*;
+    #[test]
+    fn merged_filters_merge_overlay() {
+        let merged = MergedFilters::merge(
+            &["mcp__blackbox__bbox_*".into()],
+            &["mcp__blackbox__bro_*".into()],
+            Some(&AgentFilterOverlay {
+                allow: vec!["mcp__blackbox__bbox_search".into()],
+                disallow: vec!["mcp__blackbox__bbox_forget".into()],
+            }),
+        );
+        assert_eq!(
+            merged.allow,
+            vec![
+                "mcp__blackbox__bbox_*".to_string(),
+                "mcp__blackbox__bbox_search".to_string(),
+            ]
+        );
+        assert_eq!(
+            merged.disallow,
+            vec![
+                "mcp__blackbox__bro_*".to_string(),
+                "mcp__blackbox__bbox_forget".to_string(),
+            ]
+        );
+    }
+    #[test]
+    fn merged_filters_no_overlay() {
+        let merged = MergedFilters::merge(&["a".into()], &["b".into()], None);
+        assert_eq!(merged.allow, vec!["a".to_string()]);
+        assert_eq!(merged.disallow, vec!["b".to_string()]);
+    }
+}

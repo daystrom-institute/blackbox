@@ -586,7 +586,6 @@ mod tests {
                 "diff-narrator",
                 include_str!("../../../system-defaults/agents/diff-narrator.json"),
             ),
-            ("badgey",),
             (
                 "corpus-pathfinder",
                 include_str!("../../../system-defaults/agents/corpus-pathfinder.json"),
