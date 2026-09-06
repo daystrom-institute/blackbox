@@ -11,6 +11,13 @@ brief: "Complete registered-tool inventory grouped by adapter owner and audit fi
 
 # MCP audit coverage
 
+The current checklist is the [surviving MCP action audit](mcp-survivor-action-audit.md),
+with the [served catalog and probe evidence](mcp-survivor-audit-evidence.json).
+It assigns explicit dispositions across all 109 served tools and their action/detail
+branches. The table below is historical family triage, not the completion gate.
+Caller-facing findings drive this audit; backend delivery and readiness gaps are
+separate dependencies, not its implementation sequence.
+
 The [orchestration retirement](../../orchestration/bro-execution-boundary-and-retirement.md)
 is deployed from `2dd385a2c6f4`. Its
 [exact disposition map](../../orchestration/bro-execution-retirement-map.json)
@@ -113,7 +120,8 @@ inspection, and actual latest-assistant previews. Older tasks retain truthful
 result availability even without recoverable preview evidence. The response
 audit records full gates and live proofs; these contracts are adjusted.
 
-The surviving-surface audit remains partial. Next priorities:
+The surviving-surface audit remains partial. The following priorities describe
+the earlier checkpoint; the current action audit supersedes their execution order:
 
 1. Collector delivery preconditions and mutation-bound replay receipts. A lost
    acknowledgement can still replay an old write over newer content. Duplicate
@@ -128,5 +136,6 @@ The surviving-surface audit remains partial. Next priorities:
    including required input knowledge, useful response fields, and clear
    reasons to retain each tool.
 
-The original inventory remains a historical baseline. Every surviving action
-still needs an explicit disposition and representative contract evidence.
+The original inventory remains a historical baseline. Current action dispositions
+and representative evidence now live in the surviving MCP action audit; its
+open findings and source-only validation limits remain explicit.

@@ -1,0 +1,1116 @@
+{
+  "source_revision": "f4fbdfda6366e16114feb555f72e532c07ccd780",
+  "observed_date": "2026-09-06",
+  "measurement_definition": "UTF-8 bytes of compact JSON serialization of the returned tool result object, including content, structuredContent when present, and isError. Excludes JSON-RPC/HTTP framing; not token counts. No response bodies retained.",
+  "served_ops_tools": [
+    "bbox_absorb",
+    "bbox_apply",
+    "bbox_artifact_install",
+    "bbox_artifact_list",
+    "bbox_artifact_remove",
+    "bbox_artifact_supersede",
+    "bbox_audit",
+    "bbox_blame",
+    "bbox_bootstrap",
+    "bbox_bundle_evidence",
+    "bbox_cite",
+    "bbox_compile",
+    "bbox_context",
+    "bbox_corpus_search",
+    "bbox_decide",
+    "bbox_describe_schema",
+    "bbox_discover_seed_entities",
+    "bbox_doctor",
+    "bbox_edge_compact",
+    "bbox_embed_partitions",
+    "bbox_embed_status",
+    "bbox_find_paths",
+    "bbox_forget",
+    "bbox_gap",
+    "bbox_gap_resolve",
+    "bbox_gap_update",
+    "bbox_gaps",
+    "bbox_hybrid_search",
+    "bbox_inbox",
+    "bbox_inspect_entity",
+    "bbox_knowledge",
+    "bbox_knowledge_link",
+    "bbox_learn",
+    "bbox_lint",
+    "bbox_mcp_surface",
+    "bbox_messages",
+    "bbox_note",
+    "bbox_note_resolve",
+    "bbox_notes",
+    "bbox_packet_events",
+    "bbox_packet_gap",
+    "bbox_packet_list",
+    "bbox_pin",
+    "bbox_project_attach",
+    "bbox_project_catalog_get",
+    "bbox_project_catalog_list",
+    "bbox_project_default_attachment",
+    "bbox_project_detach",
+    "bbox_project_eject",
+    "bbox_project_graph_describe",
+    "bbox_project_graph_list",
+    "bbox_project_graph_validate",
+    "bbox_project_init",
+    "bbox_project_list",
+    "bbox_project_promote",
+    "bbox_project_publisher_advance",
+    "bbox_project_publisher_bind",
+    "bbox_project_publisher_status",
+    "bbox_project_register",
+    "bbox_project_rename",
+    "bbox_project_scope_migrate",
+    "bbox_project_unregister",
+    "bbox_provenance_export",
+    "bbox_provenance_export_plan",
+    "bbox_provenance_import",
+    "bbox_reembed",
+    "bbox_ref_size",
+    "bbox_reindex",
+    "bbox_remember",
+    "bbox_render",
+    "bbox_review",
+    "bbox_roadmap",
+    "bbox_search",
+    "bbox_session",
+    "bbox_sessions_list",
+    "bbox_stats",
+    "bbox_storage_gc",
+    "bbox_storage_health",
+    "bbox_storage_migrate_legacy_edges",
+    "bbox_thread",
+    "bbox_thread_list",
+    "bbox_tool_calls",
+    "bbox_topics",
+    "bro_agent_describe",
+    "bro_agent_dispatch",
+    "bro_agent_get",
+    "bro_agent_list",
+    "bro_agent_search",
+    "bro_allocator_probe",
+    "bro_allocator_status",
+    "bro_allocator_trace",
+    "bro_broadcast",
+    "bro_brofile",
+    "bro_cancel",
+    "bro_dashboard",
+    "bro_exec",
+    "bro_interrupt",
+    "bro_mcp",
+    "bro_providers",
+    "bro_prune",
+    "bro_report",
+    "bro_resume",
+    "bro_retro",
+    "bro_status",
+    "bro_steer",
+    "bro_team",
+    "bro_wait",
+    "bro_when_all",
+    "bro_when_any"
+  ],
+  "client_unavailable_tools": [
+    "bro_agent_describe",
+    "bro_agent_dispatch",
+    "bro_agent_get",
+    "bro_agent_list",
+    "bro_agent_search",
+    "bro_allocator_probe",
+    "bro_allocator_status",
+    "bro_allocator_trace"
+  ],
+  "probes": [
+    {
+      "id": "publisher",
+      "tool": "bbox_project_publisher_status",
+      "result_bytes": 4135,
+      "text_bytes": 3725,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "accepted_commit",
+        "accepted_scope",
+        "accepted_state",
+        "advance_available",
+        "attachment_id",
+        "auto_advance",
+        "connector",
+        "diagnostic",
+        "epoch",
+        "full_ref",
+        "generation_id",
+        "generation_sha256",
+        "health",
+        "pointer_sha256",
+        "project_id",
+        "published_available",
+        "scope",
+        "scope_agreement",
+        "source_binding"
+      ],
+      "arguments": {
+        "project_id": "89bd722f"
+      }
+    },
+    {
+      "id": "surface_list",
+      "tool": "bbox_mcp_surface",
+      "result_bytes": 657,
+      "text_bytes": 525,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "count",
+        "surface_packets"
+      ],
+      "arguments": {
+        "action": "list"
+      }
+    },
+    {
+      "id": "surface_describe",
+      "tool": "bbox_mcp_surface",
+      "result_bytes": 1223,
+      "text_bytes": 1016,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "packet",
+        "rules",
+        "selected_surface",
+        "verdict_for_selected"
+      ],
+      "arguments": {
+        "action": "describe",
+        "surface": "ops"
+      }
+    },
+    {
+      "id": "knowledge_narrow",
+      "tool": "bbox_knowledge",
+      "result_bytes": 2852,
+      "text_bytes": 1548,
+      "structured_bytes": 1196,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "query": "audit",
+        "project": "89bd722f",
+        "limit": 1
+      }
+    },
+    {
+      "id": "knowledge_empty",
+      "tool": "bbox_knowledge",
+      "result_bytes": 6789,
+      "text_bytes": 3353,
+      "structured_bytes": 3344,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "query": "mcp-audit-no-match-6c317efa",
+        "limit": 1
+      }
+    },
+    {
+      "id": "thread",
+      "tool": "bbox_thread",
+      "result_bytes": 23108,
+      "text_bytes": 22965,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "action": "get",
+        "id": "thread-d7cd3385"
+      }
+    },
+    {
+      "id": "catalog",
+      "tool": "bbox_project_catalog_list",
+      "result_bytes": 446,
+      "text_bytes": 347,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "detail_hint",
+        "epoch",
+        "limit",
+        "next_offset",
+        "offset",
+        "order",
+        "projects",
+        "total"
+      ],
+      "arguments": {
+        "limit": 1,
+        "query": "89bd722f"
+      }
+    },
+    {
+      "id": "catalog_detail",
+      "tool": "bbox_project_catalog_get",
+      "result_bytes": 790,
+      "text_bytes": 671,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "aliases",
+        "attachment_note",
+        "attachments",
+        "detail",
+        "detail_hint",
+        "epoch",
+        "project"
+      ],
+      "arguments": {
+        "project": "89bd722f"
+      }
+    },
+    {
+      "id": "brofiles",
+      "tool": "bro_brofile",
+      "result_bytes": 352,
+      "text_bytes": 265,
+      "structured_bytes": 0,
+      "elapsed_ms": 53,
+      "is_error": false,
+      "keys": [
+        "brofiles",
+        "detail_hint",
+        "next_offset",
+        "offset",
+        "total"
+      ],
+      "arguments": {
+        "action": "list",
+        "limit": 1
+      }
+    },
+    {
+      "id": "teams",
+      "tool": "bro_team",
+      "result_bytes": 804,
+      "text_bytes": 350,
+      "structured_bytes": 350,
+      "elapsed_ms": 104,
+      "is_error": false,
+      "keys": [
+        "count",
+        "detail_hint",
+        "limit",
+        "next_offset",
+        "offset",
+        "teams",
+        "total"
+      ],
+      "arguments": {
+        "action": "list",
+        "limit": 1
+      }
+    },
+    {
+      "id": "templates",
+      "tool": "bro_team",
+      "result_bytes": 840,
+      "text_bytes": 363,
+      "structured_bytes": 363,
+      "elapsed_ms": 158,
+      "is_error": false,
+      "keys": [
+        "count",
+        "detail_hint",
+        "limit",
+        "next_offset",
+        "offset",
+        "scope",
+        "templates",
+        "total"
+      ],
+      "arguments": {
+        "action": "list_templates",
+        "limit": 1
+      }
+    },
+    {
+      "id": "mcp_list",
+      "tool": "bro_mcp",
+      "result_bytes": 137,
+      "text_bytes": 80,
+      "structured_bytes": 0,
+      "elapsed_ms": 210,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "action": "list"
+      }
+    },
+    {
+      "id": "providers",
+      "tool": "bro_providers",
+      "result_bytes": 854,
+      "text_bytes": 715,
+      "structured_bytes": 0,
+      "elapsed_ms": 266,
+      "is_error": false,
+      "keys": [
+        "brodex",
+        "deepseek",
+        "glm",
+        "kimi",
+        "minimax",
+        "vibebh"
+      ],
+      "arguments": {}
+    },
+    {
+      "id": "notes",
+      "tool": "bbox_notes",
+      "result_bytes": 214,
+      "text_bytes": 141,
+      "structured_bytes": 0,
+      "elapsed_ms": 318,
+      "is_error": false,
+      "keys": [
+        "detail_hint",
+        "limit",
+        "next_offset",
+        "notes",
+        "offset",
+        "order",
+        "total"
+      ],
+      "arguments": {
+        "thread_id": "thread-d7cd3385",
+        "limit": 1
+      }
+    },
+    {
+      "id": "threads",
+      "tool": "bbox_thread_list",
+      "result_bytes": 595,
+      "text_bytes": 494,
+      "structured_bytes": 0,
+      "elapsed_ms": 367,
+      "is_error": false,
+      "keys": [
+        "detail_hint",
+        "limit",
+        "next_offset",
+        "offset",
+        "order",
+        "threads",
+        "total"
+      ],
+      "arguments": {
+        "project": "89bd722f",
+        "limit": 1
+      }
+    },
+    {
+      "id": "packets",
+      "tool": "bbox_packet_list",
+      "result_bytes": 524,
+      "text_bytes": 431,
+      "structured_bytes": 0,
+      "elapsed_ms": 419,
+      "is_error": false,
+      "keys": [
+        "count",
+        "detail_hint",
+        "limit",
+        "next_offset",
+        "offset",
+        "order",
+        "packets",
+        "total"
+      ],
+      "arguments": {
+        "domain": "mcp-surface/routing",
+        "limit": 1
+      }
+    },
+    {
+      "id": "packet_events",
+      "tool": "bbox_packet_events",
+      "result_bytes": 519,
+      "text_bytes": 402,
+      "structured_bytes": 0,
+      "elapsed_ms": 472,
+      "is_error": false,
+      "keys": [
+        "count",
+        "events",
+        "limit"
+      ],
+      "arguments": {
+        "packet_id": "packet-752d4b2b",
+        "limit": 1
+      }
+    },
+    {
+      "id": "graphs",
+      "tool": "bbox_project_graph_list",
+      "result_bytes": 496,
+      "text_bytes": 391,
+      "structured_bytes": 0,
+      "elapsed_ms": 525,
+      "is_error": false,
+      "keys": [
+        "graphs",
+        "provisional",
+        "status"
+      ],
+      "arguments": {
+        "project": "89bd722f"
+      }
+    },
+    {
+      "id": "history",
+      "tool": "bbox_tool_calls",
+      "result_bytes": 89,
+      "text_bytes": 30,
+      "structured_bytes": 0,
+      "elapsed_ms": 574,
+      "is_error": false,
+      "keys": [
+        "next_offset",
+        "rows"
+      ],
+      "arguments": {
+        "project": "/Users/invidious/repos/transcript-search",
+        "tool_name": "bbox_mcp_surface",
+        "limit": 1
+      }
+    },
+    {
+      "id": "absorb",
+      "tool": "bbox_absorb",
+      "result_bytes": 114,
+      "text_bytes": 60,
+      "structured_bytes": 0,
+      "elapsed_ms": 632,
+      "is_error": true,
+      "keys": [],
+      "arguments": {}
+    },
+    {
+      "id": "brofile_bad_scope",
+      "tool": "bro_brofile",
+      "result_bytes": 352,
+      "text_bytes": 265,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "brofiles",
+        "detail_hint",
+        "next_offset",
+        "offset",
+        "total"
+      ],
+      "arguments": {
+        "action": "list",
+        "scope": "audit-invalid-scope",
+        "limit": 1
+      }
+    },
+    {
+      "id": "mcp_bad_scope",
+      "tool": "bro_mcp",
+      "result_bytes": 137,
+      "text_bytes": 80,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "action": "list",
+        "scope": "audit-invalid-scope"
+      }
+    },
+    {
+      "id": "surface_unknown",
+      "tool": "bbox_mcp_surface",
+      "result_bytes": 324,
+      "text_bytes": 234,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "entity",
+        "verdict_classification",
+        "verdict_consequent",
+        "visible_tool_count",
+        "visible_tools"
+      ],
+      "arguments": {
+        "action": "replay",
+        "surface": "audit-unknown-surface"
+      }
+    },
+    {
+      "id": "surface_list_ignored",
+      "tool": "bbox_mcp_surface",
+      "result_bytes": 657,
+      "text_bytes": 525,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "count",
+        "surface_packets"
+      ],
+      "arguments": {
+        "action": "list",
+        "surface": "audit-unknown-surface",
+        "project": "audit-unknown-project"
+      }
+    },
+    {
+      "id": "pin_bad_scope",
+      "tool": "bbox_pin",
+      "result_bytes": 129,
+      "text_bytes": 75,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "action": "list",
+        "scope": "audit-invalid-scope",
+        "project": "89bd722f"
+      }
+    },
+    {
+      "id": "packet_bad_filter",
+      "tool": "bbox_packet_events",
+      "result_bytes": 111,
+      "text_bytes": 46,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "count",
+        "events",
+        "limit"
+      ],
+      "arguments": {
+        "op": "audit-invalid-operation",
+        "limit": 1
+      }
+    },
+    {
+      "id": "absorb_global",
+      "tool": "bbox_absorb",
+      "result_bytes": 566,
+      "text_bytes": 507,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "scope": "global"
+      }
+    },
+    {
+      "id": "embed_status",
+      "tool": "bbox_embed_status",
+      "result_bytes": 1080,
+      "text_bytes": 907,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "coverage",
+        "routes"
+      ],
+      "arguments": {}
+    },
+    {
+      "id": "gc_preview",
+      "tool": "bbox_storage_gc",
+      "result_bytes": 601,
+      "text_bytes": 496,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "apply_requested",
+        "catalog_gc_exclusions",
+        "expires_in_seconds",
+        "packet_gc",
+        "receipt_id",
+        "result",
+        "status"
+      ],
+      "arguments": {
+        "project": "89bd722f",
+        "dry_run": true
+      }
+    },
+    {
+      "id": "project_list",
+      "tool": "bbox_project_list",
+      "result_bytes": 6162,
+      "text_bytes": 5537,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "projects"
+      ],
+      "arguments": {}
+    },
+    {
+      "id": "sessions",
+      "tool": "bbox_sessions_list",
+      "result_bytes": 73,
+      "text_bytes": 18,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "project": "/Users/invidious/repos/transcript-search",
+        "limit": 1
+      }
+    },
+    {
+      "id": "gaps",
+      "tool": "bbox_gaps",
+      "result_bytes": 2708,
+      "text_bytes": 1375,
+      "structured_bytes": 1111,
+      "is_error": false,
+      "keys": [
+        "built_from",
+        "detail",
+        "detail_hint",
+        "diagnostics",
+        "next_offset",
+        "offset",
+        "rows",
+        "total"
+      ],
+      "arguments": {
+        "project": "89bd722f",
+        "limit": 1,
+        "json": true
+      }
+    },
+    {
+      "id": "when_all_missing",
+      "tool": "bro_when_all",
+      "result_bytes": 94,
+      "text_bytes": 35,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "all_completed",
+        "results"
+      ],
+      "arguments": {
+        "task_ids": [
+          "mcp-audit-missing-6c317efa"
+        ],
+        "timeout_seconds": 0
+      }
+    },
+    {
+      "id": "when_any_missing",
+      "tool": "bro_when_any",
+      "result_bytes": 95,
+      "text_bytes": 36,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "any_completed",
+        "results"
+      ],
+      "arguments": {
+        "task_ids": [
+          "mcp-audit-missing-6c317efa"
+        ],
+        "timeout_seconds": 0
+      }
+    },
+    {
+      "id": "wait_missing",
+      "tool": "bro_wait",
+      "result_bytes": 97,
+      "text_bytes": 43,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "task_id": "mcp-audit-missing-6c317efa",
+        "timeout_seconds": 0
+      }
+    },
+    {
+      "id": "pin_project",
+      "tool": "bbox_pin",
+      "result_bytes": 129,
+      "text_bytes": 75,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "action": "list",
+        "project": "89bd722f"
+      }
+    },
+    {
+      "id": "pin_invalid",
+      "tool": "bbox_pin",
+      "result_bytes": 61,
+      "text_bytes": 6,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "action": "list",
+        "scope": "audit-invalid-scope"
+      }
+    },
+    {
+      "id": "graph_describe",
+      "tool": "bbox_project_graph_describe",
+      "result_bytes": 26237,
+      "text_bytes": 23633,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "graphs",
+        "status"
+      ],
+      "arguments": {
+        "project": "89bd722f",
+        "graph_id": "design"
+      }
+    },
+    {
+      "id": "graph_validate",
+      "tool": "bbox_project_graph_validate",
+      "result_bytes": 643,
+      "text_bytes": 532,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "graphs",
+        "status"
+      ],
+      "arguments": {
+        "project": "89bd722f",
+        "graph_id": "design"
+      }
+    },
+    {
+      "id": "search",
+      "tool": "bbox_search",
+      "result_bytes": 728,
+      "text_bytes": 652,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "query": "\"MCP surface audit\"",
+        "limit": 1,
+        "mode": "fulltext"
+      }
+    },
+    {
+      "id": "storage_health",
+      "tool": "bbox_storage_health",
+      "result_bytes": 2320,
+      "text_bytes": 2067,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "manifest_status",
+        "observed_policy_warning",
+        "status",
+        "top_offenders",
+        "totals"
+      ],
+      "arguments": {
+        "project": "89bd722f"
+      }
+    },
+    {
+      "id": "doctor",
+      "tool": "bbox_doctor",
+      "result_bytes": 1498,
+      "text_bytes": 1269,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "detail",
+        "detail_hint",
+        "findings",
+        "next_offset",
+        "offset",
+        "sections",
+        "status",
+        "total_findings"
+      ],
+      "arguments": {
+        "format": "json",
+        "limit": 1
+      }
+    },
+    {
+      "id": "search_native",
+      "tool": "bbox_search",
+      "result_bytes": 1051,
+      "text_bytes": 976,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "query": "\"MCP surface\"",
+        "source": "codex",
+        "mode": "fulltext",
+        "limit": 1
+      }
+    },
+    {
+      "id": "artifact_list",
+      "tool": "bbox_artifact_list",
+      "result_bytes": 454,
+      "text_bytes": 369,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "artifacts",
+        "limit",
+        "next_offset",
+        "offset",
+        "total"
+      ],
+      "arguments": {
+        "kind": "agent",
+        "limit": 1
+      }
+    },
+    {
+      "id": "pin_unscoped",
+      "tool": "bbox_pin",
+      "result_bytes": 61,
+      "text_bytes": 6,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "action": "list",
+        "scope": "thread",
+        "target": "thread-d7cd3385"
+      }
+    },
+    {
+      "id": "surface_default",
+      "tool": "bbox_mcp_surface",
+      "result_bytes": 4422,
+      "text_bytes": 3943,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "entity",
+        "verdict_classification",
+        "verdict_consequent",
+        "visible_tool_count",
+        "visible_tools"
+      ],
+      "arguments": {
+        "action": "replay",
+        "surface": "default"
+      }
+    },
+    {
+      "id": "surface_readonly",
+      "tool": "bbox_mcp_surface",
+      "result_bytes": 3319,
+      "text_bytes": 2984,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "entity",
+        "verdict_classification",
+        "verdict_consequent",
+        "visible_tool_count",
+        "visible_tools"
+      ],
+      "arguments": {
+        "action": "replay",
+        "surface": "readonly"
+      }
+    },
+    {
+      "id": "schema",
+      "tool": "bbox_describe_schema",
+      "result_bytes": 15282,
+      "text_bytes": 13514,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "agents_hint",
+        "agents_omitted",
+        "edge_families",
+        "status",
+        "vertex_types"
+      ],
+      "arguments": {}
+    },
+    {
+      "id": "knowledge_invalid_mode",
+      "tool": "bbox_knowledge",
+      "result_bytes": 160,
+      "text_bytes": 96,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "query": "mcp-audit-no-match-6c317efa",
+        "mode": "audit-invalid-mode",
+        "project": "89bd722f",
+        "limit": 1
+      }
+    },
+    {
+      "id": "graph_missing",
+      "tool": "bbox_project_graph_describe",
+      "result_bytes": 141,
+      "text_bytes": 87,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "project": "89bd722f",
+        "graph_id": "mcp-audit-missing"
+      }
+    },
+    {
+      "id": "gc_candidates",
+      "tool": "bbox_storage_gc",
+      "result_bytes": 548,
+      "text_bytes": 433,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [
+        "apply_requested",
+        "body",
+        "detail",
+        "expires_in_seconds",
+        "receipt_id",
+        "status"
+      ],
+      "arguments": {
+        "receipt_id": "53b3242a-d248-4f2f-871d-df5a623fd628",
+        "detail": "candidates",
+        "limit": 128
+      }
+    },
+    {
+      "id": "catalog_epoch_rejection",
+      "tool": "bbox_project_catalog_get",
+      "result_bytes": 156,
+      "text_bytes": 102,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "project": "89bd722f",
+        "detail": "aliases",
+        "offset": 1,
+        "expected_catalog_epoch": 1
+      }
+    },
+    {
+      "id": "packet_property",
+      "tool": "bbox_inspect_entity",
+      "result_bytes": 3398,
+      "text_bytes": 1526,
+      "structured_bytes": 1461,
+      "is_error": false,
+      "keys": [
+        "body",
+        "built_from",
+        "entity_ref",
+        "entity_type",
+        "property",
+        "source",
+        "status"
+      ],
+      "arguments": {
+        "entity_ref": "packet:packet-752d4b2b",
+        "property": "body",
+        "property_limit": 1024
+      }
+    },
+    {
+      "id": "thread_hint_context",
+      "tool": "bbox_context",
+      "result_bytes": 250,
+      "text_bytes": 196,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "file_path": "/var/lib/blackbox/state/blackbox-threads.json",
+        "byte_offset": 0,
+        "context_lines": 1
+      }
+    },
+    {
+      "id": "thread_hint_messages",
+      "tool": "bbox_messages",
+      "result_bytes": 115,
+      "text_bytes": 61,
+      "structured_bytes": 0,
+      "is_error": true,
+      "keys": [],
+      "arguments": {
+        "session_id": "",
+        "limit": 1
+      }
+    },
+    {
+      "id": "native_messages",
+      "tool": "bbox_messages",
+      "result_bytes": 1764,
+      "text_bytes": 1597,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "selector": "opaque handle from search_native; source identity omitted"
+      }
+    },
+    {
+      "id": "native_context",
+      "tool": "bbox_context",
+      "result_bytes": 3559,
+      "text_bytes": 3265,
+      "structured_bytes": 0,
+      "is_error": false,
+      "keys": [],
+      "arguments": {
+        "selector": "opaque handle from search_native; source identity omitted"
+      }
+    }
+  ],
+  "continuation_checks": [
+    {
+      "label": "packet_recovery",
+      "tool": "bbox_inspect_entity",
+      "pages": 7,
+      "total_bytes": 6969,
+      "complete": true,
+      "valid_json": true,
+      "max_continuation_result_bytes": 3412
+    },
+    {
+      "label": "gc_recovery",
+      "tool": "bbox_storage_gc",
+      "pages": 3,
+      "total_bytes": 298,
+      "complete": true,
+      "valid_json": true,
+      "max_continuation_result_bytes": 547
+    }
+  ]
+}

@@ -446,6 +446,12 @@ retaining executable workflow/atom/reaction engines.
 
 ## Residual audit disposition
 
+Current survivor dispositions and caller-contract evidence are maintained in the
+[surviving MCP action audit](../surfaces/mcp/mcp-survivor-action-audit.md).
+The historical residual list below predates the deployed GC response and queued
+gap/knowledge reconciliation corrections. Delivery replay and graph readiness
+remain independent gaps; they are not a replacement for the MCP surface audit.
+
 - Reaction delivery caps, event-open shaping, and reaction-install schemas move
   to retirement acceptance; stop treating them as independent feature fixes.
 - GC remains and still needs bounded candidate/diagnostic responses and honest

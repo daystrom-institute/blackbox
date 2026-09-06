@@ -1,0 +1,23 @@
+{
+  "id": "gap-7a2513c9",
+  "title": "Surviving MCP actions still misreport completion, require checkout access for reads, and return unbounded detail",
+  "gap_kind": "mcp_surface",
+  "domain": "survivor-audit",
+  "wanted_capability": "A reviewed per-action MCP contract: unknown task IDs cannot produce all_completed=true; project-filtered pin reads must use catalog filtering; typed filters must reject invalid values; returned detail must be bounded and recoverable; search hints must match the hit entity type; retired no-op actions need a deliberate discovery disposition.",
+  "evidence": [
+    "src/tools/dispatch.rs::bro_when_all",
+    "src/tools/attention.rs::bbox_pin",
+    "crates/bbox-corpus-index/src/index/search.rs",
+    "src/tools/graph.rs::bbox_project_graph_describe",
+    "design/surfaces/mcp/mcp-survivor-audit-evidence.json"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/survivor-audit/caller-contract-residuals",
+  "notes": "Live audit: unknown-only bro_when_all returns all_completed=true with zero results while bro_wait rejects the same ID. Pin list with a registered project fails attachment_inactive; no project filter succeeds. Invalid brofile/MCP list scope returns normal results, invalid pin scope and packet event operation return empty success. Search of this audit thread recommends bbox_messages with an empty session ID. Graph describe returns 26237 result bytes, thread get 23108, unmatched knowledge recall 6789. Record precise dispositions in the action audit. This gap tracks caller-facing corrections; checkout transaction/replay redesign and edge-index scheduling remain separate existing gaps.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T19:05:09Z",
+  "updated_at": "2026-09-06T19:05:09Z"
+}

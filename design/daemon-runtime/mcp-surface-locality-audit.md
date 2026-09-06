@@ -12,6 +12,15 @@ brief: "Complete inventory of every MCP tool's behavior on the zero-checkout-aut
 
 # MCP-surface locality audit
 
+Current per-action dispositions are in the
+[surviving MCP action audit](../surfaces/mcp/mcp-survivor-action-audit.md).
+The Class A-D inventory below is historical: workflow/atom/reaction/whiteboard
+mutation surfaces have since retired, bootstrap is a retired refusal, and the
+new audit reproduces a project-filtered pin read incorrectly requiring checkout
+write authority. Do not interpret the historical "works" family list as a
+current live pass. The project-administration operating limits below remain
+relevant, subject to the current action-specific evidence.
+
 The original audit swept the MCP catalog against the zero-checkout daemon.
 The project-administration rows below were rechecked against current handlers
 in September 2026. Catalog mode is active remotely; absence of checkout

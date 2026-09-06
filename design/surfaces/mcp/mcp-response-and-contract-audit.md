@@ -11,6 +11,13 @@ brief: "Source-backed triage of tool usefulness, caller contracts, response brev
 
 # MCP response and contract audit
 
+Current checklist: [surviving MCP action audit](mcp-survivor-action-audit.md).
+Its [evidence snapshot](mcp-survivor-audit-evidence.json) reconciles the 109-tool
+served catalog with source and records new caller-contract probes. This document
+retains the original findings and chronological milestones. Earlier next-step
+paragraphs are historical; they do not put transaction or index implementation
+ahead of auditing tool usefulness, inputs, responses and recovery.
+
 The accepted [bro execution boundary and retirement plan](../../orchestration/bro-execution-boundary-and-retirement.md)
 now takes priority over response improvements to retiring workflow, atom,
 Badgey/Slack, reaction and whiteboard surfaces. It includes an exact current-tool
