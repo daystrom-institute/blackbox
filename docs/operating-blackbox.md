@@ -549,15 +549,17 @@ the transaction root as a whole.
 | Disk grows under `vectors/` | journal compaction lines | Usually wait; re-embed only after provider/data issues |
 | Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
 | Provider markdown stale | `bbox_lint`, rendered files | `bbox_render(scope="global")` on the daemon host; `bro render global` on any other operator host (pulls the plan from a remote daemon) |
-| Reaction dead-lettered / no reaction ran / identity missing | `system_event_open` → `reaction_deliveries` → `reaction_replay dry_run` → `reaction_retry` | See [System events](system-events.md) — operational loops. |
 
-System events are journalled separately from the transcript index and have
-their own retention/compaction. The transcript-side `bbox_*` reindex tools
-do not touch the system-event journal or the outbox. For the system-event
-runbook (dead-lettered reactions, missing identities, missing token
-secrets, replay), see [System events](system-events.md).
+The observation journal has independent retention. Legacy reaction and delivery
+stores remain inert; their former MCP tools are retired. See the
+[observation journal contract](system-events.md).
 
 ## Key paths
+
+These paths belong to the host running the named component. A remote daemon's
+stores are not operator-host files; inspect them through its MCP surfaces or
+its deployment runbook. Global provider guidance is rendered on the operator
+host with `bro render global`.
 
 | Path | Contents |
 |---|---|

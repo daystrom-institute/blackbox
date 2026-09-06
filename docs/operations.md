@@ -457,25 +457,35 @@ A code deployment alone does not apply a production marker.
 
 ### After a daemon upgrade (no schema change)
 
+Build and verify the pushed revision using the project's
+[build contract](../PROJECT.md#where-heavy-work-runs). Cluster deployments use
+`bbox-cage/scripts/converge.sh --image <verified-tag>` and verify the ready
+image digest. A native deployment replaces and signs the selected instance's
+binary using its platform runbook, then restarts that instance. Operator
+hosts using a remote daemon run collectors and fleet clients; the corpus
+daemon remains on its deployment host.
+
+Update affected native `bro` and `bro-harness` binaries with a retained backup
+and platform signing. After the daemon is healthy, refresh generated guidance
+on each operator host that consumes it:
+
 ```bash
-cargo build --release
-install -m 755 target/release/blackbox ~/.local/bin/blackbox
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-install -m 755 target/release/bro ~/.local/bin/bro
-install -d ~/.local/share/blackbox/memories
-cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
-systemctl --user restart blackbox.service blackbox-dev.service
-system-defaults/maintenance/scripts/install-maintenance.sh   # (re)schedule maintenance arcs
+bro render global --check --daemon-url https://<daemon-origin>
+bro render global --daemon-url https://<daemon-origin>
 ```
 
-The maintenance script is idempotent and is what keeps storage GC and
-nightly embed compaction actually scheduled — a workflow installed without
-its cron silently never runs (`bbox_inbox` flags this as "Cron scheduling
-gaps"). See `system-defaults/maintenance/maintenance-defaults.md`.
+The first command previews managed regions. The second applies the daemon's
+current render plan to this host and backs up changed files. Verify that
+removed tools and outdated examples have disappeared from the generated
+common include. A remote daemon restart cannot refresh those host files;
+editing their managed regions manually bypasses the render contract.
 
-Watch the journal for `auto-reindex: indexed N files` - if the schema
-version changed, the index will drop and rebuild (~5–7 min for 1M docs).
+Mechanical vector recovery and journal retention are daemon-owned. Application
+schedules and orchestration belong to external callers. Archived workflow or
+cron installers are no longer an upgrade step.
+
+Check daemon startup, collector freshness, and representative MCP retrieval.
+If the schema version changed, follow the rebuild checks below.
 
 ### After a schema version bump
 

@@ -1,0 +1,16 @@
+{
+  "id": "gap-392e207b",
+  "title": "Remote daemon updates leave operator-host generated guidance stale",
+  "gap_kind": "docs_runbook",
+  "domain": "render",
+  "wanted_capability": "Operator-host generated tool guidance should reflect the deployed MCP surface after upgrades.",
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/render/host-guidance-after-remote-deploy",
+  "notes": "Observed removed workflow recommendations and old artifact examples in the operator host common guidance while the daemon render plan was current. Official bro render global refreshed the host with automatic backup; deployment runbook needs an explicit host refresh step and no manual managed-file editing.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "thread_id": "thread-d7cd3385",
+  "created_at": "2026-09-06T18:17:42Z",
+  "updated_at": "2026-09-06T18:17:42Z"
+}
