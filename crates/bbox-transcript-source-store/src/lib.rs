@@ -40,6 +40,21 @@ impl TranscriptSourceStore {
         fs2::FileExt::lock_exclusive(&lock)?;
         Ok(lock)
     }
+    /// Pins every generation discovered under a source until the lease drops.
+    /// Publication may proceed, but cleanup cannot remove a reader's snapshot.
+    pub fn reader_lease(&self, scope: &ConnectorScope) -> Result<File> {
+        let root = self.scope_root(scope);
+        fs::create_dir_all(&root)?;
+        let lease = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("readers.lock"))?;
+        fs2::FileExt::lock_shared(&lease)?;
+        Ok(lease)
+    }
+
     pub fn current(
         &self,
         scope: &ConnectorScope,
@@ -166,20 +181,30 @@ impl TranscriptSourceStore {
         File::open(&root)?.sync_all()?;
         // The current pointer is the admission boundary, installed last.
         atomic_write(&root.join("current.json"), &serde_json::to_vec(&published)?)?;
-        // Keep the immediately previous materialization for recovery. This is
-        // retention, not a reader lease: a discovery snapshot overtaken twice
-        // before opening its file must retry discovery.
-        // Unreferenced chunks from failed uploads are intentionally untouched:
-        // another collector may be assembling its next CAS publication.
-        for entry in fs::read_dir(&root)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|ext| ext == "jsonl")
-                && path != self.data_path(&published)?
-                && current
-                    .as_ref()
-                    .is_none_or(|old| self.data_path(old).ok().as_ref() != Some(&path))
-            {
-                let _ = fs::remove_file(path);
+        // Cleanup is best effort after durable admission. One source-wide
+        // shared lease pins an index pass without opening every session file.
+        // If a reader is active, defer cleanup rather than block publication.
+        let cleanup_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.scope_root(&snapshot.scope).join("readers.lock"));
+        if let Ok(cleanup_lock) = cleanup_lock {
+            if fs2::FileExt::try_lock_exclusive(&cleanup_lock).is_ok() {
+                if let Ok(entries) = fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|ext| ext == "jsonl")
+                            && self.data_path(&published).ok().as_ref() != Some(&path)
+                            && current
+                                .as_ref()
+                                .is_none_or(|old| self.data_path(old).ok().as_ref() != Some(&path))
+                        {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
+                }
             }
         }
         Ok(receipt())
@@ -374,6 +399,68 @@ mod tests {
         );
         assert!(store.current(&scope(), &torn.stream_id).unwrap().is_none());
     }
+    #[test]
+    fn source_reader_lease_pins_a_generation_across_multiple_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let store = TranscriptSourceStore::open(root).unwrap();
+        let initial = stage(&store, b"first\n");
+        store
+            .publish(
+                &PublishRequest {
+                    snapshot: initial.clone(),
+                    expected_generation: None,
+                },
+                "now",
+            )
+            .unwrap();
+        let lease = store.reader_lease(&scope()).unwrap();
+        let pinned = store
+            .current(&scope(), &initial.stream_id)
+            .unwrap()
+            .unwrap();
+        for bytes in [
+            b"second\n".as_slice(),
+            b"third\n".as_slice(),
+            b"fourth\n".as_slice(),
+        ] {
+            let current = store
+                .current(&scope(), &initial.stream_id)
+                .unwrap()
+                .unwrap();
+            let next = stage(&store, bytes);
+            store
+                .publish(
+                    &PublishRequest {
+                        snapshot: next,
+                        expected_generation: Some(current.generation),
+                    },
+                    "later",
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            fs::read(store.data_path(&pinned).unwrap()).unwrap(),
+            b"first\n"
+        );
+        drop(lease);
+        let current = store
+            .current(&scope(), &initial.stream_id)
+            .unwrap()
+            .unwrap();
+        let next = stage(&store, b"fifth\n");
+        store
+            .publish(
+                &PublishRequest {
+                    snapshot: next,
+                    expected_generation: Some(current.generation),
+                },
+                "later",
+            )
+            .unwrap();
+        assert!(!store.data_path(&pinned).unwrap().exists());
+    }
+
     #[test]
     fn a_corrupted_cached_chunk_is_reported_missing_and_can_be_repaired() {
         let dir = tempfile::tempdir().unwrap();

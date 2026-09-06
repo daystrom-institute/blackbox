@@ -10,7 +10,10 @@
   generation are idempotent; stale generations cannot overwrite newer ones.
 - Per-stream advisory locks protect independent store instances and processes.
   Snapshot replacement never mutates bytes beneath an already-open reader.
-- Current and immediately previous materializations are retained. That is not
-  a reader lease: an older discovery snapshot may require retry. Chunk blobs
-  are retained, including interrupted uploads, so maintenance must not remove
-  a blob another producer operation may still need.
+- A source-wide shared reader lease pins discovered generations for an index
+  pass using one descriptor per source, not one per session. Publication
+  continues under a lease, while cleanup requires a nonblocking exclusive
+  lease and otherwise defers. Cleanup errors after admission are best effort.
+- Current and immediately previous materializations are retained when no read
+  lease is active. Chunk blobs are retained, including interrupted uploads;
+  maintenance must not remove a blob another producer operation may need.

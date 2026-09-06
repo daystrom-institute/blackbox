@@ -12,6 +12,7 @@ pub struct NativeTranscriptAdapter {
     store: TranscriptSourceStore,
     scopes: Vec<ConnectorScope>,
     source: TranscriptSource,
+    reader_leases: std::sync::Mutex<Vec<std::fs::File>>,
 }
 impl NativeTranscriptAdapter {
     pub fn open(
@@ -30,6 +31,7 @@ impl NativeTranscriptAdapter {
             store,
             scopes,
             source,
+            reader_leases: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
@@ -52,6 +54,17 @@ impl TranscriptReadAdapter for NativeTranscriptAdapter {
         }
         let mut locations = Vec::new();
         for scope in &self.scopes {
+            let lease = self.store.reader_lease(scope).map_err(|error| {
+                TranscriptReadError::io(
+                    "pin native source",
+                    scope.connector_source_id().as_str(),
+                    std::io::Error::other(error.to_string()),
+                )
+            })?;
+            self.reader_leases
+                .lock()
+                .expect("native reader leases poisoned")
+                .push(lease);
             let rows = self.store.snapshots(scope).map_err(|error| {
                 TranscriptReadError::io(
                     "scan native source",

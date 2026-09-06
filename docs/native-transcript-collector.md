@@ -74,7 +74,9 @@ The initial source set is Claude Code and Codex JSONL sessions. Each stream is
 limited to 1GiB, uploaded in chunks of at most 1MiB. Capture, upload, and server
 publication operate with bounded chunk buffers. Root directories must be
 explicit and source/account pairs unique. Chunk materializations retain the
-current and immediately previous generation; chunk blobs are retained, including
+current and immediately previous generation. Active index readers hold a source
+lease that defers cleanup across further publications; cleanup failures do not
+undo durable admission. Chunk blobs are retained, including
 interrupted uploads. Account for that storage when choosing retention outside
 the live collection path.
 
