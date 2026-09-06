@@ -512,3 +512,13 @@ invocation error flags (part of F12), and account candidate selection (F14).
 Tests and deployed smoke results are recorded at milestone completion. Other
 findings remain open; the original observations above describe the audit
 snapshot and must not be mistaken for the current implementation status.
+
+
+The second source checkpoint adds strict locked account mutations that retain
+existing policy, validates graph detail selectors, removes embedded graph text
+mirrors, and removes native transcript filesystem reads. Native drill-down is
+explicitly an indexed projection, with exact selectors and byte-bounded pages;
+it does not establish source completeness or restore ingestion. The native
+collector/source replacement remains in progress. The bridge fixture amendment
+records the intended presentation changes rather than weakening view-selection
+or authority assertions.

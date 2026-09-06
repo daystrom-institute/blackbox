@@ -672,6 +672,18 @@ Allowed bridge-visible additions:
 - dormant code and types; catalog-inactive refusal from new tools; empty catalog runtime state not serialized into existing responses
 Any other bridge output change requires a new explicit decision.
 
+### 2026-09-05 MCP response amendment
+
+The operator-authorized MCP contract remediation deliberately changes the
+presentation of existing bridge responses. Gap lists use bounded summary pages,
+explicit detail and continuation, and deterministic created-time/id ordering.
+The published, Own, and All view selection, authorization, and BuiltFromStamp
+semantics remain the same. The common JSON transport uses compact encoding;
+project-list JSON values remain identical. The four affected parity rows
+(`published_gaps`, `own_gaps`, `all_gaps`, `project_administration`) were inspected
+individually and updated. Other rows and normalization rules remain frozen.
+See [the MCP audit](../surfaces/mcp/mcp-response-and-contract-audit.md).
+
 ## 12. Cache, invalidation, and health matrix
 | Event | Accepted content cache | Binding status | Overlay cache | Watchers | Capability status |
 |---|---|---|---|---|---|

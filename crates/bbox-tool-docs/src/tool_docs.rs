@@ -181,7 +181,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_hybrid_search",
         category: ToolCategory::Graph,
-        summary: "Hybrid BM25+vector search over typed entities and graph vertices. Returns bounded evidence hits and retrieval/degradation status; limit defaults to 10, max 50. include_vectors controls retrieval, not raw vectors. debug=true adds ranking and vector execution diagnostics.",
+        summary: "Search typed entities with BM25 and vectors. Returns bounded evidence hits and retrieval status. Use debug for ranking diagnostics.",
         when_to_use: "Step 2 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use as the default search for any topical question. Pass `project=$cwd` (or a registered project_id) when querying about your local repo to avoid cross-project keyword pollution. Trust topical hits: top seed is canonical for the query even when wording doesn't exactly match (vector lane catches paraphrases). The query language: adjacent terms broaden recall, quoted phrases stay exact, `-term` excludes. Model rerank (hosted cross-encoder, [embed.rerank], default rerank-2.5-lite) is the DEFAULT and degrades to the heuristic path on API failure (degraded.rerank_unavailable); pass rerank=\"heuristic\" to skip the cross-encoder call when latency matters more than precision, or rerank=\"none\" for raw fusion order. Project graph vertices participate like any typed entity: `project` also scopes them by their stamped project id; repeatable `graph_source` picks planes (`published`, `provisional`, `connector`; unset = all) and `graph_ids` names graphs within the resolved project, both applied before ranking so excluded vertices never consume rank positions. Vertex hits carry `graph_id`, `graph_source`, `graph_vertex_type`, `graph_generation`, and `graph_logical_ref`.",
         example: Some(
             r#"bbox_hybrid_search(query="triad implementation", limit=10, project="/home/me/repos/erlang-test")"#,
@@ -206,22 +206,22 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_context",
         category: ToolCategory::Transcripts,
-        summary: "Conversation context around a specific byte offset.",
-        when_to_use: "Use after `bbox_search` or `bbox_cite` when you want the surrounding turns for a specific hit. Also serves a Slack hit's `slack:<workspace>/<channel>` locator, resolved against the conversation landing store instead of a transcript file: pass the hit's digit-encoded message timestamp (the `byte_offset` the search breadcrumb renders for a slack hit) to center the window on that message, in channel-time order. An unenrolled or unknown channel refuses by name (with a working `bbox_search` next step) rather than an ENOENT. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        summary: "Read surrounding indexed events using a search hit's opaque locator and offset. Native replies disclose projection and freshness limits.",
+        when_to_use: "Use a bbox_search hit's file_path and byte_offset unchanged. file_path is an opaque stored locator, never a file to open. Native context_lines counts indexed events before/after the target (default 5, max 25), with 400-byte previews; bbox_messages expands retained content. Indexed projections may already be parser-truncated and do not establish source completeness or freshness. Slack locators resolve through the conversation landing store using digit-encoded message timestamps.",
         example: None,
     },
     ToolDoc {
         name: "bbox_session",
         category: ToolCategory::Transcripts,
         summary: "Summary metadata for a single session.",
-        when_to_use: "Use when you already have a session ID and want first prompt, project, duration, tool usage, or counts before reading the whole transcript. See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        when_to_use: "Use an exact indexed session ID for retained message count, sources, and indexed time range. This summary does not establish source completeness or freshness. Read messages with bbox_messages; no producer filesystem access is required.",
         example: None,
     },
     ToolDoc {
         name: "bbox_messages",
         category: ToolCategory::Transcripts,
-        summary: "Chronological messages from a session.",
-        when_to_use: "Use when you need the chronological conversation flow for a known session. Supports pagination, role filter, and tail mode. Also serves the Slack lane, resolved against the conversation landing store instead of a transcript file: `file_path=\"slack:<workspace>/<channel>\"` pages the whole channel, and `session_id=\"<channel>/<date>\"` (the per-channel-per-day bucket a slack hit's `session_id` carries) pages just that day. An unenrolled or unknown channel refuses by name (with a working `bbox_search` next step) rather than \"Session not found.\". See `sm-transcript-retrieval` via `bbox_knowledge` for retrieval ladders.",
+        summary: "Page stored messages by exact session ID or opaque transcript locator. Native replies disclose projection and freshness limits.",
+        when_to_use: "Provide exactly one of session_id or file_path from search. Native pages sort by locator then source byte offset; next_offset advances by the actual returned count under the byte cap. from_end pages from the tail. max_content_length limits preview bytes; zero returns up to 12000 retained bytes per native message, not original-source recovery. Native replies explicitly report projection-only completeness and unknown freshness. Slack file_path selects a channel; its channel/date session_id selects a day through the landing store.",
         example: None,
     },
     ToolDoc {
@@ -279,8 +279,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_inspect_entity",
         category: ToolCategory::Graph,
-        summary: "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation). Tenant-owned evidence bindings surface as an edge family on BOTH endpoints, so the same assertion is discoverable from either side, and each edge carries an `evidence.*` properties family: binding id, assertion authority, the observation or mapping version behind it, each endpoint's status (current, stale, missing, unauthorized, unresolved), and the aggregate freshness shown in brackets in the rendered text. Non-current bindings are retained rather than hidden, because a connector reprojecting or deleting an endpoint changes a binding's freshness but cannot delete the binding. On a project-graph vertex the recommended_next_hops list is schema-declared rather than a direction-blind family count: each hop carries the authoring schema's per-kind label, the direction to follow it, and a ready-to-call `edge_types=... direction=...` cue, and an authored hop with no edges renders `(none)` so an absent answer stays visible.",
-        when_to_use: "Step 3 of the agentic opening sequence (`sm-agentic-opening-sequence`). Prefer targeted inspection over broad sweeps. Set `edge_types` to the specific edges you want, set `direction` to `out` or `in` when known, use `both` only for initial orientation, and set `per_type_limit=0` for property-only inspection. Follow the `recommended_next_hops` list returned in the response: it is ordered semantic-first, and on a project-graph vertex a hop that names a direction is a schema-declared hint: pass its `edge_types` and `direction` back verbatim rather than re-deriving the next call. Read an evidence edge's `evidence.freshness` before relying on it: a `stale` or `missing` binding records what was asserted, not what is still true.",
+        summary: "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Edge omissions are explicit.",
+        when_to_use: "Use after search to verify a ref and inspect relevant relations. Select edge_types and direction (out, in, both). property_mode is summary, smart (default, 300-character text previews), or full; invalid values fail. Inspection caps the aggregate at 100 edges and reports omission counts in edge_truncation. There is currently no edge cursor; narrower edge_types/direction can recover other families but cannot exhaust an oversized single family. Schema-authored absent relations remain explicit; generic empty scaffolding is omitted. Evidence properties retain assertion authority, source generation, endpoint freshness, and unresolved states. No embedded rendered text mirror is returned.",
         example: Some(
             r#"bbox_inspect_entity(entity_ref="knowledge:abc12345", edge_types="SUPERSEDES,DERIVED_FROM", direction="both")"#,
         ),
@@ -309,8 +309,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_describe_schema",
         category: ToolCategory::Graph,
-        summary: "Catalog agentic-corpus entity types and edge families. Default is compact orientation for grounding: graph vocabulary, filterable fields, population counts, and traversal tips without the installed-agent catalog. Pass include_agents=true or mode=\"full\" only when you need installed-agent discovery.",
-        when_to_use: "Step 1 of the agentic opening sequence (`sm-agentic-opening-sequence`). Use once per session for compact orientation; cache the schema mentally. Also use before `bbox_inspect_entity`, `bbox_find_paths`, or evidence bundling when you need graph vocabulary or edge filters. For installed-agent discovery, opt in with include_agents=true.",
+        summary: "Orient to entity types, edge families, and traversal. include_agents=true or mode=\"full\" adds installed agents and consultants.",
+        when_to_use: "Use once for graph vocabulary and traversal orientation. Default omits agent and consultant catalogs; include_agents=true or mode=full adds them. mode=agents is a deprecated full alias; unknown modes fail. dispatch_adapter remains on each agent row. No rendered text mirror or duplicate agent grouping is returned.",
         example: Some("bbox_describe_schema()"),
     },
     ToolDoc {
@@ -325,7 +325,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_bundle_evidence",
         category: ToolCategory::Graph,
-        summary: "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response. Set property_mode=summary for compact provenance bundles over broad/long refs; default is full for compatibility. Evidence bindings between two bundled entities appear under intra_bundle_edges with their full `evidence.*` provenance, and endpoint freshness is re-resolved at bundle time rather than reused from when the path was cached.",
+        summary: "Bundle entity refs and cached path IDs with provenance and current evidence freshness. property_mode=summary reduces bodies; default is full. Stale paths are explicit.",
         when_to_use: "Step 5 of the agentic opening sequence (`sm-agentic-opening-sequence`) — close the loop before answering. Pass `path_ids` from `bbox_find_paths` directly; do not reconstruct path text from memory (the server holds the validated graph). Use `property_mode=\"summary\"` when bundling broad knowledge/tool refs or other long entities. This tool packages evidence only; it does not synthesize the answer for you. When a bundled binding reports a non-current freshness, say so in the answer; the bundle records what was asserted, not that it is still true.",
         example: Some(
             r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"], property_mode="summary")"#,

@@ -135,7 +135,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_hybrid_search",
-        description = "Hybrid BM25+vector search over typed entities and graph vertices. Returns bounded evidence hits and retrieval/degradation status; limit defaults to 10, max 50. include_vectors controls retrieval, not raw vectors. debug=true adds ranking and vector execution diagnostics."
+        description = "Search typed entities with BM25 and vectors. Returns bounded evidence hits and retrieval status. Use debug for ranking diagnostics."
     )]
     pub(crate) async fn bbox_hybrid_search(
         &self,
@@ -239,7 +239,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_context",
-        description = "Conversation context around a specific byte offset."
+        description = "Read surrounding indexed events using a search hit's opaque locator and offset. Native replies disclose projection and freshness limits."
     )]
     pub(crate) async fn bbox_context(
         &self,

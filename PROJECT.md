@@ -190,11 +190,13 @@ DEFAULT; the operator-local overlay repo `~/repos/bbox-cage` owns it (its
   the build submit; the script resolves the immutable digest, assembles the
   operator-local stack env, and runs `pulumi up`; `--preview` dry-runs).
   There is NO local corpus daemon to restart: this host runs only the
-  checkout-bound collectors (code, transcripts) plus fleetd, and
+  checkout-bound code collectors plus fleetd, and
   blackbox.daystrom.app serves everything. Satellites that read nothing
   local (the Slack conversation-source collector) run IN the cage from the
   same runtime image as their own Deployments; converge.sh deploys them
-  too.
+  too. Native provider transcript ingestion still needs its replacement
+  collector/source lane after the cage move; indexed drill-down alone does
+  not collect missing history (gap-e40feb8f).
 - **Interactive heavy worktrees are lanes, not local disk**: claim a warm
   standby lane in seconds (`~/repos/bbox-cage/build/lanes/lane-pool.sh
   claim` prints the checkout path), or create a named one from the

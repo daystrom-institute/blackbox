@@ -64,7 +64,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_messages",
-        description = "Chronological messages from a session."
+        description = "Page stored messages by exact session ID or opaque transcript locator. Native replies disclose projection and freshness limits."
     )]
     pub(crate) async fn bbox_messages(
         &self,

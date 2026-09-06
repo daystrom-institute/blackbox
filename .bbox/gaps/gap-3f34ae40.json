@@ -1,0 +1,21 @@
+{
+  "id": "gap-3f34ae40",
+  "title": "Unpinned Brodex dispatch can inherit an unrelated global account label",
+  "gap_kind": "tooling",
+  "domain": "runtime-allocation",
+  "wanted_capability": "An omitted dispatch account should select only the provider's declared default or native credentials, unless account membership is explicitly configured. account_candidates currently enumerates every global account for every provider, allowing Brodex to select an unrelated OpenRouter account. The label may be misleading when its environment has no Brodex effect, but account environment is also applied to the dispatch.",
+  "missing_primitive": "Provider-scoped implicit account eligibility and tests for omitted-account selection",
+  "fallback_used": "Inspect the selected account and explicitly pin an intended account when needed.",
+  "evidence": [
+    "src/orchestration/allocator.rs: account_candidates",
+    "src/orchestration/brofile.rs: effective_account and resolve_provider_env_for_locality"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/runtime-allocation/cross-provider-account-candidates",
+  "notes": "Reported by operator during MCP contract remediation. Investigate the execution environment separately from the displayed account; no assumption that OpenRouter actually served the request.",
+  "resolution": "unresolved",
+  "project_id": "89bd722f",
+  "created_at": "2026-09-06T04:25:59Z",
+  "updated_at": "2026-09-06T04:25:59Z"
+}

@@ -919,7 +919,7 @@ pub(crate) struct DescribeSchemaParams {
     /// agent list.
     pub include_agents: Option<bool>,
     /// Convenience mode. `full` includes installed agents; `orientation` keeps
-    /// the compact default.
+    /// the compact default. `agents` is a deprecated alias for `full`.
     pub mode: Option<String>,
 }
 
@@ -947,12 +947,13 @@ pub(crate) struct ProjectGraphExactParams {
 }
 
 impl DescribeSchemaParams {
-    fn include_agents_resolved(&self) -> bool {
-        self.include_agents.unwrap_or_else(|| {
-            self.mode
-                .as_deref()
-                .is_some_and(|m| matches!(m, "full" | "agents"))
-        })
+    fn include_agents_resolved(&self) -> Result<bool> {
+        let from_mode = match self.mode.as_deref() {
+            None | Some("orientation") => false,
+            Some("full" | "agents") => true,
+            Some(_) => bail!("Invalid schema mode; use orientation or full"),
+        };
+        Ok(self.include_agents.unwrap_or(from_mode))
     }
 }
 
@@ -960,7 +961,7 @@ impl DescribeSchemaParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_inspect_entity",
-        description = "Inspect a vertex: returns properties AND targeted edges in one call. Prefer targeted inspection over broad exploration: 1) Set edge_types to the specific edges you want (e.g. 'SUPERSEDES,DERIVED_FROM'). 2) Set direction to 'out' or 'in' when you know which way to traverse. 3) Use 'both' only for initial orientation on an unfamiliar entity. 4) Set per_type_limit=0 for property-only inspection. property_mode controls detail: 'summary' (names/titles only), 'smart' (full text <=300 chars, truncated for longer - default), 'full' (no truncation). Tenant-owned evidence bindings surface as an edge family on BOTH endpoints, so the same assertion is discoverable from either side, and each edge carries an `evidence.*` properties family: binding id, assertion authority, the observation or mapping version behind it, each endpoint's status (current, stale, missing, unauthorized, unresolved), and the aggregate freshness shown in brackets in the rendered text. Non-current bindings are retained rather than hidden, because a connector reprojecting or deleting an endpoint changes a binding's freshness but cannot delete the binding. On a project-graph vertex the recommended_next_hops list is schema-declared rather than a direction-blind family count: each hop carries the authoring schema's per-kind label, the direction to follow it, and a ready-to-call `edge_types=... direction=...` cue, and an authored hop with no edges renders `(none)` so an absent answer stays visible."
+        description = "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Edge omissions are explicit."
     )]
     pub(crate) async fn bbox_inspect_entity(
         &self,
@@ -1081,15 +1082,15 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_describe_schema",
-        description = "Catalog agentic-corpus entity types and edge families. Default is compact orientation for grounding: graph vocabulary, filterable fields, population counts, and traversal tips without the installed-agent catalog. Pass include_agents=true or mode=\"full\" only when you need installed-agent discovery."
+        description = "Orient to entity types, edge families, and traversal. include_agents=true or mode=\"full\" adds installed agents and consultants."
     )]
     pub(crate) fn bbox_describe_schema(
         &self,
         Parameters(p): Parameters<DescribeSchemaParams>,
     ) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
+            let include_agents = p.include_agents_resolved()?;
             let read_view = self.state.complete_code_read_view()?;
-            let include_agents = p.include_agents_resolved();
             let agents = include_agents
                 .then(|| self.build_agent_schema_entries())
                 .unwrap_or_default();
@@ -1130,7 +1131,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_bundle_evidence",
-        description = "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response. Set property_mode=summary for compact provenance bundles over broad/long refs; default is full for compatibility. Evidence bindings between two bundled entities appear under intra_bundle_edges with their full `evidence.*` provenance, and endpoint freshness is re-resolved at bundle time rather than reused from when the path was cached."
+        description = "Bundle entity refs and cached path IDs with provenance and current evidence freshness. property_mode=summary reduces bodies; default is full. Stale paths are explicit."
     )]
     pub(crate) async fn bbox_bundle_evidence(
         &self,
@@ -1629,6 +1630,30 @@ impl BlackboxServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_mode_rejects_unknown_values_even_with_explicit_agent_flag() {
+        for include_agents in [None, Some(true), Some(false)] {
+            let params = DescribeSchemaParams {
+                mode: Some("ful".into()),
+                include_agents,
+            };
+            assert!(params.include_agents_resolved().is_err());
+        }
+        assert!(
+            !DescribeSchemaParams::default()
+                .include_agents_resolved()
+                .unwrap()
+        );
+        assert!(
+            DescribeSchemaParams {
+                mode: Some("full".into()),
+                include_agents: None,
+            }
+            .include_agents_resolved()
+            .unwrap()
+        );
+    }
     use crate::artifacts;
     use crate::server::state::SharedState;
     use bbox_indexing::checkout_access::{
@@ -3556,12 +3581,14 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["agents_omitted"].as_bool(), Some(true));
-        assert_eq!(body["agents"].as_array().unwrap().len(), 0);
+        assert!(body.get("agents").is_none());
+        assert!(body.get("consultants").is_none());
+        assert!(body.get("text").is_none());
         assert!(
-            body["text"]
+            body["agents_hint"]
                 .as_str()
                 .unwrap()
-                .contains("Omitted from compact orientation")
+                .contains("include_agents")
         );
     }
 
@@ -3617,7 +3644,7 @@ mod tests {
         }));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(body["agents_omitted"].as_bool(), Some(false));
+        assert!(body.get("agents_omitted").is_none());
         let agents = body["agents"].as_array().expect("agents array");
         assert_eq!(agents.len(), 2);
         let schema_tester = agents
@@ -3647,11 +3674,7 @@ mod tests {
             "badgey-agent has empty anti_patterns but field must be present"
         );
 
-        let by_adapter = body["agents_by_dispatch_adapter"]
-            .as_object()
-            .expect("agents_by_dispatch_adapter object");
-        assert_eq!(by_adapter["direct"].as_array().unwrap().len(), 1);
-        assert_eq!(by_adapter["badgey"].as_array().unwrap().len(), 1);
+        assert!(body.get("agents_by_dispatch_adapter").is_none());
     }
 
     /// gap-edc84378: transcript entities are deliberately excluded from
