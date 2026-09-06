@@ -319,7 +319,7 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
 impl BlackboxServer {
     #[tool(
         name = "bbox_project_register",
-        description = "Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. In catalog mode this is the find-or-create composite: the checkout attaches to the project owning its committed scope (or a new Published/LegacyLocal project is minted), config-declared aliases become pending nominations, and a scope disagreement returns the exact promotion or scope-migration handoff instead of a second project. Use bbox_project_list to inspect registered projects."
+        description = "Checkout-host administration: requires local checkout authority; remote checkout onboarding uses the checkout-host collector. Register a project directory and schedule background agentic-corpus indexing. The path must be an absolute directory path (file paths and missing paths are rejected). Re-registering the same canonical path is idempotent — returns the existing record without modifying registered_at. project_id is derived from canonicalized realpath and is per-machine; repo_id derives from first commit SHA with remote fallback. In catalog mode this is the find-or-create composite: the checkout attaches to the project owning its committed scope (or a new Published/LegacyLocal project is minted), config-declared aliases become pending nominations, and a scope disagreement returns the exact promotion or scope-migration handoff instead of a second project. Use bbox_project_catalog_list for logical projects in catalog mode, or bbox_project_list for bridge registered roots."
     )]
     pub(crate) async fn bbox_project_register(
         &self,
@@ -679,7 +679,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_init",
-        description = "Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories, and records the durable repo_id for Git projects. Idempotent by default; force=true refreshes replaceable skeleton files but always merge-preserves identity-bearing config.toml."
+        description = "Checkout-host initialization, requiring local filesystem authority; remote checkouts initialize through their owning host collector. Initialize a project-local .bbox workspace. Creates `.bbox/config.toml`, `.bbox/mcp.json`, `.bbox/local/.gitignore` and default subdirectories, and records the durable repo_id for Git projects. Idempotent by default; force=true refreshes replaceable skeleton files but always merge-preserves identity-bearing config.toml."
     )]
     pub(crate) async fn bbox_project_init(
         &self,
@@ -1295,7 +1295,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_list",
-        description = "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered."
+        description = "Compatibility attached-root discovery for bridge callers; catalog-mode logical discovery uses bbox_project_catalog_list, including remote-only projects. List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered."
     )]
     pub(crate) fn bbox_project_list(&self) -> CallToolResult {
         Self::ok_json(
