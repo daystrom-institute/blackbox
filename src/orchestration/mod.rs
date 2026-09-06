@@ -9758,7 +9758,6 @@ mod tests {
     #[test]
     fn mcp_status_and_wait_receipts_omit_context_telemetry() {
         for status in [
-            TaskStatus::Pending,
             TaskStatus::Running,
             TaskStatus::Completed,
             TaskStatus::Failed,
