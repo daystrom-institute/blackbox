@@ -12,9 +12,7 @@ use crate::projects::{
     ProjectEjectParams, ProjectInitParams, ProjectListResponse, ProjectRegisterParams,
     ProjectRenameParams, ProjectUnregisterParams,
 };
-use crate::server::routes::{
-    migrate_project_refs, project_ref_counts, trigger_project_bootstrap_arc,
-};
+use crate::server::routes::{migrate_project_refs, project_ref_counts};
 use crate::server::state::BlackboxServer;
 use crate::tools::project_catalog::CatalogPathAuthority;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -665,7 +663,6 @@ impl BlackboxServer {
                 });
             }
 
-            trigger_project_bootstrap_arc(server.state.clone(), record.clone());
             let response = json!({
                 "record": record,
                 "project_config_loaded": project_config_loaded,

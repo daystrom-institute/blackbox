@@ -5,470 +5,26 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::extract::{Query, State as AxumState};
 use axum::response::IntoResponse;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::state::{ArcSnapshot, BlackboxServer, SharedState, SignalEvent, WebhookDelivery};
-use super::workflow_capabilities::validate_workflow_capabilities;
+use super::state::{BlackboxServer, SharedState};
 use crate::artifacts::{
     self, ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
 use crate::chunker;
-use crate::crons;
 use crate::edge_index;
 use crate::entity_ref;
 use crate::index;
 use crate::orchestration;
 use crate::orchestration::providers::Provider;
 use crate::packets::{self, apply_with as apply_packet_with};
-use crate::pollers;
 use crate::projects::ProjectRecord;
-use crate::routing;
 use crate::tools::bro_helpers::{
     build_member_entry, infer_provider_from_path, roster_entry_key, split_csv,
 };
-use crate::tools::bro_runtime_params::{
-    BroRosterEntry, OrchestrateListEntry, OrchestrateRequest, OrchestrateStatusQuery,
-    OrchestrateStatusResponse, RosterQuery,
-};
+use crate::tools::bro_runtime_params::{BroRosterEntry, RosterQuery};
 use crate::util;
-use crate::webhooks;
-use crate::workflow;
-
-pub(crate) async fn orchestrate_list_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    // Snapshot threads + notes via the raw stores so we don't hold
-    // any parking_lot guard across an await (there aren't any awaits
-    // in this handler, but the pattern is still cleaner).
-    let entries: Vec<OrchestrateListEntry> = {
-        let threads = state.threads.read();
-        let notes = state.notes.read();
-        let mut out: Vec<OrchestrateListEntry> = threads
-            .all()
-            .iter()
-            .filter(|t| {
-                matches!(t.kind, Some(crate::threads::ThreadKind::WorkItem))
-                    && t.name.as_deref().is_some_and(|n| n.starts_with("wf-"))
-            })
-            .map(|t| {
-                let tid = &t.id;
-                let mut latest_anchor: Option<(String, String)> = None;
-                let mut final_status: Option<String> = None;
-                let mut note_count = 0usize;
-                for n in notes.all() {
-                    if n.thread_id.as_deref() != Some(tid.as_str()) {
-                        continue;
-                    }
-                    note_count += 1;
-                    let body = n.body.as_str();
-                    if body.starts_with("ANCHOR ") {
-                        let is_newer = latest_anchor
-                            .as_ref()
-                            .map(|(ts, _)| n.created_at.as_str() > ts.as_str())
-                            .unwrap_or(true);
-                        if is_newer {
-                            latest_anchor = Some((n.created_at.clone(), body.to_string()));
-                        }
-                    }
-                    if body.starts_with("workflow ") && body.contains("completed in") {
-                        final_status = Some("completed".into());
-                    } else if body.starts_with("workflow errored") {
-                        final_status = Some("errored".into());
-                    } else if body.starts_with("paused at user node") {
-                        final_status = Some("paused".into());
-                    } else if body.starts_with("policy halt") {
-                        final_status = Some("policy_halt".into());
-                    }
-                }
-                OrchestrateListEntry {
-                    thread_id: t.id.clone(),
-                    name: t.name.clone(),
-                    topic: t.topic.clone(),
-                    status: t.status.as_ref().to_string(),
-                    created_at: t.created_at.clone(),
-                    last_activity: t.last_activity.clone(),
-                    project: if t.project.is_empty() {
-                        None
-                    } else {
-                        Some(t.project.clone())
-                    },
-                    latest_anchor: latest_anchor.map(|(_, b)| b),
-                    final_status,
-                    note_count,
-                }
-            })
-            .collect();
-        out.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
-        out
-    };
-    axum::Json(entries).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OrchestratePeekQuery {
-    /// Optional thread_id filter — when set, return only that arc's
-    /// snapshot. When absent, return all running_arcs entries.
-    #[serde(default)]
-    thread_id: Option<String>,
-}
-
-pub(crate) async fn orchestrate_peek_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    Query(q): Query<OrchestratePeekQuery>,
-) -> impl axum::response::IntoResponse {
-    let map = state.running_arcs.read();
-    match q.thread_id {
-        Some(tid) => match map.get(&tid) {
-            Some(s) => axum::Json(serde_json::to_value(s).unwrap_or_default()),
-            None => axum::Json(serde_json::json!({
-                "error": format!("no arc snapshot for thread_id={tid}")
-            })),
-        },
-        None => {
-            let mut all: Vec<&ArcSnapshot> = map.values().collect();
-            all.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            axum::Json(serde_json::to_value(&all).unwrap_or_default())
-        }
-    }
-}
-
-pub(crate) async fn orchestrate_status_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    Query(q): Query<OrchestrateStatusQuery>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let requested_id = q.thread_id;
-    let resolved_thread_id = resolve_orchestrate_thread_id(&state, &requested_id);
-    // Snapshot notes linked to this thread via the raw store.
-    let entries: Vec<Value> = {
-        let store = state.notes.read();
-        store
-            .all()
-            .iter()
-            .filter(|n| n.thread_id.as_deref() == Some(resolved_thread_id.as_str()))
-            .map(|n| serde_json::to_value(n).unwrap_or_default())
-            .collect()
-    };
-    let latest_anchor = entries
-        .iter()
-        .filter(|e| {
-            e.get("body")
-                .and_then(Value::as_str)
-                .map(|b| b.starts_with("ANCHOR "))
-                .unwrap_or(false)
-        })
-        .max_by_key(|e| {
-            e.get("created_at")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        })
-        .and_then(|e| e.get("body").and_then(Value::as_str).map(String::from));
-    axum::Json(OrchestrateStatusResponse {
-        thread_id: resolved_thread_id,
-        notes: entries,
-        latest_anchor,
-    })
-    .into_response()
-}
-
-pub(crate) fn resolve_orchestrate_thread_id(state: &SharedState, requested_id: &str) -> String {
-    if requested_id.starts_with("thread-") {
-        return requested_id.to_string();
-    }
-
-    state
-        .running_arcs
-        .read()
-        .values()
-        .find(|snapshot| snapshot.arc_id == requested_id || snapshot.arc_thread_id == requested_id)
-        .map(|snapshot| snapshot.arc_thread_id.clone())
-        .unwrap_or_else(|| requested_id.to_string())
-}
-
-pub(crate) async fn orchestrate_stream_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<OrchestrateRequest>,
-) -> axum::response::Sse<
-    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
-> {
-    use axum::response::Sse;
-    use axum::response::sse::Event;
-    let compiled = workflow::compile(req.workflow);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-
-    // Kick off the run on a background task; events stream via tx.
-    tokio::spawn(async move {
-        let state_clone = state.clone();
-        let server = BlackboxServer::new(state_clone);
-        match compiled {
-            Err(e) => {
-                let _ = tx.send(json!({
-                    "kind": "compile_error",
-                    "data": {"message": e.to_string()},
-                    "timestamp": crate::util::now_iso(),
-                }));
-            }
-            Ok(compiled) => {
-                let result = workflow::run_workflow_streaming(
-                    &server,
-                    &compiled,
-                    req.project_dir,
-                    req.max_steps,
-                    tx.clone(),
-                )
-                .await;
-                // Terminal frame: the full result. Clients should
-                // detect `kind: "result"` as end-of-run.
-                let _ = tx.send(json!({
-                    "kind": "result",
-                    "data": result,
-                    "timestamp": crate::util::now_iso(),
-                }));
-            }
-        }
-        // tx dropped here closes the stream.
-    });
-
-    let stream = async_stream::stream! {
-        while let Some(ev) = rx.recv().await {
-            let s = ev.to_string();
-            yield Ok::<_, std::convert::Infallible>(Event::default().data(s));
-        }
-    };
-    Sse::new(stream)
-}
-
-pub(crate) async fn orchestrate_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<OrchestrateRequest>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let compiled = match workflow::compile(req.workflow) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("compile failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-    // Stateful capability validation must gate this path too. The MCP
-    // `bro_orchestrate_run` path already validates before dry-run; keep the
-    // plain HTTP dry-run on the same validation path.
-    if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("capability validation: {e}"),
-        )
-            .into_response();
-    }
-    if req.dry_run {
-        return axum::Json(workflow::engine::dry_run(&compiled)).into_response();
-    }
-    let server = BlackboxServer::new(state);
-    let result = workflow::run_workflow(&server, &compiled, req.project_dir, req.max_steps).await;
-    axum::Json(result).into_response()
-}
-
-/// HTTP webhook ingestion endpoint. URL: `POST /webhook/:name`.
-///
-/// Pipeline (in order):
-///   1. Look up WebhookSpec by name (404 if unknown)
-///   2. Verify signature scheme against headers + raw body
-///   3. Optional delivery-id dedup (Forgejo: X-Gitea-Delivery)
-///   4. Run extractor over payload → flat entity
-///   5. Apply routing packet → RoutingVerdict
-///   6. Dispatch verdict (start_arc | signal_arc | cancel_arc | ignore | dead_letter)
-pub(crate) async fn webhook_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let header_map = headers_to_lowercase_map(&headers);
-    let header_subset = header_subset_for_log(&header_map);
-    let body_bytes: &[u8] = &body;
-    let outcome = process_webhook(&state, &name, &header_map, body_bytes).await;
-    let (status, response_body) = match &outcome {
-        Ok(v) => (200u16, v.clone()),
-        Err(e) => (400u16, json!({"error": e.to_string()})),
-    };
-    let entity = response_body
-        .get("extracted_entity")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let verdict_classification = response_body
-        .get("status")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if status == 200 {
-                "unknown".into()
-            } else {
-                "error".into()
-            }
-        });
-    state.record_webhook(WebhookDelivery {
-        received_at: util::now_iso(),
-        webhook_name: name.clone(),
-        source: "webhook".into(),
-        headers: header_subset,
-        extracted_entity: entity,
-        verdict_classification,
-        response_status: status,
-        response_body: response_body.clone(),
-    });
-    match outcome {
-        Ok(verdict_json) => (axum::http::StatusCode::OK, axum::Json(verdict_json)).into_response(),
-        Err(e) => {
-            tracing::warn!("webhook /{name}: {e}");
-            (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("webhook error: {e}"),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Replay an arbitrary payload through a webhook's extractor + routing
-/// packet WITHOUT dispatching the verdict. Returns the extracted entity
-/// + routing verdict so authors can debug without firing arcs.
-/// URL: `POST /webhook/:name/replay`. Skips signature verification.
-pub(crate) async fn webhook_replay_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> impl axum::response::IntoResponse {
-    let header_map = headers_to_lowercase_map(&headers);
-    use axum::response::IntoResponse;
-    let payload: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("payload not JSON: {e}"),
-            )
-                .into_response();
-        }
-    };
-    match webhook_replay_inner(&state, &name, &payload, &header_map) {
-        Ok(response_body) => axum::Json(response_body).into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
-    }
-}
-
-/// Shared replay path used by both the HTTP `/webhook/:name/replay`
-/// endpoint and the `bro_webhook_replay` MCP tool. Records the result
-/// into the delivery ring buffer with `source: replay`.
-pub(crate) fn webhook_replay_inner(
-    state: &Arc<SharedState>,
-    name: &str,
-    payload: &Value,
-    headers: &HashMap<String, String>,
-) -> Result<Value, (axum::http::StatusCode, String)> {
-    use axum::http::StatusCode;
-    let spec = state
-        .webhooks
-        .get(name)
-        .ok_or((StatusCode::NOT_FOUND, format!("unknown webhook '{name}'")))?;
-    let combined = combine_payload_and_headers(payload, headers);
-    let entity = spec
-        .extractor
-        .extract(&combined)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("extractor failed: {e}")))?;
-    let prediction = {
-        let store = state.packets.read();
-        let packet = store.load(&spec.routing_packet).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("routing packet load: {e}"),
-            )
-        })?;
-        apply_packet_with(&packet, &entity, &*store)
-    };
-    let verdict_kind = prediction
-        .as_ref()
-        .map(|p| p.classification.clone())
-        .unwrap_or_else(|| "no_match".into());
-    let verdict = prediction.map(|p| p.consequent.to_json());
-    let response_body = json!({
-        "entity": entity.clone(),
-        "verdict_classification": verdict_kind.clone(),
-        "verdict_consequent": verdict,
-    });
-    state.record_webhook(WebhookDelivery {
-        received_at: util::now_iso(),
-        webhook_name: name.to_string(),
-        source: "replay".into(),
-        headers: header_subset_for_log(headers),
-        extracted_entity: entity,
-        verdict_classification: verdict_kind,
-        response_status: 200,
-        response_body: response_body.clone(),
-    });
-    Ok(response_body)
-}
-
-/// Subset of inbound headers preserved in the webhook delivery log.
-/// Lowercased `x-*` headers carry the routing-relevant signal (event
-/// type, delivery id, signature header). Bulk Forgejo/GitHub
-/// boilerplate (`accept`, `user-agent`, `content-length`) and the
-/// signature value itself are dropped — keeps the buffer small and
-/// avoids leaking signature bytes into the read surface.
-pub(crate) fn header_subset_for_log(
-    headers: &HashMap<String, String>,
-) -> serde_json::Map<String, Value> {
-    headers
-        .iter()
-        .filter(|(k, _)| k.starts_with("x-"))
-        .filter(|(k, _)| !k.contains("signature"))
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect()
-}
-
-pub(crate) fn headers_to_lowercase_map(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|s| (k.as_str().to_lowercase(), s.to_string()))
-        })
-        .collect()
-}
-
-/// Wrap a webhook body into a single Value that the Extractor can
-/// project from. Body fields stay at the top level (so canonical
-/// `$.action` / `$.pull_request.number` paths work) and headers are
-/// available under `$._headers.<name>` for header-driven routing
-/// (Forgejo's event type is in `X-Gitea-Event`, not the body).
-pub(crate) fn combine_payload_and_headers(
-    payload: &Value,
-    headers: &HashMap<String, String>,
-) -> Value {
-    let mut map = match payload {
-        Value::Object(m) => m.clone(),
-        other => {
-            let mut m = serde_json::Map::new();
-            m.insert("_payload".into(), other.clone());
-            m
-        }
-    };
-    let header_obj: serde_json::Map<String, Value> = headers
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect();
-    map.insert("_headers".into(), Value::Object(header_obj));
-    Value::Object(map)
-}
 
 /// True iff the bind host string resolves to a loopback address.
 /// Recognized: `127.0.0.0/8` literals, `localhost` (string match —
@@ -483,345 +39,6 @@ pub(crate) fn is_loopback_bind(bind_host: &str) -> bool {
         return ip.is_loopback();
     }
     false
-}
-
-pub(crate) async fn process_webhook(
-    state: &Arc<SharedState>,
-    name: &str,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-) -> anyhow::Result<Value> {
-    let spec = state
-        .webhooks
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown webhook '{name}'"))?;
-
-    // Signature verification (loopback flag controls the `none`
-    // scheme escape hatch — defense in depth alongside install_check).
-    webhooks::verify_signature(&spec.signature, headers, body, state.bind_is_loopback)
-        .map_err(|e| anyhow::anyhow!("signature: {e}"))?;
-
-    // Delivery-id dedup (idempotency).
-    let delivery_id = spec
-        .delivery_id_header
-        .as_deref()
-        .and_then(|h| headers.get(&h.to_lowercase()))
-        .map(|s| s.as_str());
-    if !state.webhooks.check_delivery_id(name, delivery_id) {
-        tracing::info!(
-            "webhook '{name}': dropped duplicate delivery {:?}",
-            delivery_id
-        );
-        return Ok(json!({"status": "duplicate_dropped"}));
-    }
-
-    let payload: Value =
-        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("payload not JSON: {e}"))?;
-
-    // Combined extractor input: payload fields at top level (so
-    // ordinary Forgejo paths like `$.action`, `$.pull_request.number`
-    // work) PLUS `_headers` for header-driven event-type routing.
-    let combined = combine_payload_and_headers(&payload, headers);
-
-    // Project payload via extractor.
-    let entity = spec
-        .extractor
-        .extract(&combined)
-        .map_err(|e| anyhow::anyhow!("extractor: {e}"))?;
-
-    // Apply routing packet.
-    let prediction = {
-        let store = state.packets.read();
-        let packet = store
-            .load(&spec.routing_packet)
-            .map_err(|e| anyhow::anyhow!("routing packet load: {e}"))?;
-        apply_packet_with(&packet, &entity, &*store)
-    };
-
-    let consequent_json = match prediction {
-        Some(p) => p.consequent.to_json(),
-        None => {
-            tracing::warn!(
-                "webhook '{name}': routing packet '{}' produced no_match — dead-lettering. entity={}",
-                spec.routing_packet,
-                entity
-            );
-            // no_match IS a processed outcome: commit the delivery id.
-            state.webhooks.record_delivery_id(name, delivery_id);
-            return Ok(json!({
-                "status": "no_match",
-                "reason": "routing packet returned no_match (default → dead-letter)",
-                "extracted_entity": entity,
-            }));
-        }
-    };
-
-    // Resolve `${entity.X}` references inside the routing verdict
-    // (typed: `${entity.pr_number}` becomes `Number(117)`, not the
-    // string `"117"`) so routing rules can carry typed correlation
-    // tuples + payload selections without the rule author hand-
-    // encoding entity scalars.
-    let resolved_consequent = routing::resolve_entity_template(&entity, &consequent_json);
-    let verdict = routing::RoutingVerdict::parse(&resolved_consequent)
-        .map_err(|e| anyhow::anyhow!("verdict parse: {e}"))?;
-
-    let result = dispatch_verdict(
-        state.clone(),
-        &spec.name,
-        spec.default_project_dir.clone(),
-        verdict,
-        entity,
-    )
-    .await;
-    // Commit-on-success: a delivery whose verdict dispatch FAILED must
-    // stay fresh so the sender's retry reprocesses it instead of
-    // receiving `duplicate_dropped` (a 200 that reads as success to a
-    // durable sender like the bro-slack spool, which would then delete
-    // an envelope that was never dispatched).
-    if result.is_ok() {
-        state.webhooks.record_delivery_id(name, delivery_id);
-    }
-    result
-}
-
-pub(crate) async fn dispatch_verdict(
-    state: Arc<SharedState>,
-    inlet_name: &str,
-    default_project_dir: Option<String>,
-    verdict: routing::RoutingVerdict,
-    entity: Value,
-) -> anyhow::Result<Value> {
-    use routing::RoutingVerdict;
-    match verdict {
-        RoutingVerdict::Ignore => Ok(json!({"status": "ignored"})),
-        RoutingVerdict::DeadLetter { reason } => {
-            tracing::warn!("{inlet_name}: dead-lettered (reason={:?})", reason);
-            Ok(json!({
-                "status": "dead_letter",
-                "reason": reason,
-                "extracted_entity": entity,
-            }))
-        }
-        RoutingVerdict::SignalArc {
-            signal,
-            correlate,
-            payload,
-        } => {
-            // Carry the routing verdict's payload (or, when absent,
-            // the full extracted entity) through to the resumed wait
-            // as `${last_signal.payload}`. Without this hooks like
-            // `set_var feedback_text = ${last_signal.payload.review.body}`
-            // would only see the correlation tuple.
-            let signal_payload = payload.unwrap_or_else(|| entity.clone());
-            let resolved = signal_arc_dispatch(
-                &state,
-                &signal,
-                correlate.clone(),
-                signal_payload,
-                SignalDispatchOrigin::Direct,
-                None,
-            )
-            .await;
-            Ok(resolved)
-        }
-        RoutingVerdict::CancelArc { correlate } => {
-            // Match running arcs whose pending-wait correlation is a
-            // superset of `correlate`: every key in the verdict's
-            // tuple must be present with the same value somewhere on
-            // the arc's wait registrations. Empty correlate matches
-            // every running arc (the broadcast-cancel form). Each
-            // matching arc gets its CancellationToken tripped.
-            let mut cancelled: Vec<String> = Vec::new();
-            // Snapshot the wait store and find arc ids whose
-            // registrations contain a tuple matching `correlate`.
-            let snapshot = state.wait_store.snapshot();
-            let mut matching_arc_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for w in snapshot {
-                let matches = correlate.is_empty()
-                    || correlate
-                        .iter()
-                        .all(|(k, v)| w.correlation.get(k) == Some(v));
-                if matches {
-                    matching_arc_ids.insert(w.arc_id);
-                }
-            }
-            for arc_id in matching_arc_ids {
-                if state.cancel_arc(&arc_id) {
-                    cancelled.push(arc_id);
-                }
-            }
-            Ok(json!({
-                "status": "cancel_arc_dispatched",
-                "cancelled_arcs": cancelled,
-                "correlate": correlate,
-            }))
-        }
-        RoutingVerdict::StartArc {
-            workflow: workflow_id,
-            initial_vars,
-        } => {
-            let registry = state.workflow_registry.clone();
-            let spec_clone = {
-                let map = registry.read();
-                map.get(&workflow_id).cloned()
-            };
-            let workflow_spec = spec_clone.ok_or_else(|| {
-                anyhow::anyhow!("start_arc verdict references unknown workflow id '{workflow_id}'")
-            })?;
-            let compiled = workflow::compile(workflow_spec)
-                .map_err(|e| anyhow::anyhow!("workflow compile: {e}"))?;
-            // Validate brofile/team capability composition against the
-            // workflow's actor `requires` lists. Webhook ingress used
-            // to skip this and let dispatch silently downgrade — fix
-            // is to gate the spawn on the same check the MCP / HTTP
-            // dispatch paths already use.
-            if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
-                return Err(anyhow::anyhow!(
-                    "workflow '{workflow_id}' capability validation: {e}"
-                ));
-            }
-            // Strict subworkflow_ref seam validation on the ROUTED start
-            // path too: install is deliberately lenient (warnings, so
-            // install order stays free), but an arc must not start and
-            // do real work only to fail at the ref node hours later.
-            if let Err(e) = workflow::validate_subworkflow_refs(
-                &compiled.spec,
-                &|id: &str| state.workflow_registry.read().get(id).cloned(),
-                true,
-            ) {
-                return Err(anyhow::anyhow!(
-                    "workflow '{workflow_id}' subworkflow_ref validation: {e}"
-                ));
-            }
-            // Merge: extracted entity → initial_vars → caller's
-            // explicit verdict initial_vars. Last writer wins, so
-            // a routing rule's verdict can override entity fields if
-            // it really needs to. Workflow vars_schema validates;
-            // unknown keys are accepted (open schema by design).
-            let mut merged_vars = serde_json::Map::new();
-            if let Value::Object(m) = &entity {
-                for (k, v) in m {
-                    // Skip the synthetic `_headers` collection — it's
-                    // there for routing predicates, not for the arc.
-                    if k == "_headers" {
-                        continue;
-                    }
-                    if !matches!(v, Value::Null) {
-                        merged_vars.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            for (k, v) in initial_vars {
-                merged_vars.insert(k, v);
-            }
-            // Singleton admission, routing-layer half: when the key is
-            // already held, apply the workflow's on_conflict policy
-            // WITHOUT spawning. The runner-side claim remains the
-            // atomic enforcement point (two deliveries racing past this
-            // advisory check spawn two arcs, and the second's claim
-            // refuses at run start); this layer exists to give the
-            // duplicate a useful outcome - dropped with the holder
-            // named, or converted into a signal on the running arc.
-            if let Some(admission) = compiled.spec.admission.clone() {
-                let mut key_map = serde_json::Map::new();
-                let mut missing: Vec<String> = Vec::new();
-                for k in &admission.key {
-                    match merged_vars.get(k) {
-                        Some(v) if !v.is_null() => {
-                            key_map.insert(k.clone(), v.clone());
-                        }
-                        _ => missing.push(k.clone()),
-                    }
-                }
-                if !missing.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "start_arc admission key var(s) {missing:?} missing from merged vars for workflow '{workflow_id}'"
-                    ));
-                }
-                let canonical = workflow::wait::canonicalize_correlation(&key_map);
-                if let Some(holder) = state.arc_admission_holder(&compiled.spec.name, &canonical) {
-                    use crate::workflow::schema::AdmissionConflict;
-                    match admission.on_conflict {
-                        AdmissionConflict::Ignore => {
-                            return Ok(json!({
-                                "status": "duplicate_admission",
-                                "workflow": workflow_id,
-                                "admission_key": canonical,
-                                "holder_arc_id": holder,
-                            }));
-                        }
-                        AdmissionConflict::Signal => {
-                            let sig = admission.conflict_signal_name().to_string();
-                            // Target the HOLDING arc explicitly: the
-                            // `_target_arc` correlation key restricts both
-                            // live matching and any later ledger catch-up
-                            // to the holder, so an unrelated arc with a
-                            // broadcast wait cannot swallow the duplicate.
-                            let mut targeted = key_map.clone();
-                            targeted.insert("_target_arc".to_string(), json!(holder.clone()));
-                            let resolved = signal_arc_dispatch(
-                                &state,
-                                &sig,
-                                targeted,
-                                Value::Object(merged_vars.clone()),
-                                SignalDispatchOrigin::Direct,
-                                None,
-                            )
-                            .await;
-                            return Ok(json!({
-                                "status": "duplicate_admission_signaled",
-                                "workflow": workflow_id,
-                                "admission_key": canonical,
-                                "holder_arc_id": holder,
-                                "signal": sig,
-                                "dispatch": resolved,
-                            }));
-                        }
-                    }
-                }
-            }
-            // project_dir resolution priority:
-            //   1. ${INLET_NAME_UPPERCASE}_PROJECT_DIR env override
-            //      (works for webhooks AND pollers — both pass their
-            //      `name` as inlet_name)
-            //   2. inlet's `default_project_dir`
-            //   3. None (worktree hooks will fail explicitly — better
-            //      than silent fallback to cwd)
-            let env_var = format!(
-                "{}_PROJECT_DIR",
-                inlet_name.to_uppercase().replace('-', "_")
-            );
-            let project_dir = std::env::var(&env_var).ok().or(default_project_dir);
-            let workflow_id_clone = workflow_id.clone();
-            // If the inlet that triggered this arc was a cron, the
-            // cron registry has already incremented its in-flight
-            // counter (in crons::run_one_tick → try_claim). Decrement
-            // when the arc terminates so the next tick is admissible.
-            // Inlets are labeled `cron:<name>` upstream; parse out the
-            // name here.
-            let cron_name = inlet_name.strip_prefix("cron:").map(|s| s.to_string());
-            let crons_for_done = state.crons.clone();
-            let server = BlackboxServer::new(state.clone());
-            tokio::spawn(async move {
-                let _result = workflow::run_workflow_with_initial_vars(
-                    &server,
-                    &compiled,
-                    project_dir,
-                    Some(50),
-                    merged_vars,
-                )
-                .await;
-                if let Some(name) = cron_name {
-                    crons_for_done.mark_done(&name);
-                }
-            });
-            Ok(json!({
-                "status": "arc_started",
-                "workflow": workflow_id_clone,
-            }))
-        }
-    }
 }
 
 /// Dispatch an installed workflow by registry id, with optional initial
@@ -840,71 +57,6 @@ pub(crate) struct OrchestrateByIdRequest {
     await_completion: Option<bool>,
     #[serde(default)]
     timeout_seconds: Option<f64>,
-}
-
-pub(crate) async fn orchestrate_by_id_handler(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<OrchestrateByIdRequest>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let spec = match state
-        .workflow_registry
-        .read()
-        .get(&req.workflow_id)
-        .cloned()
-    {
-        Some(s) => s,
-        None => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                format!("workflow id '{}' not in registry", req.workflow_id),
-            )
-                .into_response();
-        }
-    };
-    let compiled = match workflow::compile(spec) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("compile failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let server = BlackboxServer::new(state.clone());
-    if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("capability validation failed: {e}"),
-        )
-            .into_response();
-    }
-    let (task, arc_id) =
-        server.spawn_workflow_task(compiled, req.project_dir, req.max_steps, req.initial_vars);
-    if req.await_completion.unwrap_or(false) {
-        let completed = orchestration::wait_for_task_with_timeout(&task, req.timeout_seconds).await;
-        let mut out = if completed {
-            orchestration::task_result_json(&task)
-        } else {
-            orchestration::timeout_snapshot_json(&task)
-        };
-        out["arcId"] = Value::String(arc_id);
-        return axum::Json(out).into_response();
-    }
-    let inner = task.inner.lock();
-    axum::Json(serde_json::json!({
-        "taskId": inner.id,
-        "sessionId": inner.session_id,
-        "arcId": arc_id,
-        "status": "running",
-        "poll": {
-            "status_tool": "bro_status",
-            "wait_tool": "bro_wait",
-            "arc_status_tool": "bro_arc_status"
-        }
-    }))
-    .into_response()
 }
 
 // ── Admin HTTP endpoints (plain JSON; no MCP framing) ──────────────
@@ -1133,6 +285,15 @@ pub(crate) async fn install_artifact_value(
     p: ArtifactInstallParams,
     mut value: Value,
 ) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    anyhow::ensure!(
+        !matches!(
+            p.kind,
+            artifacts::ArtifactKind::Workflow
+                | artifacts::ArtifactKind::Atom
+                | artifacts::ArtifactKind::Cron
+        ),
+        "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+    );
     let mut completed = Vec::new();
     let mut failed = "validation";
     let kind = p.kind;
@@ -1151,13 +312,21 @@ pub(crate) async fn install_artifact_value(
         supersedes.is_some_and(|previous| Some(previous) != requested_name.as_deref());
     let mut remaining = vec!["validation"];
     remaining.extend(match kind {
-        artifacts::ArtifactKind::Workflow => vec!["workflow_file", "workflow_registry"],
+        artifacts::ArtifactKind::Workflow => {
+            anyhow::bail!(
+                "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+            );
+        }
         artifacts::ArtifactKind::Packet => vec!["packet_compilation"],
         artifacts::ArtifactKind::Brofile => vec!["brofile_file", "brofile_verification"],
         artifacts::ArtifactKind::Team => {
             vec!["teamplate_file", "team_instance", "team_verification"]
         }
-        artifacts::ArtifactKind::Cron => vec!["cron_file", "cron_registry", "cron_loop"],
+        artifacts::ArtifactKind::Cron => {
+            anyhow::bail!(
+                "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+            );
+        }
         _ => vec![],
     });
     remaining.push("catalog_persistence");
@@ -1212,24 +381,9 @@ pub(crate) async fn install_artifact_value(
         )> = None;
         match p.kind {
             artifacts::ArtifactKind::Workflow => {
-                let spec: workflow::Workflow = serde_json::from_value(value.clone())?;
-                let compiled = workflow::compile(spec.clone())?;
-                if let Err(e) = validate_workflow_capabilities(&compiled, state) {
-                    anyhow::bail!("workflow capability validation failed: {e}");
-                }
-                completed.push("validation");
-                failed = "workflow_file";
-                let id = spec.name.clone();
-                let dir = state.store_dir.join("workflows");
-                std::fs::create_dir_all(&dir)?;
-                crate::json_store::atomic_write_json_locked(
-                    &dir.join(format!("{id}.json")),
-                    &spec,
-                )?;
-                completed.push("workflow_file");
-                failed = "workflow_registry";
-                state.workflow_registry.write().insert(id, spec);
-                completed.push("workflow_registry");
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                );
             }
             artifacts::ArtifactKind::Packet => {
                 let params: packets::CompileParams = serde_json::from_value(value.clone())?;
@@ -1321,24 +475,9 @@ pub(crate) async fn install_artifact_value(
                 completed.push("team_verification");
             }
             artifacts::ArtifactKind::Cron => {
-                let spec: crons::CronSpec = serde_json::from_value(value.clone())?;
-                spec.validate()?;
-                completed.push("validation");
-                failed = "cron_file";
-                let dir = state.store_dir.join("crons");
-                std::fs::create_dir_all(&dir)?;
-                crate::json_store::atomic_write_json_locked(
-                    &dir.join(format!("{}.json", spec.name)),
-                    &spec,
-                )?;
-                completed.push("cron_file");
-                failed = "cron_registry";
-                state.crons.install(spec.clone());
-                completed.push("cron_registry");
-                failed = "cron_loop";
-                let handle = crons::spawn_loop(state.clone(), spec.clone());
-                state.crons.track_handle(&spec.name, handle);
-                completed.push("cron_loop");
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                );
             }
             artifacts::ArtifactKind::Agent => {
                 if !value.is_object() {
@@ -1397,27 +536,9 @@ pub(crate) async fn install_artifact_value(
                 installed_agent = Some((agent_ref, manifest, install_warnings));
             }
             artifacts::ArtifactKind::Atom => {
-                if !value.is_object() {
-                    anyhow::bail!("atom artifact must be a JSON object");
-                }
-                let catalog = state.artifacts.read();
-                let ctx = orchestration::atoms::validate::InstallCtx {
-                    brofile_exists: |name: &str| -> bool {
-                        catalog
-                            .metadata_for(artifacts::ArtifactKind::Brofile, name)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|m| m.active)
-                    },
-                    atom_exists: |name: &str| -> bool {
-                        catalog
-                            .metadata_for(artifacts::ArtifactKind::Atom, name)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|m| m.active)
-                    },
-                };
-                orchestration::atoms::validate::validate_atom_install(&value, &ctx)?;
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                );
             }
         }
         if !completed.contains(&"validation") {
@@ -1515,9 +636,7 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
             // file-backed and survive restarts on their own.
             matches!(
                 entry.kind,
-                artifacts::ArtifactKind::Workflow
-                    | artifacts::ArtifactKind::Packet
-                    | artifacts::ArtifactKind::Brofile
+                artifacts::ArtifactKind::Packet | artifacts::ArtifactKind::Brofile
             )
         })
     {
@@ -1536,25 +655,9 @@ pub(crate) fn restore_runtime_artifacts_from_catalog(
 
         match entry.kind {
             artifacts::ArtifactKind::Workflow => {
-                let spec: workflow::Workflow = serde_json::from_value(value.clone())
-                    .with_context(|| format!("parsing workflow artifact '{}'", entry.name))?;
-                let compiled = workflow::compile(spec.clone())
-                    .with_context(|| format!("compiling workflow artifact '{}'", entry.name))?;
-                validate_workflow_capabilities(&compiled, state)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .with_context(|| format!("validating workflow artifact '{}'", entry.name))?;
-
-                let dir = state.store_dir.join("workflows");
-                std::fs::create_dir_all(&dir)?;
-                std::fs::write(
-                    dir.join(format!("{}.json", entry.name)),
-                    serde_json::to_string_pretty(&spec).unwrap_or_default(),
-                )?;
-                state
-                    .workflow_registry
-                    .write()
-                    .insert(entry.name.clone(), spec);
-                restored += 1;
+                anyhow::bail!(
+                    "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+                );
             }
             artifacts::ArtifactKind::Packet => {
                 let params: packets::CompileParams = serde_json::from_value(value.clone())
@@ -1719,18 +822,7 @@ pub(crate) fn deactivate_artifact(
     name: &str,
 ) -> anyhow::Result<()> {
     match kind {
-        artifacts::ArtifactKind::Workflow => {
-            state.workflow_registry.write().remove(name);
-            let path = state
-                .store_dir
-                .join("workflows")
-                .join(format!("{name}.json"));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
+        artifacts::ArtifactKind::Workflow => {}
         artifacts::ArtifactKind::Packet => {
             state.packets.read().remove_domain(name)?;
         }
@@ -1740,21 +832,11 @@ pub(crate) fn deactivate_artifact(
         artifacts::ArtifactKind::Agent => {
             // No separate registry to deactivate for agents (yet).
         }
-        artifacts::ArtifactKind::Atom => {
-            // No separate registry to deactivate for atoms (yet).
-        }
+        artifacts::ArtifactKind::Atom => {}
         artifacts::ArtifactKind::Team => {
             // Teams are stored purely as artifacts; no separate registry to deactivate.
         }
-        artifacts::ArtifactKind::Cron => {
-            state.crons.remove(name);
-            let path = state.store_dir.join("crons").join(format!("{name}.json"));
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
+        artifacts::ArtifactKind::Cron => {}
     }
     Ok(())
 }
@@ -2308,57 +1390,6 @@ pub(crate) fn spawn_edge_index_rebuild_watcher(
         .expect("failed to spawn edge index rebuild watcher");
 }
 
-pub(crate) fn trigger_project_bootstrap_arc(state: Arc<SharedState>, record: ProjectRecord) {
-    let Some(spec) = state
-        .workflow_registry
-        .read()
-        .get("project-bootstrap-arc")
-        .cloned()
-    else {
-        tracing::debug!(
-            project_id = %record.project_id,
-            "project-bootstrap-arc is not installed; registration recorded without arc trigger"
-        );
-        return;
-    };
-    let compiled = match workflow::compile(spec) {
-        Ok(compiled) => compiled,
-        Err(err) => {
-            tracing::warn!(error = %err, "project-bootstrap-arc compile failed");
-            return;
-        }
-    };
-    if let Err(err) = validate_workflow_capabilities(&compiled, &state) {
-        tracing::warn!(error = %err, "project-bootstrap-arc capability validation failed");
-        return;
-    }
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        tracing::debug!("no tokio runtime available; skipped project-bootstrap-arc trigger");
-        return;
-    };
-    let project_dir = Some(record.canonical_path.clone());
-    let mut vars = serde_json::Map::new();
-    vars.insert("project_id".to_string(), Value::String(record.project_id));
-    vars.insert(
-        "project_path".to_string(),
-        Value::String(record.canonical_path),
-    );
-    if let Some(repo_id) = record.repo_id {
-        vars.insert("repo_id".to_string(), Value::String(repo_id));
-    }
-    handle.spawn(async move {
-        let server = BlackboxServer::new(state);
-        let _ = workflow::run_workflow_with_initial_vars(
-            &server,
-            &compiled,
-            project_dir,
-            Some(50),
-            vars,
-        )
-        .await;
-    });
-}
-
 pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> anyhow::Result<Value> {
     let knowledge = state
         .kb
@@ -2714,22 +1745,6 @@ pub(crate) fn migrate_project_refs(
         .whiteboards
         .rename_project_refs(old_project, new_project)?;
 
-    let pollers = state.pollers.rename_project_refs(old_project, new_project);
-    let poller_count = pollers.len();
-    for spec in pollers {
-        persist_named_json(&state.store_dir.join("pollers"), &spec.name, &spec)?;
-        let handle = pollers::spawn_loop(state.clone(), spec.clone());
-        state.pollers.track_handle(&spec.name, handle);
-    }
-
-    let crons = state.crons.rename_project_refs(old_project, new_project);
-    let cron_count = crons.len();
-    for spec in crons {
-        persist_named_json(&state.store_dir.join("crons"), &spec.name, &spec)?;
-        let handle = crons::spawn_loop(state.clone(), spec.clone());
-        state.crons.track_handle(&spec.name, handle);
-    }
-
     // Phase-2 §8.4 coverage fixes: gaps and roadmap rows previously
     // orphaned silently on rename, and webhooks kept a stale execution
     // target. Same write-behind persistence discipline as their siblings.
@@ -2744,11 +1759,6 @@ pub(crate) fn migrate_project_refs(
     if roadmap > 0 {
         state.roadmap_persister.request();
     }
-    let webhook_specs = state.webhooks.rename_project_refs(old_project, new_project);
-    let webhook_count = webhook_specs.len();
-    for spec in webhook_specs {
-        persist_named_json(&state.store_dir.join("webhooks"), &spec.name, &spec)?;
-    }
 
     Ok(json!({
         "knowledge": knowledge,
@@ -2760,11 +1770,8 @@ pub(crate) fn migrate_project_refs(
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
         "whiteboards": whiteboards,
-        "pollers": poller_count,
-        "crons": cron_count,
         "gaps": gaps,
         "roadmap": roadmap,
-        "webhooks": webhook_count,
     }))
 }
 
@@ -2777,63 +1784,6 @@ pub(crate) fn persist_named_json<T: Serialize>(
     let path = dir.join(format!("{name}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(value)?)?;
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct AdminWorkflowInstallReq {
-    #[serde(default)]
-    id: Option<String>,
-    spec: Value,
-}
-
-pub(crate) async fn admin_workflow_install(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<AdminWorkflowInstallReq>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let spec: workflow::Workflow = match serde_json::from_value(req.spec) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("workflow parse: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let compiled = match workflow::compile(spec.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("workflow compile: {e}"),
-            )
-                .into_response();
-        }
-    };
-    if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("capability validation: {e}"),
-        )
-            .into_response();
-    }
-    let id = req.id.unwrap_or_else(|| spec.name.clone());
-    let dir = state.store_dir.join("workflows");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("{id}.json"));
-    if let Err(e) = std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&spec).unwrap_or_default(),
-    ) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("workflow persist: {e}"),
-        )
-            .into_response();
-    }
-    state.workflow_registry.write().insert(id.clone(), spec);
-    axum::Json(json!({"status": "installed", "id": id})).into_response()
 }
 
 pub(crate) async fn admin_artifact_install(
@@ -2936,154 +1886,6 @@ pub(crate) async fn admin_artifact_remove(
         )
             .into_response(),
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct AdminWebhookInstallReq {
-    spec: Value,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct AdminPollerInstallReq {
-    spec: Value,
-}
-
-pub(crate) async fn admin_poller_install(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<AdminPollerInstallReq>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let spec: pollers::PollerSpec = match serde_json::from_value(req.spec) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("poller parse: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let dir = state.store_dir.join("pollers");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("{}.json", spec.name));
-    if let Err(e) = std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&spec).unwrap_or_default(),
-    ) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("poller persist: {e}"),
-        )
-            .into_response();
-    }
-    state.pollers.install(spec.clone());
-    let handle = pollers::spawn_loop(state.clone(), spec.clone());
-    state.pollers.track_handle(&spec.name, handle);
-    axum::Json(json!({
-        "status": "installed",
-        "name": spec.name,
-        "every_seconds": spec.every_seconds,
-        "effective_every_seconds": state.pollers.effective_every_seconds(&spec.name),
-    }))
-    .into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct AdminCronInstallReq {
-    spec: Value,
-}
-
-pub(crate) async fn admin_cron_install(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<AdminCronInstallReq>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let spec: crons::CronSpec = match serde_json::from_value(req.spec) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("cron parse: {e}"),
-            )
-                .into_response();
-        }
-    };
-    if let Err(e) = spec.validate() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("cron spec invalid: {e}"),
-        )
-            .into_response();
-    }
-    let dir = state.store_dir.join("crons");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("{}.json", spec.name));
-    if let Err(e) = std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&spec).unwrap_or_default(),
-    ) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cron persist: {e}"),
-        )
-            .into_response();
-    }
-    state.crons.install(spec.clone());
-    let handle = crons::spawn_loop(state.clone(), spec.clone());
-    state.crons.track_handle(&spec.name, handle);
-    axum::Json(json!({
-        "status": "installed",
-        "name": spec.name,
-        "schedule": spec.schedule,
-        "concurrency": spec.concurrency,
-    }))
-    .into_response()
-}
-
-pub(crate) async fn admin_webhook_install(
-    AxumState(state): AxumState<Arc<SharedState>>,
-    axum::Json(req): axum::Json<AdminWebhookInstallReq>,
-) -> impl axum::response::IntoResponse {
-    use axum::response::IntoResponse;
-    let spec: webhooks::WebhookSpec = match serde_json::from_value(req.spec) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("webhook parse: {e}"),
-            )
-                .into_response();
-        }
-    };
-    // Reject schemes incompatible with current bind (parallel to
-    // bro_webhook_install + restore-on-startup).
-    if let Err(e) = webhooks::install_check(&spec.signature, state.bind_is_loopback) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("webhook install rejected: {e}"),
-        )
-            .into_response();
-    }
-    let dir = state.store_dir.join("webhooks");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(format!("{}.json", spec.name));
-    if let Err(e) = std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&spec).unwrap_or_default(),
-    ) {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("webhook persist: {e}"),
-        )
-            .into_response();
-    }
-    state.webhooks.install(spec.clone());
-    axum::Json(json!({
-        "status": "installed",
-        "name": spec.name,
-        "endpoint": format!("/webhook/{}", spec.name),
-    }))
-    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3226,181 +2028,6 @@ pub(crate) async fn admin_team_upsert(
     let _lock = orchestration::team::lock_teams();
     orchestration::team::save_team(&team, &state.store_dir);
     axum::Json(json!({"status": "upserted", "name": req.name})).into_response()
-}
-
-/// Where a signal dispatch originated. Direct signals (webhook
-/// `signal_arc` verdicts, `bro_arc_signal` MCP calls) that find no
-/// matching wait are persisted to the system-events ledger so a wait
-/// registered later - including one re-registered by daemon-restart
-/// rehydration - can still consume them. Bridge-originated dispatches
-/// are already replaying a persisted event and must not re-persist it
-/// (that would ping-pong between the bridge and the router forever
-/// whenever a name-matched wait has a mismatched correlation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SignalDispatchOrigin {
-    Direct,
-    SystemEventBridge,
-}
-
-pub(crate) async fn signal_arc_dispatch(
-    state: &Arc<SharedState>,
-    signal: &str,
-    correlation: serde_json::Map<String, Value>,
-    payload: Value,
-    origin: SignalDispatchOrigin,
-    source_event_id: Option<String>,
-) -> Value {
-    let store = &state.wait_store;
-    let pending_before: Vec<_> = store
-        .snapshot()
-        .into_iter()
-        .filter(|w| w.signal == signal)
-        .collect();
-    // `_target_arc` in the correlation restricts resolution to ONE
-    // arc's registrations (admission duplicate conversion targets the
-    // holding arc; subset matching alone could hand the payload to any
-    // arc with compatible - including empty broadcast - wait keys).
-    // The key travels in the correlation so a persisted idle event
-    // stays targeted through ledger catch-up and bridge redelivery.
-    let target_arc = correlation
-        .get("_target_arc")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let m = match target_arc.as_deref() {
-        Some(target) => store.match_and_take_for_arc(signal, &correlation, target),
-        None => store.match_and_take(signal, &correlation),
-    };
-    let Some((resolved_slot, notify, arc_id, wait_id)) = m else {
-        tracing::info!(
-            "signal '{signal}' arrived with correlation {correlation:?} — no matching wait (idle). pending_with_same_signal={:?}",
-            pending_before
-                .iter()
-                .map(|w| (w.arc_id.clone(), w.wait_id.clone(), w.correlation.clone()))
-                .collect::<Vec<_>>(),
-        );
-        state.record_signal(SignalEvent {
-            timestamp: util::now_iso(),
-            signal: signal.to_string(),
-            correlation: correlation.clone(),
-            outcome: "no_matching_wait".into(),
-            matched_arc_id: None,
-            matched_wait_id: None,
-            idle_pending: pending_before.clone(),
-        });
-        let mut durable_persist = Value::Null;
-        if origin == SignalDispatchOrigin::Direct {
-            // Durable idle signal: persist so Wait-registration ledger
-            // catch-up (and the live system-event bridge, which closes
-            // the register-vs-dispatch race) can deliver it later.
-            let draft = crate::system_events::SystemEventDraft {
-                kind: crate::system_events::types::SystemEventKind::from_wire(signal),
-                producer: "signal.router".to_string(),
-                project: None,
-                principal: None,
-                subject: None,
-                correlation: correlation.clone(),
-                causation_id: None,
-                payload,
-            };
-            durable_persist = match state.system_events.emit(draft).await {
-                Ok(_) => json!("ok"),
-                Err(e) => {
-                    tracing::warn!("idle signal '{signal}' durable persist failed: {e:#}");
-                    // The caller must know its signal was NOT retained -
-                    // "no_matching_wait" alone reads as "safely parked
-                    // in the ledger", which would be a silent loss.
-                    json!(format!("failed: {e}"))
-                }
-            };
-        }
-        return json!({
-            "status": "no_matching_wait",
-            "signal": signal,
-            "correlation": correlation,
-            "durable_persist": durable_persist,
-            "pending_with_same_signal": pending_before,
-        });
-    };
-    tracing::info!(
-        "signal '{signal}' arrived with correlation {correlation:?} — resolved wait arc={arc_id} wait_id={wait_id}",
-    );
-    state.record_signal(SignalEvent {
-        timestamp: util::now_iso(),
-        signal: signal.to_string(),
-        correlation: correlation.clone(),
-        outcome: "matched".into(),
-        matched_arc_id: Some(arc_id.clone()),
-        matched_wait_id: Some(wait_id.clone()),
-        idle_pending: Vec::new(),
-    });
-    let sig = crate::workflow::context::SignalRef {
-        name: signal.to_string(),
-        payload: payload.clone(),
-        correlation: correlation.clone(),
-        received_at: util::now_iso(),
-        source_event_id,
-    };
-    // First-writer-wins on the group's shared resolved slot. Two
-    // signals racing into one `any_of` group used to let the second
-    // overwrite the first before the runner woke, silently losing it.
-    // Scoped so the guard is provably dead before any await below
-    // (tokio's Send analysis does not credit branch-local drops).
-    let group_already_resolved = {
-        let mut slot = resolved_slot.lock();
-        if slot.is_some() {
-            true
-        } else {
-            *slot = Some(sig);
-            false
-        }
-    };
-    if group_already_resolved {
-        let mut durable_persist = Value::Null;
-        if origin == SignalDispatchOrigin::Direct {
-            // Do not lose the loser: persist it like an idle signal
-            // so the arc's next wait (or another arc) can consume
-            // it from the ledger. Bridge-origin events are already
-            // persisted and stay unconsumed automatically.
-            let draft = crate::system_events::SystemEventDraft {
-                kind: crate::system_events::types::SystemEventKind::from_wire(signal),
-                producer: "signal.router".to_string(),
-                project: None,
-                principal: None,
-                subject: None,
-                correlation: correlation.clone(),
-                causation_id: None,
-                payload,
-            };
-            durable_persist = match state.system_events.emit(draft).await {
-                Ok(_) => json!("ok"),
-                Err(e) => {
-                    tracing::warn!(
-                        "group-resolved loser signal '{signal}' durable persist failed: {e:#}"
-                    );
-                    json!(format!("failed: {e}"))
-                }
-            };
-        }
-        return json!({
-            "status": "wait_group_already_resolved",
-            "arc_id": arc_id,
-            "wait_id": wait_id,
-            "signal": signal,
-            "durable_persist": durable_persist,
-        });
-    }
-    // Remove the group's sibling registrations so no later signal can
-    // consume one and race the slot; the just-taken wait is already out.
-    if let Some(node_prefix) = wait_id.split('#').next() {
-        store.cancel_node_group(&arc_id, node_prefix);
-    }
-    notify.notify_one();
-    json!({
-        "status": "wait_resolved",
-        "arc_id": arc_id,
-        "wait_id": wait_id,
-        "signal": signal,
-    })
 }
 
 pub(crate) async fn roster_handler(
@@ -3563,49 +2190,6 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
-    }
-
-    #[tokio::test]
-    async fn cron_admin_and_artifact_reject_invalid_timezone_before_activation() {
-        use axum::response::IntoResponse;
-        let tmp = tempfile::tempdir().unwrap();
-        let state = Arc::new(SharedState::for_test(tmp.path()));
-        let value = json!({"name":"invalid-timezone", "schedule":"0 0 9 * * *", "routing_packet":"example-routing", "tz":"unsupported"});
-        let response = admin_cron_install(
-            AxumState(state.clone()),
-            axum::Json(AdminCronInstallReq {
-                spec: value.clone(),
-            }),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
-        assert!(state.crons.list().is_empty());
-        assert!(!state.store_dir.join("crons/invalid-timezone.json").exists());
-        let error = install_artifact_value(
-            &state,
-            ArtifactInstallParams {
-                kind: artifacts::ArtifactKind::Cron,
-                source: "https://example.invalid/cron.json".into(),
-                name: None,
-                version: Some("1".into()),
-                supersedes: None,
-            },
-            value,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("use UTC or Local"));
-        assert!(state.crons.list().is_empty());
-        assert!(!state.store_dir.join("crons/invalid-timezone.json").exists());
-        assert!(
-            state
-                .artifacts
-                .read()
-                .metadata_for(artifacts::ArtifactKind::Cron, "invalid-timezone")
-                .unwrap()
-                .is_none()
-        );
     }
 
     fn git(root: &std::path::Path, args: &[&str]) {
@@ -4056,37 +2640,5 @@ mod tests {
             .to_string();
 
         assert!(err.contains("too large"), "got: {err}");
-    }
-    #[test]
-    fn orchestrate_status_resolves_arc_id_to_arc_thread_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let server = test_server(&tmp);
-        server.state.running_arcs.write().insert(
-            "thread-test1234".into(),
-            ArcSnapshot {
-                arc_id: "arc-test1234".into(),
-                arc_thread_id: "thread-test1234".into(),
-                workflow_name: "test-workflow".into(),
-                workflow_version: 1,
-                status: "completed".into(),
-                current_node: None,
-                completed_nodes: vec!["Done".into()],
-                in_flight_nodes: vec![],
-                last_verdict: Some("satisfied".into()),
-                visit_counts: std::collections::HashMap::new(),
-                admission_key: None,
-                started_at: "2026-05-16T00:00:00Z".into(),
-                updated_at: "2026-05-16T00:00:01Z".into(),
-            },
-        );
-
-        assert_eq!(
-            crate::server::routes::resolve_orchestrate_thread_id(&server.state, "arc-test1234"),
-            "thread-test1234"
-        );
-        assert_eq!(
-            crate::server::routes::resolve_orchestrate_thread_id(&server.state, "thread-test1234"),
-            "thread-test1234"
-        );
     }
 }

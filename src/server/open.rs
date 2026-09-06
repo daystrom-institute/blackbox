@@ -20,9 +20,8 @@ use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, config, crons, edge_index, index, orchestration, path_cache, pollers,
-    slack_channel_bindings, slack_proposal_links, system_events, system_memory, tool_docs, vectors,
-    webhooks, whiteboards,
+    artifacts, config, edge_index, index, orchestration, path_cache, slack_channel_bindings,
+    slack_proposal_links, system_events, system_memory, tool_docs, vectors, whiteboards,
 };
 
 pub(super) struct OpenedServer {
@@ -30,7 +29,6 @@ pub(super) struct OpenedServer {
     pub(super) shared: Arc<SharedState>,
     pub(super) store_dir: PathBuf,
     pub(super) bind_host: String,
-    pub(super) bind_is_loopback: bool,
 }
 
 /// Open the accepted-publication authority and verify every catalog
@@ -1028,23 +1026,9 @@ pub(super) fn open_shared_state(
         roster_tx,
         roster_view: Arc::new(orchestration::RosterView::new()),
         store_dir: store_dir.clone(),
-        running_arcs: RwLock::new(HashMap::new()),
-        wait_store: Arc::new(crate::workflow::wait::WaitStore::new()),
-        arc_store: Arc::new(crate::workflow::arc_store::ArcStore::new(
-            store_dir.join("arcs"),
-        )),
-        arc_admissions: parking_lot::Mutex::new(HashMap::new()),
-        webhooks: Arc::new(webhooks::WebhookRegistry::new()),
-        pollers: Arc::new(pollers::PollerRegistry::new()),
-        crons: Arc::new(crons::CronRegistry::new()),
+
         whiteboards: Arc::new(whiteboards::WhiteboardRegistry::new()),
-        workflow_registry: Arc::new(RwLock::new(HashMap::new())),
-        bind_is_loopback,
-        signal_log: RwLock::new(std::collections::VecDeque::with_capacity(SIGNAL_LOG_CAP)),
-        webhook_delivery_log: RwLock::new(std::collections::VecDeque::with_capacity(
-            WEBHOOK_LOG_CAP,
-        )),
-        arc_cancel_tokens: RwLock::new(HashMap::new()),
+
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         drain: super::drain::DrainState::open(&store_dir),
         long_polls: Arc::new(super::drain::LongPollRegistry::new()),
@@ -1058,11 +1042,7 @@ pub(super) fn open_shared_state(
                 .unwrap_or_else(|e| panic!("opening slack proposal links at {store_dir:?}: {e}")),
         ),
         config: cfg_arc,
-        atom_invocation_store: Arc::new(RwLock::new(
-            orchestration::atoms::invocation::InvocationStore::new(
-                store_dir.join("atom-invocations.json"),
-            ),
-        )),
+
         vector_store: Arc::new(
             vectors::VectorStore::open_unloaded(cfg.paths.vectors_path.clone())
                 .expect("default vector store placeholder should open"),
@@ -1149,7 +1129,6 @@ pub(super) fn open_shared_state(
         shared,
         store_dir,
         bind_host,
-        bind_is_loopback,
     })
 }
 

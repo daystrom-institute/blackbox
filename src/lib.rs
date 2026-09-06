@@ -31,7 +31,6 @@ use bbox_artifacts::artifacts;
 // `crate::chunker` so existing call sites resolve unchanged.
 use bbox_chunker as chunker;
 pub use bbox_config::config;
-mod crons;
 pub mod dispatch_mcp;
 mod doctor;
 use bbox_edge_index::edge_index;
@@ -55,9 +54,8 @@ use bbox_indexing::index;
 pub use bbox_corpus_core::json_store;
 use bbox_knowledge::knowledge;
 mod managed_worktrees;
-use bbox_edge_sidecar::manifest;
-mod mcp_client;
 use bbox_edge_index::migration;
+use bbox_edge_sidecar::manifest;
 use bbox_mcp_tools::mcp_tools;
 use bbox_threads::notes;
 mod orchestration;
@@ -71,7 +69,6 @@ use bbox_stores::pins;
 /// daemon's indexer and the `bro` cockpit both link it). Re-exported as
 /// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.
 pub use bro_transcript as parser;
-mod pollers;
 pub mod project_catalog_rebuild_admin;
 pub mod project_catalog_stamper;
 use bbox_indexing::projects;
@@ -81,17 +78,15 @@ mod providers_ext;
 // `search` (rrf/rerank) and `template` extracted into bbox-corpus-core;
 // aliased back so existing call sites resolve unchanged. (`query` callers
 // now use bbox_corpus_core::query directly.)
+pub use bbox_config::secrets;
 pub use bbox_knowledge::render;
 use bbox_stores::roadmap;
-mod routing;
-pub use bbox_config::secrets;
 pub mod server;
 use bbox_edge_index::storage_health;
 pub use bbox_slack::slack_channel_bindings;
 pub use bbox_slack::slack_proposal_links;
 use bbox_stores::store_persister;
 use bbox_system_events::system_events;
-mod system_events_runtime;
 // `system_memory` extracted into bbox-system-memory (root-crate split);
 // aliased back to `crate::system_memory` so existing call sites resolve
 // unchanged.
@@ -108,9 +103,7 @@ pub use bbox_util::util;
 use bbox_artifacts::watcher;
 use bbox_vectors as vectors;
 mod vector_maintenance;
-mod webhooks;
 use bbox_whiteboards::whiteboards;
-mod workflow;
 
 /// Initialize the process-wide system-memory catalog for tests. The
 /// repo-root `system-defaults/memories` path is owned here (the root crate),

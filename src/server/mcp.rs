@@ -42,32 +42,6 @@ pub(super) fn build_http_app(
         .route("/readyz", axum::routing::get(health_probe))
         .route("/tail", axum::routing::get(tail_handler))
         .route("/roster", axum::routing::get(roster_handler))
-        .route("/orchestrate", axum::routing::post(orchestrate_handler))
-        .route(
-            "/orchestrate/stream",
-            axum::routing::post(orchestrate_stream_handler),
-        )
-        .route(
-            "/orchestrate/status",
-            axum::routing::get(orchestrate_status_handler),
-        )
-        .route(
-            "/orchestrate/list",
-            axum::routing::get(orchestrate_list_handler),
-        )
-        .route(
-            "/orchestrate/peek",
-            axum::routing::get(orchestrate_peek_handler),
-        )
-        .route("/webhook/{name}", axum::routing::post(webhook_handler))
-        .route(
-            "/webhook/{name}/replay",
-            axum::routing::post(webhook_replay_handler),
-        )
-        .route(
-            "/orchestrate/by-id",
-            axum::routing::post(orchestrate_by_id_handler),
-        )
         // Generic orchestration control plane. These are thin HTTP adapters over
         // the `bro_*` dispatch/control tools, shared by every external driver
         // (the fleet client, future bridges). The canonical namespace is
@@ -123,10 +97,6 @@ pub(super) fn build_http_app(
             axum::routing::post(admin_packet_compile),
         )
         .route(
-            "/admin/workflow/install",
-            axum::routing::post(admin_workflow_install),
-        )
-        .route(
             "/admin/artifact/install",
             axum::routing::post(admin_artifact_install),
         )
@@ -153,18 +123,6 @@ pub(super) fn build_http_app(
         .route(
             "/admin/artifact/remove",
             axum::routing::post(admin_artifact_remove),
-        )
-        .route(
-            "/admin/webhook/install",
-            axum::routing::post(admin_webhook_install),
-        )
-        .route(
-            "/admin/poller/install",
-            axum::routing::post(admin_poller_install),
-        )
-        .route(
-            "/admin/cron/install",
-            axum::routing::post(admin_cron_install),
         )
         .route(
             "/admin/brofile/upsert",

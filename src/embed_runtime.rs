@@ -22,8 +22,6 @@ use crate::embed::queue::{EmbedRequest, EmbedStatusResponse};
 use crate::embed::{Bucket, EmbeddingRouter};
 use crate::embed_queue::status_response;
 use crate::orchestration::agents::types::{AgentManifest, AgentRef};
-use crate::routing::RoutingVerdict;
-use crate::server::dispatch::dispatch_routing_verdict_direct;
 use crate::server::state::SharedState;
 use std::path::PathBuf;
 
@@ -1997,53 +1995,23 @@ pub(crate) fn maybe_detect_knowledge_contradiction(
     };
     drop(kb);
 
-    let payload = json!({
-        "entry_a": format!("knowledge:{}", source.id),
-        "entry_b": format!("knowledge:{}", entry_b.id),
-        "cosine": cosine,
-        "vector_route": vector_route,
-    });
-    if state
-        .workflow_registry
-        .read()
-        .contains_key("contradiction-review-arc")
-    {
-        let state_for_task = state.clone();
-        let mut initial_vars = serde_json::Map::new();
-        initial_vars.insert("entry_a".into(), json!(format!("knowledge:{}", source.id)));
-        initial_vars.insert("entry_b".into(), json!(format!("knowledge:{}", entry_b.id)));
-        initial_vars.insert("cosine".into(), json!(cosine));
-        tokio::spawn(async move {
-            let _ = dispatch_routing_verdict_direct(
-                state_for_task,
-                "contradiction-detected",
-                RoutingVerdict::StartArc {
-                    workflow: "contradiction-review-arc".into(),
-                    initial_vars,
-                },
-                payload,
-            )
-            .await;
-        });
-    } else {
-        let project = source.project.clone().or(entry_b.project.clone());
-        let body = format!(
-            "Tier-0 contradiction detected between knowledge:{} and knowledge:{} (cosine {:.3}), but contradiction-review-arc is not installed.",
-            source.id, entry_b.id, cosine
-        );
-        if let Err(err) = state.notes.write().create(&NoteParams {
-            project_id: None,
-            kind: "surprise".into(),
-            body,
-            task_id: None,
-            session_id: None,
-            project,
-            thread_id: None,
-            provider: None,
-            bro: None,
-        }) {
-            tracing::warn!(error = %err, "failed to surface contradiction fallback note");
-        }
+    let project = source.project.clone().or(entry_b.project.clone());
+    let body = format!(
+        "Tier-0 contradiction detected between knowledge:{} and knowledge:{} (cosine {:.3}); review the linked evidence.",
+        source.id, entry_b.id, cosine
+    );
+    if let Err(err) = state.notes.write().create(&NoteParams {
+        project_id: None,
+        kind: "surprise".into(),
+        body,
+        task_id: None,
+        session_id: None,
+        project,
+        thread_id: None,
+        provider: None,
+        bro: None,
+    }) {
+        tracing::warn!(error = %err, "failed to surface contradiction fallback note");
     }
 }
 

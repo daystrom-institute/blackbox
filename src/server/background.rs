@@ -1,7 +1,6 @@
 use super::restore::restore_runtime_state;
-use super::{SharedState, dispatch_routed_event, spawn_edge_index_rebuild_watcher};
+use super::{SharedState, spawn_edge_index_rebuild_watcher};
 use crate::packets::ScannerConfig;
-use crate::server::routes::{SignalDispatchOrigin, signal_arc_dispatch};
 use crate::server::runtime_metrics::{
     spawn_runtime_metrics_sampler, spawn_scheduler_latency_probe,
 };
@@ -32,17 +31,6 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     // tokio::spawn and therefore goes blind exactly when the runtime stalls.
     // See design/daemon-runtime/healthz-ingest-starvation.md §6.
     spawn_scheduler_latency_probe(runtime_handle.clone());
-    spawn_task_completed_router(shared.clone());
-    spawn_system_event_signal_bridge(shared.clone());
-    // Replay durable arc checkpoints: re-park Wait-suspended arcs and
-    // mark mid-dispatch arcs interrupted. After the signal bridge so a
-    // resumed wait's ledger catch-up and live bridge dispatch overlap
-    // instead of leaving a gap. AWAITED, not spawned: the pass
-    // pre-claims resumable arcs' admission keys and this fn completes
-    // before the daemon serves requests, so a fresh StartArc can never
-    // steal a checkpointed arc's singleton key in the boot window (the
-    // per-arc resumes themselves still run as detached tasks).
-    crate::workflow::engine::rehydrate_arcs(shared.clone()).await;
     // Inventory and checkout reconciliation may probe registered paths on
     // stalled mounts. Keep the initial pass off the listener startup path just
     // like subsequent periodic passes.
@@ -57,8 +45,6 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     start_bbox_watcher(&shared);
     spawn_knowledge_lifecycle_reconciler(shared.clone());
     restore_runtime_state(&shared).await;
-    compact_system_events(&shared);
-    spawn_outbox_worker(shared.clone());
     spawn_account_probe_refresh(shared.clone());
     crate::embed_runtime::spawn_embed_residue_sweeper(shared.clone());
     spawn_packet_self_heal_scanner(shared);
@@ -225,103 +211,6 @@ fn spawn_storage_gc(shared: Arc<SharedState>) {
         "storage GC maintenance thread enabled"
     );
     spawn_storage_gc_thread(shared, storage_gc_interval);
-}
-
-fn spawn_task_completed_router(shared: Arc<SharedState>) {
-    let mut tail_rx = shared.tail_tx.subscribe();
-    tokio::spawn(async move {
-        loop {
-            match tail_rx.recv().await {
-                Ok(orchestration::tail::TailEvent::TaskCompleted {
-                    task_id,
-                    source_session,
-                    task_kind,
-                    ..
-                }) => {
-                    let entity = serde_json::json!({
-                        "signal": "task-completed",
-                        "event_type": "task-completed",
-                        "kind": "task-completed",
-                        "task_id": task_id,
-                        "session_id": source_session,
-                        "task_kind": task_kind,
-                    });
-                    if let Err(e) = dispatch_routed_event(
-                        shared.clone(),
-                        "task-completed",
-                        "domain:auto-digest/task-completed-routing",
-                        entity,
-                        None,
-                    )
-                    .await
-                    {
-                        tracing::debug!("task-completed router: {e:#}");
-                    }
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!("task-completed router: lagged {n} events");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-}
-
-fn spawn_system_event_signal_bridge(shared: Arc<SharedState>) {
-    let mut system_event_rx = shared.system_events.subscribe();
-    tokio::spawn(async move {
-        loop {
-            match system_event_rx.recv().await {
-                Ok(event) => {
-                    let signal = event.kind.to_wire().to_string();
-                    let has_wait = shared
-                        .wait_store
-                        .snapshot()
-                        .into_iter()
-                        .any(|w| w.signal == signal);
-                    if !has_wait {
-                        continue;
-                    }
-                    let correlation = event.correlation.clone();
-                    // Router-persisted idle signals deliver the caller's
-                    // raw payload so templates see the same shape as a
-                    // live delivery; other producers keep the envelope
-                    // form consumers already depend on. Either way the
-                    // event id travels for consumed-event bookkeeping.
-                    let payload = if event.producer == "signal.router" {
-                        event.payload.clone()
-                    } else {
-                        serde_json::to_value(&event).unwrap_or_else(|e| {
-                            serde_json::json!({
-                                "event_id": event.id,
-                                "kind": signal,
-                                "serialization_error": e.to_string(),
-                            })
-                        })
-                    };
-                    let resolved = signal_arc_dispatch(
-                        &shared,
-                        &signal,
-                        correlation,
-                        payload,
-                        SignalDispatchOrigin::SystemEventBridge,
-                        Some(event.id.clone()),
-                    )
-                    .await;
-                    tracing::debug!(
-                        signal,
-                        result = %resolved,
-                        "system event signal bridge dispatched"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!("system event signal bridge lagged {n} events");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
 }
 
 fn start_bbox_watcher(shared: &Arc<SharedState>) {
@@ -494,37 +383,6 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
         }
         Err(e) => tracing::warn!(".bbox/ watcher failed to start: {e:#}"),
     }
-}
-
-fn compact_system_events(shared: &Arc<SharedState>) {
-    let now = util::now_iso();
-    match shared.system_events.compact_with_now(&now) {
-        Ok(report)
-            if report.event_journal.dropped_by_age > 0
-                || report.event_journal.dropped_by_count > 0
-                || report.outbox.dropped_succeeded > 0 =>
-        {
-            tracing::info!(
-                "event journal compaction: kept {} (dropped {} by age, {} by count)",
-                report.event_journal.after,
-                report.event_journal.dropped_by_age,
-                report.event_journal.dropped_by_count
-            );
-            tracing::info!(
-                "outbox compaction: kept {} (dropped {} succeeded)",
-                report.outbox.after,
-                report.outbox.dropped_succeeded
-            );
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("system event compaction failed: {e:#}"),
-    }
-}
-
-fn spawn_outbox_worker(shared: Arc<SharedState>) {
-    tokio::spawn(async move {
-        crate::system_events_runtime::worker::run_worker(shared).await;
-    });
 }
 
 /// Periodically refresh provider account utilization probes (the producer the

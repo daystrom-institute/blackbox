@@ -2,7 +2,6 @@ pub mod account_probes;
 pub(crate) mod admission;
 pub mod agents;
 pub mod allocator;
-pub mod atoms;
 pub mod brofile;
 pub mod executor;
 pub mod fleetd_client;

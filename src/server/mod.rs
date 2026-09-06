@@ -11,7 +11,6 @@ pub(crate) mod code_source;
 pub(crate) mod connector_grants;
 mod conversation_enrollment;
 pub(crate) mod conversation_source;
-pub mod dispatch;
 pub(crate) mod file_source;
 pub(crate) mod file_source_activation;
 mod gap_view;
@@ -26,6 +25,7 @@ pub(crate) mod transcript_source;
 // The published-view install gate lives here and is exercised from the
 // catalog tool's acceptance tests, which is why this module is crate
 // visible while its knowledge/gap siblings are not.
+mod ambient_pins;
 pub(crate) mod control;
 pub(crate) mod drain;
 pub(crate) mod knowledge_view;
@@ -51,11 +51,8 @@ pub mod storage_gc;
 pub mod store_helpers;
 pub mod surface;
 pub mod tail;
-pub mod workflow_capabilities;
-pub mod workflow_runtime;
 pub(crate) mod workspace_binding_mint;
 
-pub(crate) use dispatch::*;
 pub(crate) use knowledge_lifecycle::checkout_access_error_is_definitively_stale;
 pub(crate) use routes::*;
 pub use run::run;
@@ -89,10 +86,7 @@ impl BlackboxServer {
                 + crate::tools::knowledge::router()
                 + crate::tools::render::router()
                 + crate::tools::roadmap::router()
-                + crate::tools::whiteboards::router()
                 + crate::tools::agents::router()
-                + crate::tools::atoms::router()
-                + crate::tools::orchestrate::router()
                 + crate::tools::roster::router()
                 + crate::tools::config::router()
                 + crate::tools::dispatch::router()
@@ -101,8 +95,7 @@ impl BlackboxServer {
                 + crate::tools::storage_health::router()
                 + crate::tools::storage_gc::router()
                 + crate::tools::storage_migration::router()
-                + crate::tools::tool_calls::router()
-                + crate::tools::system_events::router(),
+                + crate::tools::tool_calls::router(),
             surface: std::sync::OnceLock::new(),
             surface_project: std::sync::OnceLock::new(),
             session_checkout: std::sync::OnceLock::new(),

@@ -340,7 +340,7 @@ fn rfc3339_age_secs(ts: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64>
 /// linear pass over the threads / notes / knowledge stores. No I/O.
 ///
 /// `quiescent` is the gate's verdict input and its scope is stated in the
-/// payload (`quiescent_scope: "tasks,arcs,waiters"`): no running tasks, no
+/// payload (`quiescent_scope: "tasks,waiters"`): no running tasks, no
 /// in-flight arcs, no long-poll waiters. Write recency is DELIBERATELY
 /// excluded from `quiescent` (a chatty operator session cannot be drained,
 /// only observed); it is reported at the same level as
@@ -385,44 +385,6 @@ pub(crate) fn orchestration_activity_snapshot(
             .cmp(&a["age_secs"].as_u64().unwrap_or(0))
     });
 
-    // Workflow arcs in flight: the cancel-token map holds exactly the live
-    // arcs (registered at run start, dropped at terminus); the running_arcs
-    // snapshot map decorates them with node-level state when present.
-    let live_arc_ids: Vec<String> = state.arc_cancel_tokens.read().keys().cloned().collect();
-    let arcs_in_flight: Vec<Value> = {
-        let snapshots = state.running_arcs.read();
-        let by_arc: HashMap<&str, &super::state::ArcSnapshot> =
-            snapshots.values().map(|s| (s.arc_id.as_str(), s)).collect();
-        let mut rows: Vec<Value> = live_arc_ids
-            .iter()
-            .map(|arc_id| match by_arc.get(arc_id.as_str()) {
-                Some(s) => json!({
-                    "arc_id": s.arc_id,
-                    "arc_thread_id": s.arc_thread_id,
-                    "workflow": s.workflow_name,
-                    "workflow_version": s.workflow_version,
-                    "status": s.status,
-                    "current_node": s.current_node,
-                    "in_flight_nodes": s.in_flight_nodes,
-                    "started_at": s.started_at,
-                    "age_secs": rfc3339_age_secs(&s.started_at, now),
-                }),
-                None => json!({
-                    "arc_id": arc_id,
-                    "status": "starting",
-                }),
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            a["arc_id"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(b["arc_id"].as_str().unwrap_or(""))
-        });
-        rows
-    };
-
-    // Long-poll waiters.
     let waiters: Vec<Value> = state
         .long_polls
         .snapshot()
@@ -475,22 +437,18 @@ pub(crate) fn orchestration_activity_snapshot(
     }
     let recent_total = thread_rows.len() + note_rows.len() + knowledge_rows.len();
 
-    let quiescent = running_tasks.is_empty() && arcs_in_flight.is_empty() && waiters.is_empty();
+    let quiescent = running_tasks.is_empty() && waiters.is_empty();
 
     json!({
         "status": "ok",
         "sampled_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "drain": state.drain.snapshot(),
         "quiescent": quiescent,
-        "quiescent_scope": "tasks,arcs,waiters",
+        "quiescent_scope": "tasks,waiters",
         "recent_writes_total": recent_total,
         "running_tasks": {
             "count": running_tasks.len(),
             "tasks": running_tasks,
-        },
-        "workflows_in_flight": {
-            "count": arcs_in_flight.len(),
-            "arcs": arcs_in_flight,
         },
         "long_poll_waiters": {
             "count": waiters.len(),
@@ -605,81 +563,6 @@ mod tests {
         assert_eq!(reg.len(), 1);
         drop(g2);
         assert_eq!(reg.len(), 0);
-    }
-
-    #[test]
-    fn activity_snapshot_reports_scope_and_activity() {
-        use crate::orchestration::providers::Provider;
-        use crate::orchestration::{TaskStatus, test_task};
-
-        let dir = tempfile::tempdir().unwrap();
-        let state = SharedState::for_test(&dir.path().join("bro"));
-
-        // Empty daemon: quiescent, scope stated, nothing recent.
-        let snap = orchestration_activity_snapshot(&state, 10);
-        assert_eq!(snap["quiescent"], json!(true));
-        assert_eq!(snap["quiescent_scope"], json!("tasks,arcs,waiters"));
-        assert_eq!(snap["recent_writes_total"], json!(0));
-        assert_eq!(snap["drain"]["draining"], json!(false));
-        assert_eq!(snap["running_tasks"]["count"], json!(0));
-        assert_eq!(snap["workflows_in_flight"]["count"], json!(0));
-        assert_eq!(snap["long_poll_waiters"]["count"], json!(0));
-
-        // One running task + one finished task: only the running one counts.
-        {
-            let mut store = state.task_store.write();
-            store
-                .insert(
-                    "run-1".into(),
-                    test_task("run-1", TaskStatus::Running, Provider::Glm),
-                )
-                .unwrap();
-            store
-                .insert(
-                    "done-1".into(),
-                    test_task("done-1", TaskStatus::Completed, Provider::Glm),
-                )
-                .unwrap();
-        }
-        // One live arc token and one long-poll waiter.
-        let _tok = state.register_arc_cancel_token("arc-live");
-        let long_polls = Arc::clone(&state.long_polls);
-        let _guard = long_polls.register("bro_wait", vec!["run-1".into()]);
-        state.drain.set(Some("converge".into()), None).unwrap();
-
-        let snap = orchestration_activity_snapshot(&state, 10);
-        assert_eq!(snap["quiescent"], json!(false));
-        assert_eq!(snap["running_tasks"]["count"], json!(1));
-        assert_eq!(snap["running_tasks"]["tasks"][0]["task_id"], json!("run-1"));
-        assert!(snap["running_tasks"]["tasks"][0]["age_secs"].is_u64());
-        assert_eq!(snap["workflows_in_flight"]["count"], json!(1));
-        assert_eq!(
-            snap["workflows_in_flight"]["arcs"][0]["arc_id"],
-            json!("arc-live")
-        );
-        assert_eq!(snap["long_poll_waiters"]["count"], json!(1));
-        assert_eq!(
-            snap["long_poll_waiters"]["waiters"][0]["tool"],
-            json!("bro_wait")
-        );
-        assert_eq!(snap["drain"]["draining"], json!(true));
-        assert_eq!(snap["drain"]["reason"], json!("converge"));
-
-        // Dropping the waiter and the arc token, and finishing the task,
-        // returns to quiescent even though drain is still set.
-        drop(_guard);
-        state.unregister_arc_cancel_token("arc-live");
-        state
-            .task_store
-            .read()
-            .get("run-1")
-            .unwrap()
-            .inner
-            .lock()
-            .status = TaskStatus::Completed;
-        let snap = orchestration_activity_snapshot(&state, 10);
-        assert_eq!(snap["quiescent"], json!(true));
-        assert_eq!(snap["drain"]["draining"], json!(true));
     }
 
     #[test]

@@ -23,8 +23,8 @@ use crate::roadmap::Roadmap;
 use crate::store_persister::StorePersister;
 use crate::threads::Threads;
 use crate::{
-    artifacts, crons, edge_index, path_cache, pollers, slack_channel_bindings,
-    slack_proposal_links, system_events, webhooks, whiteboards, workflow,
+    artifacts, edge_index, path_cache, slack_channel_bindings, slack_proposal_links, system_events,
+    whiteboards,
 };
 
 // ---------------------------------------------------------------------------
@@ -283,45 +283,8 @@ pub(crate) struct SharedState {
     /// directly to avoid locking every task's inner mutex on each
     /// fleet poll. See `src/orchestration/mod.rs::RosterView`.
     pub(crate) roster_view: Arc<orchestration::RosterView>,
-    pub(crate) store_dir: PathBuf, // BRO_HOME (default: ~/.local/state/blackbox/bro)
-    /// In-flight workflow arcs keyed by `arc_thread_id`. Updated at
-    /// every node boundary by the engine so /orchestrate/peek can
-    /// report the live state without reading notes. Entries persist
-    /// after the arc terminates so a peek shortly after close still
-    /// works (they stay until the daemon restarts).
-    pub(crate) running_arcs: RwLock<HashMap<String, ArcSnapshot>>,
-    /// Pending Wait-node registrations indexed by signal name +
-    /// correlation. Webhook router and direct `bbox_arc_signal` MCP
-    /// calls write into this; suspended arcs block on the per-wait
-    /// Notify until a matching signal arrives.
-    pub(crate) wait_store: Arc<crate::workflow::wait::WaitStore>,
-    /// Durable per-arc checkpoints under `<store_dir>/arcs/`. Written
-    /// by the engine at node boundaries and Wait registration, replayed
-    /// by the boot rehydration pass so suspended arcs survive daemon
-    /// restarts. The in-memory `wait_store` above stays authoritative
-    /// for live matching; it is rebuilt from these checkpoints by
-    /// re-entering each resumed arc's wait node.
-    pub(crate) arc_store: Arc<crate::workflow::arc_store::ArcStore>,
-    /// Singleton-admission registry: (workflow name, canonical key) →
-    /// holding arc id. Claimed by the runner at arc start for
-    /// workflows declaring `admission`, released at terminal state.
-    /// In-memory by design: live arcs re-claim through rehydration, so
-    /// the durable source of truth is the checkpoint set, not this map.
-    pub(crate) arc_admissions: parking_lot::Mutex<HashMap<(String, String), String>>,
-    /// Operator-installed webhook endpoints. Each carries its
-    /// signature scheme + extractor + routing-packet id.
-    pub(crate) webhooks: webhooks::SharedRegistry,
-    /// Operator-installed pollers — scheduled HTTP-source inlets
-    /// that converge on the same `dispatch_routed_event` pipeline as
-    /// webhooks. Carries running-task handles so they can be aborted
-    /// on uninstall / replaced on reinstall.
-    pub(crate) pollers: pollers::SharedRegistry,
-    /// Operator-installed crons — calendar-driven inlets (sibling to
-    /// webhooks/pollers). Same `dispatch_routed_event` convergence;
-    /// distinct registry because the spec shape and concurrency model
-    /// differ (pollers fetch HTTP per tick; crons dispatch arcs by
-    /// schedule and gate concurrency per-cron).
-    pub(crate) crons: crons::SharedRegistry,
+    pub(crate) store_dir: PathBuf,
+
     /// Whiteboards — multi-agent deliberation boards shared between
     /// in-workflow ensembles, in-workflow facilitators, and external
     /// agents (operator's Claude, dispatched help, eventually humans
@@ -329,37 +292,7 @@ pub(crate) struct SharedState {
     /// signals through `dispatch_routed_event` so wait_for_phase
     /// nodes resume on the same pipeline webhook ingress uses.
     pub(crate) whiteboards: whiteboards::SharedRegistry,
-    /// Operator-installed workflow specs by id. Allows
-    /// `start_arc{workflow: "name"}` routing verdicts to find their
-    /// target without the webhook payload carrying the full spec.
-    pub(crate) workflow_registry: Arc<RwLock<HashMap<String, workflow::Workflow>>>,
-    /// True iff the daemon's HTTP listener is bound to a loopback
-    /// address. Webhook signature scheme `none` is rejected at install
-    /// AND at verify when this is false (defense in depth).
-    pub(crate) bind_is_loopback: bool,
-    /// Bounded ring buffer of recent signal-dispatch events. Every
-    /// call to `signal_arc_dispatch` records one entry — whether the
-    /// signal matched a pending wait (with the resolved arc/wait ids)
-    /// or fell idle (with the pending-with-same-signal snapshot at
-    /// dispatch time). Surfaced via `bro_signals` MCP for debugging
-    /// "did this webhook actually resolve a wait?" without grepping
-    /// the daemon's tracing log.
-    pub(crate) signal_log: RwLock<std::collections::VecDeque<SignalEvent>>,
-    /// Bounded ring buffer of recent webhook deliveries. Captured by
-    /// the webhook handler post-dispatch; carries the extracted
-    /// entity, the routing verdict's classification, and the response
-    /// returned to the caller. Surfaced via `bro_webhook_deliveries`
-    /// MCP — replaces poking the upstream's hook-task table or
-    /// reading daemon tracing logs to debug routing-rule misses.
-    pub(crate) webhook_delivery_log: RwLock<std::collections::VecDeque<WebhookDelivery>>,
-    /// Cancellation tokens for in-flight workflow arcs, keyed by
-    /// `arc_id`. Created at run start, removed at terminus. The
-    /// `bro_arc_cancel` MCP tool and the `cancel_arc` routing verdict
-    /// look up the token and trigger `cancel()`; the runner observes
-    /// the token between node iterations and inside Wait suspensions
-    /// (via `tokio::select!`), bails out with status `cancelled`, and
-    /// runs `on_arc_cancel` + `on_arc_exit` hooks on the way out.
-    pub(crate) arc_cancel_tokens: RwLock<HashMap<String, CancellationToken>>,
+
     /// Daemon-wide resume lease registry keyed `(provider, session_id)`.
     /// All resume paths must acquire this before spawning a provider
     /// resume process and hold it until the task reaches a terminal
@@ -382,7 +315,7 @@ pub(crate) struct SharedState {
     pub(crate) slack_channel_bindings: Arc<slack_channel_bindings::SlackChannelBindings>,
     pub(crate) slack_proposal_links: Arc<slack_proposal_links::SlackProposalLinks>,
     pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
-    pub(crate) atom_invocation_store: orchestration::atoms::invocation::SharedInvocationStore,
+
     // kept: SharedState vector store handle; consumed by embed/queue path through alternate state plumbing, retained here for direct access
     #[allow(dead_code)]
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
@@ -504,49 +437,6 @@ fn git_overlay_visible_under_cutover(
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
 
 pub(crate) const WEBHOOK_LOG_CAP: usize = 200;
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct SignalEvent {
-    pub(crate) timestamp: String,
-    pub(crate) signal: String,
-    pub(crate) correlation: serde_json::Map<String, Value>,
-    /// `"matched"` when a pending wait resolved, `"no_matching_wait"`
-    /// otherwise.
-    pub(crate) outcome: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) matched_arc_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) matched_wait_id: Option<String>,
-    /// Snapshot of pending waits with the same signal name at
-    /// dispatch time. Empty when the signal matched. When the signal
-    /// went idle this is the diff a debugger needs: which arcs were
-    /// waiting on this signal name, with what correlation, that
-    /// failed to match.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) idle_pending: Vec<crate::workflow::wait::WaitSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct WebhookDelivery {
-    pub(crate) received_at: String,
-    pub(crate) webhook_name: String,
-    /// `"webhook"` for live deliveries via `/webhook/:name`,
-    /// `"replay"` for the no-signature replay endpoint.
-    pub(crate) source: String,
-    /// Subset of inbound headers that drove routing (lowercased
-    /// `x-*` keys). Full header capture would balloon the buffer and
-    /// most non-`x-*` headers carry no routing signal.
-    pub(crate) headers: serde_json::Map<String, Value>,
-    pub(crate) extracted_entity: Value,
-    /// `"start_arc"` / `"signal_arc"` / `"cancel_arc"` / `"ignore"` /
-    /// `"dead_letter"` / `"no_match"` (when no rule fired) /
-    /// `"extractor_failed"` / `"signature_invalid"` /
-    /// `"idempotency_dropped"`. Single string keeps the schema
-    /// flat for filter queries.
-    pub(crate) verdict_classification: String,
-    pub(crate) response_status: u16,
-    pub(crate) response_body: Value,
-}
 
 impl SharedState {
     /// The COMPLETE catalog project-id set, as a `HashSet` for the sidecar
@@ -714,22 +604,6 @@ impl SharedState {
         }
     }
 
-    pub(crate) fn record_signal(&self, ev: SignalEvent) {
-        let mut log = self.signal_log.write();
-        if log.len() >= SIGNAL_LOG_CAP {
-            log.pop_front();
-        }
-        log.push_back(ev);
-    }
-
-    pub(crate) fn record_webhook(&self, d: WebhookDelivery) {
-        let mut log = self.webhook_delivery_log.write();
-        if log.len() >= WEBHOOK_LOG_CAP {
-            log.pop_front();
-        }
-        log.push_back(d);
-    }
-
     /// Ask the edge-index rebuild watcher to run a rebuild soon (it wakes
     /// immediately when parked on its interval). `try_send` failure means a
     /// nudge is already pending — the queued rebuild will see this caller's
@@ -765,116 +639,6 @@ impl SharedState {
             self.roster_tx.clone(),
             self.roster_view.clone(),
         )
-    }
-
-    /// Register a cancel token for a freshly-spawned arc. Returns the
-    /// token so the runner can hold a clone for `is_cancelled()`
-    /// checks. Replaces any prior token for the same arc_id (e.g.
-    /// recycled arc_id under unusual restart races) — last writer
-    /// wins.
-    pub(crate) fn register_arc_cancel_token(&self, arc_id: &str) -> CancellationToken {
-        let token = CancellationToken::new();
-        self.arc_cancel_tokens
-            .write()
-            .insert(arc_id.to_string(), token.clone());
-        token
-    }
-
-    /// Register a cancel token that is chained to a parent token.
-    /// Cancelling the parent trips the child, while the child still
-    /// remains addressable directly through `cancel_arc`.
-    pub(crate) fn register_arc_cancel_token_child(
-        &self,
-        arc_id: &str,
-        parent: &CancellationToken,
-    ) -> CancellationToken {
-        let token = parent.child_token();
-        self.arc_cancel_tokens
-            .write()
-            .insert(arc_id.to_string(), token.clone());
-        token
-    }
-
-    /// Drop the cancel token for an arc that's reached terminal
-    /// state. Called from the runner's exit path so the map doesn't
-    /// grow unbounded across daemon uptime.
-    pub(crate) fn unregister_arc_cancel_token(&self, arc_id: &str) {
-        self.arc_cancel_tokens.write().remove(arc_id);
-    }
-
-    /// Claim a singleton-admission key for an arc. Returns Err with the
-    /// holding arc id when the key is already held. Claim and check are
-    /// one atomic step under the registry lock.
-    pub(crate) fn claim_arc_admission(
-        &self,
-        workflow: &str,
-        canonical_key: &str,
-        arc_id: &str,
-    ) -> Result<(), String> {
-        let mut map = self.arc_admissions.lock();
-        let slot = (workflow.to_string(), canonical_key.to_string());
-        match map.get(&slot) {
-            Some(holder) if holder != arc_id => Err(holder.clone()),
-            _ => {
-                map.insert(slot, arc_id.to_string());
-                Ok(())
-            }
-        }
-    }
-
-    /// Release an admission key IF this arc holds it. A release from a
-    /// stale loser (claim failed, arc errored out) must not evict the
-    /// legitimate holder.
-    pub(crate) fn release_arc_admission(&self, workflow: &str, canonical_key: &str, arc_id: &str) {
-        let mut map = self.arc_admissions.lock();
-        let slot = (workflow.to_string(), canonical_key.to_string());
-        if map.get(&slot).is_some_and(|holder| holder == arc_id) {
-            map.remove(&slot);
-        }
-    }
-
-    /// Current holder of an admission key, if any. Advisory read for
-    /// the routing layer's duplicate-conversion path; the runner-side
-    /// claim remains the enforcement point.
-    pub(crate) fn arc_admission_holder(
-        &self,
-        workflow: &str,
-        canonical_key: &str,
-    ) -> Option<String> {
-        self.arc_admissions
-            .lock()
-            .get(&(workflow.to_string(), canonical_key.to_string()))
-            .cloned()
-    }
-
-    /// Wrap a successfully claimed admission key in an RAII lease.
-    pub(crate) fn admission_lease(
-        self: &Arc<Self>,
-        workflow: String,
-        canonical_key: String,
-        arc_id: String,
-    ) -> AdmissionLease {
-        AdmissionLease {
-            state: self.clone(),
-            workflow,
-            canonical_key,
-            arc_id,
-        }
-    }
-
-    /// Trigger cancellation for a running arc. Returns whether a
-    /// matching token existed (and was triggered). The runner notices
-    /// at the next node boundary — or immediately if it's parked on
-    /// a Wait, since the wait's `tokio::select!` includes the token's
-    /// `cancelled()` arm.
-    pub(crate) fn cancel_arc(&self, arc_id: &str) -> bool {
-        match self.arc_cancel_tokens.read().get(arc_id) {
-            Some(token) => {
-                token.cancel();
-                true
-            }
-            None => false,
-        }
     }
 
     /// Borrowed store view for the entity-provider layer
@@ -1141,19 +905,19 @@ impl SharedState {
             roster_tx,
             roster_view: Arc::new(orchestration::RosterView::new()),
             store_dir: store_dir.to_path_buf(),
-            running_arcs: RwLock::new(HashMap::new()),
-            wait_store: Arc::new(workflow::wait::WaitStore::new()),
-            arc_store: Arc::new(workflow::arc_store::ArcStore::new(store_dir.join("arcs"))),
-            arc_admissions: parking_lot::Mutex::new(HashMap::new()),
-            webhooks: Arc::new(webhooks::WebhookRegistry::new()),
-            pollers: Arc::new(pollers::PollerRegistry::new()),
-            crons: Arc::new(crons::CronRegistry::new()),
+
+
+
+
+
+
+
             whiteboards: Arc::new(whiteboards::WhiteboardRegistry::new()),
-            workflow_registry: Arc::new(RwLock::new(HashMap::new())),
-            bind_is_loopback: true,
-            signal_log: RwLock::new(VecDeque::with_capacity(SIGNAL_LOG_CAP)),
-            webhook_delivery_log: RwLock::new(VecDeque::with_capacity(WEBHOOK_LOG_CAP)),
-            arc_cancel_tokens: RwLock::new(HashMap::new()),
+
+
+
+
+
             resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
             drain: super::drain::DrainState::in_memory(store_dir),
             long_polls: Arc::new(super::drain::LongPollRegistry::new()),
@@ -1170,11 +934,7 @@ impl SharedState {
                 crate::config::load()
                     .unwrap_or_else(|e| panic!("loading config for test SharedState: {e}")),
             )),
-            atom_invocation_store: Arc::new(RwLock::new(
-                orchestration::atoms::invocation::InvocationStore::new(
-                    store_dir.join("atom-invocations.json"),
-                ),
-            )),
+
             vector_store: Arc::new(
                 crate::vectors::VectorStore::open(store_dir.join("vectors"))
                     .expect("test vector store should open"),
@@ -2246,44 +2006,6 @@ mod code_read_view_tests {
             "the attached-only projection is exactly what must NOT seed this set"
         );
     }
-}
-
-/// RAII lease on a singleton-admission key. Dropping it performs the
-/// holder-checked release, so an arc task that PANICS (its future is
-/// dropped mid-await, never reaching the terminal epilogue) still frees
-/// its key instead of holding it until daemon restart. The normal
-/// epilogue releases by clearing the runner's lease field explicitly.
-pub(crate) struct AdmissionLease {
-    state: Arc<SharedState>,
-    workflow: String,
-    canonical_key: String,
-    arc_id: String,
-}
-
-impl Drop for AdmissionLease {
-    fn drop(&mut self) {
-        self.state
-            .release_arc_admission(&self.workflow, &self.canonical_key, &self.arc_id);
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ArcSnapshot {
-    pub(crate) arc_id: String,
-    pub(crate) arc_thread_id: String,
-    pub(crate) workflow_name: String,
-    pub(crate) workflow_version: u32,
-    pub(crate) status: String,
-    pub(crate) current_node: Option<String>,
-    pub(crate) completed_nodes: Vec<String>,
-    pub(crate) in_flight_nodes: Vec<String>,
-    pub(crate) last_verdict: Option<String>,
-    pub(crate) visit_counts: std::collections::HashMap<String, u32>,
-    /// Canonical admission key this arc holds, when its workflow
-    /// declares an `admission` contract.
-    pub(crate) admission_key: Option<String>,
-    pub(crate) started_at: String,
-    pub(crate) updated_at: String,
 }
 
 // ---------------------------------------------------------------------------

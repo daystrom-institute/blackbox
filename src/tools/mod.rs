@@ -11,7 +11,6 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 pub mod agents;
 pub mod artifacts;
-pub mod atoms;
 pub mod attention;
 mod body_page;
 pub mod bro_helpers;
@@ -25,7 +24,6 @@ pub mod graph;
 pub mod knowledge;
 pub mod mcp_surface;
 pub mod notes;
-pub mod orchestrate;
 pub mod packets;
 pub mod project_catalog;
 pub mod projects;
@@ -37,8 +35,6 @@ pub mod sessions;
 pub mod storage_gc;
 pub mod storage_health;
 pub mod storage_migration;
-pub mod system_events;
 pub mod threads;
 pub mod tool_calls;
 pub mod transcripts;
-pub mod whiteboards;
