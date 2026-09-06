@@ -853,7 +853,7 @@ mod tests {
             }))
             .await;
         assert!(result.is_error.unwrap_or(false), "{result:?}");
-        let error = result.content[0].as_text().unwrap().text;
+        let error = &result.content[0].as_text().unwrap().text;
         assert!(error.contains("action=list"), "{error}");
     }
 

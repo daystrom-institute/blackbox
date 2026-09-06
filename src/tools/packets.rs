@@ -586,7 +586,7 @@ mod tests {
             ))
             .await;
         assert!(rejected.is_error.unwrap_or(false), "{rejected:?}");
-        let error = rejected.content[0].as_text().unwrap().text;
+        let error = &rejected.content[0].as_text().unwrap().text;
         assert!(error.contains("at most 1000"), "{error}");
 
         let audits = server

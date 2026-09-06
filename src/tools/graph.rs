@@ -1115,7 +1115,7 @@ impl BlackboxServer {
             let rows = graphs
                 .into_iter()
                 .map(|graph| serde_json::to_value(&graph))
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let mut page = bbox_corpus_core::response_page::collection_page(
                 rows,
                 "graphs",
@@ -1206,7 +1206,7 @@ impl BlackboxServer {
                     let rows = graphs
                         .into_iter()
                         .map(|graph| serde_json::to_value(&graph))
-                        .collect::<Result<Vec<_>>>()?;
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     let mut page = bbox_corpus_core::response_page::collection_page(
                         rows,
                         "graphs",
@@ -3209,8 +3209,15 @@ mod tests {
             );
             views.install_published(view);
         }
-        let stale =
-            describe_detail_text(&server, &project_id, "wide", "schema", Some(cursor), None).await;
+        let stale = describe_detail_text(
+            &server,
+            &project_id,
+            "wide",
+            "schema",
+            Some(cursor.clone()),
+            None,
+        )
+        .await;
         assert!(
             stale.contains("restart without cursor"),
             "a cursor must refuse a replaced generation: {stale}"
@@ -3260,32 +3267,34 @@ mod tests {
             .state
             .project_graph_views
             .write()
-            .install_provisional(bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
-                project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
-                    project_id.to_string(),
-                )
-                .unwrap(),
-                scope: PublishedScope::try_new("test-plane", ".").unwrap(),
-                workspace_id,
-                source_generation_id: "working-one".into(),
-                graphs: std::collections::BTreeMap::from([(
-                    graph_id.clone(),
-                    bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
-                        bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
-                            graph_id,
-                            bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
-                                accepted_generation: "generation-one".into(),
-                                accepted_commit: "a".repeat(40),
-                                source_generation: Some("working-one".into()),
-                                workspace_id: Some(workspace_id),
-                                content_hash: graph.fingerprint.clone(),
-                            },
-                            graph,
+            .install_provisional(
+                bbox_indexing::project_graph_view::ProvisionalProjectGraphOverlay {
+                    project_id: bbox_corpus_core::project_catalog::ProjectId::parse(
+                        project_id.to_string(),
+                    )
+                    .unwrap(),
+                    scope: PublishedScope::try_new("test-plane", ".").unwrap(),
+                    workspace_id: workspace_id.clone(),
+                    source_generation_id: "working-one".into(),
+                    graphs: std::collections::BTreeMap::from([(
+                        graph_id.clone(),
+                        bbox_indexing::project_graph_view::ProjectGraphOverlayValue::Upsert(
+                            bbox_indexing::project_graph_view::ProjectGraphViewEntry::valid(
+                                graph_id,
+                                bbox_indexing::project_graph_view::ProjectGraphGenerationIdentity {
+                                    accepted_generation: "generation-one".into(),
+                                    accepted_commit: "a".repeat(40),
+                                    source_generation: Some("working-one".into()),
+                                    workspace_id: Some(workspace_id),
+                                    content_hash: graph.fingerprint.clone(),
+                                },
+                                graph,
+                            ),
                         ),
-                    ),
-                )]),
-                evidence: None,
-            });
+                    )]),
+                    evidence: None,
+                },
+            );
         workspace_hex.to_string()
     }
 
@@ -3389,9 +3398,10 @@ mod tests {
             &workspace_b,
             synthetic_graph(&project_id, "shared", "vary", "vary:Node", "two"),
         );
-        let expected_schema =
-            serde_json::to_value(&synthetic_graph(&project_id, "shared", "vary", "vary:Node", "one").schema)
-                .unwrap();
+        let expected_schema = serde_json::to_value(
+            &synthetic_graph(&project_id, "shared", "vary", "vary:Node", "one").schema,
+        )
+        .unwrap();
 
         let listed = server
             .bbox_project_graph_list(Parameters(ProjectGraphListParams {
@@ -3416,21 +3426,34 @@ mod tests {
             .find(|row| row["checkout_id"].as_str() == Some(workspace_a.as_str()))
             .expect("workspace-A overlay listed");
         assert_eq!(
-            overlay_a_row["content_hash"], json!(repeated_hash),
+            overlay_a_row["content_hash"],
+            json!(repeated_hash),
             "distinct source and checkout repeat one content hash"
         );
 
         // The multi-variant default summary is a bounded page, not an
         // unbounded graphs array.
-        let summary = describe_variants_text(&server, &project_id, "shared", None, None, None, None, None, None)
-            .await;
+        let summary = describe_variants_text(
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
         let summary_text = summary.clone();
         let summary_page: serde_json::Value = serde_json::from_str(&summary_text).unwrap();
         assert_eq!(summary_page["total"], json!(3), "{summary_text}");
         assert_eq!(summary_page["count"], json!(3), "{summary_text}");
         assert!(summary_page["next_offset"].is_null(), "{summary_text}");
         assert!(
-            summary_page["view_stamp"].as_str().is_some_and(|s| !s.is_empty()),
+            summary_page["view_stamp"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
             "{summary_text}"
         );
         let summary_envelope = serde_json::to_vec(&summary_page).unwrap().len();
@@ -3441,8 +3464,15 @@ mod tests {
 
         // Variant paging continues by stamp and refuses a changed set.
         let first = describe_variants_text(
-            &server, &project_id, "shared", None, None, None,
-            Some(1), None, None,
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            None,
+            Some(1),
+            None,
+            None,
         )
         .await;
         let first_text = first;
@@ -3456,8 +3486,15 @@ mod tests {
         let view_stamp = first_page["view_stamp"].as_str().unwrap().to_string();
 
         let unstamped = describe_variants_text(
-            &server, &project_id, "shared", None, None, None,
-            Some(1), Some(1), None,
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            None,
+            Some(1),
+            Some(1),
+            None,
         )
         .await;
         assert!(
@@ -3466,8 +3503,15 @@ mod tests {
         );
 
         let second = describe_variants_text(
-            &server, &project_id, "shared", None, None, None,
-            Some(1), Some(1), Some(view_stamp.clone()),
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            None,
+            Some(1),
+            Some(1),
+            Some(view_stamp.clone()),
         )
         .await;
         let second_text = second;
@@ -3479,8 +3523,15 @@ mod tests {
         );
 
         let wrong_stamp = describe_variants_text(
-            &server, &project_id, "shared", None, None, None,
-            Some(1), Some(2), Some("deadbeef".into()),
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            None,
+            Some(1),
+            Some(2),
+            Some("deadbeef".into()),
         )
         .await;
         assert!(
@@ -3495,8 +3546,15 @@ mod tests {
             synthetic_graph(&project_id, "shared", "vary", "vary:Node", "three"),
         );
         let changed = describe_variants_text(
-            &server, &project_id, "shared", None, None, None,
-            Some(1), Some(2), Some(view_stamp),
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            None,
+            Some(1),
+            Some(2),
+            Some(view_stamp),
         )
         .await;
         assert!(
@@ -3504,7 +3562,15 @@ mod tests {
             "a changed variant set refuses continuation: {changed}"
         );
         let restarted = describe_variants_text(
-            &server, &project_id, "shared", None, None, None, None, None, None,
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await;
         let restarted_page: serde_json::Value = serde_json::from_str(&restarted).unwrap();
@@ -3513,15 +3579,29 @@ mod tests {
         // A repeated hash alone stays ambiguous; the summary narrows to the
         // two variants that carry it.
         let hash_only = describe_variants_text(
-            &server, &project_id, "shared", None, None, Some(repeated_hash),
-            None, None, None,
+            &server,
+            &project_id,
+            "shared",
+            None,
+            None,
+            Some(repeated_hash),
+            None,
+            None,
+            None,
         )
         .await;
         let hash_only_page: serde_json::Value = serde_json::from_str(&hash_only).unwrap();
         assert_eq!(hash_only_page["total"], json!(2), "{hash_only}");
         let ambiguous = describe_selected_text(
-            &server, &project_id, "shared", "schema",
-            None, None, Some(repeated_hash), None, None,
+            &server,
+            &project_id,
+            "shared",
+            "schema",
+            None,
+            None,
+            Some(repeated_hash),
+            None,
+            None,
         )
         .await;
         assert!(
@@ -3533,13 +3613,21 @@ mod tests {
         // Selecting by source (or checkout) resolves the repeated hash, and
         // the exact read reconstructs the selected variant's schema.
         let selected_summary = describe_variants_text(
-            &server, &project_id, "shared",
-            Some("published"), None, Some(repeated_hash), None, None, None,
+            &server,
+            &project_id,
+            "shared",
+            Some("published"),
+            None,
+            Some(repeated_hash),
+            None,
+            None,
+            None,
         )
         .await;
         let selected_page: serde_json::Value = serde_json::from_str(&selected_summary).unwrap();
         assert_eq!(
-            selected_page["summary"]["source"], json!("published"),
+            selected_page["summary"]["source"],
+            json!("published"),
             "the selected variant unwraps alone: {selected_summary}"
         );
 
@@ -3547,13 +3635,22 @@ mod tests {
         let mut cursor = None;
         loop {
             let text = describe_selected_text(
-                &server, &project_id, "shared", "schema",
-                Some("published"), None, Some(repeated_hash), cursor, None,
+                &server,
+                &project_id,
+                "shared",
+                "schema",
+                Some("published"),
+                None,
+                Some(repeated_hash),
+                cursor,
+                None,
             )
             .await;
             let page: serde_json::Value = serde_json::from_str(&text).unwrap();
             joined.push_str(page["body"]["text"].as_str().unwrap());
-            cursor = page["body"]["next_cursor"].as_str().map(ToString::to_string);
+            cursor = page["body"]["next_cursor"]
+                .as_str()
+                .map(ToString::to_string);
             if cursor.is_none() {
                 break;
             }
@@ -3567,13 +3664,22 @@ mod tests {
         let mut cursor = None;
         loop {
             let text = describe_selected_text(
-                &server, &project_id, "shared", "schema",
-                None, Some(&workspace_a), Some(repeated_hash), cursor, None,
+                &server,
+                &project_id,
+                "shared",
+                "schema",
+                None,
+                Some(&workspace_a),
+                Some(repeated_hash),
+                cursor,
+                None,
             )
             .await;
             let page: serde_json::Value = serde_json::from_str(&text).unwrap();
             joined.push_str(page["body"]["text"].as_str().unwrap());
-            cursor = page["body"]["next_cursor"].as_str().map(ToString::to_string);
+            cursor = page["body"]["next_cursor"]
+                .as_str()
+                .map(ToString::to_string);
             if cursor.is_none() {
                 break;
             }
@@ -3587,8 +3693,15 @@ mod tests {
         // Body cursors bind to the exact selection: a cursor minted for the
         // published variant refuses under the byte-identical overlay.
         let published_first = describe_selected_text(
-            &server, &project_id, "shared", "schema",
-            Some("published"), None, Some(repeated_hash), None, Some(64),
+            &server,
+            &project_id,
+            "shared",
+            "schema",
+            Some("published"),
+            None,
+            Some(repeated_hash),
+            None,
+            Some(64),
         )
         .await;
         let published_page: serde_json::Value = serde_json::from_str(&published_first).unwrap();
@@ -3597,8 +3710,15 @@ mod tests {
             .expect("a 64-byte page always continues")
             .to_string();
         let cross_variant = describe_selected_text(
-            &server, &project_id, "shared", "schema",
-            None, Some(&workspace_a), Some(repeated_hash), Some(published_cursor), None,
+            &server,
+            &project_id,
+            "shared",
+            "schema",
+            None,
+            Some(&workspace_a),
+            Some(repeated_hash),
+            Some(published_cursor),
+            None,
         )
         .await;
         assert!(
@@ -3607,8 +3727,15 @@ mod tests {
         );
 
         let no_match = describe_selected_text(
-            &server, &project_id, "shared", "schema",
-            None, Some(&"f".repeat(32)), None, None, None,
+            &server,
+            &project_id,
+            "shared",
+            "schema",
+            None,
+            Some(&"f".repeat(32)),
+            None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -3617,8 +3744,15 @@ mod tests {
         );
 
         let bad_source = describe_selected_text(
-            &server, &project_id, "shared", "schema",
-            Some("museum"), None, None, None, None,
+            &server,
+            &project_id,
+            "shared",
+            "schema",
+            Some("museum"),
+            None,
+            None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -3682,7 +3816,8 @@ mod tests {
             .unwrap();
         assert_eq!(excluded.len(), 200);
         assert_eq!(
-            excluded[0], json!("excl:Type000"),
+            excluded[0],
+            json!("excl:Type000"),
             "the exact sorted list recovers from the schema body"
         );
     }

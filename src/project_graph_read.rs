@@ -143,7 +143,7 @@ impl GraphVariantSelector {
     fn matches_entry(&self, entry: &ProjectGraphViewEntry) -> bool {
         self.matches_parts(
             source_label(entry),
-            entry.generation.workspace_id.as_deref(),
+            entry.generation.workspace_id.as_ref().map(|id| id.as_str()),
             entry.generation.content_hash.as_str(),
         )
     }
@@ -169,7 +169,12 @@ fn variant_identity(entry: &ProjectGraphViewEntry) -> String {
     format!(
         "source={}, checkout_id={}, content_hash={}",
         source_label(entry),
-        entry.generation.workspace_id.as_deref().unwrap_or("-"),
+        entry
+            .generation
+            .workspace_id
+            .as_ref()
+            .map(|id| id.as_str())
+            .unwrap_or("-"),
         entry.generation.content_hash
     )
 }
@@ -386,7 +391,7 @@ impl BlackboxServer {
                 let retrieval = graph_retrieval_participation(&entry, &*index, &project_id)?;
                 Ok(GraphDescription {
                     summary,
-                    schema: entry.graph().map(schema_summary),
+                    schema: entry.graph().map(|graph| schema_summary(graph)),
                     generation: entry.generation,
                     retrieval,
                 })
@@ -456,7 +461,8 @@ impl BlackboxServer {
         detail: GraphDescribeDetail,
         selector: Option<&GraphVariantSelector>,
     ) -> Result<GraphDetailRead> {
-        let (project_id, mode, entry) = self.single_graph_entry(project, graph_id, provisional, selector)?;
+        let (project_id, mode, entry) =
+            self.single_graph_entry(project, graph_id, provisional, selector)?;
         let summary = summary(entry.clone());
         let Some(graph) = entry.graph().cloned() else {
             bail!(
@@ -515,14 +521,14 @@ impl BlackboxServer {
                 let error_values = errors
                     .iter()
                     .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 let errors_total = error_values.len();
                 let error_stamp = graph_error_stamp(
                     &project_id,
                     mode,
                     &entry.graph_id,
                     source,
-                    entry.generation.workspace_id.as_deref(),
+                    entry.generation.workspace_id.as_ref().map(|id| id.as_str()),
                     &entry.generation.content_hash,
                     &error_values,
                 )?;

@@ -1484,10 +1484,7 @@ fn knowledge_query_scope(p: &KnowledgeListParams) -> serde_json::Value {
     })
 }
 
-fn knowledge_recovery_arguments(
-    p: &KnowledgeListParams,
-    entity_ref: &str,
-) -> serde_json::Value {
+fn knowledge_recovery_arguments(p: &KnowledgeListParams, entity_ref: &str) -> serde_json::Value {
     let mut arguments = knowledge_query_scope(p);
     arguments["entry_detail"] = json!(entity_ref);
     if let Some(limit) = p.detail_limit {
@@ -1501,7 +1498,10 @@ fn resolve_knowledge_item<'a>(
     selector: &str,
 ) -> anyhow::Result<&'a crate::server::knowledge_view::KnowledgeViewItem> {
     let selector = selector.trim();
-    anyhow::ensure!(!selector.is_empty(), "entry_detail must name a knowledge entry");
+    anyhow::ensure!(
+        !selector.is_empty(),
+        "entry_detail must name a knowledge entry"
+    );
     if selector.starts_with("knowledge:") || selector.starts_with("provisional_knowledge:") {
         return items
             .iter()
@@ -1654,7 +1654,9 @@ fn exact_system_memory_detail_response(
     memory: &system_memory::SystemMemory,
     p: &KnowledgeListParams,
 ) -> anyhow::Result<(String, serde_json::Value)> {
-    let body = serde_json::to_string(memory)?;
+    let body = serde_json::to_string(
+        &json!({"id": memory.id, "title": memory.title, "tags": memory.tags, "content": memory.content}),
+    )?;
     let page = projection_body_page(
         "system memory record",
         &memory.id,
@@ -3297,11 +3299,11 @@ mod tests {
             reconstructed.push_str(page["body"]["text"].as_str().unwrap());
             cursor = page["body"]["next_cursor"].as_str().map(str::to_string);
         }
-        let recovered: system_memory::SystemMemory = serde_json::from_str(&reconstructed).unwrap();
-        assert_eq!(recovered.id, memory.id);
-        assert_eq!(recovered.title, memory.title);
-        assert_eq!(&recovered.tags, &memory.tags);
-        assert_eq!(recovered.content, memory.content);
+        let recovered: serde_json::Value = serde_json::from_str(&reconstructed).unwrap();
+        assert_eq!(recovered["id"], memory.id);
+        assert_eq!(recovered["title"], memory.title);
+        assert_eq!(recovered["tags"], json!(memory.tags));
+        assert_eq!(recovered["content"], memory.content);
     }
 
     #[test]
@@ -3356,7 +3358,9 @@ mod tests {
         let entry = &structured["rows"][0]["entry"];
         assert!(entry["title"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32);
         assert_eq!(entry["title_bytes"], title.len());
-        assert!(entry["rationale"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32);
+        assert!(
+            entry["rationale"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_METADATA_BYTES + 32
+        );
         assert_eq!(entry["rationale_bytes"], rationale.len());
         assert_eq!(entry["variants"]["count"], 1);
         assert_eq!(entry["variants"]["truncated"], true);
@@ -3406,7 +3410,7 @@ mod tests {
             diagnostics: Vec::new(),
             degraded_overlays: Vec::new(),
         };
-        let visible_refs = [published_ref, own_ref.clone(), peer_ref];
+        let visible_refs = [published_ref, own_ref.clone(), peer_ref.clone()];
         let p = KnowledgeListParams {
             entry_detail: Some(own_ref.clone()),
             provisional: Some("all".into()),
@@ -3436,7 +3440,11 @@ mod tests {
         hidden.entry_detail = Some(peer_ref);
         let out_of_scope = exact_entry_detail_response(&view, &hidden, &[own_ref])
             .expect_err("filter scope must reject a hidden variant");
-        assert!(out_of_scope.to_string().contains("not in the requested filter scope"));
+        assert!(
+            out_of_scope
+                .to_string()
+                .contains("not in the requested filter scope")
+        );
     }
 
     #[tokio::test]
@@ -3467,7 +3475,10 @@ mod tests {
             row["entry"]["content"].as_str().unwrap().len() <= STRUCTURED_KNOWLEDGE_CONTENT_BYTES
         );
         assert_eq!(row["entry"]["content_bytes"], content.len());
-        assert_eq!(row["detail"]["arguments"]["entry_detail"], "knowledge:unicode-entry");
+        assert_eq!(
+            row["detail"]["arguments"]["entry_detail"],
+            "knowledge:unicode-entry"
+        );
 
         let first = server
             .bbox_knowledge(Parameters(KnowledgeListParams {
@@ -3528,14 +3539,15 @@ mod tests {
         let tmp_root = tmp.path().canonicalize().unwrap();
         let (base, _worktree) = init_repo_with_worktree(&tmp_root);
         let (server, record) = server_with_registered(&tmp_root, &base);
-        let mut entry = stamped_entry(
-            "metadata-entry",
-            "small content",
-            &record.project_id,
-        );
+        let mut entry = stamped_entry("metadata-entry", "small content", &record.project_id);
         entry.title = "\"metadata title\"\t".repeat(2_000);
         entry.rationale = Some("\"rationale\"\n".repeat(2_000));
-        server.state.kb.write().upsert_generated(entry.clone()).unwrap();
+        server
+            .state
+            .kb
+            .write()
+            .upsert_generated(entry.clone())
+            .unwrap();
 
         let mut params = KnowledgeListParams {
             entry_detail: Some("knowledge:metadata-entry".into()),

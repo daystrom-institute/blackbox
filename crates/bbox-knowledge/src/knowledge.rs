@@ -784,7 +784,7 @@ pub struct AbsorbParams {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewParams {
     /// Closed action set: list, get, approve, or reject (default: list).
     #[serde(default)]
@@ -4415,7 +4415,10 @@ impl Knowledge {
             }
             "get" => {
                 let entry_id = p.id.as_deref().context("'id' required for get")?;
-                anyhow::ensure!(!entry_id.trim().is_empty(), "'id' must not be empty for get");
+                anyhow::ensure!(
+                    !entry_id.trim().is_empty(),
+                    "'id' must not be empty for get"
+                );
                 anyhow::ensure!(
                     p.project.is_none(),
                     "project selects a mutation owner and applies only to approve/reject"
@@ -4426,17 +4429,23 @@ impl Knowledge {
                     p.cursor.is_none() && p.limit.is_none(),
                     "cursor and limit apply only to review list/get reads"
                 );
-                let entry_id = p.id.as_deref().context(format!("'id' required for {action}"))?;
+                let entry_id =
+                    p.id.as_deref()
+                        .context(format!("'id' required for {action}"))?;
                 anyhow::ensure!(!entry_id.trim().is_empty(), "'id' must not be empty");
             }
-            other => anyhow::bail!(
-                "invalid review action {other:?}: use list, get, approve, or reject"
-            ),
+            other => {
+                anyhow::bail!("invalid review action {other:?}: use list, get, approve, or reject")
+            }
         }
         Ok(())
     }
 
-    fn review_list_response(&self, cursor: Option<&str>, requested_limit: Option<u64>) -> Result<String> {
+    fn review_list_response(
+        &self,
+        cursor: Option<&str>,
+        requested_limit: Option<u64>,
+    ) -> Result<String> {
         let unverified = self.unverified_review_entries();
         let revision = review_snapshot_revision(&unverified);
         let offset = match cursor {
@@ -4568,14 +4577,20 @@ impl Knowledge {
                     let persisted = self.persist_repo_owned_mutation_at(&[entry_id], write_dir);
                     self.restore_checkout_mutation_seed(restore);
                     persisted?;
-                    let outcome = if action == "approve" { "Approved" } else { "Rejected" };
+                    let outcome = if action == "approve" {
+                        "Approved"
+                    } else {
+                        "Rejected"
+                    };
                     Ok(format!("{outcome} entry {entry_id}"))
                 } else {
                     self.restore_checkout_mutation_seed(restore);
                     Ok(format!("Entry {entry_id} not found"))
                 }
             }
-            other => anyhow::bail!("invalid review action {other:?}: use list, get, approve, or reject"),
+            other => {
+                anyhow::bail!("invalid review action {other:?}: use list, get, approve, or reject")
+            }
         }
     }
 }

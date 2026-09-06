@@ -585,7 +585,7 @@ mod tests {
             .store()
             .transact(epoch, |_catalog, attachments| {
                 attachments.legacy_path_bindings.insert(
-                    binding_id,
+                    binding_id.clone(),
                     LegacyPathLedgerEntry {
                         legacy_path_binding_id: binding_id,
                         historical_path: historical.into(),
