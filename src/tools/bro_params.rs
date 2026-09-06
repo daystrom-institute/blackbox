@@ -321,12 +321,22 @@ pub(crate) struct BadgeyProposalsListParams {
     /// Initial page's upper proposal id bound. Reuse on subsequent pages.
     #[serde(default)]
     pub(crate) through: Option<String>,
-    /// Exact proposal/draft read; cannot combine with list filters, limit, or cursors.
+    /// Exact proposal/draft read; cannot combine with since/only_pending/limit/after/through.
     #[serde(default)]
     pub(crate) proposal_id: Option<String>,
     /// Include transition history only on an exact proposal_id read.
     #[serde(default)]
     pub(crate) include_events: bool,
+    /// full returns revision-bound JSON body pages for proposal_id, including oversized drafts.
+    /// Default summary preserves ordinary small proposals[0] exact-read compatibility.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Continue an exact detail=full read with body.next_cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact body page byte budget, maximum 4096; requires detail=full.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 impl BadgeyProposalsListParams {
     pub(crate) fn read_options(
@@ -1272,12 +1282,22 @@ pub(crate) struct ConsultantProposalsListParams {
     /// Initial page's upper proposal id bound. Reuse on subsequent pages.
     #[serde(default)]
     pub(crate) through: Option<String>,
-    /// Exact proposal/draft read; cannot combine with list filters, limit, or cursors.
+    /// Exact proposal/draft read; cannot combine with since/only_pending/limit/after/through.
     #[serde(default)]
     pub(crate) proposal_id: Option<String>,
     /// Include transition history only on an exact proposal_id read.
     #[serde(default)]
     pub(crate) include_events: bool,
+    /// full returns revision-bound JSON body pages for proposal_id, including oversized drafts.
+    /// Default summary preserves ordinary small proposals[0] exact-read compatibility.
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    /// Continue an exact detail=full read with body.next_cursor.
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    /// Exact body page byte budget, maximum 4096; requires detail=full.
+    #[serde(default)]
+    pub(crate) body_limit: Option<usize>,
 }
 impl ConsultantProposalsListParams {
     pub(crate) fn read_options(

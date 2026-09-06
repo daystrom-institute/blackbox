@@ -15,14 +15,14 @@ An agent artifact carries:
 | Field | Purpose |
 |---|---|
 | `name` | Unique agent name (canonical: `name@vN`) |
-| `version` | Semver string |
+| `version` | Positive integer |
 | `description` | What this agent does |
 | `when_to_use` | Heuristic for when to dispatch this agent |
 | `anti_patterns` | When NOT to use this agent |
 | `brofile` | Resolved persona (provider, model, effort, MCP filters) |
 | `prompt_template` | Template with `{{args.field}}` expansion |
 | `dispatch_adapter` | Optional custom dispatch path (e.g. `badgey`) |
-| `cost_class` | `cheap` / `standard` / `expensive` |
+| `cost_class` | `cheap` / `normal` / `expensive` |
 | `allow_recursion` | Declares a fan-out orchestrator: dispatch keeps the recursive `bro_*` tools available and injects the orchestrator directive. Reviewed at install; there is deliberately no per-call override on `bro_agent_dispatch` (ad-hoc recursive dispatch is `bro_exec`'s `allow_recursion`) |
 | `provenance_kind` | `bootstrap` / `learned` / `installed` |
 
@@ -32,26 +32,30 @@ Agents are installed as artifacts. Blackbox-owned defaults live under
 `system-defaults/agents/`; tutorial and integration examples stay under
 `examples/`.
 
-The source can be a local JSON file or an HTTP URL:
+MCP accepts an inline artifact JSON object or an explicit HTTP(S) source URL:
 
 ```json
-// From a local file
+// Inline typed artifact object obtained from source-owned evidence
 bbox_artifact_install(
   kind = "agent",
-  source = "/path/to/pr-reviewer.agent.json"
+  artifact = reviewer_artifact
 )
 
 // From a URL
 bbox_artifact_install(
   kind = "agent",
-  source = "https://registry.example.com/agents/code-reviewer@v1.0.0.json"
+  source = "https://registry.example.com/agents/code-reviewer@v1.json"
 )
 ```
 
 ## Discovering agents
 
+`bro_agent_list` returns 20 summaries by default, capped at 100 per page.
+`detail=true` expands descriptions and installation diagnostics; get/describe
+reads one exact agent. Keep filters unchanged while following `next_offset`.
+
 ```json
-// List all active agents
+// First page of active agents; follow next_offset as offset
 bro_agent_list()
 
 // Search by capability

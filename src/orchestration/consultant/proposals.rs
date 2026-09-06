@@ -98,6 +98,31 @@ pub struct ProposalReadOptions {
     pub include_events: bool,
 }
 
+impl ProposalReadOptions {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.proposal_id.is_some()
+            && (self.since.is_some()
+                || self.only_pending
+                || self.after.is_some()
+                || self.through.is_some()
+                || self.limit.is_some())
+        {
+            anyhow::bail!(
+                "error.proposal_read_options: proposal_id cannot be combined with list filters, limit, or cursors"
+            );
+        }
+        if self.after.is_some() && self.through.is_none() {
+            anyhow::bail!(
+                "error.proposal_cursor_invalid: after requires the through bound from the initial page"
+            );
+        }
+        if self.include_events && self.proposal_id.is_none() {
+            anyhow::bail!("error.proposal_read_options: include_events requires proposal_id");
+        }
+        Ok(())
+    }
+}
+
 pub struct ProposalStore {
     root: PathBuf,
 }
@@ -256,6 +281,32 @@ impl ProposalStore {
         Ok(proposals)
     }
 
+    /// Exact source-owned proposal projection, before transport paging.
+    pub fn exact_response_row(
+        &self,
+        instance: &ConsultantId,
+        options: &ProposalReadOptions,
+    ) -> anyhow::Result<serde_json::Value> {
+        use serde_json::json;
+        options.validate()?;
+        let id = options
+            .proposal_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("proposal_id is required for an exact read"))?;
+        let proposal = self
+            .get(instance, id)?
+            .ok_or_else(|| anyhow::anyhow!("error.proposal_not_found: {id}"))?;
+        let mut row = json!({"id": proposal.id, "kind": proposal.kind, "state": proposal.state,
+                "draft": proposal.draft, "created_at": proposal.created_at, "updated_at": proposal.updated_at});
+        if let Some(task) = proposal.applied_task_id {
+            row["applied_task_id"] = json!(task);
+        }
+        if options.include_events {
+            row["events"] = json!(proposal.events);
+        }
+        Ok(row)
+    }
+
     /// Stable numeric-id continuation survives state changes in earlier proposals.
     /// `through` freezes the initial upper id bound, so new proposals do not extend
     /// a workflow's current synthesis window indefinitely.
@@ -266,37 +317,9 @@ impl ProposalStore {
         mut envelope: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         use serde_json::json;
-        if options.proposal_id.is_some()
-            && (options.since.is_some()
-                || options.only_pending
-                || options.after.is_some()
-                || options.through.is_some()
-                || options.limit.is_some())
-        {
-            anyhow::bail!(
-                "error.proposal_read_options: proposal_id cannot be combined with list filters, limit, or cursors"
-            );
-        }
-        if options.after.is_some() && options.through.is_none() {
-            anyhow::bail!(
-                "error.proposal_cursor_invalid: after requires the through bound from the initial page"
-            );
-        }
-        if options.include_events && options.proposal_id.is_none() {
-            anyhow::bail!("error.proposal_read_options: include_events requires proposal_id");
-        }
+        options.validate()?;
         let (rows, through, limit, total) = if let Some(id) = options.proposal_id.as_deref() {
-            let proposal = self
-                .get(instance, id)?
-                .ok_or_else(|| anyhow::anyhow!("error.proposal_not_found: {id}"))?;
-            let mut row = json!({"id": proposal.id, "kind": proposal.kind, "state": proposal.state,
-                "draft": proposal.draft, "created_at": proposal.created_at, "updated_at": proposal.updated_at});
-            if let Some(task) = proposal.applied_task_id {
-                row["applied_task_id"] = json!(task);
-            }
-            if options.include_events {
-                row["events"] = json!(proposal.events);
-            }
+            let row = self.exact_response_row(instance, options)?;
             (vec![row], id.to_owned(), 1, 1)
         } else {
             if let Some(since) = options.since.as_deref() {
