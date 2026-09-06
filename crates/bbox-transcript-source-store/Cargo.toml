@@ -1,0 +1,13 @@
+[package]
+name = "bbox-transcript-source-store"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bbox-corpus-core = { path = "../bbox-corpus-core" }
+bbox-transcript-source = { path = "../bbox-transcript-source" }
+fs2 = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
