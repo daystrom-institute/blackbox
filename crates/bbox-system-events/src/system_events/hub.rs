@@ -376,6 +376,59 @@ impl EventHub {
         })
     }
 
+    /// Continue strictly behind an existing matching event, so new appends cannot
+    /// duplicate or displace rows between pages. A compacted/unknown cursor fails.
+    pub fn list_event_page(
+        &self,
+        limit: Option<usize>,
+        before: Option<&str>,
+        kind: Option<&str>,
+        producer: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let events = self.list_events(None, kind, producer, project)?;
+        let start = match before {
+            Some(id) => events.iter().position(|event| event.id == id)
+                .ok_or_else(|| anyhow::anyhow!("error.event_cursor_unavailable: before is absent from the filtered journal; restart without before"))? + 1,
+            None => 0,
+        };
+        let total = events.len().saturating_sub(start);
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let rows: Vec<_> = events
+            .iter()
+            .skip(start)
+            .take(limit)
+            .map(SystemEvent::summary)
+            .collect();
+        // Reserve continuation space before byte selection; event ids normally have
+        // equal lengths, but this also covers historical/custom event identities.
+        let cursor_reserve = rows
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .max_by_key(|id| id.len());
+        let mut page = bbox_corpus_core::response_page::bound_page(
+            serde_json::json!({
+                "events": rows, "offset": 0, "total": total, "limit": limit,
+                "count": rows.len(), "next_before": cursor_reserve,
+            }),
+            "events",
+        )?;
+        let next = if page["next_offset"].is_null() {
+            serde_json::Value::Null
+        } else {
+            page["events"]
+                .as_array()
+                .and_then(|rows| rows.last())
+                .and_then(|row| row.get("id"))
+                .cloned()
+                .unwrap_or_default()
+        };
+        page["next_before"] = next;
+        page.as_object_mut().unwrap().remove("offset");
+        page.as_object_mut().unwrap().remove("next_offset");
+        Ok(page)
+    }
+
     pub fn list_events(
         &self,
         limit: Option<usize>,
