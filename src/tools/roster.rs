@@ -84,35 +84,41 @@ impl BlackboxServer {
         // If `bro_prune(task_ids=[...])` also cannot find the task, the daemon
         // has restarted and `TaskStore::load` dropped it via the task_ttl_ms
         // retention cutoff (default 24 h from `started_at`).
-        let limit = p.limit.unwrap_or(20);
+        let limit = p.limit.unwrap_or(20).clamp(1, 100);
+        let offset = p.offset.unwrap_or(0);
 
-        let filter_provider = p
-            .provider
-            .as_deref()
-            .and_then(|s| s.parse::<Provider>().ok());
-        // Filter status parses through the in-process enum (no
-        // `Pending` variant) and is then converted to the wire
-        // enum for comparison against `RosterSummaryV1.status`.
-        let filter_status: Option<bro_protocol::TaskStatus> =
-            p.status.as_deref().and_then(|s| match s {
-                "pending" => Some(bro_protocol::TaskStatus::Pending),
-                "running" => Some(bro_protocol::TaskStatus::Running),
-                "completed" => Some(bro_protocol::TaskStatus::Completed),
-                "failed" => Some(bro_protocol::TaskStatus::Failed),
-                "cancelled" => Some(bro_protocol::TaskStatus::Cancelled),
-                _ => None,
-            });
-
-        let team_task_ids: Option<std::collections::HashSet<String>> =
-            p.team.as_ref().and_then(|name| {
-                let team = orchestration::team::load_team(name, &self.state.store_dir)?;
-                Some(
+        let filter_provider = match p.provider.as_deref() {
+            Some(provider) => match provider.parse::<Provider>() {
+                Ok(provider) => Some(provider),
+                Err(error) => return Self::err_text(&error.to_string()),
+            },
+            None => None,
+        };
+        let filter_status = match p.status.as_deref() {
+            Some("pending") => Some(bro_protocol::TaskStatus::Pending),
+            Some("running") => Some(bro_protocol::TaskStatus::Running),
+            Some("completed") => Some(bro_protocol::TaskStatus::Completed),
+            Some("failed") => Some(bro_protocol::TaskStatus::Failed),
+            Some("cancelled") => Some(bro_protocol::TaskStatus::Cancelled),
+            Some(_) => {
+                return Self::err_text(
+                    "status must be pending, running, completed, failed, or cancelled",
+                );
+            }
+            None => None,
+        };
+        let team_task_ids: Option<std::collections::HashSet<String>> = match p.team.as_ref() {
+            Some(name) => match orchestration::team::load_team(name, &self.state.store_dir) {
+                Some(team) => Some(
                     team.members
                         .iter()
-                        .flat_map(|m| m.task_history.clone())
+                        .flat_map(|member| member.task_history.clone())
                         .collect(),
-                )
-            });
+                ),
+                None => return Self::err_text(&format!("Unknown team: {name}")),
+            },
+            None => None,
+        };
 
         // Wave 7c: read the materialized RosterView snapshot instead
         // of iterating `task_store` and locking every per-task inner
@@ -126,8 +132,7 @@ impl BlackboxServer {
         let snapshot = self.state.roster_view.snapshot();
         let store_dir = self.state.store_dir.clone();
 
-        let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
-        let mut with_ts: Vec<(u64, Value)> = snapshot
+        let mut selected: Vec<_> = snapshot
             .into_iter()
             .filter(|s| {
                 if let Some(fp) = filter_provider {
@@ -147,6 +152,21 @@ impl BlackboxServer {
                 }
                 true
             })
+            .collect();
+        let total = selected.len();
+        selected.sort_by(|a, b| {
+            b.started_at
+                .or(b.last_event_at)
+                .unwrap_or(0)
+                .cmp(&a.started_at.or(a.last_event_at).unwrap_or(0))
+                .then_with(|| a.task_id.as_str().cmp(b.task_id.as_str()))
+        });
+        let mut agent_metrics: BTreeMap<String, AgentDashboardMetrics> = BTreeMap::new();
+        let mut context_hint = None;
+        let entries: Vec<Value> = selected
+            .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|s| {
                 let task_id_str = s.task_id.as_str().to_string();
                 let bro_name =
@@ -219,24 +239,29 @@ impl BlackboxServer {
                 // Share the status observation: context occupancy does not
                 // determine whether a session can accept more work.
                 if let Some(pressure) = s.context {
-                    entry["context"] = pressure.observation_json();
+                    let mut observation = pressure.observation_json();
+                    context_hint = observation
+                        .as_object_mut()
+                        .and_then(|value| value.remove("guidance"));
+                    entry["context"] = observation;
                 }
-                // Sort key: legacy used `started_at`. Fall back to
-                // `last_event_at` when `started_at` is somehow
-                // missing (older summaries before the wave-7c DTO
-                // extension); fall back to 0 so the row still sorts.
-                let sort_key = s.started_at.or(s.last_event_at).unwrap_or(0);
-                (sort_key, entry)
+                entry
             })
             .collect();
-        with_ts.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
-        let entries: Vec<Value> = with_ts.into_iter().take(limit).map(|(_, e)| e).collect();
         let agents: BTreeMap<String, Value> = agent_metrics
             .into_iter()
             .map(|(label, metrics)| (label, metrics.to_json()))
             .collect();
 
-        Self::ok_json(&json!({"count": entries.len(), "tasks": entries, "agents": agents}))
+        let mut response = json!({"count": entries.len(), "total": total, "offset": offset, "tasks": entries, "agents": agents});
+        let next_offset = offset.saturating_add(entries.len());
+        if next_offset < total {
+            response["next_offset"] = json!(next_offset);
+        }
+        if let Some(hint) = context_hint {
+            response["context_hint"] = hint;
+        }
+        Self::ok_json(&response)
     }
 
     #[tool(
@@ -1438,26 +1463,15 @@ fn label_from_summary(s: &bro_protocol::RosterSummaryV1) -> Option<String> {
     s.label.clone()
 }
 
-/// Project the wire `BroReportV1` to the dashboard's legacy report
-/// object shape (`{message, reportedAt, reportedAgo, needs?, data?}`).
-///
-/// `reportedAgo` is recomputed at call time against the daemon's
-/// wall clock so the rendered string is fresh — the legacy
-/// `BroReport::to_json()` did the same. The wire summary's
-/// `reported_ago` is only a snapshot for the fleet row UI.
+/// Dashboard reports are previews; full stable JSON pages are available via
+/// bro_status(detail=report), so arbitrary report.data never grows the list.
 fn bro_report_v1_to_dashboard_json(report: &bro_protocol::BroReportV1) -> Value {
-    let mut obj = serde_json::json!({
-        "message": report.message,
-        "reportedAt": report.reported_at,
-        "reportedAgo": crate::orchestration::format_elapsed(report.reported_at, None),
-    });
-    if let Some(ref needs) = report.needs {
-        obj["needs"] = Value::String(needs.clone());
-    }
-    if let Some(ref data) = report.data {
-        obj["data"] = data.clone();
-    }
-    obj
+    orch::task_report_summary(
+        &report.message,
+        report.needs.as_deref(),
+        report.data.is_some(),
+        report.reported_at,
+    )
 }
 
 #[cfg(test)]
@@ -1654,6 +1668,7 @@ mod tests {
             );
 
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: None,
                 status: None,
@@ -1736,6 +1751,59 @@ mod tests {
         }
 
         #[test]
+        fn dashboard_pagination_bounds_agent_rollup_and_report_payload() {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            for idx in 0..4 {
+                let id = format!("task-{idx}");
+                let mut summary = live_summary(&id, Provider::Glm, 1000 + idx);
+                summary.report_full.as_mut().unwrap().data =
+                    Some(json!({"trace": "x".repeat(40000)}));
+                server.state.roster_view.upsert(id, summary);
+            }
+            let read_page = |offset| {
+                let response = server.bro_dashboard(Parameters(DashboardParams {
+                    provider: None,
+                    team: None,
+                    status: None,
+                    limit: Some(1),
+                    offset: Some(offset),
+                }));
+                serde_json::from_str::<Value>(&extract_text(&response)).unwrap()
+            };
+            let first = read_page(0);
+            let second = read_page(first["next_offset"].as_u64().unwrap() as usize);
+            assert_eq!(first["total"], 4);
+            assert_eq!(first["tasks"][0]["taskId"], "task-3");
+            assert_eq!(second["tasks"][0]["taskId"], "task-2");
+            assert_eq!(first["agents"].as_object().unwrap().len(), 1);
+            assert_eq!(second["agents"].as_object().unwrap().len(), 1);
+            assert!(first["tasks"][0]["report"].get("data").is_none());
+            assert_eq!(first["tasks"][0]["report"]["detailsOmitted"], true);
+            assert!(serde_json::to_vec(&first).unwrap().len() < 4096);
+        }
+
+        #[test]
+        fn dashboard_invalid_filters_do_not_broaden_the_selection() {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            for (provider, status, team) in [
+                (Some("unknown"), None, None),
+                (None, Some("done"), None),
+                (None, None, Some("missing-team")),
+            ] {
+                let response = server.bro_dashboard(Parameters(DashboardParams {
+                    provider: provider.map(str::to_string),
+                    status: status.map(str::to_string),
+                    team: team.map(str::to_string),
+                    limit: None,
+                    offset: None,
+                }));
+                assert_eq!(response.is_error, Some(true));
+            }
+        }
+
+        #[test]
         fn dashboard_filter_by_status_and_provider_runs_against_view() {
             // Filters must apply on the snapshot, not the
             // per-task inner lock. Seed one live and one terminal
@@ -1759,6 +1827,7 @@ mod tests {
 
             // status="running" → only `a`.
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: None,
                 status: Some("running".into()),
@@ -1771,6 +1840,7 @@ mod tests {
 
             // provider="deepseek" → only `b`.
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: Some("deepseek".into()),
                 status: None,
@@ -1783,6 +1853,7 @@ mod tests {
 
             // provider="glm" + status="completed" → only `c`.
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: Some("glm".into()),
                 status: Some("completed".into()),
@@ -1809,6 +1880,7 @@ mod tests {
                 .upsert("interrupted".to_string(), interrupted);
 
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: None,
                 status: Some("cancelled".into()),
@@ -1848,6 +1920,7 @@ mod tests {
             );
 
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: None,
                 status: None,
@@ -1868,6 +1941,8 @@ mod tests {
             assert_eq!(row["context"]["utilization"], 0.95);
             assert!(row["context"].get("approaching_ceiling").is_none());
             assert_eq!(row["context"]["measurement"], "last_model_request");
+            assert!(row["context"].get("guidance").is_none());
+            assert!(body["context_hint"].as_str().unwrap().contains("budget"));
 
             let quiet = by_id.get("quiet").expect("quiet row present");
             assert!(
@@ -1899,6 +1974,7 @@ mod tests {
             );
 
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: None,
                 status: None,
@@ -1937,6 +2013,7 @@ mod tests {
             assert!(server.state.task_store.read().all_tasks().is_empty());
 
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: None,
                 status: None,
@@ -2003,6 +2080,7 @@ mod tests {
                 .rebuild_from_store(&server.state.task_store.read());
 
             let dash = server.bro_dashboard(Parameters(DashboardParams {
+                offset: None,
                 limit: Some(20),
                 provider: None,
                 status: None,
@@ -2375,6 +2453,7 @@ mod tests {
         let task_id = body["task_id"].as_str().unwrap();
 
         let dash = server.bro_dashboard(Parameters(DashboardParams {
+            offset: None,
             limit: Some(20),
             provider: None,
             status: None,
@@ -2465,6 +2544,7 @@ mod tests {
         assert!(report_body["report"]["reportedAgo"].as_str().is_some());
 
         let dash = server.bro_dashboard(Parameters(DashboardParams {
+            offset: None,
             limit: Some(20),
             provider: None,
             status: None,
@@ -2484,6 +2564,10 @@ mod tests {
         assert_eq!(entry["report"]["needs"].as_str(), Some("review API naming"));
 
         let status = server.bro_status(Parameters(StatusParams {
+            detail: None,
+            cursor: None,
+            limit: None,
+            debug: false,
             task_id: task_id.clone(),
             tail: None,
         }));

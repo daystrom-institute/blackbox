@@ -33,7 +33,7 @@ use crate::tools::bro_helpers::{
 };
 use crate::tools::bro_params::{
     BroadcastParams, CancelParams, DashboardParams, ExecParams, InterruptParams, ResumeParams,
-    StatusParams, SteerParams,
+    SteerParams,
 };
 use crate::tools::bro_runtime_params::{
     BroRosterEntry, OrchestrateListEntry, OrchestrateRequest, OrchestrateStatusQuery,
@@ -1327,12 +1327,16 @@ pub(crate) async fn control_status_handler(
     axum::extract::Path(task_id): axum::extract::Path<String>,
     Query(query): Query<ControlStatusQuery>,
 ) -> axum::Json<CallToolResult> {
-    axum::Json(
-        BlackboxServer::new(state).bro_status(Parameters(StatusParams {
-            task_id,
-            tail: query.tail,
-        })),
-    )
+    // The Fleet control DTO includes its legacy snapshot and result fields.
+    // MCP routine status uses a separate compact projection.
+    let task = state.task_store.read().get(&task_id);
+    axum::Json(match task {
+        Some(task) => BlackboxServer::ok_json(&orchestration::task_status_json(
+            &task,
+            query.tail.unwrap_or(0),
+        )),
+        None => BlackboxServer::err_text(&format!("Unknown task ID: {task_id}")),
+    })
 }
 
 // ── /control/roster — daemon-authoritative fleet roster snapshot ─────────
