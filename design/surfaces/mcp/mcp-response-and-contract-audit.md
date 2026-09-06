@@ -602,8 +602,8 @@ failures, and reports completed, failed, and unattempted stages. Its stores
 remain nontransactional; exact stage receipts describe partial effects.
 
 The full-suite gate caught a historical-agent supersession regression introduced
-while moving artifact deactivation after replacement persistence. It is being
-fixed before deployment. Proposal summary pagination also remains unfinished:
+while moving artifact deactivation after replacement persistence. The correction retires old snapshots after durable replacement and repairs
+interrupted retirement on retry; deployment remains gated on full verification. Proposal summary pagination also remains unfinished:
 a shipped Badgey workflow consumes complete drafts from one list call, so the
 producer and its page/expansion loop must migrate together. Blind truncation
 would silently drop proposals. Whiteboard visibility and project-admin locality
