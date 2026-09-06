@@ -1,7 +1,4 @@
-use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Bro roster endpoint — resolves selectors to concrete per-bro lane info
@@ -38,5 +35,3 @@ pub(crate) struct BroRosterEntry {
     pub(crate) brofile: String,
     pub(crate) model: Option<String>,
 }
-
-

@@ -199,7 +199,7 @@ impl BlackboxServer {
             let task_store = server.state.task_store.read();
             let failed_rows = collect_failed_tasks(&task_store);
             let vector_alerts = collect_vector_connectivity_alerts();
-            let cron_alerts: Vec<serde_json::Value> = Vec::new();
+            let cron_alerts: Vec<crate::inbox::CronScheduleAlert> = Vec::new();
             let conversation_silence = collect_conversation_producer_silence(&server.state);
             let inbox = append_overlay_diagnostics(
                 inbox::compute_inbox(

@@ -166,6 +166,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_application_routes_are_absent_while_control_remains() {
+        let app = test_app();
+        for path in [
+            "/orchestrate",
+            "/orchestrate/stream",
+            "/orchestrate/by-id",
+            "/webhook/example",
+            "/webhook/example/replay",
+            "/admin/workflow/install",
+            "/admin/cron/install",
+            "/admin/poller/install",
+            "/admin/webhook/install",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control/exec")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn unauthenticated_health_and_readiness_routes_are_live() {
         for path in ["/healthz", "/readyz"] {
             let response = test_app()

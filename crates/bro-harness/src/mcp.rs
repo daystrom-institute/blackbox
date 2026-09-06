@@ -246,7 +246,6 @@ pub async fn load_mcp_tools_from_config_with_capability_aliases(
 fn capability_alias(call_name: &str) -> Option<&'static str> {
     match call_name {
         "bbox_corpus_search" => Some("corpus_search"),
-        "atom_invoke" => Some("atom_invoke"),
         _ => None,
     }
 }
@@ -896,8 +895,8 @@ mod tests {
                     input_schema: serde_json::json!({"type": "object"}),
                 },
                 McpToolSpec {
-                    name: "atom_invoke".to_string(),
-                    description: "atom".to_string(),
+                    name: "external_action".to_string(),
+                    description: "qualified external capability".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
                 },
                 McpToolSpec {
@@ -935,8 +934,7 @@ mod tests {
             vec![
                 "corpus_search",
                 "mcp__blackbox__bbox_corpus_search",
-                "atom_invoke",
-                "mcp__blackbox__atom_invoke",
+                "mcp__blackbox__external_action",
                 "mcp__blackbox__bbox_search",
             ]
         );

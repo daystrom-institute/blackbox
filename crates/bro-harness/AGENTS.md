@@ -87,9 +87,8 @@ the daemon boundary contract is `design/bro-harness/harness-process-boundary.md`
   runtime dependency graph.
 - stdin NDJSON is the session control plane; stdout NDJSON is the event plane.
   The daemon injects its complete server-filtered MCP catalog over HTTP.
-  `bbox_corpus_search` and `atom_invoke` also project to the compatibility flat
-  names `corpus_search` and `atom_invoke`; the qualified MCP tools remain
-  present. A missing capability server fails closed by tool absence.
+  `bbox_corpus_search` also projects to the compatibility flat name
+  `corpus_search`; the qualified MCP tools remain present. A missing capability server fails closed by tool absence.
 - Provider credentials stay in the harness child. Shell children receive only
   the dedicated non-secret shell env and scrub the daemon/session keys named
   by `BRO_HARNESS_SPAWN_SCRUB`.

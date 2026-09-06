@@ -157,13 +157,6 @@ direct_git_process	crates/bbox-corpus-core/src/git.rs	fn spawn	1	route through t
 direct_git_process	crates/bbox-corpus-core/src/git.rs	fn write_note	1	route through the verified-commit git wrapper
 direct_git_process	crates/bbox-gaps/src/gap_closeout.rs	fn scan_git_trailers	1	route through the verified-commit git wrapper
 direct_git_process	src/server/knowledge_merge_gate.rs	fn target_contains_bbox	1	route through the verified-commit git wrapper
-direct_git_process	src/tools/workspace.rs	fn git_diff_untracked_file	1	route through the verified-commit git wrapper
-direct_git_process	src/tools/workspace.rs	fn git_run	1	route through the verified-commit git wrapper
-direct_git_process	src/workflow/ops/tests.rs	fn worktree_create_fails_when_branch_in_use	1	route through the verified-commit git wrapper
-direct_git_process	src/workflow/ops/tests.rs	fn worktree_create_reuses_existing_branch	2	route through the verified-commit git wrapper
-direct_git_process	src/workflow/ops/worktree.rs	fn branch_state	2	route through the verified-commit git wrapper
-direct_git_process	src/workflow/ops/worktree.rs	fn exec_worktree_create	1	route through the verified-commit git wrapper
-direct_git_process	src/workflow/ops/worktree.rs	fn exec_worktree_remove	1	route through the verified-commit git wrapper
 legacy_publisher	crates/bbox-indexing/src/index/knowledge_docs.rs	fn publish	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/index/knowledge_docs.rs	fn reindex_knowledge_store_with_access	1	delete the legacy publisher store outright
 legacy_publisher	crates/bbox-indexing/src/project_catalog_inventory.rs	enum MutableInventorySourceKindV1	1	delete the legacy publisher store outright

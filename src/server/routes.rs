@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use futures::StreamExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,13 +18,12 @@ use crate::entity_ref;
 use crate::index;
 use crate::orchestration;
 use crate::orchestration::providers::Provider;
-use crate::packets::{self, apply_with as apply_packet_with};
+use crate::packets;
 use crate::projects::ProjectRecord;
 use crate::tools::bro_helpers::{
     build_member_entry, infer_provider_from_path, roster_entry_key, split_csv,
 };
 use crate::tools::bro_runtime_params::{BroRosterEntry, RosterQuery};
-use crate::util;
 
 /// True iff the bind host string resolves to a loopback address.
 /// Recognized: `127.0.0.0/8` literals, `localhost` (string match —
@@ -39,24 +38,6 @@ pub(crate) fn is_loopback_bind(bind_host: &str) -> bool {
         return ip.is_loopback();
     }
     false
-}
-
-/// Dispatch an installed workflow by registry id, with optional initial
-/// vars. Mirrors the `start_arc` routing verdict in webhook handling
-/// but exposes it for direct CLI / scripted invocation.
-#[derive(Debug, Deserialize)]
-pub(crate) struct OrchestrateByIdRequest {
-    workflow_id: String,
-    #[serde(default)]
-    initial_vars: serde_json::Map<String, Value>,
-    #[serde(default)]
-    project_dir: Option<String>,
-    #[serde(default)]
-    max_steps: Option<usize>,
-    #[serde(default)]
-    await_completion: Option<bool>,
-    #[serde(default)]
-    timeout_seconds: Option<f64>,
 }
 
 // ── Admin HTTP endpoints (plain JSON; no MCP framing) ──────────────
@@ -238,6 +219,15 @@ pub(crate) async fn install_artifact_from_params(
     state: &Arc<SharedState>,
     p: ArtifactInstallParams,
 ) -> anyhow::Result<artifacts::ArtifactMetadata> {
+    anyhow::ensure!(
+        !matches!(
+            p.kind,
+            artifacts::ArtifactKind::Workflow
+                | artifacts::ArtifactKind::Atom
+                | artifacts::ArtifactKind::Cron
+        ),
+        "error.retired_artifact_kind: workflows, atoms and crons cannot be activated"
+    );
     let value = read_artifact_source(&p.source).await?;
     install_artifact_value(state, p, value).await
 }
@@ -1437,18 +1427,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
                 .is_some_and(|board| board.read().project == project)
         })
         .count();
-    let pollers = state
-        .pollers
-        .list()
-        .iter()
-        .filter(|spec| spec.default_project_dir.as_deref() == Some(project))
-        .count();
-    let crons = state
-        .crons
-        .list()
-        .iter()
-        .filter(|spec| spec.default_project_dir.as_deref() == Some(project))
-        .count();
     let gaps = state
         .gaps
         .read()
@@ -1463,12 +1441,6 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         .iter()
         .filter(|item| item.project.as_deref() == Some(project))
         .count();
-    let webhooks = state
-        .webhooks
-        .list()
-        .iter()
-        .filter(|spec| spec.default_project_dir.as_deref() == Some(project))
-        .count();
 
     Ok(json!({
         "knowledge": knowledge,
@@ -1480,11 +1452,8 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
         "slack_proposal_links": slack_proposal_links,
         "teams": teams,
         "whiteboards": whiteboards,
-        "pollers": pollers,
-        "crons": crons,
         "gaps": gaps,
         "roadmap": roadmap,
-        "webhooks": webhooks,
     }))
 }
 

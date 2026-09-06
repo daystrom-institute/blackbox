@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, OnceLock};
@@ -6,9 +6,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::{Mutex, RwLock};
 use rmcp::handler::server::router::tool::ToolRouter;
 use serde::Serialize;
-use serde_json::Value;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use crate::gaps::GapStore;
 use crate::index::TranscriptIndex;
@@ -674,7 +672,6 @@ impl SharedState {
 
     #[cfg(test)]
     pub(crate) fn for_test(store_dir: &std::path::Path) -> SharedState {
-        use std::collections::VecDeque;
         let (tail_tx, _) = broadcast::channel(128);
         let (roster_tx, _) = broadcast::channel(ROSTER_BROADCAST_BUFFER);
         let projects_path = store_dir.join("projects.json");

@@ -6,7 +6,7 @@ use crate::server::runtime_metrics::{
 };
 use crate::server::storage_gc::{spawn_storage_gc_thread, storage_gc_interval_from_env};
 use crate::tools::bro_helpers::tier0_cosine_threshold_from_env;
-use crate::{embed, embed_queue, orchestration, util, vectors, watcher};
+use crate::{embed, embed_queue, orchestration, vectors, watcher};
 use std::sync::Arc;
 
 pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::Result<()> {

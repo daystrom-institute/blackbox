@@ -798,16 +798,6 @@ mod tests {
         assert_eq!(agent.cwd.as_deref(), Some("/repo/g2"));
     }
 
-    #[test]
-    fn atom_invoke_args_schema_is_object() {
-        let schema = serde_json::to_value(rmcp::schemars::schema_for!(AtomInvokeParams)).unwrap();
-        let args_schema = &schema["properties"]["args"];
-        assert_eq!(
-            args_schema["type"], "object",
-            "atom_invoke.args must be advertised as an object, not a string"
-        );
-    }
-
     /// Contract with the fleet cockpit's `/control/resume` body
     /// (`bro-fleet-client::resume_body`): every field the cockpit sends must
     /// deserialize under `deny_unknown_fields`. Regression guard: the

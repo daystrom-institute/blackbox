@@ -1,12 +1,8 @@
 use std::path::Path;
-use std::sync::Arc;
-
-use serde_json::Value;
 
 use crate::index;
 use crate::orchestration;
 use crate::orchestration::providers::Provider;
-use crate::server::SharedState;
 use crate::tools::bro_runtime_params::BroRosterEntry;
 
 pub(crate) fn extract_json_candidates(text: &str) -> Vec<String> {

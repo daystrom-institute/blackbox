@@ -838,27 +838,6 @@ mod tests {
                 .expect("item stored");
             assert_eq!(item.project.as_deref(), Some(base_str.as_str()));
         }
-
-        // Whiteboards: board opened from the worktree keys base.
-        let opened = server
-            .whiteboard_open(Parameters(
-                crate::tools::bro_runtime_params::WhiteboardOpenParams {
-                    board_id: "scope-test-board".into(),
-                    topic: "worktree scoping".into(),
-                    project: Some(wt.clone()),
-                    arc_thread_id: None,
-                    opened_by: "tester".into(),
-                    domain: None,
-                },
-            ))
-            .await;
-        assert_ne!(opened.is_error, Some(true), "open failed: {opened:?}");
-        let board = server
-            .state
-            .whiteboards
-            .get("scope-test-board")
-            .expect("board registered");
-        assert_eq!(board.read().project, base_str);
     }
 }
 

@@ -13,9 +13,29 @@ use rmcp::schemars;
 use rmcp::{tool, tool_router};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InstallableArtifactKind {
+    Packet,
+    Brofile,
+    Agent,
+    Team,
+}
+
+impl From<InstallableArtifactKind> for crate::artifacts::ArtifactKind {
+    fn from(kind: InstallableArtifactKind) -> Self {
+        match kind {
+            InstallableArtifactKind::Packet => Self::Packet,
+            InstallableArtifactKind::Brofile => Self::Brofile,
+            InstallableArtifactKind::Agent => Self::Agent,
+            InstallableArtifactKind::Team => Self::Team,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArtifactInstallToolParams {
-    pub kind: crate::artifacts::ArtifactKind,
+    pub kind: InstallableArtifactKind,
     /// Explicit HTTP(S) JSON URL. Supply exactly one of source or artifact; filesystem paths are not accepted.
     #[serde(default)]
     pub source: Option<String>,
@@ -52,7 +72,7 @@ fn artifact_install_input(
     };
     Ok((
         ArtifactInstallParams {
-            kind: p.kind,
+            kind: p.kind.into(),
             source,
             name: p.name,
             version: p.version,
@@ -136,7 +156,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a typed artifact from an inline artifact object or explicit HTTP(S) source URL. Supply exactly one; caller filesystem paths are rejected. The selected kind controls validation. Returns activation state and actionable warnings without source credentials or storage paths."
+        description = "Install a packet, brofile, simple agent or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, atom and cron installation is retired."
     )]
     pub(crate) async fn bbox_artifact_install(
         &self,
@@ -252,11 +272,45 @@ mod tests {
     use super::*;
     use crate::artifacts;
     use crate::orchestration;
+    use crate::packets;
     use crate::server::routes::{install_artifact_value, restore_runtime_artifacts_from_catalog};
     use crate::server::state::SharedState;
-    use crate::{packets, workflow};
     use serde_json::{Value, json};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn retired_artifact_kinds_cannot_activate_but_receipts_stay_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = BlackboxServer::new(std::sync::Arc::new(
+            crate::server::SharedState::for_test(&root),
+        ));
+        for kind in [
+            artifacts::ArtifactKind::Workflow,
+            artifacts::ArtifactKind::Atom,
+            artifacts::ArtifactKind::Cron,
+        ] {
+            let request = json!({"kind":kind,"artifact":{"name":"archived","version":1}});
+            assert!(serde_json::from_value::<ArtifactInstallToolParams>(request).is_err());
+            let params = ArtifactInstallParams {
+                kind,
+                source: "http://127.0.0.1:1/never-fetch".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            };
+            let error = install_artifact_from_params(&server.state, params)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("retired_artifact_kind"));
+            assert_eq!(
+                serde_json::from_value::<artifacts::ArtifactKind>(json!(kind)).unwrap(),
+                kind
+            );
+        }
+        assert!(!root.join("workflows").exists());
+        assert!(!root.join("crons").exists());
+    }
 
     #[test]
     fn artifact_summary_pages_omit_storage_paths_and_bound_descriptions() {

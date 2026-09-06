@@ -2182,15 +2182,6 @@ impl BlackboxServer {
             Some(t) => t,
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         };
-        {
-            let inner = task.inner.lock();
-            if inner.provider == Provider::Workflow {
-                let _ = self.state.cancel_arc(&inner.session_id);
-            }
-        }
-        // Workflow tasks register cancel tokens under their task id. Trip it so
-        // in-flight work is interrupted before cancel_task records the status.
-        let _ = self.state.cancel_arc(&p.task_id);
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
             Ok(()) => {
                 let mut inner = task.inner.lock();

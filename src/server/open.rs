@@ -1,5 +1,5 @@
 use super::startup::{configure_dispatch_mcp_env, discover_transcript_roots, resolve_codex_root};
-use super::{SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP, is_loopback_bind};
+use super::{SharedState, is_loopback_bind};
 use anyhow::Context;
 use parking_lot::RwLock;
 use std::collections::{BTreeSet, HashMap};
@@ -29,6 +29,7 @@ pub(super) struct OpenedServer {
     pub(super) shared: Arc<SharedState>,
     pub(super) store_dir: PathBuf,
     pub(super) bind_host: String,
+    pub(super) bind_is_loopback: bool,
 }
 
 /// Open the accepted-publication authority and verify every catalog
@@ -1129,6 +1130,7 @@ pub(super) fn open_shared_state(
         shared,
         store_dir,
         bind_host,
+        bind_is_loopback,
     })
 }
 

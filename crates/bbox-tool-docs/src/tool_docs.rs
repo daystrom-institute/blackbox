@@ -680,7 +680,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
-        summary: "Install a typed artifact from an inline artifact object or explicit HTTP(S) source URL. Supply exactly one; caller filesystem paths are rejected. The selected kind controls validation. Returns activation state and actionable warnings without source credentials or storage paths.",
+        summary: "Install a packet, brofile, simple agent or team from an inline artifact object or explicit HTTP(S) URL. Supply exactly one; caller filesystem paths are rejected. Workflow, atom and cron installation is retired.",
         when_to_use: "Use for producer-side artifacts shipped under system-defaults/agentic-corpus, system-defaults/atoms, system-defaults/maintenance, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, team, or cron path, then records version/source/supersession metadata in the catalog. Team artifacts are teamplate-shaped and materialize on install: the teamplate store is written and the team instantiated under the teamplate's name (member brofiles must already be installed; re-install never clobbers a live team's sessions; advisor-carrying teamplates are rejected; automatic advisors are retired, so omit advisor and dispatch reviewers explicitly).",
         example: Some(
             r#"bbox_artifact_install(kind="workflow", source="system-defaults/agentic-corpus/workflows/schema-migration-arc.json")"#,
@@ -982,7 +982,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
         name: "bbox_tool_calls",
-        category: ToolCategory::Transcripts,
+        category: ToolCategory::Workspace,
         summary: "Search indexed tool-call history by server, tool name, kind, target, project and time. Returns bounded rows and next_offset; paths in records describe historical calls, not files the caller must open.",
         when_to_use: "Use for tool-use evidence from indexed transcripts. Exact server/tool/kind filters narrow the index query. Glob (* wildcard), target substring, project and since filters apply to a bounded candidate page. Follow next_offset even when rows is empty; use identical filters, and restart after index changes. No automatic reindex or local file read occurs.",
         example: Some(r#"bbox_tool_calls(server="blackbox", tool_name="bro_exec", limit=20)"#),
