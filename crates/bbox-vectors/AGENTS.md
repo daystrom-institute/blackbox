@@ -39,12 +39,16 @@ explicit design.
 
 ## Connectivity guard (gap-1168b0bd)
 
-- **The connectivity gate lives in the WORKFLOW compaction lane only**
-  (embed-compaction-arc: quiesce → rebuild → swap; packet
-  `embed/compaction-policy` v2 compacts >5% / notifies >2%). It is
-  deliberately NOT in `spawn_periodic_compactor`'s 5-minute tick: a
-  connectivity-triggered rebuild holds the partition write lock for the
-  full rebuild and must never fire unquiesced. Don't "fix" the asymmetry.
+- Connectivity repair has a dedicated daily service loop, with the first pass
+  delayed a full day after startup. It scans diagnostics with a two-second
+  deadline and attempts at most one repair per pass. Ordinary tombstone/WAL
+  cleanup keeps its five-minute cadence. Both share a per-store maintenance
+  try-lock with manual rebuilds; busy work is deferred.
+- Rebuilds copy active vectors under a read lock, then release it before HNSW
+  construction. Publication checks partition identity, WAL/slab counters and
+  rebuild generation. Concurrent ingest, removal or replacement defers a stale
+  result. WAL and derived-file publication still holds a write lock and can
+  delay readers; do not describe this as a constant-time or lock-free swap.
 - Thresholds: `COMPACT_CONNECTIVITY_RATIO` 0.05 / `NOTIFY_CONNECTIVITY_RATIO`
   0.02, calibrated from the gap-2eabd96d incident (16.7% at detection,
   ~1.4% post-rebuild residual, ≤0.3% healthy). `connectivity_breach`
@@ -57,14 +61,13 @@ explicit design.
 
 ## Rebuild and persistence semantics
 
-- The partition snapshot persists the GRAPH, not just the vectors: a daemon
-  restart restores a broken graph verbatim. Repair is
-  `vectors::rebuild(route)` (compact → bulk `HnswIndex::build`), reachable
-  as the `rebuild_hnsw` workflow op.
-- `compact()` holds the partition write lock for the entire rebuild —
-  399k × 1024d took ~25 minutes and starves the vector lane meanwhile.
-  Routine compaction belongs in `embed-compaction-arc` (quiesce → rebuild →
-  swap); a bare rebuild op is a maintenance-window move.
+- The partition snapshot persists the graph as well as vectors, so restarting
+  preserves graph defects. Repair uses `VectorStore::rebuild` or the daily
+  connectivity maintenance loop; it does not depend on a workflow runtime.
+- A rebuild can take minutes and needs memory for the active-vector snapshot
+  plus the replacement graph. Diagnostic deadlines bound diagnostics only.
+  The expensive graph construction holds no partition lock; final persistence
+  still needs a maintenance window when even a shorter reader delay is unsafe.
 - Incremental `push` and bulk `build` both funnel through
   `insert_internal` → `add_reverse_edge`: a fix (or a regression) in that
   path applies to both. Levels are deterministic from the id hash, so

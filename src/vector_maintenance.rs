@@ -1,6 +1,7 @@
 //! Vector maintenance operations independent of workflow execution.
-//! Rebuilding holds the partition write lock; callers must arrange their
-//! maintenance window. Diagnostic deadlines do not bound rebuild duration.
+//! Graph construction runs outside the partition lock; stale snapshots are
+//! deferred. Publication still locks for WAL/derived-file persistence.
+//! Diagnostic deadlines do not bound rebuild duration.
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -19,7 +20,7 @@ fn diagnostic_timeout(args: &Value) -> Duration {
 
 pub(crate) fn read_status(args: &Value) -> Result<Value> {
     let route_filter = args.get("route").and_then(|value| value.as_str());
-    let mut partitions = crate::vectors::metrics();
+    let mut partitions = crate::vectors::metrics_nonblocking();
     if let Some(route) = route_filter {
         partitions.retain(|name, _| name == route);
     }
@@ -88,7 +89,7 @@ pub(crate) fn compact(args: &Value) -> Result<Value> {
     // or graph orphaning (connectivity_risk_ratio, gap-1168b0bd). Severity
     // for ordering is the worse of the two so a badly orphaned partition
     // is not starved behind moderately deleted ones.
-    let cheap_metrics = crate::vectors::metrics();
+    let cheap_metrics = crate::vectors::metrics_nonblocking();
     let diagnostic_routes = cheap_metrics.keys().cloned().collect::<Vec<_>>();
     let mut diagnostics =
         crate::vectors::diagnostics_bounded(&diagnostic_routes, diagnostic_timeout(args))?;
@@ -121,7 +122,7 @@ pub(crate) fn compact(args: &Value) -> Result<Value> {
     for (route, _, before, before_hnsw) in candidates.into_iter().take(limit) {
         let started = std::time::Instant::now();
         crate::vectors::rebuild(&route)?;
-        let after = crate::vectors::metrics()
+        let after = crate::vectors::metrics_nonblocking()
             .remove(&route)
             .unwrap_or(before.clone());
         let after_diagnostics = crate::vectors::diagnostics_bounded(

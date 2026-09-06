@@ -14,9 +14,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use parking_lot::RwLock;
 #[cfg(any(test, feature = "test-support"))]
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use self::hnsw::{HnswIndex, HnswMetrics, HnswOptions, SearchHit};
@@ -84,7 +84,8 @@ pub fn install_global(store: Arc<VectorStore>) {
         return;
     }
     spawn_periodic_flusher(store.clone());
-    spawn_periodic_compactor(store);
+    spawn_periodic_compactor(store.clone());
+    spawn_connectivity_maintenance(store);
 }
 
 /// Periodic flusher thread. Walks every partition every FLUSH_INTERVAL_SECS
@@ -173,6 +174,32 @@ fn spawn_periodic_compactor(store: Arc<VectorStore>) {
         .expect("failed to spawn vector compaction thread");
 }
 
+// Delay the first repair for a full day. Deploying or restarting must not
+// immediately initiate a potentially long rebuild of production partitions.
+const CONNECTIVITY_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+fn spawn_connectivity_maintenance(store: Arc<VectorStore>) {
+    std::thread::Builder::new()
+        .name("blackbox-vector-connectivity".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(CONNECTIVITY_INTERVAL_SECS));
+                match store.maintain_connectivity() {
+                    Ok(stats) => {
+                        for stat in stats {
+                            tracing::info!(route = %stat.route, elapsed_ms = stat.elapsed_ms,
+                        "vector connectivity repaired");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "vector connectivity maintenance deferred")
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn vector connectivity maintenance thread");
+}
+
 /// Install the resolved vector-store root, once, before anything opens the
 /// global store.
 ///
@@ -214,6 +241,7 @@ pub fn global() -> Arc<VectorStore> {
             );
             spawn_periodic_flusher(store.clone());
             spawn_periodic_compactor(store.clone());
+            spawn_connectivity_maintenance(store.clone());
             store
         })
         .clone()
@@ -413,6 +441,7 @@ pub fn default_vectors_dir() -> PathBuf {
 pub struct VectorStore {
     root: PathBuf,
     partitions: RwLock<BTreeMap<String, Arc<RwLock<Partition>>>>,
+    maintenance: Mutex<()>,
 }
 
 impl VectorStore {
@@ -423,6 +452,7 @@ impl VectorStore {
         let store = Self {
             root,
             partitions: RwLock::new(BTreeMap::new()),
+            maintenance: Mutex::new(()),
         };
         store.load_existing_partitions()?;
         Ok(store)
@@ -440,6 +470,7 @@ impl VectorStore {
         Ok(Self {
             root,
             partitions: RwLock::new(BTreeMap::new()),
+            maintenance: Mutex::new(()),
         })
     }
 
@@ -654,9 +685,16 @@ impl VectorStore {
     }
 
     pub fn rebuild(&self, route: &str) -> Result<()> {
+        let _maintenance = self
+            .maintenance
+            .try_lock()
+            .ok_or_else(|| anyhow::anyhow!("vector maintenance is busy; retry later"))?;
         let partition = self.partition(route)?;
-        let result = partition.write().compact().map(|_| ());
-        result
+        anyhow::ensure!(
+            self.rebuild_partition(route, &partition)?.is_some(),
+            "vector partition changed or is busy; rebuild deferred"
+        );
+        Ok(())
     }
 
     pub fn compact_partitions(
@@ -678,12 +716,15 @@ impl VectorStore {
         min_wal_surplus_records: usize,
         max_partitions: Option<usize>,
     ) -> Result<Vec<RouteCompactionStats>> {
+        let Some(_maintenance) = self.maintenance.try_lock() else {
+            return Ok(Vec::new());
+        };
         let mut candidates = self
             .partitions
             .read()
             .iter()
             .filter_map(|(route, partition)| {
-                let partition_read = partition.read();
+                let partition_read = partition.try_read()?;
                 if !partition_read.needs_compaction_with_policy(
                     deleted_ratio_threshold,
                     min_deleted_entries,
@@ -704,13 +745,7 @@ impl VectorStore {
         let mut compacted = Vec::new();
         for (route, _, partition) in candidates.into_iter().take(limit) {
             let started = std::time::Instant::now();
-            let Some(stats) = Self::compact_partition_from_snapshot(
-                &partition,
-                deleted_ratio_threshold,
-                min_deleted_entries,
-                min_wal_surplus_records,
-            )?
-            else {
+            let Some(stats) = self.rebuild_partition(&route, &partition)? else {
                 continue;
             };
             compacted.push(RouteCompactionStats {
@@ -725,30 +760,106 @@ impl VectorStore {
         Ok(compacted)
     }
 
-    fn compact_partition_from_snapshot(
+    fn rebuild_partition(
+        &self,
+        route: &str,
         partition: &Arc<RwLock<Partition>>,
-        deleted_ratio_threshold: f32,
-        min_deleted_entries: usize,
-        min_wal_surplus_records: usize,
     ) -> Result<Option<CompactionStats>> {
-        let prepared = {
-            let partition = partition.read();
-            if !partition.needs_compaction_with_policy(
-                deleted_ratio_threshold,
-                min_deleted_entries,
-                min_wal_surplus_records,
-            ) {
+        self.rebuild_partition_using(route, partition, CompactionSnapshot::build)
+    }
+
+    fn rebuild_partition_using(
+        &self,
+        route: &str,
+        partition: &Arc<RwLock<Partition>>,
+        build: impl FnOnce(CompactionSnapshot) -> Result<PreparedCompaction>,
+    ) -> Result<Option<CompactionStats>> {
+        let snapshot = {
+            let Some(partition) = partition.try_read() else {
                 return Ok(None);
-            }
-            partition.prepare_compaction()?
+            };
+            partition.capture_compaction()?
         };
-        let mut partition = partition.write();
-        if partition.wal_records != prepared.before_wal_records
-            || partition.slab.len() != prepared.before_slab_entries
+        // Graph construction is the expensive phase. It owns its snapshot and
+        // holds no partition lock, so ingestion and search can continue.
+        let prepared = build(snapshot)?;
+        self.publish_compaction(route, partition, prepared)
+    }
+
+    fn publish_compaction(
+        &self,
+        route: &str,
+        partition: &Arc<RwLock<Partition>>,
+        prepared: PreparedCompaction,
+    ) -> Result<Option<CompactionStats>> {
+        // Fence removal/replacement as well as in-place writes and rebuilds.
+        let partitions = self.partitions.read();
+        if !partitions
+            .get(route)
+            .is_some_and(|current| Arc::ptr_eq(current, partition))
         {
             return Ok(None);
         }
+        let Some(mut partition) = partition.try_write() else {
+            return Ok(None);
+        };
+        if partition.wal_records != prepared.snapshot.before_wal_records
+            || partition.slab.len() != prepared.snapshot.before_slab_entries
+            || partition.hnsw_rebuilds != prepared.snapshot.before_hnsw_rebuilds
+        {
+            return Ok(None);
+        }
+        // WAL rewrite and derived-file persistence still hold the write lock.
+        // This publication is not a constant-time or lock-free swap.
         partition.apply_prepared_compaction(prepared).map(Some)
+    }
+
+    /// Daily connectivity repair, separate from ordinary tombstone/WAL cleanup.
+    /// Diagnostics have a two-second budget; at most one graph is rebuilt.
+    /// A changed or busy partition is deferred until a later pass.
+    pub fn maintain_connectivity(&self) -> Result<Vec<RouteCompactionStats>> {
+        let Some(_maintenance) = self.maintenance.try_lock() else {
+            return Ok(Vec::new());
+        };
+        let routes = self.partitions.read().keys().cloned().collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut candidates = Vec::new();
+        for chunk in routes.chunks(64) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let report = self.diagnostics_bounded(chunk, remaining)?;
+            for (route, metrics) in report.partitions {
+                if let Some(hnsw) = metrics.hnsw {
+                    if hnsw.connectivity_breach(COMPACT_CONNECTIVITY_RATIO) {
+                        candidates.push((route, hnsw.connectivity_risk_ratio()));
+                    } else if hnsw.connectivity_breach(NOTIFY_CONNECTIVITY_RATIO) {
+                        tracing::warn!(%route, ratio = hnsw.connectivity_risk_ratio(),
+                            "vector connectivity exceeds notification threshold");
+                    }
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let Some((route, _)) = candidates.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let Some(partition) = self.partitions.read().get(&route).cloned() else {
+            return Ok(Vec::new());
+        };
+        let started = Instant::now();
+        let Some(stats) = self.rebuild_partition(&route, &partition)? else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![RouteCompactionStats {
+            route,
+            before_wal_records: stats.before_wal_records,
+            after_wal_records: stats.after_wal_records,
+            before_slab_entries: stats.before_slab_entries,
+            after_slab_entries: stats.after_slab_entries,
+            elapsed_ms: started.elapsed().as_millis(),
+        }])
     }
 
     pub fn partition_count(&self) -> usize {
@@ -1267,12 +1378,36 @@ struct CompactionStats {
     after_slab_entries: usize,
 }
 
-struct PreparedCompaction {
+struct CompactionSnapshot {
     before_wal_records: usize,
     before_slab_entries: usize,
+    before_hnsw_rebuilds: usize,
     compacted_slab: VectorSlab,
-    rebuilt_hnsw: Option<HnswIndex>,
     compacted_count: usize,
+}
+
+impl CompactionSnapshot {
+    fn build(self) -> Result<PreparedCompaction> {
+        let items = self
+            .compacted_slab
+            .active_entries()
+            .map(|entry| (entry.entity_id.clone(), entry.vector.clone()))
+            .collect::<Vec<_>>();
+        let rebuilt_hnsw = if items.is_empty() {
+            None
+        } else {
+            Some(HnswIndex::build(items, HnswOptions::default()).map_err(anyhow::Error::msg)?)
+        };
+        Ok(PreparedCompaction {
+            snapshot: self,
+            rebuilt_hnsw,
+        })
+    }
+}
+
+struct PreparedCompaction {
+    snapshot: CompactionSnapshot,
+    rebuilt_hnsw: Option<HnswIndex>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1742,20 +1877,7 @@ impl Partition {
         }
     }
 
-    fn compact(&mut self) -> Result<CompactionStats> {
-        let prepared = self.prepare_compaction()?;
-        self.apply_prepared_compaction(prepared)
-    }
-
-    fn prepare_compaction(&self) -> Result<PreparedCompaction> {
-        let before_wal_records = self.wal_records;
-        let before_slab_entries = self.slab.len();
-        // Build the new slab from the old one's active entries.
-        // Each entry's metadata and vector are cloned into the replacement
-        // slab (unavoidable — the old slab is still the source of truth
-        // until we swap). The HNSW rebuild further below clones vectors
-        // again for the graph construction. Two copies is the floor for
-        // compaction; the previous implementation kept four.
+    fn capture_compaction(&self) -> Result<CompactionSnapshot> {
         let mut compacted_slab = VectorSlab::new(self.slab.dims());
         let mut compacted_count = 0usize;
         for entry in self.slab.active_entries() {
@@ -1767,20 +1889,11 @@ impl Partition {
             )?;
             compacted_count += 1;
         }
-        let items = compacted_slab
-            .active_entries()
-            .map(|entry| (entry.entity_id.clone(), entry.vector.clone()))
-            .collect::<Vec<_>>();
-        let rebuilt_hnsw = if items.is_empty() {
-            None
-        } else {
-            Some(HnswIndex::build(items, HnswOptions::default()).map_err(anyhow::Error::msg)?)
-        };
-        Ok(PreparedCompaction {
-            before_wal_records,
-            before_slab_entries,
+        Ok(CompactionSnapshot {
+            before_wal_records: self.wal_records,
+            before_slab_entries: self.slab.len(),
+            before_hnsw_rebuilds: self.hnsw_rebuilds,
             compacted_slab,
-            rebuilt_hnsw,
             compacted_count,
         })
     }
@@ -1806,6 +1919,7 @@ impl Partition {
         wal::rewrite(
             &self.wal_path(),
             prepared
+                .snapshot
                 .compacted_slab
                 .active_entries()
                 .map(|entry| WalRecord {
@@ -1819,17 +1933,17 @@ impl Partition {
                     route: self.route.clone(),
                 }),
         )?;
-        self.slab = prepared.compacted_slab;
-        self.wal_records = prepared.compacted_count;
+        self.slab = prepared.snapshot.compacted_slab;
+        self.wal_records = prepared.snapshot.compacted_count;
         self.hnsw = prepared.rebuilt_hnsw;
         self.hnsw_rebuilds += 1;
         self.flush_derived_full()?;
         self.write_snapshot_best_effort("compaction");
 
         Ok(CompactionStats {
-            before_wal_records: prepared.before_wal_records,
+            before_wal_records: prepared.snapshot.before_wal_records,
             after_wal_records: self.wal_records,
-            before_slab_entries: prepared.before_slab_entries,
+            before_slab_entries: prepared.snapshot.before_slab_entries,
             after_slab_entries: self.slab.len(),
         })
     }
@@ -2667,6 +2781,91 @@ mod tests {
             disconnected_nodes: zero_in,
             zero_in_degree_nodes: zero_in,
         }
+    }
+
+    #[test]
+    fn snapshot_rebuild_allows_search_and_ingest_and_defers_stale_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = VectorStore::open(&root).unwrap();
+        store.upsert("route", "old", "h1", vec![1.0, 0.0]).unwrap();
+        let partition = store.partition("route").unwrap();
+        let result = store
+            .rebuild_partition_using("route", &partition, |snapshot| {
+                assert!(!store.search("route", &[1.0, 0.0], 1)?.is_empty());
+                store.upsert("route", "new", "h2", vec![0.0, 1.0])?;
+                snapshot.build()
+            })
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "a write during graph construction defers publication"
+        );
+        assert!(store.contains_active("route", "new", "h2").unwrap());
+        drop(store);
+        let reopened = VectorStore::open(&root).unwrap();
+        assert!(reopened.contains_active("route", "new", "h2").unwrap());
+    }
+
+    #[test]
+    fn snapshot_publication_fences_rebuild_generation_and_replaced_partition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = VectorStore::open(&root).unwrap();
+        store.upsert("route", "old", "h1", vec![1.0, 0.0]).unwrap();
+        let partition = store.partition("route").unwrap();
+        let snapshot = partition.read().capture_compaction().unwrap();
+        store.rebuild("route").unwrap();
+        assert!(
+            store
+                .publish_compaction("route", &partition, snapshot.build().unwrap())
+                .unwrap()
+                .is_none(),
+            "same WAL count and slab length cannot hide an intervening rebuild"
+        );
+        let snapshot = partition.read().capture_compaction().unwrap();
+        store.remove_partition("route").unwrap();
+        store
+            .upsert("route", "replacement", "h2", vec![0.0, 1.0])
+            .unwrap();
+        assert!(
+            store
+                .publish_compaction("route", &partition, snapshot.build().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        let reopened = VectorStore::open(&root).unwrap();
+        assert!(
+            reopened
+                .contains_active("route", "replacement", "h2")
+                .unwrap()
+        );
+        assert!(!reopened.contains_active("route", "old", "h1").unwrap());
+    }
+
+    #[test]
+    fn maintenance_busy_and_partition_busy_defer_without_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let store = VectorStore::open(&root).unwrap();
+        store.upsert("route", "old", "h1", vec![1.0, 0.0]).unwrap();
+        let maintenance = store.maintenance.lock();
+        assert!(
+            store
+                .rebuild("route")
+                .unwrap_err()
+                .to_string()
+                .contains("busy")
+        );
+        assert!(store.compact_partitions(None).unwrap().is_empty());
+        assert!(store.maintain_connectivity().unwrap().is_empty());
+        drop(maintenance);
+        let partition = store.partition("route").unwrap();
+        let busy = partition.write();
+        assert!(store.rebuild("route").is_err());
+        drop(busy);
+        store.rebuild("route").unwrap();
     }
 
     #[test]
