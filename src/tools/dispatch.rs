@@ -1330,7 +1330,7 @@ impl BlackboxServer {
             let brofile = match orchestration::brofile::resolve_brofile(
                 &member.brofile,
                 &store_dir,
-                team.project_dir.as_deref(),
+                super::roster::team_source_project_dir(self, team.project_dir.as_deref()),
             ) {
                 Some(bf) => bf,
                 None => {
@@ -1994,7 +1994,10 @@ impl BlackboxServer {
                     orchestration::brofile::resolve_brofile(
                         &member.brofile,
                         &self.state.store_dir,
-                        bro_match.team.project_dir.as_deref(),
+                        super::roster::team_source_project_dir(
+                            self,
+                            bro_match.team.project_dir.as_deref(),
+                        ),
                     )
                 }
                 _ => orchestration::brofile::resolve_brofile(label, &self.state.store_dir, cwd),
@@ -2151,7 +2154,7 @@ impl BlackboxServer {
             return orchestration::brofile::resolve_brofile(
                 &member.brofile,
                 store_dir,
-                bro_match.team.project_dir.as_deref(),
+                super::roster::team_source_project_dir(self, bro_match.team.project_dir.as_deref()),
             );
         }
         orchestration::brofile::resolve_brofile(bro_name, store_dir, project_dir)
@@ -2187,7 +2190,10 @@ impl BlackboxServer {
                     let bf = orchestration::brofile::resolve_brofile(
                         &member.brofile,
                         store_dir,
-                        bro_match.team.project_dir.as_deref(),
+                        super::roster::team_source_project_dir(
+                            self,
+                            bro_match.team.project_dir.as_deref(),
+                        ),
                     )
                     .ok_or(format!("Brofile not found: {}", member.brofile))?;
                     orchestration::brofile::enforce_provider_defaults(
@@ -2375,7 +2381,7 @@ impl BlackboxServer {
             let bf = orchestration::brofile::resolve_brofile(
                 &member.brofile,
                 store_dir,
-                bro_match.team.project_dir.as_deref(),
+                super::roster::team_source_project_dir(self, bro_match.team.project_dir.as_deref()),
             )
             .ok_or(format!("Brofile not found: {}", member.brofile))?;
             let lease = member.task_history.last().and_then(|task_id| {
@@ -2574,6 +2580,8 @@ impl BlackboxServer {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::server::state::SharedState;
 
@@ -2606,6 +2614,122 @@ mod tests {
                 .insert(id.into(), orch::test_task(id, status, Provider::Glm))
                 .unwrap();
         }
+    }
+
+    fn assert_team_dispatch_source(server: &BlackboxServer, root: &Path, catalog: bool) {
+        use orchestration::{brofile, team};
+        let project = root.join("worker-checkout");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.to_str().unwrap();
+        for (scope, provider, model) in [
+            ("global", "glm", "global-model"),
+            ("project", "deepseek", "project-model"),
+        ] {
+            let bf = serde_json::from_value(serde_json::json!({
+                "name": "reviewer", "provider": provider, "model": model,
+            }))
+            .unwrap();
+            brofile::save_brofile(
+                &bf,
+                scope,
+                &server.state.store_dir,
+                (scope == "project").then_some(project),
+            )
+            .unwrap();
+        }
+        team::save_team(
+            &team::Team {
+                name: "panel".into(),
+                teamplate: "panel-template".into(),
+                members: vec![team::TeamMember {
+                    name: "reviewer".into(),
+                    brofile: "reviewer".into(),
+                    session_id: Some("synthetic-session".into()),
+                    task_history: vec![],
+                }],
+                advisor: None,
+                project_dir: Some(project.into()),
+                created_at: 0,
+                diversity_floor: None,
+            },
+            &server.state.store_dir,
+        );
+        let expected_provider = if catalog {
+            Provider::Glm
+        } else {
+            Provider::Deepseek
+        };
+        let expected_model = if catalog {
+            "global-model"
+        } else {
+            "project-model"
+        };
+        let bf = server
+            .resolve_exec_brofile_for_allocator("panel::reviewer", None)
+            .unwrap();
+        assert_eq!(bf.provider, expected_provider);
+        let (provider, _, opts, _, cwd, _, _, _, _) = server
+            .resolve_exec_target(Some("panel::reviewer"), None, None)
+            .unwrap();
+        assert_eq!(provider, expected_provider);
+        assert_eq!(opts.unwrap().model.as_deref(), Some(expected_model));
+        assert_eq!(cwd.as_deref(), Some(project));
+        let (provider, sid, _, opts, _, cwd, _, _, _, _) = server
+            .resolve_resume_target(Some("panel::reviewer"), None, None, None)
+            .unwrap();
+        assert_eq!(provider, expected_provider);
+        assert_eq!(sid, "synthetic-session");
+        assert_eq!(opts.unwrap().model.as_deref(), Some(expected_model));
+        assert_eq!(cwd.as_deref(), Some(project));
+        let (opts, _) = server
+            .resolve_workload_retro_runtime(
+                "missing-task",
+                expected_provider,
+                "synthetic-session",
+                Some("panel::reviewer"),
+                Some(project),
+            )
+            .unwrap();
+        assert_eq!(opts.unwrap().model.as_deref(), Some(expected_model));
+        // A caller cwd override remains worker context, not source authority.
+        let (_, _, _, _, cwd, _, _, _, _) = server
+            .resolve_exec_target(Some("panel::reviewer"), None, Some("worker-context"))
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some("worker-context"));
+        if catalog {
+            std::fs::remove_file(server.state.store_dir.join("brofiles/reviewer.json")).unwrap();
+            assert!(
+                server
+                    .resolve_exec_brofile_for_allocator("panel::reviewer", None)
+                    .is_none()
+            );
+            assert!(
+                server
+                    .resolve_exec_target(Some("panel::reviewer"), None, None)
+                    .is_err()
+            );
+            assert!(
+                server
+                    .resolve_resume_target(Some("panel::reviewer"), None, None, None)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_team_dispatch_uses_global_brofile_and_preserves_worker_cwd() {
+        let fixture = crate::server::state::catalog_fixture::CatalogFixture::new();
+        let server = fixture.server();
+        let root = fixture.root().canonicalize().unwrap();
+        assert_team_dispatch_source(&server, &root, true);
+    }
+
+    #[test]
+    fn bridge_team_dispatch_preserves_project_brofile_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&tmp);
+        assert_team_dispatch_source(&server, &root, false);
     }
 
     #[test]
