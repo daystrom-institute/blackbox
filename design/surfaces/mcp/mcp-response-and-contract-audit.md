@@ -583,8 +583,8 @@ content-addressed chunks, compare-and-swap snapshot admission, and streamed
 host capture. Reader leases and purge protection preserve the indexed generation
 across concurrent publication and source outages. Revocation still removes
 index enrollment. Source observations distinguish contact, scan completion,
-published generation, and indexed generation. Host enrollment and backfill are
-pending deployment verification; this source checkpoint is not collection proof.
+published generation, and indexed generation. Host enrollment and backfill were verified in the deployed milestone below.
+Continuous host collection still requires macOS Local Network approval.
 
 Graph inspection now pages edges and exact property text using revision-bound
 cursors. Bundles default to 600-character summaries with exact expansion.
@@ -603,8 +603,53 @@ remain nontransactional; exact stage receipts describe partial effects.
 
 The full-suite gate caught a historical-agent supersession regression introduced
 while moving artifact deactivation after replacement persistence. The correction retires old snapshots after durable replacement and repairs
-interrupted retirement on retry; deployment remains gated on full verification. Proposal summary pagination also remains unfinished:
-a shipped Badgey workflow consumes complete drafts from one list call, so the
-producer and its page/expansion loop must migrate together. Blind truncation
-would silently drop proposals. Whiteboard visibility and project-admin locality
-are under the next source review, not claimed complete here.
+interrupted retirement on retry. Full verification and deployment succeeded
+in the milestone below. Proposal summary pagination and the shipped Badgey
+page/expansion loop are implemented together in the next source milestone;
+their coordinated runtime upgrade remains separately gated. Whiteboard
+visibility and project-admin locality fixes are included in the deployed
+collection milestone.
+
+
+### Deployed collection and continuation milestone, 2026-09-06 UTC
+
+Image `ef7f7f04d0f1`, digest
+`057dfc885fab28deb76c87c9e4c848e6eee564c5ac7ddf619d2416bb5a482e5c`,
+passed image workflow `build-bbox-image-fctq9`. Full verification
+`bbox-verify-kb8t8` passed 7464 tests (21 explicitly skipped), Clippy, and
+concurrency lint on `72092204`. That verification revision differs from the
+image only in two audit classifications: brokered catalog leases and a
+response-only canonical-path read. Both the daemon and Slack collector are
+healthy; a subsequent converge reported 22 unchanged resources.
+
+A dedicated native transcript producer enrolled through the source catalog.
+An interactive backfill discovered and published all 720 eligible Claude and
+Codex streams, uploading 3022167556 bytes with zero failures or deferrals.
+Live search, context, messages, and session reads returned indexed native
+locators with matching published/indexed generations. This establishes a
+successful backfill, not continuous collection: the installed launch agent
+cannot connect under macOS Local Network privacy, while the same binary can
+connect interactively. Its bounded error chain reports TCP errno 65. Normal
+signing and operator Local Network approval are required before a completed
+background cycle can be verified; see `docs/native-transcript-collector.md`.
+
+Live read-only MCP checks measured complete compact result envelopes:
+
+| Probe | Prior bytes | Deployed bytes |
+| --- | ---: | ---: |
+| Atom catalog, default page | 63660 unbounded | 6900 |
+| Agent catalog | not compared | 1782 |
+| Workflow catalog | not compared | 1110 |
+| Event list, limit 3 | 1348 | 831 |
+| Storage health summary | 3872 | 2325 |
+| Storage health files, limit 3 | not compared | 3189 |
+| Doctor JSON summary, limit 3 | not compared | 2090 |
+
+All 135 installed atoms were reachable exactly once across seven pages. Task
+result continuation reconstructed the synthetic Astra result in three
+8-byte pages. Graph property continuation reconstructed the stored 300-byte
+preview in five pages, and evidence bundling succeeded. This checks exact
+stored-property continuation, not recovery of text already shortened during
+indexing; that distinction is under further scrutiny. No live Slack message
+was sent for these probes. Configuration and whiteboard confidentiality
+checks used synthetic fixtures rather than exposing live private values.
