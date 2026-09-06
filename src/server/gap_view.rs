@@ -57,6 +57,8 @@ pub(crate) struct CatalogPublishedGapCacheEntry {
 pub(crate) struct SessionGapView {
     pub(crate) gaps: GapStore,
     pub(crate) built_from: BuiltFromTable,
+    /// Exact accepted identities pinned while this view's project rows were assembled.
+    pub(crate) accepted_content: BTreeMap<ProjectId, AcceptedPublicationContentStamp>,
     pub(crate) diagnostics: Vec<String>,
     /// Checkouts `all` omitted because they could not position themselves
     /// against accepted content, as typed rows.
@@ -278,6 +280,7 @@ impl BlackboxServer {
         let mut gaps = Vec::new();
         let mut metadata = BTreeMap::<String, GapViewMetadata>::new();
         let mut built_from = BuiltFromTable::default();
+        let mut accepted_content = BTreeMap::new();
         let mut diagnostics = Vec::new();
         let mut degraded_overlays = Vec::new();
         let mut has_legacy_compatibility_rows = false;
@@ -309,6 +312,7 @@ impl BlackboxServer {
                 &mut gaps,
                 &mut metadata,
                 &mut built_from,
+                &mut accepted_content,
                 &mut diagnostics,
                 &mut degraded_overlays,
             )?;
@@ -527,6 +531,7 @@ impl BlackboxServer {
         Ok(SessionGapView {
             gaps: GapStore::detached_view(gaps, metadata),
             built_from,
+            accepted_content,
             diagnostics,
             degraded_overlays,
         })
@@ -546,6 +551,7 @@ impl BlackboxServer {
         gaps: &mut Vec<bbox_gaps::gaps::GapNote>,
         metadata: &mut BTreeMap<String, GapViewMetadata>,
         built_from: &mut BuiltFromTable,
+        accepted_content: &mut BTreeMap<ProjectId, AcceptedPublicationContentStamp>,
         diagnostics: &mut Vec<String>,
         degraded_overlays: &mut Vec<OverlayDegradation>,
     ) -> Result<()> {
@@ -601,6 +607,7 @@ impl BlackboxServer {
                 &verified,
                 target.catalog_scope.as_ref(),
             ));
+            accepted_content.insert(target.project_id.clone(), verified.content_stamp().clone());
             let published = self.cached_catalog_published_gaps(&target.project_id, &verified);
             let published_ref = built_from.intern(BuiltFromStamp::Published {
                 published_scope: published.published_scope,

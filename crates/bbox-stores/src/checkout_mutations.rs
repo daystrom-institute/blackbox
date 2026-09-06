@@ -66,7 +66,6 @@ pub struct MutationPublication {
 
 pub struct CheckoutMutations {
     store: CheckoutMutationStore,
-    publication_revision: u64,
 }
 
 impl StoreSnapshot for CheckoutMutations {
@@ -87,10 +86,7 @@ impl CheckoutMutations {
         } else {
             CheckoutMutationStore::default()
         };
-        Ok(Self {
-            store,
-            publication_revision: 0,
-        })
+        Ok(Self { store })
     }
 
     /// Queue a mutation for checkout-owner delivery. Ids are minted by the
@@ -227,11 +223,6 @@ impl CheckoutMutations {
         })
     }
 
-    /// Process-local fence for snapshots captured before the queue lock.
-    pub fn publication_revision(&self) -> u64 {
-        self.publication_revision
-    }
-
     /// Retire the overlay prefix whose exact content has reached publication.
     /// Delivery acknowledgement alone is insufficient: the owner may not have
     /// committed and published the delivered file yet.
@@ -285,9 +276,6 @@ impl CheckoutMutations {
                 publication.observed = true;
                 changed = true;
             }
-        }
-        if changed {
-            self.publication_revision = self.publication_revision.wrapping_add(1);
         }
         changed
     }
@@ -506,9 +494,7 @@ mod tests {
                 "2026-09-06T00:00:00Z".into(),
             )
             .unwrap();
-        let captured = store.publication_revision();
         assert!(store.observe_publication(&scope(), file, Some(b)));
-        assert_ne!(captured, store.publication_revision());
         store
             .enqueue_tracked_writes(
                 scope(),
