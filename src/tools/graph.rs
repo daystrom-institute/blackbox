@@ -961,7 +961,7 @@ impl DescribeSchemaParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_inspect_entity",
-        description = "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Edge omissions are explicit."
+        description = "Inspect properties and targeted edges. Filter edge_types and direction; per_type_limit=0 reads properties only. property_mode selects summary, smart, or full. Follow edge_page.next_cursor for more edges; property retrieves exact text in pages."
     )]
     pub(crate) async fn bbox_inspect_entity(
         &self,
@@ -1131,7 +1131,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_bundle_evidence",
-        description = "Bundle entity refs and cached path IDs with provenance and current evidence freshness. property_mode=summary reduces bodies; default is full. Stale paths are explicit."
+        description = "Bundle entity refs and cached path IDs with provenance and current evidence freshness. Default summary bodies are 600 characters; full and none are explicit. Exact property pages are available through bbox_inspect_entity. Stale paths are explicit."
     )]
     pub(crate) async fn bbox_bundle_evidence(
         &self,

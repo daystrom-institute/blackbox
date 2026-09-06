@@ -1203,7 +1203,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_webhook_list",
         category: ToolCategory::Workflows,
-        summary: "List installed webhook endpoints with their signature scheme + routing packet.",
+        summary: "List installed webhooks as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted.",
         when_to_use: "Inventory check — what webhooks does this daemon serve? Useful before installing to avoid duplicate names.",
         example: Some("bro_webhook_list()"),
     },
@@ -1226,7 +1226,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_poller_list",
         category: ToolCategory::Workflows,
-        summary: "List installed pollers with their schedule + source URL + routing packet.",
+        summary: "List installed pollers as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted.",
         when_to_use: "Inventory check before installing to avoid duplicate names; also surfaces effective tick intervals (which may be clamped above your configured value via BBOX_POLLER_MIN_INTERVAL_SECS).",
         example: Some("bro_poller_list()"),
     },
@@ -1249,7 +1249,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_cron_list",
         category: ToolCategory::Workflows,
-        summary: "List installed crons with schedule + concurrency cap + routing packet.",
+        summary: "List installed crons as name-ordered summary pages (default 20, maximum 100). Filter by exact name and continue with next_offset. detail=true adds safe configuration diagnostics; credentials, opaque URL components, payload values, selector constants, and server-local paths stay omitted.",
         when_to_use: "Inventory check before installing; also surfaces in-flight count so you can tell whether a cap is currently blocking a tick.",
         example: Some("bro_cron_list()"),
     },
@@ -1277,7 +1277,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_workflow_list",
         category: ToolCategory::Workflows,
-        summary: "List installed workflow specs by id.",
+        summary: "List installed workflows as name/version summary pages (default 20, maximum 100), ordered by registry name. Filter by exact name and continue with next_offset. detail=true adds entry node, node/actor counts, and policy packet; workflow hooks and embedded credentials are never returned.",
         when_to_use: "Inventory check — what workflows can routing verdicts target on this daemon?",
         example: Some("bro_workflow_list()"),
     },
@@ -1292,7 +1292,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_agent_list",
         category: ToolCategory::Orchestration,
-        summary: "List installed agents from the registry. Optional filters for cost_class, provenance_kind, include_superseded, and limit.",
+        summary: "List installed agents in name/version order as compact summary pages (default 20, maximum 100). Continue with next_offset. Existing registry filters apply before paging. detail=true expands descriptions and installation diagnostics; bro_agent_get/bro_agent_describe reads one exact agent.",
         when_to_use: "Discover what agents are available for dispatch, composition, or review. Filter by cost_class to find cheap/expensive agents; use include_superseded=true to see version history.",
         example: Some(r#"bro_agent_list(include_superseded=true)"#),
     },
@@ -1332,7 +1332,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "atom_list",
         category: ToolCategory::Orchestration,
-        summary: "List installed atoms from the registry. Optional filters for cost_class, provenance_kind, subcontract, include_superseded, and limit.",
+        summary: "List installed atoms in name/version order as compact summary pages (default 20, maximum 100). Continue with next_offset. Existing registry filters apply before paging. detail=true expands descriptions and installation diagnostics; atom_get/atom_describe reads one exact atom.",
         when_to_use: "Discover what typed capabilities (atoms) are available. Filter by subcontract to find e.g. refactor atoms (subcontract=\"refactor/v1\"). Use include_superseded=true to see version history.",
         example: Some(r#"atom_list(subcontract="refactor/v1")"#),
     },
@@ -1562,8 +1562,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_storage_health",
         category: ToolCategory::StorageHealth,
-        summary: "Read-only edge sidecar inventory. Totals active legacy, managed derived, backups, temps, orphan classes, inactive snapshots, and observed history; include_files=true for exact rows.",
-        when_to_use: "Use when diagnosing storage growth or validating retention before GC. Observed history is reported separately and retained by explicit keep/no-cap policy unless an operator supplies a cap to GC.",
+        summary: "Read daemon-owned edge storage totals and the ten largest contributors. include_files=true returns file pages (limit default 20, max 100); follow next_offset. File paths are relative to daemon storage, not caller-readable paths. Use bbox_storage_gc for managed cleanup. Manifest and retention warnings remain visible.",
+        when_to_use: "Paths in file pages are relative diagnostic coordinates in daemon-owned storage, not caller filesystem paths. Manifest and retention warnings remain visible. Use when diagnosing storage growth or validating retention before GC. Observed history is reported separately and retained by explicit keep/no-cap policy unless an operator supplies a cap to GC.",
         example: None,
     },
     ToolDoc {

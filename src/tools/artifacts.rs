@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(response.is_error, Some(true));
         let failure: Value =
             serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
-        assert_eq!(failure["failed"], "artifact_content");
+        assert_eq!(failure["failed"], "catalog_persistence");
         assert!(
             failure["completed"]
                 .as_array()
