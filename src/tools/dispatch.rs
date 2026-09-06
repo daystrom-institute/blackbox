@@ -2290,6 +2290,32 @@ impl BlackboxServer {
         Err("Provide either bro or provider".into())
     }
 
+    /// Ordinary caller resumes cannot take over a session owned by another runtime.
+    /// The stored session ID is authoritative even if the caller changes provider.
+    /// Internal workflow/atom recovery uses its own lower-level dispatch path.
+    fn ensure_ordinary_resume_ownership(
+        &self,
+        session_id: &str,
+        member_task_id: Option<&str>,
+    ) -> Result<(), String> {
+        for task in self.state.task_store.read().all_tasks() {
+            let inner = task.inner.lock();
+            if (inner.session_id == session_id || member_task_id == Some(inner.id.as_str()))
+                && (inner.workflow_owned
+                    || orchestration::workflow_owned_for_origin(inner.origin)
+                    || inner.provider == Provider::Workflow)
+            {
+                return Err(format!(
+                    "error.owner_managed_session: task {} belongs to a workflow or atom; \
+                     ordinary bro_resume cannot take over its session. Inspect the existing \
+                     task with bro_status; recovery requires its owning runtime's explicit path.",
+                    inner.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::type_complexity)]
     pub(crate) fn resolve_resume_target(
         &self,
@@ -2336,6 +2362,10 @@ impl BlackboxServer {
                 .ok_or(format!(
                     "Bro \"{name}\" has no active session — use exec first"
                 ))?;
+            self.ensure_ordinary_resume_ownership(
+                sid,
+                member.task_history.last().map(String::as_str),
+            )?;
             let bf = orchestration::brofile::resolve_brofile(
                 &member.brofile,
                 store_dir,
@@ -2434,6 +2464,7 @@ impl BlackboxServer {
         }
 
         if let (Some(sid), Some(p)) = (session_id, raw_provider) {
+            self.ensure_ordinary_resume_ownership(sid, None)?;
             let provider = p
                 .parse::<Provider>()
                 .map_err(|_| format!("Unknown provider: {p}"))?;
@@ -3100,6 +3131,130 @@ mod tests {
             !text.contains(crate::server::drain::MAINTENANCE_PENDING_CODE),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn bro_resume_refuses_each_owner_marker_before_creating_a_task() {
+        for (provider, origin, owned) in [
+            (Provider::Glm, bro_core::Origin::AgentDispatch, true),
+            (Provider::Glm, bro_core::Origin::Workflow, false),
+            (Provider::Glm, bro_core::Origin::Atom, false),
+            (Provider::Workflow, bro_core::Origin::Unknown, false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let server = test_server(&tmp);
+            let task = orch::test_task("owned", orch::TaskStatus::Failed, provider);
+            {
+                let mut inner = task.inner.lock();
+                inner.origin = origin;
+                inner.workflow_owned = owned;
+                // Eligibility telemetry, including stale flags, is not authority.
+                inner.recoverable = true;
+            }
+            server
+                .state
+                .task_store
+                .write()
+                .insert("owned".into(), task.clone())
+                .unwrap();
+            for requested_origin in [
+                None,
+                Some(bro_core::Origin::Cockpit),
+                Some(bro_core::Origin::Workflow),
+            ] {
+                let mut p: ResumeParams = serde_json::from_value(json!({
+                    "prompt": "continue",
+                    "session_id": "sess-owned",
+                    // A different caller-supplied provider cannot shed ownership.
+                    "provider": "deepseek",
+                }))
+                .unwrap();
+                p.origin_override = requested_origin;
+                let result = server.bro_resume(Parameters(p)).await;
+                assert_eq!(result.is_error, Some(true));
+                assert!(call_result_text(&result).contains("error.owner_managed_session"));
+                assert_eq!(server.state.task_store.read().all_tasks().len(), 1);
+                let inner = task.inner.lock();
+                assert_eq!(inner.status, orch::TaskStatus::Failed);
+                assert_eq!(inner.origin, origin);
+                assert_eq!(inner.workflow_owned, owned);
+                assert!(inner.recoverable);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bro_resume_team_history_refuses_owned_task_before_brofile_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let task = orch::test_task("owned", orch::TaskStatus::Completed, Provider::Glm);
+        task.inner.lock().origin = bro_core::Origin::Atom;
+        server
+            .state
+            .task_store
+            .write()
+            .insert("owned".into(), task)
+            .unwrap();
+        orchestration::team::save_team(
+            &orchestration::team::Team {
+                name: "panel".into(),
+                teamplate: "review".into(),
+                members: vec![orchestration::team::TeamMember {
+                    name: "reviewer".into(),
+                    brofile: "missing-brofile".into(),
+                    // Legacy history still protects ownership when IDs disagree.
+                    session_id: Some("legacy-team-session".into()),
+                    task_history: vec!["owned".into()],
+                }],
+                advisor: None,
+                project_dir: None,
+                created_at: 0,
+                diversity_floor: None,
+            },
+            &server.state.store_dir,
+        );
+        let p = serde_json::from_value(json!({
+            "prompt": "continue", "bro": "panel::reviewer",
+        }))
+        .unwrap();
+        let result = server.bro_resume(Parameters(p)).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(call_result_text(&result).contains("error.owner_managed_session"));
+        assert_eq!(server.state.task_store.read().all_tasks().len(), 1);
+    }
+
+    #[test]
+    fn ordinary_resume_ownership_preserves_current_and_external_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        for (id, origin) in [
+            ("direct", bro_core::Origin::AgentDispatch),
+            ("cockpit", bro_core::Origin::Cockpit),
+            ("legacy", bro_core::Origin::Unknown),
+            ("cron", bro_core::Origin::Cron),
+            ("webhook", bro_core::Origin::Webhook),
+        ] {
+            let task = orch::test_task(id, orch::TaskStatus::Completed, Provider::Glm);
+            task.inner.lock().origin = origin;
+            server
+                .state
+                .task_store
+                .write()
+                .insert(id.into(), task)
+                .unwrap();
+            let sid = format!("sess-{id}");
+            let (provider, resolved_sid, ..) = server
+                .resolve_resume_target(None, Some(&sid), Some("glm"), None)
+                .unwrap();
+            assert_eq!(provider, Provider::Glm);
+            assert_eq!(resolved_sid, sid);
+        }
+        assert!(
+            server
+                .resolve_resume_target(None, Some("external-session"), Some("glm"), None)
+                .is_ok()
+        );
+        assert_eq!(server.state.task_store.read().all_tasks().len(), 5);
     }
 
     #[tokio::test]
