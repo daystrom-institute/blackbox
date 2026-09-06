@@ -22,23 +22,25 @@ activation. Counts describe this snapshot, not a permanent product budget.
 
 ## Implementation record
 
-- S1 source at `a3139da9` separates `/control/*` handlers, removes automatic
-  team advisors, preserves readable rows in mixed legacy task snapshots, refuses
-  unsafe new admission when snapshot recovery fails, and guards ordinary resume
-  and re-adoption against workflow/atom ownership. Native/corpus harness fixtures
-  run without atom/workflow capabilities. Selected bpool checks passed (14 and
-  56 tests); full cluster verification and image build are pending.
-- E4 operations now live in `src/vector_maintenance.rs`; workflow wrappers only
-  translate their results. Scheduling has not changed. Storage GC already has a
-  six-hour service loop, embedding residue a five-minute sweeper, and ordinary
-  vector tombstone/WAL compaction a five-minute loop. Connectivity repair still
-  needs an explicit replacement for its workflow-owned cadence and lock behavior.
-- S2 source at `284547c1` removes the three Slack binding/link MCP tools. This
-  partial S2 change is not a standalone deployment milestone: Badgey admission,
-  runtime/default cleanup and retained conversation enrollment must land together.
-- E1 uncertain-admission deduplication remains in progress. The proposed narrow
-  request key retains an admission identity and refuses automatic retry after an
-  unresolved durable claim; it does not promise exactly-once worker execution.
+- S1 deployed from `a3139da9` after full cluster verification. Neutral control
+  routes, ordinary bro status/wait and advisor refusal passed live smoke checks.
+  Mixed legacy task recovery and ownership guards remain enforced.
+- S2 deployed from `973ef861` after full verification `bbox-verify-xcb6q` and
+  image build `build-bbox-image-6fjpv` passed. The live ops catalog has 168 tools:
+  all 22 Slack, Badgey and consultant tools are absent. Their runtime hooks,
+  collector binaries, installed defaults and deployment credentials are removed.
+  Previously collected search/context/messages retain the same evidence after
+  cutover; the removed producer credential returns HTTP 401. The old collector
+  journal volume is retained, and ordinary bro admission is open.
+- E1 request-key admission is pushed through `a3d40cc7`. Four focused cluster
+  checks cover concurrent/reopened claims, corrupt claims, repeated invocation,
+  and hidden-origin rejection. It is not deployed yet. An unresolved durable
+  claim never authorizes another launch; this is not exactly-once execution.
+- E4 operations live in `src/vector_maintenance.rs`; connectivity scheduling
+  and rebuild lock behavior are being moved into the vector store before S3.
+  Storage GC and embedding residue already have independent service loops.
+- S3 workflow/atom removal, S4 shared event/whiteboard owners, and S5 surviving
+  MCP response/docs checks remain open. Deployment of S2 does not close them.
 
 ## Responsibility boundary
 
