@@ -93,11 +93,14 @@ fn project_catalog_list_page(
         })
         .collect();
     let next_offset = offset.saturating_add(projects.len());
-    Ok(json!({
-        "epoch": epoch, "projects": projects, "total": total, "offset": offset, "limit": limit,
-        "next_offset": (next_offset < total).then_some(next_offset), "order": "project_id_asc",
-        "detail_hint": "bbox_project_catalog_get(project=<project_id>)",
-    }))
+    bbox_corpus_core::response_page::bound_page(
+        json!({
+            "epoch": epoch, "projects": projects, "total": total, "offset": offset, "limit": limit,
+            "next_offset": (next_offset < total).then_some(next_offset), "order": "project_id_asc",
+            "detail_hint": "bbox_project_catalog_get(project=<project_id>)",
+        }),
+        "projects",
+    )
 }
 
 /// Longest accepted `audit_reason`, matching the catalog's own bounded

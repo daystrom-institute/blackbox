@@ -4,6 +4,7 @@ use crate::threads::{ThreadListParams, ThreadParams};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
+use rmcp::schemars;
 use rmcp::{tool, tool_router};
 
 #[derive(Debug, Default, serde::Deserialize, rmcp::schemars::JsonSchema)]

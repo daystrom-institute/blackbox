@@ -727,16 +727,21 @@ impl Notes {
                         row["project_selector"] = serde_json::json!(project);
                     }
                 }
+                bbox_corpus_core::response_page::preview_field(&mut row, "bro", 200);
+                bbox_corpus_core::response_page::preview_field(&mut row, "provider", 200);
                 row
             })
             .collect();
         let next_offset = offset.saturating_add(notes.len());
-        Ok(serde_json::json!({
-            "notes": notes, "total": total, "offset": offset, "limit": limit,
-            "next_offset": (next_offset < total).then_some(next_offset),
-            "order": "created_at_desc,id_asc",
-            "detail_hint": "bbox_notes(id=<id>,full=true)",
-        }))
+        bbox_corpus_core::response_page::bound_page(
+            serde_json::json!({
+                "notes": notes, "total": total, "offset": offset, "limit": limit,
+                "next_offset": (next_offset < total).then_some(next_offset),
+                "order": "created_at_desc,id_asc",
+                "detail_hint": "bbox_notes(id=<id>,full=true)",
+            }),
+            "notes",
+        )
     }
 
     pub fn list(&self, p: &NoteListParams) -> Result<String> {
@@ -830,8 +835,13 @@ mod tests {
             ..Default::default()
         };
         let first = store.list_page(&p, 0).unwrap();
-        assert_eq!(first["notes"].as_array().unwrap().len(), 100);
-        assert_eq!(first["next_offset"], 100);
+        let returned = first["notes"].as_array().unwrap().len();
+        assert!(returned > 0 && returned <= 100);
+        assert_eq!(first["next_offset"], returned);
+        assert!(
+            serde_json::to_vec(&first).unwrap().len()
+                <= bbox_corpus_core::response_page::PAGE_BUDGET_BYTES
+        );
         assert_eq!(first["notes"][0]["id"], "note-00000000");
         assert_eq!(first["notes"][0]["body_truncated"], true);
         assert_eq!(first["notes"][0]["resolution_note_truncated"], true);
