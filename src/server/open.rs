@@ -736,9 +736,6 @@ pub(super) fn open_shared_state(
     tracing::info!("Packets store: {}", packets_dir.display());
 
     let artifacts_dir = cfg.paths.artifacts_dir.clone();
-    let agent_adapter_registry = Arc::new(RwLock::new(
-        orchestration::agents::adapter::AgentAdapterRegistry::new(),
-    ));
     let artifacts_store = artifacts::ArtifactCatalog::open(&artifacts_dir)?;
     tracing::info!("Artifact catalog: {}", artifacts_store.root().display());
     backfill_artifact_hashes(&artifacts_store);
@@ -1033,7 +1030,6 @@ pub(super) fn open_shared_state(
         resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
         drain: super::drain::DrainState::open(&store_dir),
         long_polls: Arc::new(super::drain::LongPollRegistry::new()),
-        agent_adapter_registry,
         slack_channel_bindings: Arc::new(
             slack_channel_bindings::SlackChannelBindings::open(&store_dir)
                 .unwrap_or_else(|e| panic!("opening slack channel bindings at {store_dir:?}: {e}")),

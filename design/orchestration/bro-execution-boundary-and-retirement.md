@@ -36,11 +36,21 @@ activation. Counts describe this snapshot, not a permanent product budget.
   checks cover concurrent/reopened claims, corrupt claims, repeated invocation,
   and hidden-origin rejection. It is not deployed yet. An unresolved durable
   claim never authorizes another launch; this is not exactly-once execution.
-- E4 operations live in `src/vector_maintenance.rs`; connectivity scheduling
-  and rebuild lock behavior are being moved into the vector store before S3.
-  Storage GC and embedding residue already have independent service loops.
-- S3 workflow/atom removal, S4 shared event/whiteboard owners, and S5 surviving
-  MCP response/docs checks remain open. Deployment of S2 does not close them.
+- E4 maintenance moved into `bbox-vectors`; all 51 focused vector checks passed.
+  Connectivity repair snapshots under a short read lock, builds outside the
+  partition lock and defers stale publication. Storage GC, embedding residue
+  and observation-journal retention run as independent mechanical loops.
+- S3/S4 source is pushed through `cb2702f8`: workflow/atom execution, trigger
+  routes, reaction delivery and whiteboard mutation are removed. The map gate
+  passes 109 surviving declarations and all 82 planned retirements absent.
+  `bbox_tool_calls` preserves indexed tool history. Native bro and bro-harness
+  builds passed, were stablesigned and installed; Fleet remains and the retired
+  orchestrate command is absent. The cage is still running S2 pending full gates.
+- S5 removed executable defaults and updated caller-composition guidance.
+  Focused checks passed retained history, project ownership and visibility.
+  Full verification is in progress; stale permission-test expectations and the
+  empty custom-agent adapter registry are being removed before convergence.
+  The final deployed surface and response audit remain open.
 
 ## Responsibility boundary
 

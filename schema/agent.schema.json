@@ -138,10 +138,6 @@
             "expensive"
           ]
         },
-        "dispatch_adapter": {
-          "type": "string",
-          "minLength": 1
-        },
         "provenance": {
           "oneOf": [
             {

@@ -473,10 +473,8 @@ pub(crate) async fn install_artifact_value(
                 if !value.is_object() {
                     anyhow::bail!("agent artifact must be a JSON object");
                 }
-                let adapter_registry = state.agent_adapter_registry.read();
                 let catalog = state.artifacts.read();
                 let ctx = orchestration::agents::validate::InstallCtx {
-                    adapter_registry: &adapter_registry,
                     brofile_exists: |name: &str| -> bool {
                         catalog
                             .metadata_for(artifacts::ArtifactKind::Brofile, name)

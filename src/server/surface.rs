@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn example_surface_packet_system_event_tool_visibility() {
+    fn example_surface_packet_retains_bro_and_admin_permissions() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("system-defaults/mcp-surfaces/routing.json");
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -673,30 +673,15 @@ mod tests {
 
         let state = SharedState::for_test(tmp.path());
         let packets = state.packets.read();
-        let work = "mcp__blackbox__work_bash";
-        let emit = "mcp__blackbox__system_event_emit";
-        let compact = "mcp__blackbox__system_event_compact";
-        let list = "mcp__blackbox__system_event_list";
-        let open = "mcp__blackbox__system_event_open";
-        let r_install = "mcp__blackbox__reaction_install";
-        let r_list = "mcp__blackbox__reaction_list";
-        let r_replay = "mcp__blackbox__reaction_replay";
-        let r_execute = "mcp__blackbox__reaction_execute";
-        let r_deliveries = "mcp__blackbox__reaction_deliveries";
-        let r_retry = "mcp__blackbox__reaction_retry";
-        let universe: Vec<String> = vec![
-            work.into(),
-            emit.into(),
-            compact.into(),
-            list.into(),
-            open.into(),
-            r_install.into(),
-            r_list.into(),
-            r_replay.into(),
-            r_execute.into(),
-            r_deliveries.into(),
-            r_retry.into(),
-        ];
+        let search = "mcp__blackbox__bbox_search";
+        let exec = "mcp__blackbox__bro_exec";
+        let resume = "mcp__blackbox__bro_resume";
+        let install = "mcp__blackbox__bbox_artifact_install";
+        let report = "mcp__blackbox__bro_report";
+        let universe: Vec<String> = [search, exec, resume, install, report]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
 
         let check = |surface: &str, expect_visible: &[&str], expect_hidden: &[&str]| {
             let entity = build_surface_entity(surface, None);
@@ -715,53 +700,14 @@ mod tests {
             }
         };
 
-        check(
-            "readonly",
-            &[list, open, r_list, r_replay, r_deliveries],
-            &[emit, compact, r_install, r_execute, r_retry, work],
-        );
-        check(
-            "default",
-            &[list, open, r_list, r_replay, r_deliveries],
-            &[emit, compact, r_install, r_execute, r_retry, work],
-        );
+        check("readonly", &[search], &[exec, resume, install, report]);
         check(
             "agent-internal",
-            &[list, open, r_list, r_replay, r_deliveries, work],
-            &[emit, compact, r_install, r_execute, r_retry],
+            &[search, report],
+            &[exec, resume, install],
         );
-        check(
-            "interactive",
-            &[],
-            &[
-                emit,
-                compact,
-                list,
-                open,
-                r_install,
-                r_list,
-                r_replay,
-                r_execute,
-                r_deliveries,
-                r_retry,
-            ],
-        );
-        check(
-            "ops",
-            &[
-                emit,
-                compact,
-                list,
-                open,
-                r_install,
-                r_list,
-                r_replay,
-                r_execute,
-                r_deliveries,
-                r_retry,
-            ],
-            &[],
-        );
+        check("interactive", &[search, exec, resume], &[]);
+        check("ops", &[search, exec, resume, install, report], &[]);
     }
 
     #[test]

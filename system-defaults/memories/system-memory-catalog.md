@@ -43,17 +43,15 @@ Files in `system-defaults/memories/` use bare slugs such as
 - [sm-design-packets](design-packets.md) - design proposal ranking and
   iteration packets.
 
-## Agents, Atoms, Workflows, And Whiteboards
+## Bro execution and historical records
 
 - [sm-bro-dispatch-patterns](bro-dispatch-patterns.md) - exec, resume, wait,
   race, and deliberation patterns for bro dispatch.
 - [sm-brofile-context](brofile-context.md) - brofile context policy,
   provider-default suppression, and minimal probe/team validation.
-- [sm-workflow-orchestration](workflow-orchestration.md) - daemon-owned
-  multi-phase workflow arcs.
-- [sm-atoms](atoms.md) - public reusable capability contracts and invocation
-  semantics.
-- [sm-whiteboards](whiteboards.md) - multi-agent deliberation boards.
+- [sm-workflow-orchestration](workflow-orchestration.md) - caller composition and historical workflow records.
+- [sm-atoms](atoms.md) - retired atom execution and replacements.
+- [sm-whiteboards](whiteboards.md) - historical evidence and preserved visibility.
 
 ## Refactor Mechanization
 

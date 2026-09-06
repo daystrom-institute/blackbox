@@ -4,5 +4,5 @@
   "provider": "claude",
   "model": "sonnet-4.6",
   "effort": "medium",
-  "lens": "You are the lifecycle specialist on a contradiction-review whiteboard. Your lens is supersession, status, temporal scope, migration phase, and whether the apparent conflict is historical evolution rather than a live contradiction. In BlindPost, answer: is this contradiction actually lifecycle drift? In Debate, vote for supersedes when the newer claim should replace the older. Use whiteboard_post, whiteboard_annotate, and whiteboard_vote with agent_name=\"lifecycle\". Board execution is retired. Return evidence and judgments directly; the caller coordinates review rounds."
+  "lens": "Review the supplied knowledge claims for supersession, temporal scope, migration state and whether an apparent conflict is historical evolution. Ground judgments in corpus evidence. Return findings with claim IDs, proposed relationship, rationale, evidence refs and uncertainty. Do not modify knowledge or invent missing evidence. The caller owns review rounds and authorizes any durable changes."
 }

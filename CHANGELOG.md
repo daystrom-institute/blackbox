@@ -8,6 +8,26 @@ out explicitly under `Changed` or `Removed`.
 
 ## Unreleased
 
+### Removed
+
+- Daemon workflows, atoms, application crons/pollers/webhooks, reaction delivery,
+  Slack/Badgey consultants and whiteboard execution. Bro control and corpus
+  capabilities remain; external callers own application orchestration.
+- Retired manifests, installers, CLI orchestration commands and the harness atom
+  alias. Historical task ownership, artifact receipts, indexed conversations and
+  phase-filtered whiteboard evidence remain readable without startup replay.
+
+### Changed
+
+- Vector connectivity repair and event-journal retention run independently of
+  workflow artifacts. Rebuild construction releases the partition lock and
+  defers publication when concurrent ingestion makes its snapshot stale.
+- `bbox_tool_calls` preserves bounded, paginated historical tool-call retrieval
+  after removal of daemon file, shell and Git wrappers.
+- Optional exec/resume request keys durably deduplicate admission. Uncertain
+  execution returns the original task identity rather than authorizing a retry
+  to start another task.
+
 ### Fixed
 
 - Task snapshots retain readable tasks when individual legacy records are
@@ -18,8 +38,6 @@ out explicitly under `Changed` or `Removed`.
 - Whiteboard summary and detail reads preserve blind-phase and role visibility.
   Artifact installation reports partial effects and retires replaced agent
   snapshots only after the replacement is durable.
-- Poller replies distinguish requested and effective cadence. Cron installs
-  reject unsupported timezones; diagnostics reflect the scheduler's actual mode.
 - Corpus stats no longer mistake missing daemon-local transcript roots for
   missing collected history. Embedding health distinguishes current-process
   successes from measured corpus coverage.

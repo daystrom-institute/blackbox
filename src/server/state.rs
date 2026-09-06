@@ -303,11 +303,6 @@ pub(crate) struct SharedState {
     /// In-flight `bro_wait` / `bro_when_*` long-poll waiters, so the
     /// activity probe can name who a daemon cycle would sandbag.
     pub(crate) long_polls: Arc<super::drain::LongPollRegistry>,
-    /// Agent dispatch adapter registry. Initialized before artifact
-    /// catalog opens so AS-I1 validation can check dispatch_adapter
-    /// membership against the live registry.
-    pub(crate) agent_adapter_registry:
-        Arc<RwLock<orchestration::agents::adapter::AgentAdapterRegistry>>,
     /// Retained linkage records for catalog migration and project renames.
     /// No bot, signal hook, or application runtime consumes these stores.
     pub(crate) slack_channel_bindings: Arc<slack_channel_bindings::SlackChannelBindings>,
@@ -914,9 +909,6 @@ impl SharedState {
             resume_leases: Arc::new(orchestration::resume_lease::ResumeLeaseRegistry::new()),
             drain: super::drain::DrainState::in_memory(store_dir),
             long_polls: Arc::new(super::drain::LongPollRegistry::new()),
-            agent_adapter_registry: Arc::new(RwLock::new(
-                orchestration::agents::adapter::AgentAdapterRegistry::new(),
-            )),
             slack_channel_bindings: Arc::new(
                 slack_channel_bindings::SlackChannelBindings::open(store_dir).unwrap(),
             ),
