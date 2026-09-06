@@ -373,6 +373,22 @@ impl<'a> ProviderContext<'a> {
             None => index.entity_properties(entity_id),
         }
     }
+
+    /// Inspection-only stored content, using the same pinned index generation
+    /// as the rest of this provider context. No checkout or Git access.
+    pub fn indexed_entity_properties_with_content(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        let Some(stores) = self.stores() else {
+            return Ok(None);
+        };
+        let index = stores.idx.read_recursive();
+        match self.searcher {
+            Some(searcher) => index.entity_properties_with_content(entity_id, searcher),
+            None => index.entity_properties_with_content(entity_id, &index.searcher()),
+        }
+    }
 }
 
 pub trait InspectableEntityProvider: Send + Sync {

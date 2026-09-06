@@ -30,7 +30,8 @@ pub struct InspectEntityParams {
     /// Property detail: smart (default, text shortened to 300 characters),
     /// summary (names, status, source identity and freshness), or full.
     /// property_projection identifies omitted/shortened properties and how
-    /// to retrieve them in full. Unknown values are errors.
+    /// to retrieve stored values in full. Upstream ingestion limits and intrinsic
+    /// *_preview fields are not expanded by full mode. Unknown values are errors.
     pub property_mode: Option<String>,
     /// Opaque edge_page.next_cursor from the preceding response. Keep the same
     /// entity_ref, direction, edge_types and per_type_limit. Changed evidence
@@ -39,7 +40,9 @@ pub struct InspectEntityParams {
     pub edge_cursor: Option<String>,
     /// Read this exact property as text pages instead of an edge/property
     /// overview. Choose a key under properties or property_projection.omitted_keys. Empty strings are
-    /// valid property values; absent keys return error.not_found.
+    /// valid property values; absent keys return error.not_found. Pages recover
+    /// the stored property, not content omitted upstream. Commit content is the
+    /// indexed message; evidence.content_completeness reports ingest truncation.
     #[serde(default)]
     pub property: Option<String>,
     /// Opaque body.next_cursor from a preceding read of the same property.
@@ -366,7 +369,7 @@ pub fn inspect_entity(
             "omitted": omitted_keys.len(),
             "omitted_keys": omitted_keys,
             "shortened": shortened,
-            "expand_hint": "Use property=<key> for exact text pages and follow body.next_cursor; property_mode=full returns all properties when they fit.",
+            "expand_hint": "Use property=<key> for exact stored text pages and follow body.next_cursor; property_mode=full returns all properties when they fit.",
         });
     }
     Ok(serde_json::to_string_pretty(&out)?)
@@ -1217,10 +1220,21 @@ mod tests {
                 ("content".into(), original.clone()),
                 ("generation".into(), "v1".into()),
                 ("source_uri".into(), "blackbox://knowledge/example".into()),
+                (
+                    "evidence.content_completeness".into(),
+                    "ingest_truncated".into(),
+                ),
             ]),
             neighborhood: Neighborhood::default(),
             next_hop_hints: Vec::new(),
         };
+        let smart = render_properties(&entity, PropertyMode::Smart);
+        assert_ne!(smart["content"], original);
+        assert_eq!(smart["evidence.content_completeness"], "ingest_truncated");
+        assert_eq!(
+            render_properties(&entity, PropertyMode::Summary)["evidence.content_completeness"],
+            "ingest_truncated"
+        );
         let mut params = InspectEntityParams {
             entity_ref: reference.to_string(),
             provisional: None,
@@ -1240,6 +1254,10 @@ mod tests {
             )
             .unwrap();
             assert_eq!(page["source"]["generation"], "v1");
+            assert_eq!(
+                page["source"]["evidence.content_completeness"],
+                "ingest_truncated"
+            );
             assert!(page.get("edges").is_none());
             let text = page["body"]["text"].as_str().unwrap();
             assert!(text.len() <= 101);

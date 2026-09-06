@@ -1093,6 +1093,26 @@ impl TranscriptIndex {
         entity_id: &str,
         searcher: &tantivy::Searcher,
     ) -> Result<Option<BTreeMap<String, String>>> {
+        self.entity_properties_projection(entity_id, searcher, false)
+    }
+
+    /// Stored content for an explicit entity inspection. Search/reranking
+    /// keeps the existing preview projection; callers must bound this body
+    /// at the response boundary and retain any source-completeness metadata.
+    pub fn entity_properties_with_content(
+        &self,
+        entity_id: &str,
+        searcher: &tantivy::Searcher,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        self.entity_properties_projection(entity_id, searcher, true)
+    }
+
+    fn entity_properties_projection(
+        &self,
+        entity_id: &str,
+        searcher: &tantivy::Searcher,
+        include_content: bool,
+    ) -> Result<Option<BTreeMap<String, String>>> {
         let query = TermQuery::new(
             Term::from_field_text(self.fields.entity_id, entity_id),
             IndexRecordOption::Basic,
@@ -1102,7 +1122,27 @@ impl TranscriptIndex {
             return Ok(None);
         };
         let doc: TantivyDocument = searcher.doc(addr)?;
-        Ok(Some(self.properties_from_doc(&doc)))
+        let mut properties = self.properties_from_doc(&doc);
+        if include_content && let Some(content) = optional_text(&doc, self.fields.content) {
+            properties.remove("content_preview");
+            if properties
+                .get("doc_type")
+                .is_some_and(|kind| kind == "commit")
+                && content.ends_with(git_history::TRUNCATED_COMMIT_MESSAGE_SUFFIX)
+            {
+                properties.insert(
+                    "evidence.content_completeness".into(),
+                    "ingest_truncated".into(),
+                );
+                properties.insert(
+                    "evidence.content_scope".into(),
+                    "indexed_commit_message".into(),
+                );
+                properties.insert("evidence.content_limitation".into(), "The stored message ends with an ingest truncation marker; omitted original bytes are unavailable through this entity.".into());
+            }
+            properties.insert("content".into(), content);
+        }
+        Ok(Some(properties))
     }
 
     pub fn session_properties(
@@ -1765,6 +1805,78 @@ mod tests {
             current_properties.get("file_path").map(String::as_str),
             Some("src/new.rs")
         );
+    }
+
+    #[test]
+    fn commit_inspection_recovers_stored_content_without_changing_search_previews() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let index = TranscriptIndex::open_or_create_with_records(
+            &root.join("index"),
+            Vec::new(),
+            None,
+            root.join("projects.json"),
+            root.join("knowledge.json"),
+            root.join("threads.json"),
+            root.join("roadmap.json"),
+            std::sync::Arc::new(StaticProjectRecordsProvider::empty()),
+        )
+        .unwrap();
+        let fields = index.field_handles();
+        let entity_id = "commit:repo-example:abc123";
+        let original = "A complete commit message 語🦀\n".repeat(40);
+        let add_commit = |writer: &mut tantivy::IndexWriter, content: &str| {
+            let mut doc = TantivyDocument::new();
+            doc.add_text(fields.doc_type, "commit");
+            doc.add_text(fields.entity_id, entity_id);
+            doc.add_text(fields.content, content);
+            writer.add_document(doc).unwrap();
+        };
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        add_commit(&mut writer, &original);
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+        let pinned = index.searcher();
+
+        let preview = index.entity_properties(entity_id).unwrap().unwrap();
+        assert_eq!(
+            preview["content_preview"],
+            original.chars().take(300).collect::<String>()
+        );
+        assert!(!preview.contains_key("content"));
+        let inspected = index
+            .entity_properties_with_content(entity_id, &pinned)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspected["content"], original);
+        assert!(!inspected.contains_key("content_preview"));
+        assert!(!inspected.contains_key("evidence.content_completeness"));
+
+        // A later ingest can replace the document, but a pinned inspection
+        // must retain its original body and source-completeness state.
+        let oversized = "語🦀".repeat(10_000);
+        let stored = git_history::indexable_commit_message(&oversized);
+        assert!(stored.len() < oversized.len());
+        writer.delete_term(Term::from_field_text(fields.entity_id, entity_id));
+        add_commit(&mut writer, &stored);
+        writer.commit().unwrap();
+        index.reader_reload_for_test();
+        assert_eq!(
+            index
+                .entity_properties_with_content(entity_id, &pinned)
+                .unwrap()
+                .unwrap(),
+            inspected
+        );
+        let latest = index
+            .entity_properties_with_content(entity_id, &index.searcher())
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest["content"], stored);
+        assert_eq!(latest["evidence.content_completeness"], "ingest_truncated");
+        assert_eq!(latest["evidence.content_scope"], "indexed_commit_message");
+        assert!(latest["evidence.content_limitation"].contains("unavailable"));
+        assert!(!latest.contains_key("content_preview"));
     }
 
     #[test]
