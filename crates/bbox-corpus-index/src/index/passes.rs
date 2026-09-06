@@ -23,6 +23,59 @@ use crate::transcripts::adapters::{
 use crate::transcripts::projection::{normalized_to_doc, normalized_to_tool_call_doc};
 use crate::transcripts::types::TranscriptLocation;
 
+/// A publication may advance after index discovery but before the purge scan.
+/// Retain enrolled native projections until the published replacement itself
+/// appears in this pass's metadata. Missing source status is not a tombstone.
+/// Removing enrollment remains an explicit purge instruction.
+pub fn native_purge_exempt_paths(
+    config: &ReindexConfig,
+    meta: &HashMap<String, FileMeta>,
+) -> std::collections::HashSet<String> {
+    let mut grouped: std::collections::BTreeMap<(&str, &str), Vec<&String>> =
+        std::collections::BTreeMap::new();
+    for path in meta.keys() {
+        let Some(native) = path.strip_prefix("native:") else {
+            continue;
+        };
+        let parts = native.split('/').collect::<Vec<_>>();
+        if parts.len() == 3
+            && bbox_transcript_source::validate_hash(parts[1]).is_ok()
+            && bbox_transcript_source::validate_hash(parts[2]).is_ok()
+        {
+            grouped.entry((parts[0], parts[1])).or_default().push(path);
+        }
+    }
+    let store = config
+        .native_source_root
+        .as_ref()
+        .map(bbox_transcript_source_store::TranscriptSourceStore::for_read);
+    let mut protected = std::collections::HashSet::new();
+    for ((source, stream), paths) in grouped {
+        let Some(scope) = config
+            .native_sources
+            .iter()
+            .find(|scope| scope.connector_source_id().as_str() == source)
+        else {
+            continue;
+        };
+        let current = store
+            .as_ref()
+            .and_then(|store| store.current(scope, stream).ok().flatten());
+        let indexed_current = current
+            .map(|row| row.snapshot.locator(&row.generation))
+            .filter(|locator| meta.contains_key(locator));
+        for path in paths {
+            if indexed_current
+                .as_ref()
+                .is_none_or(|current| current == path)
+            {
+                protected.insert(path.clone());
+            }
+        }
+    }
+    protected
+}
+
 pub fn conservative_log_merge_policy() -> tantivy::merge_policy::LogMergePolicy {
     let mut policy = tantivy::merge_policy::LogMergePolicy::default();
     policy.set_min_num_segments(20);

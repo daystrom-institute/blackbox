@@ -783,7 +783,11 @@ pub(super) fn execute_reindex_pass(
     let collected_project_ids = project_files::active_collected_sources(config)?
         .into_keys()
         .collect::<std::collections::BTreeSet<_>>();
+    let native_exempt = native_purge_exempt_paths(config, &meta);
     for path in &stale_paths {
+        if native_exempt.contains(path) {
+            continue;
+        }
         // F2: exemption is keyed on the pass's own plans, not on the
         // collected-selector map alone. Every non-locally-scanned project
         // keeps its documents; the ones whose last-good source is local also

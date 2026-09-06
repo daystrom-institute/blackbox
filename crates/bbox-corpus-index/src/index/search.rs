@@ -1897,10 +1897,11 @@ impl TranscriptIndex {
         if native.is_empty() {
             return Value::String("not_established".into());
         }
-        let store =
-            self.config.native_source_root.as_ref().and_then(|root| {
-                bbox_transcript_source_store::TranscriptSourceStore::open(root).ok()
-            });
+        let store = self
+            .config
+            .native_source_root
+            .as_ref()
+            .map(bbox_transcript_source_store::TranscriptSourceStore::for_read);
         let mut sources = std::collections::BTreeMap::new();
         let observations = native.iter().take(8).map(|locator| {
             let mut row = serde_json::json!({"locator": locator, "status": "source_status_unavailable"});
@@ -2577,7 +2578,11 @@ impl TranscriptIndex {
                 purge_exempt.insert(project_id.clone());
             }
         }
+        let native_exempt = native_purge_exempt_paths(&self.config, &meta);
         for path in &stale_paths {
+            if native_exempt.contains(path) {
+                continue;
+            }
             match project_files::classify_stale_meta_row(
                 meta.get(path).map(|row| &row.source),
                 &purge_exempt,

@@ -76,14 +76,13 @@ impl TranscriptAdapterRegistry {
         }
         if let Some(root) = &config.native_source_root {
             for source in [TranscriptSource::Claude, TranscriptSource::Codex] {
-                match super::native::NativeTranscriptAdapter::open(
+                // Keep the adapter present when storage is unavailable so its
+                // scan fails the indexing pass instead of silently dropping it.
+                adapters.push(Box::new(super::native::NativeTranscriptAdapter::new(
                     root,
                     config.native_sources.clone(),
                     source,
-                ) {
-                    Ok(adapter) => adapters.push(Box::new(adapter)),
-                    Err(error) => tracing::warn!(%error, "native transcript source unavailable"),
-                }
+                )));
             }
         }
         // Connector-landed conversations. Same explicit-only contract as every

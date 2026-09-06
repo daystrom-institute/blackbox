@@ -108,3 +108,14 @@
 - Native message pagination is ordered by locator and source byte offset.
   A byte-limited page advances by returned rows, including from_end pages;
   never advance by the requested count when fewer rows fit.
+
+## Native transcript publication and purge
+
+- Native source locators include the admitted generation. Source publication
+  can advance between transcript indexing and the later purge scan. Both
+  indexing loops retain an enrolled stream's prior projection until its
+  currently published replacement is present in the pass metadata.
+- A missing or unavailable native source is not a deletion instruction.
+  Keep its adapter registered so source failures stop indexing visibly;
+  explicit enrollment removal permits purge. Reader leases pin discovered
+  materializations until the adapter finishes its pass.
