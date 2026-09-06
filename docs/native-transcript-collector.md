@@ -101,9 +101,17 @@ grant removal. Removing a grant is an authorization change, not a data wipe.
 Smoke the installed launch agent itself. A successful Terminal/SSH invocation
 does not establish its network access: macOS automatically permits those command
 contexts, while a launch agent connecting to a LAN endpoint needs its own Local
-Network permission. Code signing identifies the program for this policy; ad-hoc
-build identities do not provide reliable continuity across replacement binaries.
-See [Apple TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+Network permission. macOS builds embed `__TEXT,__info_plist` with the collector's
+own identifier (`com.daystrom.bbox-transcript-collector`), display name, and
+`NSLocalNetworkUsageDescription`. This gives the standalone executable identity
+and usage metadata for permission attribution; it does not grant access.
+Verify that metadata survives the installed binary's build/signing process.
+Linux builds do not embed this macOS section.
+
+Apple recommends an Apple-issued code-signing identity for reliable Local
+Network identity tracking. Ad-hoc signatures do not provide that guarantee,
+and self-signed stable signing must not be presented as equivalent. See
+[Apple TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
 
 Watch errors retain the transport cause. If launchd reports `No route to host
 (os error 65)` while the same host and binary connect successfully from a shell,
@@ -111,9 +119,13 @@ check the resolved address, route, and Local Network diagnostics before changing
 collector credentials or server configuration. A running job is not proof of a
 successful scan; inspect its cycle report and the source's completed-scan evidence.
 
-Use the operator's normal signing and Local Network approval flow. An unattended
-keychain error means signing is blocked until that authority is available; a
-retry or environment change does not grant permission. Do not attribute the job
+With the collector's own identity and usage metadata installed, complete the
+normal signing and Local Network approval flow. Approve the collector itself
+through the system prompt or System Settings > Privacy & Security > Local
+Network, then verify a completed launch-agent cycle. Signing alone does not
+grant access or guarantee that a prompt will appear. An unattended keychain
+error means signing is blocked until that authority is available; a retry or
+environment change does not grant permission. Do not attribute the job
 to an unrelated app, disable privacy controls, or elevate it to root to bypass
 this requirement. Keep launch-agent environment inheritance isolated, with only
 explicit host paths and the collector's token-file configuration.
