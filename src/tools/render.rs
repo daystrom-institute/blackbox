@@ -357,7 +357,9 @@ impl BlackboxServer {
         Parameters(p): Parameters<ReviewParams>,
     ) -> CallToolResult {
         let server = self.clone();
-        Self::run_blocking("bbox_review", move || {
+        let owner = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let worker_owner = owner.clone();
+        let result = Self::run_blocking("bbox_review", move || {
             let mut p = p;
             if !matches!(p.action.as_deref().unwrap_or("list"), "approve" | "reject") {
                 return server.review_session_knowledge(&p);
@@ -366,6 +368,8 @@ impl BlackboxServer {
                 p.action.as_deref().unwrap_or("list"),
                 p.id.as_deref().unwrap_or_default(),
             )? {
+                *worker_owner.lock() =
+                    Some(super::knowledge::KnowledgeMutationOwner::CheckoutQueue);
                 return Ok(text);
             }
             let target =
@@ -380,12 +384,18 @@ impl BlackboxServer {
                 target.seed.as_ref(),
             )?;
             server.finish_existing_knowledge_mutation(target.checkout.as_ref());
-            // Central KB persistence is write-behind here: this body runs on
-            // the blocking pool where the durable ack can't be awaited.
-            server.state.kb_persister.request();
+            *worker_owner.lock() = Some(super::knowledge::KnowledgeMutationOwner::Local);
             Ok(out)
         })
-        .await
+        .await;
+        let owner = *owner.lock();
+        if result.is_error != Some(true)
+            && let Some(owner) = owner
+            && let Err(error) = self.persist_knowledge_mutation(owner).await
+        {
+            return Self::err_text(&format!("Error: knowledge durability failed: {error:#}"));
+        }
+        result
     }
 
     #[tool(

@@ -213,9 +213,13 @@ impl CheckoutMutations {
     /// Latest outstanding write, isolated by durable scope. Applied tracked
     /// writes remain an overlay until their content is observed in publication.
     pub fn outstanding_writes(&self) -> impl Iterator<Item = &PendingCheckoutMutation> {
+        self.outstanding_intents()
+            .filter(|row| row.mutation.mode == "write")
+    }
+
+    pub fn outstanding_intents(&self) -> impl Iterator<Item = &PendingCheckoutMutation> {
         self.store.mutations.iter().filter(|row| {
             row.status != CheckoutMutationStatus::Failed
-                && row.mutation.mode == "write"
                 && match &row.publication {
                     Some(publication) => !publication.observed,
                     None => row.status == CheckoutMutationStatus::Pending,
@@ -232,16 +236,28 @@ impl CheckoutMutations {
         relative_path: &str,
         published: Option<&str>,
     ) -> bool {
-        let last = self.store.mutations.iter().rposition(|row| {
-            &row.mutation.scope == scope
-                && row.mutation.relative_path == relative_path
-                && row.status != CheckoutMutationStatus::Failed
-                && row
-                    .publication
-                    .as_ref()
-                    .is_some_and(|state| !state.observed)
-                && same_json(row.mutation.content_json.as_deref(), published)
-        });
+        let last = self
+            .store
+            .mutations
+            .iter()
+            .enumerate()
+            .rposition(|(index, row)| {
+                &row.mutation.scope == scope
+                    && row.mutation.relative_path == relative_path
+                    && row.status != CheckoutMutationStatus::Failed
+                    && (published.is_some()
+                        || (row.status == CheckoutMutationStatus::Applied
+                            && !self.store.mutations[..index].iter().any(|previous| {
+                                &previous.mutation.scope == scope
+                                    && previous.mutation.relative_path == relative_path
+                                    && previous.status == CheckoutMutationStatus::Pending
+                            })))
+                    && row
+                        .publication
+                        .as_ref()
+                        .is_some_and(|state| !state.observed)
+                    && same_json(row.mutation.content_json.as_deref(), published)
+            });
         let Some(last) = last else {
             return false;
         };
@@ -291,7 +307,7 @@ impl CheckoutMutations {
     ) -> Result<Option<String>> {
         self.observe_publication(scope, relative_path, published);
         let latest = self
-            .outstanding_writes()
+            .outstanding_intents()
             .filter(|row| {
                 &row.mutation.scope == scope && row.mutation.relative_path == relative_path
             })
@@ -321,9 +337,27 @@ impl CheckoutMutations {
         reason: String,
         now: String,
     ) -> Result<Vec<String>> {
+        self.enqueue_tracked_mutations(
+            scope,
+            writes
+                .into_iter()
+                .map(|(path, content, base)| (path, Some(content), base))
+                .collect(),
+            reason,
+            now,
+        )
+    }
+
+    pub fn enqueue_tracked_mutations(
+        &mut self,
+        scope: PublishedScope,
+        mutations: Vec<(String, Option<String>, Option<String>)>,
+        reason: String,
+        now: String,
+    ) -> Result<Vec<String>> {
         let mut rows = Vec::new();
         let mut paths = BTreeSet::new();
-        for (relative_path, content, base) in writes {
+        for (relative_path, content, base) in mutations {
             anyhow::ensure!(
                 paths.insert(relative_path.clone()),
                 "duplicate checkout mutation path in one edit"
@@ -333,8 +367,8 @@ impl CheckoutMutations {
                 mutation_id: self.mint_id(),
                 scope: scope.clone(),
                 relative_path,
-                mode: "write".into(),
-                content_json: Some(content),
+                mode: if content.is_some() { "write" } else { "delete" }.into(),
+                content_json: content,
                 reason: reason.clone(),
                 enqueued_at: now.clone(),
             };
@@ -476,6 +510,89 @@ mod tests {
             reason: "test".into(),
             enqueued_at: "2026-08-12T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn tracked_delete_waits_for_delivery_of_the_entire_path_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("mutations.json");
+        let mut store = CheckoutMutations::open(&path).unwrap();
+        let file = ".bbox/knowledge/1234567890abcdef.json";
+        let write = store
+            .enqueue_tracked_writes(
+                scope(),
+                vec![(file.into(), "{}".into(), None)],
+                "create".into(),
+                "now".into(),
+            )
+            .unwrap()[0]
+            .clone();
+        let delete = store
+            .enqueue_tracked_mutations(
+                scope(),
+                vec![(file.into(), None, None)],
+                "delete".into(),
+                "now".into(),
+            )
+            .unwrap()[0]
+            .clone();
+        assert!(!store.observe_publication(&scope(), file, None));
+        assert_eq!(store.write_base(&scope(), file, None).unwrap(), None);
+        assert_eq!(store.outstanding_intents().count(), 2);
+        store.ack(&delete, "applied", None, None, "now").unwrap();
+        assert!(!store.observe_publication(&scope(), file, None));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&store.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut store = CheckoutMutations::open(&path).unwrap();
+        assert_eq!(store.write_base(&scope(), file, None).unwrap(), None);
+        assert_eq!(store.outstanding_intents().count(), 2);
+        store.ack(&write, "applied", None, None, "now").unwrap();
+        assert!(store.observe_publication(&scope(), file, None));
+        assert_eq!(store.outstanding_intents().count(), 0);
+    }
+
+    #[test]
+    fn tracked_delete_is_scope_isolated_and_mixed_batches_validate_before_enqueue() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut store = CheckoutMutations::open(&root.join("mutations.json")).unwrap();
+        let file = ".bbox/knowledge/1234567890abcdef.json";
+        let other = PublishedScope::try_new("repo_example", "nested").unwrap();
+        store
+            .enqueue_tracked_mutations(
+                scope(),
+                vec![(file.into(), None, Some("{}".into()))],
+                "delete".into(),
+                "now".into(),
+            )
+            .unwrap();
+        assert_eq!(store.write_base(&scope(), file, Some("{}")).unwrap(), None);
+        assert_eq!(
+            store
+                .write_base(&other, file, Some("{}"))
+                .unwrap()
+                .as_deref(),
+            Some("{}")
+        );
+        let count = store.pending_count();
+        assert!(
+            store
+                .enqueue_tracked_mutations(
+                    scope(),
+                    vec![
+                        (".bbox/knowledge/other.json".into(), None, Some("{}".into())),
+                        ("../invalid.json".into(), Some("{}".into()), None)
+                    ],
+                    "invalid pair".into(),
+                    "now".into()
+                )
+                .is_err()
+        );
+        assert_eq!(store.pending_count(), count);
     }
 
     #[test]
