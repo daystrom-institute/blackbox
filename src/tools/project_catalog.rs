@@ -279,6 +279,16 @@ fn project_catalog_get_page(
 /// transaction closure.
 const MAX_AUDIT_REASON_BYTES: usize = 1024;
 
+/// Rows retained by the compact publisher status projection. Exact recovery
+/// lives behind the detail body pager, never in a larger default inventory.
+const PUBLISHER_STATUS_ROW_LIMIT: usize = 4;
+
+/// Free text and opaque producer identifiers retained by the compact
+/// summary. Values within the limit keep their plain shape; oversized
+/// metadata becomes an explicit size-and-truncation marker and the exact
+/// bytes stay in detail pages.
+const PUBLISHER_STATUS_TEXT_LIMIT: usize = 64;
+
 // ── Parameters ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -431,9 +441,29 @@ pub(crate) struct ProjectPublisherAdvanceParams {
     pub audit_reason: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectPublisherStatusDetail {
+    /// The complete runtime health view as exact body pages.
+    Health,
+    /// The complete connector publication view as exact body pages.
+    Connector,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProjectPublisherStatusParams {
     pub project_id: String,
+    /// Opt-in exact diagnostic detail. `health` always exists; `connector`
+    /// requires a connector-scoped project.
+    #[serde(default)]
+    pub detail: Option<ProjectPublisherStatusDetail>,
+    /// Continuation from detail.body.next_cursor. A changed selector, catalog
+    /// epoch, or detail body refuses continuation.
+    #[serde(default)]
+    pub detail_cursor: Option<String>,
+    /// Detail page byte budget, clamped to 4..=4096.
+    #[serde(default)]
+    pub detail_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -647,6 +677,270 @@ fn connector_publication_json(
         "generation_count": generations.len(),
         "generation_states": states,
         "last_cursor_degradation": degradation,
+    })
+}
+
+/// A bounded id list with explicit totals. Omission is a projection fact the
+/// caller can see, never a silent trim.
+fn publisher_status_id_inventory(values: &[String]) -> serde_json::Value {
+    let mut sorted = values.to_vec();
+    sorted.sort();
+    let total = sorted.len();
+    if total == 0 {
+        return json!({"total": 0});
+    }
+    let returned = total.min(PUBLISHER_STATUS_ROW_LIMIT);
+    json!({
+        "total": total,
+        "returned": returned,
+        "omitted": total - returned,
+        "values": sorted[..returned],
+    })
+}
+
+/// A bounded lane list with the same explicit totals as id inventories.
+fn publisher_status_lane_inventory(values: &[&str]) -> serde_json::Value {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let total = sorted.len();
+    let returned = total.min(PUBLISHER_STATUS_ROW_LIMIT);
+    json!({
+        "total": total,
+        "returned": returned,
+        "omitted": total - returned,
+        "values": sorted[..returned],
+    })
+}
+
+/// Bound a decision-relevant diagnostic string without lying about what
+/// happened. Values inside the limit keep the plain string shape callers
+/// already parse; an oversized value keeps a short prefix plus the exact
+/// total byte count and an explicit truncated flag.
+fn publisher_status_bounded_text(raw: &str) -> serde_json::Value {
+    if raw.len() <= PUBLISHER_STATUS_TEXT_LIMIT {
+        return serde_json::Value::String(raw.to_owned());
+    }
+    let mut end = PUBLISHER_STATUS_TEXT_LIMIT;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    json!({
+        "text": &raw[..end],
+        "total_bytes": raw.len(),
+        "truncated": true,
+    })
+}
+
+/// Summarize display-only producer metadata. The default status carries the
+/// signal (present, exact size, would-truncate) and never the oversized text
+/// itself; `detail=connector` remains the exact recovery path.
+fn publisher_status_metadata_summary(raw: &str) -> serde_json::Value {
+    if raw.len() <= PUBLISHER_STATUS_TEXT_LIMIT {
+        return serde_json::Value::String(raw.to_owned());
+    }
+    json!({
+        "present": true,
+        "total_bytes": raw.len(),
+        "truncated": true,
+    })
+}
+
+/// Compact default health projection.
+///
+/// Accepted identity and binding tokens already render once at the top level,
+/// so repeating them here is the crowding the audit flagged. What stays is
+/// decision-relevant runtime state: catalog authority, binding usability, and
+/// the actionable stale, unavailable, queued, and partial signals, each with
+/// total and omission counts. Recorded rows are observations assembled on
+/// demand; they are not a live filesystem authority check.
+fn publisher_health_summary(
+    health: &crate::server::state::ProjectRuntimeStatus,
+    accepted_generation: Option<&str>,
+) -> serde_json::Value {
+    let mut attachments = health.attachments.clone();
+    // Unusable bindings surface first, and every status stays counted even
+    // when its rows fall past the retention limit.
+    attachments.sort_by(|a, b| {
+        let a_failed = a.status != "attached";
+        let b_failed = b.status != "attached";
+        b_failed
+            .cmp(&a_failed)
+            .then_with(|| a.attachment_id.cmp(&b.attachment_id))
+    });
+    let mut attachment_status_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for row in &attachments {
+        *attachment_status_counts
+            .entry(row.status.as_str())
+            .or_insert(0) += 1;
+    }
+    let attachment_total = attachments.len();
+    let attachment_rows = attachments[..attachment_total.min(PUBLISHER_STATUS_ROW_LIMIT)]
+        .iter()
+        .map(|row| {
+            json!({
+                "attachment_id": row.attachment_id,
+                "status": row.status,
+                "available": row.available,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut overlays = health.overlays.clone();
+    overlays
+        .sort_by(|a, b| (a.checkout_id.as_str(), a.lane).cmp(&(b.checkout_id.as_str(), b.lane)));
+    let stale = |overlay: &crate::server::state::CheckoutOverlayView| {
+        overlay
+            .accepted_generation
+            .as_deref()
+            .zip(accepted_generation)
+            .is_some_and(|(recorded, accepted)| recorded != accepted)
+    };
+    let degraded =
+        |overlay: &crate::server::state::CheckoutOverlayView| !overlay.diagnostics.is_empty();
+    let unavailable =
+        |overlay: &crate::server::state::CheckoutOverlayView| overlay.outcome != "fresh";
+    overlays.sort_by_key(|overlay| !unavailable(overlay) && !stale(overlay) && !degraded(overlay));
+    let overlay_total = overlays.len();
+    let overlay_rows = overlays[..overlay_total.min(PUBLISHER_STATUS_ROW_LIMIT)]
+        .iter()
+        .map(|row| {
+            json!({
+                "checkout_id": row.checkout_id,
+                "outcome": row.outcome,
+                "stale": stale(row),
+                "diagnostics_count": row.diagnostics.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "catalog_authority": health.catalog_authority,
+        "binding": {"status": health.binding.status},
+        "attachments": if attachment_total == 0 {
+            json!({"total": 0})
+        } else {
+            json!({
+                "evidence": "catalog_observation_not_filesystem_authority",
+                "total": attachment_total,
+                "returned": attachment_rows.len(),
+                "omitted": attachment_total - attachment_rows.len(),
+                "status_counts": attachment_status_counts,
+                "rows": attachment_rows,
+            })
+        },
+        "overlays": if overlay_total == 0 {
+            json!({"total": 0})
+        } else {
+            json!({
+                "evidence": "runtime_observation_not_filesystem_authority",
+                "total": overlay_total,
+                "returned": overlay_rows.len(),
+                "omitted": overlay_total - overlay_rows.len(),
+                "unavailable": overlays.iter().filter(|row| unavailable(row)).count(),
+                "stale": overlays.iter().filter(|row| stale(row)).count(),
+                "degraded": overlays.iter().filter(|row| degraded(row)).count(),
+                "rows": overlay_rows,
+            })
+        },
+        "watcher": {
+            "watcher_running": health.watcher.watcher_running,
+            "registered_attachments": publisher_status_id_inventory(
+                &health.watcher.registered_attachments,
+            ),
+            "capable_but_unregistered": publisher_status_id_inventory(
+                &health.watcher.capable_but_unregistered,
+            ),
+        },
+    })
+}
+
+/// Compact default connector projection over the full producer-owned view.
+///
+/// The active generation keeps its identity tokens and freshness facts. The
+/// publication telemetry, collected selector, installation bookkeeping, and
+/// the display-only remote watermark stay behind exact `connector` detail.
+fn publisher_connector_summary(full: &serde_json::Value) -> serde_json::Value {
+    let file_source = &full["file_source"];
+    let file_source_summary = if file_source["readable"].as_bool() == Some(false) {
+        json!({
+            "readable": false,
+            "diagnostic": file_source
+                .get("diagnostic")
+                .and_then(serde_json::Value::as_str)
+                .map(publisher_status_bounded_text),
+        })
+    } else {
+        let active = file_source["active"].as_object().map(|active| {
+            json!({
+                "generation_id": active.get("generation_id"),
+                "ordinal": active.get("ordinal"),
+                "producer_id": active
+                    .get("producer_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(publisher_status_metadata_summary),
+                "document_count": active.get("document_count"),
+                "file_count": active.get("file_count"),
+                "logical_bytes": active.get("logical_bytes"),
+                "cursor_epoch": active.get("cursor_epoch"),
+                "manifest_sha256": active.get("manifest_sha256"),
+            })
+        });
+        let degradation = file_source
+            .get("last_cursor_degradation")
+            .and_then(|degradation| {
+                let bounded = |field: &str| {
+                    degradation
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .map(publisher_status_metadata_summary)
+                };
+                serde_json::json!({
+                    "checkpoint_name": bounded("checkpoint_name"),
+                    "cause": bounded("cause"),
+                    "observed_at": bounded("observed_at"),
+                    "cursor_epoch": degradation.get("cursor_epoch"),
+                    "entries_enumerated": degradation.get("entries_enumerated"),
+                    "blobs_refetched": degradation.get("blobs_refetched"),
+                    "documents_reexported": degradation.get("documents_reexported"),
+                })
+            });
+        json!({
+            "readable": true,
+            "active": active,
+            "generation_count": file_source.get("generation_count"),
+            "generation_states": file_source.get("generation_states"),
+            "last_cursor_degradation": degradation,
+        })
+    };
+    let mut observations = full["observations"].clone();
+    if observations.is_object() {
+        observations["evidence"] = json!("producer_observed_not_verified");
+        for field in [
+            "observed_at",
+            "producer_id",
+            "remote_authority",
+            "remote_root_id",
+            "remote_display_name",
+        ] {
+            if let Some(raw) = observations.get(field).and_then(serde_json::Value::as_str) {
+                observations[field] = publisher_status_metadata_summary(raw);
+            }
+        }
+    }
+    let publication_lanes = full["publication_lanes"].as_array().map(|lanes| {
+        let lanes = lanes
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        publisher_status_lane_inventory(&lanes)
+    });
+    json!({
+        "connector_source_id": full.get("connector_source_id"),
+        "connector_kind": full.get("connector_kind"),
+        "observations": observations,
+        "publication_lanes": publication_lanes,
+        "file_source": file_source_summary,
     })
 }
 
@@ -1692,7 +1986,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_project_publisher_status",
-        description = "Read-only accepted-publication status and runtime health for one catalog project. Reports current, prior-fallback, missing, or corrupt state; accepted scope, ref, commit, generation identity, pointer SHA-256, and the typed source binding. Attachment bindings name an attachment; producer bindings name the producer plus source generation id and evidence hash. It also reports scope agreement and advance availability. A `health` object adds the bounded runtime projection: binding status, source kind, recorded attachment capabilities, overlay outcomes, and watcher state. An `auto_advance` object reports the standing operator grant (enabled, the audit reason that installed it, and whether the accepted binding is producer-bound and therefore eligible) plus the last policy attempt and why it did or did not move the pointer. Generation id and pointer SHA-256 are the compare-and-swap tokens bbox_project_publisher_advance requires. The response also echoes the project's catalog `scope`, and for a connector source adds a `connector` object naming the connector_source_id, the connector kind, the producer's observed vendor coordinates, the publication_lanes it claims, and a `file_source` object carrying that lane's state: the active generation with its ordinal, producer, collected selector, document and file counts, logical bytes, cursor epoch, manifest digest, and the producer's publication telemetry (entries enumerated, blobs fetched, documents exported, per-reason skip counters); the per-state generation counts; and the last reported cursor degradation with its cause and cost. `remote_watermark_display_only` is named for what it is and is never freshness authority. A connector project that has onboarded without publishing reports an absent active generation rather than an error, and an unreadable lane reports readable=false with a diagnostic instead of failing the whole call. No credential material appears anywhere in this response. The call is observational, takes no checkout lease, and is path-free. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
+        description = "Read one catalog project's accepted-publication status: state, scope/ref/commit identity, typed source binding, advance availability, and the generation_id plus pointer_sha256 compare-and-swap tokens. Default health and connector sections are compact bounded summaries that keep stale, unavailable, queued, and partial signals visible with total, status, and omission counts; recorded rows are observations, not live filesystem authority. Oversized summary strings become explicit size-and-truncation markers (diagnostics keep a bounded prefix) whose exact bytes live only in detail pages. detail=health returns the complete runtime view and detail=connector returns the complete connector view as exact bounded body pages; replay detail.body.next_cursor while the body is unchanged. Connector detail requires a connector-scoped project. Observational, path-free, and takes no checkout lease; see design/daemon-runtime/publisher-auto-advance.md for deep mechanics. Returns error.project_catalog_inactive while the version-1 registry is the runtime authority."
     )]
     pub(crate) async fn bbox_project_publisher_status(
         &self,
@@ -1706,6 +2000,21 @@ impl BlackboxServer {
         };
         let server = self.clone();
         Self::run_blocking("bbox_project_publisher_status", move || {
+            // Validate the paging request before any catalog or runtime
+            // assembly: a malformed combination must not pay for, or depend
+            // on, the evidence it is trying to page through.
+            if p.detail.is_none() && p.detail_cursor.is_some() {
+                anyhow::bail!(
+                    "error.project_publisher_status_detail_cursor: detail_cursor requires detail"
+                );
+            }
+            if let Some(limit) = p.detail_limit
+                && !(4..=4096).contains(&limit)
+            {
+                anyhow::bail!(
+                    "error.project_publisher_status_detail_limit: detail_limit must be between 4 and 4096"
+                );
+            }
             let project_id = parse_project_id(&p.project_id)?;
             let state = store.snapshot().map_err(|error| anyhow::anyhow!("{error}"))?;
             let Some(project) = state.catalog().projects.get(&project_id) else {
@@ -1739,12 +2048,20 @@ impl BlackboxServer {
                     "source_generation_sha256": source_generation_sha256,
                 }),
             });
-            // The accepted fields stay exactly where they were: the
-            // generation id and pointer SHA-256 here are the advance
-            // compare-and-swap tokens, and moving them would break every
-            // caller that reads them. P5-G ADDS the runtime health view
-            // beside them (plan section 8, P5-G mechanic 4).
             let runtime_health = server.state.project_runtime_status(project_id.as_str());
+            let (health_summary, health_detail_source) = match &runtime_health {
+                Some(health) => (
+                    publisher_health_summary(
+                        health,
+                        status
+                            .content_stamp()
+                            .map(|stamp| stamp.generation_id())
+                            .as_deref(),
+                    ),
+                    serde_json::to_value(health)?,
+                ),
+                None => (serde_json::Value::Null, serde_json::Value::Null),
+            };
             // Auto-advance state is REPORTED, never inferred by the caller:
             // the standing grant is a pointer fact and the last attempt is
             // the only place a policy refusal is visible without a log
@@ -1766,13 +2083,7 @@ impl BlackboxServer {
                 .knowledge_sources
                 .auto_advance_ledger()
                 .last_attempt(project_id.as_str());
-            // A connector project reports its family and, since phase 1
-            // mounted the lane, its actual file-source publication state.
-            // `publication_lanes` names the lanes that exist rather than
-            // staying empty: a reader can now tell "this project publishes
-            // through file-source" from "this project claims no lane at all",
-            // which is the distinction phase 0 could not express.
-            let connector = project.scope.connector().map(|scope| {
+            let connector_detail_source = project.scope.connector().map(|scope| {
                 let file_source =
                     connector_publication_json(server.state.file_sources.store().as_ref(), scope);
                 json!({
@@ -1783,10 +2094,41 @@ impl BlackboxServer {
                     "file_source": file_source,
                 })
             });
-            Ok(serde_json::to_string_pretty(&json!({
+            let connector_summary = connector_detail_source
+                .as_ref()
+                .map(publisher_connector_summary);
+            let detail = match p.detail {
+                None => None,
+                Some(ProjectPublisherStatusDetail::Health) => Some((
+                    "health",
+                    super::body_page::json_body_page(
+                        &format!("publisher-status:{project_id}:{}:health", state.epoch()),
+                        &health_detail_source,
+                        p.detail_cursor.as_deref(),
+                        p.detail_limit,
+                    )?,
+                )),
+                Some(ProjectPublisherStatusDetail::Connector) => {
+                    let Some(source) = &connector_detail_source else {
+                        anyhow::bail!(
+                            "error.project_publisher_status_detail_unavailable: connector detail requires a connector-scoped project"
+                        );
+                    };
+                    Some((
+                        "connector",
+                        super::body_page::json_body_page(
+                            &format!("publisher-status:{project_id}:{}:connector", state.epoch()),
+                            source,
+                            p.detail_cursor.as_deref(),
+                            p.detail_limit,
+                        )?,
+                    ))
+                }
+            };
+            let mut response = json!({
                 "project_id": project_id.as_str(),
                 "scope": scope_json(&project.scope),
-                "connector": connector,
+                "connector": connector_summary,
                 "accepted_state": accepted_state_label(status.state()),
                 "published_available": status.published_available(),
                 "advance_available": status.advance_available(),
@@ -1808,8 +2150,13 @@ impl BlackboxServer {
                     "grant": auto_advance_grant,
                     "last_attempt": auto_advance_last_attempt,
                 },
-                "health": runtime_health,
-            }))?)
+                "health": health_summary,
+                "detail_hint": "detail=health or detail=connector returns exact bounded pages; replay detail.body.next_cursor while the body is unchanged",
+            });
+            if let Some((selector, body)) = detail {
+                response["detail"] = json!({"selector": selector, "body": body});
+            }
+            Ok(serde_json::to_string_pretty(&response)?)
         })
         .await
     }
@@ -3113,6 +3460,7 @@ mod tests {
             server
                 .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                     project_id: "p_00000000000000000000000000000000".into(),
+                    ..Default::default()
                 }))
                 .await,
         ];
@@ -4090,6 +4438,7 @@ mod tests {
         let status = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_candidate_tool".into(),
+                ..Default::default()
             }))
             .await;
         assert_ne!(status.is_error, Some(true), "{}", error_text(&status));
@@ -4533,6 +4882,7 @@ mod tests {
                 .server
                 .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                     project_id: self.project_id.clone(),
+                    ..Default::default()
                 }))
                 .await;
             assert_ne!(status.is_error, Some(true), "{}", error_text(&status));
@@ -4955,53 +5305,114 @@ mod tests {
         assert!(probe_checkout(missing.to_str().unwrap()).is_err());
     }
 
-    /// P5-G mechanic 4: the status tool keeps every accepted field where it
-    /// was (the generation id and pointer SHA-256 are advance CAS tokens)
-    /// and ADDS the bounded runtime health view beside them.
-    #[tokio::test]
-    async fn publisher_status_carries_the_runtime_health_view() {
+    fn publisher_health_fixture(
+        project_id: &str,
+        attachment_count: usize,
+    ) -> (
+        crate::server::state::catalog_fixture::CatalogFixture,
+        PublishedScope,
+        bbox_indexing::accepted_publication_test_support::InstalledAcceptedPublicationForTest,
+    ) {
         use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
 
-        let tmp = tempfile::tempdir().unwrap();
-        let checkout = tmp.path().canonicalize().unwrap().join("checkout");
-        std::fs::create_dir_all(&checkout).unwrap();
-        let scope = PublishedScope::try_new("repo_example", ".").unwrap();
+        let scope = CatalogFixture::scope(".");
         let fixture = CatalogFixture::new();
-        fixture.add_published_project("p_status", &scope);
-        fixture.attach_overlay_checkout(
-            "p_status",
-            &scope,
-            &checkout,
-            CatalogFixture::attachment().as_str(),
-            "cccccccccccccccccccccccccccccc0f",
-            true,
-        );
-        fixture.install_publication(
-            "p_status",
+        fixture.add_published_project(project_id, &scope);
+        for index in 0..attachment_count {
+            let checkout = fixture.root().join(format!("checkout-{index:02}"));
+            fixture.attach_overlay_checkout(
+                project_id,
+                &scope,
+                &checkout,
+                &format!("att_{index:032x}"),
+                &format!("{index:032x}"),
+                true,
+            );
+        }
+        let installed = fixture.install_publication(
+            project_id,
             &scope,
             COMMIT_ONE,
             &[knowledge_entry("knowledge-a", "published")],
             &[],
         );
+        (fixture, scope, installed)
+    }
+
+    async fn page_publisher_status_detail(
+        server: &BlackboxServer,
+        project_id: &str,
+        detail: ProjectPublisherStatusDetail,
+    ) -> String {
+        let mut cursor: Option<String> = None;
+        let mut text = String::new();
+        loop {
+            let result = server
+                .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                    project_id: project_id.into(),
+                    detail: Some(detail),
+                    detail_cursor: cursor,
+                    detail_limit: None,
+                }))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+            let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+            let page = &body["detail"]["body"];
+            assert!(
+                serde_json::to_vec(page).unwrap().len() <= 4096,
+                "a detail page plus its envelope must stay bounded"
+            );
+            text.push_str(page["text"].as_str().unwrap());
+            cursor = page["next_cursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                return text;
+            }
+        }
+    }
+
+    /// The compact default keeps accepted identity once, preserves the exact
+    /// advance CAS tokens, and bounds recorded inventories with omission
+    /// counts instead of silently trimming them.
+    #[tokio::test]
+    async fn publisher_status_compacts_inventories_and_preserves_cas_tokens() {
+        let (fixture, _scope, installed) = publisher_health_fixture("p_status_compact", 12);
         let server = fixture.server();
 
         let result = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
-                project_id: "p_status".into(),
+                project_id: "p_status_compact".into(),
+                ..Default::default()
             }))
             .await;
         assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
-        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        let rendered = error_text(&result);
+        let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert!(
+            rendered.len() <= 4096,
+            "the compact default must stay inside the body-page budget: {rendered.len()}"
+        );
 
-        // The compare-and-swap tokens stay exactly where callers read them.
         assert_eq!(body["accepted_state"], "current");
-        assert!(body["generation_id"].is_string());
-        assert!(body["pointer_sha256"].is_string());
+        assert_eq!(body["generation_id"], installed.generation_id);
+        assert_eq!(body["generation_sha256"], installed.generation_hash);
+        assert_eq!(body["pointer_sha256"], installed.pointer_sha256);
 
         let health = &body["health"];
         assert_eq!(health["binding"]["status"], "attached");
-        assert_eq!(health["accepted"]["state"], "current");
-        let capabilities = health["attachments"][0]["available"]
+        assert!(
+            health.get("accepted").is_none(),
+            "accepted identity must render once at the top level"
+        );
+        let attachments = &health["attachments"];
+        assert_eq!(attachments["total"], 12);
+        assert_eq!(attachments["returned"], 4);
+        assert_eq!(attachments["omitted"], 8);
+        assert_eq!(attachments["rows"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            attachments["evidence"],
+            "catalog_observation_not_filesystem_authority"
+        );
+        let capabilities = attachments["rows"][0]["available"]
             .as_array()
             .unwrap()
             .iter()
@@ -5013,12 +5424,663 @@ mod tests {
             "an unrecorded bit is absent, not denied: {capabilities:?}"
         );
 
-        // Path-free (plan 13.6), asserted against a real checkout path.
-        let needle = checkout.to_string_lossy().into_owned();
         assert!(
-            !error_text(&result).contains(&needle),
+            !rendered.contains("/checkout-"),
             "publisher status leaked a checkout path"
         );
+    }
+
+    /// Missing and bridge-stale projects keep their actionable state in the
+    /// compact default, and catalog movement does not disturb accepted CAS
+    /// tokens.
+    #[tokio::test]
+    async fn publisher_status_keeps_missing_and_stale_partial_states_visible() {
+        use crate::server::state::catalog_fixture::{COMMIT_ONE, CatalogFixture, knowledge_entry};
+
+        let scope = CatalogFixture::scope(".");
+        let fixture = CatalogFixture::new();
+        fixture.add_published_project("p_status_missing", &scope);
+        fixture.add_published_project("p_status_stale", &scope);
+        let checkout = fixture.root().join("checkout-bound");
+        fixture.attach_overlay_checkout(
+            "p_status_stale",
+            &scope,
+            &checkout,
+            CatalogFixture::attachment().as_str(),
+            "cccccccccccccccccccccccccccccc0f",
+            true,
+        );
+        let installed = fixture.install_publication(
+            "p_status_stale",
+            &scope,
+            COMMIT_ONE,
+            &[knowledge_entry("knowledge-a", "published")],
+            &[],
+        );
+        let server = fixture.server();
+
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_missing".into(),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(body["accepted_state"], "missing");
+        assert!(body["generation_id"].is_null());
+        assert!(body["pointer_sha256"].is_null());
+        assert_eq!(body["health"]["catalog_authority"], "available");
+        assert_eq!(body["health"]["binding"]["status"], "unbound");
+
+        fixture.detach(CatalogFixture::attachment().as_str());
+        fixture.migrate_project_scope("p_status_stale", &CatalogFixture::scope("sub/moved"));
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_stale".into(),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(body["accepted_state"], "current");
+        assert_eq!(body["scope_agreement"], "scope_refresh_required");
+        assert_eq!(body["health"]["binding"]["status"], "detached");
+        assert_eq!(body["generation_id"], installed.generation_id);
+        assert_eq!(body["pointer_sha256"], installed.pointer_sha256);
+    }
+
+    /// Exact health detail reconstructs the complete runtime view and a
+    /// changed body refuses an old cursor.
+    #[tokio::test]
+    async fn publisher_status_health_detail_is_exact_and_content_bound() {
+        let (fixture, _scope, _installed) = publisher_health_fixture("p_status_detail", 12);
+        let server = fixture.server();
+
+        let first = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_detail".into(),
+                detail: Some(ProjectPublisherStatusDetail::Health),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(first.is_error, Some(true), "{}", error_text(&first));
+        let first_body: serde_json::Value = serde_json::from_str(&error_text(&first)).unwrap();
+        let cursor = first_body["detail"]["body"]["next_cursor"]
+            .as_str()
+            .map(str::to_owned);
+
+        let text = page_publisher_status_detail(
+            &server,
+            "p_status_detail",
+            ProjectPublisherStatusDetail::Health,
+        )
+        .await;
+        let reconstructed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let expected = serde_json::to_value(
+            server
+                .state
+                .project_runtime_status("p_status_detail")
+                .expect("catalog project"),
+        )
+        .unwrap();
+        assert_eq!(reconstructed, expected);
+
+        let extra_checkout = fixture.root().join("checkout-extra");
+        fixture.attach_overlay_checkout(
+            "p_status_detail",
+            &CatalogFixture::scope("."),
+            &extra_checkout,
+            "att_ffffffffffffffffffffffffffffffff",
+            "ffffffffffffffffffffffffffffffff",
+            true,
+        );
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_detail".into(),
+                detail: Some(ProjectPublisherStatusDetail::Health),
+                detail_cursor: cursor,
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            error_text(&result).contains("evidence or selection changed"),
+            "changed health evidence must refuse continuation: {}",
+            error_text(&result)
+        );
+
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_detail".into(),
+                detail_cursor: Some("anything".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            error_text(&result).contains("error.project_publisher_status_detail_cursor"),
+            "{}",
+            error_text(&result)
+        );
+
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_status_detail".into(),
+                detail: Some(ProjectPublisherStatusDetail::Health),
+                detail_limit: Some(3),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            error_text(&result).contains("error.project_publisher_status_detail_limit"),
+            "{}",
+            error_text(&result)
+        );
+    }
+
+    /// The connector summary stays compact while exact connector detail
+    /// recovers telemetry and bookkeeping, and a changed generation set
+    /// refuses continuation.
+    #[tokio::test]
+    async fn publisher_status_connector_detail_is_exact_and_content_bound() {
+        use bbox_corpus_core::project_catalog::{
+            ConnectorObservationsV1, ConnectorScope, CorpusProject,
+        };
+        use bbox_file_source::{
+            CONNECTOR_POLICY_VERSION, CursorDegradationV1, FileGenerationDescriptorV1,
+            FileManifestEntryV1, PublicationTelemetryV1, SCHEMA_VERSION,
+        };
+        use sha2::{Digest, Sha256};
+
+        let connector_scope = ConnectorScope::try_new("csrc_5f2c1d9a4b6e470e", "gdrive").unwrap();
+        let fixture = CatalogFixture::new();
+        let project_id = ProjectId::parse("p_connector_status").unwrap();
+        fixture
+            .store()
+            .transact(fixture.epoch(), |catalog, _attachments| {
+                catalog.projects.insert(
+                    project_id.clone(),
+                    CorpusProject {
+                        project_id: project_id.clone(),
+                        scope: ProjectScope::Connector(connector_scope.clone()),
+                        operator_aliases: Default::default(),
+                        nominated_aliases: Default::default(),
+                        display_name: "connector status".into(),
+                        created_at: "2026-08-01T00:00:00Z".into(),
+                        registered_at_compat: None,
+                        repo_history: None,
+                        languages: Default::default(),
+                    },
+                );
+                catalog.connector_observations.insert(
+                    project_id.clone(),
+                    ConnectorObservationsV1 {
+                        observed_at: "2026-08-01T00:00:00Z".into(),
+                        producer_id: Some("producer-a".into()),
+                        remote_authority: Some("vendor-example".into()),
+                        remote_root_id: Some("root-1".into()),
+                        remote_display_name: Some("Root".into()),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        fixture.add_published_project(
+            "p_not_connector",
+            &PublishedScope::try_new("repo_example", ".").unwrap(),
+        );
+        let server = fixture.server();
+
+        let documents = (0..3)
+            .map(|index| {
+                let bytes = format!("document-{index}").into_bytes();
+                FileManifestEntryV1 {
+                    logical_path: format!("notes/document-{index}.txt"),
+                    content_sha256: hex::encode(Sha256::digest(&bytes)),
+                    size: bytes.len() as u64,
+                    remote_id: format!("remote-{index}"),
+                    remote_version: format!("version-{index}"),
+                    remote_url: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let descriptor = FileGenerationDescriptorV1 {
+            schema_version: SCHEMA_VERSION,
+            connector_policy_version: CONNECTOR_POLICY_VERSION.into(),
+            scope: connector_scope.clone(),
+            remote_watermark: "watermark-display-only".into(),
+            cursor_epoch: 7,
+            manifest_sha256: bbox_file_source::manifest_sha256(&documents),
+            file_count: documents.len() as u64,
+            logical_bytes: 30,
+        };
+        let mut skipped = std::collections::BTreeMap::new();
+        for reason in 0..32u32 {
+            skipped.insert(
+                format!("skip-reason-{reason:02}-{}", "r".repeat(40)),
+                reason + 1,
+            );
+        }
+        let telemetry = PublicationTelemetryV1 {
+            skipped,
+            entries_enumerated: 100,
+            blobs_fetched: 3,
+            documents_exported: 3,
+        };
+        let degradation = CursorDegradationV1 {
+            checkpoint_name: "checkpoint-a".into(),
+            cause: "c".repeat(96),
+            cursor_epoch: 6,
+            entries_enumerated: 90,
+            blobs_refetched: 2,
+            documents_reexported: 1,
+            observed_at: "2026-08-01T00:01:00Z".into(),
+        };
+        let store = server.state.file_sources.store();
+        let record = store
+            .begin_upload("producer-a", &descriptor, &telemetry, Some(&degradation))
+            .unwrap();
+        for document in &documents {
+            let bytes = format!(
+                "document-{}",
+                document
+                    .logical_path
+                    .trim_start_matches("notes/document-")
+                    .trim_end_matches(".txt")
+            )
+            .into_bytes();
+            store
+                .install_blob(&document.content_sha256, &bytes)
+                .unwrap();
+        }
+        store
+            .append_manifest_page(&record.upload_id, 0, documents.clone())
+            .unwrap();
+        assert!(
+            store
+                .complete_manifest(&record.upload_id)
+                .unwrap()
+                .is_empty()
+        );
+        let generation = store.finalize(&record.upload_id).unwrap();
+        store
+            .stage_activation(
+                &connector_scope,
+                &generation.generation_id,
+                3,
+                &"a".repeat(64),
+            )
+            .unwrap();
+        store
+            .install_activation(
+                &connector_scope,
+                &generation.generation_id,
+                "p_connector_status",
+                "2026-08-01T00:02:00Z",
+            )
+            .unwrap();
+        store
+            .mark_active(&connector_scope, &generation.generation_id)
+            .unwrap();
+
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_connector_status".into(),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
+        let rendered = error_text(&result);
+        assert!(
+            rendered.len() <= 4096,
+            "the connector summary must stay compact: {rendered.len()}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let file_source = &body["connector"]["file_source"];
+        assert_eq!(file_source["readable"], true);
+        assert_eq!(
+            file_source["active"]["generation_id"],
+            generation.generation_id
+        );
+        assert!(file_source["active"].get("telemetry").is_none());
+        assert!(
+            file_source["active"]
+                .get("remote_watermark_display_only")
+                .is_none()
+        );
+        assert_eq!(file_source["active"]["producer_id"], "producer-a");
+        assert_eq!(file_source["generation_states"]["active"], 1);
+        assert_eq!(body["connector"]["publication_lanes"]["total"], 1);
+        assert_eq!(
+            body["connector"]["publication_lanes"]["values"][0],
+            "file_source"
+        );
+        assert_eq!(
+            body["connector"]["observations"]["producer_id"],
+            "producer-a"
+        );
+        assert_eq!(
+            body["connector"]["observations"]["evidence"],
+            "producer_observed_not_verified"
+        );
+
+        let first = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_connector_status".into(),
+                detail: Some(ProjectPublisherStatusDetail::Connector),
+                ..Default::default()
+            }))
+            .await;
+        assert_ne!(first.is_error, Some(true), "{}", error_text(&first));
+        let first_body: serde_json::Value = serde_json::from_str(&error_text(&first)).unwrap();
+        let cursor = first_body["detail"]["body"]["next_cursor"]
+            .as_str()
+            .map(str::to_owned);
+
+        let text = page_publisher_status_detail(
+            &server,
+            "p_connector_status",
+            ProjectPublisherStatusDetail::Connector,
+        )
+        .await;
+        let reconstructed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let snapshot = fixture.store().snapshot().unwrap();
+        let catalog = snapshot.catalog();
+        let expected = json!({
+            "connector_source_id": connector_scope.connector_source_id().as_str(),
+            "connector_kind": connector_scope.connector_kind().as_str(),
+            "observations": connector_observations_json(
+                catalog,
+                &catalog.projects[&project_id],
+            ),
+            "publication_lanes": vec!["file_source"],
+            "file_source": connector_publication_json(store, &connector_scope),
+        });
+        assert_eq!(reconstructed, expected);
+
+        let second_descriptor = FileGenerationDescriptorV1 {
+            cursor_epoch: 8,
+            ..descriptor.clone()
+        };
+        let second = store
+            .begin_upload("producer-a", &second_descriptor, &telemetry, None)
+            .unwrap();
+        store
+            .append_manifest_page(&second.upload_id, 0, documents.clone())
+            .unwrap();
+        assert!(
+            store
+                .complete_manifest(&second.upload_id)
+                .unwrap()
+                .is_empty()
+        );
+        store.finalize(&second.upload_id).unwrap();
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_connector_status".into(),
+                detail: Some(ProjectPublisherStatusDetail::Connector),
+                detail_cursor: cursor,
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            error_text(&result).contains("evidence or selection changed"),
+            "a changed connector body must refuse continuation: {}",
+            error_text(&result)
+        );
+
+        let result = server
+            .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
+                project_id: "p_not_connector".into(),
+                detail: Some(ProjectPublisherStatusDetail::Connector),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            error_text(&result).contains("error.project_publisher_status_detail_unavailable"),
+            "{}",
+            error_text(&result)
+        );
+    }
+
+    /// Synthetic runtime rows cover the inventory classes the compact
+    /// projection must keep visible and count.
+    #[test]
+    fn publisher_health_summary_bounds_synthetic_inventories() {
+        use crate::server::state::{
+            AcceptedRuntimeView, AttachmentCapabilityView, BindingRuntimeView, CheckoutOverlayView,
+            ProjectRuntimeStatus, PublishedScopeView, WatcherRuntimeView,
+        };
+
+        let published_scope = PublishedScopeView {
+            repo_id: "repo-example".into(),
+            bbox_root_relpath: ".".into(),
+        };
+        let attachments = (0..9)
+            .map(|index| AttachmentCapabilityView {
+                attachment_id: format!("att_{index:032x}"),
+                checkout_id: format!("{index:032x}"),
+                kind: "base".into(),
+                status: if index == 8 { "detached" } else { "attached" }.into(),
+                available: vec!["repo_knowledge"],
+            })
+            .collect::<Vec<_>>();
+        let overlay =
+            |checkout: char, outcome: &str, generation: Option<&str>, diagnostics: usize| {
+                CheckoutOverlayView {
+                    checkout_id: checkout.to_string(),
+                    lane: "knowledge",
+                    published_scope: published_scope.clone(),
+                    outcome: outcome.into(),
+                    accepted_generation: generation.map(str::to_owned),
+                    diagnostics: (0..diagnostics)
+                        .map(|index| format!("diagnostic-{index}"))
+                        .collect(),
+                }
+            };
+        let overlays = vec![
+            overlay('b', "unavailable", Some("old"), 1),
+            overlay('a', "fresh", Some("new"), 0),
+            overlay('c', "fresh", Some("new"), 0),
+            overlay('d', "fresh", Some("new"), 0),
+            overlay('e', "fresh", Some("new"), 0),
+            overlay('f', "fresh", Some("new"), 0),
+            overlay('g', "fresh", Some("new"), 0),
+        ];
+        let health = ProjectRuntimeStatus {
+            project_id: "p_synthetic".into(),
+            catalog_authority: "available",
+            catalog_scope: Some(published_scope.clone()),
+            accepted: AcceptedRuntimeView {
+                state: "current",
+                serves_published_content: true,
+                advance_available: true,
+                scope_agreement: "agreed",
+                accepted_scope: None,
+                full_ref: None,
+                accepted_commit: None,
+                generation_id: None,
+                generation_sha256: None,
+                last_verified_unix_secs: None,
+                diagnostic: None,
+            },
+            binding: BindingRuntimeView {
+                source_kind: Some("attachment"),
+                attachment_id: Some("att_00000000000000000000000000000000".into()),
+                producer_id: None,
+                source_generation_id: None,
+                source_generation_sha256: None,
+                pointer_sha256: None,
+                status: "detached",
+            },
+            attachments,
+            overlays,
+            watcher: WatcherRuntimeView {
+                watcher_running: true,
+                registered_attachments: (0..6).map(|index| format!("att_{index:032x}")).collect(),
+                capable_but_unregistered: vec!["att_ffffffffffffffffffffffffffffffff".into()],
+            },
+        };
+
+        let summary = publisher_health_summary(&health, Some("new"));
+        let serialized = serde_json::to_vec(&summary).unwrap();
+        assert!(
+            serialized.len() <= 2560,
+            "the bounded health summary must leave room for fixed status identity: {}",
+            serialized.len()
+        );
+        assert!(summary.get("accepted").is_none());
+        assert_eq!(summary["binding"]["status"], "detached");
+        let attachments = &summary["attachments"];
+        assert_eq!(attachments["total"], 9);
+        assert_eq!(attachments["returned"], 4);
+        assert_eq!(attachments["omitted"], 5);
+        assert_eq!(attachments["status_counts"]["attached"], 8);
+        assert_eq!(attachments["status_counts"]["detached"], 1);
+        assert_eq!(
+            attachments["rows"][0]["attachment_id"],
+            format!("att_{:032x}", 8)
+        );
+        assert_eq!(attachments["rows"][0]["status"], "detached");
+        let overlays = &summary["overlays"];
+        assert_eq!(overlays["total"], 7);
+        assert_eq!(overlays["returned"], 4);
+        assert_eq!(overlays["omitted"], 3);
+        assert_eq!(overlays["unavailable"], 1);
+        assert_eq!(overlays["stale"], 1);
+        assert_eq!(overlays["degraded"], 1);
+        assert_eq!(overlays["rows"][0]["checkout_id"], "b");
+        assert_eq!(overlays["rows"][0]["stale"], true);
+        let registered = &summary["watcher"]["registered_attachments"];
+        assert_eq!(registered["total"], 6);
+        assert_eq!(registered["returned"], 4);
+        assert_eq!(registered["omitted"], 2);
+        assert_eq!(summary["watcher"]["capable_but_unregistered"]["total"], 1);
+    }
+
+    /// Oversized producer strings stay bounded and honestly marked in the
+    /// summary while their exact bytes remain recoverable through detail.
+    #[test]
+    fn publisher_connector_summary_bounds_adversarial_scalars() {
+        let long = "x".repeat(4096);
+        let multibyte = "é".repeat(512);
+        let full = json!({
+            "connector_source_id": "csrc_5f2c1d9a4b6e470e",
+            "connector_kind": "gdrive",
+            "observations": {
+                "observed_at": long.clone(),
+                "producer_id": long.clone(),
+                "remote_authority": long.clone(),
+                "remote_root_id": long.clone(),
+                "remote_display_name": multibyte,
+            },
+            "publication_lanes": (0..40)
+                .map(|index| format!("lane-{index:02}"))
+                .collect::<Vec<_>>(),
+            "file_source": {
+                "readable": true,
+                "active": {
+                    "generation_id":
+                        "kpf_0000000000000000000000000000000000000000000000000000000000000000",
+                    "ordinal": 3,
+                    "producer_id": long.clone(),
+                    "document_count": 3,
+                    "file_count": 3,
+                    "logical_bytes": 30,
+                    "cursor_epoch": 7,
+                    "manifest_sha256": "0".repeat(64),
+                },
+                "generation_count": 4,
+                "generation_states": {"active": 1, "ready": 3},
+                "last_cursor_degradation": {
+                    "checkpoint_name": long.clone(),
+                    "cause": long.clone(),
+                    "observed_at": long.clone(),
+                    "cursor_epoch": 6,
+                    "entries_enumerated": 90,
+                    "blobs_refetched": 2,
+                    "documents_reexported": 1,
+                },
+            },
+        });
+
+        let summary = publisher_connector_summary(&full);
+        let serialized = serde_json::to_vec(&summary).unwrap();
+        assert!(
+            serialized.len() <= 2048,
+            "the complete connector summary must stay bounded: {}",
+            serialized.len()
+        );
+
+        let metadata = |value: &serde_json::Value, total_bytes: usize| {
+            assert_eq!(value["present"], true);
+            assert_eq!(value["truncated"], true);
+            assert_eq!(value["total_bytes"], total_bytes);
+            assert!(
+                value.get("text").is_none(),
+                "oversized display metadata must defer text to detail"
+            );
+        };
+        for field in [
+            "observed_at",
+            "producer_id",
+            "remote_authority",
+            "remote_root_id",
+        ] {
+            metadata(&summary["observations"][field], 4096);
+        }
+        metadata(&summary["observations"]["remote_display_name"], 1024);
+        assert_eq!(
+            summary["observations"]["evidence"],
+            "producer_observed_not_verified"
+        );
+
+        let lanes = &summary["publication_lanes"];
+        assert_eq!(lanes["total"], 40);
+        assert_eq!(lanes["returned"], 4);
+        assert_eq!(lanes["omitted"], 36);
+        assert_eq!(lanes["values"].as_array().unwrap().len(), 4);
+        assert_eq!(lanes["values"][0], "lane-00");
+
+        metadata(&summary["file_source"]["active"]["producer_id"], 4096);
+        assert_eq!(
+            summary["file_source"]["active"]["generation_id"],
+            "kpf_0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        metadata(
+            &summary["file_source"]["last_cursor_degradation"]["cause"],
+            4096,
+        );
+        assert_eq!(
+            summary["file_source"]["last_cursor_degradation"]["cursor_epoch"],
+            6
+        );
+        assert_eq!(summary["file_source"]["generation_states"]["ready"], 3);
+
+        let unreadable = json!({
+            "connector_source_id": "csrc_5f2c1d9a4b6e470e",
+            "connector_kind": "gdrive",
+            "observations": serde_json::Value::Null,
+            "publication_lanes": serde_json::Value::Null,
+            "file_source": {"readable": false, "diagnostic": long.clone()},
+        });
+        let summary = publisher_connector_summary(&unreadable);
+        let serialized = serde_json::to_vec(&summary).unwrap();
+        assert!(
+            serialized.len() <= 1024,
+            "the unreadable summary must stay bounded: {}",
+            serialized.len()
+        );
+        let diagnostic = &summary["file_source"]["diagnostic"];
+        assert_eq!(diagnostic["truncated"], true);
+        assert_eq!(diagnostic["total_bytes"], 4096);
+        assert!(diagnostic["text"].as_str().unwrap().len() <= 64);
+        assert_eq!(summary["file_source"]["readable"], false);
+        assert!(summary["file_source"].get("active").is_none());
     }
 
     #[tokio::test]
@@ -5072,6 +6134,7 @@ mod tests {
         let result = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: project_id.to_string(),
+                ..Default::default()
             }))
             .await;
         assert_ne!(result.is_error, Some(true), "{}", error_text(&result));
@@ -5083,7 +6146,6 @@ mod tests {
         );
         assert!(body["attachment_id"].is_null());
         assert_eq!(body["health"]["binding"]["status"], "producer");
-        assert_eq!(body["health"]["binding"]["source_kind"], "producer");
     }
 
     /// Bridge mode refusal is unchanged by the widening.
@@ -5094,6 +6156,7 @@ mod tests {
         let result = server
             .bbox_project_publisher_status(Parameters(ProjectPublisherStatusParams {
                 project_id: "p_00000000000000000000000000000000".into(),
+                ..Default::default()
             }))
             .await;
         assert_eq!(result.is_error, Some(true));
